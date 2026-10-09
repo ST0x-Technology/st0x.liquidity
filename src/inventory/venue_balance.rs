@@ -203,6 +203,16 @@ where
         })
     }
 
+    /// Set available to the snapshot balance and keep inflight as is. Only
+    /// for a caller that has already established the inflight is not part
+    /// of what the venue reports, such as startup-stranded redemptions.
+    pub(super) fn apply_snapshot_keeping_inflight(self, snapshot_balance: T) -> Self {
+        Self {
+            available: snapshot_balance,
+            inflight: self.inflight,
+        }
+    }
+
     /// Force-apply a snapshot, clearing inflight and setting
     /// available to the snapshot balance.
     ///
@@ -413,6 +423,16 @@ mod tests {
 
         assert!(result.available().inner().eq(float!(75)).unwrap());
         assert!(result.inflight().is_zero().unwrap());
+    }
+
+    #[test]
+    fn apply_snapshot_keeping_inflight_sets_available_over_inflight() {
+        let balance = equity_balance(90, 7);
+
+        let result = balance.apply_snapshot_keeping_inflight(FractionalShares::new(float!(40)));
+
+        assert!(result.available().inner().eq(float!(40)).unwrap());
+        assert!(result.inflight().inner().eq(float!(7)).unwrap());
     }
 
     #[test]

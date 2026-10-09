@@ -1,0 +1,3392 @@
+{
+  "uid": "t0-liquidity-pnl",
+  "title": "Liquidity bot: PnL",
+  "description": "Sub-page of the Liquidity bot board in the liquidity folder. The SPA's PnL tab, tiles, table and charts all driven by the range pill; closed-lot and cost-ledger drilldowns live in the SPA.",
+  "tags": [
+    "liquidity",
+    "bot",
+    "t0"
+  ],
+  "timezone": "utc",
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "refresh": "1m",
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "env",
+        "type": "custom",
+        "label": "Environment",
+        "description": "GCP project id \u2014 both the Cloud Monitoring and Cloud Logging queries take it directly.",
+        "query": "production : t0-liquidity, staging : t0-liquidity-staging",
+        "includeAll": false,
+        "multi": false,
+        "hide": 0,
+        "current": {
+          "selected": true,
+          "text": "production",
+          "value": "t0-liquidity"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "production",
+            "value": "t0-liquidity"
+          },
+          {
+            "selected": false,
+            "text": "staging",
+            "value": "t0-liquidity-staging"
+          }
+        ]
+      },
+      {
+        "name": "window",
+        "type": "custom",
+        "label": "PnL range",
+        "description": "Matches the SPA's PnL range buttons. Windows are relative to the last date with fills, not to today.",
+        "query": "1D : 1d, 1W : 1w, 1M : 1m, YTD : ytd, 1Y : 1y, All : all",
+        "includeAll": false,
+        "multi": false,
+        "hide": 0,
+        "current": {
+          "selected": true,
+          "text": "1W",
+          "value": "1w"
+        },
+        "options": [
+          {
+            "selected": false,
+            "text": "1D",
+            "value": "1d"
+          },
+          {
+            "selected": true,
+            "text": "1W",
+            "value": "1w"
+          },
+          {
+            "selected": false,
+            "text": "1M",
+            "value": "1m"
+          },
+          {
+            "selected": false,
+            "text": "YTD",
+            "value": "ytd"
+          },
+          {
+            "selected": false,
+            "text": "1Y",
+            "value": "1y"
+          },
+          {
+            "selected": false,
+            "text": "All",
+            "value": "all"
+          }
+        ]
+      }
+    ]
+  },
+  "links": [
+    {
+      "type": "link",
+      "title": "Dashboard",
+      "url": "/d/t0-liquidity/?theme=light&autofitpanels",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": true,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "type": "link",
+      "title": "Orders",
+      "url": "/d/t0-liquidity-orders/?theme=light",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": true,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "type": "link",
+      "title": "\u25b8 PnL",
+      "url": "/d/t0-liquidity-pnl/?theme=light",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": true,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "type": "link",
+      "title": "Performance",
+      "url": "/d/t0-liquidity-performance/?theme=light",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": true,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "type": "link",
+      "title": "Logs",
+      "url": "/d/t0-liquidity-logs/?theme=light",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": true,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "type": "dashboards",
+      "title": "Related",
+      "tags": [
+        "t0"
+      ],
+      "asDropdown": true,
+      "icon": "external link",
+      "includeVars": false,
+      "keepTime": true,
+      "targetBlank": false,
+      "tooltip": "Other T0 dashboards"
+    }
+  ],
+  "panels": [
+    {
+      "id": 25,
+      "type": "stat",
+      "title": "",
+      "description": "The SPA header's connection light: is the bot process up and answering /health? '\u2014' means the exporter itself is not reporting.",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max(liq_up)",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 1,
+        "w": 3,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "Connected",
+                  "color": "green",
+                  "index": 0
+                },
+                "0": {
+                  "text": "Disconnected",
+                  "color": "red",
+                  "index": 1
+                }
+              }
+            },
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "displayName": "Bot"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 14,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "timeFrom": "5m",
+      "hideTimeOverride": true
+    },
+    {
+      "id": 26,
+      "type": "stat",
+      "title": "",
+      "description": "Deployed commit, from /health, cut to 7 characters like the SPA header. The stackdriver plugin runs a range query even for an instant target, so over the dashboard's 24h the previous commit is a second series and its name drew over this one. PromQL also keeps a stopped series for its 5m lookback, so topk on the sample timestamp keeps only the commit with the newest sample, over a 1m window.",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max by (git_commit) (topk(1, label_replace(timestamp(liq_bot_info), \"git_commit\", \"$1\", \"git_commit\", \"(.{7}).*\")))",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true,
+          "legendFormat": "{{git_commit}}"
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 1,
+        "w": 3,
+        "x": 3,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 14,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "timeFrom": "1m",
+      "hideTimeOverride": true
+    },
+    {
+      "id": 27,
+      "type": "stat",
+      "title": "",
+      "description": "Bot process uptime, from /health uptimeSeconds.",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "time() - max(liq_bot_start_timestamp_seconds)",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 1,
+        "w": 3,
+        "x": 6,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s",
+          "displayName": "Uptime",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 14,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "timeFrom": "5m",
+      "hideTimeOverride": true
+    },
+    {
+      "id": 28,
+      "type": "stat",
+      "title": "",
+      "description": "The SPA settings bar's Broker pill.",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "sum by (broker) (liq_settings_info)",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true,
+          "legendFormat": "{{broker}}"
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 1,
+        "w": 3,
+        "x": 9,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 14,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "timeFrom": "5m",
+      "hideTimeOverride": true
+    },
+    {
+      "id": 29,
+      "type": "stat",
+      "title": "",
+      "description": "Equity rebalance target. The SPA pill also shows the band: target +/- liq_settings_equity_deviation.",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max(liq_settings_equity_target)",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 1,
+        "w": 4,
+        "x": 12,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percentunit",
+          "displayName": "Equity",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 14,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "timeFrom": "5m",
+      "hideTimeOverride": true
+    },
+    {
+      "id": 30,
+      "type": "stat",
+      "title": "",
+      "description": "USDC rebalance target. The SPA pill also shows the band: target +/- liq_settings_usdc_deviation.",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max(liq_settings_usdc_target)",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 1,
+        "w": 4,
+        "x": 16,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percentunit",
+          "displayName": "USDC",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 14,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "timeFrom": "5m",
+      "hideTimeOverride": true
+    },
+    {
+      "id": 31,
+      "type": "stat",
+      "title": "",
+      "description": "Hedge execution threshold (settings bar 'Trigger').",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max(liq_settings_execution_threshold_usd)",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 1,
+        "w": 4,
+        "x": 20,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "currencyUSD",
+          "displayName": "Trigger",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 14,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "timeFrom": "5m",
+      "hideTimeOverride": true
+    },
+    {
+      "id": 32,
+      "type": "stat",
+      "title": "",
+      "description": "Gross minus costs plus revenues. (SPA PnL tile, computed by the bot's replay \u2014 5-min refresh cadence.)",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max(liq_pnl_summary_usd{stream=\"net_realized\",window=\"$window\"})",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 3,
+        "w": 4,
+        "x": 0,
+        "y": 2
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "text",
+                "value": -0.01
+              },
+              {
+                "color": "green",
+                "value": 0.01
+              }
+            ]
+          },
+          "unit": "currency:financial:$",
+          "displayName": "NET REALIZED PNL",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 22,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 33,
+      "type": "stat",
+      "title": "",
+      "description": "Closed-lot fill replay before costs. (SPA PnL tile, computed by the bot's replay \u2014 5-min refresh cadence.)",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max(liq_pnl_summary_usd{stream=\"gross_realized\",window=\"$window\"})",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 3,
+        "w": 4,
+        "x": 4,
+        "y": 2
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "text",
+                "value": -0.01
+              },
+              {
+                "color": "green",
+                "value": 0.01
+              }
+            ]
+          },
+          "unit": "currency:financial:$",
+          "displayName": "REALIZED GROSS PNL",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 22,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 34,
+      "type": "stat",
+      "title": "",
+      "description": "Cost/revenue ledger entries. (SPA PnL tile, computed by the bot's replay \u2014 5-min refresh cadence.)",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max(liq_pnl_summary_usd{stream=\"tracked_costs\",window=\"$window\"})",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 3,
+        "w": 4,
+        "x": 8,
+        "y": 2
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "currency:financial:$",
+          "displayName": "TRACKED COSTS",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 22,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 35,
+      "type": "stat",
+      "title": "",
+      "description": "Dividends and broker ledger credits. (SPA PnL tile, computed by the bot's replay \u2014 5-min refresh cadence.)",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max(liq_pnl_summary_usd{stream=\"tracked_revenue\",window=\"$window\"})",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 3,
+        "w": 4,
+        "x": 12,
+        "y": 2
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "text",
+                "value": -0.01
+              },
+              {
+                "color": "green",
+                "value": 0.01
+              }
+            ]
+          },
+          "unit": "currency:financial:$",
+          "displayName": "TRACKED REVENUE",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 22,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 36,
+      "type": "stat",
+      "title": "",
+      "description": "Broker hedge stream. (SPA PnL tile, computed by the bot's replay \u2014 5-min refresh cadence.)",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max(liq_pnl_summary_usd{stream=\"counter_trade\",window=\"$window\"})",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 3,
+        "w": 4,
+        "x": 16,
+        "y": 2
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "text",
+                "value": -0.01
+              },
+              {
+                "color": "green",
+                "value": 0.01
+              }
+            ]
+          },
+          "unit": "currency:financial:$",
+          "displayName": "COUNTER-TRADE PNL",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 22,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 37,
+      "type": "stat",
+      "title": "",
+      "description": "Users passively crossed open inventory. (SPA PnL tile, computed by the bot's replay \u2014 5-min refresh cadence.)",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max(liq_pnl_summary_usd{stream=\"onchain_netting\",window=\"$window\"})",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 3,
+        "w": 4,
+        "x": 0,
+        "y": 5
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "text",
+                "value": -0.01
+              },
+              {
+                "color": "green",
+                "value": 0.01
+              }
+            ]
+          },
+          "unit": "currency:financial:$",
+          "displayName": "ON-CHAIN NETTING PNL",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 22,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 38,
+      "type": "stat",
+      "title": "",
+      "description": "Closed delayed or offchain-origin exposure. (SPA PnL tile, computed by the bot's replay \u2014 5-min refresh cadence.)",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max(liq_pnl_summary_usd{stream=\"directional_imbalance_excess\",window=\"$window\"})",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 3,
+        "w": 4,
+        "x": 4,
+        "y": 5
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "text",
+                "value": -0.01
+              },
+              {
+                "color": "green",
+                "value": 0.01
+              }
+            ]
+          },
+          "unit": "currency:financial:$",
+          "displayName": "DIRECTIONAL REALIZED PNL",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 22,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 39,
+      "type": "stat",
+      "title": "",
+      "description": "Requires historical snapshots. (SPA PnL tile, computed by the bot's replay \u2014 5-min refresh cadence.)",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max(liq_pnl_summary_usd{stream=\"directional_inventory_baseline\",window=\"$window\"})",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 3,
+        "w": 4,
+        "x": 8,
+        "y": 5
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "text",
+                "value": -0.01
+              },
+              {
+                "color": "green",
+                "value": 0.01
+              }
+            ]
+          },
+          "unit": "currency:financial:$",
+          "displayName": "BASELINE DRIFT PNL",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 22,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 40,
+      "type": "stat",
+      "title": "",
+      "description": "All directional streams together. (SPA PnL tile, computed by the bot's replay \u2014 5-min refresh cadence.)",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max(liq_pnl_summary_usd{stream=\"directional_exposure\",window=\"$window\"})",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 3,
+        "w": 4,
+        "x": 12,
+        "y": 5
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "text",
+                "value": -0.01
+              },
+              {
+                "color": "green",
+                "value": 0.01
+              }
+            ]
+          },
+          "unit": "currency:financial:$",
+          "displayName": "DIRECTIONAL REALIZED TOTAL",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 22,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 41,
+      "type": "stat",
+      "title": "",
+      "description": "Every stream summed. (SPA PnL tile, computed by the bot's replay \u2014 5-min refresh cadence.)",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max(liq_pnl_summary_usd{stream=\"total\",window=\"$window\"})",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 3,
+        "w": 4,
+        "x": 16,
+        "y": 5
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "text",
+                "value": -0.01
+              },
+              {
+                "color": "green",
+                "value": 0.01
+              }
+            ]
+          },
+          "unit": "currency:financial:$",
+          "displayName": "TOTAL PNL",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 22,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 42,
+      "type": "stat",
+      "title": "",
+      "description": "Open replay inventory in shares (the SPA's muted tile).",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max(liq_pnl_summary_shares{kind=\"inventory_drift\",window=\"$window\"})",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 3,
+        "w": 4,
+        "x": 20,
+        "y": 2
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "displayName": "OPEN INVENTORY (SH)",
+          "decimals": 3
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 43,
+      "type": "stat",
+      "title": "",
+      "description": "Total fills in the PnL database sample.",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max(liq_pnl_sample_total_fills{window=\"$window\"})",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 3,
+        "w": 4,
+        "x": 20,
+        "y": 5
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "displayName": "TOTAL FILLS",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 44,
+      "type": "stat",
+      "title": "",
+      "description": "Average deployed capital from daily snapshots \u2014 computed by the bot, never rendered by the SPA.",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max(liq_pnl_capital_avg_deployed_usd{window=\"$window\"})",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 3,
+        "w": 8,
+        "x": 0,
+        "y": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "currencyUSD",
+          "displayName": "AVG DEPLOYED CAPITAL",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 45,
+      "type": "stat",
+      "title": "",
+      "description": "Annualized return on that capital \u2014 computed by the bot, never rendered by the SPA.",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max(liq_pnl_capital_annualized_return_pct{window=\"$window\"})",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 3,
+        "w": 8,
+        "x": 8,
+        "y": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "text",
+                "value": 0
+              },
+              {
+                "color": "green",
+                "value": 0.01
+              }
+            ]
+          },
+          "unit": "percent",
+          "displayName": "ANNUALIZED RETURN",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 46,
+      "type": "stat",
+      "title": "",
+      "description": "Days of snapshot coverage behind the capital figures.",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max(liq_pnl_capital_coverage_days{window=\"$window\"})",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 3,
+        "w": 8,
+        "x": 16,
+        "y": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "displayName": "COVERAGE DAYS",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 47,
+      "type": "table",
+      "title": "Per Asset PnL",
+      "description": "The SPA's Per Asset PnL table (closed-lot replay per symbol; Lots = matched lot count; Volume = both legs of the matched shares, without the SPA's USD sub-line).",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "sum by (symbol, col) (label_replace(liq_pnl_symbol_usd{col=\"gross_realized\",window=\"$window\"}, \"col\", \"Gross\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_usd{col=\"tracked_costs\",window=\"$window\"}, \"col\", \"Costs\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_usd{col=\"tracked_revenue\",window=\"$window\"}, \"col\", \"Revenue\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_usd{col=\"net_realized\",window=\"$window\"}, \"col\", \"Net\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_usd{col=\"counter_trade\",window=\"$window\"}, \"col\", \"Counter\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_usd{col=\"onchain_netting\",window=\"$window\"}, \"col\", \"On-chain\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_usd{col=\"directional_imbalance_excess\",window=\"$window\"}, \"col\", \"Directional\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_usd{col=\"directional_inventory_baseline\",window=\"$window\"}, \"col\", \"Baseline Drift\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_usd{col=\"total\",window=\"$window\"}, \"col\", \"Total\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_lots{window=\"$window\"}, \"col\", \"Lots\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_volume_shares{window=\"$window\"}, \"col\", \"Volume\", \"\", \"\"))",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 11
+      },
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {}
+        },
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "groupBy",
+          "options": {
+            "fields": {
+              "symbol": {
+                "operation": "groupby",
+                "aggregations": []
+              },
+              "col": {
+                "operation": "groupby",
+                "aggregations": []
+              },
+              "Value": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "groupingToMatrix",
+          "options": {
+            "columnField": "col",
+            "rowField": "symbol",
+            "valueField": "Value (lastNotNull)",
+            "emptyValue": "null"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {},
+            "renameByName": {
+              "symbol\\col": "Asset"
+            },
+            "indexByName": {
+              "symbol\\col": 0,
+              "Gross": 1,
+              "Costs": 2,
+              "Revenue": 3,
+              "Net": 4,
+              "Volume": 5,
+              "Counter": 6,
+              "On-chain": 7,
+              "Directional": 8,
+              "Baseline Drift": 9,
+              "Total": 10,
+              "Lots": 11
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 3,
+          "custom": {
+            "align": "auto",
+            "filterable": true,
+            "cellOptions": {
+              "type": "auto"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Gross"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "currency:financial:$"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "text",
+                      "value": -0.01
+                    },
+                    {
+                      "color": "green",
+                      "value": 0.01
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Costs"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "currency:financial:$"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "text",
+                      "value": -0.01
+                    },
+                    {
+                      "color": "green",
+                      "value": 0.01
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Revenue"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "currency:financial:$"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "text",
+                      "value": -0.01
+                    },
+                    {
+                      "color": "green",
+                      "value": 0.01
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Net"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "currency:financial:$"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "text",
+                      "value": -0.01
+                    },
+                    {
+                      "color": "green",
+                      "value": 0.01
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Counter"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "currency:financial:$"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "text",
+                      "value": -0.01
+                    },
+                    {
+                      "color": "green",
+                      "value": 0.01
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "On-chain"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "currency:financial:$"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "text",
+                      "value": -0.01
+                    },
+                    {
+                      "color": "green",
+                      "value": 0.01
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Directional"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "currency:financial:$"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "text",
+                      "value": -0.01
+                    },
+                    {
+                      "color": "green",
+                      "value": 0.01
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Baseline Drift"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "currency:financial:$"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "text",
+                      "value": -0.01
+                    },
+                    {
+                      "color": "green",
+                      "value": 0.01
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Total"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "currency:financial:$"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "text",
+                      "value": -0.01
+                    },
+                    {
+                      "color": "green",
+                      "value": 0.01
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Volume"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 4
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "Total",
+            "desc": true
+          }
+        ]
+      }
+    },
+    {
+      "id": 48,
+      "type": "barchart",
+      "title": "PnL by Asset per Time Unit",
+      "description": "One bar per calendar day, split by asset and stacked, straight from the bot's daily PnL buckets. A day with no closed lot for an asset is a zero, as in the SPA.",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "sum by (day, symbol) (liq_pnl_day_usd{window=\"$window\"})",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 19
+      },
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {}
+        },
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "groupBy",
+          "options": {
+            "fields": {
+              "day": {
+                "operation": "groupby",
+                "aggregations": []
+              },
+              "symbol": {
+                "operation": "groupby",
+                "aggregations": []
+              },
+              "Value": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "groupingToMatrix",
+          "options": {
+            "columnField": "symbol",
+            "rowField": "day",
+            "valueField": "Value (lastNotNull)",
+            "emptyValue": "zero"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {},
+            "indexByName": {},
+            "renameByName": {
+              "day\\symbol": "Day"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "Day",
+                "desc": false
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2,
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 80,
+            "gradientMode": "none",
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "xField": "Day",
+        "orientation": "auto",
+        "stacking": "normal",
+        "showValue": "never",
+        "barWidth": 0.35,
+        "groupWidth": 0.7,
+        "xTickLabelRotation": -45,
+        "xTickLabelSpacing": 0,
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 49,
+      "type": "barchart",
+      "title": "PnL by PnL-Stream per Time Unit",
+      "description": "The same days split by PnL stream, the SPA's four component streams only, since directional_exposure and total are tile-only aggregates there and stacking them beside their own components double-counts.",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "sum by (day, stream) (liq_pnl_day_stream_usd{window=\"$window\"})",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 19
+      },
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {}
+        },
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "groupBy",
+          "options": {
+            "fields": {
+              "day": {
+                "operation": "groupby",
+                "aggregations": []
+              },
+              "stream": {
+                "operation": "groupby",
+                "aggregations": []
+              },
+              "Value": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "groupingToMatrix",
+          "options": {
+            "columnField": "stream",
+            "rowField": "day",
+            "valueField": "Value (lastNotNull)",
+            "emptyValue": "zero"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {},
+            "indexByName": {},
+            "renameByName": {
+              "day\\stream": "Day"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "Day",
+                "desc": false
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2,
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 80,
+            "gradientMode": "none",
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "counter_trade"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#0284c7"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "onchain_netting"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#16a34a"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "directional_inventory_baseline"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d97706"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "directional_imbalance_excess"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#e11d48"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "xField": "Day",
+        "orientation": "auto",
+        "stacking": "normal",
+        "showValue": "never",
+        "barWidth": 0.35,
+        "groupWidth": 0.7,
+        "xTickLabelRotation": -45,
+        "xTickLabelSpacing": 0,
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 50,
+      "type": "barchart",
+      "title": "Cumulative PnL by Asset",
+      "description": "Running total per asset through the selected range. Unstacked: the SPA draws one independent line per asset here, not a stack. The last day's bars sum to the Total PnL tile above.",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "sum by (day, symbol) (liq_pnl_day_cum_usd{window=\"$window\"})",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 26
+      },
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {}
+        },
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "groupBy",
+          "options": {
+            "fields": {
+              "day": {
+                "operation": "groupby",
+                "aggregations": []
+              },
+              "symbol": {
+                "operation": "groupby",
+                "aggregations": []
+              },
+              "Value": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "groupingToMatrix",
+          "options": {
+            "columnField": "symbol",
+            "rowField": "day",
+            "valueField": "Value (lastNotNull)",
+            "emptyValue": "zero"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {},
+            "indexByName": {},
+            "renameByName": {
+              "day\\symbol": "Day"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "Day",
+                "desc": false
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2,
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 80,
+            "gradientMode": "none",
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "xField": "Day",
+        "orientation": "auto",
+        "stacking": "none",
+        "showValue": "never",
+        "barWidth": 0.35,
+        "groupWidth": 0.7,
+        "xTickLabelRotation": -45,
+        "xTickLabelSpacing": 0,
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 51,
+      "type": "barchart",
+      "title": "Cumulative PnL by PnL-Stream",
+      "description": "Running total per stream, unstacked like the SPA's lines. Grafana has no categorical-axis line chart, so these are bars over the same day buckets: the numbers are the SPA's, the shape is not.",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "sum by (day, stream) (liq_pnl_day_cum_stream_usd{window=\"$window\"})",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 26
+      },
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {}
+        },
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "groupBy",
+          "options": {
+            "fields": {
+              "day": {
+                "operation": "groupby",
+                "aggregations": []
+              },
+              "stream": {
+                "operation": "groupby",
+                "aggregations": []
+              },
+              "Value": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "groupingToMatrix",
+          "options": {
+            "columnField": "stream",
+            "rowField": "day",
+            "valueField": "Value (lastNotNull)",
+            "emptyValue": "zero"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {},
+            "indexByName": {},
+            "renameByName": {
+              "day\\stream": "Day"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "Day",
+                "desc": false
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2,
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 80,
+            "gradientMode": "none",
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "counter_trade"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#0284c7"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "onchain_netting"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#16a34a"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "directional_inventory_baseline"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d97706"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "directional_imbalance_excess"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#e11d48"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "xField": "Day",
+        "orientation": "auto",
+        "stacking": "none",
+        "showValue": "never",
+        "barWidth": 0.35,
+        "groupWidth": 0.7,
+        "xTickLabelRotation": -45,
+        "xTickLabelSpacing": 0,
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    }
+  ]
+}

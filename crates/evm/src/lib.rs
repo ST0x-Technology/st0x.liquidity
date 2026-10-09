@@ -16,12 +16,14 @@
 //! `Wallet::submit` (write transactions), so consumers get
 //! human-readable revert reasons without manual wiring.
 
+use alloy::consensus::transaction::SignerRecoverable as _;
 use alloy::consensus::{Transaction, TxEnvelope};
-use alloy::eips::BlockId;
+use alloy::eips::Typed2718 as _;
 #[cfg(any(feature = "turnkey", feature = "local-signer"))]
 use alloy::eips::eip2718::Encodable2718;
 use alloy::eips::eip2718::{Decodable2718, Eip2718Error};
-use alloy::primitives::{Address, B256, Bytes, Signature, TxHash};
+use alloy::eips::{BlockId, BlockNumberOrTag};
+use alloy::primitives::{Address, B256, Bytes, Signature, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use alloy::sol_types::SolCall;
@@ -54,10 +56,11 @@ pub use chain::{Chain, ParseChainError, SettlementStable};
 ///
 /// Those are a transport-level failure (the backend becomes reachable again)
 /// or a null response (the awaited value becomes visible on another node).
-/// Every other `RpcError` is deterministic and fails identically on every
-/// redrive, so a caller must surface it for operator action instead of
-/// redriving forever: a formal `ErrorResp` rejection, a serialization or
-/// deserialization failure, a local usage error, or an unsupported feature.
+/// Other `RpcError`s are not transport outages: a formal `ErrorResp` rejection,
+/// a serialization or deserialization failure, a local usage error, or an
+/// unsupported feature. Callers must normally surface these for operator action,
+/// unless the operation explicitly treats them as unavailable evidence (such as
+/// a rejected canonical-state read during suspected-drop classification).
 pub fn is_transient_rpc(
     error: &alloy::transports::RpcError<alloy::transports::TransportErrorKind>,
 ) -> bool {
@@ -226,8 +229,8 @@ pub enum EvmError {
     )]
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     PreparedTransactionReconciliationPending { tx_hash: alloy::primitives::TxHash },
-    /// Transaction was dropped from the mempool (not found via
-    /// `eth_getTransactionByHash` after initial propagation window).
+    /// Suspected drop after qualified absence from receipt and mempool lookups.
+    /// This is not proof of absence from every backend's mempool.
     #[error(
         "transaction {tx_hash} dropped from mempool \
          (not found after {elapsed_secs}s)"
@@ -262,11 +265,16 @@ pub enum EvmError {
     #[error("replacement fee bump overflowed u128 (network fee estimate too large)")]
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     ReplacementFeeOverflow,
-    /// Padding a gas estimate overflowed `u64`. Only reachable if the RPC
-    /// returns an absurd estimate.
-    #[error("gas limit padding overflowed u64 (gas estimate {estimate} too large)")]
+    /// Padding a gas limit overflowed `u64`: an absurd RPC estimate or an
+    /// absurd pinned limit.
+    #[error("gas limit padding overflowed u64 (unpadded gas limit {estimate} too large)")]
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     GasLimitOverflow { estimate: u64 },
+    /// A pinned gas limit the node would reject on every broadcast: the unpadded limit is below
+    /// the 21,000 intrinsic gas, or the padded limit exceeds the per-transaction gas cap.
+    #[error("pinned gas limit out of bounds (unpadded {unpadded}, padded {padded})")]
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    PinnedGasLimitOutOfBounds { unpadded: u64, padded: u64 },
     #[cfg(feature = "local-signer")]
     #[error("invalid private key: {0}")]
     InvalidPrivateKey(#[from] alloy::signers::k256::ecdsa::Error),
@@ -287,9 +295,45 @@ pub enum EvmError {
         required_block: u64,
         attempts: u32,
     },
+    /// A send's first attempt failed while filling or signing (for example
+    /// an `eth_estimateGas` revert), so no `eth_sendRawTransaction` was made
+    /// for that send. Only the first attempt is marked: once a send enters
+    /// nonce or fee recovery, an earlier raw send may have been accepted even
+    /// though the client saw an error. Every classifier answers for `source`.
+    #[error("rejected before broadcast: {source}")]
+    RejectedBeforeBroadcast {
+        #[source]
+        source: Box<Self>,
+    },
 }
 
 impl EvmError {
+    /// `true` when this send provably made no `eth_sendRawTransaction`: see
+    /// [`Self::RejectedBeforeBroadcast`].
+    pub fn was_never_broadcast(&self) -> bool {
+        matches!(self, Self::RejectedBeforeBroadcast { .. })
+    }
+
+    /// The error with any [`Self::RejectedBeforeBroadcast`] marker removed,
+    /// for callers that inspect the error's shape.
+    pub fn underlying(&self) -> &Self {
+        match self {
+            Self::RejectedBeforeBroadcast { source } => source.underlying(),
+            other => other,
+        }
+    }
+
+    /// Drops the [`Self::RejectedBeforeBroadcast`] marker. Nonce and fee
+    /// recovery use it, because a raw send before theirs may have been
+    /// accepted.
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    pub(crate) fn into_underlying(self) -> Self {
+        match self {
+            Self::RejectedBeforeBroadcast { source } => source.into_underlying(),
+            other => other,
+        }
+    }
+
     /// `true` if this error represents an EVM transaction revert (as opposed
     /// to a transport failure or other non-revert error).
     ///
@@ -335,18 +379,22 @@ impl EvmError {
             Self::ReplacementFeeOverflow => false,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::GasLimitOverflow { .. } => false,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::PinnedGasLimitOutOfBounds { .. } => false,
             #[cfg(feature = "local-signer")]
             Self::InvalidPrivateKey(_) => false,
             #[cfg(feature = "turnkey")]
             Self::Turnkey(_) => false,
             Self::NodeBehindRequiredBlock { .. } => false,
+            Self::RejectedBeforeBroadcast { source } => source.is_revert(),
         }
     }
 
-    /// `true` if this reports a transaction dropped from the mempool (it will
-    /// never mine) -- a terminal failure, distinct from a still-pending tx that
-    /// merely has not confirmed yet. Only the wallet builds (`turnkey` /
-    /// `local-signer`), which run the confirm loop, can produce it.
+    /// `true` when qualified absence meets the wallet's suspected-drop policy.
+    /// This is distinct from an inconclusive receipt timeout, but does not prove
+    /// the transaction can never mine. Durable recovery must not infer permission
+    /// to resubmit a different transaction from this verdict alone. Only wallet
+    /// builds (`turnkey` / `local-signer`) run the confirm loop that produces it.
     pub fn is_transaction_dropped(&self) -> bool {
         match self {
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
@@ -371,11 +419,14 @@ impl EvmError {
             Self::ReplacementFeeOverflow => false,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::GasLimitOverflow { .. } => false,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::PinnedGasLimitOutOfBounds { .. } => false,
             #[cfg(feature = "local-signer")]
             Self::InvalidPrivateKey(_) => false,
             #[cfg(feature = "turnkey")]
             Self::Turnkey(_) => false,
             Self::NodeBehindRequiredBlock { .. } => false,
+            Self::RejectedBeforeBroadcast { source } => source.is_transaction_dropped(),
         }
     }
 
@@ -412,10 +463,13 @@ impl EvmError {
             Self::ReplacementFeeOverflow => false,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::GasLimitOverflow { .. } => false,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::PinnedGasLimitOutOfBounds { .. } => false,
             #[cfg(feature = "local-signer")]
             Self::InvalidPrivateKey(_) => false,
             #[cfg(feature = "turnkey")]
             Self::Turnkey(_) => false,
+            Self::RejectedBeforeBroadcast { source } => source.is_confirmation_pending(),
         }
     }
 
@@ -461,10 +515,13 @@ impl EvmError {
             Self::ReplacementFeeOverflow => None,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::GasLimitOverflow { .. } => None,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::PinnedGasLimitOutOfBounds { .. } => None,
             #[cfg(feature = "local-signer")]
             Self::InvalidPrivateKey(_) => None,
             #[cfg(feature = "turnkey")]
             Self::Turnkey(_) => None,
+            Self::RejectedBeforeBroadcast { source } => source.revert_data(),
         }
     }
 }
@@ -487,7 +544,7 @@ impl EvmError {
     /// and what does its payload say) come from one traversal.
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     fn nonce_too_low_payload(&self) -> Option<&alloy::rpc::json_rpc::ErrorPayload> {
-        let Self::Transport(rpc_error) = self else {
+        let Self::Transport(rpc_error) = self.underlying() else {
             return None;
         };
 
@@ -555,7 +612,7 @@ impl EvmError {
 
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     fn already_known_payload(&self) -> Option<&alloy::rpc::json_rpc::ErrorPayload> {
-        let Self::Transport(rpc_error) = self else {
+        let Self::Transport(rpc_error) = self.underlying() else {
             return None;
         };
 
@@ -580,7 +637,7 @@ impl EvmError {
     /// needlessly replace an already-accepted transaction.
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     pub(crate) fn is_replacement_underpriced(&self) -> bool {
-        match self {
+        match self.underlying() {
             Self::Transport(rpc_error) => rpc_error.as_error_resp().is_some_and(|payload| {
                 payload
                     .message
@@ -730,6 +787,80 @@ impl PreparedTransaction {
     pub fn raw(&self) -> &Bytes {
         &self.raw
     }
+
+    /// The account that signed these bytes, or `None` when they are not a
+    /// signed envelope a signer can be recovered from.
+    pub fn signer(&self) -> Option<Address> {
+        TxEnvelope::decode_2718_exact(self.raw.as_ref())
+            .ok()?
+            .recover_signer()
+            .ok()
+    }
+
+    /// Whether `wallet` signed these bytes. Nonce bookkeeping is per address,
+    /// so bytes another key signed (a rotated wallet) must never enter
+    /// `wallet`'s; bytes no signer can be recovered from are not `wallet`'s
+    /// either.
+    pub fn signed_by(&self, wallet: Address) -> bool {
+        // Test doubles carry no signed envelope; they stand for the wallet's own.
+        #[cfg(any(test, feature = "test-support"))]
+        if self.raw.is_empty() {
+            return true;
+        }
+
+        self.signer() == Some(wallet)
+    }
+
+    /// The address these bytes call, or `None` when they are not a signed
+    /// envelope or create a contract.
+    pub fn to(&self) -> Option<Address> {
+        TxEnvelope::decode_2718_exact(self.raw.as_ref()).ok()?.to()
+    }
+
+    /// The max fee and max priority fee per gas these bytes were signed with,
+    /// in wei, or `None` when they are not a signed EIP-1559 envelope.
+    pub fn fees_per_gas(&self) -> Option<(u128, u128)> {
+        let envelope = TxEnvelope::decode_2718_exact(self.raw.as_ref()).ok()?;
+        Some((
+            envelope.max_fee_per_gas(),
+            envelope.max_priority_fee_per_gas()?,
+        ))
+    }
+
+    /// Whether these bytes are a fee replacement of `original`: another
+    /// signed transaction at the same nonce, with the same chain, recipient,
+    /// value and calldata, so at most one of the two can mine.
+    pub fn replaces(&self, original: &Self) -> bool {
+        if self.tx_hash == original.tx_hash || self.nonce != original.nonce {
+            return false;
+        }
+        // Test doubles carry no signed envelope; only the nonce identifies them.
+        #[cfg(any(test, feature = "test-support"))]
+        if self.raw.is_empty() && original.raw.is_empty() {
+            return true;
+        }
+
+        let decode = |prepared: &Self| TxEnvelope::decode_2718_exact(prepared.raw.as_ref()).ok();
+        let (Some(replacement), Some(original)) = (decode(self), decode(original)) else {
+            return false;
+        };
+        replacement.chain_id() == original.chain_id()
+            && replacement.to() == original.to()
+            && replacement.value() == original.value()
+            && replacement.input() == original.input()
+            && replacement.recover_signer().ok() == original.recover_signer().ok()
+    }
+
+    /// The calldata these bytes carry, or `None` when they are not a signed
+    /// envelope.
+    pub fn input(&self) -> Option<Bytes> {
+        Some(
+            TxEnvelope::decode_2718_exact(self.raw.as_ref())
+                .ok()?
+                .input()
+                .clone(),
+        )
+    }
 }
 
 impl<'de> Deserialize<'de> for PreparedTransaction {
@@ -771,6 +902,42 @@ impl<'de> Deserialize<'de> for PreparedTransaction {
     }
 }
 
+/// Ownership and submission-boundary evidence used to qualify an absent hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransactionSubmission {
+    pub sender: Address,
+    pub nonce: u64,
+    pub submitted_after_block: Option<u64>,
+}
+
+/// Qualify absence against canonical state, never independent `latest` reads.
+/// A consumed nonce may hide a mined transaction on another RPC backend.
+pub async fn qualified_absence_head(
+    provider: &impl Provider,
+    submission: TransactionSubmission,
+    head_margin: u64,
+) -> Result<Option<u64>, EvmError> {
+    let Some(floor) = submission.submitted_after_block else {
+        warn!(sender = %submission.sender, nonce = submission.nonce, "No submission block evidence; transaction absence is inconclusive");
+        return Ok(None);
+    };
+    let Some(head) = provider
+        .get_block_by_number(BlockNumberOrTag::Latest)
+        .await?
+    else {
+        warn!(sender = %submission.sender, nonce = submission.nonce, "Latest canonical head unavailable; transaction absence is inconclusive");
+        return Ok(None);
+    };
+    if head.header.number.saturating_sub(floor) < head_margin || head.header.number <= floor {
+        return Ok(None);
+    }
+    let nonce = provider
+        .get_transaction_count(submission.sender)
+        .block_id(BlockId::hash_canonical(head.header.hash))
+        .await?;
+    Ok((nonce <= submission.nonce).then_some(head.header.number))
+}
+
 /// Signing wallet on an EVM chain.
 ///
 /// Extends [`Evm`] with a wallet identity (address) and transaction
@@ -789,6 +956,12 @@ impl<'de> Deserialize<'de> for PreparedTransaction {
 pub trait Wallet: Evm {
     /// Returns the address this wallet signs transactions from.
     fn address(&self) -> Address;
+
+    /// Locally proven sender/nonce ownership. Restored transactions may lack
+    /// the original submission boundary and cannot independently prove a drop.
+    fn transaction_submission(&self, _tx_hash: TxHash) -> Option<TransactionSubmission> {
+        None
+    }
 
     /// Signs an EIP-712 typed-data payload with this wallet's key.
     ///
@@ -823,6 +996,22 @@ pub trait Wallet: Evm {
         note: &str,
     ) -> Result<PreparedTransaction, EvmError>;
 
+    /// [`prepare_pending`](Self::prepare_pending) with a caller-supplied gas limit in place of
+    /// `eth_estimateGas`. The signed limit is the padded value, never `unpadded_gas_limit` itself.
+    ///
+    /// For the second of a dependent pair (a deposit behind its unmined approve), whose estimate
+    /// would revert until the first transaction mines.
+    ///
+    /// Discard such a pair second-then-first, never the first alone while the second is held:
+    /// discarding the first rewinds the nonce cache under the held second.
+    async fn prepare_pending_with_gas_limit(
+        &self,
+        contract: Address,
+        calldata: Bytes,
+        unpadded_gas_limit: u64,
+        note: &str,
+    ) -> Result<PreparedTransaction, EvmError>;
+
     /// Broadcast a previously prepared transaction.
     ///
     /// Repeated calls are idempotent because they submit the exact same signed
@@ -832,6 +1021,18 @@ pub trait Wallet: Evm {
         prepared: &PreparedTransaction,
         note: &str,
     ) -> Result<TxHash, EvmError>;
+    /// Re-signs `prepared` at its own nonce with higher fees when the
+    /// network's fee estimate has risen above the max fee it was signed with,
+    /// so a send the market priced out can still mine. `None` while the
+    /// market is at or below that fee. The replacement carries the same call,
+    /// so at most one of the two mines. It is only signed: persist it before
+    /// [`broadcast_prepared`](Self::broadcast_prepared), which records it at
+    /// the reserved nonce.
+    async fn prepare_fee_replacement(
+        &self,
+        prepared: &PreparedTransaction,
+    ) -> Result<Option<PreparedTransaction>, EvmError>;
+
     /// Releases the wallet nonce reservation held for a prepared transaction
     /// that will never be broadcast (a persist-failure rollback), and rewinds
     /// allocation so its unused nonce is refilled first. Ownership-checked and
@@ -841,8 +1042,9 @@ pub trait Wallet: Evm {
     /// Releases the wallet nonce reservation held for a prepared transaction
     /// after another transaction from this wallet mined at its nonce. Unlike
     /// [`discard_prepared`](Self::discard_prepared) it leaves allocation
-    /// untouched, because the chain has already used the nonce.
-    /// Ownership-checked and idempotent.
+    /// untouched, because the chain has already used the nonce, and it drops
+    /// every hash recorded at that nonce, including fee replacements, since
+    /// none of them can mine any more. Ownership-checked and idempotent.
     async fn release_superseded(&self, tx_hash: TxHash);
 
     /// Restores allocator and ownership state for an exact transaction loaded
@@ -1056,6 +1258,10 @@ impl<Inner: Wallet + ?Sized> Wallet for Arc<Inner> {
         (**self).address()
     }
 
+    fn transaction_submission(&self, tx_hash: TxHash) -> Option<TransactionSubmission> {
+        (**self).transaction_submission(tx_hash)
+    }
+
     async fn sign_typed_data(
         &self,
         payload_json: String,
@@ -1084,6 +1290,18 @@ impl<Inner: Wallet + ?Sized> Wallet for Arc<Inner> {
         (**self).prepare_pending(contract, calldata, note).await
     }
 
+    async fn prepare_pending_with_gas_limit(
+        &self,
+        contract: Address,
+        calldata: Bytes,
+        unpadded_gas_limit: u64,
+        note: &str,
+    ) -> Result<PreparedTransaction, EvmError> {
+        (**self)
+            .prepare_pending_with_gas_limit(contract, calldata, unpadded_gas_limit, note)
+            .await
+    }
+
     async fn broadcast_prepared(
         &self,
         prepared: &PreparedTransaction,
@@ -1094,6 +1312,13 @@ impl<Inner: Wallet + ?Sized> Wallet for Arc<Inner> {
 
     async fn discard_prepared(&self, tx_hash: TxHash) {
         (**self).discard_prepared(tx_hash).await;
+    }
+
+    async fn prepare_fee_replacement(
+        &self,
+        prepared: &PreparedTransaction,
+    ) -> Result<Option<PreparedTransaction>, EvmError> {
+        (**self).prepare_fee_replacement(prepared).await
     }
 
     async fn release_superseded(&self, tx_hash: TxHash) {
@@ -1284,12 +1509,23 @@ const CONFIRMATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 #[cfg(any(feature = "turnkey", feature = "local-signer"))]
 const DROPPED_TX_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Consecutive `get_transaction_by_hash == None` observations (after the grace
-/// period) required before concluding the tx was dropped. Any sighting —
-/// pending or mined — resets the count. Debounces the load-balanced-RPC race
+/// Consecutive `get_transaction_by_hash == None` observations after grace and
+/// the required head advance before concluding the tx was dropped. Any sighting,
+/// pending or mined, resets the count. Debounces the load-balanced-RPC race
 /// where a single lagging node transiently reports a live tx as absent.
 #[cfg(any(feature = "turnkey", feature = "local-signer"))]
 const DROPPED_TX_CONSECUTIVE_MISSES: u32 = 3;
+
+/// Blocks the answering node's head must advance past the head observed at the
+/// first post-grace absence before a drop verdict is trusted. A lagging
+/// load-balanced backend returns `None` for a tx that actually mined — a
+/// synced node never does -- so misses need canonical nonce evidence beyond
+/// the known submission boundary, as well as head progress. A node
+/// whose head is frozen (fully stalled backend) therefore never concludes
+/// `Dropped`; the wait ends in the retryable inclusion timeout instead.
+/// Mirrors the CCTP bridge's `SCAN_FINALITY_MARGIN` discipline.
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+const DROPPED_TX_HEAD_ADVANCE: u64 = 2;
 
 /// Consecutive transport errors (with no successful poll in between) tolerated
 /// while polling before giving up. A transient blip on a load-balanced RPC
@@ -1300,11 +1536,13 @@ const DROPPED_TX_CONSECUTIVE_MISSES: u32 = 3;
 #[cfg(any(feature = "turnkey", feature = "local-signer"))]
 const MAX_CONSECUTIVE_TRANSPORT_ERRORS: u32 = 5;
 
-/// Tuning parameters for [`wait_for_receipt_with_config`]. Bundled into a struct
+/// Tuning parameters for [`wait_for_receipt`]. Bundled into a struct
 /// so the wait function keeps a small argument list as knobs are added.
 #[cfg(any(feature = "turnkey", feature = "local-signer"))]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ReceiptWaitConfig {
+    #[cfg(test)]
+    pub(crate) submission: Option<TransactionSubmission>,
     /// Interval between receipt polls.
     pub(crate) poll_interval: std::time::Duration,
     /// Max time to wait for the tx to be included in a block.
@@ -1313,8 +1551,11 @@ pub(crate) struct ReceiptWaitConfig {
     pub(crate) confirmation_timeout: std::time::Duration,
     /// Grace period before the dropped-from-mempool check may fire.
     pub(crate) dropped_grace: std::time::Duration,
-    /// Consecutive mempool-absence observations required to conclude a drop.
+    /// Consecutive head-qualified mempool absences required to conclude a drop.
     pub(crate) dropped_consecutive_misses: u32,
+    /// Head advance (blocks, from the first post-grace absence) the answering
+    /// node must show before its absences are trusted as a drop verdict.
+    pub(crate) dropped_head_advance: u64,
 }
 
 #[cfg(any(feature = "turnkey", feature = "local-signer"))]
@@ -1323,13 +1564,89 @@ impl ReceiptWaitConfig {
     /// load-balanced RPC.
     const fn mainnet_defaults() -> Self {
         Self {
+            #[cfg(test)]
+            submission: None,
             poll_interval: RECEIPT_POLL_INTERVAL,
             inclusion_timeout: RECEIPT_TIMEOUT,
             confirmation_timeout: CONFIRMATION_TIMEOUT,
             dropped_grace: DROPPED_TX_GRACE,
             dropped_consecutive_misses: DROPPED_TX_CONSECUTIVE_MISSES,
+            dropped_head_advance: DROPPED_TX_HEAD_ADVANCE,
         }
     }
+}
+
+/// A mined transaction as the node reports it.
+///
+/// Who sent it, what it called, with what value and calldata, at which nonce,
+/// whether it succeeded and emitted logs, and how deep it is (the inclusion
+/// block counts as confirmation 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MinedTx {
+    pub from: Address,
+    /// `None` for a contract creation.
+    pub to: Option<Address>,
+    pub nonce: u64,
+    pub value: U256,
+    /// Its calldata (initcode, for a contract creation).
+    pub input: Bytes,
+    /// The EIP-2718 type byte. `EIP7702_TX_TYPE_ID` sets code on accounts.
+    pub tx_type: u8,
+    /// `false` when it reverted. A reverted tx still used its nonce.
+    pub succeeded: bool,
+    /// Whether its receipt holds any log. A reverted frame drops its logs, so
+    /// every log here is from code that ran to completion.
+    pub emitted_logs: bool,
+    pub confirmations: u64,
+}
+
+/// Returns `tx_hash` as mined, or `None` while the node shows no canonical
+/// receipt for it.
+///
+/// `None` also covers no transaction for the hash, or a receipt whose block is
+/// not the canonical block at its height. Does not wait. Every failure is a
+/// provider RPC read, so it returns the raw transport error for callers to wrap
+/// in their own variant.
+pub async fn mined_tx(
+    provider: &impl Provider,
+    tx_hash: TxHash,
+) -> alloy::transports::TransportResult<Option<MinedTx>> {
+    let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? else {
+        return Ok(None);
+    };
+
+    let (Some(tx_block), Some(receipt_block_hash)) = (receipt.block_number, receipt.block_hash)
+    else {
+        return Ok(None);
+    };
+
+    // Reads are not pinned to one node (a load-balanced RPC offers no way to),
+    // so a lagging node can serve a receipt from a reorged-out block while the
+    // head comes from another. Read the head first, then count confirmations
+    // only if the receipt's block is still canonical after it.
+    let head = provider.get_block_number().await?;
+
+    let canonical = provider.get_block_by_number(tx_block.into()).await?;
+    if canonical.is_none_or(|block| block.header.hash != receipt_block_hash) {
+        warn!(target: "wallet", %tx_hash, tx_block, %receipt_block_hash, "Receipt block is not the canonical block at its height; treating the tx as not mined");
+        return Ok(None);
+    }
+
+    let Some(tx) = provider.get_transaction_by_hash(tx_hash).await? else {
+        return Ok(None);
+    };
+
+    Ok(Some(MinedTx {
+        from: receipt.from,
+        to: tx.to(),
+        nonce: tx.nonce(),
+        value: tx.value(),
+        input: tx.input().clone(),
+        tx_type: tx.ty(),
+        succeeded: receipt.status(),
+        emitted_logs: !receipt.inner.logs().is_empty(),
+        confirmations: head.saturating_sub(tx_block).saturating_add(1),
+    }))
 }
 
 /// Polls for a transaction receipt with confirmation depth, bypassing alloy's
@@ -1345,23 +1662,39 @@ pub(crate) async fn wait_for_receipt(
     provider: &impl Provider,
     tx_hash: alloy::primitives::TxHash,
     required_confirmations: u64,
+    submission: impl Fn() -> Option<TransactionSubmission> + Sync,
 ) -> Result<TransactionReceipt, EvmError> {
-    wait_for_receipt_with_config(
+    wait_for_receipt_with_submission(
         provider,
         tx_hash,
         required_confirmations,
         ReceiptWaitConfig::mainnet_defaults(),
+        submission,
     )
     .await
 }
 
 /// Parameterized version of [`wait_for_receipt`] for testability.
-#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+#[cfg(all(test, any(feature = "turnkey", feature = "local-signer")))]
 pub(crate) async fn wait_for_receipt_with_config(
     provider: &impl Provider,
     tx_hash: alloy::primitives::TxHash,
     required_confirmations: u64,
     config: ReceiptWaitConfig,
+) -> Result<TransactionReceipt, EvmError> {
+    wait_for_receipt_with_submission(provider, tx_hash, required_confirmations, config, || {
+        config.submission
+    })
+    .await
+}
+
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+async fn wait_for_receipt_with_submission(
+    provider: &impl Provider,
+    tx_hash: TxHash,
+    required_confirmations: u64,
+    config: ReceiptWaitConfig,
+    submission: impl Fn() -> Option<TransactionSubmission> + Sync,
 ) -> Result<TransactionReceipt, EvmError> {
     let mut poll = interval(config.poll_interval);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1375,8 +1708,12 @@ pub(crate) async fn wait_for_receipt_with_config(
         // RPC (the lookup may hit a lagging node that has not seen a recent tx),
         // so we require several in a row — and only after a grace period —
         // before concluding the tx was dropped.
-        let mut consecutive_misses = 0u32;
         let mut consecutive_transport_errors = 0u32;
+        // Head observed at the first post-grace absence: the drop verdict
+        // additionally requires the node's head to advance past this by
+        // `dropped_head_advance`. The account nonce is additionally pinned to
+        // this head's canonical hash, not read independently from latest state.
+        let mut drop_progress = ReceiptDropProgress::default();
 
         loop {
             poll.tick().await;
@@ -1394,6 +1731,7 @@ pub(crate) async fn wait_for_receipt_with_config(
             let maybe_receipt = match provider.get_transaction_receipt(tx_hash).await {
                 Ok(maybe_receipt) => maybe_receipt,
                 Err(transport_error) => {
+                    drop_progress.reset();
                     note_receipt_poll_transport_error(
                         &mut consecutive_transport_errors,
                         transport_error,
@@ -1412,7 +1750,8 @@ pub(crate) async fn wait_for_receipt_with_config(
                     tx_hash,
                     &config,
                     start,
-                    &mut consecutive_misses,
+                    &submission,
+                    &mut drop_progress,
                     &mut consecutive_transport_errors,
                 )
                 .await?;
@@ -1475,17 +1814,45 @@ pub(crate) async fn wait_for_receipt_with_config(
     })?
 }
 
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+#[derive(Default)]
+struct ReceiptDropProgress {
+    consecutive_misses: u32,
+    reference_head: Option<u64>,
+    submission: Option<TransactionSubmission>,
+}
+
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+impl ReceiptDropProgress {
+    fn reset(&mut self) {
+        self.consecutive_misses = 0;
+        self.reference_head = None;
+    }
+
+    fn observe_submission(&mut self, submission: Option<TransactionSubmission>) -> bool {
+        if self.submission == submission {
+            return false;
+        }
+        self.reset();
+        self.submission = submission;
+        true
+    }
+}
+
 /// Classify an inclusion poll whose receipt is absent. Returns `Ok(())` to keep
-/// waiting; returns a terminal `Err` when the tx is confirmed dropped (missing
+/// waiting; returns a terminal `Err` when the suspected-drop policy qualifies (missing
 /// from the receipt lookup and the mempool past the grace period for
-/// `dropped_consecutive_misses` polls) or the RPC is down past the transport cap.
+/// `dropped_consecutive_misses` polls, observed by a node whose head advanced
+/// `dropped_head_advance` blocks past the first post-grace absence) or the RPC
+/// is down past the transport cap.
 #[cfg(any(feature = "turnkey", feature = "local-signer"))]
 async fn classify_pending_receipt(
     provider: &impl Provider,
     tx_hash: alloy::primitives::TxHash,
     config: &ReceiptWaitConfig,
     start: std::time::Instant,
-    consecutive_misses: &mut u32,
+    submission_source: &(impl Fn() -> Option<TransactionSubmission> + Sync),
+    drop_progress: &mut ReceiptDropProgress,
     consecutive_transport_errors: &mut u32,
 ) -> Result<(), EvmError> {
     // Before the grace period a missing tx is almost certainly still propagating
@@ -1499,10 +1866,7 @@ async fn classify_pending_receipt(
     // A transport error here is not a confirmed absence; retry rather than
     // counting it toward the drop threshold.
     let mempool_tx = match provider.get_transaction_by_hash(tx_hash).await {
-        Ok(mempool_tx) => {
-            *consecutive_transport_errors = 0;
-            mempool_tx
-        }
+        Ok(mempool_tx) => mempool_tx,
         Err(transport_error) => {
             // A transport error is not a confirmed absence, so it breaks the run
             // of consecutive confirmed absences the drop threshold relies on.
@@ -1510,7 +1874,7 @@ async fn classify_pending_receipt(
             // (absent, transport error, absent, absent) could accumulate to the
             // threshold and falsely declare a live-but-lagging tx dropped,
             // prompting a resubmit of a transaction that is still in flight.
-            *consecutive_misses = 0;
+            drop_progress.reset();
             note_receipt_poll_transport_error(
                 consecutive_transport_errors,
                 transport_error,
@@ -1522,14 +1886,67 @@ async fn classify_pending_receipt(
 
     // Still in the mempool: not dropped, so reset the miss run.
     if mempool_tx.is_some() {
-        *consecutive_misses = 0;
+        drop_progress.reset();
+        *consecutive_transport_errors = 0;
         return Ok(());
     }
 
-    // Absent from both the receipt lookup and the mempool past the grace period.
-    *consecutive_misses += 1;
+    // Absent from both the receipt lookup and the mempool past the grace
+    // period. Independent latest-head reads cannot authenticate the missing
+    // receipt: a different backend may hide a mined transaction. Require its
+    // known nonce to remain unused at this canonical head beyond submission.
+    let live_submission = submission_source();
+    drop_progress.observe_submission(live_submission);
+    let Some(submission) = live_submission else {
+        warn!(%tx_hash, "No transaction submission identity; absence cannot qualify as dropped");
+        drop_progress.reset();
+        *consecutive_transport_errors = 0;
+        return Ok(());
+    };
+    let canonical_state =
+        qualified_absence_head(provider, submission, config.dropped_head_advance).await;
+    if drop_progress.observe_submission(submission_source()) {
+        warn!(%tx_hash, "Submission evidence changed during canonical lookup; discarding absence progress");
+        *consecutive_transport_errors = 0;
+        return Ok(());
+    }
+    let head = match canonical_state {
+        Ok(Some(head)) => {
+            *consecutive_transport_errors = 0;
+            head
+        }
+        Ok(None) => {
+            drop_progress.reset();
+            *consecutive_transport_errors = 0;
+            return Ok(());
+        }
+        Err(EvmError::Transport(transport_error)) => {
+            // Unavailable canonical state is not a confirmed absence. A
+            // backend rejecting the pinned hash is reachable, not a transport
+            // outage; retry without exhausting the outage cap or using latest.
+            drop_progress.reset();
+            if is_transient_rpc(&transport_error) {
+                note_receipt_poll_transport_error(
+                    consecutive_transport_errors,
+                    transport_error,
+                    "checking canonical state for drop verdict",
+                )?;
+            } else {
+                *consecutive_transport_errors = 0;
+                warn!(%tx_hash, ?transport_error, "Canonical state unavailable; transaction absence is inconclusive");
+            }
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
 
-    if *consecutive_misses >= config.dropped_consecutive_misses {
+    let reference = *drop_progress.reference_head.get_or_insert(head);
+    if head.saturating_sub(reference) < config.dropped_head_advance {
+        drop_progress.consecutive_misses = 0;
+        return Ok(());
+    }
+    drop_progress.consecutive_misses += 1;
+    if drop_progress.consecutive_misses >= config.dropped_consecutive_misses {
         return Err(EvmError::TransactionDropped {
             tx_hash,
             elapsed_secs: start.elapsed().as_secs(),
@@ -1598,23 +2015,45 @@ mod tests {
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     use alloy::consensus::{Receipt, ReceiptEnvelope, ReceiptWithBloom};
     use alloy::consensus::{SignableTransaction, TxEip1559};
-    use alloy::eips::eip2718::Encodable2718;
+    use alloy::eips::eip2718::{EIP1559_TX_TYPE_ID, Encodable2718};
     use alloy::eips::eip2930::AccessList;
-    use alloy::network::EthereumWallet;
+    use alloy::network::{EthereumWallet, TransactionBuilder};
     use alloy::node_bindings::{Anvil, AnvilInstance};
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     use alloy::primitives::Bloom;
-    use alloy::primitives::{Address, TxKind, U256};
+    use alloy::primitives::{Address, TxKind, U256, hex};
     use alloy::providers::ProviderBuilder;
+    use alloy::providers::ext::AnvilApi as _;
     use alloy::providers::mock::Asserter;
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     use alloy::rpc::types::TransactionReceipt;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol;
     use std::sync::Arc;
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     const PREPARED_NONCE: u64 = 7;
+
+    fn submission_at(block: u64) -> TransactionSubmission {
+        TransactionSubmission {
+            sender: Address::ZERO,
+            nonce: 0,
+            submitted_after_block: Some(block),
+        }
+    }
+
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    fn push_absence(asserter: &Asserter, head: u64, nonce: u64) {
+        asserter.push_success(&serde_json::Value::Null);
+        asserter.push_success(&serde_json::Value::Null);
+        let mut block: alloy::rpc::types::Block = alloy::rpc::types::Block::default();
+        block.header.number = head;
+        block.header.hash = alloy::primitives::BlockHash::random();
+        asserter.push_success(&block);
+        asserter.push_success(&nonce);
+    }
 
     fn signed_transaction_bytes() -> Bytes {
         let transaction = TxEip1559 {
@@ -1648,6 +2087,37 @@ mod tests {
         assert!(
             EvmError::Transport(TransportErrorKind::backend_gone()).is_confirmation_pending(),
             "a transport failure may recover once a backend becomes visible"
+        );
+    }
+
+    #[test]
+    fn rejected_before_broadcast_classifies_as_its_source() {
+        use alloy::rpc::json_rpc::ErrorPayload;
+        use alloy::transports::{RpcError, TransportErrorKind};
+
+        let revert = || {
+            EvmError::Transport(RpcError::ErrorResp(ErrorPayload {
+                code: 3,
+                message: "execution reverted".into(),
+                data: Some(serde_json::value::to_raw_value("0xdeadbeef").unwrap()),
+            }))
+        };
+        let marked = EvmError::RejectedBeforeBroadcast {
+            source: Box::new(revert()),
+        };
+
+        assert!(marked.was_never_broadcast());
+        assert!(!revert().was_never_broadcast());
+        assert!(marked.is_revert());
+        assert_eq!(marked.revert_data(), revert().revert_data());
+        assert!(matches!(marked.underlying(), EvmError::Transport(_)));
+        assert!(!marked.is_transaction_dropped());
+        assert!(!marked.is_confirmation_pending());
+        assert!(
+            EvmError::RejectedBeforeBroadcast {
+                source: Box::new(EvmError::Transport(TransportErrorKind::backend_gone())),
+            }
+            .is_confirmation_pending()
         );
     }
 
@@ -2021,58 +2491,170 @@ mod tests {
     }
 
     #[cfg(feature = "turnkey")]
+    const VALID_TURNKEY_ORGANIZATION_ID: &str = "a4d3f3c8-7d52-4d8b-91e1-6f79a02d0bce";
+
+    #[cfg(feature = "turnkey")]
+    fn parse_only_provider() -> impl Provider + Clone {
+        let asserter = Asserter::new();
+
+        ProviderBuilder::new().connect_mocked_client(asserter)
+    }
+
+    #[cfg(feature = "turnkey")]
+    fn wallet_config_parse_message(error: EvmError) -> String {
+        let EvmError::WalletConfigParse(source) = error else {
+            panic!("expected WalletConfigParse error, got: {error:?}");
+        };
+
+        source.to_string()
+    }
+
+    #[cfg(feature = "turnkey")]
     #[tokio::test]
     async fn wallet_kind_turnkey_settings_parse_error() {
-        let anvil = Anvil::new().spawn();
-        let provider = ProviderBuilder::new()
-            .disable_recommended_fillers()
-            .connect_http(anvil.endpoint_url());
-
         let ctx = WalletCtx {
             settings: MaybeParser(None),
             credentials: MaybeParser(Some(serde_json::json!({}))),
-            provider,
+            provider: parse_only_provider(),
             required_confirmations: 1,
         };
 
         let result = WalletKind::Turnkey.try_into_wallet(ctx).await;
         let Err(error) = result else {
-            panic!("expected WalletConfigParse error from settings parse, got Ok");
+            panic!("expected Turnkey wallet config parsing to fail");
         };
+        let message = wallet_config_parse_message(error);
 
-        assert!(
-            matches!(error, EvmError::WalletConfigParse(_)),
-            "expected WalletConfigParse error from settings parse, got: {error:?}"
-        );
+        assert_eq!(message, "intentional test parse failure");
     }
 
     #[cfg(feature = "turnkey")]
     #[tokio::test]
     async fn wallet_kind_turnkey_credentials_parse_error() {
-        let anvil = Anvil::new().spawn();
-        let provider = ProviderBuilder::new()
-            .disable_recommended_fillers()
-            .connect_http(anvil.endpoint_url());
-
         let ctx = WalletCtx {
             settings: MaybeParser(Some(serde_json::json!({
                 "address": format!("{}", Address::random()),
-                "organization_id": "org-test-123"
+                "organization_id": VALID_TURNKEY_ORGANIZATION_ID
             }))),
             credentials: MaybeParser(None),
-            provider,
+            provider: parse_only_provider(),
             required_confirmations: 1,
         };
 
         let result = WalletKind::Turnkey.try_into_wallet(ctx).await;
         let Err(error) = result else {
-            panic!("expected WalletConfigParse error from credentials parse, got Ok");
+            panic!("expected Turnkey wallet config parsing to fail");
+        };
+        let message = wallet_config_parse_message(error);
+
+        assert_eq!(message, "intentional test parse failure");
+    }
+
+    #[cfg(feature = "turnkey")]
+    #[tokio::test]
+    async fn wallet_kind_turnkey_rejects_blank_organization_id_during_parse() {
+        let ctx = WalletCtx {
+            settings: MaybeParser(Some(serde_json::json!({
+                "address": format!("{}", Address::random()),
+                "organization_id": "   "
+            }))),
+            credentials: MaybeParser(Some(serde_json::json!({
+                "api_private_key":
+                    "0000000000000000000000000000000000000000000000000000000000000001"
+            }))),
+            provider: parse_only_provider(),
+            required_confirmations: 1,
         };
 
-        assert!(
-            matches!(error, EvmError::WalletConfigParse(_)),
-            "expected WalletConfigParse error from credentials parse, got: {error:?}"
-        );
+        let result = WalletKind::Turnkey.try_into_wallet(ctx).await;
+        let Err(error) = result else {
+            panic!("expected Turnkey wallet config parsing to fail");
+        };
+        let message = wallet_config_parse_message(error);
+
+        assert_eq!(message, "Turnkey organization ID must not be empty");
+    }
+
+    #[cfg(feature = "turnkey")]
+    #[tokio::test]
+    async fn wallet_kind_turnkey_rejects_non_uuid_organization_id_during_parse() {
+        let ctx = WalletCtx {
+            settings: MaybeParser(Some(serde_json::json!({
+                "address": format!("{}", Address::random()),
+                "organization_id": "org-test-123"
+            }))),
+            credentials: MaybeParser(Some(serde_json::json!({
+                "api_private_key":
+                    "0000000000000000000000000000000000000000000000000000000000000001"
+            }))),
+            provider: parse_only_provider(),
+            required_confirmations: 1,
+        };
+
+        let result = WalletKind::Turnkey.try_into_wallet(ctx).await;
+        let Err(error) = result else {
+            panic!("expected Turnkey wallet config parsing to fail");
+        };
+        let message = wallet_config_parse_message(error);
+
+        assert_eq!(message, "Turnkey organization ID must be a UUID");
+    }
+
+    #[cfg(feature = "turnkey")]
+    #[tokio::test]
+    async fn wallet_kind_turnkey_rejects_invalid_api_key_during_parse() {
+        let ctx = WalletCtx {
+            settings: MaybeParser(Some(serde_json::json!({
+                "address": format!("{}", Address::random()),
+                "organization_id": VALID_TURNKEY_ORGANIZATION_ID
+            }))),
+            credentials: MaybeParser(Some(serde_json::json!({
+                "api_private_key": "not-a-p256-private-key"
+            }))),
+            provider: parse_only_provider(),
+            required_confirmations: 1,
+        };
+
+        let result = WalletKind::Turnkey.try_into_wallet(ctx).await;
+        let Err(error) = result else {
+            panic!("expected Turnkey wallet config parsing to fail");
+        };
+        let message = wallet_config_parse_message(error);
+
+        assert_eq!(message, "Turnkey API private key must be valid hexadecimal");
+    }
+
+    #[cfg(feature = "turnkey")]
+    #[tokio::test]
+    async fn wallet_kind_turnkey_rejects_wrong_length_api_keys_during_parse() {
+        for (api_private_key, expected_length) in [
+            (String::new(), 0),
+            ("deadbeef".to_string(), 4),
+            ("00".repeat(31), 31),
+        ] {
+            let ctx = WalletCtx {
+                settings: MaybeParser(Some(serde_json::json!({
+                    "address": format!("{}", Address::random()),
+                    "organization_id": VALID_TURNKEY_ORGANIZATION_ID
+                }))),
+                credentials: MaybeParser(Some(serde_json::json!({
+                    "api_private_key": api_private_key
+                }))),
+                provider: parse_only_provider(),
+                required_confirmations: 1,
+            };
+
+            let result = WalletKind::Turnkey.try_into_wallet(ctx).await;
+            let Err(error) = result else {
+                panic!("expected Turnkey wallet config parsing to fail");
+            };
+            let message = wallet_config_parse_message(error);
+
+            assert_eq!(
+                message,
+                format!("Turnkey API private key must be 32 bytes, got {expected_length}")
+            );
+        }
     }
 
     #[cfg(feature = "local-signer")]
@@ -2094,10 +2676,195 @@ mod tests {
             .disable_recommended_fillers()
             .connect_http(anvil.endpoint_url());
 
-        let receipt = wait_for_receipt(&read_provider, tx_hash, 1).await.unwrap();
+        let receipt = wait_for_receipt(&read_provider, tx_hash, 1, || None)
+            .await
+            .unwrap();
 
         assert_eq!(receipt.transaction_hash, tx_hash);
         assert!(receipt.status());
+    }
+
+    /// PUSH0 PUSH0 REVERT runtime (always reverts); the init code copies the
+    /// 3-byte runtime from bytecode offset 10 into memory and returns it.
+    const ALWAYS_REVERTS_INIT_CODE: [u8; 13] = hex!("0x6003600a5f3960035ff35f5ffd");
+    /// PUSH0 PUSH0 LOG0 STOP runtime (emits one empty log), deployed the same
+    /// way.
+    const EMITS_A_LOG_INIT_CODE: [u8; 14] = hex!("0x6004600a5f3960045ff35f5fa000");
+
+    #[tokio::test]
+    async fn mined_tx_returns_none_for_unknown_hash() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
+
+        let mined = mined_tx(&provider, TxHash::repeat_byte(0xAB))
+            .await
+            .unwrap();
+
+        assert_eq!(mined, None);
+    }
+
+    #[tokio::test]
+    async fn mined_tx_reports_successful_call_and_counts_later_blocks() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .wallet(anvil_signer(&anvil))
+            .connect_http(anvil.endpoint_url());
+        let recipient = Address::repeat_byte(0x42);
+
+        let receipt = provider
+            .send_transaction(
+                TransactionRequest::default()
+                    .to(recipient)
+                    .value(U256::from(1)),
+            )
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+
+        let included = MinedTx {
+            from: anvil.addresses()[0],
+            to: Some(recipient),
+            nonce: 0,
+            value: U256::from(1),
+            input: Bytes::new(),
+            tx_type: EIP1559_TX_TYPE_ID,
+            succeeded: true,
+            emitted_logs: false,
+            confirmations: 1,
+        };
+        assert_eq!(
+            mined_tx(&provider, receipt.transaction_hash).await.unwrap(),
+            Some(included.clone())
+        );
+
+        provider.anvil_mine(Some(2), None).await.unwrap();
+
+        assert_eq!(
+            mined_tx(&provider, receipt.transaction_hash).await.unwrap(),
+            Some(MinedTx {
+                confirmations: 3,
+                ..included
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn mined_tx_reports_contract_creation_without_target() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .wallet(anvil_signer(&anvil))
+            .connect_http(anvil.endpoint_url());
+
+        let receipt = provider
+            .send_transaction(
+                TransactionRequest::default().with_deploy_code(ALWAYS_REVERTS_INIT_CODE),
+            )
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mined_tx(&provider, receipt.transaction_hash).await.unwrap(),
+            Some(MinedTx {
+                from: anvil.addresses()[0],
+                to: None,
+                nonce: 0,
+                value: U256::ZERO,
+                input: Bytes::from_static(&ALWAYS_REVERTS_INIT_CODE),
+                tx_type: EIP1559_TX_TYPE_ID,
+                succeeded: true,
+                emitted_logs: false,
+                confirmations: 1,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn mined_tx_reports_reverted_call_as_not_succeeded() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .wallet(anvil_signer(&anvil))
+            .connect_http(anvil.endpoint_url());
+
+        let reverting = provider
+            .send_transaction(
+                TransactionRequest::default().with_deploy_code(ALWAYS_REVERTS_INIT_CODE),
+            )
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap()
+            .contract_address
+            .unwrap();
+
+        // Explicit gas skips estimation, which would reject a reverting call.
+        let receipt = provider
+            .send_transaction(
+                TransactionRequest::default()
+                    .to(reverting)
+                    .with_gas_limit(100_000),
+            )
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mined_tx(&provider, receipt.transaction_hash).await.unwrap(),
+            Some(MinedTx {
+                from: anvil.addresses()[0],
+                to: Some(reverting),
+                nonce: 1,
+                value: U256::ZERO,
+                input: Bytes::new(),
+                tx_type: EIP1559_TX_TYPE_ID,
+                succeeded: false,
+                emitted_logs: false,
+                confirmations: 1,
+            })
+        );
+    }
+
+    /// A log from a call that ran to completion is in the receipt, so a tx that
+    /// moved tokens through a contract never reads as having emitted none.
+    #[tokio::test]
+    async fn mined_tx_reports_a_call_that_emitted_logs() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .wallet(anvil_signer(&anvil))
+            .connect_http(anvil.endpoint_url());
+        let emitter = provider
+            .send_transaction(TransactionRequest::default().with_deploy_code(EMITS_A_LOG_INIT_CODE))
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap()
+            .contract_address
+            .unwrap();
+
+        let receipt = provider
+            .send_transaction(TransactionRequest::default().to(emitter))
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+
+        let mined = mined_tx(&provider, receipt.transaction_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(mined.succeeded);
+        assert!(mined.emitted_logs);
     }
 
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
@@ -2124,6 +2891,7 @@ mod tests {
             alloy::primitives::B256::random(),
             1,
             ReceiptWaitConfig {
+                submission: None,
                 poll_interval: std::time::Duration::from_millis(1),
                 // Generous, so the consecutive-error cap is what trips, not the
                 // inclusion timeout.
@@ -2131,6 +2899,7 @@ mod tests {
                 confirmation_timeout: std::time::Duration::from_secs(1),
                 dropped_grace: std::time::Duration::from_secs(60),
                 dropped_consecutive_misses: 3,
+                dropped_head_advance: DROPPED_TX_HEAD_ADVANCE,
             },
         )
         .await;
@@ -2169,6 +2938,7 @@ mod tests {
             alloy::primitives::B256::random(),
             1,
             ReceiptWaitConfig {
+                submission: None,
                 poll_interval: std::time::Duration::from_millis(1),
                 inclusion_timeout: std::time::Duration::from_secs(30),
                 confirmation_timeout: std::time::Duration::from_secs(1),
@@ -2176,6 +2946,7 @@ mod tests {
                 dropped_grace: std::time::Duration::ZERO,
                 // High, so the drop check never fires before the transport cap.
                 dropped_consecutive_misses: 100,
+                dropped_head_advance: DROPPED_TX_HEAD_ADVANCE,
             },
         )
         .await;
@@ -2238,12 +3009,14 @@ mod tests {
             // Require depth > 1 so Phase 2 must poll the tip past the receipt block.
             2,
             ReceiptWaitConfig {
+                submission: None,
                 poll_interval: std::time::Duration::from_millis(1),
                 inclusion_timeout: std::time::Duration::from_secs(1),
                 // Generous, so the cap trips, not the confirmation timeout.
                 confirmation_timeout: std::time::Duration::from_secs(30),
                 dropped_grace: std::time::Duration::from_secs(60),
                 dropped_consecutive_misses: 3,
+                dropped_head_advance: DROPPED_TX_HEAD_ADVANCE,
             },
         )
         .await;
@@ -2292,6 +3065,7 @@ mod tests {
             tx_hash,
             1,
             ReceiptWaitConfig {
+                submission: None,
                 poll_interval: std::time::Duration::from_millis(1),
                 // Generous, so the wait does not time out before the receipt lands.
                 inclusion_timeout: std::time::Duration::from_secs(30),
@@ -2299,6 +3073,7 @@ mod tests {
                 // Large, so the Ok(None) poll stays in the before-grace reset path.
                 dropped_grace: std::time::Duration::from_secs(60),
                 dropped_consecutive_misses: 3,
+                dropped_head_advance: DROPPED_TX_HEAD_ADVANCE,
             },
         )
         .await;
@@ -2351,12 +3126,14 @@ mod tests {
             // Depth > 1 so Phase 2 must poll the tip past the receipt block.
             2,
             ReceiptWaitConfig {
+                submission: None,
                 poll_interval: std::time::Duration::from_millis(1),
                 inclusion_timeout: std::time::Duration::from_secs(1),
                 // Generous, so the cap logic is exercised, not the timeout.
                 confirmation_timeout: std::time::Duration::from_secs(30),
                 dropped_grace: std::time::Duration::from_secs(60),
                 dropped_consecutive_misses: 3,
+                dropped_head_advance: DROPPED_TX_HEAD_ADVANCE,
             },
         )
         .await;
@@ -2376,9 +3153,8 @@ mod tests {
         // dropped on the fourth poll -- before it is seen mined.
         let tx_hash = alloy::primitives::B256::random();
         let asserter = Asserter::new();
-        // Poll 1: receipt None, mempool absent -> miss 1.
-        asserter.push_success(&serde_json::Value::Null);
-        asserter.push_success(&serde_json::Value::Null);
+        // Poll 1: receipt None, mempool absent, head 10 -> miss 1.
+        push_absence(&asserter, 10, 0);
         // Poll 2: receipt None, mempool transport error -> reset the miss run.
         asserter.push_success(&serde_json::Value::Null);
         asserter.push_failure(alloy::rpc::json_rpc::ErrorPayload {
@@ -2386,12 +3162,11 @@ mod tests {
             message: "mempool backend blip".into(),
             data: None,
         });
-        // Poll 3: receipt None, mempool absent -> miss 1 (not 2).
-        asserter.push_success(&serde_json::Value::Null);
-        asserter.push_success(&serde_json::Value::Null);
-        // Poll 4: receipt None, mempool absent -> miss 2 (not 3 -> no false drop).
-        asserter.push_success(&serde_json::Value::Null);
-        asserter.push_success(&serde_json::Value::Null);
+        // Poll 3: receipt None, mempool absent, head 11 -> miss 1 (not 2).
+        push_absence(&asserter, 11, 0);
+        // Poll 4: receipt None, mempool absent, head 12 -> miss 2 (not 3 -> no
+        // false drop).
+        push_absence(&asserter, 12, 0);
         // Poll 5: the tx is finally mined at block 0, ending Phase 1.
         asserter.push_success(&mined_receipt(tx_hash));
         // Phase 2 with required_confirmations = 1: satisfied immediately.
@@ -2403,12 +3178,14 @@ mod tests {
             tx_hash,
             1,
             ReceiptWaitConfig {
+                submission: Some(submission_at(0)),
                 poll_interval: std::time::Duration::from_millis(1),
                 inclusion_timeout: std::time::Duration::from_secs(30),
                 confirmation_timeout: std::time::Duration::from_secs(1),
                 // Check the mempool from the first poll so the interleave runs.
                 dropped_grace: std::time::Duration::ZERO,
                 dropped_consecutive_misses: 3,
+                dropped_head_advance: DROPPED_TX_HEAD_ADVANCE,
             },
         )
         .await;
@@ -2425,6 +3202,8 @@ mod tests {
             .disable_recommended_fillers()
             .connect_http(anvil.endpoint_url());
 
+        provider.anvil_mine(Some(1), None).await.unwrap();
+
         let fake_hash = alloy::primitives::B256::random();
 
         let result = wait_for_receipt_with_config(
@@ -2432,11 +3211,15 @@ mod tests {
             fake_hash,
             1,
             ReceiptWaitConfig {
+                submission: Some(submission_at(0)),
                 poll_interval: std::time::Duration::from_millis(50),
                 inclusion_timeout: std::time::Duration::from_secs(30),
                 confirmation_timeout: std::time::Duration::from_secs(60),
                 dropped_grace: std::time::Duration::ZERO,
                 dropped_consecutive_misses: 1,
+                // Anvil's head stays frozen in these fixtures; the freshness
+                // gate is exercised by its own dedicated tests below.
+                dropped_head_advance: 0,
             },
         )
         .await;
@@ -2480,6 +3263,7 @@ mod tests {
             tx_hash,
             1,
             ReceiptWaitConfig {
+                submission: None,
                 poll_interval: std::time::Duration::from_millis(50),
                 inclusion_timeout: std::time::Duration::from_millis(600),
                 confirmation_timeout: std::time::Duration::from_secs(60),
@@ -2487,6 +3271,9 @@ mod tests {
                 // logic — the tx is in the mempool, so it must not be dropped.
                 dropped_grace: std::time::Duration::ZERO,
                 dropped_consecutive_misses: 1,
+                // Anvil's head stays frozen in these fixtures; the freshness
+                // gate is exercised by its own dedicated tests below.
+                dropped_head_advance: 0,
             },
         )
         .await;
@@ -2507,6 +3294,8 @@ mod tests {
             .disable_recommended_fillers()
             .connect_http(anvil.endpoint_url());
 
+        provider.anvil_mine(Some(1), None).await.unwrap();
+
         let fake_hash = alloy::primitives::B256::random();
         let grace = std::time::Duration::from_millis(400);
         let start = std::time::Instant::now();
@@ -2516,11 +3305,15 @@ mod tests {
             fake_hash,
             1,
             ReceiptWaitConfig {
+                submission: Some(submission_at(0)),
                 poll_interval: std::time::Duration::from_millis(50),
                 inclusion_timeout: std::time::Duration::from_secs(30),
                 confirmation_timeout: std::time::Duration::from_secs(60),
                 dropped_grace: grace,
                 dropped_consecutive_misses: 1,
+                // Anvil's head stays frozen in these fixtures; the freshness
+                // gate is exercised by its own dedicated tests below.
+                dropped_head_advance: 0,
             },
         )
         .await;
@@ -2533,6 +3326,550 @@ mod tests {
         assert!(
             elapsed >= grace,
             "drop must not be declared before the grace period: elapsed {elapsed:?} < {grace:?}"
+        );
+    }
+
+    /// The RAI-1241 incident shape: a lagging load-balanced backend reports the
+    /// tx absent from BOTH the receipt lookup and the mempool while its head is
+    /// frozen. A synced node never returns `None` for a mined tx, so absences
+    /// from a node that is not provably advancing past where the tx could have
+    /// mined must never conclude `Dropped` — the wait ends in the retryable
+    /// inclusion timeout instead.
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    #[tokio::test]
+    async fn wait_for_receipt_does_not_drop_when_node_head_is_frozen() {
+        let tx_hash = alloy::primitives::B256::random();
+        let asserter = Asserter::new();
+        // Every poll: receipt None, mempool None, head STUCK at 42. Misses
+        // accumulate far past the threshold, but the head never advances, so
+        // the drop verdict must stay gated. Enough cycles are queued to outlast
+        // the inclusion timeout at the 1ms poll interval.
+        for _ in 0..500 {
+            push_absence(&asserter, 42, 0);
+        }
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let result = wait_for_receipt_with_config(
+            &provider,
+            tx_hash,
+            1,
+            ReceiptWaitConfig {
+                submission: Some(submission_at(0)),
+                poll_interval: std::time::Duration::from_millis(1),
+                // Short, so the gated wait resolves as ReceiptTimeout quickly.
+                inclusion_timeout: std::time::Duration::from_millis(100),
+                confirmation_timeout: std::time::Duration::from_secs(1),
+                dropped_grace: std::time::Duration::ZERO,
+                dropped_consecutive_misses: 3,
+                dropped_head_advance: 2,
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(EvmError::ReceiptTimeout { tx_hash: ht, .. }) if ht == tx_hash),
+            "a frozen-head node cannot prove a drop; expected the retryable \
+             ReceiptTimeout, got: {result:?}"
+        );
+    }
+
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    #[tokio::test]
+    async fn receipt_wait_counts_only_consecutive_head_qualified_absences() {
+        for heads in [
+            vec![102, 102, 102, 104],
+            vec![102, 104, 103, 104, 104],
+            vec![u64::MAX - 1, u64::MAX, u64::MAX, u64::MAX],
+        ] {
+            let tx_hash = TxHash::random();
+            let asserter = Asserter::new();
+            for head in &heads {
+                push_absence(&asserter, *head, 0);
+            }
+            asserter.push_success(&mined_receipt(tx_hash));
+            asserter.push_success(&serde_json::Value::from(0u64));
+            let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+            let result = wait_for_receipt_with_config(
+                &provider,
+                tx_hash,
+                1,
+                ReceiptWaitConfig {
+                    submission: Some(submission_at(100)),
+                    poll_interval: Duration::from_millis(1),
+                    inclusion_timeout: Duration::from_secs(2),
+                    dropped_grace: Duration::ZERO,
+                    dropped_consecutive_misses: 3,
+                    dropped_head_advance: 2,
+                    ..ReceiptWaitConfig::mainnet_defaults()
+                },
+            )
+            .await;
+            let receipt = result.unwrap_or_else(|error| panic!(
+                "frozen or regressed observations must not contribute to a drop: {heads:?}: {error:?}"
+            ));
+            assert_eq!(receipt.transaction_hash, tx_hash);
+        }
+    }
+
+    /// Complement of the frozen-head case: once the answering node's head has
+    /// advanced `dropped_head_advance` past the first post-grace absence while
+    /// the tx stays missing from both lookups, the drop verdict fires.
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    #[tokio::test]
+    async fn wait_for_receipt_drops_when_head_advances_past_absent_tx() {
+        let tx_hash = alloy::primitives::B256::random();
+        let asserter = Asserter::new();
+        // Heads 42 and 43 establish the reference but do not qualify. Three
+        // observations at 44 (= reference + 2) satisfy the qualified-miss run.
+        for head in [42u64, 43, 44, 44, 44] {
+            push_absence(&asserter, head, 0);
+        }
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let result = wait_for_receipt_with_config(
+            &provider,
+            tx_hash,
+            1,
+            ReceiptWaitConfig {
+                submission: Some(submission_at(40)),
+                poll_interval: std::time::Duration::from_millis(1),
+                inclusion_timeout: std::time::Duration::from_secs(30),
+                confirmation_timeout: std::time::Duration::from_secs(1),
+                dropped_grace: std::time::Duration::ZERO,
+                dropped_consecutive_misses: 3,
+                dropped_head_advance: 2,
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(EvmError::TransactionDropped { tx_hash: ht, .. }) if ht == tx_hash),
+            "an absent tx observed by an advancing (caught-up) node past the miss \
+             threshold must classify as Dropped, got: {result:?}"
+        );
+    }
+
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    fn absent_transaction_server(head: u64) -> httpmock::MockServer {
+        let server = httpmock::MockServer::start();
+        for method in ["eth_getTransactionReceipt", "eth_getTransactionByHash"] {
+            server.mock(|when, then| {
+                when.body_includes(method);
+                then.json_body(serde_json::json!({"jsonrpc":"2.0", "id":0, "result":null}));
+            });
+        }
+        let mut block: alloy::rpc::types::Block = alloy::rpc::types::Block::default();
+        block.header.number = head;
+        block.header.hash = alloy::primitives::BlockHash::random();
+        server.mock(|when, then| {
+            when.body_includes("eth_getBlockByNumber");
+            then.json_body(serde_json::json!({"jsonrpc":"2.0", "id":0, "result":block}));
+        });
+        server.mock(|when, then| {
+            when.body_includes("eth_getTransactionCount");
+            then.json_body(serde_json::json!({"jsonrpc":"2.0", "id":0, "result":"0x0"}));
+        });
+        server
+    }
+
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    #[tokio::test]
+    async fn live_submission_changed_during_canonical_lookup_cannot_drop_old_boundary() {
+        for changed in [None, Some(submission_at(300))] {
+            let server = absent_transaction_server(104);
+            let provider = ProviderBuilder::new().connect_http(server.url("/").parse().unwrap());
+            let reads = AtomicUsize::new(0);
+            let tx_hash = TxHash::random();
+            let error = wait_for_receipt_with_submission(
+                &provider,
+                tx_hash,
+                1,
+                ReceiptWaitConfig {
+                    poll_interval: Duration::from_millis(1),
+                    inclusion_timeout: Duration::from_millis(500),
+                    dropped_grace: Duration::ZERO,
+                    dropped_consecutive_misses: 1,
+                    dropped_head_advance: 0,
+                    ..ReceiptWaitConfig::mainnet_defaults()
+                },
+                || {
+                    if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Some(submission_at(100))
+                    } else {
+                        changed
+                    }
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(error, EvmError::ReceiptTimeout { tx_hash: actual, .. } if actual == tx_hash),
+                "hidden or raised live evidence must invalidate the in-flight old-floor verdict: {error:?}"
+            );
+            assert!(reads.load(Ordering::SeqCst) > 1);
+        }
+    }
+
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    #[tokio::test]
+    async fn live_submission_boundary_change_resets_misses_then_stable_evidence_drops() {
+        let server = absent_transaction_server(202);
+        let provider = ProviderBuilder::new().connect_http(server.url("/").parse().unwrap());
+        let reads = AtomicUsize::new(0);
+        let tx_hash = TxHash::random();
+        let error = wait_for_receipt_with_submission(
+            &provider,
+            tx_hash,
+            1,
+            ReceiptWaitConfig {
+                poll_interval: Duration::from_millis(1),
+                inclusion_timeout: Duration::from_secs(2),
+                dropped_grace: Duration::ZERO,
+                dropped_consecutive_misses: 2,
+                dropped_head_advance: 0,
+                ..ReceiptWaitConfig::mainnet_defaults()
+            },
+            || {
+                Some(submission_at(if reads.fetch_add(1, Ordering::SeqCst) < 2 {
+                    100
+                } else {
+                    200
+                }))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, EvmError::TransactionDropped { tx_hash: actual, .. } if actual == tx_hash)
+        );
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            6,
+            "two new qualified misses must be collected after the boundary changes, with evidence checked on both sides of each canonical lookup"
+        );
+    }
+
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    #[tokio::test]
+    async fn wait_for_receipt_unknown_submission_cannot_drop_on_advancing_head() {
+        let tx_hash = TxHash::random();
+        let asserter = Asserter::new();
+        for _ in 1u64..500 {
+            asserter.push_success(&serde_json::Value::Null);
+            asserter.push_success(&serde_json::Value::Null);
+        }
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let result = wait_for_receipt_with_config(
+            &provider,
+            tx_hash,
+            1,
+            ReceiptWaitConfig {
+                submission: None,
+                poll_interval: Duration::from_millis(1),
+                inclusion_timeout: Duration::from_millis(20),
+                confirmation_timeout: Duration::from_secs(1),
+                dropped_grace: Duration::ZERO,
+                dropped_consecutive_misses: 3,
+                dropped_head_advance: 2,
+            },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(EvmError::ReceiptTimeout { .. })),
+            "advancement without the submission boundary or nonce proves no drop: {result:?}"
+        );
+    }
+
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    #[tokio::test]
+    async fn wait_for_receipt_consumed_nonce_cannot_drop_hidden_mined_transaction() {
+        let asserter = Asserter::new();
+        for head in 42..500 {
+            push_absence(&asserter, head, 1);
+        }
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let result = wait_for_receipt_with_config(
+            &provider,
+            TxHash::random(),
+            1,
+            ReceiptWaitConfig {
+                submission: Some(submission_at(40)),
+                poll_interval: Duration::from_millis(1),
+                inclusion_timeout: Duration::from_millis(20),
+                confirmation_timeout: Duration::from_secs(1),
+                dropped_grace: Duration::ZERO,
+                dropped_consecutive_misses: 1,
+                dropped_head_advance: 2,
+            },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(EvmError::ReceiptTimeout { .. })),
+            "fresh canonical nonce consumed while receipt backend lags must not Drop: {result:?}"
+        );
+    }
+
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    #[tokio::test]
+    async fn wait_for_receipt_advancing_head_behind_submission_cannot_drop() {
+        let asserter = Asserter::new();
+        for head in 1..500 {
+            asserter.push_success(&serde_json::Value::Null);
+            asserter.push_success(&serde_json::Value::Null);
+            let mut block: alloy::rpc::types::Block = alloy::rpc::types::Block::default();
+            block.header.number = head;
+            block.header.hash = alloy::primitives::BlockHash::random();
+            asserter.push_success(&block);
+        }
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let result = wait_for_receipt_with_config(
+            &provider,
+            TxHash::random(),
+            1,
+            ReceiptWaitConfig {
+                submission: Some(submission_at(1000)),
+                poll_interval: Duration::from_millis(1),
+                inclusion_timeout: Duration::from_millis(20),
+                confirmation_timeout: Duration::from_secs(1),
+                dropped_grace: Duration::ZERO,
+                dropped_consecutive_misses: 1,
+                dropped_head_advance: 2,
+            },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(EvmError::ReceiptTimeout { .. })),
+            "an advancing but behind-submission backend is not fresh evidence: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn qualified_absence_pins_nonce_read_to_canonical_head_hash() {
+        let server = httpmock::MockServer::start();
+        let mut block: alloy::rpc::types::Block = alloy::rpc::types::Block::default();
+        block.header.number = 42;
+        block.header.hash = alloy::primitives::BlockHash::random();
+        let head_mock = server.mock(|when, then| {
+            when.body_includes("eth_getBlockByNumber");
+            then.json_body(serde_json::json!({"jsonrpc":"2.0", "id":0, "result":block}));
+        });
+        let nonce_mock = server.mock(|when, then| {
+            when.body_includes("eth_getTransactionCount")
+                .body_includes(format!("\"blockHash\":\"{}\"", block.header.hash))
+                .body_includes("\"requireCanonical\":true");
+            then.json_body(serde_json::json!({"jsonrpc":"2.0", "id":1, "result":"0x0"}));
+        });
+        let provider = ProviderBuilder::new().connect_http(server.url("/").parse().unwrap());
+        assert_eq!(
+            qualified_absence_head(&provider, submission_at(40), 2)
+                .await
+                .unwrap(),
+            Some(42)
+        );
+        head_mock.assert();
+        nonce_mock.assert();
+    }
+
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    #[tokio::test]
+    async fn wait_for_receipt_repeated_canonical_state_errors_remain_retryable() {
+        for (code, message) in [
+            (-32000, "header not found"),
+            (-32602, "EIP-1898 blockHash parameter unsupported"),
+        ] {
+            let asserter = Asserter::new();
+            for _ in 0..200 {
+                asserter.push_success(&serde_json::Value::Null);
+                asserter.push_success(&serde_json::Value::Null);
+                let mut block: alloy::rpc::types::Block = alloy::rpc::types::Block::default();
+                block.header.number = 44;
+                block.header.hash = alloy::primitives::BlockHash::random();
+                asserter.push_success(&block);
+                asserter.push_failure(alloy::rpc::json_rpc::ErrorPayload {
+                    code,
+                    message: message.into(),
+                    data: None,
+                });
+            }
+            let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+            let result = wait_for_receipt_with_config(
+                &provider,
+                TxHash::random(),
+                1,
+                ReceiptWaitConfig {
+                    submission: Some(submission_at(40)),
+                    poll_interval: Duration::from_millis(1),
+                    inclusion_timeout: Duration::from_millis(30),
+                    confirmation_timeout: Duration::from_secs(1),
+                    dropped_grace: Duration::ZERO,
+                    dropped_consecutive_misses: 3,
+                    dropped_head_advance: 2,
+                },
+            )
+            .await;
+            assert!(
+                matches!(result, Err(EvmError::ReceiptTimeout { .. })),
+                "unavailable canonical state must remain retryable beyond the error cap ({message}): {result:?}"
+            );
+        }
+    }
+
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    #[tokio::test]
+    async fn canonical_state_error_resets_drop_and_transport_progress() {
+        let asserter = Asserter::new();
+        for _ in 0..=MAX_CONSECUTIVE_TRANSPORT_ERRORS {
+            asserter.push_success(&serde_json::Value::Null);
+            let mut block: alloy::rpc::types::Block = alloy::rpc::types::Block::default();
+            block.header.number = 44;
+            block.header.hash = alloy::primitives::BlockHash::random();
+            asserter.push_success(&block);
+            asserter.push_failure(alloy::rpc::json_rpc::ErrorPayload {
+                code: -32000,
+                message: "header not found".into(),
+                data: None,
+            });
+        }
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let config = ReceiptWaitConfig {
+            submission: Some(submission_at(40)),
+            dropped_grace: Duration::ZERO,
+            ..ReceiptWaitConfig::mainnet_defaults()
+        };
+        let mut drop_progress = ReceiptDropProgress {
+            consecutive_misses: config.dropped_consecutive_misses - 1,
+            reference_head: Some(42),
+            submission: config.submission,
+        };
+        let mut transport_errors = MAX_CONSECUTIVE_TRANSPORT_ERRORS - 1;
+        for _ in 0..=MAX_CONSECUTIVE_TRANSPORT_ERRORS {
+            classify_pending_receipt(
+                &provider,
+                TxHash::random(),
+                &config,
+                std::time::Instant::now(),
+                &|| config.submission,
+                &mut drop_progress,
+                &mut transport_errors,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                (
+                    drop_progress.consecutive_misses,
+                    transport_errors,
+                    drop_progress.reference_head
+                ),
+                (0, 0, None)
+            );
+        }
+    }
+
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    #[tokio::test]
+    async fn canonical_state_transient_failures_still_reach_transport_cap() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.body_includes("eth_getTransactionByHash");
+            then.json_body(serde_json::json!({"jsonrpc":"2.0", "id":0, "result":null}));
+        });
+        let mut block: alloy::rpc::types::Block = alloy::rpc::types::Block::default();
+        block.header.number = 44;
+        block.header.hash = alloy::primitives::BlockHash::random();
+        server.mock(|when, then| {
+            when.body_includes("eth_getBlockByNumber");
+            then.json_body(serde_json::json!({"jsonrpc":"2.0", "id":1, "result":block}));
+        });
+        let nonce_mock = server.mock(|when, then| {
+            when.body_includes("eth_getTransactionCount");
+            then.status(503);
+        });
+        let provider = ProviderBuilder::new().connect_http(server.url("/").parse().unwrap());
+        let config = ReceiptWaitConfig {
+            submission: Some(submission_at(40)),
+            dropped_grace: Duration::ZERO,
+            ..ReceiptWaitConfig::mainnet_defaults()
+        };
+        let mut drop_progress = ReceiptDropProgress {
+            consecutive_misses: 1,
+            reference_head: Some(42),
+            submission: config.submission,
+        };
+        let mut transport_errors = 0;
+        for attempt in 1..=MAX_CONSECUTIVE_TRANSPORT_ERRORS {
+            let result = classify_pending_receipt(
+                &provider,
+                TxHash::random(),
+                &config,
+                std::time::Instant::now(),
+                &|| config.submission,
+                &mut drop_progress,
+                &mut transport_errors,
+            )
+            .await;
+            assert_eq!(
+                (
+                    drop_progress.consecutive_misses,
+                    drop_progress.reference_head
+                ),
+                (0, None)
+            );
+            assert_eq!(transport_errors, attempt);
+            if attempt == MAX_CONSECUTIVE_TRANSPORT_ERRORS {
+                assert!(
+                    matches!(
+                        result,
+                        Err(EvmError::Transport(alloy::transports::RpcError::Transport(
+                            _
+                        )))
+                    ),
+                    "genuine HTTP outage must fail at the cap: {result:?}"
+                );
+            } else {
+                result.unwrap();
+            }
+        }
+        nonce_mock.assert_calls(usize::try_from(MAX_CONSECUTIVE_TRANSPORT_ERRORS).unwrap());
+    }
+
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    #[tokio::test]
+    async fn wait_for_receipt_state_error_resets_progress_before_new_frozen_absence_run() {
+        let asserter = Asserter::new();
+        push_absence(&asserter, 42, 0);
+        asserter.push_success(&serde_json::Value::Null);
+        asserter.push_success(&serde_json::Value::Null);
+        let mut block: alloy::rpc::types::Block = alloy::rpc::types::Block::default();
+        block.header.number = 44;
+        block.header.hash = alloy::primitives::BlockHash::random();
+        asserter.push_success(&block);
+        asserter.push_failure(alloy::rpc::json_rpc::ErrorPayload {
+            code: -32000,
+            message: "fresh canonical hash not available on stale backend".into(),
+            data: None,
+        });
+        for _ in 0..200 {
+            push_absence(&asserter, 44, 0);
+        }
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let result = wait_for_receipt_with_config(
+            &provider,
+            TxHash::random(),
+            1,
+            ReceiptWaitConfig {
+                submission: Some(submission_at(40)),
+                poll_interval: Duration::from_millis(1),
+                inclusion_timeout: Duration::from_millis(30),
+                confirmation_timeout: Duration::from_secs(1),
+                dropped_grace: Duration::ZERO,
+                dropped_consecutive_misses: 3,
+                dropped_head_advance: 2,
+            },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(EvmError::ReceiptTimeout { .. })),
+            "failed hash-pinned state must reset the run; its subsequent frozen head cannot Drop: {result:?}"
         );
     }
 
@@ -2560,7 +3897,9 @@ mod tests {
             .disable_recommended_fillers()
             .connect_http(anvil.endpoint_url());
 
-        let receipt = wait_for_receipt(&read_provider, tx_hash, 3).await.unwrap();
+        let receipt = wait_for_receipt(&read_provider, tx_hash, 3, || None)
+            .await
+            .unwrap();
 
         assert_eq!(receipt.transaction_hash, tx_hash);
 

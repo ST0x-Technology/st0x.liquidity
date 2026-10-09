@@ -24,13 +24,15 @@ use rain_math_float::Float;
 use tracing::{debug, info, warn};
 
 use st0x_evm::{
-    Evm, EvmError, IntoErrorRegistry, OpenChainErrorRegistry, PreparedTransaction, USDC_BASE,
-    Wallet,
+    Evm, EvmError, IntoErrorRegistry, MinedTx, OpenChainErrorRegistry, PreparedTransaction, Wallet,
 };
 use st0x_execution::FractionalShares;
 use st0x_finance::Usdc;
 
-use crate::{Raindex, RaindexContracts, RaindexError, RaindexVaultId, RevokeOutcome, ScanAnomaly};
+use crate::{
+    Raindex, RaindexContracts, RaindexError, RaindexVaultId, RevokeOutcome, ScanAnomaly,
+    WithdrawBroadcast,
+};
 
 sol!(
     #![sol(all_derives = true, rpc)]
@@ -46,8 +48,6 @@ sol!(
     #![sol(all_derives = true, rpc)]
     IERC20, env!("ST0X_IERC20_ABI")
 );
-
-const USDC_DECIMALS: u8 = 6;
 
 /// Number of `eth_getLogs` attempts made before an unresolved withdrawal
 /// submission is surfaced. Repeated scans improve recovery when one
@@ -89,7 +89,10 @@ const SCAN_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis
 ///
 /// // Submit a USDC deposit to the vault, then confirm it (needs Wallet)
 /// let amount = U256::from(1000) * U256::from(10).pow(U256::from(6)); // 1000 USDC
-/// let deposit_tx = service.submit_deposit_usdc(vault_id, amount).await?;
+/// let stable = Chain::Base.settlement_stable();
+/// let deposit_tx = service
+///     .submit_deposit(stable.address, vault_id, amount, stable.decimals)
+///     .await?;
 /// service.confirm_tx(deposit_tx).await?;
 /// ```
 pub struct RaindexService<E: Evm> {
@@ -200,18 +203,7 @@ impl<W: Wallet> RaindexService<W> {
         &self,
         token: Address,
     ) -> Result<RevokeOutcome, RaindexError> {
-        let current_allowance: U256 = self
-            .evm
-            .call::<Registry, _>(
-                token,
-                IERC20::allowanceCall {
-                    owner: self.owner,
-                    spender: self.orderbook_address,
-                },
-            )
-            .await?;
-
-        if current_allowance.is_zero() {
+        if self.orderbook_allowance::<Registry>(token).await?.is_zero() {
             return Ok(RevokeOutcome::AlreadyZero);
         }
 
@@ -228,7 +220,53 @@ impl<W: Wallet> RaindexService<W> {
             .await?;
 
         info!(target: "inventory", tx_hash = %receipt.transaction_hash, %token, spender = %self.orderbook_address, "Revoked stale orderbook allowance");
-        Ok(RevokeOutcome::Revoked)
+        Ok(RevokeOutcome::Revoked {
+            tx: receipt.transaction_hash,
+        })
+    }
+
+    /// Like [`revoke_orderbook_allowance`](Self::revoke_orderbook_allowance),
+    /// but returns as soon as the revoke is broadcast instead of waiting for
+    /// its receipt. Use [`Raindex::confirm_tx`] to wait for confirmation.
+    pub async fn submit_revoke_orderbook_allowance<Registry: IntoErrorRegistry>(
+        &self,
+        token: Address,
+    ) -> Result<RevokeOutcome, RaindexError> {
+        if self.orderbook_allowance::<Registry>(token).await?.is_zero() {
+            return Ok(RevokeOutcome::AlreadyZero);
+        }
+
+        let tx_hash = self
+            .evm
+            .submit_pending(
+                token,
+                IERC20::approveCall {
+                    spender: self.orderbook_address,
+                    amount: U256::ZERO,
+                },
+                "revoke stale orderbook allowance",
+            )
+            .await?;
+
+        info!(target: "inventory", %tx_hash, %token, spender = %self.orderbook_address, "Stale orderbook allowance revoke submitted");
+        Ok(RevokeOutcome::Revoked { tx: tx_hash })
+    }
+
+    /// The signing wallet's current `token` allowance for the orderbook.
+    async fn orderbook_allowance<Registry: IntoErrorRegistry>(
+        &self,
+        token: Address,
+    ) -> Result<U256, RaindexError> {
+        Ok(self
+            .evm
+            .call::<Registry, _>(
+                token,
+                IERC20::allowanceCall {
+                    owner: self.owner,
+                    spender: self.orderbook_address,
+                },
+            )
+            .await?)
     }
 
     async fn deposit4_to_vault<Registry: IntoErrorRegistry>(
@@ -284,42 +322,6 @@ impl<W: Wallet> RaindexService<W> {
 
         info!(target: "inventory", %tx_hash, %token, %amount, "deposit4 submitted");
         Ok(tx_hash)
-    }
-
-    /// Submits a USDC deposit to a Rain OrderBook vault on Base WITHOUT waiting
-    /// for confirmation, returning the broadcast tx hash.
-    ///
-    /// Used by the crash-safe deposit path: the hash is persisted as
-    /// `InitiateDeposit` before confirmation, so a crash during the confirmation
-    /// wait resumes from `DepositInitiated` (re-verifying the recorded tx via
-    /// `confirm_tx`) instead of re-submitting a second deposit.
-    pub async fn submit_deposit_usdc(
-        &self,
-        vault_id: RaindexVaultId,
-        amount: U256,
-    ) -> Result<TxHash, RaindexError> {
-        // `submit_deposit` handles the ERC20 approval before submitting deposit4
-        // (unlike the bare `submit_deposit4_to_vault`), then returns without
-        // confirming.
-        self.submit_deposit(USDC_BASE, vault_id, amount, USDC_DECIMALS)
-            .await
-    }
-
-    /// Withdraws USDC from a Rain OrderBook vault on Base.
-    ///
-    /// Convenience method that calls `withdraw` with the Base USDC address and decimals.
-    ///
-    /// # Parameters
-    ///
-    /// * `vault_id` - Source vault identifier
-    /// * `target_amount` - Target amount of USDC to withdraw (in USDC's base units, 6 decimals)
-    pub async fn withdraw_usdc(
-        &self,
-        vault_id: RaindexVaultId,
-        target_amount: U256,
-    ) -> Result<TxHash, RaindexError> {
-        self.withdraw(USDC_BASE, vault_id, target_amount, USDC_DECIMALS)
-            .await
     }
 }
 
@@ -616,14 +618,22 @@ fn map_withdraw_revert(err: EvmError) -> RaindexError {
     let Some(revert_data) = err.revert_data() else {
         return err.into();
     };
-    IRaindexInventory::InsufficientVaultLiquidity::abi_decode(revert_data.as_ref()).map_or_else(
-        |_| err.into(),
-        |decoded| RaindexError::InsufficientVaultLiquidity {
-            token: decoded.token,
-            requested: decoded.requested,
-            received: decoded.received,
-        },
-    )
+    let Ok(decoded) =
+        IRaindexInventory::InsufficientVaultLiquidity::abi_decode(revert_data.as_ref())
+    else {
+        return err.into();
+    };
+    let broadcast = if err.was_never_broadcast() {
+        WithdrawBroadcast::NotBroadcast
+    } else {
+        WithdrawBroadcast::MayHaveBroadcast
+    };
+    RaindexError::InsufficientVaultLiquidity {
+        token: decoded.token,
+        requested: decoded.requested,
+        received: decoded.received,
+        broadcast,
+    }
 }
 
 #[async_trait]
@@ -792,6 +802,17 @@ impl<W: Wallet> Raindex for RaindexService<W> {
             .is_some())
     }
 
+    async fn mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, RaindexError> {
+        Ok(st0x_evm::mined_tx(self.evm.provider(), tx_hash).await?)
+    }
+
+    async fn tx_receipt(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<Option<TransactionReceipt>, RaindexError> {
+        Ok(self.evm.provider().get_transaction_receipt(tx_hash).await?)
+    }
+
     async fn confirm_tx_receipt(
         &self,
         tx_hash: TxHash,
@@ -814,6 +835,7 @@ impl<W: Wallet> Raindex for RaindexService<W> {
 
 #[cfg(test)]
 mod tests {
+    use alloy::consensus::Transaction as _;
     use alloy::hex;
     use alloy::network::{Ethereum, TransactionBuilder};
     use alloy::node_bindings::{Anvil, AnvilInstance};
@@ -836,7 +858,7 @@ mod tests {
     use tracing_test::traced_test;
 
     use st0x_evm::local::RawPrivateKeyWallet;
-    use st0x_evm::{EvmError, NoOpErrorRegistry, ReadOnlyEvm, Wallet};
+    use st0x_evm::{EvmError, NoOpErrorRegistry, ReadOnlyEvm, USDC_BASE, Wallet};
 
     use super::*;
 
@@ -1445,6 +1467,16 @@ mod tests {
             )))
         }
 
+        async fn prepare_pending_with_gas_limit(
+            &self,
+            _contract: Address,
+            _calldata: Bytes,
+            _unpadded_gas_limit: u64,
+            _note: &str,
+        ) -> Result<PreparedTransaction, EvmError> {
+            unreachable!("prepare_withdraw must not pin a gas limit")
+        }
+
         async fn broadcast_prepared(
             &self,
             _prepared: &PreparedTransaction,
@@ -1455,6 +1487,13 @@ mod tests {
 
         async fn discard_prepared(&self, _tx_hash: TxHash) {
             unreachable!("prepare_withdraw must not discard")
+        }
+
+        async fn prepare_fee_replacement(
+            &self,
+            _prepared: &PreparedTransaction,
+        ) -> Result<Option<PreparedTransaction>, EvmError> {
+            unreachable!("prepare_withdraw must not sign a fee replacement")
         }
 
         async fn release_superseded(&self, _tx_hash: TxHash) {
@@ -1512,23 +1551,31 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_maps_to_insufficient_liquidity(error, requested, received);
+        assert_maps_to_insufficient_liquidity(
+            error,
+            requested,
+            received,
+            WithdrawBroadcast::MayHaveBroadcast,
+        );
     }
 
     fn assert_maps_to_insufficient_liquidity(
         mapped: RaindexError,
         requested: U256,
         received: U256,
+        expected_broadcast: WithdrawBroadcast,
     ) {
         match mapped {
             RaindexError::InsufficientVaultLiquidity {
                 token,
                 requested: r,
                 received: rc,
+                broadcast,
             } => {
                 assert_eq!(token, USDC_BASE);
                 assert_eq!(r, requested);
                 assert_eq!(rc, received);
+                assert_eq!(broadcast, expected_broadcast);
             }
             other => panic!("expected InsufficientVaultLiquidity, got {other:?}"),
         }
@@ -1545,7 +1592,12 @@ mod tests {
 
         let mapped = map_withdraw_revert(EvmError::Contract(contract_err));
 
-        assert_maps_to_insufficient_liquidity(mapped, requested, received);
+        assert_maps_to_insufficient_liquidity(
+            mapped,
+            requested,
+            received,
+            WithdrawBroadcast::MayHaveBroadcast,
+        );
     }
 
     #[test]
@@ -1560,7 +1612,31 @@ mod tests {
 
         let mapped = map_withdraw_revert(EvmError::Transport(TransportError::ErrorResp(payload)));
 
-        assert_maps_to_insufficient_liquidity(mapped, requested, received);
+        assert_maps_to_insufficient_liquidity(
+            mapped,
+            requested,
+            received,
+            WithdrawBroadcast::MayHaveBroadcast,
+        );
+    }
+
+    #[test]
+    fn map_withdraw_revert_marks_a_revert_rejected_before_broadcast() {
+        let requested = U256::from(2000u64);
+        let received = U256::ZERO;
+        let payload =
+            revert_error_payload(&insufficient_liquidity_revert_bytes(requested, received));
+
+        let mapped = map_withdraw_revert(EvmError::RejectedBeforeBroadcast {
+            source: Box::new(EvmError::Transport(TransportError::ErrorResp(payload))),
+        });
+
+        assert_maps_to_insufficient_liquidity(
+            mapped,
+            requested,
+            received,
+            WithdrawBroadcast::NotBroadcast,
+        );
     }
 
     #[test]
@@ -1574,7 +1650,12 @@ mod tests {
 
         let mapped = map_withdraw_revert(EvmError::DecodedRevert(decoded));
 
-        assert_maps_to_insufficient_liquidity(mapped, requested, received);
+        assert_maps_to_insufficient_liquidity(
+            mapped,
+            requested,
+            received,
+            WithdrawBroadcast::MayHaveBroadcast,
+        );
     }
 
     #[test]
@@ -1752,11 +1833,32 @@ mod tests {
             .revoke_orderbook_allowance::<NoOpErrorRegistry>(local_evm.token_address)
             .await
             .unwrap();
-        assert_eq!(
-            outcome,
-            RevokeOutcome::Revoked,
-            "non-zero allowance must trigger a revoke tx"
-        );
+        let RevokeOutcome::Revoked { tx } = outcome else {
+            panic!("non-zero allowance must trigger a revoke tx, got {outcome:?}");
+        };
+
+        // The reported tx is the mined approve(orderbook, 0) the wallet sent to
+        // the token, the hash operators are shown to look it up onchain.
+        let receipt = local_evm
+            .wallet
+            .provider()
+            .get_transaction_receipt(tx)
+            .await
+            .unwrap()
+            .expect("the revoke tx must be mined");
+        assert!(receipt.status(), "the revoke tx must succeed");
+        assert_eq!(receipt.from, local_evm.wallet.address());
+        assert_eq!(receipt.to, Some(local_evm.token_address));
+        let sent = local_evm
+            .wallet
+            .provider()
+            .get_transaction_by_hash(tx)
+            .await
+            .unwrap()
+            .expect("the revoke tx must be visible");
+        let approve = IERC20::approveCall::abi_decode(sent.input()).unwrap();
+        assert_eq!(approve.spender, local_evm.orderbook_address);
+        assert_eq!(approve.amount, U256::ZERO);
 
         // Idempotent: a second call sees zero and does nothing.
         let second = service

@@ -5,7 +5,7 @@ use alloy::primitives::Address;
 use rain_math_float::{Float, FloatError};
 use serde::Deserialize;
 use serde::de::IgnoredAny;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -50,10 +50,19 @@ pub enum RebalancingCtxError {
     ZeroTransferTimeout,
     #[error("rebalancing transfer_attempt_timeout_secs must be non-zero")]
     ZeroTransferAttemptTimeout,
+    #[error("rebalancing recovery_hold_alert_after_secs must be non-zero")]
+    ZeroRecoveryHoldAlertAfter,
     #[error("rebalancing attestation_retry_deadline_secs must be non-zero")]
     ZeroAttestationRetryDeadline,
     #[error("rebalancing settlement_retry_deadline_secs must be non-zero")]
     ZeroSettlementRetryDeadline,
+    #[error("[rebalancing.usdc] conversion_failure_cooldown_secs must be non-zero")]
+    ZeroUsdcConversionFailureCooldown,
+    #[error(
+        "[rebalancing.usdc] conversion_failure_cooldown_secs is {secs}, above the \
+         maximum of {MAX_USDC_CONVERSION_FAILURE_COOLDOWN_SECS}"
+    )]
+    UsdcConversionFailureCooldownTooLong { secs: u64 },
     #[error(
         "rebalancing max_burn_revert_redrives must be non-zero when USDC rebalancing \
          is enabled; set it to the maximum number of burn-revert redrive attempts \
@@ -137,7 +146,23 @@ pub struct UsdcRebalancing {
         deserialize_with = "st0x_float_serde::deserialize_option_float_from_number_or_string"
     )]
     pub deviation: Option<Float>,
+    /// How long a USD->USDC conversion that failed before the Alpaca
+    /// withdrawal holds Alpaca->Base planning on every corridor. The book is
+    /// Alpaca's, shared by every corridor, so an immediate retry would meet
+    /// the same cause. Must be non-zero and at most one day; defaults to 300
+    /// when absent.
+    #[serde(default = "default_usdc_conversion_failure_cooldown_secs")]
+    pub conversion_failure_cooldown_secs: u64,
 }
+
+fn default_usdc_conversion_failure_cooldown_secs() -> u64 {
+    5 * 60
+}
+
+/// Upper bound on `conversion_failure_cooldown_secs`: one day. A longer hold
+/// would stop Alpaca->Base rebalancing for longer than an operator would
+/// leave it unattended.
+const MAX_USDC_CONVERSION_FAILURE_COOLDOWN_SECS: u64 = 24 * 60 * 60;
 
 /// One `[rebalancing.usdc.corridors.<chain>]` table. Every key is required.
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -159,24 +184,198 @@ pub struct UsdcCorridorCtx {
     pub threshold: ImbalanceThreshold,
 }
 
+/// Whether Base is a hedged chain holding a cash vault. Base via CCTP is then
+/// served with no corridor table, so its in-flight transfers always recover.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum BaseCashVault {
+    Held,
+    Absent,
+}
+
+/// The validated cash corridors, active and served.
+///
+/// New transfers run on the active ones (every table while USDC mode is
+/// enabled); a cash transfer service carries the served ones (every table
+/// whatever the mode, plus Base via CCTP while Base holds a cash vault).
+#[derive(Debug, Clone)]
+pub struct UsdcCorridors {
+    mode: OperationMode,
+    by_chain: BTreeMap<Chain, UsdcCorridorCtx>,
+    served: BTreeSet<UsdcCorridor>,
+    conversion_failure_cooldown: Duration,
+}
+
+impl UsdcCorridors {
+    /// The corridors new transfers run on, in chain order; none while USDC
+    /// mode is disabled.
+    pub fn active(&self) -> impl Iterator<Item = &UsdcCorridorCtx> {
+        let enabled = self.mode == OperationMode::Enabled;
+
+        self.by_chain.values().filter(move |_| enabled)
+    }
+
+    /// The corridors this build runs a cash transfer service for.
+    pub const fn served(&self) -> &BTreeSet<UsdcCorridor> {
+        &self.served
+    }
+
+    pub fn serves(&self, corridor: UsdcCorridor) -> bool {
+        self.served.contains(&corridor)
+    }
+
+    /// How long a failed pre-withdrawal USD->USDC conversion holds
+    /// Alpaca->Base planning. See
+    /// [`UsdcRebalancing::conversion_failure_cooldown_secs`].
+    pub const fn conversion_failure_cooldown(&self) -> Duration {
+        self.conversion_failure_cooldown
+    }
+}
+
+/// Why a manual USDC transfer cannot pick its corridor.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ManualCorridorError {
+    #[error("no served USDC corridor runs on {chain}; served: {served}")]
+    NoneOnChain { chain: Chain, served: String },
+    #[error("this build serves no USDC corridor")]
+    NoneServed,
+    #[error("several served USDC corridors run on {chain}: {served}")]
+    SeveralOnChain { chain: Chain, served: String },
+    #[error("several USDC corridors are served ({served}); pass --chain to pick one")]
+    ChainRequired { served: String },
+}
+
+/// The served corridor a manual transfer runs on.
+///
+/// It is the one on `chain`, or the only one when `chain` is left out.
+/// Several served corridors with no `chain`, or none on it, are refused with
+/// the choices named. Shared by `st0x-cli transfer-usdc` and the bot's
+/// `capital transfer-usdc` route.
+pub fn manual_transfer_corridor(
+    served: &BTreeSet<UsdcCorridor>,
+    chain: Option<Chain>,
+) -> Result<UsdcCorridor, ManualCorridorError> {
+    let candidates: Vec<UsdcCorridor> = served
+        .iter()
+        .copied()
+        .filter(|corridor| chain.is_none_or(|chain| corridor.chain() == chain))
+        .collect();
+    let served_list = || {
+        served
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    match (candidates.as_slice(), chain) {
+        ([corridor], _) => Ok(*corridor),
+        ([], Some(chain)) => Err(ManualCorridorError::NoneOnChain {
+            chain,
+            served: served_list(),
+        }),
+        ([], None) => Err(ManualCorridorError::NoneServed),
+        (_, Some(chain)) => Err(ManualCorridorError::SeveralOnChain {
+            chain,
+            served: served_list(),
+        }),
+        (_, None) => Err(ManualCorridorError::ChainRequired {
+            served: served_list(),
+        }),
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl UsdcCorridors {
+    /// Base via CCTP, active on `threshold`.
+    pub fn base_cctp(threshold: ImbalanceThreshold) -> Self {
+        Self::for_test(OperationMode::Enabled, [base_cctp_corridor(threshold)])
+    }
+
+    /// USDC mode disabled, Base via CCTP still served.
+    pub fn base_cctp_disabled() -> Self {
+        Self {
+            mode: OperationMode::Disabled,
+            by_chain: BTreeMap::new(),
+            served: BTreeSet::from([UsdcCorridor::BASE_CCTP]),
+            conversion_failure_cooldown: Duration::from_secs(
+                default_usdc_conversion_failure_cooldown_secs(),
+            ),
+        }
+    }
+
+    /// `corridors` under `mode`, each one served.
+    pub fn for_test(
+        mode: OperationMode,
+        corridors: impl IntoIterator<Item = UsdcCorridorCtx>,
+    ) -> Self {
+        let by_chain: BTreeMap<Chain, UsdcCorridorCtx> = corridors
+            .into_iter()
+            .map(|usdc| (usdc.corridor.chain(), usdc))
+            .collect();
+        let served = by_chain.values().map(|usdc| usdc.corridor).collect();
+
+        Self {
+            mode,
+            by_chain,
+            served,
+            conversion_failure_cooldown: Duration::from_secs(
+                default_usdc_conversion_failure_cooldown_secs(),
+            ),
+        }
+    }
+
+    /// The same corridors with `cooldown` as the conversion-failure cooldown.
+    #[must_use]
+    pub const fn with_conversion_failure_cooldown(mut self, cooldown: Duration) -> Self {
+        self.conversion_failure_cooldown = cooldown;
+        self
+    }
+}
+
 impl UsdcRebalancing {
-    /// Validates every corridor table, whatever the mode, and returns the
-    /// corridor new transfers run on: `None` while the mode is disabled.
-    fn corridor_ctx(&self) -> Result<Option<UsdcCorridorCtx>, RebalancingCtxError> {
-        let mut validated = self
+    /// Validates every corridor table, whatever the mode. Every table is
+    /// served, and Base via CCTP too while Base holds a cash vault; with USDC
+    /// mode enabled at least one table is required.
+    fn corridors(
+        &self,
+        base_cash_vault: BaseCashVault,
+    ) -> Result<UsdcCorridors, RebalancingCtxError> {
+        if self.conversion_failure_cooldown_secs == 0 {
+            return Err(RebalancingCtxError::ZeroUsdcConversionFailureCooldown);
+        }
+
+        if self.conversion_failure_cooldown_secs > MAX_USDC_CONVERSION_FAILURE_COOLDOWN_SECS {
+            return Err(RebalancingCtxError::UsdcConversionFailureCooldownTooLong {
+                secs: self.conversion_failure_cooldown_secs,
+            });
+        }
+
+        let by_chain = self
             .corridors
             .iter()
-            .map(|(chain, config)| self.validate_corridor(*chain, config))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter();
+            .map(|(chain, config)| Ok((*chain, self.validate_corridor(*chain, config)?)))
+            .collect::<Result<BTreeMap<_, _>, RebalancingCtxError>>()?;
 
-        match self.mode {
-            OperationMode::Enabled => validated
-                .next()
-                .map(Some)
-                .ok_or(RebalancingCtxError::UsdcEnabledWithoutCorridor),
-            OperationMode::Disabled => Ok(None),
+        if self.mode == OperationMode::Enabled && by_chain.is_empty() {
+            return Err(RebalancingCtxError::UsdcEnabledWithoutCorridor);
         }
+
+        let implicit_base = match base_cash_vault {
+            BaseCashVault::Held => Some(UsdcCorridor::BASE_CCTP),
+            BaseCashVault::Absent => None,
+        };
+        let served = by_chain
+            .values()
+            .map(|usdc| usdc.corridor)
+            .chain(implicit_base)
+            .collect();
+
+        Ok(UsdcCorridors {
+            mode: self.mode,
+            by_chain,
+            served,
+            conversion_failure_cooldown: Duration::from_secs(self.conversion_failure_cooldown_secs),
+        })
     }
 
     fn validate_corridor(
@@ -247,6 +446,12 @@ pub struct RebalancingConfig {
     pub(crate) allocation: Option<AllocationConfig>,
     pub usdc: UsdcRebalancing,
     pub transfer_timeout_secs: u64,
+    /// Alert after a recovery keeps a symbol unavailable this long. Defaults
+    /// to one hour when absent, so a deployed config does not need a key that
+    /// released binaries refuse. Remove the default once released binaries
+    /// accept the key.
+    #[serde(default = "default_recovery_hold_alert_after_secs")]
+    pub recovery_hold_alert_after_secs: u64,
     /// Per-attempt wall-clock bound for a single Base->Alpaca transfer job
     /// attempt. A hung RPC is aborted after this so the attempt fails and
     /// retries rather than wedging forever. Distinct from
@@ -333,6 +538,10 @@ fn default_settlement_retry_deadline_secs() -> u64 {
     24 * 60 * 60
 }
 
+fn default_recovery_hold_alert_after_secs() -> u64 {
+    60 * 60
+}
+
 /// Runtime configuration for rebalancing operations.
 ///
 /// Constructed from `RebalancingConfig` after the parsed schema has been
@@ -342,10 +551,11 @@ fn default_settlement_retry_deadline_secs() -> u64 {
 pub struct RebalancingCtx {
     /// The validated `[rebalancing.allocation]` section.
     pub allocation: AllocationCtx,
-    /// The corridor new cash transfers run on; `None` while USDC mode is
-    /// disabled.
-    pub usdc: Option<UsdcCorridorCtx>,
+    /// The corridors new cash transfers run on and the ones this build
+    /// serves.
+    pub usdc: UsdcCorridors,
     pub transfer_timeout: Duration,
+    pub recovery_hold_alert_after: Duration,
     /// Staleness bound for per-chain inventory snapshots. See
     /// [`RebalancingConfig::inventory_staleness_bound_secs`].
     pub inventory_staleness_bound: Duration,
@@ -381,7 +591,12 @@ pub struct RebalancingCtx {
 impl RebalancingCtx {
     /// Construct from config. Validates only rebalancing-specific
     /// trigger thresholds; wallet construction lives elsewhere.
-    pub fn new(config: &RebalancingConfig) -> Result<Self, RebalancingCtxError> {
+    /// `base_cash_vault` says whether Base via CCTP is served with no
+    /// corridor table.
+    pub(crate) fn new(
+        config: &RebalancingConfig,
+        base_cash_vault: BaseCashVault,
+    ) -> Result<Self, RebalancingCtxError> {
         let allocation = config.allocation()?;
         if config.transfer_timeout_secs == 0 {
             return Err(RebalancingCtxError::ZeroTransferTimeout);
@@ -400,9 +615,13 @@ impl RebalancingCtx {
             return Err(RebalancingCtxError::ZeroTransferAttemptTimeout);
         }
 
-        let usdc = config.usdc.corridor_ctx()?;
+        if config.recovery_hold_alert_after_secs == 0 {
+            return Err(RebalancingCtxError::ZeroRecoveryHoldAlertAfter);
+        }
 
-        if usdc.is_some() && config.max_burn_revert_redrives == 0 {
+        let usdc = config.usdc.corridors(base_cash_vault)?;
+
+        if usdc.active().next().is_some() && config.max_burn_revert_redrives == 0 {
             return Err(RebalancingCtxError::ZeroMaxBurnRevertRedrives);
         }
 
@@ -410,6 +629,7 @@ impl RebalancingCtx {
             allocation: AllocationCtx::new(allocation)?,
             usdc,
             transfer_timeout: Duration::from_secs(config.transfer_timeout_secs),
+            recovery_hold_alert_after: Duration::from_secs(config.recovery_hold_alert_after_secs),
             inventory_staleness_bound: Duration::from_secs(config.inventory_staleness_bound_secs),
             transfer_attempt_timeout: Duration::from_secs(config.transfer_attempt_timeout_secs),
             attestation_retry_deadline: Duration::from_secs(config.attestation_retry_deadline_secs),
@@ -439,6 +659,7 @@ impl RebalancingCtx {
         #[builder(default = AllocationCtx::base_test())] allocation: AllocationCtx,
         usdc: Option<ImbalanceThreshold>,
         #[builder(default = Duration::from_secs(30 * 60))] transfer_timeout: Duration,
+        #[builder(default = Duration::from_secs(60 * 60))] recovery_hold_alert_after: Duration,
         #[builder(default = Duration::from_secs(300))] inventory_staleness_bound: Duration,
         #[builder(default = Duration::from_secs(60 * 60))] transfer_attempt_timeout: Duration,
         #[builder(default = Duration::from_secs(24 * 60 * 60))]
@@ -449,8 +670,9 @@ impl RebalancingCtx {
     ) -> Self {
         Self {
             allocation,
-            usdc: usdc.map(base_cctp_corridor),
+            usdc: usdc.map_or_else(UsdcCorridors::base_cctp_disabled, UsdcCorridors::base_cctp),
             transfer_timeout,
+            recovery_hold_alert_after,
             inventory_staleness_bound,
             transfer_attempt_timeout,
             attestation_retry_deadline,
@@ -478,6 +700,7 @@ impl RebalancingCtx {
         #[builder(default = AllocationCtx::base_test())] allocation: AllocationCtx,
         usdc: Option<ImbalanceThreshold>,
         #[builder(default = Duration::from_secs(30 * 60))] transfer_timeout: Duration,
+        #[builder(default = Duration::from_secs(60 * 60))] recovery_hold_alert_after: Duration,
         #[builder(default = Duration::from_secs(300))] inventory_staleness_bound: Duration,
         #[builder(default = Duration::from_secs(60 * 60))] transfer_attempt_timeout: Duration,
         #[builder(default = Duration::from_secs(24 * 60 * 60))]
@@ -488,8 +711,9 @@ impl RebalancingCtx {
     ) -> Self {
         Self {
             allocation,
-            usdc: usdc.map(base_cctp_corridor),
+            usdc: usdc.map_or_else(UsdcCorridors::base_cctp_disabled, UsdcCorridors::base_cctp),
             transfer_timeout,
+            recovery_hold_alert_after,
             inventory_staleness_bound,
             transfer_attempt_timeout,
             attestation_retry_deadline,
@@ -557,6 +781,7 @@ mod tests {
     fn valid_rebalancing_config_toml() -> &'static str {
         r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -587,7 +812,7 @@ mod tests {
     fn rebalancing_ctx_resolves_the_ethereum_base_corridor() {
         let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
 
-        let ctx = RebalancingCtx::new(&config).unwrap();
+        let ctx = RebalancingCtx::new(&config, BaseCashVault::Held).unwrap();
 
         assert_eq!(ctx.cctp_corridor.usdc_ethereum(), USDC_ETHEREUM);
         assert_eq!(ctx.cctp_corridor.usdc_base(), USDC_BASE);
@@ -623,6 +848,7 @@ mod tests {
         assert!(target.eq(float!(0.5)).unwrap());
         assert!(deviation.eq(float!(0.3)).unwrap());
         assert_eq!(config.transfer_timeout_secs, 1800);
+        assert_eq!(config.recovery_hold_alert_after_secs, 3600);
         assert_eq!(config.transfer_attempt_timeout_secs, 3600);
         assert_eq!(config.attestation_retry_deadline_secs, 86400);
         assert_eq!(config.max_burn_revert_redrives, 5);
@@ -634,6 +860,7 @@ mod tests {
         let config: RebalancingConfig = toml::from_str(
             r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -656,7 +883,9 @@ mod tests {
 
         assert_eq!(config.freeze_check, OperationMode::Disabled);
         assert_eq!(
-            RebalancingCtx::new(&config).unwrap().freeze_check,
+            RebalancingCtx::new(&config, BaseCashVault::Held)
+                .unwrap()
+                .freeze_check,
             OperationMode::Disabled,
             "RebalancingCtx must carry the configured freeze_check through"
         );
@@ -666,6 +895,7 @@ mod tests {
     fn deserialize_missing_freeze_check_fails() {
         let toml_str = r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -700,6 +930,7 @@ mod tests {
         let config: RebalancingConfig = toml::from_str(
             r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 7200
@@ -774,6 +1005,7 @@ mod tests {
     fn deserialize_missing_inventory_staleness_bound_secs_defaults() {
         let toml_str = r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
             settlement_retry_deadline_secs = 86400
@@ -801,9 +1033,20 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_missing_recovery_hold_alert_after_secs_defaults_to_one_hour() {
+        let toml_str =
+            valid_rebalancing_config_toml().replace("recovery_hold_alert_after_secs = 3600\n", "");
+        assert!(!toml_str.contains("recovery_hold_alert_after_secs"));
+
+        let config = toml::from_str::<RebalancingConfig>(&toml_str).unwrap();
+        assert_eq!(config.recovery_hold_alert_after_secs, 3600);
+    }
+
+    #[test]
     fn zero_inventory_staleness_bound_fails_validation() {
         let toml_str = r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 0
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -823,7 +1066,7 @@ mod tests {
         "#;
 
         let config = toml::from_str::<RebalancingConfig>(toml_str).unwrap();
-        let error = RebalancingCtx::new(&config).unwrap_err();
+        let error = RebalancingCtx::new(&config, BaseCashVault::Held).unwrap_err();
         assert!(matches!(
             error,
             RebalancingCtxError::ZeroInventoryStalenessBound
@@ -834,6 +1077,7 @@ mod tests {
     fn deserialize_missing_attestation_retry_deadline_secs_fails() {
         let toml_str = r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             max_burn_revert_redrives = 5
@@ -867,6 +1111,7 @@ mod tests {
         let config: RebalancingConfig = toml::from_str(
             r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 0
@@ -892,7 +1137,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = RebalancingCtx::new(&config).unwrap_err();
+        let error = RebalancingCtx::new(&config, BaseCashVault::Held).unwrap_err();
         assert!(matches!(
             error,
             RebalancingCtxError::ZeroAttestationRetryDeadline
@@ -903,6 +1148,7 @@ mod tests {
     fn deserialize_missing_settlement_retry_deadline_secs_defaults() {
         let toml_str = r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
@@ -933,6 +1179,7 @@ mod tests {
         let config: RebalancingConfig = toml::from_str(
             r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -958,7 +1205,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = RebalancingCtx::new(&config).unwrap_err();
+        let error = RebalancingCtx::new(&config, BaseCashVault::Held).unwrap_err();
         assert!(matches!(
             error,
             RebalancingCtxError::ZeroSettlementRetryDeadline
@@ -970,6 +1217,7 @@ mod tests {
         let config: RebalancingConfig = toml::from_str(
             r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -995,7 +1243,7 @@ mod tests {
         )
         .unwrap();
 
-        let ctx = RebalancingCtx::new(&config).unwrap();
+        let ctx = RebalancingCtx::new(&config, BaseCashVault::Held).unwrap();
         assert_eq!(ctx.settlement_retry_deadline, Duration::from_secs(7200));
     }
 
@@ -1003,6 +1251,7 @@ mod tests {
     fn deserialize_missing_usdc_fails() {
         let toml_str = r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -1029,6 +1278,7 @@ mod tests {
     fn deserialize_missing_transfer_attempt_timeout_secs_fails() {
         let toml_str = r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             attestation_retry_deadline_secs = 86400
             settlement_retry_deadline_secs = 86400
@@ -1063,6 +1313,7 @@ mod tests {
         let config: RebalancingConfig = toml::from_str(
             r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 0
             attestation_retry_deadline_secs = 86400
@@ -1088,10 +1339,48 @@ mod tests {
         )
         .unwrap();
 
-        let error = RebalancingCtx::new(&config).unwrap_err();
+        let error = RebalancingCtx::new(&config, BaseCashVault::Held).unwrap_err();
         assert!(matches!(
             error,
             RebalancingCtxError::ZeroTransferAttemptTimeout
+        ));
+    }
+
+    #[test]
+    fn zero_recovery_hold_alert_after_secs_fails_validation() {
+        let config: RebalancingConfig = toml::from_str(
+            r#"
+            transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 0
+            inventory_staleness_bound_secs = 300
+            transfer_attempt_timeout_secs = 3600
+            attestation_retry_deadline_secs = 86400
+            settlement_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 5
+            freeze_check = "enabled"
+
+            [allocation]
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = 0.2
+            min_operation_usd = 10
+            cooldown_secs = 300
+
+            [usdc]
+            mode = "enabled"
+
+            [usdc.corridors.base]
+            hop = "cctp"
+            target = "0.5"
+            deviation = "0.3"
+        "#,
+        )
+        .unwrap();
+
+        let error = RebalancingCtx::new(&config, BaseCashVault::Held).unwrap_err();
+        assert!(matches!(
+            error,
+            RebalancingCtxError::ZeroRecoveryHoldAlertAfter
         ));
     }
 
@@ -1100,6 +1389,7 @@ mod tests {
         let config: RebalancingConfig = toml::from_str(
             r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -1125,7 +1415,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = RebalancingCtx::new(&config).unwrap_err();
+        let error = RebalancingCtx::new(&config, BaseCashVault::Held).unwrap_err();
         assert!(matches!(
             error,
             RebalancingCtxError::ZeroMaxBurnRevertRedrives
@@ -1137,6 +1427,7 @@ mod tests {
         let config: RebalancingConfig = toml::from_str(
             r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -1158,13 +1449,14 @@ mod tests {
         .unwrap();
 
         // USDC is disabled so the zero-check is skipped.
-        RebalancingCtx::new(&config).unwrap();
+        RebalancingCtx::new(&config, BaseCashVault::Held).unwrap();
     }
 
     #[test]
     fn deserialize_missing_max_burn_revert_redrives_fails() {
         let toml_str = r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -1242,7 +1534,7 @@ mod tests {
         );
         assert_eq!(allocation.cooldown_secs, 600);
 
-        let ctx = RebalancingCtx::new(&config).unwrap();
+        let ctx = RebalancingCtx::new(&config, BaseCashVault::Held).unwrap();
         let allocation = ctx.allocation;
         assert_eq!(allocation.cooldown, Duration::from_secs(600));
         assert!(
@@ -1352,7 +1644,7 @@ mod tests {
         ))
         .unwrap();
 
-        let error = RebalancingCtx::new(&config).unwrap_err();
+        let error = RebalancingCtx::new(&config, BaseCashVault::Held).unwrap_err();
         assert!(matches!(
             error,
             RebalancingCtxError::Allocation(AllocationConfigError::ZeroCooldown)
@@ -1366,6 +1658,7 @@ mod tests {
         let config: RebalancingConfig = toml::from_str(
             r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -1390,7 +1683,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = RebalancingCtx::new(&config).unwrap_err();
+        let error = RebalancingCtx::new(&config, BaseCashVault::Held).unwrap_err();
 
         assert!(
             matches!(error, RebalancingCtxError::RetiredEquityThreshold),
@@ -1405,6 +1698,7 @@ mod tests {
         let config: RebalancingConfig = toml::from_str(
             r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -1422,7 +1716,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = RebalancingCtx::new(&config).unwrap_err();
+        let error = RebalancingCtx::new(&config, BaseCashVault::Held).unwrap_err();
 
         assert!(
             matches!(error, RebalancingCtxError::RetiredEquityThreshold),
@@ -1435,6 +1729,7 @@ mod tests {
         let config: RebalancingConfig = toml::from_str(
             r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -1448,7 +1743,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = RebalancingCtx::new(&config).unwrap_err();
+        let error = RebalancingCtx::new(&config, BaseCashVault::Held).unwrap_err();
 
         assert!(
             matches!(error, RebalancingCtxError::MissingAllocation),
@@ -1467,13 +1762,14 @@ mod tests {
     }
 
     fn corridor_error(usdc: &str) -> RebalancingCtxError {
-        RebalancingCtx::new(&with_usdc(usdc)).unwrap_err()
+        RebalancingCtx::new(&with_usdc(usdc), BaseCashVault::Held).unwrap_err()
     }
 
     #[test]
     fn corridor_table_resolves_the_base_cctp_corridor() {
-        let ctx = RebalancingCtx::new(&with_usdc(
-            r#"
+        let ctx = RebalancingCtx::new(
+            &with_usdc(
+                r#"
             [usdc]
             mode = "enabled"
 
@@ -1482,13 +1778,92 @@ mod tests {
             target = 0.6
             deviation = 0.05
             "#,
-        ))
+            ),
+            BaseCashVault::Held,
+        )
         .unwrap();
 
-        let usdc = ctx.usdc.unwrap();
+        let usdc = ctx.usdc.active().next().unwrap();
         assert_eq!(usdc.corridor, UsdcCorridor::BASE_CCTP);
         assert!(usdc.threshold.target.eq(float!(0.6)).unwrap());
         assert!(usdc.threshold.deviation.eq(float!(0.05)).unwrap());
+    }
+
+    #[test]
+    fn conversion_failure_cooldown_defaults_to_five_minutes() {
+        let ctx = RebalancingCtx::new(
+            &with_usdc(
+                r#"
+            [usdc]
+            mode = "disabled"
+            "#,
+            ),
+            BaseCashVault::Held,
+        )
+        .unwrap();
+
+        assert_eq!(
+            ctx.usdc.conversion_failure_cooldown(),
+            Duration::from_secs(300)
+        );
+    }
+
+    #[test]
+    fn conversion_failure_cooldown_is_read_from_the_usdc_table() {
+        let ctx = RebalancingCtx::new(
+            &with_usdc(
+                r#"
+            [usdc]
+            mode = "disabled"
+            conversion_failure_cooldown_secs = 120
+            "#,
+            ),
+            BaseCashVault::Held,
+        )
+        .unwrap();
+
+        assert_eq!(
+            ctx.usdc.conversion_failure_cooldown(),
+            Duration::from_secs(120)
+        );
+    }
+
+    #[test]
+    fn zero_conversion_failure_cooldown_is_refused() {
+        let error = corridor_error(
+            r#"
+            [usdc]
+            mode = "disabled"
+            conversion_failure_cooldown_secs = 0
+            "#,
+        );
+
+        assert!(
+            matches!(
+                error,
+                RebalancingCtxError::ZeroUsdcConversionFailureCooldown
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn conversion_failure_cooldown_above_one_day_is_refused() {
+        let error = corridor_error(
+            r#"
+            [usdc]
+            mode = "disabled"
+            conversion_failure_cooldown_secs = 86401
+            "#,
+        );
+
+        assert!(
+            matches!(
+                error,
+                RebalancingCtxError::UsdcConversionFailureCooldownTooLong { secs: 86_401 }
+            ),
+            "got {error:?}"
+        );
     }
 
     #[test]
@@ -1735,8 +2110,9 @@ mod tests {
 
     #[test]
     fn legacy_threshold_equal_to_the_corridor_is_accepted() {
-        let ctx = RebalancingCtx::new(&with_usdc(
-            r#"
+        let ctx = RebalancingCtx::new(
+            &with_usdc(
+                r#"
             [usdc]
             mode = "enabled"
             target = 0.6
@@ -1747,10 +2123,15 @@ mod tests {
             target = "0.6"
             deviation = 0.05
             "#,
-        ))
+            ),
+            BaseCashVault::Held,
+        )
         .unwrap();
 
-        assert_eq!(ctx.usdc.unwrap().corridor, UsdcCorridor::BASE_CCTP);
+        assert_eq!(
+            ctx.usdc.active().next().unwrap().corridor,
+            UsdcCorridor::BASE_CCTP
+        );
     }
 
     /// A typo in a corridor table fails the day it is written, not the day
@@ -1780,10 +2161,13 @@ mod tests {
         );
     }
 
+    /// A disabled mode starts no transfers, but every table stays served so
+    /// its in-flight transfers recover.
     #[test]
-    fn disabled_mode_with_a_valid_corridor_starts_no_transfers() {
-        let ctx = RebalancingCtx::new(&with_usdc(
-            r#"
+    fn disabled_mode_still_serves_every_table() {
+        let ctx = RebalancingCtx::new(
+            &with_usdc(
+                r#"
             [usdc]
             mode = "disabled"
 
@@ -1792,14 +2176,36 @@ mod tests {
             target = 0.6
             deviation = 0.05
             "#,
-        ))
+            ),
+            BaseCashVault::Absent,
+        )
         .unwrap();
 
-        let None = ctx.usdc else {
-            panic!(
-                "a disabled mode must start no transfers, got {:?}",
-                ctx.usdc
-            );
-        };
+        assert_eq!(ctx.usdc.active().count(), 0, "got {:?}", ctx.usdc);
+        assert_eq!(
+            ctx.usdc.served(),
+            &BTreeSet::from([UsdcCorridor::BASE_CCTP])
+        );
+    }
+
+    /// With no corridor table Base via CCTP is served only while Base holds a
+    /// cash vault.
+    #[test]
+    fn base_cash_vault_serves_base_cctp_without_a_table() {
+        let config = with_usdc(
+            r#"
+            [usdc]
+            mode = "disabled"
+            "#,
+        );
+
+        let held = RebalancingCtx::new(&config, BaseCashVault::Held).unwrap();
+        let absent = RebalancingCtx::new(&config, BaseCashVault::Absent).unwrap();
+
+        assert_eq!(
+            held.usdc.served(),
+            &BTreeSet::from([UsdcCorridor::BASE_CCTP])
+        );
+        assert!(absent.usdc.served().is_empty(), "got {:?}", absent.usdc);
     }
 }

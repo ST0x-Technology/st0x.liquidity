@@ -15,8 +15,8 @@ Every command that itself submits an onchain operation takes `--network`
 (`base`, `ethereum`, `hyperevm`, `robinhood`; default `base`) and runs on that
 chain's signing wallet. The `transfer` recovery verbs (`recheck`, `resume`,
 `reconcile`, `fail`) take no `--network`: they act on the bot's local records or
-hand the work to the running bot, whose recovery runs on the primary chain's
-services. Two contracts apply to the network-aware commands:
+hand the work to the running bot, which resumes each mint or redemption on the
+chain its record names. Two contracts apply to the network-aware commands:
 
 - Orderbook-backed commands (`vault-deposit`, `vault-withdraw`,
   `vault-withdraw-usdc`, `reset-allowance`, `transfer-equity`, `donate-equity`,
@@ -249,12 +249,12 @@ automated path for this, the operator deposits it. Prerequisites, all per chain:
 - A `[chains.<name>.trading]` table with the chain's orderbook, inventory, vault
   owner, asset table and `redemption_wallet`. The wallet and a deployed wrapper
   vault per equity are required only when the chain rebalances equity (the
-  primary, or a secondary with an equity that has `rebalancing = "enabled"`);
-  the bot fails startup without them there. A hedge-only secondary (every equity
-  `rebalancing = "disabled"`) needs neither: its fills are hedged and nothing is
-  minted, wrapped or redeemed on it, so its startup MAX approvals (and the
-  Turnkey policies `verify-approvals` demands for them) are the single USDC
-  grant alone, with no wrapper to approve. That grant names the chain's
+  primary, or a secondary with an equity that has `rebalancing = "enabled"` or
+  `"paused"`); the bot fails startup without them there. A hedge-only secondary
+  (every equity `rebalancing = "disabled"`) needs neither: its fills are hedged
+  and nothing is minted, wrapped or redeemed on it, so its startup MAX approvals
+  (and the Turnkey policies `verify-approvals` demands for them) are the single
+  USDC grant alone, with no wrapper to approve. That grant names the chain's
   orderbook when its `inventory_mode` is `legacy`, and its configured
   `inventory` when it is `managed`.
 - A signing wallet for the chain in `[wallet]`, funded with native gas, and an
@@ -278,15 +278,275 @@ stox wrap-equity -s COIN -q 10 --network ethereum
 stox vault-deposit --amount 10 --token <wrapped-token> --vault-id <vault-id> --network ethereum
 ```
 
-For USDC, deposit the chain's canonical USDC into the cash vault the same way
+For cash, deposit the chain's settlement stable (USDC, or USDG on Robinhood)
+into the cash vault the same way
 (`vault-deposit --amount <amount> --network ethereum --token <usdc> --vault-id <cash-vault-id>`);
 `vault-withdraw-usdc --amount <amount> --network <chain>` reverses it and
-`reset-allowance --network <chain>` zeroes the orderbook's USDC allowance on
-that chain. `transfer-equity --network <chain>` records the chain it ran on, and
-the server resumes an interrupted transfer with that chain's wallet, vault and
-issuer. A resumed mint (`--issuer-request-id`) must be given the network it
+`reset-allowance --network <chain>` zeroes the orderbook's allowance of that
+settlement stable on that chain; both act on USDG on Robinhood despite the
+command names. `transfer-equity --network <chain>` records the chain it ran on,
+and the server resumes an interrupted transfer with that chain's wallet, vault
+and issuer. A resumed mint (`--issuer-request-id`) must be given the network it
 started on; a `--network` that disagrees with the record is refused, and the
 `transfer` recovery verbs carry no network at all.
+
+Fresh `transfer-equity` mints and redemptions require the listing on the
+selected chain to have `rebalancing = "enabled"`. Paused or disabled listings
+refuse new operations, including manually requested transfers. Resuming a
+persisted mint with `--issuer-request-id` remains available while paused or
+disabled. A persisted mint that the issuer has no record of is not replayed on
+such a listing. The lookup is inconclusive, so the resume errors and leaves the
+mint at `MintRequested` with its reservation. Confirm with the issuer that it
+never received the request, then use `transfer fail --kind mint`.
+
+Without container access, the capital verbs run in the bot through IAP with
+`st0x-liquidity-client --env <env> capital <verb>`, which needs the write tier
+Workspace group and signs with the bot's own wallets:
+
+```bash
+st0x-liquidity-client --env <env> capital vault-deposit --amount 10 --token <wrapped-token> --vault-id <vault-id> --network ethereum
+st0x-liquidity-client --env <env> capital vault-withdraw --amount 10 --token <token> --vault-id <vault-id> --network ethereum
+st0x-liquidity-client --env <env> capital vault-withdraw-usdc --amount <amount> --network <chain>
+st0x-liquidity-client --env <env> capital reset-allowance --network <chain>
+# starts the transfer on the bot's worker and prints its id at once; --chain
+# picks the served corridor and may be left out while the bot serves one
+st0x-liquidity-client --env <env> capital transfer-usdc --direction <to-raindex|to-alpaca> --amount <amount> [--chain <chain>]
+# burns only and prints the burn tx and its status; it prints its operation id
+# to stderr first: rerun with --operation-id <id> to report that same burn
+st0x-liquidity-client --env <env> capital cctp-bridge --from <ethereum|base> --amount <amount> [--operation-id <id>]
+st0x-liquidity-client --env <env> debug cctp complete-mint --burn-tx <burn-tx> --source-chain <ethereum|base>
+# settles a pending burn whose nonce a cancel took (see below)
+st0x-liquidity-client --env <env> capital cctp-burn-supersede --operation-id <id> --superseding-tx <cancel-tx>
+```
+
+`--network` defaults to `base`, as in `st0x-cli`. `capital transfer-usdc` is
+refused with `409` while another USDC transfer is in flight or holds the
+corridor guard, so retrying it cannot start a second transfer alongside the
+first. Like the automatic rebalancer, it is also refused with `409` while a cash
+snapshot divergence is unresolved or the cash balance is restart tainted; retry
+once the inventory poller has cleared it. `capital vault-deposit` is refused
+with `409` while another `capital vault-deposit` that answered with a tx waits
+for that tx's outcome; the lock does not cover the bot's own transfer deposits.
+Likewise `capital vault-withdraw` and `capital vault-withdraw-usdc` share one
+lock: either is refused with `409` while the other, or a rerun of itself, waits
+for the outcome of the tx it answered with. A verb that answered `500` holds no
+lock. `capital transfer-usdc` and `capital cctp-bridge` both answer `503` while
+the Base or Ethereum signing wallet cannot be shown to pay gas: fund a wallet
+that is below its gas threshold, or retry if the message says its balance could
+not be read. `capital cctp-bridge` waits for neither Circle nor the burn's
+receipt: it returns the burn tx as soon as the burn is broadcast, and
+`debug cctp complete-mint` fetches the attestation and mints once Circle has
+attested it.
+
+A bot release from before operation ids ignores the id and burns on every call,
+so the bot ships before this client: after deploy, and after a rollback of the
+bot, a rerun with `--operation-id` against an older bot burns again. The client
+warns when an answer does not echo the operation id and a `status`; then do not
+rerun, and finish that burn with `debug cctp complete-mint`. Every
+`capital cctp-bridge` run prints `operation id <id>` to stderr before it sends
+the request, and the bot records the signed burn under that id before
+broadcasting it. After a timeout, a `502`, any `500` except the one that says
+the bot cannot tell whether the burn was recorded (see below), or any other
+doubt, rerun the same command with `--operation-id <id>`: it never burns a
+second time, and it prints the burn tx of that id with its `status`. A pending
+burn that no node holds is sent again from its recorded bytes, under the
+recovery lock and the driver pause like a new burn, so that rerun can answer
+`409` while another operation holds the lock; retry it. A rerun must repeat the
+same `--from` and `--amount` (or `--all`), else it answers `409`. Without
+`--operation-id` the client generates a new id, which is a new burn. The
+`status` is `pending` (not mined with the required confirmations yet),
+`confirmed` (finish with `complete-mint`), `reverted` (it burned nothing; burn
+again with a new id), `superseded` (another tx took its nonce; it can never
+burn), or `replaced` (a fee bumped copy of the burn burned in its place; the
+printed `burnTx` is that copy, which is the one to pass to `complete-mint`).
+
+After answering, the bot keeps the recovery lock and the driver pause until the
+burn has the source chain's required confirmations (12 blocks on Ethereum in
+production, about two and a half minutes; 3 on Base) or the confirmation wait
+gives up, which takes up to 5 minutes for inclusion plus 30 minutes for the
+confirmations. Until then every verb that takes the recovery lock answers `409`:
+`debug resume`, `debug recheck`, `debug resume-usdc`, `debug reconcile-usdc`,
+`debug fail-usdc-transfer`, `debug fail-equity-transfer`,
+`capital transfer-usdc`, a `capital cctp-bridge` with a new operation id, and
+`debug cctp complete-mint`. Most say
+`A resume or recheck operation is already in progress`; `debug resume` says
+`A resume operation is already in progress` and `debug fail-equity-transfer`
+says `A transfer recovery operation is already in progress`. `complete-mint`
+answers `502` instead while Circle has not attested the burn, since it fetches
+the attestation before it tries the lock; both mean retry. A rerun with the
+burn's own operation id is answered at once while its burn is settled or a node
+holds it; one that must send the burn again waits for the lock like any other.
+After the task finishes, the lock is free again. The outcome is
+`CCTP burn confirmed via API`, `CCTP burn broadcast via API reverted`, or
+`CCTP burn broadcast via API is not confirmed yet` when the receipt wait timed
+out or a drop report or RPC errors left the burn unproven; a rerun with its
+operation id reports its status later. A burn that never confirmed never
+attests, and `complete-mint` keeps answering `502` for it.
+
+At startup the bot reserves the nonce of every pending burn and rebroadcasts it
+before any other send from its wallet (a burn the node already shows mined keeps
+its nonce and is not sent again). A pending burn that will not mine at its fee
+keeps its nonce, and later sends from that wallet queue behind it. To clear it,
+send a 0 value transfer from the bot wallet to itself, with no calldata, at the
+burn's nonce and a higher fee; once that cancel has the chain's required
+confirmations, run
+`capital cctp-burn-supersede --operation-id <id> --superseding-tx <cancel-tx>`.
+The bot checks the cancel is mined from the burn's signer at the burn's nonce
+and is a plain cancel or a revert, then records the burn `superseded` and frees
+its nonce. If a wallet speed up already sent a copy of the burn (the same
+calldata at the same nonce with a higher fee), name that copy instead: the bot
+checks it called the same TokenMessenger with the burn's exact calldata and
+emitted `MessageSent`, records the burn `replaced`, and prints the copy as the
+burn tx to pass to `complete-mint`. Any other successful tx at the nonce is
+refused with `409`, since it may have moved funds. A burn signed by a key the
+bot no longer uses (after a rotation) is never rebroadcast or restored: startup
+pages and skips that chain's approvals and revokes, and a rerun answers `502`.
+Cancel it with the old key at its nonce and settle it the same way: the bot
+checks the cancel against the burn's own signer.
+
+A burn whose receipt succeeded without the CCTP `MessageSent` event pages
+`emitted no MessageSent` and stays `pending`: Circle has nothing to attest, so
+check the configured TokenMessenger before anything else.
+
+`capital vault-deposit`, `capital vault-withdraw`, `capital vault-withdraw-usdc`
+and `capital reset-allowance` also print their tx as soon as it is broadcast,
+and the bot confirms it afterwards, so they answer within the load balancer cut
+even on a chain that needs many confirmations, such as Ethereum's 12. They
+refuse a chain without a `[chains.<name>.trading]` table with `400`, and
+Ethereum has none in staging or prod today. The outcome is
+`Vault operation confirmed via API` or
+`Vault operation broadcast via API did not confirm` for the vault verbs, and
+`Orderbook allowance reset confirmed via API` or
+`Orderbook allowance reset via API did not confirm` for `reset-allowance`, each
+with the tx hash. A vault verb whose confirmation hits any error that does not
+prove the tx's fate (a receipt timeout, a drop report, a transport failure, a
+JSON-RPC error reply) logs that the vault operation broadcast via API is not
+confirmed yet and waits for the receipt again 30 seconds later, still holding
+its lock. A drop report keeps the lock because a lagging or load balanced RPC
+can report a tx dropped while it is still pending elsewhere. Each wait can take
+up to 5 minutes for inclusion plus 30 minutes for the confirmations, so the
+`409` can last for hours. It ends only when the tx's own receipt at the required
+confirmations shows it succeeded or failed, or on a decoded revert, so a vault
+`did not confirm` line is final. A tx that never mines keeps the lock until a
+restart; check the wallet's nonce onchain. For `reset-allowance` it may also
+mean a timeout, so check the tx onchain before retrying. A
+`Vault operation confirmation panicked` line keeps the lock until a restart, and
+the 409 then says the outcome is unknown; check the vault and the wallet onchain
+before rerunning after the restart. A vault send that fails logs
+`Capital route failed onchain`, answers `500`, and frees the lock, but its tx
+may still have gone out, so check the vault and the wallet onchain before
+rerunning. When the allowance is short, `capital vault-deposit` first approves
+and waits for the approve to confirm, so a deposit of a token without the
+startup MAX grant can still time out on a chain that needs many confirmations.
+The answer does not wait for the onchain effect, so the vault balance or the
+allowance may not have changed yet when it arrives. A rerun of a vault verb that
+answered with a tx answers `409` until that tx's outcome line, so it cannot
+withdraw or deposit twice. The `409` then clears on either outcome line, so
+rerun only after a `did not confirm` line: after `confirmed via API` the move
+already happened. The locks live in memory, so after a bot restart check the
+vault onchain before rerunning. A rerun of `capital reset-allowance` sends a
+redundant `approve(0)`, which moves no funds.
+
+A request that times out on the client may still complete in the bot; check the
+bot logs and the chain for the transaction before retrying a vault or allowance
+verb. A `cctp-bridge` rerun with the printed operation id is safe, as described
+above, against a bot that records operation ids. If the logs show
+`Capital route failed onchain` for `cctp-bridge`, the burn was not signed or
+recorded: the balance read, the allowance approve or the Circle fee lookup
+failed, and a rerun with the same operation id burns once. A `500` that says the
+bot cannot tell whether the burn was recorded keeps its nonce reserved until a
+restart: rerun with the same operation id only after the restart. Every capital
+verb answers `503` until the bot finishes starting. The tokenization and issuer
+verbs (`transfer-equity`, `wrap-equity`, `unwrap-equity`, `donate-equity`,
+`dividend-bump`) have no client subcommand and stay on `st0x-cli`.
+
+### Taking a Listing off Rebalancing
+
+To stop equity rebalancing for one symbol on one chain, go through `paused`. Do
+not go straight from `enabled` to `disabled`. A `disabled` listing keeps the
+chain's equity services, its wallet polling and its recovery only while it has
+unfinished equity work: once that work completes, a secondary chain where no
+other equity is `enabled` or `paused` loses them, and tokens left in its wallet
+are no longer seen or recovered. `paused` keeps all of them until you have
+checked that nothing is left. Removing the listing or the chain from config
+while its work is still open refuses startup.
+
+1. In `st0x.registry`, set `rebalancing = "paused"` on
+   `[chains.<chain>.assets.equities.<SYM>]` and publish the token file. The
+   planner and `transfer-equity` start no new mint or redemption for that
+   listing. Transfers already under way, their resume jobs and wallet recovery
+   on that chain run to completion: a paused listing keeps the chain's equity
+   services, so its wallet is still polled.
+2. Wait until nothing for that symbol and chain is in flight. This lists every
+   mint and redemption that has not reached a terminal state:
+
+   ```bash
+   st0x-liquidity-client --env <env> read resource interrupted
+   ```
+
+   For each id it lists, check the chain and symbol in its events:
+
+   ```bash
+   st0x-liquidity-client --env <env> read transfer-events mint <issuer-request-id>
+   st0x-liquidity-client --env <env> read transfer-events redemption <redemption-aggregate-id>
+   ```
+
+   A transfer of this listing that does not finish follows the normal recovery
+   steps in this guide (`transfer recheck`, `transfer resume`, `transfer fail`).
+   A mint that the issuer never received stays at `MintRequested` while paused.
+   Confirm with the issuer, then use `transfer fail --kind mint`.
+3. Set `rebalancing = "disabled"` and publish again.
+
+Pausing does not move the listing's equity off the chain. To move it first, use
+`vault-withdraw`, `unwrap-equity`, then `alpaca-redeem` with the unwrapped
+quantity, while the listing is paused. The chain still counts in the planner's
+total while paused. If the on-chain equity vault read of any listing in that
+total is stale or missing, the planner starts no new rebalancing for the symbol
+on any chain until the read is fresh again or that listing is `disabled`.
+
+Before you publish `paused`, the running bot must read it, and the registry
+validator (`t0/check.jq`) must accept it. On rollback, restore the token value
+before you downgrade the binary. The dashboard shows paused and disabled
+listings with the same red rebalancing indicator, so check the mode in the
+registry, not on the dashboard, before step 3.
+
+### Recovery Holds a Symbol
+
+The page "Recovery has held <SYM> on <chain> since ..." means a wallet recovery
+on that chain owns the symbol, so no new rebalancing of <SYM> starts on any
+chain. Pausing or disabling the listing does not end the hold. The page repeats
+every `recovery_hold_alert_after` while the hold stands.
+
+1. Read the page. When the recovery keeps retrying a mint, it names the recovery
+   id, the mint (issuer request) id and the last error. Otherwise, find the mint
+   in the bot's logs: search for "Mint recovery remains pending" with the symbol
+   and chain; each line has `recovery_id`, `mint_id` and `failure`.
+2. Read the mint's events and the chain:
+
+   ```bash
+   st0x-liquidity-client --env <env> read transfer-events mint <issuer-request-id>
+   ```
+
+   Check the bot wallet on that chain for the symbol's tStock and wrapped token,
+   and the equity vault balance, with a block explorer.
+3. If the last error is transient (RPC, gas, node behind), fix that cause; the
+   next retry finishes the mint and ends the hold.
+4. If the mint cannot finish, run
+
+   ```bash
+   stox transfer fail --kind mint --id <issuer-request-id> --reason "mint cannot finish; handing wallet tokens to orphan recovery"
+   ```
+
+   (see "Force-Failing Stuck Mint or Redemption Transfers"). The recovery's next
+   attempt finds the mint terminal and ends the hold. Tokens still in the wallet
+   are then picked up by the next wallet poll as an orphan recovery, which wraps
+   and deposits them. If that fails too, move them with `wrap-equity` and
+   `vault-deposit`, both with `--network <chain>`. Once the tokens are in the
+   vault, close the failed mint with:
+
+   ```bash
+   stox transfer reconcile --kind mint --id <issuer-request-id> --reason "wallet tokens wrapped and deposited to the vault by hand"
+   ```
 
 ### Orchestrator Rollout per Chain
 
@@ -431,8 +691,12 @@ Not covered by `transfer recheck` yet:
 - Provider rejections. These remain failed unless an operator performs a
   separate manual reconciliation.
 - USDC rebalancing failures. Those use the USDC/CCTP state machine and have
-  their own recovery commands. A manual `transfer-usdc` prints its transfer id
-  and, if interrupted mid-flight, is resumed with
+  their own recovery commands. A manual `transfer-usdc` runs on the served
+  corridor that `--chain <chain>` names; the flag may be left out only while the
+  build serves one corridor, and with several the command refuses and lists
+  them. Only Base via CCTP can execute in this build: on any other served
+  corridor the command refuses before any transfer starts. It prints its
+  transfer id and, if interrupted mid-flight, is resumed with
   `stox transfer resume --kind usdc --id <id> --direction <to-raindex|to-alpaca>`.
   This covers post-burn interruptions and the resumable pre-burn states (a
   BaseToAlpaca `WithdrawalSubmitting`, an AlpacaToBase `Withdrawing` with a
@@ -477,8 +741,12 @@ transfer should be marked resolved rather than left in `Failed`.
 
 `transfer fail --kind redemption` refuses a redemption with a signed vault
 withdrawal (`VaultWithdrawSubmitting` or `VaultWithdrawSubmitted`), because the
-withdrawal can still mine. Verify the withdrawal onchain and reconcile the
-redemption instead (see the `--kind redemption` notes below).
+withdrawal can still mine. Check the withdrawal on chain and reconcile the
+redemption instead (see the `--kind redemption` notes below): a reverted
+withdrawal needs no cancel; one with no receipt whose nonce another tx from the
+bot wallet already used to do the withdrawal itself is adopted with
+`st0x-liquidity-client --env <env> debug adopt-withdrawal`; one with no receipt
+and nothing at its nonce must be cancelled first.
 
 ### Withdrawal poll inconclusive (Alpaca->Base stuck at `Withdrawing`)
 
@@ -585,7 +853,9 @@ guard records the transfers that hold it. Who touches it, and when:
 ### Clearing a pre-burn guard latch
 
 Use `fail-usdc-transfer` when a USDC rebalance is stranded at
-`WithdrawalComplete` or `BridgingSubmitting`. This transitions the aggregate to
+`WithdrawalComplete` or `BridgingSubmitting`, or a Base->Alpaca rebalance is
+stranded at `WithdrawalSubmitting` (see "Withdrawal that never reached the
+chain" below). For the first two it transitions the aggregate to
 `BridgingFailed` (pre-burn, `burn_tx_hash: None`). The guard outcome depends on
 the direction:
 
@@ -637,6 +907,26 @@ that no recent CCTP burn was submitted from the market-maker wallet (e.g. via
   accepts persisted post-burn terminals such as `DepositFailed`). Instead, run
   `transfer resume --kind usdc`: its `find_recent_burn` scan adopts the orphan
   burn, persists `BridgingInitiated`, and the transfer continues normally.
+
+#### Withdrawal that never reached the chain
+
+A Base->Alpaca transfer at `WithdrawalSubmitting` recorded its vault withdrawal
+intent (with `from_block`), but no withdrawal was initiated. A resume only
+adopts a withdrawal mined after `from_block` and never re-issues one, so if none
+landed it scans forever. First check on Base for an `OperatorWithdraw` by the
+bot wallet on the inventory after `from_block` (the latch alert names the
+block). A withdraw the network accepted but has not mined is not in the logs
+yet, so also wait until the transfer's attempt timeout has passed and confirm
+the bot wallet has no pending transaction to the inventory (no pending
+`withdraw4` in the explorer, or pending nonce equal to latest nonce):
+
+- **If one landed**: run `transfer resume --kind usdc`; it adopts it.
+- **If none landed**: run `fail-usdc-transfer`. It sends `RejectWithdrawal`, and
+  the transfer ends in `WithdrawalFailed` with no withdrawal recorded. Nothing
+  moved, so the guard clears. The live route (bot running) clears it at once and
+  kills the transfer's queued job rows; the offline command clears it on
+  restart. Base->Alpaca planning on the corridor then waits for the 30-minute
+  withdraw cooldown and a fresh vault read; both survive a restart.
 
 `transfer reconcile` is the path for persisted terminal failures whose funds
 left the source venue (e.g. `DepositFailed`, `BridgingFailed` with a burn tx
@@ -761,22 +1051,145 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   `--reason` is free text.
 - Reconciling a redemption with a signed vault withdrawal releases the wallet
   nonce reservation of that withdrawal in the running bot, with no restart. The
-  release is bookkeeping only. It does not cancel the withdrawal, and it is the
-  mined replacement below that lets later sends proceed. Reconcile only after
-  another transaction from the bot wallet has mined at the withdrawal's nonce. A
-  withdrawal that is not pending on one node can still mine from another node's
-  mempool or a rebroadcast, so "not pending" is not enough. Send a 0-value
-  self-transfer from the bot wallet at the withdrawal's nonce, with fees above
-  the withdrawal's, and wait until it confirms. Then reconcile. If the
-  withdrawal itself mined and reverted, or mined with no matching vault
-  transfer, it already used the nonce and moved nothing: the bot cannot confirm
-  it and `fail` refuses it, so reconcile directly with no replacement. Only if
-  the withdrawal mined successfully, do not reconcile: the redemption must
-  continue. A live redrive confirms it by itself. If the give-up page fired (the
-  job budget is spent and no job remains), run
-  `stox transfer resume --kind
-  equity` or restart the bot so that a new resume
-  confirms it.
+  release is bookkeeping only. It does not cancel the withdrawal: a withdrawal
+  stuck below the market fee will not confirm at that fee, but it can still mine
+  when fees drop, including from another node's mempool or a rebroadcast. So
+  reconcile refuses unless the chain proves the withdrawal can never land. Check
+  the withdrawal on chain:
+  - Mined successfully: do not reconcile. The withdrawal went through, and
+    reconcile refuses with "the withdrawal went through". A live redrive
+    confirms it by itself. If the give-up page fired (the job budget is spent
+    and no job remains), run `stox transfer resume --kind equity` or restart the
+    bot so that a new resume confirms it.
+  - Mined and reverted: it used the nonce and moved nothing. Once it has the
+    chain's required confirmations (`[chains.<chain>] required_confirmations`),
+    settle the equity by hand and reconcile with no `--superseding-tx`:
+    `stox transfer reconcile --kind redemption --id <id> --reason <reason>`.
+  - No receipt, but another tx from the bot wallet already mined at the
+    withdrawal's nonce and did the withdrawal itself (for example a wallet
+    "speed up" that sent the same `withdraw4` again at a higher fee): do **not**
+    settle the equity by hand or reconcile. The equity moved, and reconcile
+    refuses it as not a plain cancel. Adopt that tx as the redemption's
+    withdrawal instead, against the live bot:
+    `st0x-liquidity-client --env <env> debug adopt-withdrawal <id> --replacement-tx <tx> --reason <reason>`
+    (the API is
+    `POST /liquidity-write/transfers/equity_redemption/{id}/adopt-withdrawal`
+    with `replacementTx` and `reason` in the body; `stox` has no adopt verb).
+    The bot refuses (the API with `409`, naming the failed check) unless `<tx>`
+    is mined from the bot wallet, at the withdrawal's nonce, is not the
+    withdrawal itself, has the chain's required confirmations, succeeded, and is
+    a `withdraw4` to the contract the withdrawal calls, from the same token and
+    vault, and its receipt shows a transfer of that token to the bot wallet; the
+    amount may be smaller but not larger. A reverted tx withdrew nothing:
+    reconcile with it as the `--superseding-tx` instead. After adoption the
+    redemption's redrive confirms `<tx>`, records the vault transfer its receipt
+    shows, releases the withdrawal's nonce and continues with the unwrap and
+    send. After the reconciliation deadline the redrive runs every 30 minutes,
+    so to continue at once, or when the job budget page fired and no job
+    remains, run `stox transfer resume --kind equity` or restart the bot. Once
+    adopted, reconcile always refuses the redemption; the redrive is the only
+    exit. A legacy redemption holding only a withdrawal hash is refused too once
+    that hash mined successfully ("the withdrawal went through").
+  - No receipt (pending, or dropped): do **not** settle the equity or reconcile
+    yet. Cancel it: from the bot wallet on the redemption's chain, send a
+    0-value transfer with no calldata to the wallet itself (any tx type except
+    EIP-7702) at the withdrawal's nonce, with `maxFeePerGas` and
+    `maxPriorityFeePerGas` at least 10% above the withdrawal's. Never fee bump
+    the withdrawal itself (the same call at a higher fee), or cancel through a
+    contract: that can withdraw the vault, and reconcile refuses any successful
+    cancel that is not this plain self-transfer. Wait until the cancel has the
+    chain's required confirmations. If the withdrawal mined instead, follow the
+    cases above. Then settle the equity by hand (the same settlement as for a
+    reverted withdrawal: nothing moved in either case) and run
+    `stox transfer reconcile --kind redemption --id <id> --reason <reason> --superseding-tx <cancel>`
+    (or, against the live bot,
+    `st0x-liquidity-client --env <env> debug reconcile-equity redemption <id> --reason <reason> --superseding-tx <cancel>`;
+    the API takes `supersedingTx` in the body).
+
+  Reconcile reads the redemption's chain and refuses (the API with `409`) unless
+  `<cancel>` is mined from the bot wallet, at the withdrawal's nonce, is not the
+  withdrawal itself, has the chain's required confirmations, and either reverted
+  or is a plain cancel: a 0-value transfer with no calldata to the bot wallet
+  itself, not EIP-7702, whose receipt holds no logs. A vault withdrawal always
+  logs, so a successful cancel with no logs moved nothing, even if code ran at
+  the wallet through an EIP-7702 delegation. Any other successful tx may have
+  withdrawn the vault. Each refusal names the failed check. No receipt for the
+  withdrawal is not proof: a lagging node shows none for one that did mine.
+  "could not read tx" (the API: `502`) is transient; retry. The withdrawal must
+  be signed by the chain's configured bot wallet, since nonces are per sender:
+  one signed by a key rotated out since is refused; cancel it from that key and
+  run the CLI reconcile configured with that key. `--superseding-tx` is refused
+  for a mint and for a redemption with no signed withdrawal or send to the
+  issuer (the API with `400`).
+- A redemption on `SendPending` with a signed send to the issuer follows the
+  same rule: reconcile refuses until the chain proves the send can never land,
+  with the same checks as for a withdrawal. When the market fee rose above the
+  send's, the bot has also signed fee replacements of it: the same transfer at
+  the same nonce, so at most one copy mines. Reconcile checks every copy, and a
+  refusal names the send to the issuer. If any copy mined successfully, do not
+  reconcile: recovery records it as `TokensSent`. If a copy reverted with the
+  required confirmations, it used the shared nonce: reconcile with no
+  `--superseding-tx`. Otherwise cancel it with the same plain 0-value
+  self-transfer at the send's nonce, wait for its required confirmations, and
+  reconcile with `--superseding-tx <cancel>`. Cancel only after the
+  `transfer_timeout` page: from then on the bot stops fee-replacing the send, so
+  it cannot outbid the cancel. Price both of the cancel's fees at least 10%
+  above the newest copy's, which the page names, and above the current market
+  fee.
+- A redemption on `SendPending` with no signed send to the issuer is a legacy
+  row; see
+  [Legacy pending send to the issuer](#legacy-pending-send-to-the-issuer).
+
+### Legacy pending send to the issuer
+
+A binary from before durable sends to the issuer may have left a redemption on
+`SendPending` with no recorded transaction: it may have broadcast the ERC-20
+transfer of the unwrapped tokens to the issuer redemption wallet without storing
+its hash. The bot never signs such a send again. It pages ("legacy pending send
+to the issuer with no recorded transaction") at startup and when the transfer
+times out, keeps the redemption's guard and inflight, and pauses startup
+approvals on that chain. The only exit is `transfer reconcile`, after these
+steps.
+
+1. Read what the redemption unwrapped. The `TokensUnwrapped` payload names the
+   unwrapped token (`underlying_token`), the amount (`unwrapped_amount`, in the
+   token's smallest unit) and the unwrap tx (`unwrap_tx_hash`); the redemption's
+   chain is in its first event:
+
+   ```sql
+   SELECT event_type, payload
+   FROM events
+   WHERE aggregate_type = 'EquityRedemption' AND aggregate_id = '<id>'
+   ORDER BY sequence;
+   ```
+
+2. On a block explorer for that chain, list the bot wallet's transfers of the
+   unwrapped token after the unwrap tx. The old send, if it went out, is a
+   transfer of exactly `unwrapped_amount` to the chain's `redemption_wallet`
+   (`[chains.<name>.trading]`).
+3. Follow up on what you found, before you reconcile. Reconcile stops all
+   tracking of the redemption, so nothing does this afterwards:
+   - **It landed.** The tokens reached the issuer. Find the redemption request
+     for that tx in `stox alpaca-tokenization-requests` and check that Alpaca
+     completed it, so the shares are in the broker account. If Alpaca rejected
+     it or never detected the transfer, raise it with Alpaca first: the bot will
+     not surface that rejection.
+   - **It never went out.** The unwrapped tokens are still in the bot wallet.
+     Once the reconcile releases the redemption's guard, the bot's
+     unwrapped-equity recovery wraps them and deposits them for market making if
+     the listing has `wrapped_equity_recovery = "enabled"`. Otherwise move them
+     by hand: `stox wrap-equity`, then `stox vault-deposit` (add
+     `--network <chain>` off Base), or redeem them with `stox alpaca-redeem`.
+   - **Anything else** (another amount, another recipient, a reverted transfer):
+     stop and escalate. That is not a send this guide covers.
+4. Reconcile with what you found:
+   `stox transfer reconcile --kind redemption --id <id> --reason "<what you found>"`.
+   No `--superseding-tx`: there is no stored send to prove dead.
+
+Reconciling a legacy row writes `OperatorReconciled` after a `SendPending` with
+no stored send, which a binary before durable sends to the issuer cannot replay:
+from then on that binary fails the deploy gate (see "Rollback floor for durable
+sends to the issuer" in SPEC.md).
 
 ### Base->Alpaca deposit send pages
 

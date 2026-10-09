@@ -4,7 +4,6 @@
 //! `CctpBridge`, `RaindexService`, and the `UsdcRebalance` aggregate to
 //! execute USDC transfers between Alpaca and Base.
 
-use alloy::consensus::transaction::SignerRecoverable as _;
 use alloy::consensus::{Transaction as _, TxEnvelope};
 use alloy::eips::eip2718::Decodable2718 as _;
 use alloy::primitives::{Address, B256, TxHash, U256};
@@ -13,19 +12,24 @@ use chrono::{DateTime, Utc};
 use itertools::Itertools;
 use rain_math_float::Float;
 use sqlx::SqlitePool;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
 use st0x_bridge::cctp::{
-    AttestationResponse, CctpBridge, CctpError, MinedTx, MintScanFloorCheck, UsdcTransferStatus,
+    AttestationResponse, CctpBridge, CctpError, MintScanFloorCheck, UsdcTransferStatus,
 };
 use st0x_bridge::corridor::UsdcCorridor;
-use st0x_bridge::{Attestation, Bridge, BridgeDirection, BurnReceipt, BurnTxStatus, MintReceipt};
-use st0x_config::{ALPACA_MINIMUM_WITHDRAWAL, ALPACA_TO_BASE_MINIMUM_TRANSFER, ChainRegistry};
+use st0x_bridge::{
+    Attestation, Bridge, BridgeDirection, BurnReceipt, BurnTxStatus, MintReceipt, RecordedBurnScan,
+};
+use st0x_config::{
+    ALPACA_MINIMUM_WITHDRAWAL, ALPACA_TO_BASE_MINIMUM_TRANSFER, ChainRegistry, RebalancingCtx,
+};
 use st0x_event_sorcery::Store;
-use st0x_evm::{Chain, IERC20, PreparedTransaction, USDC_BASE, Wallet};
+use st0x_evm::{Chain, EvmError, IERC20, MinedTx, PreparedTransaction, Wallet, is_transient_rpc};
 use st0x_execution::alpaca_broker_api::CryptoOrderResponse;
 use st0x_execution::{
     AlpacaAmount, AlpacaBrokerApiError, AlpacaTransferId, AlpacaWalletError, AlpacaWalletService,
@@ -34,10 +38,12 @@ use st0x_execution::{
 };
 use st0x_finance::{HasZero, Usd, Usdc};
 use st0x_float_macro::float;
-use st0x_raindex::{Raindex, RaindexError, RaindexService, RaindexVaultId};
+use st0x_raindex::{Raindex, RaindexError, RaindexService, RaindexVaultId, WithdrawBroadcast};
 
 use super::driver_pause::UsdcDriverGate;
-use super::{DepositSendPending, UnresolvedDepositSend, UsdcTransferError};
+use super::{
+    DepositSendPending, UnresolvedDepositSend, UsdcTransferError, refuse_unserved_corridor,
+};
 use crate::bot_gas::{BotGasOperationCategory, BotGasReceiptCostEnqueuer, RecordBotGasReceiptCost};
 use crate::inventory::view::alpaca_to_base_usdc_capacity;
 use crate::native_gas::{ConfiguredGasReadiness, GasReadiness, TransferGasRoute};
@@ -45,8 +51,9 @@ use crate::rebalancing::equity::RecheckOutcome;
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::usdc_rebalance::{
     ConversionAmounts, DepositSend, EthereumWalletCredit, RebalanceDirection, TransferRef,
-    UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId, deposit_send_recorded_elsewhere,
-    open_ethereum_credits, prepared_deposit_send_ids, withdrawal_tx_recorded_elsewhere,
+    UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId, burn_tx_recorded_elsewhere,
+    deposit_send_recorded_elsewhere, open_ethereum_credits, prepared_deposit_send_ids,
+    withdrawal_tx_recorded_elsewhere,
 };
 
 /// Attempts to commit `RecordPendingBurn` in the detached submit-and-record
@@ -63,11 +70,11 @@ const BURN_RECORD_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 /// Alpaca accepts USD conversion notionals only to whole-cent precision.
 const USD_CONVERSION_NOTIONAL_DECIMAL_PLACES: u8 = 2;
 
-/// A definitive Alpaca `40310000` placement rejection creates no order, so it
-/// is safe to retry this many times inside one durable conversion attempt. The
-/// 2026-08-25 incident missed the balance eleven times and succeeded on the
-/// twelfth; keeping the bound here beside the resize rule makes that operational
-/// contract explicit.
+/// A definitive Alpaca insufficient-balance placement rejection creates no
+/// order, so it is safe to retry this many times inside one durable conversion
+/// attempt. The 2026-08-25 incident missed the balance eleven times and
+/// succeeded on the twelfth; keeping the bound here beside the resize rule makes
+/// that operational contract explicit.
 const USD_CONVERSION_PLACEMENT_ATTEMPTS: u32 = 12;
 
 /// Upper bound on the whole `submit_burn` call -- the allowance check, fee query,
@@ -100,10 +107,10 @@ pub struct UsdcSettlementParams {
     /// `confirmed_at`. Past it the redrive terminalizes via `FailBridging`
     /// instead of re-enqueueing forever.
     pub settlement_retry_deadline: Duration,
-    pub required_confirmations: u64,
-    /// Depth a tx on Ethereum needs before it proves a signed deposit send
-    /// can never mine: Ethereum's own `required_confirmations`. `None` with
-    /// no `[chains.ethereum]` entry, which refuses that proof.
+    /// Ethereum's own `required_confirmations`: the depth the Alpaca
+    /// withdrawal tx needs before its USDC is used, and the depth a tx needs
+    /// before it proves a signed deposit send can never mine. `None` with no
+    /// `[chains.ethereum]` entry, which refuses both checks.
     pub ethereum_required_confirmations: Option<u64>,
     pub reserved_cash: Option<Usd>,
     /// Circle attestation/fee API base URL (test-only override; production
@@ -116,6 +123,30 @@ pub struct UsdcSettlementParams {
     /// `MessageTransmitterV2` contract address (test-only override).
     #[cfg(feature = "test-support")]
     pub message_transmitter: Address,
+}
+
+impl UsdcSettlementParams {
+    /// A cash transfer's settlement tuning. Its depth is Ethereum's: the txs
+    /// it checks against a depth land on Ethereum, whichever chain the
+    /// corridor or the primary is.
+    pub fn for_chains(
+        rebalancing: &RebalancingCtx,
+        chains: &ChainRegistry,
+        reserved_cash: Option<Usd>,
+    ) -> Self {
+        Self {
+            attestation_retry_deadline: rebalancing.attestation_retry_deadline,
+            settlement_retry_deadline: rebalancing.settlement_retry_deadline,
+            ethereum_required_confirmations: chains.required_confirmations(Chain::Ethereum),
+            reserved_cash,
+            #[cfg(feature = "test-support")]
+            circle_api_base: rebalancing.circle_api_base.clone(),
+            #[cfg(feature = "test-support")]
+            token_messenger: rebalancing.token_messenger,
+            #[cfg(feature = "test-support")]
+            message_transmitter: rebalancing.message_transmitter,
+        }
+    }
 }
 
 /// Identifies the market-making endpoints for bridged USDC.
@@ -297,22 +328,30 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> UsdcBridgeHelper for CctpBridge<EthW
     }
 }
 
-/// Classifies a failed vault `withdraw_usdc`. An atomic
-/// [`RaindexError::InsufficientVaultLiquidity`] revert means the vault could not
-/// cover the request; it withdrew nothing (atomic revert), so retrying only
-/// reverts again until the vault is refunded. It is surfaced as a distinct,
+/// Classifies a failed vault `withdraw` that `withdraw_from_vault` did not
+/// fail outright. A [`RaindexError::InsufficientVaultLiquidity`] revert means
+/// the vault could not cover the request, but here a withdraw for this
+/// transfer may have been broadcast (a mined revert, or a resend after the
+/// first raw send may have been accepted). It is surfaced as a distinct,
 /// contextful error the job latches for operator reconciliation (no auto-retry)
 /// rather than the opaque `Vault` wrap, which the job redrives. Any other error
 /// keeps the opaque wrap and the normal redrive path.
-fn classify_vault_withdrawal_error(error: RaindexError) -> UsdcTransferError {
+fn classify_vault_withdrawal_error(
+    id: &UsdcRebalanceId,
+    from_block: u64,
+    error: RaindexError,
+) -> UsdcTransferError {
     match error {
         RaindexError::InsufficientVaultLiquidity {
             token,
             requested,
             received,
+            broadcast,
         } => {
-            warn!(target: "rebalance", %token, %requested, %received, "Vault under-funded on withdraw; latching for operator reconciliation (no auto-retry)");
+            warn!(target: "rebalance", %id, from_block, %token, %requested, %received, %broadcast, "Vault under-funded on withdraw; latching for operator reconciliation (no auto-retry)");
             UsdcTransferError::InsufficientVaultLiquidity {
+                id: id.clone(),
+                from_block,
                 token,
                 requested,
                 received,
@@ -404,7 +443,6 @@ pub struct CrossVenueCashTransfer<Signer: Wallet, B = CctpBridge<Signer, Signer>
     vault_id: RaindexVaultId,
     attestation_retry_deadline: Duration,
     settlement_retry_deadline: Duration,
-    required_confirmations: u64,
     ethereum_required_confirmations: Option<u64>,
     reserved_cash: Option<Usd>,
     gas_readiness: ConfiguredGasReadiness,
@@ -414,7 +452,8 @@ pub struct CrossVenueCashTransfer<Signer: Wallet, B = CctpBridge<Signer, Signer>
     credit_ledger: CreditLedger,
     /// Held across the sign and persist of a deposit send, so a redrive
     /// waits for a timed-out attempt's prepare and takes its persisted send
-    /// instead of signing at the next nonce.
+    /// instead of signing at the next nonce. Shared by every corridor's
+    /// service, since all sign on the one Ethereum wallet.
     deposit_send_prepare: Arc<tokio::sync::Mutex<()>>,
     /// The USDC driver gate the conductor's workers claim. The detached burn
     /// task claims through it too, so an operator pause waits for a burn
@@ -593,6 +632,79 @@ fn mint_can_lie_below_scan_floor(
     }
 }
 
+#[derive(Clone, Copy)]
+enum BurnRecoveryCheck {
+    Required,
+    OptionalPending,
+}
+
+/// An optional pending check cannot exhaust retry budget through RPC unavailability.
+/// Required evidence and actual invalid burn data still use strict classification.
+fn classify_burn_recovery_error(
+    id: &UsdcRebalanceId,
+    error: CctpError,
+    check: BurnRecoveryCheck,
+) -> UsdcTransferError {
+    let pending = match &error {
+        CctpError::ScanInconclusive { .. } => true,
+        CctpError::Evm(error) => {
+            if let EvmError::Transport(_) = error {
+                match check {
+                    BurnRecoveryCheck::OptionalPending => true,
+                    BurnRecoveryCheck::Required => error.is_confirmation_pending(),
+                }
+            } else {
+                error.is_confirmation_pending()
+            }
+        }
+        CctpError::RpcTransport(error) => match check {
+            BurnRecoveryCheck::OptionalPending => true,
+            BurnRecoveryCheck::Required => is_transient_rpc(error),
+        },
+        CctpError::Contract(_)
+        | CctpError::SolType(_)
+        | CctpError::BurnTxPending { .. }
+        | CctpError::Http(_)
+        | CctpError::AttestationNotReady { .. }
+        | CctpError::AttestationTimeout { .. }
+        | CctpError::MalformedAttestation { .. }
+        | CctpError::MessageSentEventNotFound { .. }
+        | CctpError::MintAndWithdrawEventNotFound
+        | CctpError::TxReceiptMissingBlock { .. }
+        | CctpError::TxNotMined { .. }
+        | CctpError::UsdcCreditOverflow { .. }
+        | CctpError::UsdcTransferLogDecode { .. }
+        | CctpError::MessageTooShort { .. }
+        | CctpError::MessageTooShortForRecovery { .. }
+        | CctpError::MessageDestinationDomainMismatch { .. }
+        | CctpError::AlreadyMintedMessageNotFound { .. }
+        | CctpError::MintNotFoundInScanWindow { .. }
+        | CctpError::MintScanFloorBlockMissing { .. }
+        | CctpError::RecoveredMintMessageMismatch { .. }
+        | CctpError::RecoveredMintLogMissingTxHash { .. }
+        | CctpError::RecoveredMintReceiptReverted { .. }
+        | CctpError::RecoveredMintAndWithdrawEventNotFound { .. }
+        | CctpError::PlaceholderNonce
+        | CctpError::MintRecoveryInconclusive { .. }
+        | CctpError::FeeCalculationOverflow
+        | CctpError::Float(_)
+        | CctpError::AmountConversion(_)
+        | CctpError::FastTransferFeeNotAvailable { .. }
+        | CctpError::AmountBelowFastTransferFee { .. }
+        | CctpError::HexDecode(_)
+        | CctpError::FeeValueParse(_) => false,
+    };
+
+    if pending {
+        UsdcTransferError::SettlementCheckTransient {
+            id: id.clone(),
+            source: Box::new(error),
+        }
+    } else {
+        UsdcTransferError::Cctp(Box::new(error))
+    }
+}
+
 /// Classifies a `find_attested_mint` or Circle re-poll failure that recurs on
 /// every retry. Exhaustive so a new `CctpError` needs a decision. The rest
 /// (`None`) redrive, the conservative choice for burned USDC.
@@ -730,7 +842,6 @@ impl<
             vault_id: market_making_endpoints.vault_id,
             attestation_retry_deadline: settlement.attestation_retry_deadline,
             settlement_retry_deadline: settlement.settlement_retry_deadline,
-            required_confirmations: settlement.required_confirmations,
             ethereum_required_confirmations: settlement.ethereum_required_confirmations,
             reserved_cash: settlement.reserved_cash,
             gas_readiness: ConfiguredGasReadiness::default(),
@@ -742,35 +853,14 @@ impl<
     }
 
     /// Refuses, before any call, a transfer this service's corridor does not
-    /// carry: one recorded on another corridor, or a fresh one asking for
-    /// another. The transfer is left untouched. A recorded one that holds the
-    /// guard re-queues its job for a build that serves it and the rebalancing
-    /// service pages once (one that holds none ends its job); a fresh one
-    /// retries and dead-letters, which pages once.
+    /// carry (see [`refuse_unserved_corridor`]).
     fn require_served_corridor(
         &self,
         id: &UsdcRebalanceId,
         requested: UsdcCorridor,
         state: Option<&UsdcRebalance>,
     ) -> Result<(), UsdcTransferError> {
-        let served = self.corridor;
-        let error = match state {
-            Some(state) if state.corridor() != served => UsdcTransferError::CorridorMismatch {
-                id: id.clone(),
-                recorded: state.corridor(),
-                served,
-                holds_guard: state.holds_rebalance_guard(),
-            },
-            None if requested != served => UsdcTransferError::CorridorNotServed {
-                id: id.clone(),
-                requested,
-                served,
-            },
-            Some(_) | None => return Ok(()),
-        };
-
-        error!(target: "rebalance", %id, "{error}");
-        Err(error)
+        refuse_unserved_corridor(id, requested, &BTreeSet::from([self.corridor]), state)
     }
 
     /// Checks the Ethereum wallet against the credits of the open transfers in
@@ -915,12 +1005,17 @@ impl<
         credit_id: &UsdcRebalanceId,
         withdrawal_tx: TxHash,
     ) -> Option<Usdc> {
+        let Some(required) = self.ethereum_required_confirmations else {
+            warn!(target: "rebalance", %credit_id, %withdrawal_tx, error = %EthereumChainMissing, "Cannot confirm the withdrawal tx for the credit ledger");
+            return None;
+        };
+
         match self
             .cctp_bridge
             .ethereum_tx_confirmations(withdrawal_tx)
             .await
         {
-            Ok(Some(confirmations)) if confirmations >= self.required_confirmations => {}
+            Ok(Some(confirmations)) if confirmations >= required => {}
             Ok(_) => return None,
             Err(error) => {
                 warn!(target: "rebalance", %credit_id, %withdrawal_tx, %error, "Could not read the withdrawal tx confirmations for the credit ledger");
@@ -953,6 +1048,14 @@ impl<
         self
     }
 
+    /// Signs and persists deposit sends under `lock`, shared with every other
+    /// service that signs on the same Ethereum wallet.
+    #[must_use]
+    pub(crate) fn with_deposit_send_lock(mut self, lock: Arc<tokio::sync::Mutex<()>>) -> Self {
+        self.deposit_send_prepare = lock;
+        self
+    }
+
     /// Uses the supplied native-gas readiness check before starting a transfer.
     #[must_use]
     pub fn with_gas_readiness(mut self, readiness: Arc<GasReadiness>) -> Self {
@@ -972,7 +1075,7 @@ impl<
     /// enqueueing, or a crash during confirmation could re-submit a second
     /// deposit on resume. There the invariant is preserved differently: the
     /// `DepositInitiated` resume arm repeats this same enqueue call after its
-    /// own `confirm_tx`, since no resume path re-enters `deposit_to_vault`
+    /// own `confirm_tx_receipt`, since no resume path re-enters `deposit_to_vault`
     /// itself once past that state (see that resume arm's comment).
     async fn enqueue_bot_gas_cost(
         &self,
@@ -1619,6 +1722,9 @@ impl<
                 .await
             {
                 Ok(order) => break order,
+                // Only an insufficient-balance rejection can succeed with a
+                // smaller notional. Any other Alpaca rejection, including a
+                // `40310000` "no available quote", takes the fail-once arm below.
                 Err(error @ AlpacaBrokerApiError::UsdConversionInsufficientBalance { .. }) => {
                     if attempt >= USD_CONVERSION_PLACEMENT_ATTEMPTS {
                         warn!(
@@ -2140,10 +2246,10 @@ impl<
                 let TransferRef::OnchainTx(deposit_tx) = deposit_ref else {
                     return Err(UsdcTransferError::DepositRefMustBeOnchain { id: id.clone() });
                 };
-                match self.raindex.confirm_tx(deposit_tx).await {
-                    Ok(()) => {
+                match self.raindex.confirm_tx_receipt(deposit_tx).await {
+                    Ok(receipt) => {
                         // `deposit_to_vault`'s fresh path enqueues the `VaultDeposit`
-                        // bot-gas job right after this same `confirm_tx` call, before
+                        // bot-gas job right after this same `confirm_tx_receipt` call, before
                         // ever reaching `DepositConfirmed`. A crash between
                         // `InitiateDeposit` and that enqueue lands here, and no
                         // resume path re-enters `deposit_to_vault` once past
@@ -2152,16 +2258,16 @@ impl<
                         // `confirm_deposit` advances the aggregate to its terminal
                         // state.
                         self.enqueue_bot_gas_cost(
-                            Chain::Base,
+                            self.corridor.chain(),
                             deposit_tx,
                             BotGasOperationCategory::VaultDeposit,
                         )
                         .await?;
-                        self.confirm_deposit(id).await
+                        self.confirm_deposit(id, receipt.block_number).await
                     }
                     // A dropped tx (gone from the mempool, will never mine) is a
                     // terminal failure -- distinct from a still-pending tx that
-                    // confirm_tx merely couldn't confirm yet. Without this, a
+                    // `confirm_tx_receipt` merely couldn't confirm yet. Without this, a
                     // dropped deposit retries forever until the breaker trips.
                     // Record FailDeposit so an operator can reconcile, then
                     // surface the error.
@@ -2622,6 +2728,9 @@ impl<
         tx: TxHash,
         confirmed_at: DateTime<Utc>,
     ) -> Result<(), UsdcTransferError> {
+        let required = self
+            .ethereum_required_confirmations
+            .ok_or(EthereumChainMissing)?;
         let confirmations = match self.cctp_bridge.ethereum_tx_confirmations(tx).await {
             Ok(confirmations) => confirmations,
             Err(error) => {
@@ -2651,11 +2760,11 @@ impl<
                 Err(UsdcTransferError::WithdrawalTxUnderconfirmed {
                     id: id.clone(),
                     tx,
-                    required: self.required_confirmations,
+                    required,
                     actual: 0,
                 })
             }
-            Some(confirmations) if confirmations < self.required_confirmations => {
+            Some(confirmations) if confirmations < required => {
                 self.check_settlement_deadline(id, confirmed_at, SettlementStall::TxUnderconfirmed)
                     .await?;
                 warn!(
@@ -2663,13 +2772,13 @@ impl<
                     %id,
                     %tx,
                     confirmations,
-                    required = self.required_confirmations,
+                    required,
                     "Withdrawal tx under-confirmed on redrive; retrying"
                 );
                 Err(UsdcTransferError::WithdrawalTxUnderconfirmed {
                     id: id.clone(),
                     tx,
-                    required: self.required_confirmations,
+                    required,
                     actual: confirmations,
                 })
             }
@@ -2882,8 +2991,8 @@ impl<
     ) -> Result<(), UsdcTransferError> {
         let amount_u256 = usdc_to_u256(amount_received)?;
 
-        self.deposit_to_vault(id, amount_u256).await?;
-        self.confirm_deposit(id).await?;
+        let vault_deposit_block = self.deposit_to_vault(id, amount_u256).await?;
+        self.confirm_deposit(id, vault_deposit_block).await?;
 
         Ok(())
     }
@@ -3128,6 +3237,9 @@ impl<
         // apalis redrive the resume path enters
         // continue_alpaca_to_base_from_withdrawal_complete and re-runs this same
         // confirmation check durably before any burn.
+        let required = self
+            .ethereum_required_confirmations
+            .ok_or(EthereumChainMissing)?;
         match self
             .cctp_bridge
             .ethereum_tx_confirmations(withdrawal_tx)
@@ -3146,23 +3258,23 @@ impl<
                 return Err(UsdcTransferError::WithdrawalTxUnderconfirmed {
                     id: id.clone(),
                     tx: withdrawal_tx,
-                    required: self.required_confirmations,
+                    required,
                     actual: 0,
                 });
             }
-            Some(confirmations) if confirmations < self.required_confirmations => {
+            Some(confirmations) if confirmations < required => {
                 warn!(
                     target: "rebalance",
                     %id,
                     tx = %withdrawal_tx,
                     confirmations,
-                    required = self.required_confirmations,
+                    required,
                     "Alpaca withdrawal tx under-confirmed; retrying"
                 );
                 return Err(UsdcTransferError::WithdrawalTxUnderconfirmed {
                     id: id.clone(),
                     tx: withdrawal_tx,
-                    required: self.required_confirmations,
+                    required,
                     actual: confirmations,
                 });
             }
@@ -3632,23 +3744,26 @@ impl<
         Ok(mint_receipt)
     }
 
+    /// Submits, records and confirms the vault deposit, returning the block
+    /// that holds it.
     #[instrument(target = "rebalance", skip(self), fields(%id, %amount), level = tracing::Level::DEBUG)]
     async fn deposit_to_vault(
         &self,
         id: &UsdcRebalanceId,
         amount: U256,
-    ) -> Result<(), UsdcTransferError> {
+    ) -> Result<Option<u64>, UsdcTransferError> {
         // Submit the deposit and persist its tx hash as `InitiateDeposit` BEFORE
         // confirming. `deposit_usdc` would submit AND confirm atomically, only
         // recording the hash afterwards -- a crash during the (potentially long)
         // confirmation wait would leave the aggregate in `Bridged`, and resume
         // would re-enter here and submit a SECOND deposit for the same funds.
         // Persisting the hash first lands a crash in `DepositInitiated`, whose
-        // resume arm re-verifies the recorded tx via `confirm_tx` instead of
+        // resume arm re-verifies the recorded tx via `confirm_tx_receipt` instead of
         // re-depositing.
+        let stable = self.corridor.chain().settlement_stable();
         let deposit_tx = match self
             .raindex
-            .submit_deposit_usdc(self.vault_id, amount)
+            .submit_deposit(stable.address, self.vault_id, amount, stable.decimals)
             .await
         {
             Ok(tx) => tx,
@@ -3678,23 +3793,32 @@ impl<
         // `DepositInitiated` (the hash is persisted) rather than emitting
         // `FailDeposit`: the deposit may still confirm, and the `DepositInitiated`
         // resume arm re-checks it. Propagate so apalis retries from there.
-        self.raindex.confirm_tx(deposit_tx).await?;
+        let receipt = self.raindex.confirm_tx_receipt(deposit_tx).await?;
 
         self.enqueue_bot_gas_cost(
-            Chain::Base,
+            self.corridor.chain(),
             deposit_tx,
             BotGasOperationCategory::VaultDeposit,
         )
         .await?;
 
-        info!(target: "rebalance", %deposit_tx, "Vault deposit submitted, recorded, and confirmed");
-        Ok(())
+        info!(target: "rebalance", %deposit_tx, block_number = ?receipt.block_number, "Vault deposit submitted, recorded, and confirmed");
+        Ok(receipt.block_number)
     }
 
     #[instrument(target = "rebalance", skip(self), fields(%id), level = tracing::Level::DEBUG)]
-    async fn confirm_deposit(&self, id: &UsdcRebalanceId) -> Result<(), UsdcTransferError> {
+    async fn confirm_deposit(
+        &self,
+        id: &UsdcRebalanceId,
+        vault_deposit_block: Option<u64>,
+    ) -> Result<(), UsdcTransferError> {
         self.cqrs
-            .send(id, UsdcRebalanceCommand::ConfirmDeposit)
+            .send(
+                id,
+                UsdcRebalanceCommand::ConfirmDeposit {
+                    vault_deposit_block,
+                },
+            )
             .await?;
 
         info!(target: "rebalance", "Vault deposit confirmed");
@@ -5242,12 +5366,89 @@ impl<
             )
             .await?;
 
-        let withdraw_tx = match self.raindex.withdraw_usdc(self.vault_id, amount_u256).await {
+        let stable = self.corridor.chain().settlement_stable();
+        let withdraw_tx = match self
+            .raindex
+            .withdraw(stable.address, self.vault_id, amount_u256, stable.decimals)
+            .await
+        {
             Ok(tx) => tx,
-            Err(error) => return Err(classify_vault_withdrawal_error(error)),
+            Err(RaindexError::InsufficientVaultLiquidity {
+                token,
+                requested,
+                received,
+                broadcast: WithdrawBroadcast::NotBroadcast,
+            }) => {
+                return Err(self
+                    .reject_unsent_withdrawal(id, from_block, token, requested, received)
+                    .await);
+            }
+            Err(error) => return Err(classify_vault_withdrawal_error(id, from_block, error)),
         };
 
         self.record_vault_withdrawal(id, amount, withdraw_tx).await
+    }
+
+    /// Fails a transfer whose vault withdraw the vault could not cover and the
+    /// evm layer proved was rejected before broadcast. This is the only call
+    /// that issues this transfer's withdraw, and `BeginWithdrawal` precedes
+    /// it, so no withdraw for this transfer exists anywhere and failing it is
+    /// safe. The guard then clears and rebalancing plans again from fresh
+    /// balances instead of resuming into a scan that can never find a
+    /// withdrawal.
+    ///
+    /// If `RejectWithdrawal` cannot be confirmed, the transfer latches as for
+    /// any other under-funded withdraw: a redrive would only scan.
+    async fn reject_unsent_withdrawal(
+        &self,
+        id: &UsdcRebalanceId,
+        from_block: u64,
+        token: Address,
+        requested: U256,
+        received: U256,
+    ) -> UsdcTransferError {
+        warn!(target: "rebalance", %id, %token, %requested, %received, "Vault under-funded; withdraw rejected before broadcast; failing the transfer");
+
+        let rejected = UsdcTransferError::WithdrawalRejectedUnderfunded {
+            id: id.clone(),
+            token,
+            requested,
+            received,
+        };
+        let Err(error) = self
+            .cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::RejectWithdrawal {
+                    reason: format!(
+                        "inventory vault under-funded: requested {requested} of {token}, vault \
+                         could cover {received}; withdraw rejected before broadcast"
+                    ),
+                },
+            )
+            .await
+        else {
+            return rejected;
+        };
+
+        // A reactor error can surface after the event committed.
+        if let Ok(Some(UsdcRebalance::WithdrawalFailed {
+            withdrawal_ref: None,
+            ..
+        })) = self.cqrs.load(id).await
+        {
+            warn!(target: "rebalance", %id, ?error, "RejectWithdrawal committed but reported an error");
+            return rejected;
+        }
+
+        error!(target: "rebalance", %id, ?error, "Failed to record RejectWithdrawal; latching at WithdrawalSubmitting");
+        UsdcTransferError::InsufficientVaultLiquidity {
+            id: id.clone(),
+            from_block,
+            token,
+            requested,
+            received,
+        }
     }
 
     /// Resumes a transfer stalled at `WithdrawalSubmitting` by adopting the
@@ -5267,7 +5468,11 @@ impl<
     ) -> Result<(), UsdcTransferError> {
         let (existing_tx, withdrawn) = self
             .raindex
-            .find_recent_withdrawal(USDC_BASE, self.vault_id, from_block)
+            .find_recent_withdrawal(
+                self.corridor.chain().settlement_stable().address,
+                self.vault_id,
+                from_block,
+            )
             .await
             .map_err(|error| classify_vault_withdrawal_scan_error(id, initiated_at, error))?;
 
@@ -5311,7 +5516,7 @@ impl<
         // succeeds) proceeds to genuinely fail the transfer for
         // reconciliation below.
         self.enqueue_bot_gas_cost(
-            Chain::Base,
+            self.corridor.chain(),
             existing_tx,
             BotGasOperationCategory::VaultWithdraw,
         )
@@ -5356,7 +5561,7 @@ impl<
         // Enqueue BEFORE `Initiate`/`ConfirmWithdrawal` (see
         // `enqueue_bot_gas_cost`'s doc for why the ordering matters here).
         self.enqueue_bot_gas_cost(
-            Chain::Base,
+            self.corridor.chain(),
             withdraw_tx,
             BotGasOperationCategory::VaultWithdraw,
         )
@@ -5412,6 +5617,7 @@ impl<
                 BridgeDirection::BaseToEthereum,
                 amount,
                 self.market_maker_wallet,
+                from_block,
             )
             .await?;
         self.record_cctp_burn(id, BridgeDirection::BaseToEthereum, burn_receipt)
@@ -5443,7 +5649,13 @@ impl<
         pending_burn_tx: Option<TxHash>,
     ) -> Result<BurnReceipt, UsdcTransferError> {
         if let Some(adopted) = self
-            .check_pending_burn(id, BridgeDirection::BaseToEthereum, amount, pending_burn_tx)
+            .check_pending_burn(
+                id,
+                BridgeDirection::BaseToEthereum,
+                amount,
+                pending_burn_tx,
+                from_block,
+            )
             .await?
         {
             return self
@@ -5458,32 +5670,29 @@ impl<
         let reburn_on_empty = pending_burn_tx.is_some();
 
         let burn_receipt = match self
-            .cctp_bridge
-            .find_recent_burn(
-                BridgeDirection::BaseToEthereum,
-                amount,
-                self.market_maker_wallet,
-                from_block,
-            )
-            .await
+            .find_recoverable_burn(id, BridgeDirection::BaseToEthereum, amount, from_block)
+            .await?
         {
-            Ok(Some(existing_tx)) => {
-                info!(target: "rebalance", %existing_tx, "Adopting already-submitted CCTP burn on resume");
-                BurnReceipt {
-                    tx: existing_tx,
+            Some(existing_tx) => {
+                self.recover_unrecorded_burn(
+                    id,
+                    BridgeDirection::BaseToEthereum,
                     amount,
-                }
+                    existing_tx,
+                )
+                .await?
             }
-            Ok(None) if reburn_on_empty => {
+            None if reburn_on_empty => {
                 self.burn_recording_pending(
                     id,
                     BridgeDirection::BaseToEthereum,
                     amount,
                     self.market_maker_wallet,
+                    from_block,
                 )
                 .await?
             }
-            Ok(None) => {
+            None => {
                 error!(
                     target: "rebalance",
                     %id,
@@ -5493,29 +5702,81 @@ impl<
                 );
                 return Err(UsdcTransferError::BurnSubmitInconclusive { id: id.clone() });
             }
-            // ScanInconclusive: the chain head hasn't advanced far enough past
-            // `from_block` to trust an empty scan result. The aggregate is at
-            // `BridgingSubmitting` (a durable state), so return
-            // `SettlementCheckTransient` so the job delayed-redrives instead of
-            // consuming the apalis retry budget.
-            Err(error @ CctpError::ScanInconclusive { .. }) => {
-                warn!(
-                    target: "rebalance",
-                    %id,
-                    "CCTP burn scan on Base inconclusive; will retry after delay"
-                );
-                return Err(UsdcTransferError::SettlementCheckTransient {
-                    id: id.clone(),
-                    source: Box::new(error),
-                });
-            }
-            Err(error) => {
-                warn!(target: "rebalance", "CCTP burn scan on Base failed: {error}");
-                return Err(UsdcTransferError::Cctp(Box::new(error)));
-            }
         };
 
         self.record_cctp_burn(id, BridgeDirection::BaseToEthereum, burn_receipt)
+            .await
+    }
+
+    /// A complete candidate range is needed before excluding foreign claims can
+    /// mean no recoverable burn remains. Never turn a partial scan into absence.
+    async fn find_recoverable_burn(
+        &self,
+        id: &UsdcRebalanceId,
+        direction: BridgeDirection,
+        amount: U256,
+        from_block: u64,
+    ) -> Result<Option<TxHash>, UsdcTransferError> {
+        let candidates = self.cctp_bridge
+            .find_recent_burns(direction, amount, self.market_maker_wallet, from_block)
+            .await
+            .map_err(|error| {
+                warn!(target: "rebalance", %id, ?direction, ?error, "CCTP burn candidate scan failed");
+                match error {
+                    error @ CctpError::ScanInconclusive { .. } =>
+                        UsdcTransferError::SettlementCheckTransient {
+                            id: id.clone(), source: Box::new(error),
+                        },
+                    error => UsdcTransferError::Cctp(Box::new(error)),
+                }
+            })?;
+        for candidate in candidates {
+            if self.check_recovered_burn_ownership(id, candidate).await? {
+                return Ok(Some(candidate));
+            }
+        }
+        Ok(None)
+    }
+
+    /// A stale initial RPC head can include an earlier identical burn. Only
+    /// retained transfer history can rule out another transfer's recorded claim.
+    async fn check_recovered_burn_ownership(
+        &self,
+        id: &UsdcRebalanceId,
+        tx: TxHash,
+    ) -> Result<bool, UsdcTransferError> {
+        let CreditLedger::Wired(pool) = &self.credit_ledger else {
+            error!(target: "rebalance", %id, %tx, "Burn ownership history is not wired; refusing scan adoption");
+            return Err(UsdcTransferError::BurnTxOwnershipUnchecked { id: id.clone(), tx });
+        };
+        let owner = burn_tx_recorded_elsewhere(pool, id, tx)
+            .await
+            .inspect_err(|source| {
+                error!(target: "rebalance", %id, %tx, ?source, "Burn ownership history unavailable; refusing scan adoption");
+            })
+            .map_err(|source| UsdcTransferError::BurnTxOwnershipLookupFailed {
+                id: id.clone(), tx, source,
+            })?;
+        if let Some(recorded_by) = owner {
+            warn!(target: "rebalance", %id, %tx, %recorded_by, "Skipping scan candidate recorded by another transfer");
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    async fn recover_unrecorded_burn(
+        &self,
+        id: &UsdcRebalanceId,
+        direction: BridgeDirection,
+        amount: U256,
+        burn_tx: TxHash,
+    ) -> Result<BurnReceipt, UsdcTransferError> {
+        // Replace a confirmed-reverted hash before awaiting: an unavailable or
+        // cancelled candidate confirmation must never leave permission to reburn.
+        self.cqrs
+            .send(id, UsdcRebalanceCommand::RecordPendingBurn { burn_tx })
+            .await?;
+        self.confirm_recovered_burn(id, direction, amount, burn_tx, BurnRecoveryCheck::Required)
             .await
     }
 
@@ -5555,6 +5816,7 @@ impl<
         direction: BridgeDirection,
         amount: U256,
         recipient: Address,
+        from_block: u64,
     ) -> Result<BurnReceipt, UsdcTransferError> {
         // First attempt.
         let burn_tx = self
@@ -5569,6 +5831,11 @@ impl<
             Err(error) if error.is_revert() => {
                 self.enqueue_cctp_burn_gas_cost(direction, burn_tx).await?;
                 warn!(target: "rebalance", %burn_tx, "CCTP burn reverted on confirm; re-submitting once");
+            }
+            Err(CctpError::Evm(EvmError::TransactionDropped { .. })) => {
+                return self
+                    .recover_suspected_dropped_burn(id, direction, amount, burn_tx, from_block)
+                    .await;
             }
             Err(error) => {
                 warn!(target: "rebalance", "CCTP burn confirm failed: {error}");
@@ -5602,6 +5869,10 @@ impl<
                 self.enqueue_cctp_burn_gas_cost(direction, burn_tx).await?;
                 warn!(target: "rebalance", "CCTP burn reverted on confirm after retry: {error}");
                 Err(UsdcTransferError::BurnRevert(Box::new(error)))
+            }
+            Err(CctpError::Evm(EvmError::TransactionDropped { .. })) => {
+                self.recover_suspected_dropped_burn(id, direction, amount, burn_tx, from_block)
+                    .await
             }
             Err(error) => {
                 warn!(target: "rebalance", "CCTP burn confirm failed: {error}");
@@ -5791,17 +6062,17 @@ impl<
     ///   the resume path must NEVER auto-reburn). See `resume_bridging_submitting`;
     /// - `Err(SettlementCheckTransient)` when the tx is still PENDING (delayed
     ///   redrive -- the caller must NOT reburn); and
-    /// - `Err(BurnTxDropped)` when the tx is classified DROPPED -- TERMINAL. Once a
-    ///   burn tx hash is durably recorded, an ambiguous "dropped" classification
-    ///   (which a load-balanced RPC can produce for a still-pending burn) NEVER
-    ///   auto-issues a second burn; it pages the operator for manual on-chain
-    ///   verification instead.
+    /// - A suspected DROPPED tx is cross-checked against the burn log: a
+    ///   validated match is adopted, unavailable evidence redrives, and only a
+    ///   conclusive empty scan yields terminal `BurnTxDropped`. No outcome
+    ///   auto-issues a second burn from an ambiguous absence.
     async fn check_pending_burn(
         &self,
         id: &UsdcRebalanceId,
         direction: BridgeDirection,
         amount: U256,
         pending_burn_tx: Option<TxHash>,
+        from_block: u64,
     ) -> Result<Option<BurnReceipt>, UsdcTransferError> {
         let Some(burn_tx) = pending_burn_tx else {
             // No recorded hash: fall through to the scan, which ADOPTS an already-mined
@@ -5811,13 +6082,16 @@ impl<
             return Ok(None);
         };
 
+        // `from_block` is the pre-burn chain head the transfer recorded (the
+        // same anchor the log scan uses): the burn can only have mined after
+        // it, so `burn_status` gates its `Dropped` verdict on the polled node
+        // being provably past it rather than trusting a lagging backend.
         let status = self
             .cctp_bridge
-            .burn_status(direction, burn_tx)
+            .burn_status(direction, burn_tx, from_block)
             .await
-            .map_err(|error| UsdcTransferError::SettlementCheckTransient {
-                id: id.clone(),
-                source: Box::new(error),
+            .map_err(|error| {
+                classify_burn_recovery_error(id, error, BurnRecoveryCheck::Required)
             })?;
 
         match status {
@@ -5829,31 +6103,33 @@ impl<
                     "Adopting durably-recorded CCTP burn on resume (mined successfully)"
                 );
                 // Adopt via confirm_burn (not a bare BurnReceipt) so the adopt path
-                // runs the same MessageSent validation as the normal burn path. The
-                // receipt is already mined-success, so a non-revert confirm error
-                // (e.g. MessageSentEventNotFound) is the actionable failure -> Cctp.
-                let burn_receipt = self
+                // runs the same MessageSent validation as the normal burn path.
+                // Freshness/transport failures still retry; invalid MessageSent
+                // evidence surfaces for operator action without adopting a burn.
+                match self
                     .cctp_bridge
                     .confirm_burn(direction, burn_tx, amount)
                     .await
-                    .map_err(|error| {
+                {
+                    Ok(receipt) => Ok(Some(receipt)),
+                    Err(CctpError::Evm(EvmError::TransactionDropped { .. })) => self
+                        .recover_suspected_dropped_burn(id, direction, amount, burn_tx, from_block)
+                        .await
+                        .map(Some),
+                    Err(error) => {
                         warn!(target: "rebalance", %id, %burn_tx, "Adopt-path confirm of recorded burn failed: {error}");
-                        UsdcTransferError::Cctp(Box::new(error))
-                    })?;
-                Ok(Some(burn_receipt))
+                        Err(classify_burn_recovery_error(
+                            id,
+                            error,
+                            BurnRecoveryCheck::Required,
+                        ))
+                    }
+                }
             }
-            BurnTxStatus::Pending => {
-                warn!(
-                    target: "rebalance",
-                    %id,
-                    %burn_tx,
-                    "Recorded CCTP burn not yet mined; will retry after delay (no reburn)"
-                );
-                Err(UsdcTransferError::SettlementCheckTransient {
-                    id: id.clone(),
-                    source: Box::new(CctpError::BurnTxPending { burn_tx }),
-                })
-            }
+            BurnTxStatus::Pending => self
+                .recover_pending_burn(id, direction, amount, burn_tx, from_block)
+                .await
+                .map(Some),
             BurnTxStatus::MinedReverted => {
                 self.enqueue_cctp_burn_gas_cost(direction, burn_tx).await?;
                 warn!(
@@ -5864,17 +6140,53 @@ impl<
                 );
                 Ok(None)
             }
-            BurnTxStatus::Dropped => {
-                // A burn tx hash is durably recorded, so we must NEVER auto-issue a
-                // second burn for an ambiguous "dropped" classification: a
-                // load-balanced RPC can falsely report a still-pending burn as
-                // dropped, and a reburn there would double-burn. Page the operator
-                // for manual on-chain verification instead.
+            BurnTxStatus::Dropped => self
+                .recover_suspected_dropped_burn(id, direction, amount, burn_tx, from_block)
+                .await
+                .map(Some),
+        }
+    }
+
+    /// Positive burn-log evidence can recover a suspected drop; unavailable
+    /// evidence can only defer it, never authorize a second burn.
+    async fn recover_suspected_dropped_burn(
+        &self,
+        id: &UsdcRebalanceId,
+        direction: BridgeDirection,
+        amount: U256,
+        burn_tx: TxHash,
+        from_block: u64,
+    ) -> Result<BurnReceipt, UsdcTransferError> {
+        let scan = self
+            .cctp_bridge
+            .find_recorded_burn(
+                direction,
+                amount,
+                self.market_maker_wallet,
+                from_block,
+                burn_tx,
+            )
+            .await
+            .map_err(|error| {
+                classify_burn_recovery_error(id, error, BurnRecoveryCheck::Required)
+            })?;
+        match scan {
+            RecordedBurnScan::Found => {
+                self.confirm_recovered_burn(
+                    id,
+                    direction,
+                    amount,
+                    burn_tx,
+                    BurnRecoveryCheck::Required,
+                )
+                .await
+            }
+            RecordedBurnScan::Absent => {
                 error!(
                     target: "rebalance",
                     %id,
                     %burn_tx,
-                    "Recorded CCTP burn not mined and no longer in mempool (dropped); \
+                    "Suspected-dropped CCTP burn absent from the DepositForBurn scan; \
                      NOT reburning -- operator must verify on-chain"
                 );
                 Err(UsdcTransferError::BurnTxDropped {
@@ -5882,7 +6194,84 @@ impl<
                     burn_tx,
                 })
             }
+            RecordedBurnScan::Inconclusive => {
+                warn!(target: "rebalance", %id, %burn_tx, "Recorded burn scan cannot establish exact-hash absence");
+                Err(UsdcTransferError::SettlementCheckTransient {
+                    id: id.clone(),
+                    source: Box::new(CctpError::ScanInconclusive { from_block }),
+                })
+            }
         }
+    }
+
+    async fn recover_pending_burn(
+        &self,
+        id: &UsdcRebalanceId,
+        direction: BridgeDirection,
+        amount: U256,
+        burn_tx: TxHash,
+        from_block: u64,
+    ) -> Result<BurnReceipt, UsdcTransferError> {
+        let scan = self
+            .cctp_bridge
+            .find_recorded_burn(direction, amount, self.market_maker_wallet, from_block, burn_tx)
+            .await.map_err(|error| {
+                warn!(target: "rebalance", %id, %burn_tx, %error,
+                    "Optional pending-burn recovery scan unavailable; retaining pending transaction");
+                UsdcTransferError::SettlementCheckTransient { id: id.clone(), source: Box::new(error) }
+            })?;
+        match scan {
+            RecordedBurnScan::Found => {
+                self.confirm_recovered_burn(
+                    id,
+                    direction,
+                    amount,
+                    burn_tx,
+                    BurnRecoveryCheck::OptionalPending,
+                )
+                .await
+            }
+            RecordedBurnScan::Absent | RecordedBurnScan::Inconclusive => {
+                warn!(target: "rebalance", %id, %burn_tx,
+                    "Recorded CCTP burn not proven mined; will retry after delay (no reburn)");
+                Err(UsdcTransferError::SettlementCheckTransient {
+                    id: id.clone(),
+                    source: Box::new(CctpError::BurnTxPending { burn_tx }),
+                })
+            }
+        }
+    }
+
+    async fn confirm_recovered_burn(
+        &self,
+        id: &UsdcRebalanceId,
+        direction: BridgeDirection,
+        amount: U256,
+        burn_tx: TxHash,
+        check: BurnRecoveryCheck,
+    ) -> Result<BurnReceipt, UsdcTransferError> {
+        info!(
+            target: "rebalance",
+            %id,
+            %burn_tx,
+            "CCTP burn candidate found by DepositForBurn scan; validating before adoption"
+        );
+        self.cctp_bridge
+            .confirm_burn(direction, burn_tx, amount)
+            .await
+            .map_err(|error| {
+                warn!(target: "rebalance", %id, %burn_tx, %error, "Scan-recovered burn confirmation failed");
+                if let CctpError::Evm(EvmError::TransactionDropped { .. }) = &error {
+                    // The positive log is not confirmed evidence yet. Redrive
+                    // through fresh drop qualification and the bounded scan.
+                    UsdcTransferError::SettlementCheckTransient {
+                        id: id.clone(),
+                        source: Box::new(error),
+                    }
+                } else {
+                    classify_burn_recovery_error(id, error, check)
+                }
+            })
     }
 
     /// Records the submitted CCTP burn transaction, advancing to `Bridging`.
@@ -5976,6 +6365,7 @@ impl<
                 BridgeDirection::EthereumToBase,
                 amount,
                 self.market_maker_wallet,
+                from_block,
             )
             .await?;
         self.record_cctp_burn(id, BridgeDirection::EthereumToBase, burn_receipt)
@@ -6003,7 +6393,13 @@ impl<
         pending_burn_tx: Option<TxHash>,
     ) -> Result<BurnReceipt, UsdcTransferError> {
         if let Some(adopted) = self
-            .check_pending_burn(id, BridgeDirection::EthereumToBase, amount, pending_burn_tx)
+            .check_pending_burn(
+                id,
+                BridgeDirection::EthereumToBase,
+                amount,
+                pending_burn_tx,
+                from_block,
+            )
             .await?
         {
             return self
@@ -6017,27 +6413,19 @@ impl<
         let reburn_on_empty = pending_burn_tx.is_some();
 
         let burn_receipt = match self
-            .cctp_bridge
-            .find_recent_burn(
-                BridgeDirection::EthereumToBase,
-                amount,
-                self.market_maker_wallet,
-                from_block,
-            )
-            .await
+            .find_recoverable_burn(id, BridgeDirection::EthereumToBase, amount, from_block)
+            .await?
         {
-            Ok(Some(existing_tx)) => {
-                info!(
-                    target: "rebalance",
-                    %existing_tx,
-                    "Adopting already-submitted CCTP burn on Ethereum resume"
-                );
-                BurnReceipt {
-                    tx: existing_tx,
+            Some(existing_tx) => {
+                self.recover_unrecorded_burn(
+                    id,
+                    BridgeDirection::EthereumToBase,
                     amount,
-                }
+                    existing_tx,
+                )
+                .await?
             }
-            Ok(None) if reburn_on_empty => {
+            None if reburn_on_empty => {
                 // The recorded burn reverted, so its credit is still in the
                 // wallet. The reverted hash stays recorded until
                 // `submit_and_record_burn` clears it: it is what lets a restart
@@ -6050,10 +6438,11 @@ impl<
                     BridgeDirection::EthereumToBase,
                     amount,
                     self.market_maker_wallet,
+                    from_block,
                 )
                 .await?
             }
-            Ok(None) => {
+            None => {
                 error!(
                     target: "rebalance",
                     %id,
@@ -6062,26 +6451,6 @@ impl<
                      reconciliation (no auto-reburn)"
                 );
                 return Err(UsdcTransferError::BurnSubmitInconclusive { id: id.clone() });
-            }
-            // ScanInconclusive: the chain head hasn't advanced far enough past
-            // `from_block` to trust an empty scan result. The aggregate is at
-            // `BridgingSubmitting` (a durable state), so return
-            // `SettlementCheckTransient` so the job delayed-redrives instead of
-            // consuming the apalis retry budget.
-            Err(error @ CctpError::ScanInconclusive { .. }) => {
-                warn!(
-                    target: "rebalance",
-                    %id,
-                    "CCTP burn scan on Ethereum inconclusive; will retry after delay"
-                );
-                return Err(UsdcTransferError::SettlementCheckTransient {
-                    id: id.clone(),
-                    source: Box::new(error),
-                });
-            }
-            Err(error) => {
-                warn!(target: "rebalance", "CCTP burn scan on Ethereum failed: {error}");
-                return Err(UsdcTransferError::Cctp(Box::new(error)));
             }
         };
 
@@ -6231,7 +6600,12 @@ impl<
         }
 
         self.cqrs
-            .send(id, UsdcRebalanceCommand::ConfirmDeposit)
+            .send(
+                id,
+                UsdcRebalanceCommand::ConfirmDeposit {
+                    vault_deposit_block: None,
+                },
+            )
             .await?;
 
         info!(target: "rebalance", "Alpaca deposit confirmed");
@@ -6615,7 +6989,8 @@ pub async fn verify_deposit_send_superseded<Helper: UsdcBridgeHelper + ?Sized>(
         return Err(DepositSendNotSuperseded::SupersedingTxIsTheSend { tx });
     }
 
-    let signer = deposit_send_signer(prepared)
+    let signer = prepared
+        .signer()
         .ok_or(DepositSendNotSuperseded::UnreadableDepositSend { tx })?;
     if signer != bot_wallet {
         return Err(DepositSendNotSuperseded::SendSignedByAnotherWallet {
@@ -6634,6 +7009,7 @@ pub async fn verify_deposit_send_superseded<Helper: UsdcBridgeHelper + ?Sized>(
         from,
         nonce: superseding_nonce,
         confirmations,
+        ..
     }) = mined
     else {
         return Err(DepositSendNotSuperseded::SupersedingTxNotMined { superseding });
@@ -6696,14 +7072,6 @@ pub async fn verify_deposit_send_superseded<Helper: UsdcBridgeHelper + ?Sized>(
     Ok(())
 }
 
-/// The account that signed the deposit send.
-fn deposit_send_signer(prepared: &PreparedTransaction) -> Option<Address> {
-    TxEnvelope::decode_2718_exact(prepared.raw().as_ref())
-        .ok()?
-        .recover_signer()
-        .ok()
-}
-
 /// The address a signed deposit send pays: the `to` of its USDC `transfer`.
 fn deposit_send_recipient(prepared: &PreparedTransaction) -> Option<Address> {
     let envelope = TxEnvelope::decode_2718_exact(prepared.raw().as_ref()).ok()?;
@@ -6713,9 +7081,9 @@ fn deposit_send_recipient(prepared: &PreparedTransaction) -> Option<Address> {
 }
 
 /// The configured chains have no Ethereum entry, so there is no depth for
-/// the tx that supersedes a signed deposit send.
+/// the Ethereum txs a cash transfer checks.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
-#[error("no [chains.ethereum] entry: its required_confirmations gates the deposit send check")]
+#[error("no [chains.ethereum] entry: its required_confirmations gates the Ethereum tx checks")]
 pub struct EthereumChainMissing;
 
 /// The depth a tx needs before it proves a signed Alpaca deposit send can
@@ -6873,6 +7241,9 @@ pub(crate) enum CctpMintRecoveryError {
         #[source]
         source: CctpError,
     },
+    /// No service in this build carries the corridor a CCTP burn runs on.
+    #[error("no cash transfer service in this build serves the {corridor} corridor")]
+    CorridorNotServed { corridor: UsdcCorridor },
 }
 
 impl CctpMintRecoveryError {
@@ -7033,10 +7404,12 @@ mod tests {
     use alloy::eips::eip2718::Encodable2718;
     use alloy::eips::eip2930::AccessList;
     use alloy::node_bindings::Anvil;
-    use alloy::primitives::{B256, Bytes, TxKind, address, b256, fixed_bytes};
+    use alloy::primitives::{B256, Bytes, Signature, TxKind, address, b256, fixed_bytes};
     use alloy::providers::ext::AnvilApi as _;
-    use alloy::providers::{Provider, ProviderBuilder};
-    use alloy::rpc::types::TransactionRequest;
+    use alloy::providers::mock::Asserter;
+    use alloy::providers::{Provider, ProviderBuilder, RootProvider};
+    use alloy::rpc::json_rpc::ErrorPayload;
+    use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
     use alloy::signers::SignerSync as _;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::{self, SolCall, SolEvent};
@@ -7046,7 +7419,10 @@ mod tests {
     use reqwest::StatusCode;
     use serde_json::json;
     use sqlx::SqlitePool;
+    use std::num::NonZeroU32;
     use std::str::FromStr;
+    #[cfg(feature = "test-support")]
+    use std::sync::LazyLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::sync::Notify;
@@ -7064,10 +7440,12 @@ mod tests {
         TestMintBurnToken, deploy_cctp_on_chain, link_chains, mint_usdc, set_max_burn_amount,
     };
     use st0x_bridge::corridor::HopKind;
-    use st0x_config::HedgedChain;
+    use st0x_config::{ChainCtx, HedgedChain};
     use st0x_event_sorcery::{AggregateError, LifecycleError, test_store};
     use st0x_evm::local::RawPrivateKeyWallet;
-    use st0x_evm::{AbiDecodedErrorType, Evm, EvmError, IERC20, NoOpErrorRegistry, Wallet};
+    use st0x_evm::{
+        AbiDecodedErrorType, Evm, EvmError, IERC20, NoOpErrorRegistry, USDC_BASE, Wallet,
+    };
     use st0x_execution::{AlpacaTransferId, AlpacaWalletClient, AlpacaWalletError, PollingConfig};
     use st0x_raindex::{RaindexContracts, RaindexService};
 
@@ -7129,20 +7507,29 @@ mod tests {
         ));
     }
 
+    enum BurnScanAnswer {
+        Absent,
+        Found(TxHash),
+        FoundMany(Vec<TxHash>),
+        Failed(fn() -> CctpError),
+    }
+
     /// A minimal bridge double for tests that exercise `burn_recording_pending`.
     ///
     /// By default, `submit_burn` returns a different hash on each call (first:
     /// all-1 bytes, second: all-2 bytes), while `confirm_burn` reverts once and
-    /// then succeeds. Tests can override the number of confirmation reverts or
-    /// supply a `burn_status`; all other Bridge and UsdcBridgeHelper methods
-    /// remain `unimplemented!()`.
+    /// then succeeds. Recovery tests opt into status, scan and confirmation
+    /// outcomes; unrelated Bridge methods remain `unimplemented!()`.
     struct MockBridge {
         submit_call_count: AtomicUsize,
         confirm_call_count: AtomicUsize,
         submit_delay: Duration,
         submit_started: Option<Arc<Notify>>,
         confirm_revert_count: usize,
+        confirm_drop: bool,
+        confirm_error: Option<fn() -> CctpError>,
         burn_status: Option<st0x_bridge::BurnTxStatus>,
+        burn_status_error: Option<fn() -> CctpError>,
         // `unimplemented!()` is the default for `prepare_usdc_on_ethereum`, same
         // as every other unused method on this mock -- so a test that
         // unexpectedly walks into the deposit send still panics loudly. The
@@ -7162,7 +7549,8 @@ mod tests {
         // as a scan of mined logs does while a send is still unmined.
         empty_usdc_scan: bool,
         ledger_probe: Option<LedgerBalanceProbe>,
-        empty_burn_scan: bool,
+        burn_scan: Option<BurnScanAnswer>,
+        burn_scan_calls: Mutex<Vec<(BridgeDirection, U256, Address, u64)>>,
         // Opt-in failing Circle re-poll with the nonce read consumed; see
         // `with_failing_repoll_on_consumed_nonce`.
         repoll_error: Option<fn() -> CctpError>,
@@ -7195,7 +7583,10 @@ mod tests {
                 submit_delay: Duration::ZERO,
                 submit_started: None,
                 confirm_revert_count: 1,
+                confirm_drop: false,
+                confirm_error: None,
                 burn_status: None,
+                burn_status_error: None,
                 send_usdc_tx: None,
                 usdc_prepare_calls: AtomicUsize::new(0),
                 first_usdc_prepare_delay: Duration::ZERO,
@@ -7207,7 +7598,8 @@ mod tests {
                 mined_usdc_sends: Mutex::new(Vec::new()),
                 empty_usdc_scan: false,
                 ledger_probe: None,
-                empty_burn_scan: false,
+                burn_scan: None,
+                burn_scan_calls: Mutex::new(Vec::new()),
                 repoll_error: None,
                 mint_error: None,
                 #[cfg(feature = "test-support")]
@@ -7218,7 +7610,17 @@ mod tests {
         }
 
         fn with_empty_burn_scan(mut self) -> Self {
-            self.empty_burn_scan = true;
+            self.burn_scan = Some(BurnScanAnswer::Absent);
+            self
+        }
+
+        fn with_burn_scan(mut self, answer: BurnScanAnswer) -> Self {
+            self.burn_scan = Some(answer);
+            self
+        }
+
+        fn with_confirm_error(mut self, error: fn() -> CctpError) -> Self {
+            self.confirm_error = Some(error);
             self
         }
 
@@ -7270,6 +7672,11 @@ mod tests {
 
         fn with_confirm_revert_count(mut self, confirm_revert_count: usize) -> Self {
             self.confirm_revert_count = confirm_revert_count;
+            self
+        }
+
+        fn with_confirm_drop(mut self) -> Self {
+            self.confirm_drop = true;
             self
         }
 
@@ -7384,8 +7791,21 @@ mod tests {
             amount: U256,
         ) -> Result<BurnReceipt, CctpError> {
             let count = self.confirm_call_count.fetch_add(1, Ordering::SeqCst);
+            if !self.confirm_drop
+                && let Some(error) = self.confirm_error
+            {
+                return Err(error());
+            }
+
             if count < self.confirm_revert_count {
                 Err(CctpError::Evm(EvmError::Reverted { tx_hash }))
+            } else if self.confirm_drop && count == self.confirm_revert_count {
+                Err(CctpError::Evm(EvmError::TransactionDropped {
+                    tx_hash,
+                    elapsed_secs: 120,
+                }))
+            } else if let Some(error) = self.confirm_error {
+                Err(error())
             } else {
                 Ok(BurnReceipt {
                     tx: tx_hash,
@@ -7398,7 +7818,12 @@ mod tests {
             &self,
             _direction: BridgeDirection,
             _tx_hash: TxHash,
+            _submitted_after_block: u64,
         ) -> Result<st0x_bridge::BurnTxStatus, CctpError> {
+            if let Some(error) = self.burn_status_error {
+                return Err(error());
+            }
+
             let Some(status) = self.burn_status else {
                 unimplemented!("MockBridge: burn_status not used in this test")
             };
@@ -7461,18 +7886,45 @@ mod tests {
             unimplemented!("MockBridge: reconstruct_attestation not used in this test")
         }
 
-        async fn find_recent_burn(
+        async fn find_recent_burns(
             &self,
-            _direction: BridgeDirection,
-            _amount: U256,
-            _recipient: Address,
-            _from_block: u64,
-        ) -> Result<Option<TxHash>, CctpError> {
-            if !self.empty_burn_scan {
-                unimplemented!("MockBridge: find_recent_burn not used in this test")
-            }
+            direction: BridgeDirection,
+            amount: U256,
+            recipient: Address,
+            from_block: u64,
+        ) -> Result<Vec<TxHash>, CctpError> {
+            self.burn_scan_calls
+                .lock()
+                .unwrap()
+                .push((direction, amount, recipient, from_block));
 
-            Ok(None)
+            match self.burn_scan.as_ref() {
+                Some(BurnScanAnswer::Absent) => Ok(Vec::new()),
+                Some(BurnScanAnswer::Found(tx)) => Ok(vec![*tx]),
+                Some(BurnScanAnswer::FoundMany(txs)) => Ok(txs.clone()),
+                Some(BurnScanAnswer::Failed(error)) => Err(error()),
+                None => unimplemented!("MockBridge: find_recent_burn not used in this test"),
+            }
+        }
+
+        async fn find_recorded_burn(
+            &self,
+            direction: BridgeDirection,
+            amount: U256,
+            recipient: Address,
+            from_block: u64,
+            burn_tx: TxHash,
+        ) -> Result<RecordedBurnScan, CctpError> {
+            let candidates = self
+                .find_recent_burns(direction, amount, recipient, from_block)
+                .await?;
+            Ok(if candidates.contains(&burn_tx) {
+                RecordedBurnScan::Found
+            } else if candidates.is_empty() {
+                RecordedBurnScan::Absent
+            } else {
+                RecordedBurnScan::Inconclusive
+            })
         }
 
         async fn find_attested_mint(
@@ -7690,8 +8142,11 @@ mod tests {
             &self,
             direction: BridgeDirection,
             tx_hash: TxHash,
+            submitted_after_block: u64,
         ) -> Result<st0x_bridge::BurnTxStatus, CctpError> {
-            self.inner.burn_status(direction, tx_hash).await
+            self.inner
+                .burn_status(direction, tx_hash, submitted_after_block)
+                .await
         }
 
         async fn poll_attestation(
@@ -7728,15 +8183,15 @@ mod tests {
             self.inner.reconstruct_attestation(message, attestation)
         }
 
-        async fn find_recent_burn(
+        async fn find_recent_burns(
             &self,
             direction: BridgeDirection,
             amount: U256,
             recipient: Address,
             from_block: u64,
-        ) -> Result<Option<TxHash>, CctpError> {
+        ) -> Result<Vec<TxHash>, CctpError> {
             self.inner
-                .find_recent_burn(direction, amount, recipient, from_block)
+                .find_recent_burns(direction, amount, recipient, from_block)
                 .await
         }
 
@@ -7902,8 +8357,11 @@ mod tests {
             &self,
             direction: BridgeDirection,
             tx_hash: TxHash,
+            submitted_after_block: u64,
         ) -> Result<st0x_bridge::BurnTxStatus, CctpError> {
-            self.inner.burn_status(direction, tx_hash).await
+            self.inner
+                .burn_status(direction, tx_hash, submitted_after_block)
+                .await
         }
 
         async fn poll_attestation(
@@ -7938,15 +8396,15 @@ mod tests {
             self.inner.reconstruct_attestation(message, attestation)
         }
 
-        async fn find_recent_burn(
+        async fn find_recent_burns(
             &self,
             direction: BridgeDirection,
             amount: U256,
             recipient: Address,
             from_block: u64,
-        ) -> Result<Option<TxHash>, CctpError> {
+        ) -> Result<Vec<TxHash>, CctpError> {
             self.inner
-                .find_recent_burn(direction, amount, recipient, from_block)
+                .find_recent_burns(direction, amount, recipient, from_block)
                 .await
         }
 
@@ -8109,8 +8567,11 @@ mod tests {
             &self,
             direction: BridgeDirection,
             tx_hash: TxHash,
+            submitted_after_block: u64,
         ) -> Result<st0x_bridge::BurnTxStatus, CctpError> {
-            self.inner.burn_status(direction, tx_hash).await
+            self.inner
+                .burn_status(direction, tx_hash, submitted_after_block)
+                .await
         }
 
         async fn poll_attestation(
@@ -8145,15 +8606,15 @@ mod tests {
             self.inner.reconstruct_attestation(message, attestation)
         }
 
-        async fn find_recent_burn(
+        async fn find_recent_burns(
             &self,
             direction: BridgeDirection,
             amount: U256,
             recipient: Address,
             from_block: u64,
-        ) -> Result<Option<TxHash>, CctpError> {
+        ) -> Result<Vec<TxHash>, CctpError> {
             self.inner
-                .find_recent_burn(direction, amount, recipient, from_block)
+                .find_recent_burns(direction, amount, recipient, from_block)
                 .await
         }
 
@@ -8293,11 +8754,10 @@ mod tests {
         UsdcSettlementParams {
             attestation_retry_deadline: TEST_ATTESTATION_RETRY_DEADLINE,
             settlement_retry_deadline: TEST_SETTLEMENT_RETRY_DEADLINE,
-            required_confirmations: 3,
             ethereum_required_confirmations: Some(3),
             reserved_cash: None,
             #[cfg(feature = "test-support")]
-            circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+            circle_api_base: test_circle_fee_api_base(),
             #[cfg(feature = "test-support")]
             token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
             #[cfg(feature = "test-support")]
@@ -8306,10 +8766,14 @@ mod tests {
     }
 
     async fn create_test_store_instance() -> Arc<Store<UsdcRebalance>> {
+        create_test_store_with_pool().await.0
+    }
+
+    async fn create_test_store_with_pool() -> (Arc<Store<UsdcRebalance>>, SqlitePool) {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
 
-        Arc::new(test_store(pool, ()))
+        (Arc::new(test_store(pool.clone(), ())), pool)
     }
 
     /// Advances aggregate through: Initiate -> ConfirmWithdrawal ->
@@ -8383,9 +8847,14 @@ mod tests {
         .await
         .unwrap();
 
-        cqrs.send(id, UsdcRebalanceCommand::ConfirmDeposit)
-            .await
-            .unwrap();
+        cqrs.send(
+            id,
+            UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            },
+        )
+        .await
+        .unwrap();
     }
 
     fn setup_anvil() -> (TestAnvilInstance, String, B256) {
@@ -8490,9 +8959,14 @@ mod tests {
         deposit_tx: TxHash,
     ) {
         advance_to_deposit_initiated_alpaca_to_base(cqrs, id, amount, deposit_tx).await;
-        cqrs.send(id, UsdcRebalanceCommand::ConfirmDeposit)
-            .await
-            .unwrap();
+        cqrs.send(
+            id,
+            UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            },
+        )
+        .await
+        .unwrap();
     }
 
     /// Drives an Alpaca->Base aggregate through `InitiateConversion` ->
@@ -8504,6 +8978,15 @@ mod tests {
         id: &UsdcRebalanceId,
         amount: Usdc,
     ) {
+        advance_to_attested_alpaca_to_base_on(cqrs, id, amount, UsdcCorridor::BASE_CCTP).await;
+    }
+
+    async fn advance_to_attested_alpaca_to_base_on(
+        cqrs: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        corridor: UsdcCorridor,
+    ) {
         use UsdcRebalanceCommand::*;
 
         let burn_tx =
@@ -8512,7 +8995,7 @@ mod tests {
         cqrs.send(
             id,
             InitiateConversion {
-                corridor: UsdcCorridor::BASE_CCTP,
+                corridor,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -8531,7 +9014,7 @@ mod tests {
         cqrs.send(
             id,
             Initiate {
-                corridor: UsdcCorridor::BASE_CCTP,
+                corridor,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -8571,7 +9054,16 @@ mod tests {
         id: &UsdcRebalanceId,
         amount: Usdc,
     ) {
-        advance_to_attested_alpaca_to_base(cqrs, id, amount).await;
+        advance_to_bridged_alpaca_to_base_on(cqrs, id, amount, UsdcCorridor::BASE_CCTP).await;
+    }
+
+    async fn advance_to_bridged_alpaca_to_base_on(
+        cqrs: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        corridor: UsdcCorridor,
+    ) {
+        advance_to_attested_alpaca_to_base_on(cqrs, id, amount, corridor).await;
 
         let mint_tx =
             fixed_bytes!("0xaaaa111111111111111111111111111111111111111111111111111111111111");
@@ -8665,6 +9157,23 @@ mod tests {
         RawPrivateKeyWallet::new(private_key, base_provider, 1).unwrap()
     }
 
+    #[cfg(feature = "test-support")]
+    fn test_circle_fee_api_base() -> String {
+        static SERVER: LazyLock<MockServer> = LazyLock::new(|| {
+            let server = MockServer::start();
+            server.mock(|when, then| {
+                when.method(GET).path_includes("/v2/burn/USDC/fees/");
+                then.status(200).json_body(json!([
+                    {"finalityThreshold": 1000, "minimumFee": 1},
+                    {"finalityThreshold": 2000, "minimumFee": 0}
+                ]));
+            });
+            server
+        });
+
+        SERVER.base_url()
+    }
+
     fn create_test_onchain_services<Signer: Wallet + Clone>(
         wallet: Signer,
     ) -> (CctpBridge<Signer, Signer>, RaindexService<Signer>) {
@@ -8673,7 +9182,7 @@ mod tests {
             ethereum_wallet: wallet.clone(),
             base_wallet: wallet.clone(),
             #[cfg(feature = "test-support")]
-            circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+            circle_api_base: test_circle_fee_api_base(),
             #[cfg(feature = "test-support")]
             token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
             #[cfg(feature = "test-support")]
@@ -9687,6 +10196,56 @@ mod tests {
         ));
     }
 
+    /// Alpaca returned this body for every `USDCUSD` buy on 2026-10-05 while
+    /// the book had no asks. A smaller notional cannot help.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn no_available_quote_fails_conversion_once_without_resizing() {
+        const NO_AVAILABLE_QUOTE: &str = "order has been rejected due to no available quote for symbol. please reenter with a limit";
+
+        let server = MockServer::start();
+        let withdrawable_cash = create_withdrawable_cash_mock(&server, "100");
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+        let rejected = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(403)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "code": 40_310_000,
+                    "message": NO_AVAILABLE_QUOTE
+                }));
+        });
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let error = manager
+            .execute_usd_to_usdc_conversion(&id, usdc("69.38"))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                UsdcTransferError::AlpacaBrokerApi(AlpacaBrokerApiError::ApiError {
+                    alpaca_code: Some(40_310_000),
+                    ..
+                })
+            ),
+            "expected the raw Alpaca rejection, got {error:?}"
+        );
+        rejected.assert_calls(1);
+        // The broker's startup account read only: no resize re-read.
+        withdrawable_cash.assert_calls(1);
+        let Some(UsdcRebalance::ConversionFailed { reason, .. }) = cqrs.load(&id).await.unwrap()
+        else {
+            panic!("expected ConversionFailed");
+        };
+        assert!(reason.contains(NO_AVAILABLE_QUOTE), "reason: {reason}");
+        assert!(!logs_contain(
+            "USD to USDC conversion failed after exhausting insufficient-balance placement attempts"
+        ));
+    }
+
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn resized_notional_below_transfer_minimum_fails_without_another_placement() {
@@ -10263,9 +10822,14 @@ mod tests {
         .await
         .unwrap();
 
-        cqrs.send(&id, UsdcRebalanceCommand::ConfirmDeposit)
-            .await
-            .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            },
+        )
+        .await
+        .unwrap();
 
         let manager = CrossVenueCashTransfer::new(
             alpaca_broker,
@@ -12151,9 +12715,14 @@ mod tests {
         )
         .await
         .unwrap();
-        cqrs.send(id, UsdcRebalanceCommand::ConfirmDeposit)
-            .await
-            .unwrap();
+        cqrs.send(
+            id,
+            UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            },
+        )
+        .await
+        .unwrap();
         cqrs.send(
             id,
             UsdcRebalanceCommand::InitiatePostDepositConversion {
@@ -13125,9 +13694,14 @@ mod tests {
         )
         .await
         .unwrap();
-        cqrs.send(&id, UsdcRebalanceCommand::ConfirmDeposit)
-            .await
-            .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            },
+        )
+        .await
+        .unwrap();
 
         let _order_mock =
             create_conversion_order_pending_mock(&server, ConversionDirection::UsdcToUsd, "100");
@@ -13183,9 +13757,14 @@ mod tests {
         )
         .await
         .unwrap();
-        cqrs.send(&id, UsdcRebalanceCommand::ConfirmDeposit)
-            .await
-            .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            },
+        )
+        .await
+        .unwrap();
 
         let _conversion_mock =
             create_conversion_order_mock(&server, ConversionDirection::UsdcToUsd, "100");
@@ -13240,9 +13819,14 @@ mod tests {
         )
         .await
         .unwrap();
-        cqrs.send(&id, UsdcRebalanceCommand::ConfirmDeposit)
-            .await
-            .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            },
+        )
+        .await
+        .unwrap();
         cqrs.send(
             &id,
             UsdcRebalanceCommand::InitiatePostDepositConversion {
@@ -14086,9 +14670,14 @@ mod tests {
             fixed_bytes!("0xdddd111111111111111111111111111111111111111111111111111111111111"),
         )
         .await;
-        cqrs.send(&id, UsdcRebalanceCommand::ConfirmDeposit)
-            .await
-            .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            },
+        )
+        .await
+        .unwrap();
 
         let outcome = manager.recheck_deposit(&id, None).await.unwrap();
 
@@ -15875,6 +16464,132 @@ mod tests {
         );
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum DepositConfirmationOutcome {
+        QualifiedDrop,
+        InconclusiveTimeout,
+    }
+
+    /// Supplies the wallet's classified confirmation result, without fabricating
+    /// ownership evidence or waiting through the production inclusion timeout.
+    #[derive(Clone)]
+    struct DepositConfirmationWallet {
+        provider: RootProvider,
+        deposit_tx: TxHash,
+        outcome: DepositConfirmationOutcome,
+        confirmations: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Evm for DepositConfirmationWallet {
+        type Provider = RootProvider;
+
+        fn provider(&self) -> &RootProvider {
+            &self.provider
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Wallet for DepositConfirmationWallet {
+        fn address(&self) -> Address {
+            Address::ZERO
+        }
+
+        async fn sign_typed_data(
+            &self,
+            _json: String,
+            _digest: B256,
+        ) -> Result<Signature, EvmError> {
+            unreachable!("deposit re-verification must not sign");
+        }
+
+        async fn prepare_pending(
+            &self,
+            _contract: Address,
+            _data: Bytes,
+            _note: &str,
+        ) -> Result<PreparedTransaction, EvmError> {
+            unreachable!("deposit re-verification must not prepare another transaction");
+        }
+
+        async fn prepare_pending_with_gas_limit(
+            &self,
+            _contract: Address,
+            _data: Bytes,
+            _unpadded_gas_limit: u64,
+            _note: &str,
+        ) -> Result<PreparedTransaction, EvmError> {
+            unreachable!("deposit re-verification must not prepare another transaction");
+        }
+
+        async fn broadcast_prepared(
+            &self,
+            _prepared: &PreparedTransaction,
+            _note: &str,
+        ) -> Result<TxHash, EvmError> {
+            unreachable!("deposit re-verification must not broadcast");
+        }
+
+        async fn prepare_fee_replacement(
+            &self,
+            _prepared: &PreparedTransaction,
+        ) -> Result<Option<PreparedTransaction>, EvmError> {
+            unreachable!("deposit re-verification must not prepare a fee replacement");
+        }
+
+        async fn discard_prepared(&self, _hash: TxHash) {
+            unreachable!("deposit re-verification must not discard ownership");
+        }
+
+        async fn release_superseded(&self, _hash: TxHash) {
+            unreachable!("deposit re-verification must not release ownership");
+        }
+
+        async fn restore_prepared(&self, _prepared: &PreparedTransaction) {
+            unreachable!("deposit re-verification must not restore ownership");
+        }
+
+        async fn restore_transaction(&self, _hash: TxHash) -> Result<(), EvmError> {
+            unreachable!("deposit re-verification must not restore a transaction");
+        }
+
+        async fn send_pending(
+            &self,
+            _contract: Address,
+            _data: Bytes,
+            _note: &str,
+        ) -> Result<TxHash, EvmError> {
+            unreachable!("deposit re-verification must not submit another transaction");
+        }
+
+        async fn await_receipt(&self, tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
+            assert_eq!(
+                tx_hash, self.deposit_tx,
+                "resume must verify the durable deposit hash"
+            );
+            self.confirmations.fetch_add(1, Ordering::SeqCst);
+            Err(match self.outcome {
+                DepositConfirmationOutcome::QualifiedDrop => EvmError::TransactionDropped {
+                    tx_hash,
+                    elapsed_secs: 30,
+                },
+                DepositConfirmationOutcome::InconclusiveTimeout => EvmError::ReceiptTimeout {
+                    tx_hash,
+                    timeout_secs: 120,
+                },
+            })
+        }
+
+        async fn send(
+            &self,
+            _contract: Address,
+            _data: Bytes,
+            _note: &str,
+        ) -> Result<TransactionReceipt, EvmError> {
+            unreachable!("deposit re-verification must not send another transaction");
+        }
+    }
+
     /// Hypothesis: resuming `resume_alpaca_to_base` from `DepositInitiated`
     /// must re-verify the persisted on-chain deposit tx (status +
     /// configured confirmation depth) before transitioning to
@@ -15886,63 +16601,76 @@ mod tests {
     /// the worker retries instead of silently confirming.
     #[tokio::test]
     async fn resume_alpaca_to_base_from_deposit_initiated_reverifies_deposit_tx() {
-        let server = MockServer::start();
-        let (_anvil, endpoint, private_key) = setup_anvil();
+        assert_deposit_resume_reverifies(DepositConfirmationOutcome::QualifiedDrop).await;
+    }
 
-        let alpaca_broker = InstrumentedAlpacaBroker::new(
-            create_test_broker_service(&server).await,
-            TelemetrySender::disabled(),
-        );
-        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
-        let wallet = create_test_wallet(&endpoint, &private_key);
-        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
+    #[tokio::test]
+    async fn resume_alpaca_to_base_from_deposit_initiated_unknown_submission_stays_retryable() {
+        assert_deposit_resume_reverifies(DepositConfirmationOutcome::InconclusiveTimeout).await;
+    }
+
+    async fn assert_deposit_resume_reverifies(outcome: DepositConfirmationOutcome) {
+        let deposit_tx = TxHash::random();
+        let confirmations = Arc::new(AtomicUsize::new(0));
+        let wallet = DepositConfirmationWallet {
+            provider: ProviderBuilder::new()
+                .disable_recommended_fillers()
+                .connect_mocked_client(Asserter::new()),
+            deposit_tx,
+            outcome,
+            confirmations: Arc::clone(&confirmations),
+        };
+        if outcome == DepositConfirmationOutcome::InconclusiveTimeout {
+            assert!(
+                wallet.transaction_submission(deposit_tx).is_none(),
+                "a restored unknown hash has no drop-qualifying submission identity"
+            );
+        }
         let cqrs = create_test_store_instance().await;
-
-        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
-        let manager = CrossVenueCashTransfer::new(
-            alpaca_broker,
-            alpaca_wallet,
-            Arc::new(cctp_bridge),
-            Arc::new(vault_service),
-            cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(
-                UsdcCorridor::BASE_CCTP,
-                market_maker_wallet,
-                TEST_VAULT_ID,
-            ),
-            &test_settlement_params(),
-            BotGasReceiptCostEnqueuer::Disabled,
-        );
-
         let id = UsdcRebalanceId(Uuid::new_v4());
         let amount = usdc("100");
-        // A persisted deposit tx that never landed on chain (reorged out,
-        // dropped, or never mined): the live anvil node has no record of it, so
-        // `confirm_tx` reports it dropped. Rather than retrying confirm forever
-        // (a transient-vs-dropped confusion), resume must re-verify the tx and,
-        // finding it gone, record a terminal `FailDeposit` for operator
-        // reconciliation -- never blindly transitioning the aggregate to complete.
-        let deposit_tx =
-            fixed_bytes!("0xdddd000000000000000000000000000000000000000000000000000000000001");
-
         advance_to_deposit_initiated_alpaca_to_base(&cqrs, &id, amount, deposit_tx).await;
+        let (manager, _pool, _server) =
+            manager_with_bot_gas_queue(cqrs.clone(), wallet, MockBridge::new()).await;
 
         let error = manager
             .resume_alpaca_to_base(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
-        assert!(
-            matches!(error, UsdcTransferError::Vault(_)),
-            "Resume must surface the unconfirmable deposit as a Vault (confirm_tx) error, \
-             got: {error:?}"
+        assert_eq!(
+            confirmations.load(Ordering::SeqCst),
+            1,
+            "resume must re-verify the persisted hash"
         );
-
+        let UsdcTransferError::Vault(RaindexError::Evm(evm_error)) = error else {
+            panic!("resume must preserve the wallet confirmation failure: {error:?}");
+        };
         let final_state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
-        assert!(
-            matches!(final_state, UsdcRebalance::DepositFailed { .. }),
-            "A dropped deposit tx (will never mine) must transition to `DepositFailed` for \
-             operator reconciliation rather than retrying forever; got: {final_state:?}"
+        match outcome {
+            DepositConfirmationOutcome::QualifiedDrop => {
+                assert!(
+                    matches!(evm_error, EvmError::TransactionDropped { tx_hash, .. } if tx_hash == deposit_tx)
+                );
+                assert!(
+                    matches!(final_state, UsdcRebalance::DepositFailed { .. }),
+                    "a qualified drop must fail the deposit for operator reconciliation: {final_state:?}"
+                );
+            }
+            DepositConfirmationOutcome::InconclusiveTimeout => {
+                assert!(
+                    matches!(evm_error, EvmError::ReceiptTimeout { tx_hash, .. } if tx_hash == deposit_tx)
+                );
+                assert!(
+                    matches!(final_state, UsdcRebalance::DepositInitiated { .. }),
+                    "unknown ownership must retain the pending deposit for retry: {final_state:?}"
+                );
+            }
+        }
+        assert_eq!(
+            deposit_ref_tx(&final_state),
+            deposit_tx,
+            "resume must preserve the original deposit identity"
         );
     }
 
@@ -16856,6 +17584,28 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    /// The withdrawal tx, the deposit send and its cancel all land on
+    /// Ethereum, so a Base primary three deep still checks them five deep.
+    #[test]
+    fn settlement_params_check_ethereum_txs_at_ethereums_depth() {
+        let mut chains = ChainRegistry::single_hedged_chain(
+            HedgedChain::test().required_confirmations(3).call(),
+        );
+        let rebalancing = RebalancingCtx::stub().call();
+
+        let without_ethereum = UsdcSettlementParams::for_chains(&rebalancing, &chains, None);
+        assert_eq!(without_ethereum.ethereum_required_confirmations, None);
+
+        chains.insert_transport(ChainCtx {
+            chain: Chain::Ethereum,
+            rpc_url: "http://127.0.0.1:0".parse().unwrap(),
+            required_confirmations: 5,
+        });
+        let settlement = UsdcSettlementParams::for_chains(&rebalancing, &chains, None);
+
+        assert_eq!(settlement.ethereum_required_confirmations, Some(5));
     }
 
     /// The cancel lands on Ethereum, so it needs Ethereum's depth, not the
@@ -17993,6 +18743,50 @@ mod tests {
         assert!(bridge.usdc_discarded().is_empty(), "no nonce is released");
     }
 
+    /// Two corridors' services signing on the one Ethereum wallet share the
+    /// deposit-send lock, so a prepare on one waits for the other's and takes
+    /// its persisted send.
+    #[tokio::test]
+    async fn services_sharing_the_deposit_send_lock_sign_once() {
+        let bridge = Arc::new(
+            MockBridge::new()
+                .with_send_usdc_tx(MOCK_DEPOSIT_SEND_TX)
+                .with_first_usdc_prepare_delay(Duration::from_millis(300)),
+        );
+        let cqrs = create_test_store_instance().await;
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let (first_service, _first_server, _first_anvil) =
+            deposit_send_manager(cqrs.clone(), Arc::clone(&bridge)).await;
+        let (second_service, _second_server, _second_anvil) =
+            deposit_send_manager(cqrs.clone(), Arc::clone(&bridge)).await;
+        let first_service = first_service.with_deposit_send_lock(Arc::clone(&lock));
+        let second_service = second_service.with_deposit_send_lock(lock);
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        stage_bridged_with_mint_tx(&cqrs, &id, usdc("100"), usdc("99.99"), TxHash::ZERO).await;
+        let deposit_address = Address::random();
+        let amount = U256::from(99_990_000);
+
+        let (first, second) = tokio::join!(
+            first_service.prepare_and_persist_deposit_send(&id, deposit_address, amount),
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                second_service
+                    .prepare_and_persist_deposit_send(&id, deposit_address, amount)
+                    .await
+            },
+        );
+
+        let (first, _) = first.expect("the first prepare persists its send");
+        let (second, _) = second.expect("the second takes the persisted send");
+        assert_eq!(bridge.usdc_prepare_calls(), 1, "only one send is signed");
+        assert_eq!(
+            (second.tx_hash(), second.nonce()),
+            (first.tx_hash(), first.nonce())
+        );
+        assert!(bridge.usdc_discarded().is_empty(), "no nonce is released");
+    }
+
     /// Startup restores the nonce of every signed send still on `Bridged`,
     /// recorded or not, and of no other transfer.
     #[tokio::test]
@@ -18751,48 +19545,6 @@ mod tests {
         let (manager, cqrs) =
             build_manager_with_ethereum_chain(&chain, server, market_maker_wallet).await;
         (manager, cqrs, chain)
-    }
-
-    /// Like [`build_manager_with_ethereum_chain`] but applies the fast burn-drop
-    /// policy so an absent recorded burn tx classifies as `Dropped` immediately
-    /// (no production 30 s grace), letting the dropped-burn resume test run fast.
-    #[cfg(feature = "test-support")]
-    async fn build_manager_with_ethereum_chain_fast_burn_drop(
-        chain: &EthereumUsdcChain,
-        server: &MockServer,
-        market_maker_wallet: Address,
-    ) -> (
-        CrossVenueCashTransfer<
-            RawPrivateKeyWallet<impl alloy::providers::Provider + Clone + use<>>,
-        >,
-        Arc<Store<UsdcRebalance>>,
-    ) {
-        let alpaca_broker = InstrumentedAlpacaBroker::new(
-            create_test_broker_service(server).await,
-            TelemetrySender::disabled(),
-        );
-        let alpaca_wallet = Arc::new(create_test_wallet_service(server));
-        let wallet = create_test_wallet(&chain.endpoint, &chain.bot_key);
-        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
-        let cctp_bridge = cctp_bridge.with_fast_burn_drop_policy();
-        let cqrs = create_test_store_instance().await;
-
-        let manager = CrossVenueCashTransfer::new(
-            alpaca_broker,
-            alpaca_wallet,
-            Arc::new(cctp_bridge),
-            Arc::new(vault_service),
-            cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(
-                UsdcCorridor::BASE_CCTP,
-                market_maker_wallet,
-                TEST_VAULT_ID,
-            ),
-            &test_settlement_params(),
-            BotGasReceiptCostEnqueuer::Disabled,
-        );
-
-        (manager, cqrs)
     }
 
     /// Stages the aggregate at `WithdrawalComplete` (AlpacaToBase direction)
@@ -20038,6 +20790,7 @@ mod tests {
             &UsdcRebalanceEvent::DepositConfirmed {
                 direction: RebalanceDirection::AlpacaToBase,
                 deposit_confirmed_at: Utc::now(),
+                vault_deposit_block: None,
             },
         )
         .await;
@@ -20609,6 +21362,112 @@ mod tests {
                 }
             ),
             "Aggregate must advance to WithdrawalComplete when tx is under-confirmed; got: {state:?}"
+        );
+    }
+
+    /// With no `[chains.ethereum]` entry the withdrawal tx has no depth to
+    /// reach, so the check refuses rather than borrowing another chain's.
+    #[tokio::test]
+    async fn withdrawal_tx_check_refuses_without_an_ethereum_depth() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain = deploy_ethereum_usdc_chain_with_balance(U256::ZERO, market_maker_wallet).await;
+        let server = MockServer::start();
+        let (mut manager, cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+        manager.ethereum_required_confirmations = None;
+        let transfer_uuid = Uuid::new_v4();
+        let _transfer_mock =
+            mock_complete_withdrawal_with_tx(&server, transfer_uuid, Some(chain.mint_tx));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let withdrawal_id = AlpacaTransferId::from(transfer_uuid);
+        for command in [
+            UsdcRebalanceCommand::InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            },
+            UsdcRebalanceCommand::ConfirmConversion {
+                conversion: par_conversion(amount),
+            },
+            UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                withdrawal: TransferRef::AlpacaId(withdrawal_id),
+            },
+        ] {
+            cqrs.send(&id, command).await.unwrap();
+        }
+
+        let error = manager
+            .poll_and_confirm_withdrawal(&id, &withdrawal_id, Utc::now())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::EthereumChainMissing(_)),
+            "got: {error:?}"
+        );
+    }
+
+    /// The redrive re-check refuses too: a mined tx that passes at a
+    /// configured depth fails without one instead of borrowing another depth.
+    #[tokio::test]
+    async fn redrive_withdrawal_tx_check_refuses_without_an_ethereum_depth() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain = deploy_ethereum_usdc_chain_with_balance(U256::ZERO, market_maker_wallet).await;
+        let server = MockServer::start();
+        let (mut manager, _cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        manager.ethereum_required_confirmations = Some(1);
+        manager
+            .require_withdrawal_tx_confirmed(&id, chain.mint_tx, Utc::now())
+            .await
+            .unwrap();
+
+        manager.ethereum_required_confirmations = None;
+        let error = manager
+            .require_withdrawal_tx_confirmed(&id, chain.mint_tx, Utc::now())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::EthereumChainMissing(_)),
+            "got: {error:?}"
+        );
+    }
+
+    /// The credit ledger counts a confirmed withdrawal credit at a configured
+    /// depth, and none without one instead of borrowing another depth.
+    #[tokio::test]
+    async fn withdrawal_credit_is_unconfirmed_without_an_ethereum_depth() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain =
+            deploy_ethereum_usdc_chain_with_balance(U256::from(1_000_000u64), market_maker_wallet)
+                .await;
+        let server = MockServer::start();
+        let (mut manager, _cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+        let credit_id = UsdcRebalanceId(Uuid::new_v4());
+
+        manager.ethereum_required_confirmations = Some(1);
+        assert_eq!(
+            manager
+                .confirmed_withdrawal_credit(&credit_id, chain.mint_tx)
+                .await,
+            Some(usdc("1"))
+        );
+
+        manager.ethereum_required_confirmations = None;
+        assert_eq!(
+            manager
+                .confirmed_withdrawal_credit(&credit_id, chain.mint_tx)
+                .await,
+            None
         );
     }
 
@@ -22501,7 +23360,7 @@ mod tests {
                 corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                circle_api_base: test_circle_fee_api_base(),
                 token_messenger: chains.token_messenger,
                 message_transmitter: chains.message_transmitter,
             })
@@ -22551,7 +23410,7 @@ mod tests {
             },
             chains.bot_address,
         );
-        let cqrs = create_test_store_instance().await;
+        let (cqrs, pool) = create_test_store_with_pool().await;
         let manager = CrossVenueCashTransfer::new(
             alpaca_broker,
             alpaca_wallet,
@@ -22565,7 +23424,8 @@ mod tests {
             ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
-        );
+        )
+        .with_credit_ledger(pool);
 
         let id = UsdcRebalanceId(Uuid::new_v4());
         advance_to_bridging_submitting_alpaca_to_base(&cqrs, &id, amount, from_block).await;
@@ -22612,6 +23472,1649 @@ mod tests {
             ),
             "Aggregate must reach Bridging with the adopted burn tx; got: {state:?}"
         );
+    }
+
+    async fn dropped_burn_fixture(
+        direction: BridgeDirection,
+        scan: BurnScanAnswer,
+        confirm_error: Option<fn() -> CctpError>,
+    ) -> (
+        CrossVenueCashTransfer<impl Wallet + Clone, MockBridge>,
+        UsdcRebalanceId,
+        MockServer,
+    ) {
+        let cqrs = create_test_store_instance().await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        match direction {
+            BridgeDirection::BaseToEthereum => {
+                advance_to_bridging_submitting_base_to_alpaca(&cqrs, &id, amount, 42).await;
+            }
+            BridgeDirection::EthereumToBase => {
+                advance_to_bridging_submitting_alpaca_to_base(&cqrs, &id, amount, 42).await;
+            }
+        }
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::RecordPendingBurn {
+                burn_tx: TxHash::from([7; 32]),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut bridge = MockBridge::new()
+            .with_burn_status(BurnTxStatus::Dropped)
+            .with_burn_scan(scan)
+            .with_confirm_revert_count(0);
+        if let Some(error) = confirm_error {
+            bridge = bridge.with_confirm_error(error);
+        }
+        let key = b256!("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+        let wallet = create_test_wallet("http://127.0.0.1:1", &key);
+        let (manager, _pool, server) = manager_with_bot_gas_queue(cqrs, wallet, bridge).await;
+        (manager, id, server)
+    }
+
+    async fn resume_dropped_burn<Signer: Wallet>(
+        manager: &CrossVenueCashTransfer<Signer, MockBridge>,
+        id: &UsdcRebalanceId,
+        direction: BridgeDirection,
+    ) -> Result<BurnReceipt, UsdcTransferError> {
+        let amount = usdc_to_u256(usdc("100")).unwrap();
+        let recorded = Some(TxHash::from([7; 32]));
+        match direction {
+            BridgeDirection::BaseToEthereum => {
+                manager
+                    .resume_bridging_submitting(id, amount, 42, recorded)
+                    .await
+            }
+            BridgeDirection::EthereumToBase => {
+                manager
+                    .resume_bridging_submitting_ethereum(id, amount, 42, recorded)
+                    .await
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum BurnCandidateClaim {
+        Unclaimed,
+        Own,
+        Other,
+    }
+
+    async fn generic_burn_scan_fixture(
+        direction: BridgeDirection,
+        pending: Option<TxHash>,
+        claim: BurnCandidateClaim,
+    ) -> (
+        CrossVenueCashTransfer<impl Wallet + Clone, MockBridge>,
+        UsdcRebalanceId,
+        SqlitePool,
+        MockServer,
+    ) {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let previous = UsdcRebalanceId(Uuid::new_v4());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let candidate = TxHash::from([8; 32]);
+        for transfer in [&previous, &id] {
+            match direction {
+                BridgeDirection::BaseToEthereum => {
+                    advance_to_bridging_submitting_base_to_alpaca(&cqrs, transfer, usdc("100"), 42)
+                        .await;
+                }
+                BridgeDirection::EthereumToBase => {
+                    advance_to_bridging_submitting_alpaca_to_base(&cqrs, transfer, usdc("100"), 42)
+                        .await;
+                }
+            }
+        }
+        let owner = match claim {
+            BurnCandidateClaim::Unclaimed => None,
+            BurnCandidateClaim::Own => Some(&id),
+            BurnCandidateClaim::Other => Some(&previous),
+        };
+        if let Some(owner) = owner {
+            cqrs.send(
+                owner,
+                UsdcRebalanceCommand::RecordPendingBurn { burn_tx: candidate },
+            )
+            .await
+            .unwrap();
+            cqrs.send(owner, UsdcRebalanceCommand::ClearPendingBurn)
+                .await
+                .unwrap();
+        }
+        if let Some(burn_tx) = pending {
+            cqrs.send(&id, UsdcRebalanceCommand::RecordPendingBurn { burn_tx })
+                .await
+                .unwrap();
+        }
+        let bridge = MockBridge::new()
+            .with_burn_status(BurnTxStatus::MinedReverted)
+            .with_burn_scan(BurnScanAnswer::Found(candidate))
+            .with_confirm_revert_count(0)
+            .with_ledger_probe(cqrs.clone(), id.clone(), usdc_to_u256(usdc("100")).unwrap());
+        let key = b256!("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+        let wallet = create_test_wallet("http://127.0.0.1:1", &key);
+        let (manager, _queue, server) = manager_with_bot_gas_queue(cqrs, wallet, bridge).await;
+        (manager.with_credit_ledger(pool.clone()), id, pool, server)
+    }
+
+    async fn resume_generic_burn_scan<Signer: Wallet>(
+        manager: &CrossVenueCashTransfer<Signer, MockBridge>,
+        id: &UsdcRebalanceId,
+        direction: BridgeDirection,
+        pending: Option<TxHash>,
+    ) -> Result<BurnReceipt, UsdcTransferError> {
+        let amount = usdc_to_u256(usdc("100")).unwrap();
+        match direction {
+            BridgeDirection::BaseToEthereum => {
+                manager
+                    .resume_bridging_submitting(id, amount, 42, pending)
+                    .await
+            }
+            BridgeDirection::EthereumToBase => {
+                manager
+                    .resume_bridging_submitting_ethereum(id, amount, 42, pending)
+                    .await
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recorded_burn_generic_adapter_never_promotes_empty_candidates_to_absence() {
+        let recorded = TxHash::from([7; 32]);
+        for (answer, expected) in [
+            (BurnScanAnswer::Absent, RecordedBurnScan::Inconclusive),
+            (BurnScanAnswer::Found(recorded), RecordedBurnScan::Found),
+            (
+                BurnScanAnswer::FoundMany(vec![TxHash::from([8; 32]), recorded]),
+                RecordedBurnScan::Found,
+            ),
+            (
+                BurnScanAnswer::Found(TxHash::from([8; 32])),
+                RecordedBurnScan::Inconclusive,
+            ),
+        ] {
+            // This wrapper deliberately uses Bridge's generic adapter rather
+            // than the mock's explicit authoritative-absence override.
+            let bridge = MintErrorBridge {
+                inner: MockBridge::new().with_burn_scan(answer),
+                recovery_error: || CctpError::ScanInconclusive { from_block: 42 },
+            };
+            assert_eq!(
+                bridge
+                    .find_recorded_burn(
+                        BridgeDirection::BaseToEthereum,
+                        U256::from(100),
+                        Address::random(),
+                        42,
+                        recorded
+                    )
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_burn_scan_hashless_foreign_only_fails_closed() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            let (manager, id, _pool, _server) =
+                generic_burn_scan_fixture(direction, None, BurnCandidateClaim::Other).await;
+            let result = resume_generic_burn_scan(&manager, &id, direction, None).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(UsdcTransferError::BurnSubmitInconclusive { .. })
+                ),
+                "another transfer's historical burn must not be adopted: {result:?}"
+            );
+            assert_eq!(
+                manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+                0
+            );
+            assert_eq!(
+                manager
+                    .cctp_bridge
+                    .confirm_call_count
+                    .load(Ordering::SeqCst),
+                0
+            );
+            let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+            assert!(
+                matches!(
+                    state,
+                    UsdcRebalance::BridgingSubmitting {
+                        pending_burn_tx: None,
+                        ..
+                    }
+                ),
+                "foreign candidate must retain guard: {state:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_burn_scan_foreign_only_confirmed_revert_reburns_safely() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            let pending = Some(TxHash::from([7; 32]));
+            let (manager, id, _pool, _server) =
+                generic_burn_scan_fixture(direction, pending, BurnCandidateClaim::Other).await;
+            let receipt = resume_generic_burn_scan(&manager, &id, direction, pending)
+                .await
+                .unwrap();
+            assert_eq!(receipt.tx, TxHash::from([1; 32]));
+            assert_eq!(
+                manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+                1
+            );
+            assert_eq!(
+                manager
+                    .cctp_bridge
+                    .confirm_call_count
+                    .load(Ordering::SeqCst),
+                1
+            );
+            let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+            assert!(
+                matches!(state, UsdcRebalance::Bridging { burn_tx_hash, .. } if burn_tx_hash == receipt.tx),
+                "confirmed revert may reburn only after excluding all foreign candidates: {state:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_burn_scan_finds_eligible_older_candidate_behind_foreign_newest() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for pending in [None, Some(TxHash::from([7; 32]))] {
+                let (mut manager, id, _pool, _server) =
+                    generic_burn_scan_fixture(direction, pending, BurnCandidateClaim::Other).await;
+                let eligible = TxHash::from([9; 32]);
+                Arc::get_mut(&mut manager.cctp_bridge).unwrap().burn_scan =
+                    Some(BurnScanAnswer::FoundMany(vec![
+                        TxHash::from([8; 32]),
+                        eligible,
+                    ]));
+                let receipt = resume_generic_burn_scan(&manager, &id, direction, pending)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    receipt.tx, eligible,
+                    "foreign newest must not hide an eligible older burn"
+                );
+                assert_eq!(
+                    manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+                    0
+                );
+                assert_eq!(
+                    manager
+                        .cctp_bridge
+                        .confirm_call_count
+                        .load(Ordering::SeqCst),
+                    1
+                );
+                let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+                assert!(
+                    matches!(state, UsdcRebalance::Bridging { burn_tx_hash, .. } if burn_tx_hash == eligible)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_burn_scan_older_candidate_confirmation_failure_retains_its_hash_on_retry() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for pending in [None, Some(TxHash::from([7; 32]))] {
+                let (mut manager, id, _pool, _server) =
+                    generic_burn_scan_fixture(direction, pending, BurnCandidateClaim::Other).await;
+                let eligible = TxHash::from([9; 32]);
+                let bridge = Arc::get_mut(&mut manager.cctp_bridge).unwrap();
+                bridge.burn_scan = Some(BurnScanAnswer::FoundMany(vec![
+                    TxHash::from([8; 32]),
+                    eligible,
+                ]));
+                bridge.confirm_error = Some(|| {
+                    CctpError::RpcTransport(TransportErrorKind::custom_str("connection reset"))
+                });
+                assert!(matches!(
+                    resume_generic_burn_scan(&manager, &id, direction, pending).await,
+                    Err(UsdcTransferError::SettlementCheckTransient { .. })
+                ));
+                let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+                assert!(
+                    matches!(state, UsdcRebalance::BridgingSubmitting { pending_burn_tx: Some(hash), .. } if hash == eligible)
+                );
+                let bridge = Arc::get_mut(&mut manager.cctp_bridge).unwrap();
+                bridge.burn_status = Some(BurnTxStatus::Pending);
+                bridge.burn_scan = Some(BurnScanAnswer::Absent);
+                assert!(matches!(
+                    resume_generic_burn_scan(&manager, &id, direction, Some(eligible)).await,
+                    Err(UsdcTransferError::SettlementCheckTransient { .. })
+                ));
+                assert_eq!(
+                    manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+                    0
+                );
+                assert_eq!(
+                    manager
+                        .cctp_bridge
+                        .confirm_call_count
+                        .load(Ordering::SeqCst),
+                    1
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_burn_scan_adopts_only_unclaimed_or_own_historical_burns() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for pending in [None, Some(TxHash::from([7; 32]))] {
+                for claim in [BurnCandidateClaim::Unclaimed, BurnCandidateClaim::Own] {
+                    let (manager, id, _pool, _server) =
+                        generic_burn_scan_fixture(direction, pending, claim).await;
+                    let receipt = resume_generic_burn_scan(&manager, &id, direction, pending)
+                        .await
+                        .unwrap();
+                    assert_eq!(receipt.tx, TxHash::from([8; 32]));
+                    assert_eq!(
+                        manager
+                            .cctp_bridge
+                            .confirm_call_count
+                            .load(Ordering::SeqCst),
+                        1
+                    );
+                    assert_eq!(
+                        manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+                        0
+                    );
+                    let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+                    assert!(
+                        matches!(state, UsdcRebalance::Bridging { burn_tx_hash, .. }
+                        if burn_tx_hash == receipt.tx),
+                        "eligible candidate should be adopted: {state:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_burn_scan_unavailable_ownership_history_fails_closed() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for pending in [None, Some(TxHash::from([7; 32]))] {
+                for unwired in [true, false] {
+                    let (mut manager, id, _pool, _server) = generic_burn_scan_fixture(
+                        direction,
+                        pending,
+                        BurnCandidateClaim::Unclaimed,
+                    )
+                    .await;
+                    if unwired {
+                        manager.credit_ledger = CreditLedger::Unwired;
+                    } else {
+                        let unavailable = SqlitePool::connect(":memory:").await.unwrap();
+                        unavailable.close().await;
+                        manager.credit_ledger = CreditLedger::Wired(unavailable);
+                    }
+                    let error = resume_generic_burn_scan(&manager, &id, direction, pending)
+                        .await
+                        .unwrap_err();
+                    if unwired {
+                        assert!(
+                            matches!(error, UsdcTransferError::BurnTxOwnershipUnchecked { tx, .. }
+                            if tx == TxHash::from([8; 32]))
+                        );
+                    } else {
+                        assert!(matches!(
+                            error,
+                            UsdcTransferError::BurnTxOwnershipLookupFailed {
+                                source: crate::usdc_rebalance::BurnTxOwnershipLookupError::Query(
+                                    sqlx::Error::PoolClosed
+                                ),
+                                ..
+                            }
+                        ));
+                    }
+                    assert_eq!(
+                        manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+                        0
+                    );
+                    assert_eq!(
+                        manager
+                            .cctp_bridge
+                            .confirm_call_count
+                            .load(Ordering::SeqCst),
+                        0
+                    );
+                    let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+                    assert!(
+                        matches!(state, UsdcRebalance::BridgingSubmitting { pending_burn_tx, .. }
+                        if pending_burn_tx == pending),
+                        "unavailable ownership must retain guard: {state:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_burn_scan_requires_valid_confirmed_burn_evidence() {
+        let errors: [(fn() -> CctpError, bool); 4] = [
+            (
+                || CctpError::MessageSentEventNotFound {
+                    tx_hash: TxHash::from([8; 32]),
+                },
+                false,
+            ),
+            (
+                || {
+                    CctpError::Evm(EvmError::ReceiptTimeout {
+                        tx_hash: TxHash::from([8; 32]),
+                        timeout_secs: 30,
+                    })
+                },
+                true,
+            ),
+            (
+                || CctpError::RpcTransport(TransportErrorKind::custom_str("connection reset")),
+                true,
+            ),
+            (
+                || {
+                    CctpError::Evm(EvmError::TransactionDropped {
+                        tx_hash: TxHash::from([8; 32]),
+                        elapsed_secs: 30,
+                    })
+                },
+                true,
+            ),
+        ];
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for pending in [None, Some(TxHash::from([7; 32]))] {
+                for (error, retryable) in errors {
+                    let (mut manager, id, _pool, _server) = generic_burn_scan_fixture(
+                        direction,
+                        pending,
+                        BurnCandidateClaim::Unclaimed,
+                    )
+                    .await;
+                    Arc::get_mut(&mut manager.cctp_bridge)
+                        .unwrap()
+                        .confirm_error = Some(error);
+                    let result = resume_generic_burn_scan(&manager, &id, direction, pending)
+                        .await
+                        .unwrap_err();
+                    assert_eq!(
+                        matches!(result, UsdcTransferError::SettlementCheckTransient { .. }),
+                        retryable
+                    );
+                    let source = match result {
+                        UsdcTransferError::SettlementCheckTransient { source, .. }
+                        | UsdcTransferError::Cctp(source) => source,
+                        other => panic!("confirmation source must be preserved: {other:?}"),
+                    };
+                    assert_eq!(source.to_string(), error().to_string());
+                    assert_eq!(
+                        manager
+                            .cctp_bridge
+                            .confirm_call_count
+                            .load(Ordering::SeqCst),
+                        1
+                    );
+                    assert_eq!(
+                        manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+                        0
+                    );
+                    let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+                    assert!(
+                        matches!(state, UsdcRebalance::BridgingSubmitting { pending_burn_tx, .. }
+                        if pending_burn_tx == Some(TxHash::from([8; 32]))),
+                        "unconfirmed candidate must retain guard: {state:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_burn_scan_confirmation_failure_retries_the_candidate_without_reburn() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for pending in [None, Some(TxHash::from([7; 32]))] {
+                let (mut manager, id, _pool, _server) =
+                    generic_burn_scan_fixture(direction, pending, BurnCandidateClaim::Unclaimed)
+                        .await;
+                Arc::get_mut(&mut manager.cctp_bridge)
+                    .unwrap()
+                    .confirm_error = Some(|| {
+                    CctpError::RpcTransport(TransportErrorKind::custom_str("connection reset"))
+                });
+                let error = resume_generic_burn_scan(&manager, &id, direction, pending)
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    error,
+                    UsdcTransferError::SettlementCheckTransient { .. }
+                ));
+                let candidate = TxHash::from([8; 32]);
+                let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+                assert!(
+                    matches!(state, UsdcRebalance::BridgingSubmitting { pending_burn_tx: Some(hash), .. }
+                    if hash == candidate),
+                    "failed confirmation must durably replace old revert: {state:?}"
+                );
+                let bridge = Arc::get_mut(&mut manager.cctp_bridge).unwrap();
+                bridge.burn_status = Some(BurnTxStatus::Pending);
+                bridge.burn_scan = Some(BurnScanAnswer::Absent);
+                let error = resume_generic_burn_scan(&manager, &id, direction, Some(candidate))
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error, UsdcTransferError::SettlementCheckTransient { source, .. }
+                    if matches!(*source, CctpError::BurnTxPending { burn_tx } if burn_tx == candidate))
+                );
+                assert_eq!(
+                    manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+                    0
+                );
+                assert_eq!(
+                    manager
+                        .cctp_bridge
+                        .confirm_call_count
+                        .load(Ordering::SeqCst),
+                    1
+                );
+                let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+                assert!(
+                    matches!(state, UsdcRebalance::BridgingSubmitting { pending_burn_tx: Some(hash), .. }
+                    if hash == candidate),
+                    "pending retry must retain candidate: {state:?}"
+                );
+            }
+        }
+    }
+
+    async fn assert_suspected_drop_stays_latched<Signer: Wallet>(
+        manager: &CrossVenueCashTransfer<Signer, MockBridge>,
+        id: &UsdcRebalanceId,
+        direction: BridgeDirection,
+    ) {
+        let state = manager.cqrs.load(id).await.unwrap().unwrap();
+        assert!(
+            matches!(state, UsdcRebalance::BridgingSubmitting {
+                pending_burn_tx: Some(tx), ..
+            } if tx == TxHash::from([7; 32])),
+            "unresolved burn must retain its recorded hash: {state:?}"
+        );
+        assert_eq!(
+            manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+            0,
+            "a suspected drop must never submit another burn"
+        );
+        assert_eq!(
+            *manager.cctp_bridge.burn_scan_calls.lock().unwrap(),
+            vec![(
+                direction,
+                usdc_to_u256(usdc("100")).unwrap(),
+                manager.market_maker_wallet,
+                42
+            )],
+            "cross-check must use this transfer's source, amount, recipient and pre-burn boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_bridging_submitting_dropped_verdict_adopts_burn_found_by_scan() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            let found = TxHash::from([7; 32]);
+            let (manager, id, _server) =
+                dropped_burn_fixture(direction, BurnScanAnswer::Found(found), None).await;
+            let receipt = resume_dropped_burn(&manager, &id, direction).await.unwrap();
+            assert_eq!(receipt.tx, found, "must adopt the scan-recovered hash");
+            assert_eq!(
+                manager
+                    .cctp_bridge
+                    .confirm_call_count
+                    .load(Ordering::SeqCst),
+                1
+            );
+            assert_eq!(
+                manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+                0
+            );
+            let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+            assert!(
+                matches!(state, UsdcRebalance::Bridging { burn_tx_hash, .. } if burn_tx_hash == found),
+                "validated scan match must advance to Bridging: {state:?}"
+            );
+            assert_eq!(
+                *manager.cctp_bridge.burn_scan_calls.lock().unwrap(),
+                vec![(direction, receipt.amount, manager.market_maker_wallet, 42)]
+            );
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ConfirmDropOrigin {
+        NewBurn { reverts: usize },
+        RecordedBurn,
+    }
+
+    impl ConfirmDropOrigin {
+        fn tx_hash(self) -> TxHash {
+            match self {
+                Self::NewBurn { reverts: 0 } => TxHash::from([1; 32]),
+                Self::NewBurn { .. } => TxHash::from([2; 32]),
+                Self::RecordedBurn => TxHash::from([7; 32]),
+            }
+        }
+    }
+
+    async fn drive_confirm_drop<Signer: Wallet + Clone>(
+        manager: &mut CrossVenueCashTransfer<Signer, MockBridge>,
+        id: &UsdcRebalanceId,
+        direction: BridgeDirection,
+        origin: ConfirmDropOrigin,
+    ) -> Result<BurnReceipt, UsdcTransferError> {
+        let bridge = Arc::get_mut(&mut manager.cctp_bridge).unwrap();
+        bridge.confirm_drop = true;
+        bridge.burn_status = Some(BurnTxStatus::MinedSuccess);
+        match origin {
+            ConfirmDropOrigin::NewBurn { reverts } => {
+                bridge.confirm_revert_count = reverts;
+                manager
+                    .burn_recording_pending(
+                        id,
+                        direction,
+                        usdc_to_u256(usdc("100")).unwrap(),
+                        manager.market_maker_wallet,
+                        42,
+                    )
+                    .await
+            }
+            ConfirmDropOrigin::RecordedBurn => manager
+                .check_pending_burn(
+                    id,
+                    direction,
+                    usdc_to_u256(usdc("100")).unwrap(),
+                    Some(TxHash::from([7; 32])),
+                    42,
+                )
+                .await
+                .map(|receipt| receipt.expect("a mined recorded burn must yield a receipt")),
+        }
+    }
+
+    async fn assert_confirm_drop_stays_latched<Signer: Wallet>(
+        manager: &CrossVenueCashTransfer<Signer, MockBridge>,
+        id: &UsdcRebalanceId,
+        direction: BridgeDirection,
+        origin: ConfirmDropOrigin,
+    ) {
+        let (expected_tx, submissions) = match origin {
+            ConfirmDropOrigin::NewBurn { reverts } => (
+                TxHash::from([if reverts == 0 { 1 } else { 2 }; 32]),
+                reverts + 1,
+            ),
+            ConfirmDropOrigin::RecordedBurn => (TxHash::from([7; 32]), 0),
+        };
+        let state = manager.cqrs.load(id).await.unwrap().unwrap();
+        assert!(
+            matches!(state, UsdcRebalance::BridgingSubmitting {
+                pending_burn_tx: Some(tx), ..
+            } if tx == expected_tx),
+            "unresolved confirmation drop must retain ownership: {state:?}"
+        );
+        assert_eq!(
+            manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+            submissions
+        );
+        assert_eq!(
+            *manager.cctp_bridge.burn_scan_calls.lock().unwrap(),
+            vec![(
+                direction,
+                usdc_to_u256(usdc("100")).unwrap(),
+                manager.market_maker_wallet,
+                42
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_drop_adopts_scan_found_burn_without_reburn() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for origin in [
+                ConfirmDropOrigin::NewBurn { reverts: 0 },
+                ConfirmDropOrigin::NewBurn { reverts: 1 },
+                ConfirmDropOrigin::RecordedBurn,
+            ] {
+                let found = origin.tx_hash();
+                let (mut manager, id, _server) =
+                    dropped_burn_fixture(direction, BurnScanAnswer::Found(found), None).await;
+                let receipt = drive_confirm_drop(&mut manager, &id, direction, origin)
+                    .await
+                    .unwrap();
+                assert_eq!(receipt.tx, found);
+                assert_confirm_drop_stays_latched(&manager, &id, direction, origin).await;
+                let expected_confirms = match origin {
+                    ConfirmDropOrigin::NewBurn { reverts } => reverts + 2,
+                    ConfirmDropOrigin::RecordedBurn => 2,
+                };
+                assert_eq!(
+                    manager
+                        .cctp_bridge
+                        .confirm_call_count
+                        .load(Ordering::SeqCst),
+                    expected_confirms
+                );
+                manager
+                    .record_cctp_burn(&id, direction, receipt)
+                    .await
+                    .unwrap();
+                let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+                assert!(
+                    matches!(state, UsdcRebalance::Bridging { burn_tx_hash, .. } if burn_tx_hash == found),
+                    "validated recovery must advance using scanned identity: {state:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn confirm_drop_unavailable_scan_retries_without_reburn() {
+        let errors: [fn() -> CctpError; 2] = [
+            || CctpError::ScanInconclusive { from_block: 42 },
+            || CctpError::RpcTransport(TransportErrorKind::custom_str("connection reset")),
+        ];
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for origin in [
+                ConfirmDropOrigin::NewBurn { reverts: 0 },
+                ConfirmDropOrigin::NewBurn { reverts: 1 },
+                ConfirmDropOrigin::RecordedBurn,
+            ] {
+                for error in errors {
+                    let (mut manager, id, _server) =
+                        dropped_burn_fixture(direction, BurnScanAnswer::Failed(error), None).await;
+                    let error = drive_confirm_drop(&mut manager, &id, direction, origin)
+                        .await
+                        .unwrap_err();
+                    assert!(
+                        matches!(error, UsdcTransferError::SettlementCheckTransient { .. }),
+                        "unavailable confirmation-drop scan must retry: {error:?}"
+                    );
+                    assert_confirm_drop_stays_latched(&manager, &id, direction, origin).await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn confirm_drop_scan_recovered_burn_requires_valid_confirmation() {
+        let errors: [(fn() -> CctpError, bool); 2] = [
+            (
+                || {
+                    CctpError::Evm(EvmError::ReceiptTimeout {
+                        tx_hash: TxHash::from([8; 32]),
+                        timeout_secs: 1,
+                    })
+                },
+                true,
+            ),
+            (
+                || CctpError::MessageSentEventNotFound {
+                    tx_hash: TxHash::from([8; 32]),
+                },
+                false,
+            ),
+        ];
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for origin in [
+                ConfirmDropOrigin::NewBurn { reverts: 0 },
+                ConfirmDropOrigin::NewBurn { reverts: 1 },
+                ConfirmDropOrigin::RecordedBurn,
+            ] {
+                for (error, retryable) in errors {
+                    let (mut manager, id, _server) = dropped_burn_fixture(
+                        direction,
+                        BurnScanAnswer::Found(origin.tx_hash()),
+                        Some(error),
+                    )
+                    .await;
+                    let error = drive_confirm_drop(&mut manager, &id, direction, origin)
+                        .await
+                        .unwrap_err();
+                    assert_eq!(
+                        matches!(error, UsdcTransferError::SettlementCheckTransient { .. }),
+                        retryable
+                    );
+                    if !retryable {
+                        assert!(matches!(error, UsdcTransferError::Cctp(source)
+                            if matches!(*source, CctpError::MessageSentEventNotFound { .. })));
+                    }
+                    assert_confirm_drop_stays_latched(&manager, &id, direction, origin).await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn confirm_drop_inconclusive_scan_later_pending_adopts_found_burn() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            let (mut manager, id, _server) = dropped_burn_fixture(
+                direction,
+                BurnScanAnswer::Failed(|| CctpError::ScanInconclusive { from_block: 42 }),
+                None,
+            )
+            .await;
+            let error = drive_confirm_drop(
+                &mut manager,
+                &id,
+                direction,
+                ConfirmDropOrigin::NewBurn { reverts: 0 },
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                UsdcTransferError::SettlementCheckTransient { .. }
+            ));
+            let bridge = Arc::get_mut(&mut manager.cctp_bridge).unwrap();
+            bridge.burn_status = Some(BurnTxStatus::Pending);
+            bridge.burn_scan = Some(BurnScanAnswer::Found(TxHash::from([1; 32])));
+            let receipt = manager
+                .check_pending_burn(
+                    &id,
+                    direction,
+                    usdc_to_u256(usdc("100")).unwrap(),
+                    Some(TxHash::from([1; 32])),
+                    42,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(receipt.tx, TxHash::from([1; 32]));
+            assert_eq!(
+                manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+                1
+            );
+            assert_eq!(
+                manager
+                    .cctp_bridge
+                    .confirm_call_count
+                    .load(Ordering::SeqCst),
+                2
+            );
+            assert_eq!(
+                *manager.cctp_bridge.burn_scan_calls.lock().unwrap(),
+                vec![(direction, receipt.amount, manager.market_maker_wallet, 42); 2]
+            );
+            manager
+                .record_cctp_burn(&id, direction, receipt)
+                .await
+                .unwrap();
+            let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+            assert!(
+                matches!(state, UsdcRebalance::Bridging { burn_tx_hash, .. }
+                if burn_tx_hash == TxHash::from([1; 32])),
+                "positive evidence must remain recoverable after wallet identity release: {state:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn confirm_drop_unavailable_scan_then_requalified_drop_can_page_without_reburn() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for scan_error in [
+                || CctpError::ScanInconclusive { from_block: 42 },
+                || CctpError::RpcTransport(TransportErrorKind::custom_str("connection reset")),
+            ] {
+                let (mut manager, id, _server) =
+                    dropped_burn_fixture(direction, BurnScanAnswer::Failed(scan_error), None).await;
+                let error = drive_confirm_drop(
+                    &mut manager,
+                    &id,
+                    direction,
+                    ConfirmDropOrigin::NewBurn { reverts: 0 },
+                )
+                .await
+                .unwrap_err();
+                assert!(matches!(
+                    error,
+                    UsdcTransferError::SettlementCheckTransient { .. }
+                ));
+                let bridge = Arc::get_mut(&mut manager.cctp_bridge).unwrap();
+                bridge.burn_status = Some(BurnTxStatus::Dropped);
+                bridge.burn_scan = Some(BurnScanAnswer::Absent);
+                let recorded = TxHash::from([1; 32]);
+                let error = manager
+                    .check_pending_burn(
+                        &id,
+                        direction,
+                        usdc_to_u256(usdc("100")).unwrap(),
+                        Some(recorded),
+                        42,
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error, UsdcTransferError::BurnTxDropped { burn_tx, .. }
+                    if burn_tx == recorded)
+                );
+                assert_eq!(
+                    manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+                    1
+                );
+                assert_eq!(
+                    manager
+                        .cctp_bridge
+                        .confirm_call_count
+                        .load(Ordering::SeqCst),
+                    1
+                );
+                let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+                assert!(
+                    matches!(state, UsdcRebalance::BridgingSubmitting { pending_burn_tx: Some(hash), .. }
+                    if hash == recorded),
+                    "terminal drop must keep ownership: {state:?}"
+                );
+                assert_eq!(
+                    *manager.cctp_bridge.burn_scan_calls.lock().unwrap(),
+                    vec![
+                        (
+                            direction,
+                            usdc_to_u256(usdc("100")).unwrap(),
+                            manager.market_maker_wallet,
+                            42
+                        );
+                        2
+                    ]
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_burn_empty_scan_stays_pending_without_drop_or_reburn() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            let (mut manager, id, _server) =
+                dropped_burn_fixture(direction, BurnScanAnswer::Absent, None).await;
+            Arc::get_mut(&mut manager.cctp_bridge).unwrap().burn_status =
+                Some(BurnTxStatus::Pending);
+            let error = manager
+                .check_pending_burn(
+                    &id,
+                    direction,
+                    usdc_to_u256(usdc("100")).unwrap(),
+                    Some(TxHash::from([7; 32])),
+                    42,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, UsdcTransferError::SettlementCheckTransient { source, .. }
+                if matches!(*source, CctpError::BurnTxPending { burn_tx } if burn_tx == TxHash::from([7; 32])))
+            );
+            assert_suspected_drop_stays_latched(&manager, &id, direction).await;
+            assert_eq!(
+                manager
+                    .cctp_bridge
+                    .confirm_call_count
+                    .load(Ordering::SeqCst),
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_burn_scan_errors_preserve_classification_without_reburn() {
+        let errors: [fn() -> CctpError; 6] = [
+            || CctpError::ScanInconclusive { from_block: 42 },
+            || CctpError::RpcTransport(TransportErrorKind::custom_str("connection reset")),
+            || CctpError::RpcTransport(RpcError::UnsupportedFeature("eth_getLogs")),
+            || {
+                CctpError::RpcTransport(RpcError::ErrorResp(ErrorPayload {
+                    code: -32000,
+                    message: "block range exceeds provider limit".into(),
+                    data: None,
+                }))
+            },
+            || {
+                CctpError::RpcTransport(RpcError::ErrorResp(ErrorPayload {
+                    code: -32000,
+                    message: "header not found".into(),
+                    data: None,
+                }))
+            },
+            || {
+                CctpError::RpcTransport(RpcError::ErrorResp(ErrorPayload {
+                    code: -32005,
+                    message: "rate limit exceeded".into(),
+                    data: None,
+                }))
+            },
+        ];
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for error in errors {
+                let (mut manager, id, _server) =
+                    dropped_burn_fixture(direction, BurnScanAnswer::Failed(error), None).await;
+                Arc::get_mut(&mut manager.cctp_bridge).unwrap().burn_status =
+                    Some(BurnTxStatus::Pending);
+                let result = manager
+                    .check_pending_burn(
+                        &id,
+                        direction,
+                        usdc_to_u256(usdc("100")).unwrap(),
+                        Some(TxHash::from([7; 32])),
+                        42,
+                    )
+                    .await
+                    .unwrap_err();
+                let UsdcTransferError::SettlementCheckTransient { source, .. } = result else {
+                    panic!("any unavailable optional scanner must preserve Pending: {result:?}");
+                };
+                assert_eq!(
+                    source.to_string(),
+                    error().to_string(),
+                    "preserve the original RPC source"
+                );
+                assert_eq!(
+                    manager
+                        .cctp_bridge
+                        .confirm_call_count
+                        .load(Ordering::SeqCst),
+                    0
+                );
+                assert_suspected_drop_stays_latched(&manager, &id, direction).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recorded_burn_scan_cannot_adopt_an_unrelated_identical_burn() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for status in [BurnTxStatus::Pending, BurnTxStatus::Dropped] {
+                let (mut manager, id, _server) = dropped_burn_fixture(
+                    direction,
+                    BurnScanAnswer::Found(TxHash::from([8; 32])),
+                    None,
+                )
+                .await;
+                Arc::get_mut(&mut manager.cctp_bridge).unwrap().burn_status = Some(status);
+                let error = resume_dropped_burn(&manager, &id, direction)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error, UsdcTransferError::SettlementCheckTransient { .. }),
+                    "an unrelated hash is neither adoption nor authoritative absence: {error:?}"
+                );
+                assert_eq!(
+                    manager
+                        .cctp_bridge
+                        .confirm_call_count
+                        .load(Ordering::SeqCst),
+                    0
+                );
+                assert_suspected_drop_stays_latched(&manager, &id, direction).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_burn_scan_match_requires_valid_confirmation() {
+        let errors: [(fn() -> CctpError, bool); 2] = [
+            (
+                || {
+                    CctpError::Evm(EvmError::ReceiptTimeout {
+                        tx_hash: TxHash::from([7; 32]),
+                        timeout_secs: 1,
+                    })
+                },
+                true,
+            ),
+            (
+                || CctpError::MessageSentEventNotFound {
+                    tx_hash: TxHash::from([7; 32]),
+                },
+                false,
+            ),
+        ];
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for (error, retryable) in errors {
+                let (mut manager, id, _server) = dropped_burn_fixture(
+                    direction,
+                    BurnScanAnswer::Found(TxHash::from([7; 32])),
+                    Some(error),
+                )
+                .await;
+                Arc::get_mut(&mut manager.cctp_bridge).unwrap().burn_status =
+                    Some(BurnTxStatus::Pending);
+                let error = manager
+                    .check_pending_burn(
+                        &id,
+                        direction,
+                        usdc_to_u256(usdc("100")).unwrap(),
+                        Some(TxHash::from([7; 32])),
+                        42,
+                    )
+                    .await
+                    .unwrap_err();
+                match error {
+                    UsdcTransferError::SettlementCheckTransient { source, .. } if retryable => {
+                        assert!(matches!(
+                            *source,
+                            CctpError::Evm(EvmError::ReceiptTimeout { .. })
+                        ));
+                    }
+                    UsdcTransferError::Cctp(source) if !retryable => {
+                        assert!(matches!(
+                            *source,
+                            CctpError::MessageSentEventNotFound { .. }
+                        ));
+                    }
+                    error => panic!(
+                        "pending log match requires confirmation-specific classification: {error:?}"
+                    ),
+                }
+                assert_suspected_drop_stays_latched(&manager, &id, direction).await;
+                assert_eq!(
+                    manager
+                        .cctp_bridge
+                        .confirm_call_count
+                        .load(Ordering::SeqCst),
+                    1
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_burn_confirmation_rpc_rejections_remain_retryable() {
+        let errors: [fn() -> CctpError; 3] = [
+            || CctpError::RpcTransport(RpcError::UnsupportedFeature("eth_getTransactionReceipt")),
+            || {
+                CctpError::RpcTransport(RpcError::ErrorResp(ErrorPayload {
+                    code: -32000,
+                    message: "header not found".into(),
+                    data: None,
+                }))
+            },
+            || {
+                CctpError::Evm(EvmError::Transport(RpcError::ErrorResp(ErrorPayload {
+                    code: -32005,
+                    message: "request exceeds provider limit".into(),
+                    data: None,
+                })))
+            },
+        ];
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for error in errors {
+                let (mut manager, id, _server) = dropped_burn_fixture(
+                    direction,
+                    BurnScanAnswer::Found(TxHash::from([7; 32])),
+                    Some(error),
+                )
+                .await;
+                Arc::get_mut(&mut manager.cctp_bridge).unwrap().burn_status =
+                    Some(BurnTxStatus::Pending);
+                let result = resume_dropped_burn(&manager, &id, direction)
+                    .await
+                    .unwrap_err();
+                let UsdcTransferError::SettlementCheckTransient { source, .. } = result else {
+                    panic!("optional pending confirmation RPC failure must retry: {result:?}");
+                };
+                assert_eq!(
+                    source.to_string(),
+                    error().to_string(),
+                    "preserve the typed RPC source"
+                );
+                assert_suspected_drop_stays_latched(&manager, &id, direction).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_found_recorded_burn_confirmation_drop_redrives_without_recursive_scan_or_reburn()
+    {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for status in [BurnTxStatus::Pending, BurnTxStatus::Dropped] {
+                let (mut manager, id, _server) = dropped_burn_fixture(
+                    direction,
+                    BurnScanAnswer::Found(TxHash::from([7; 32])),
+                    Some(|| {
+                        CctpError::Evm(EvmError::TransactionDropped {
+                            tx_hash: TxHash::from([7; 32]),
+                            elapsed_secs: 30,
+                        })
+                    }),
+                )
+                .await;
+                Arc::get_mut(&mut manager.cctp_bridge).unwrap().burn_status = Some(status);
+                let error = resume_dropped_burn(&manager, &id, direction)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error, UsdcTransferError::SettlementCheckTransient { source, .. }
+                    if matches!(*source, CctpError::Evm(EvmError::TransactionDropped { tx_hash, .. })
+                    if tx_hash == TxHash::from([7; 32])))
+                );
+                assert_eq!(
+                    manager
+                        .cctp_bridge
+                        .confirm_call_count
+                        .load(Ordering::SeqCst),
+                    1
+                );
+                assert_suspected_drop_stays_latched(&manager, &id, direction).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recorded_mined_burn_confirmation_timeout_retries_without_reburn() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            let (mut manager, id, _server) = dropped_burn_fixture(
+                direction,
+                BurnScanAnswer::Absent,
+                Some(|| {
+                    CctpError::Evm(EvmError::ReceiptTimeout {
+                        tx_hash: TxHash::from([7; 32]),
+                        timeout_secs: 1,
+                    })
+                }),
+            )
+            .await;
+            Arc::get_mut(&mut manager.cctp_bridge).unwrap().burn_status =
+                Some(BurnTxStatus::MinedSuccess);
+            let error = resume_dropped_burn(&manager, &id, direction)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, UsdcTransferError::SettlementCheckTransient { .. }),
+                "receipt visibility or depth timeout must retry the recorded burn: {error:?}"
+            );
+            assert!(
+                manager
+                    .cctp_bridge
+                    .burn_scan_calls
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                manager
+                    .cctp_bridge
+                    .confirm_call_count
+                    .load(Ordering::SeqCst),
+                1
+            );
+            assert_eq!(
+                manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+                0
+            );
+            let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+            assert!(
+                matches!(state, UsdcRebalance::BridgingSubmitting {
+                pending_burn_tx: Some(tx), ..
+            } if tx == TxHash::from([7; 32])),
+                "recorded burn must remain latched: {state:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recorded_burn_status_errors_preserve_retryability_without_reburn() {
+        let errors: [(fn() -> CctpError, bool); 2] = [
+            (
+                || CctpError::RpcTransport(TransportErrorKind::custom_str("connection reset")),
+                true,
+            ),
+            (
+                || {
+                    CctpError::RpcTransport(RpcError::UnsupportedFeature(
+                        "eth_getTransactionReceipt",
+                    ))
+                },
+                false,
+            ),
+        ];
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for (error, retryable) in errors {
+                let (mut manager, id, _server) =
+                    dropped_burn_fixture(direction, BurnScanAnswer::Absent, None).await;
+                Arc::get_mut(&mut manager.cctp_bridge)
+                    .unwrap()
+                    .burn_status_error = Some(error);
+                let error = resume_dropped_burn(&manager, &id, direction)
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    matches!(error, UsdcTransferError::SettlementCheckTransient { .. }),
+                    retryable,
+                    "only transient status errors may retry: {error:?}"
+                );
+                if !retryable {
+                    assert!(matches!(error, UsdcTransferError::Cctp(_)));
+                }
+                assert!(
+                    manager
+                        .cctp_bridge
+                        .burn_scan_calls
+                        .lock()
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(
+                    manager
+                        .cctp_bridge
+                        .confirm_call_count
+                        .load(Ordering::SeqCst),
+                    0
+                );
+                assert_eq!(
+                    manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+                    0
+                );
+                let state = manager.cqrs.load(&id).await.unwrap().unwrap();
+                assert!(
+                    matches!(state, UsdcRebalance::BridgingSubmitting {
+                    pending_burn_tx: Some(tx), ..
+                } if tx == TxHash::from([7; 32])),
+                    "recorded burn must remain latched: {state:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn suspected_dropped_burn_empty_scan_pages_without_reburn() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            let (manager, id, _server) =
+                dropped_burn_fixture(direction, BurnScanAnswer::Absent, None).await;
+            let error = resume_dropped_burn(&manager, &id, direction)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, UsdcTransferError::BurnTxDropped { burn_tx, .. }
+                    if burn_tx == TxHash::from([7; 32])),
+                "only conclusive empty scan may yield terminal drop: {error:?}"
+            );
+            assert_eq!(
+                manager
+                    .cctp_bridge
+                    .confirm_call_count
+                    .load(Ordering::SeqCst),
+                0
+            );
+            assert_suspected_drop_stays_latched(&manager, &id, direction).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn suspected_dropped_burn_inconclusive_scan_retries_without_reburn() {
+        let errors: [fn() -> CctpError; 2] = [
+            || CctpError::ScanInconclusive { from_block: 42 },
+            || CctpError::RpcTransport(TransportErrorKind::custom_str("connection reset")),
+        ];
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for error in errors {
+                let (manager, id, _server) =
+                    dropped_burn_fixture(direction, BurnScanAnswer::Failed(error), None).await;
+                let error = resume_dropped_burn(&manager, &id, direction)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error, UsdcTransferError::SettlementCheckTransient { .. }),
+                    "unavailable scan evidence must retry, not page for a drop: {error:?}"
+                );
+                assert_eq!(
+                    manager
+                        .cctp_bridge
+                        .confirm_call_count
+                        .load(Ordering::SeqCst),
+                    0
+                );
+                assert_suspected_drop_stays_latched(&manager, &id, direction).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn suspected_dropped_burn_deterministic_scan_failure_surfaces_without_reburn() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            let (manager, id, _server) = dropped_burn_fixture(
+                direction,
+                BurnScanAnswer::Failed(|| {
+                    CctpError::RpcTransport(RpcError::UnsupportedFeature("eth_getLogs"))
+                }),
+                None,
+            )
+            .await;
+            let error = resume_dropped_burn(&manager, &id, direction)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, UsdcTransferError::Cctp(ref source)
+                    if matches!(**source, CctpError::RpcTransport(RpcError::UnsupportedFeature(_)))),
+                "deterministic scan failures must surface, not silently retry forever: {error:?}"
+            );
+            assert_eq!(
+                manager
+                    .cctp_bridge
+                    .confirm_call_count
+                    .load(Ordering::SeqCst),
+                0
+            );
+            assert_suspected_drop_stays_latched(&manager, &id, direction).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn suspected_dropped_burn_confirmation_timeout_retries_without_reburn() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            let found = TxHash::from([7; 32]);
+            let (manager, id, _server) = dropped_burn_fixture(
+                direction,
+                BurnScanAnswer::Found(found),
+                Some(|| {
+                    CctpError::Evm(EvmError::ReceiptTimeout {
+                        tx_hash: TxHash::from([7; 32]),
+                        timeout_secs: 1,
+                    })
+                }),
+            )
+            .await;
+            let error = resume_dropped_burn(&manager, &id, direction)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, UsdcTransferError::SettlementCheckTransient { .. }),
+                "a confirmation timeout is retryable, never proof of drop: {error:?}"
+            );
+            assert_eq!(
+                manager
+                    .cctp_bridge
+                    .confirm_call_count
+                    .load(Ordering::SeqCst),
+                1
+            );
+            assert_suspected_drop_stays_latched(&manager, &id, direction).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn suspected_dropped_burn_confirmation_rpc_failure_is_classified_without_reburn() {
+        let errors: [(fn() -> CctpError, bool); 3] = [
+            (
+                || CctpError::RpcTransport(TransportErrorKind::custom_str("connection reset")),
+                true,
+            ),
+            (
+                || {
+                    CctpError::Evm(EvmError::Transport(TransportErrorKind::custom_str(
+                        "connection reset",
+                    )))
+                },
+                true,
+            ),
+            (
+                || {
+                    CctpError::RpcTransport(RpcError::UnsupportedFeature(
+                        "eth_getTransactionReceipt",
+                    ))
+                },
+                false,
+            ),
+        ];
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            for (error, retryable) in errors {
+                let (manager, id, _server) = dropped_burn_fixture(
+                    direction,
+                    BurnScanAnswer::Found(TxHash::from([7; 32])),
+                    Some(error),
+                )
+                .await;
+                let error = resume_dropped_burn(&manager, &id, direction)
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    matches!(error, UsdcTransferError::SettlementCheckTransient { .. }),
+                    retryable,
+                    "only transient confirmation failures may retry: {error:?}"
+                );
+                if !retryable {
+                    assert!(matches!(error, UsdcTransferError::Cctp(_)));
+                }
+                assert_eq!(
+                    manager
+                        .cctp_bridge
+                        .confirm_call_count
+                        .load(Ordering::SeqCst),
+                    1
+                );
+                assert_suspected_drop_stays_latched(&manager, &id, direction).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn suspected_dropped_burn_invalid_message_is_not_adopted_or_dropped() {
+        for direction in [
+            BridgeDirection::BaseToEthereum,
+            BridgeDirection::EthereumToBase,
+        ] {
+            let found = TxHash::from([7; 32]);
+            let (manager, id, _server) = dropped_burn_fixture(
+                direction,
+                BurnScanAnswer::Found(found),
+                Some(|| CctpError::MessageSentEventNotFound {
+                    tx_hash: TxHash::from([7; 32]),
+                }),
+            )
+            .await;
+            let error = resume_dropped_burn(&manager, &id, direction)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, UsdcTransferError::Cctp(ref source)
+                    if matches!(**source, CctpError::MessageSentEventNotFound { .. })),
+                "invalid burn evidence must not be adopted or mislabeled dropped: {error:?}"
+            );
+            assert_eq!(
+                manager
+                    .cctp_bridge
+                    .confirm_call_count
+                    .load(Ordering::SeqCst),
+                1
+            );
+            assert_suspected_drop_stays_latched(&manager, &id, direction).await;
+        }
     }
 
     /// `burn_recording_pending` persists `RecordPendingBurn` BEFORE awaiting the
@@ -22719,7 +25222,13 @@ mod tests {
             manager_with_bot_gas_queue(cqrs.clone(), wallet, MockBridge::new()).await;
 
         let receipt = manager
-            .burn_recording_pending(&id, BridgeDirection::EthereumToBase, amount_u256, recipient)
+            .burn_recording_pending(
+                &id,
+                BridgeDirection::EthereumToBase,
+                amount_u256,
+                recipient,
+                0,
+            )
             .await
             .unwrap();
 
@@ -22796,6 +25305,123 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn burn_recording_pending_confirm_drop_pages_without_reburn() {
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        for direction in [
+            BridgeDirection::EthereumToBase,
+            BridgeDirection::BaseToEthereum,
+        ] {
+            for revert_count in [0, 1] {
+                let cqrs = create_test_store_instance().await;
+                let id = UsdcRebalanceId(Uuid::new_v4());
+                let amount = usdc("1");
+                match direction {
+                    BridgeDirection::EthereumToBase => {
+                        advance_to_bridging_submitting_alpaca_to_base(&cqrs, &id, amount, 0).await;
+                    }
+                    BridgeDirection::BaseToEthereum => {
+                        advance_to_bridging_submitting_base_to_alpaca(&cqrs, &id, amount, 0).await;
+                    }
+                }
+                let bridge = MockBridge::new()
+                    .with_confirm_revert_count(revert_count)
+                    .with_confirm_drop()
+                    .with_empty_burn_scan();
+                let wallet = create_test_wallet(&endpoint, &private_key);
+                let (manager, pool, _server) =
+                    manager_with_bot_gas_queue(cqrs.clone(), wallet, bridge).await;
+                let error = manager
+                    .burn_recording_pending(
+                        &id,
+                        direction,
+                        usdc_to_u256(amount).unwrap(),
+                        Address::random(),
+                        0,
+                    )
+                    .await
+                    .unwrap_err();
+                let expected_tx = TxHash::from([if revert_count == 0 { 1 } else { 2 }; 32]);
+                assert!(
+                    matches!(&error, UsdcTransferError::BurnTxDropped { id: actual_id, burn_tx }
+                        if actual_id == &id && *burn_tx == expected_tx),
+                    "confirm-time drop must page with durable identity: {direction:?}, {revert_count}: {error:?}"
+                );
+                assert_eq!(
+                    manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+                    revert_count + 1,
+                    "only a proved revert permits a second burn"
+                );
+                assert_eq!(pending_bot_gas_jobs(&pool).await.len(), revert_count);
+                assert_eq!(
+                    *manager.cctp_bridge.burn_scan_calls.lock().unwrap(),
+                    vec![(
+                        direction,
+                        usdc_to_u256(amount).unwrap(),
+                        manager.market_maker_wallet,
+                        0
+                    )]
+                );
+                let state = cqrs.load(&id).await.unwrap().unwrap();
+                assert!(
+                    matches!(state, UsdcRebalance::BridgingSubmitting {
+                        pending_burn_tx: Some(burn_tx), ..
+                    } if burn_tx == expected_tx),
+                    "qualified drop must retain the durable hash and transfer ownership: {state:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_burn_adoption_confirm_drop_pages_without_reburn() {
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        for direction in [
+            BridgeDirection::EthereumToBase,
+            BridgeDirection::BaseToEthereum,
+        ] {
+            let cqrs = create_test_store_instance().await;
+            let id = UsdcRebalanceId(Uuid::new_v4());
+            let amount = usdc("1");
+            let burn_tx = TxHash::random();
+            let bridge = MockBridge::new()
+                .with_confirm_revert_count(0)
+                .with_confirm_drop()
+                .with_empty_burn_scan()
+                .with_burn_status(st0x_bridge::BurnTxStatus::MinedSuccess);
+            let wallet = create_test_wallet(&endpoint, &private_key);
+            let (manager, _pool, _server) = manager_with_bot_gas_queue(cqrs, wallet, bridge).await;
+            let error = manager
+                .check_pending_burn(
+                    &id,
+                    direction,
+                    usdc_to_u256(amount).unwrap(),
+                    Some(burn_tx),
+                    0,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, UsdcTransferError::BurnTxDropped { id: actual_id, burn_tx: actual_tx }
+                    if actual_id == &id && *actual_tx == burn_tx),
+                "adoption must retain the qualified drop verdict: {error:?}"
+            );
+            assert_eq!(
+                manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+                0
+            );
+            assert_eq!(
+                *manager.cctp_bridge.burn_scan_calls.lock().unwrap(),
+                vec![(
+                    direction,
+                    usdc_to_u256(amount).unwrap(),
+                    manager.market_maker_wallet,
+                    0
+                )]
+            );
+        }
+    }
+
     /// Both mined reverts consume gas, including the final attempt that is
     /// returned to the job layer for bounded redrive.
     #[tokio::test]
@@ -22816,7 +25442,13 @@ mod tests {
             manager_with_bot_gas_queue(cqrs, wallet, bridge).await;
 
         let error = manager
-            .burn_recording_pending(&id, BridgeDirection::EthereumToBase, amount_u256, recipient)
+            .burn_recording_pending(
+                &id,
+                BridgeDirection::EthereumToBase,
+                amount_u256,
+                recipient,
+                0,
+            )
             .await
             .unwrap_err();
 
@@ -22858,6 +25490,7 @@ mod tests {
                 BridgeDirection::BaseToEthereum,
                 usdc_to_u256(amount).unwrap(),
                 Some(burn_tx),
+                0,
             )
             .await
             .unwrap();
@@ -22894,6 +25527,7 @@ mod tests {
                 BridgeDirection::EthereumToBase,
                 usdc_to_u256(amount).unwrap(),
                 recipient,
+                0,
             )
             .await
             .unwrap_err();
@@ -22930,6 +25564,7 @@ mod tests {
                 BridgeDirection::BaseToEthereum,
                 usdc_to_u256(amount).unwrap(),
                 Some(burn_tx),
+                0,
             )
             .await
             .unwrap_err();
@@ -24270,7 +26905,13 @@ mod tests {
         let manager = manager.with_credit_ledger(pool);
 
         manager
-            .burn_recording_pending(&id, BridgeDirection::EthereumToBase, amount_u256, recipient)
+            .burn_recording_pending(
+                &id,
+                BridgeDirection::EthereumToBase,
+                amount_u256,
+                recipient,
+                0,
+            )
             .await
             .unwrap();
 
@@ -24385,6 +27026,19 @@ mod tests {
         apalis_sqlite::SqlitePool,
         MockServer,
     ) {
+        manager_on_corridor_with_bot_gas_queue(UsdcCorridor::BASE_CCTP, cqrs, wallet, bridge).await
+    }
+
+    async fn manager_on_corridor_with_bot_gas_queue<Signer: Wallet + Clone>(
+        corridor: UsdcCorridor,
+        cqrs: Arc<Store<UsdcRebalance>>,
+        wallet: Signer,
+        bridge: MockBridge,
+    ) -> (
+        CrossVenueCashTransfer<Signer, MockBridge>,
+        apalis_sqlite::SqlitePool,
+        MockServer,
+    ) {
         let (_apalis_only_pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let queue = crate::bot_gas::RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
 
@@ -24410,7 +27064,7 @@ mod tests {
             Arc::new(bridge),
             Arc::new(vault_service),
             cqrs,
-            MarketMakingUsdcEndpoints::new(UsdcCorridor::BASE_CCTP, recipient, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(corridor, recipient, TEST_VAULT_ID),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Enabled(queue),
         );
@@ -24640,6 +27294,319 @@ mod tests {
         assert_eq!(jobs[0].chain, Chain::Base);
         assert_eq!(jobs[0].tx_hash, withdraw_tx);
         assert_eq!(jobs[0].symbol, None, "USDC paths carry no symbol");
+    }
+
+    /// Runtime bytecode that reverts every call with `revert_data`.
+    fn always_reverting_code(revert_data: &[u8]) -> Bytes {
+        let length = u8::try_from(revert_data.len()).unwrap();
+        let mut code = Vec::new();
+        for (index, word) in revert_data.chunks(32).enumerate() {
+            let mut padded = [0u8; 32];
+            padded[..word.len()].copy_from_slice(word);
+            code.push(0x7f); // PUSH32 word
+            code.extend_from_slice(&padded);
+            code.push(0x60); // PUSH1 offset
+            code.push(u8::try_from(index * 32).unwrap());
+            code.push(0x52); // MSTORE
+        }
+        code.extend_from_slice(&[0x60, length, 0x60, 0x00, 0xfd]); // REVERT(0, length)
+        Bytes::from(code)
+    }
+
+    /// The production incident: the inventory vault cannot cover the
+    /// withdraw, so its gas estimate reverts and nothing is sent. The
+    /// transfer must fail (guard released), and a resume must find a
+    /// terminal state instead of scanning for a withdrawal that never existed.
+    #[tokio::test]
+    async fn under_funded_withdraw_rejected_before_broadcast_fails_the_transfer() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1971.318665");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let revert = sol_types::SolError::abi_encode(
+            &crate::bindings::IRaindexInventory::InsufficientVaultLiquidity {
+                token: Chain::Base.settlement_stable().address,
+                requested: amount_u256,
+                received: U256::ZERO,
+            },
+        );
+        wallet
+            .provider()
+            .anvil_set_code(ORDERBOOK_ADDRESS, always_reverting_code(&revert))
+            .await
+            .unwrap();
+        let (manager, _apalis_pool, _server) =
+            manager_with_bot_gas_queue(cqrs.clone(), wallet.clone(), MockBridge::new()).await;
+
+        let error = manager
+            .withdraw_from_vault(&id, amount, amount_u256)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                UsdcTransferError::WithdrawalRejectedUnderfunded { id: error_id, requested, received, .. }
+                    if *error_id == id && *requested == amount_u256 && *received == U256::ZERO
+            ),
+            "expected WithdrawalRejectedUnderfunded, got {error:?}"
+        );
+        let state = cqrs.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::WithdrawalFailed {
+                    withdrawal_ref: None,
+                    ..
+                }
+            ),
+            "expected WithdrawalFailed with no withdrawal, got {state:?}"
+        );
+        assert!(!state.holds_rebalance_guard());
+        assert_eq!(
+            wallet
+                .provider()
+                .get_transaction_count(wallet.address())
+                .await
+                .unwrap(),
+            0,
+            "no withdraw transaction may have been sent"
+        );
+
+        let resumed = manager
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(resumed, UsdcTransferError::PreviouslyFailedAggregate { .. }),
+            "a resume must end at the terminal failure, not scan; got {resumed:?}"
+        );
+    }
+
+    /// A corridor off Base scans its own chain's stable for the withdrawal
+    /// it adopts and books that withdrawal's gas on its own chain.
+    #[tokio::test]
+    async fn vault_legs_use_the_corridor_chains_stable_and_gas_chain() {
+        let corridor = UsdcCorridor::HubRouted {
+            chain: Chain::Robinhood,
+            hop: HopKind::Cctp,
+        };
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+        let from_block = 100;
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::BeginWithdrawal {
+                corridor,
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount,
+                from_block,
+            },
+        )
+        .await
+        .unwrap();
+
+        let withdraw_tx =
+            fixed_bytes!("0xdddd000000000000000000000000000000000000000000000000000000000003");
+        let withdrawal = crate::bindings::IRaindexInventory::OperatorWithdraw {
+            operator: address!("0x2222222222222222222222222222222222222222"),
+            token: Chain::Robinhood.settlement_stable().address,
+            vaultId: TEST_VAULT_ID.0,
+            amount: amount_u256,
+        };
+        let log = alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: ORDERBOOK_ADDRESS,
+                data: withdrawal.encode_log_data(),
+            },
+            block_hash: None,
+            block_number: Some(from_block + 1),
+            block_timestamp: None,
+            transaction_hash: Some(withdraw_tx),
+            transaction_index: None,
+            log_index: None,
+            removed: false,
+        };
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_success(&json!([log]));
+        let wallet = RawPrivateKeyWallet::new(
+            &B256::repeat_byte(0x11),
+            ProviderBuilder::new().connect_mocked_client(asserter),
+            1,
+        )
+        .unwrap();
+        let (manager, apalis_pool, _server) =
+            manager_on_corridor_with_bot_gas_queue(corridor, cqrs, wallet, MockBridge::new()).await;
+
+        manager
+            .resume_withdrawal_submitting(&id, amount, amount_u256, from_block, Utc::now())
+            .await
+            .unwrap();
+
+        let jobs = pending_bot_gas_jobs(&apalis_pool).await;
+        assert_eq!(jobs.len(), 1, "expected exactly one bot-gas job");
+        assert_eq!(jobs[0].category, BotGasOperationCategory::VaultWithdraw);
+        assert_eq!(jobs[0].chain, Chain::Robinhood);
+        assert_eq!(jobs[0].tx_hash, withdraw_tx);
+    }
+
+    /// A fresh deposit, its resume from `DepositInitiated`, and a fresh
+    /// withdrawal on a corridor off Base move their own chain's stable and
+    /// book their gas on their own chain. Only USDG has token code here, so
+    /// a deposit of any other token fails its allowance read.
+    #[tokio::test]
+    async fn fresh_vault_legs_use_the_corridor_chains_stable_and_gas_chain() {
+        let corridor = UsdcCorridor::HubRouted {
+            chain: Chain::Robinhood,
+            hop: HopKind::Cctp,
+        };
+        let usdg = Chain::Robinhood.settlement_stable().address;
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let deposit_id = UsdcRebalanceId(Uuid::new_v4());
+        let withdrawal_id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+        advance_to_bridged_alpaca_to_base_on(&cqrs, &deposit_id, amount, corridor).await;
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        wallet
+            .provider()
+            .anvil_set_code(
+                usdg,
+                crate::bindings::DeployableERC20::DEPLOYED_BYTECODE.clone(),
+            )
+            .await
+            .unwrap();
+        let (manager, apalis_pool, _server) = manager_on_corridor_with_bot_gas_queue(
+            corridor,
+            cqrs,
+            wallet.clone(),
+            MockBridge::new(),
+        )
+        .await;
+
+        manager
+            .deposit_to_vault(&deposit_id, amount_u256)
+            .await
+            .unwrap();
+        manager
+            .resume_alpaca_to_base(&deposit_id, amount, corridor)
+            .await
+            .unwrap();
+        manager
+            .withdraw_from_vault(&withdrawal_id, amount, amount_u256)
+            .await
+            .unwrap();
+
+        let jobs = pending_bot_gas_jobs(&apalis_pool).await;
+        let booked = jobs
+            .iter()
+            .map(|job| (job.category, job.chain))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            booked,
+            vec![
+                (BotGasOperationCategory::VaultDeposit, Chain::Robinhood),
+                (BotGasOperationCategory::VaultDeposit, Chain::Robinhood),
+                (BotGasOperationCategory::VaultWithdraw, Chain::Robinhood),
+            ]
+        );
+
+        let withdraw_tx = wallet
+            .provider()
+            .get_transaction_by_hash(jobs[2].tx_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        let withdraw = crate::bindings::IRaindexInventory::withdraw4Call::abi_decode(
+            withdraw_tx.inner.input(),
+        )
+        .unwrap();
+        assert_eq!(withdraw.token, usdg);
+    }
+
+    /// The fresh deposit path records the block that holds the vault
+    /// deposit on `DepositConfirmed`, read from the deposit's receipt.
+    #[tokio::test]
+    async fn fresh_alpaca_to_base_deposit_records_the_deposit_block() {
+        let corridor = UsdcCorridor::HubRouted {
+            chain: Chain::Robinhood,
+            hop: HopKind::Cctp,
+        };
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        advance_to_bridged_alpaca_to_base_on(&cqrs, &id, amount, corridor).await;
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        wallet
+            .provider()
+            .anvil_set_code(
+                Chain::Robinhood.settlement_stable().address,
+                crate::bindings::DeployableERC20::DEPLOYED_BYTECODE.clone(),
+            )
+            .await
+            .unwrap();
+        let (manager, apalis_pool, _server) = manager_on_corridor_with_bot_gas_queue(
+            corridor,
+            cqrs,
+            wallet.clone(),
+            MockBridge::new(),
+        )
+        .await;
+
+        manager
+            .resume_alpaca_to_base(&id, amount, corridor)
+            .await
+            .unwrap();
+
+        let jobs = pending_bot_gas_jobs(&apalis_pool).await;
+        let deposit_block = wallet
+            .provider()
+            .get_transaction_receipt(jobs[0].tx_hash)
+            .await
+            .unwrap()
+            .and_then(|receipt| receipt.block_number)
+            .expect("the vault deposit is mined");
+        assert_eq!(
+            recorded_vault_deposit_block(&pool, &id).await,
+            Some(deposit_block)
+        );
+    }
+
+    /// The `vault_deposit_block` of `id`'s `DepositConfirmed`, read through
+    /// the event store API.
+    async fn recorded_vault_deposit_block(pool: &SqlitePool, id: &UsdcRebalanceId) -> Option<u64> {
+        let head = st0x_event_sorcery::head_rowid(pool).await.unwrap();
+        st0x_event_sorcery::events_since::<UsdcRebalance>(pool, 0, head, NonZeroU32::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|sequenced| sequenced.id == *id)
+            .find_map(|sequenced| match sequenced.event {
+                UsdcRebalanceEvent::DepositConfirmed {
+                    vault_deposit_block,
+                    ..
+                } => Some(vault_deposit_block),
+                _ => None,
+            })
+            .expect("a DepositConfirmed event")
     }
 
     /// An enqueue failure for a confirmed vault withdrawal propagates as a
@@ -25095,6 +28062,42 @@ mod tests {
         assert_eq!(jobs[0].symbol, None, "USDC paths carry no symbol");
     }
 
+    /// The confirmation a resume records carries the deposit's own block,
+    /// read from its receipt, so the trigger can order the credit against
+    /// the fills of that block.
+    #[tokio::test]
+    async fn resume_alpaca_to_base_from_deposit_initiated_records_the_deposit_block() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+
+        let deposit = wallet
+            .send(wallet.address(), Bytes::new(), "test deposit tx")
+            .await
+            .unwrap();
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        advance_to_deposit_initiated_alpaca_to_base(&cqrs, &id, amount, deposit.transaction_hash)
+            .await;
+        let (manager, _apalis_pool, _server) =
+            manager_with_bot_gas_queue(cqrs, wallet, MockBridge::new()).await;
+
+        manager
+            .resume_alpaca_to_base(&id, amount, UsdcCorridor::BASE_CCTP)
+            .await
+            .unwrap();
+
+        let deposit_block = deposit
+            .block_number
+            .expect("a mined receipt carries its block");
+        assert_eq!(
+            recorded_vault_deposit_block(&pool, &id).await,
+            Some(deposit_block)
+        );
+    }
+
     /// CORRECTION C: when `pending_burn_tx` is set and `burn_status` reports the
     /// recorded burn MINED, resume adopts it via `confirm_burn` (which runs the
     /// MessageSent validation, not a bare receipt) and advances to `Bridging`
@@ -25113,7 +28116,7 @@ mod tests {
                 corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                circle_api_base: test_circle_fee_api_base(),
                 token_messenger: chains.token_messenger,
                 message_transmitter: chains.message_transmitter,
             })
@@ -25419,58 +28422,42 @@ mod tests {
     /// policy concludes `Dropped` without waiting out the production grace window.
     #[tokio::test]
     async fn resume_bridging_submitting_ethereum_dropped_burn_pages_operator_no_reburn() {
-        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
-        let chain =
-            deploy_ethereum_usdc_chain_with_balance(U256::from(1_000_000u64), market_maker_wallet)
-                .await;
-
-        let server = MockServer::start();
-        let (manager, cqrs) =
-            build_manager_with_ethereum_chain_fast_burn_drop(&chain, &server, market_maker_wallet)
-                .await;
-
-        let provider = ProviderBuilder::new()
-            .connect(&chain.endpoint)
-            .await
-            .unwrap();
-        let nonce_before = provider
-            .get_transaction_count(chain.bot_address)
-            .await
-            .unwrap();
-
-        // A hash that was never broadcast: no receipt and absent from the mempool,
-        // so the fast drop policy classifies it Dropped on the first poll.
-        let dropped_tx =
-            b256!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
-
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let sender = wallet.address();
+        let provider = ProviderBuilder::new().connect(&endpoint).await.unwrap();
+        let nonce_before = provider.get_transaction_count(sender).await.unwrap();
+        let cqrs = create_test_store_instance().await;
+        let bridge = MockBridge::new()
+            .with_burn_status(st0x_bridge::BurnTxStatus::Dropped)
+            .with_empty_burn_scan();
+        let (manager, _pool, _server) =
+            manager_with_bot_gas_queue(cqrs.clone(), wallet, bridge).await;
         let id = UsdcRebalanceId(Uuid::new_v4());
         let amount = usdc("1");
-        let amount_u256 = usdc_to_u256(amount).unwrap();
         let from_block = provider.get_block_number().await.unwrap();
         advance_to_bridging_submitting_alpaca_to_base(&cqrs, &id, amount, from_block).await;
+        let dropped_tx = TxHash::random();
 
         let error = manager
-            .resume_bridging_submitting_ethereum(&id, amount_u256, from_block, Some(dropped_tx))
+            .resume_bridging_submitting_ethereum(
+                &id,
+                usdc_to_u256(amount).unwrap(),
+                from_block,
+                Some(dropped_tx),
+            )
             .await
             .unwrap_err();
 
         assert!(
-            matches!(
-                error,
-                UsdcTransferError::BurnTxDropped { burn_tx, .. } if burn_tx == dropped_tx
-            ),
-            "a dropped recorded burn must page the operator with terminal BurnTxDropped, \
-             not reburn; got: {error:?}"
+            matches!(error, UsdcTransferError::BurnTxDropped { burn_tx, .. } if burn_tx == dropped_tx),
+            "a qualified dropped recorded burn must page, never reburn: {error:?}"
         );
         assert_eq!(
-            provider
-                .get_transaction_count(chain.bot_address)
-                .await
-                .unwrap(),
+            provider.get_transaction_count(sender).await.unwrap(),
             nonce_before,
-            "a dropped recorded burn must NOT submit a second burn (nonce unchanged)"
+            "a dropped recorded burn must not submit another transaction"
         );
-
         let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
         assert!(
             matches!(
@@ -25480,8 +28467,7 @@ mod tests {
                     ..
                 }
             ),
-            "aggregate must stay at BridgingSubmitting on a dropped recorded burn \
-             (operator reconciles); got: {state:?}"
+            "dropped burn must retain durable inventory ownership: {state:?}"
         );
     }
 
@@ -25503,7 +28489,7 @@ mod tests {
                 corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                circle_api_base: test_circle_fee_api_base(),
                 token_messenger: chains.token_messenger,
                 message_transmitter: chains.message_transmitter,
             })
@@ -25636,7 +28622,7 @@ mod tests {
                 corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                circle_api_base: test_circle_fee_api_base(),
                 token_messenger: chains.token_messenger,
                 message_transmitter: chains.message_transmitter,
             })
@@ -25878,7 +28864,7 @@ mod tests {
                 corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                circle_api_base: test_circle_fee_api_base(),
                 token_messenger: chains.token_messenger,
                 message_transmitter: chains.message_transmitter,
             })
@@ -25987,71 +28973,41 @@ mod tests {
     #[tokio::test]
     async fn resume_bridging_submitting_base_dropped_burn_pages_operator_no_reburn() {
         let (_anvil, endpoint, private_key) = setup_anvil();
-
-        let server = MockServer::start();
-        let alpaca_broker = InstrumentedAlpacaBroker::new(
-            create_test_broker_service(&server).await,
-            TelemetrySender::disabled(),
-        );
-        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let wallet = create_test_wallet(&endpoint, &private_key);
-        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
-        let cctp_bridge = cctp_bridge.with_fast_burn_drop_policy();
-        let cqrs = create_test_store_instance().await;
-        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
-        let manager = CrossVenueCashTransfer::new(
-            alpaca_broker,
-            alpaca_wallet,
-            Arc::new(cctp_bridge),
-            Arc::new(vault_service),
-            cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(
-                UsdcCorridor::BASE_CCTP,
-                market_maker_wallet,
-                TEST_VAULT_ID,
-            ),
-            &test_settlement_params(),
-            BotGasReceiptCostEnqueuer::Disabled,
-        );
-
-        // The bridge's Base wallet (Anvil account 0) is the address a reburn would
-        // send from, so its nonce is what must stay unchanged.
-        let bridge_wallet = PrivateKeySigner::from_bytes(&private_key)
-            .unwrap()
-            .address();
+        let sender = wallet.address();
         let provider = ProviderBuilder::new().connect(&endpoint).await.unwrap();
-        let nonce_before = provider.get_transaction_count(bridge_wallet).await.unwrap();
-
-        // A hash that was never broadcast: no receipt and absent from the mempool,
-        // so the fast drop policy classifies it Dropped on the first poll.
-        let dropped_tx =
-            b256!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
-
+        let nonce_before = provider.get_transaction_count(sender).await.unwrap();
+        let cqrs = create_test_store_instance().await;
+        let bridge = MockBridge::new()
+            .with_burn_status(st0x_bridge::BurnTxStatus::Dropped)
+            .with_empty_burn_scan();
+        let (manager, _pool, _server) =
+            manager_with_bot_gas_queue(cqrs.clone(), wallet, bridge).await;
         let id = UsdcRebalanceId(Uuid::new_v4());
         let amount = usdc("1");
-        let amount_u256 = usdc_to_u256(amount).unwrap();
         let from_block = provider.get_block_number().await.unwrap();
         advance_to_bridging_submitting_base_to_alpaca(&cqrs, &id, amount, from_block).await;
+        let dropped_tx = TxHash::random();
 
         let error = manager
-            .resume_bridging_submitting(&id, amount_u256, from_block, Some(dropped_tx))
+            .resume_bridging_submitting(
+                &id,
+                usdc_to_u256(amount).unwrap(),
+                from_block,
+                Some(dropped_tx),
+            )
             .await
             .unwrap_err();
 
         assert!(
-            matches!(
-                error,
-                UsdcTransferError::BurnTxDropped { burn_tx, .. } if burn_tx == dropped_tx
-            ),
-            "a dropped recorded burn must page the operator with terminal BurnTxDropped, \
-             not reburn; got: {error:?}"
+            matches!(error, UsdcTransferError::BurnTxDropped { burn_tx, .. } if burn_tx == dropped_tx),
+            "a qualified dropped recorded burn must page, never reburn: {error:?}"
         );
         assert_eq!(
-            provider.get_transaction_count(bridge_wallet).await.unwrap(),
+            provider.get_transaction_count(sender).await.unwrap(),
             nonce_before,
-            "a dropped recorded burn must NOT submit a second burn (nonce unchanged)"
+            "a dropped recorded burn must not submit another transaction"
         );
-
         let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
         assert!(
             matches!(
@@ -26061,8 +29017,7 @@ mod tests {
                     ..
                 }
             ),
-            "aggregate must stay at BridgingSubmitting on a dropped recorded burn \
-             (operator reconciles); got: {state:?}"
+            "dropped burn must retain durable inventory ownership: {state:?}"
         );
     }
 
@@ -26086,7 +29041,7 @@ mod tests {
                 corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                circle_api_base: test_circle_fee_api_base(),
                 token_messenger: chains.token_messenger,
                 message_transmitter: chains.message_transmitter,
             })
@@ -26244,6 +29199,7 @@ mod tests {
                 BridgeDirection::BaseToEthereum,
                 amount_u256,
                 market_maker_wallet,
+                0,
             )
             .await
             .unwrap_err();
@@ -26301,6 +29257,7 @@ mod tests {
                 BridgeDirection::BaseToEthereum,
                 amount_u256,
                 Some(pending_tx),
+                0,
             )
             .await
             .unwrap_err();
@@ -26334,7 +29291,7 @@ mod tests {
                 corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                circle_api_base: test_circle_fee_api_base(),
                 token_messenger: chains.token_messenger,
                 message_transmitter: chains.message_transmitter,
             })
@@ -26418,6 +29375,7 @@ mod tests {
                 BridgeDirection::BaseToEthereum,
                 amount_u256,
                 chains.bot_address,
+                from_block,
             )
             .await
             .unwrap_err();
@@ -26473,7 +29431,7 @@ mod tests {
                 corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                circle_api_base: test_circle_fee_api_base(),
                 token_messenger: chains.token_messenger,
                 message_transmitter: chains.message_transmitter,
             })
@@ -26528,7 +29486,7 @@ mod tests {
             },
             chains.bot_address,
         );
-        let cqrs = create_test_store_instance().await;
+        let (cqrs, pool) = create_test_store_with_pool().await;
         let manager = CrossVenueCashTransfer::new(
             alpaca_broker,
             alpaca_wallet,
@@ -26542,7 +29500,8 @@ mod tests {
             ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
-        );
+        )
+        .with_credit_ledger(pool);
 
         let id = UsdcRebalanceId(Uuid::new_v4());
 
@@ -26639,7 +29598,7 @@ mod tests {
                 corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                circle_api_base: test_circle_fee_api_base(),
                 token_messenger: chains.token_messenger,
                 message_transmitter: chains.message_transmitter,
             })
@@ -26851,7 +29810,7 @@ mod tests {
                 corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                circle_api_base: test_circle_fee_api_base(),
                 token_messenger: chains.token_messenger,
                 message_transmitter: chains.message_transmitter,
             })
@@ -26901,7 +29860,7 @@ mod tests {
             },
             chains.bot_address,
         );
-        let cqrs = create_test_store_instance().await;
+        let (cqrs, pool) = create_test_store_with_pool().await;
         let manager = CrossVenueCashTransfer::new(
             alpaca_broker,
             alpaca_wallet,
@@ -26915,7 +29874,8 @@ mod tests {
             ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
-        );
+        )
+        .with_credit_ledger(pool);
 
         let id = UsdcRebalanceId(Uuid::new_v4());
 
@@ -27031,18 +29991,25 @@ mod tests {
     }
 
     #[test]
-    fn under_funded_vault_withdraw_surfaces_distinct_terminal_error() {
-        // An atomic InsufficientVaultLiquidity revert withdrew nothing, so it
-        // must surface the distinct terminal variant (which the job latches for
-        // operator reconciliation, no auto-retry) rather than the opaque Vault
-        // wrap the job redrives.
-        let error = classify_vault_withdrawal_error(RaindexError::InsufficientVaultLiquidity {
-            token: USDC_BASE,
-            requested: U256::from(1_000_000u64),
-            received: U256::from(400_000u64),
-        });
+    fn under_funded_vault_withdraw_that_may_have_broadcast_latches() {
+        // A revert that may follow an accepted broadcast must surface the
+        // distinct latch variant (no auto-retry, no failure recorded) rather
+        // than the opaque Vault wrap the job redrives.
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let error = classify_vault_withdrawal_error(
+            &id,
+            52_027_377,
+            RaindexError::InsufficientVaultLiquidity {
+                token: USDC_BASE,
+                requested: U256::from(1_000_000u64),
+                received: U256::from(400_000u64),
+                broadcast: WithdrawBroadcast::MayHaveBroadcast,
+            },
+        );
 
         let UsdcTransferError::InsufficientVaultLiquidity {
+            id: error_id,
+            from_block,
             token,
             requested,
             received,
@@ -27050,6 +30017,8 @@ mod tests {
         else {
             panic!("under-funded revert must surface the distinct terminal error, got: {error:?}");
         };
+        assert_eq!(error_id, id);
+        assert_eq!(from_block, 52_027_377);
         assert_eq!(token, USDC_BASE);
         assert_eq!(requested, U256::from(1_000_000u64));
         assert_eq!(received, U256::from(400_000u64));
@@ -27059,7 +30028,11 @@ mod tests {
     fn non_under_funded_vault_withdraw_wraps_opaquely_for_redrive() {
         // Any other RaindexError keeps the opaque Vault wrap so the caller's
         // normal redrive path still runs.
-        let error = classify_vault_withdrawal_error(RaindexError::ZeroAmount);
+        let error = classify_vault_withdrawal_error(
+            &UsdcRebalanceId(Uuid::new_v4()),
+            0,
+            RaindexError::ZeroAmount,
+        );
 
         assert!(
             matches!(error, UsdcTransferError::Vault(RaindexError::ZeroAmount)),
@@ -27244,9 +30217,9 @@ mod tests {
                 error,
                 UsdcTransferError::CorridorMismatch {
                     recorded: ROBINHOOD_RELAY,
-                    served: UsdcCorridor::BASE_CCTP,
+                    ref served,
                     ..
-                }
+                } if *served == BTreeSet::from([UsdcCorridor::BASE_CCTP])
             ),
             "got {error:?}"
         );
@@ -27290,9 +30263,9 @@ mod tests {
                 error,
                 UsdcTransferError::CorridorMismatch {
                     recorded: ROBINHOOD_RELAY,
-                    served: UsdcCorridor::BASE_CCTP,
+                    ref served,
                     ..
-                }
+                } if *served == BTreeSet::from([UsdcCorridor::BASE_CCTP])
             ),
             "got {error:?}"
         );
@@ -27326,9 +30299,9 @@ mod tests {
                 error,
                 UsdcTransferError::CorridorNotServed {
                     requested: ROBINHOOD_RELAY,
-                    served: UsdcCorridor::BASE_CCTP,
+                    ref served,
                     ..
-                }
+                } if *served == BTreeSet::from([UsdcCorridor::BASE_CCTP])
             ),
             "got {error:?}"
         );
@@ -27364,9 +30337,9 @@ mod tests {
                 *error,
                 UsdcTransferError::CorridorMismatch {
                     recorded: ROBINHOOD_RELAY,
-                    served: UsdcCorridor::BASE_CCTP,
+                    ref served,
                     ..
-                }
+                } if *served == BTreeSet::from([UsdcCorridor::BASE_CCTP])
             ),
             "got {error:?}"
         );
@@ -27415,6 +30388,7 @@ mod tests {
             max_burn_revert_redrives: 5,
             notifier: Arc::new(CapturingNotifier::default()),
             driver_gate: UsdcDriverGate::unpaused(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToMarketMaking {
             id,

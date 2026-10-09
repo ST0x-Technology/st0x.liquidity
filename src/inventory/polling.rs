@@ -43,10 +43,13 @@ use crate::position::Position;
 use crate::rebalancing::usdc::{UsdcTransferError, u256_to_usdc};
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 
-/// Pending mints and redemptions aggregated by symbol.
+/// Pending mints aggregated by symbol, and pending redemptions by the chain
+/// they withdraw from, then symbol. A mint's in-flight shares leave the
+/// broker, one offchain slot shared by every chain, so mints are not split
+/// by chain.
 struct PendingRequests {
     mints: BTreeMap<Symbol, FractionalShares>,
-    redemptions: BTreeMap<Symbol, FractionalShares>,
+    redemptions: BTreeMap<Chain, BTreeMap<Symbol, FractionalShares>>,
 }
 
 async fn timestamp_before<F>(future: F) -> (DateTime<Utc>, F::Output)
@@ -57,13 +60,22 @@ where
     (fetched_at, future.await)
 }
 
-/// Active bot-owned tokenization provider request identifiers.
+/// Active bot-owned tokenization provider request identifiers. Each
+/// redemption identifier maps to the chain the redemption withdraws from.
+/// Mints are not split by chain (see [`PendingRequests`]).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PendingRequestOwnershipSnapshot {
     pub(crate) mint_issuers: HashSet<ClientRequestId>,
     pub(crate) mint_tokenizations: HashSet<TokenizationRequestId>,
-    pub(crate) redemption_tokenizations: HashSet<TokenizationRequestId>,
-    pub(crate) redemption_txs: HashSet<TxHash>,
+    pub(crate) redemption_tokenizations: HashMap<TokenizationRequestId, Chain>,
+    pub(crate) redemption_txs: HashMap<TxHash, Chain>,
+}
+
+/// A pending provider request the bot owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnedRequest {
+    Mint,
+    Redemption(Chain),
 }
 
 #[async_trait]
@@ -120,8 +132,48 @@ pub(crate) enum ReserveError {
 pub(crate) struct WalletPollingCtx {
     pub(crate) ethereum: Arc<dyn Wallet<Provider = RootProvider>>,
     pub(crate) base: Arc<dyn Wallet<Provider = RootProvider>>,
-    pub(crate) unwrapped_equity_token_addresses: HashMap<Symbol, Address>,
-    pub(crate) wrapped_equity_token_addresses: HashMap<Symbol, Address>,
+    /// The bot wallet of every chain that rebalances equity, polled for the
+    /// equity tokens a failed transfer can leave behind there.
+    pub(crate) equity_wallets: BTreeMap<Chain, EquityWalletPolling>,
+}
+
+/// One chain's bot wallet and the equity tokens read from it.
+pub(crate) struct EquityWalletPolling {
+    pub(crate) wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+    pub(crate) unwrapped_token_addresses: HashMap<Symbol, Address>,
+    pub(crate) wrapped_token_addresses: HashMap<Symbol, Address>,
+}
+
+/// Which of a wallet's equity tokens a read covers.
+#[derive(Clone, Copy)]
+enum WalletEquityForm {
+    Unwrapped,
+    Wrapped,
+}
+
+impl WalletEquityForm {
+    fn command(
+        self,
+        chain: Chain,
+        balances: BTreeMap<Symbol, FractionalShares>,
+    ) -> InventorySnapshotCommand {
+        match self {
+            Self::Unwrapped => {
+                InventorySnapshotCommand::ChainWalletUnwrappedEquity { chain, balances }
+            }
+            Self::Wrapped => InventorySnapshotCommand::ChainWalletWrappedEquity { chain, balances },
+        }
+    }
+
+    /// The portfolio slot a read on `chain` refreshes. Only Base's wallet is
+    /// valued in the portfolio snapshot.
+    fn portfolio_location(self, chain: Chain) -> Option<PortfolioLocation> {
+        match (self, chain) {
+            (Self::Unwrapped, Chain::Base) => Some(PortfolioLocation::BaseWalletUnwrapped),
+            (Self::Wrapped, Chain::Base) => Some(PortfolioLocation::BaseWalletWrapped),
+            (_, Chain::Ethereum | Chain::HyperEvm | Chain::Robinhood) => None,
+        }
+    }
 }
 
 /// Durable authority and alerting used to heal reordered hedge-order gates
@@ -853,6 +905,11 @@ where
         Ok(())
     }
 
+    /// Polls the cash wallets and every chain's equity wallet. Each read is
+    /// independent: a failure is logged with its chain and the remaining
+    /// reads still run, so one chain's RPC outage cannot hide another
+    /// chain's stranded tokens. The first failure is returned so the caller
+    /// still sees the tick was incomplete.
     async fn poll_wallets(
         &self,
         snapshot_id: &InventorySnapshotId,
@@ -862,62 +919,87 @@ where
             return Ok(());
         };
 
-        self.poll_ethereum_usdc(snapshot_id, &wallets.ethereum)
-            .await?;
+        let mut first_error = None;
 
-        self.poll_base_wallet_usdc(snapshot_id, &wallets.base)
-            .await?;
-
-        let balances = self
-            .poll_base_wallet_token_balances(
-                &wallets.base,
-                &wallets.unwrapped_equity_token_addresses,
-            )
-            .await?;
-        let symbols: Vec<Symbol> = balances.keys().cloned().collect();
-
-        if !balances.is_empty() {
-            self.snapshot
-                .send(
-                    snapshot_id,
-                    InventorySnapshotCommand::BaseWalletUnwrappedEquity { balances },
-                )
-                .await?;
+        if let Err(error) = self
+            .poll_ethereum_usdc(snapshot_id, &wallets.ethereum)
+            .await
+        {
+            warn!(target: "inventory", ?error, "Ethereum wallet USDC polling failed");
+            first_error.get_or_insert(error);
         }
 
-        // Reached whether or not `send` ran above (a configured token polled
-        // to a zero balance is still a real observation), but never reached
-        // when `send` errors, so a failed persist never leaves these slots
-        // falsely fresh.
-        for symbol in symbols {
-            self.poll_freshness.observe(
-                PortfolioLocation::BaseWalletUnwrapped,
-                PortfolioAsset::Equity(symbol),
-            );
+        if let Err(error) = self.poll_base_wallet_usdc(snapshot_id, &wallets.base).await {
+            warn!(target: "inventory", ?error, "Base wallet USDC polling failed");
+            first_error.get_or_insert(error);
         }
 
-        let balances = self
-            .poll_base_wallet_token_balances(&wallets.base, &wallets.wrapped_equity_token_addresses)
-            .await?;
-        let symbols: Vec<Symbol> = balances.keys().cloned().collect();
-
-        if !balances.is_empty() {
-            self.snapshot
-                .send(
-                    snapshot_id,
-                    InventorySnapshotCommand::BaseWalletWrappedEquity { balances },
-                )
-                .await?;
+        for (chain, equity_wallet) in &wallets.equity_wallets {
+            if let Err(error) = self
+                .poll_wallet_equity(snapshot_id, *chain, equity_wallet)
+                .await
+            {
+                warn!(
+                    target: "inventory",
+                    %chain,
+                    ?error,
+                    "Wallet equity polling failed on chain"
+                );
+                first_error.get_or_insert(error);
+            }
         }
 
-        for symbol in symbols {
-            self.poll_freshness.observe(
-                PortfolioLocation::BaseWalletWrapped,
-                PortfolioAsset::Equity(symbol),
-            );
+        first_error.map_or(Ok(()), Err)
+    }
+
+    async fn poll_wallet_equity(
+        &self,
+        snapshot_id: &InventorySnapshotId,
+        chain: Chain,
+        equity_wallet: &EquityWalletPolling,
+    ) -> Result<(), InventoryPollingError<Exe::Error>> {
+        let mut first_error = None;
+        for (form, token_addresses) in [
+            (
+                WalletEquityForm::Unwrapped,
+                &equity_wallet.unwrapped_token_addresses,
+            ),
+            (
+                WalletEquityForm::Wrapped,
+                &equity_wallet.wrapped_token_addresses,
+            ),
+        ] {
+            let result: Result<(), InventoryPollingError<Exe::Error>> = async {
+                let balances = self
+                    .poll_wallet_token_balances(&equity_wallet.wallet, token_addresses)
+                    .await?;
+                let symbols: Vec<Symbol> = balances.keys().cloned().collect();
+
+                if !balances.is_empty() {
+                    self.snapshot
+                        .send(snapshot_id, form.command(chain, balances))
+                        .await?;
+                }
+
+                // Reached whether or not `send` ran above (a configured token
+                // polled to a zero balance is still a real observation), but
+                // never reached when `send` errors, so a failed persist never
+                // leaves these slots falsely fresh.
+                if let Some(location) = form.portfolio_location(chain) {
+                    for symbol in symbols {
+                        self.poll_freshness
+                            .observe(location, PortfolioAsset::Equity(symbol));
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
+            }
         }
 
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     async fn poll_ethereum_usdc(
@@ -982,7 +1064,7 @@ where
         Ok(())
     }
 
-    async fn poll_base_wallet_token_balances(
+    async fn poll_wallet_token_balances(
         &self,
         wallet: &Arc<dyn Wallet<Provider = RootProvider>>,
         token_addresses: &HashMap<Symbol, Address>,
@@ -1207,9 +1289,17 @@ where
 
         Self::resolve_matching_cash_taint(recovery, &state, tainted).await;
 
-        let Some(escalation) =
-            self.record_cash_divergence_observation(recovery, &state, usd_balance_cents, tainted)
-        else {
+        let escalation =
+            self.record_cash_divergence_observation(recovery, &state, usd_balance_cents, tainted);
+
+        // Engaged after the counter lock is released: the engagement waits
+        // for any USDC dispatch holding the gate, so it must not run under
+        // a synchronous lock.
+        if matches!(state, ObservedCashLedgerState::Divergence { .. }) {
+            recovery.gate.engage_cash(InventoryScope::Hedging).await;
+        }
+
+        let Some(escalation) = escalation else {
             return Ok(());
         };
 
@@ -1260,9 +1350,10 @@ where
             .clear_restart_cash_taint();
     }
 
-    /// Folds one poll's cash observation into the counter and the dispatch
-    /// gate. Synchronous on purpose: the counter guard must never be held
-    /// across an await.
+    /// Folds one poll's cash observation into the counter, releasing the
+    /// dispatch gate on a match; the caller engages it on a divergence.
+    /// Synchronous on purpose: the counter guard must never be held across
+    /// an await.
     fn record_cash_divergence_observation(
         &self,
         recovery: &InventoryDivergenceRecoveryCtx,
@@ -1283,7 +1374,6 @@ where
             }
             ObservedCashLedgerState::Divergence { ledger } => {
                 *counter += 1;
-                recovery.gate.engage_cash(InventoryScope::Hedging);
 
                 warn!(
                     target: "inventory",
@@ -1774,13 +1864,13 @@ where
     }
 
     fn aggregate_pending_requests(
-        requests: impl Iterator<Item = st0x_tokenization::TokenizationRequest>,
+        requests: impl Iterator<Item = (st0x_tokenization::TokenizationRequest, OwnedRequest)>,
     ) -> Result<PendingRequests, FloatError> {
         let mut mints: BTreeMap<Symbol, FractionalShares> = BTreeMap::new();
-        let mut redemptions: BTreeMap<Symbol, FractionalShares> = BTreeMap::new();
+        let mut redemptions: BTreeMap<Chain, BTreeMap<Symbol, FractionalShares>> = BTreeMap::new();
         let mut seen = HashSet::new();
 
-        for request in requests {
+        for (request, owned) in requests {
             if !seen.insert(request.id.clone()) {
                 warn!(
                     target: "inventory",
@@ -1791,18 +1881,9 @@ where
                 continue;
             }
 
-            let target = match request.r#type {
-                Some(TokenizationRequestType::Mint) => &mut mints,
-                Some(TokenizationRequestType::Redeem) => &mut redemptions,
-                None => {
-                    warn!(
-                        target: "inventory",
-                        request_id = %request.id,
-                        symbol = %request.underlying_symbol,
-                        "Pending tokenization request has no type, skipping"
-                    );
-                    continue;
-                }
+            let target = match owned {
+                OwnedRequest::Mint => &mut mints,
+                OwnedRequest::Redemption(chain) => redemptions.entry(chain).or_default(),
             };
 
             let entry = target
@@ -1827,25 +1908,30 @@ where
             })
     }
 
-    fn is_own_request(
+    /// The bot's own mint or redemption behind `request`, or `None` when the
+    /// request is not the bot's.
+    fn own_request(
         &self,
         request: &st0x_tokenization::TokenizationRequest,
         ownership: &PendingRequestOwnershipSnapshot,
-    ) -> bool {
-        let is_owned = match request.r#type {
-            Some(TokenizationRequestType::Mint) => {
-                request
-                    .client_request_id
-                    .as_ref()
-                    .is_some_and(|id| ownership.mint_issuers.contains(id))
-                    || ownership.mint_tokenizations.contains(&request.id)
-            }
-            Some(TokenizationRequestType::Redeem) => {
-                ownership.redemption_tokenizations.contains(&request.id)
-                    || request
+    ) -> Option<OwnedRequest> {
+        let owned = match request.r#type {
+            Some(TokenizationRequestType::Mint) => (request
+                .client_request_id
+                .as_ref()
+                .is_some_and(|id| ownership.mint_issuers.contains(id))
+                || ownership.mint_tokenizations.contains(&request.id))
+            .then_some(OwnedRequest::Mint),
+            Some(TokenizationRequestType::Redeem) => ownership
+                .redemption_tokenizations
+                .get(&request.id)
+                .or_else(|| {
+                    request
                         .tx_hash
-                        .is_some_and(|tx_hash| ownership.redemption_txs.contains(&tx_hash))
-            }
+                        .and_then(|tx_hash| ownership.redemption_txs.get(&tx_hash))
+                })
+                .copied()
+                .map(OwnedRequest::Redemption),
             None => {
                 // Dedup through the same warn-once set as external requests so a
                 // persistently typeless provider row does not warn on every poll.
@@ -1861,12 +1947,12 @@ where
                     );
                 }
 
-                return false;
+                return None;
             }
         };
 
-        if is_owned {
-            return true;
+        if owned.is_some() {
+            return owned;
         }
 
         if request
@@ -1893,7 +1979,7 @@ where
             }
         }
 
-        false
+        None
     }
 
     async fn poll_inflight_equity(
@@ -1920,21 +2006,26 @@ where
         let current_request_ids: HashSet<TokenizationRequestId> =
             pending.iter().map(|request| request.id.clone()).collect();
 
-        let PendingRequests { mints, redemptions } = Self::aggregate_pending_requests(
-            pending
-                .into_iter()
-                .filter(|request| self.is_own_request(request, &ownership)),
-        )?;
+        let PendingRequests {
+            mints,
+            mut redemptions,
+        } = Self::aggregate_pending_requests(pending.into_iter().filter_map(|request| {
+            let owned = self.own_request(&request, &ownership)?;
+            Some((request, owned))
+        }))?;
 
         // Bound the warn-once dedup set to requests still present this poll so it
         // cannot grow without bound as external requests appear and complete.
         self.lock_external_pending_warnings()
             .retain(|id| current_request_ids.contains(id));
 
+        let base_redemptions = redemptions.remove(&Chain::Base).unwrap_or_default();
+
         debug!(
             target: "inventory",
             mint_symbols = mints.len(),
-            redemption_symbols = redemptions.len(),
+            base_redemption_symbols = base_redemptions.len(),
+            other_redemption_chains = redemptions.len(),
             "Polled inflight equity from tokenization provider"
         );
 
@@ -1943,6 +2034,16 @@ where
                 snapshot_id,
                 InventorySnapshotCommand::InflightEquity {
                     mints,
+                    redemptions: base_redemptions,
+                    fetched_at,
+                },
+            )
+            .await?;
+
+        self.snapshot
+            .send(
+                snapshot_id,
+                InventorySnapshotCommand::ChainInflightRedemptions {
                     redemptions,
                     fetched_at,
                 },
@@ -2063,11 +2164,13 @@ mod tests {
     use crate::equity_redemption::RedemptionAggregateId;
     use crate::inventory::projection::InventoryProjection;
     use crate::inventory::snapshot::InventorySnapshotEvent;
-    use crate::inventory::{BroadcastingInventory, InventoryDivergenceGate, InventoryView};
+    use crate::inventory::{
+        ActiveUsdcRebalance, BroadcastingInventory, InventoryDivergenceGate, InventoryView,
+    };
     use crate::offchain::order::OffchainOrderId;
     use crate::position::{PositionCommand, TradeId};
     use crate::test_utils::setup_test_db;
-    use crate::usdc_rebalance::UsdcRebalanceId;
+    use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceId};
     use crate::vault_registry::{VaultRegistry, VaultRegistryCommand};
 
     fn test_order_id() -> OffchainOrderId {
@@ -2082,6 +2185,10 @@ mod tests {
         async fn pending_request_ownership(&self) -> PendingRequestOwnershipSnapshot {
             self.0.clone()
         }
+    }
+
+    fn test_tokenization_request_id(id: &str) -> TokenizationRequestId {
+        TokenizationRequestId::try_new(id).expect("test tokenization request id must be non-empty")
     }
 
     fn ownership(
@@ -2099,19 +2206,16 @@ mod tests {
                     .collect(),
                 mint_tokenizations: mint_tokenization_request_ids
                     .into_iter()
-                    .map(|id| {
-                        TokenizationRequestId::try_new(id)
-                            .expect("test tokenization request id must be non-empty")
-                    })
+                    .map(test_tokenization_request_id)
                     .collect(),
                 redemption_tokenizations: redemption_tokenization_request_ids
                     .into_iter()
-                    .map(|id| {
-                        TokenizationRequestId::try_new(id)
-                            .expect("test tokenization request id must be non-empty")
-                    })
+                    .map(|id| (test_tokenization_request_id(id), Chain::Base))
                     .collect(),
-                redemption_txs: redemption_txs.into_iter().collect(),
+                redemption_txs: redemption_txs
+                    .into_iter()
+                    .map(|tx| (tx, Chain::Base))
+                    .collect(),
             },
         ))
     }
@@ -2176,6 +2280,18 @@ mod tests {
             panic!("MockEthereumWallet::prepare_pending should not be called in polling tests")
         }
 
+        async fn prepare_pending_with_gas_limit(
+            &self,
+            _contract: Address,
+            _calldata: Bytes,
+            _unpadded_gas_limit: u64,
+            _note: &str,
+        ) -> Result<PreparedTransaction, EvmError> {
+            panic!(
+                "MockEthereumWallet::prepare_pending_with_gas_limit should not be called in polling tests"
+            )
+        }
+
         async fn broadcast_prepared(
             &self,
             _prepared: &PreparedTransaction,
@@ -2186,6 +2302,13 @@ mod tests {
 
         async fn discard_prepared(&self, _tx_hash: TxHash) {
             panic!("MockEthereumWallet::discard_prepared should not be called in polling tests");
+        }
+
+        async fn prepare_fee_replacement(
+            &self,
+            _prepared: &PreparedTransaction,
+        ) -> Result<Option<PreparedTransaction>, EvmError> {
+            panic!("MockEthereumWallet::prepare_fee_replacement should not be called here")
         }
 
         async fn release_superseded(&self, _tx_hash: TxHash) {
@@ -2255,6 +2378,18 @@ mod tests {
             panic!("MockBaseWallet::prepare_pending should not be called in polling tests")
         }
 
+        async fn prepare_pending_with_gas_limit(
+            &self,
+            _contract: Address,
+            _calldata: Bytes,
+            _unpadded_gas_limit: u64,
+            _note: &str,
+        ) -> Result<PreparedTransaction, EvmError> {
+            panic!(
+                "MockBaseWallet::prepare_pending_with_gas_limit should not be called in polling tests"
+            )
+        }
+
         async fn broadcast_prepared(
             &self,
             _prepared: &PreparedTransaction,
@@ -2265,6 +2400,13 @@ mod tests {
 
         async fn discard_prepared(&self, _tx_hash: TxHash) {
             panic!("MockBaseWallet::discard_prepared should not be called in polling tests");
+        }
+
+        async fn prepare_fee_replacement(
+            &self,
+            _prepared: &PreparedTransaction,
+        ) -> Result<Option<PreparedTransaction>, EvmError> {
+            panic!("MockBaseWallet::prepare_fee_replacement should not be called here")
         }
 
         async fn release_superseded(&self, _tx_hash: TxHash) {
@@ -2322,9 +2464,25 @@ mod tests {
         WalletPollingCtx {
             ethereum: MockEthereumWallet::with_asserter(&ethereum_asserter),
             base: MockBaseWallet::with_asserter(&base_asserter),
-            unwrapped_equity_token_addresses: HashMap::new(),
-            wrapped_equity_token_addresses: HashMap::new(),
+            equity_wallets: BTreeMap::new(),
         }
+    }
+
+    /// Polls Base's equity wallet on `wallet`, the wallet a test also reads
+    /// Base USDC from, so one asserter serves both reads in poll order.
+    fn base_equity_wallet(
+        wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+        unwrapped_token_addresses: HashMap<Symbol, Address>,
+        wrapped_token_addresses: HashMap<Symbol, Address>,
+    ) -> BTreeMap<Chain, EquityWalletPolling> {
+        BTreeMap::from([(
+            Chain::Base,
+            EquityWalletPolling {
+                wallet,
+                unwrapped_token_addresses,
+                wrapped_token_addresses,
+            },
+        )])
     }
 
     /// A Float (bytes32) representing zero balance, used as mock vaultBalance2 response.
@@ -4823,8 +4981,8 @@ mod tests {
             },
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
-                base: base_wallet,
-                unwrapped_equity_token_addresses: equity_tokens,
+                base: base_wallet.clone(),
+                equity_wallets: base_equity_wallet(base_wallet, equity_tokens, HashMap::new()),
                 ..mock_wallet_polling_ctx(&server)
             }),
             None,
@@ -4943,8 +5101,8 @@ mod tests {
             },
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
-                base: base_wallet,
-                unwrapped_equity_token_addresses: equity_tokens,
+                base: base_wallet.clone(),
+                equity_wallets: base_equity_wallet(base_wallet, equity_tokens, HashMap::new()),
                 ..mock_wallet_polling_ctx(&server)
             }),
             None,
@@ -5001,8 +5159,8 @@ mod tests {
             },
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
-                base: base_wallet,
-                unwrapped_equity_token_addresses: equity_tokens,
+                base: base_wallet.clone(),
+                equity_wallets: base_equity_wallet(base_wallet, equity_tokens, HashMap::new()),
                 ..mock_wallet_polling_ctx(&server)
             }),
             None,
@@ -5061,8 +5219,12 @@ mod tests {
             },
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
-                base: base_wallet,
-                wrapped_equity_token_addresses: wrapped_equity_tokens,
+                base: base_wallet.clone(),
+                equity_wallets: base_equity_wallet(
+                    base_wallet,
+                    HashMap::new(),
+                    wrapped_equity_tokens,
+                ),
                 ..mock_wallet_polling_ctx(&server)
             }),
             None,
@@ -5139,8 +5301,12 @@ mod tests {
             },
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
-                base: base_wallet,
-                wrapped_equity_token_addresses: wrapped_equity_tokens,
+                base: base_wallet.clone(),
+                equity_wallets: base_equity_wallet(
+                    base_wallet,
+                    HashMap::new(),
+                    wrapped_equity_tokens,
+                ),
                 ..mock_wallet_polling_ctx(&server)
             }),
             None,
@@ -5256,8 +5422,12 @@ mod tests {
             },
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
-                base: base_wallet,
-                wrapped_equity_token_addresses: wrapped_equity_tokens,
+                base: base_wallet.clone(),
+                equity_wallets: base_equity_wallet(
+                    base_wallet,
+                    HashMap::new(),
+                    wrapped_equity_tokens,
+                ),
                 ..mock_wallet_polling_ctx(&server)
             }),
             None,
@@ -5317,8 +5487,12 @@ mod tests {
             },
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
-                base: base_wallet,
-                wrapped_equity_token_addresses: wrapped_equity_tokens,
+                base: base_wallet.clone(),
+                equity_wallets: base_equity_wallet(
+                    base_wallet,
+                    HashMap::new(),
+                    wrapped_equity_tokens,
+                ),
                 ..mock_wallet_polling_ctx(&server)
             }),
             None,
@@ -5966,41 +6140,215 @@ mod tests {
         assert_eq!(redemptions.get(&test_symbol("AAPL")), Some(&test_shares(5)));
     }
 
+    #[tokio::test]
+    async fn poll_inflight_equity_records_each_owned_redemption_on_its_own_chain() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(provider.clone());
+        let (orderbook, order_owner) = test_addresses();
+        let base_tx = TxHash::random();
+        let robinhood_tx = TxHash::random();
+
+        let tokenizer = Arc::new(
+            st0x_tokenization::mock::MockTokenizer::new().with_pending_requests(vec![
+                mock_pending_request_with_tx_hash(
+                    st0x_tokenization::TokenizationRequestType::Redeem,
+                    "AAPL",
+                    5,
+                    base_tx,
+                    Some(order_owner),
+                ),
+                mock_pending_request_with_tx_hash(
+                    st0x_tokenization::TokenizationRequestType::Redeem,
+                    "AAPL",
+                    7,
+                    robinhood_tx,
+                    Some(order_owner),
+                ),
+            ]),
+        );
+
+        let service = InventoryPollingService::new(
+            PollFreshness::new(),
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
+            MockExecutor::new(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            Some(tokenizer),
+            Usd::ZERO,
+        )
+        .with_pending_request_ownership(Arc::new(TestPendingRequestOwnership(
+            PendingRequestOwnershipSnapshot {
+                redemption_txs: HashMap::from([
+                    (base_tx, Chain::Base),
+                    (robinhood_tx, Chain::Robinhood),
+                ]),
+                ..PendingRequestOwnershipSnapshot::default()
+            },
+        )));
+
+        service.poll_and_record().await.unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        let base_redemptions = events
+            .iter()
+            .find_map(|event| match event {
+                InventorySnapshotEvent::InflightEquity { redemptions, .. } => Some(redemptions),
+                _ => None,
+            })
+            .expect("Expected InflightEquity event");
+        assert_eq!(
+            *base_redemptions,
+            BTreeMap::from([(test_symbol("AAPL"), test_shares(5))]),
+            "Base must not carry the Robinhood redemption"
+        );
+
+        let chain_events: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                InventorySnapshotEvent::ChainInflightRedemptions {
+                    chain, redemptions, ..
+                } => Some((*chain, redemptions.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            chain_events,
+            vec![(
+                Chain::Robinhood,
+                BTreeMap::from([(test_symbol("AAPL"), test_shares(7))])
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_inflight_equity_skips_none_type_but_keeps_valid_rows() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(provider.clone());
+        let (orderbook, order_owner) = test_addresses();
+
+        let tokenizer = Arc::new(
+            st0x_tokenization::mock::MockTokenizer::new().with_pending_requests(vec![
+                mock_pending_request_no_type("AAPL", 5),
+                mock_pending_request(st0x_tokenization::TokenizationRequestType::Mint, "AAPL", 10),
+                mock_pending_request(
+                    st0x_tokenization::TokenizationRequestType::Redeem,
+                    "TSLA",
+                    20,
+                ),
+            ]),
+        );
+
+        let service = InventoryPollingService::new(
+            PollFreshness::new(),
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
+            MockExecutor::new(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            Some(tokenizer),
+            Usd::ZERO,
+        )
+        .with_pending_request_ownership(ownership(
+            [],
+            ["REQ_AAPL_10", "REQ_AAPL_5_notype"],
+            ["REQ_TSLA_20", "REQ_AAPL_5_notype"],
+            [],
+        ));
+
+        service.poll_and_record().await.unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        let (mints, redemptions) = events
+            .iter()
+            .find_map(|event| match event {
+                InventorySnapshotEvent::InflightEquity {
+                    mints, redemptions, ..
+                } => Some((mints, redemptions)),
+                _ => None,
+            })
+            .expect("Expected InflightEquity event");
+        assert_eq!(
+            *mints,
+            BTreeMap::from([(test_symbol("AAPL"), test_shares(10))])
+        );
+        assert_eq!(
+            *redemptions,
+            BTreeMap::from([(test_symbol("TSLA"), test_shares(20))])
+        );
+    }
+
     #[test]
-    fn aggregate_pending_requests_skips_none_type_but_keeps_valid_rows() {
-        let requests = vec![
-            mock_pending_request_no_type("AAPL", 5),
-            mock_pending_request(st0x_tokenization::TokenizationRequestType::Mint, "AAPL", 10),
-            mock_pending_request(
-                st0x_tokenization::TokenizationRequestType::Redeem,
-                "TSLA",
-                20,
-            ),
-            mock_pending_request(st0x_tokenization::TokenizationRequestType::Mint, "AAPL", 3),
-        ];
+    fn aggregate_pending_requests_splits_redemptions_by_chain_and_sums_mints() {
+        let base_redemption = mock_pending_request(
+            st0x_tokenization::TokenizationRequestType::Redeem,
+            "AAPL",
+            4,
+        );
+        let robinhood_redemption = mock_pending_request(
+            st0x_tokenization::TokenizationRequestType::Redeem,
+            "AAPL",
+            6,
+        );
+        let first_mint =
+            mock_pending_request(st0x_tokenization::TokenizationRequestType::Mint, "AAPL", 1);
+        let second_mint =
+            mock_pending_request(st0x_tokenization::TokenizationRequestType::Mint, "AAPL", 2);
 
         let PendingRequests { mints, redemptions } = InventoryPollingService::<
             ReadOnlyEvm<RootProvider>,
             MockExecutor,
         >::aggregate_pending_requests(
-            requests.into_iter()
+            [
+                (base_redemption, OwnedRequest::Redemption(Chain::Base)),
+                (
+                    robinhood_redemption,
+                    OwnedRequest::Redemption(Chain::Robinhood),
+                ),
+                (first_mint, OwnedRequest::Mint),
+                (second_mint, OwnedRequest::Mint),
+            ]
+            .into_iter(),
         )
         .unwrap();
 
         assert_eq!(
-            mints.get(&test_symbol("AAPL")),
-            Some(&test_shares(13)),
-            "Valid mint rows should aggregate despite a None-type row"
+            mints,
+            BTreeMap::from([(test_symbol("AAPL"), test_shares(3))])
         );
-
         assert_eq!(
-            redemptions.get(&test_symbol("TSLA")),
-            Some(&test_shares(20)),
-            "Redemption row should be unaffected by the None-type row"
+            redemptions,
+            BTreeMap::from([
+                (
+                    Chain::Base,
+                    BTreeMap::from([(test_symbol("AAPL"), test_shares(4))])
+                ),
+                (
+                    Chain::Robinhood,
+                    BTreeMap::from([(test_symbol("AAPL"), test_shares(6))])
+                ),
+            ])
         );
-
-        assert_eq!(mints.len(), 1);
-        assert_eq!(redemptions.len(), 1);
     }
 
     #[test]
@@ -6014,7 +6362,9 @@ mod tests {
             ReadOnlyEvm<RootProvider>,
             MockExecutor,
         >::aggregate_pending_requests(
-            requests.into_iter()
+            requests
+                .into_iter()
+                .map(|request| (request, OwnedRequest::Mint)),
         )
         .unwrap();
 
@@ -6848,7 +7198,7 @@ mod tests {
         // Phantom credit at Hedging, guard armed by clear_equity_inflight.
         let view = InventoryView::default()
             .with_equity(spym.clone(), FractionalShares::ZERO, phantom)
-            .clear_equity_inflight(&spym, Venue::Hedging, now)
+            .clear_equity_inflight_at(&spym, Chain::Base, Venue::Hedging, now)
             .unwrap();
         let inventory = broadcasting_inventory(view);
         let gate = Arc::new(InventoryDivergenceGate::default());
@@ -6914,7 +7264,7 @@ mod tests {
             let mut view = inventory.write().await;
             *view = view
                 .clone()
-                .clear_equity_inflight(&spym, Venue::Hedging, Utc::now())
+                .clear_equity_inflight_at(&spym, Chain::Base, Venue::Hedging, Utc::now())
                 .unwrap();
         }
 
@@ -7193,9 +7543,38 @@ mod tests {
 
     #[tokio::test]
     async fn cash_divergence_counter_frozen_while_usdc_rebalance_active() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
         assert_cash_counter_frozen_while_busy(
-            |view| view.set_active_usdc_rebalance(UsdcRebalanceId(Uuid::new_v4())),
-            InventoryView::clear_active_usdc_rebalance,
+            |view| {
+                view.set_active_usdc_rebalance(
+                    id.clone(),
+                    ActiveUsdcRebalance::Known {
+                        chain: Chain::Base,
+                        direction: RebalanceDirection::AlpacaToBase,
+                    },
+                )
+            },
+            |view| view.clear_active_usdc_rebalance(&id),
+        )
+        .await;
+    }
+
+    /// A Robinhood-corridor conversion reserves no inflight yet; its marker
+    /// alone must freeze the broker cash counter.
+    #[tokio::test]
+    async fn cash_divergence_counter_frozen_during_a_non_primary_conversion() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        assert_cash_counter_frozen_while_busy(
+            |view| {
+                view.set_active_usdc_rebalance(
+                    id.clone(),
+                    ActiveUsdcRebalance::Known {
+                        chain: Chain::Robinhood,
+                        direction: RebalanceDirection::AlpacaToBase,
+                    },
+                )
+            },
+            |view| view.clear_active_usdc_rebalance(&id),
         )
         .await;
     }
@@ -7287,10 +7666,10 @@ mod tests {
         let threshold = 3u32;
         let now = Utc::now();
 
-        // Phantom cash at Hedging, guard armed by clear_usdc_inflight.
+        // Phantom cash at Hedging, guard armed by clear_usdc_inflight_at.
         let view = InventoryView::default()
             .with_usdc(Usdc::ZERO, phantom)
-            .clear_usdc_inflight(Venue::Hedging, now)
+            .clear_usdc_inflight_at(Chain::Base, Venue::Hedging, now)
             .unwrap();
         let inventory = broadcasting_inventory(view);
         let gate = Arc::new(InventoryDivergenceGate::default());
@@ -7348,7 +7727,7 @@ mod tests {
             let mut view = inventory.write().await;
             *view = view
                 .clone()
-                .clear_usdc_inflight(Venue::Hedging, Utc::now())
+                .clear_usdc_inflight_at(Chain::Base, Venue::Hedging, Utc::now())
                 .unwrap();
         }
 
@@ -7497,7 +7876,13 @@ mod tests {
         let mut view =
             InventoryView::default().with_usdc(Usdc::ZERO, Usdc::from_cents(50_000).unwrap());
         taint_from_restart(&mut view, &spym);
-        let view = view.set_active_usdc_rebalance(UsdcRebalanceId(Uuid::new_v4()));
+        let view = view.set_active_usdc_rebalance(
+            UsdcRebalanceId(Uuid::new_v4()),
+            ActiveUsdcRebalance::Known {
+                chain: Chain::Base,
+                direction: RebalanceDirection::AlpacaToBase,
+            },
+        );
         let inventory = broadcasting_inventory(view);
         let gate = Arc::new(InventoryDivergenceGate::default());
         let service = reconciling_service(
@@ -8003,8 +8388,8 @@ mod tests {
             },
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
-                base: base_wallet,
-                unwrapped_equity_token_addresses: equity_tokens,
+                base: base_wallet.clone(),
+                equity_wallets: base_equity_wallet(base_wallet, equity_tokens, HashMap::new()),
                 ..mock_wallet_polling_ctx(&server)
             }),
             None,
@@ -8020,6 +8405,313 @@ mod tests {
                 &PortfolioAsset::Equity(test_symbol("AAPL"))
             ),
             "a zero on-chain balance is still a real observation and must be stamped"
+        );
+    }
+
+    /// `(token, account)` of each recorded `balanceOf` read.
+    type BalanceOfReads = Arc<Mutex<Vec<(Address, Address)>>>;
+
+    /// Serves one chain's wallet `balanceOf` reads, recording the token and
+    /// account of each so a test can assert which wallet and token a chain
+    /// was read with. Answers every read with `balance`, or with an RPC
+    /// error when `balance` is `None`.
+    #[derive(Clone)]
+    struct BalanceOfRecorder {
+        balance: Option<U256>,
+        reads: BalanceOfReads,
+    }
+
+    impl Service<RequestPacket> for BalanceOfRecorder {
+        type Response = ResponsePacket;
+        type Error = TransportError;
+        type Future = TransportFut<'static>;
+
+        fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), TransportError>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: RequestPacket) -> Self::Future {
+            let RequestPacket::Single(request) = request else {
+                panic!("BalanceOfRecorder serves single requests only");
+            };
+            assert_eq!(
+                request.method(),
+                "eth_call",
+                "BalanceOfRecorder got an unexpected method"
+            );
+
+            let params: Vec<serde_json::Value> =
+                serde_json::from_str(request.params().unwrap().get()).unwrap();
+            let transaction: TransactionRequest =
+                serde_json::from_value(params[0].clone()).unwrap();
+            let token = transaction.to.unwrap().into_to().unwrap();
+            let call =
+                IERC20::balanceOfCall::abi_decode(transaction.input.input().unwrap()).unwrap();
+            self.reads.lock().unwrap().push((token, call.account));
+
+            let payload = self.balance.map_or_else(
+                || {
+                    ResponsePayload::Failure(alloy::rpc::json_rpc::ErrorPayload {
+                        code: -32000,
+                        message: "balanceOf RPC failure".into(),
+                        data: None,
+                    })
+                },
+                |balance| {
+                    let encoded = alloy::hex::encode_prefixed(balance.abi_encode());
+                    ResponsePayload::Success(
+                        RawValue::from_string(serde_json::to_string(&encoded).unwrap()).unwrap(),
+                    )
+                },
+            );
+            let response = Response {
+                id: request.id().clone(),
+                payload,
+            };
+
+            Box::pin(async move { Ok(ResponsePacket::Single(response)) })
+        }
+    }
+
+    fn recording_equity_wallet(
+        address: Address,
+        balance: Option<U256>,
+        unwrapped_token_addresses: HashMap<Symbol, Address>,
+    ) -> (EquityWalletPolling, BalanceOfReads) {
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let recorder = BalanceOfRecorder {
+            balance,
+            reads: Arc::clone(&reads),
+        };
+        let wallet = EquityWalletPolling {
+            wallet: Arc::new(MockBaseWallet {
+                address,
+                provider: RootProvider::new(RpcClient::new(recorder, true)),
+            }),
+            unwrapped_token_addresses,
+            wrapped_token_addresses: HashMap::new(),
+        };
+        (wallet, reads)
+    }
+
+    fn equity_wallet(
+        asserter: &Asserter,
+        unwrapped_token_addresses: HashMap<Symbol, Address>,
+    ) -> EquityWalletPolling {
+        EquityWalletPolling {
+            wallet: MockBaseWallet::with_asserter(asserter),
+            unwrapped_token_addresses,
+            wrapped_token_addresses: HashMap::new(),
+        }
+    }
+
+    fn wallet_polling_service(
+        pool: &SqlitePool,
+        poll_freshness: PollFreshness,
+        wallet_polling: WalletPollingCtx,
+    ) -> InventoryPollingService<ReadOnlyEvm<impl Provider + Clone + 'static>, MockExecutor> {
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(provider);
+        let (orderbook, order_owner) = test_addresses();
+
+        InventoryPollingService::new(
+            poll_freshness,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
+            MockExecutor::new(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            Arc::new(test_store(pool.clone(), ())),
+            Some(wallet_polling),
+            None,
+            Usd::ZERO,
+        )
+    }
+
+    /// One chain's failed wallet read must not hide the tokens stranded in
+    /// the other chains' wallets: every chain is still read and recorded,
+    /// and the failure is still reported.
+    #[tokio::test]
+    async fn a_failing_chain_wallet_read_does_not_stop_the_other_chains() {
+        let pool = setup_test_db().await;
+        let server = MockServer::start();
+        let five_shares = Some(U256::from(5_000_000_000_000_000_000_u128));
+
+        let base_wallet = address!("0xB000000000000000000000000000000000000001");
+        let base_token = address!("0xB000000000000000000000000000000000000002");
+        let ethereum_wallet = address!("0xE000000000000000000000000000000000000001");
+        let ethereum_token = address!("0xE000000000000000000000000000000000000002");
+        let robinhood_wallet = address!("0xD000000000000000000000000000000000000001");
+        let robinhood_token = address!("0xD000000000000000000000000000000000000002");
+        let aapl = |token| HashMap::from([(test_symbol("AAPL"), token)]);
+
+        let (base, base_reads) =
+            recording_equity_wallet(base_wallet, five_shares, aapl(base_token));
+        let (ethereum, ethereum_reads) =
+            recording_equity_wallet(ethereum_wallet, None, aapl(ethereum_token));
+        let (robinhood, robinhood_reads) =
+            recording_equity_wallet(robinhood_wallet, five_shares, aapl(robinhood_token));
+
+        let service = wallet_polling_service(
+            &pool,
+            PollFreshness::new(),
+            WalletPollingCtx {
+                equity_wallets: BTreeMap::from([
+                    (Chain::Base, base),
+                    (Chain::Ethereum, ethereum),
+                    (Chain::Robinhood, robinhood),
+                ]),
+                ..mock_wallet_polling_ctx(&server)
+            },
+        );
+        let (orderbook, order_owner) = test_addresses();
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+
+        let error = service.poll_wallets(&snapshot_id).await.unwrap_err();
+        assert!(matches!(error, InventoryPollingError::Evm(_)), "{error:?}");
+
+        let expected = BTreeMap::from([(test_symbol("AAPL"), test_shares(5))]);
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            InventorySnapshotEvent::BaseWalletUnwrappedEquity { balances, .. }
+                if *balances == expected
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            InventorySnapshotEvent::ChainWalletUnwrappedEquity {
+                chain: Chain::Robinhood,
+                balances,
+                ..
+            } if *balances == expected
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            InventorySnapshotEvent::ChainWalletUnwrappedEquity {
+                chain: Chain::Ethereum,
+                ..
+            }
+        )));
+
+        assert_eq!(*base_reads.lock().unwrap(), vec![(base_token, base_wallet)]);
+        assert_eq!(
+            *ethereum_reads.lock().unwrap(),
+            vec![(ethereum_token, ethereum_wallet)]
+        );
+        assert_eq!(
+            *robinhood_reads.lock().unwrap(),
+            vec![(robinhood_token, robinhood_wallet)]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_unwrapped_read_still_records_wrapped_equity_on_same_chain() {
+        let pool = setup_test_db().await;
+        let server = MockServer::start();
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("unwrapped RPC failure");
+        asserter.push_success(&alloy::hex::encode_prefixed(
+            U256::from(5_000_000_000_000_000_000_u128).abi_encode(),
+        ));
+        let tokens = HashMap::from([(
+            test_symbol("AAPL"),
+            address!("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        )]);
+        let mut wallet = equity_wallet(&asserter, tokens.clone());
+        wallet.wrapped_token_addresses = tokens;
+        let service = wallet_polling_service(
+            &pool,
+            PollFreshness::new(),
+            WalletPollingCtx {
+                equity_wallets: BTreeMap::from([(Chain::Robinhood, wallet)]),
+                ..mock_wallet_polling_ctx(&server)
+            },
+        );
+        let (orderbook, order_owner) = test_addresses();
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+        let wallet = &service.wallet_polling.as_ref().unwrap().equity_wallets[&Chain::Robinhood];
+        assert!(matches!(
+            service
+                .poll_wallet_equity(&snapshot_id, Chain::Robinhood, wallet)
+                .await,
+            Err(InventoryPollingError::Evm(_))
+        ));
+        let expected = BTreeMap::from([(test_symbol("AAPL"), test_shares(5))]);
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        assert!(events.iter().any(|event| matches!(event,
+            InventorySnapshotEvent::ChainWalletWrappedEquity { chain: Chain::Robinhood, balances, .. }
+            if *balances == expected)));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            InventorySnapshotEvent::ChainWalletUnwrappedEquity {
+                chain: Chain::Robinhood,
+                ..
+            }
+        )));
+    }
+
+    /// The portfolio snapshot values Base's wallet only: another chain's
+    /// wallet read records its event but refreshes no Base slot.
+    #[tokio::test]
+    async fn another_chains_wallet_read_stamps_no_base_wallet_freshness() {
+        let pool = setup_test_db().await;
+        let server = MockServer::start();
+        let tokens = HashMap::from([(
+            test_symbol("AAPL"),
+            address!("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        )]);
+        let robinhood_asserter = zero_balance_wallet_asserter(1);
+        let poll_freshness = PollFreshness::new();
+
+        let service = wallet_polling_service(
+            &pool,
+            poll_freshness.clone(),
+            WalletPollingCtx {
+                equity_wallets: BTreeMap::from([(
+                    Chain::Robinhood,
+                    equity_wallet(&robinhood_asserter, tokens),
+                )]),
+                ..mock_wallet_polling_ctx(&server)
+            },
+        );
+        let (orderbook, order_owner) = test_addresses();
+
+        service
+            .poll_wallets(&InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            })
+            .await
+            .unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            InventorySnapshotEvent::ChainWalletUnwrappedEquity {
+                chain: Chain::Robinhood,
+                ..
+            }
+        )));
+        assert!(
+            !observed(
+                &poll_freshness,
+                PortfolioLocation::BaseWalletUnwrapped,
+                &PortfolioAsset::Equity(test_symbol("AAPL"))
+            ),
+            "a Robinhood wallet read must not mark Base's wallet slot fresh"
         );
     }
 
@@ -8350,9 +9042,12 @@ mod tests {
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
                 ethereum: ethereum_wallet,
-                base: base_wallet,
-                unwrapped_equity_token_addresses,
-                wrapped_equity_token_addresses,
+                base: base_wallet.clone(),
+                equity_wallets: base_equity_wallet(
+                    base_wallet,
+                    unwrapped_equity_token_addresses,
+                    wrapped_equity_token_addresses,
+                ),
             }),
             None,
             Usd::ZERO,

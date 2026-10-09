@@ -142,10 +142,11 @@ required_confirmations = 1
 
 # Robinhood Chain (an Arbitrum Orbit L2, chain id 4663): a prefunded
 # hedge-only secondary. Fills on its orderbook are ingested, validated
-# against USDG (pinned in code) and hedged; inventory is topped up by hand
-# and no asset may enable rebalancing (no wrapper or CCTP domain is wired
-# there). Gas is ETH. There is one Robinhood deployment, so staging watches
-# the same orderbook and inventory as prod.
+# against USDG (pinned in code) and hedged. Gas is ETH. There is one
+# Robinhood deployment, so staging watches the same orderbook and inventory
+# as prod, on a different broker account. Staging must therefore never
+# rebalance Robinhood equity, even though the chain can: the wrappers are
+# deployed there and Alpaca serves its network. Prod owns that inventory.
 
 [chains.robinhood]
 lifecycle = "prefunded"
@@ -157,8 +158,10 @@ required_confirmations = 10
 # RaindexV6 on Robinhood Chain (st0x.raindex-deploy docs/CHAINS.md).
 orderbook = "0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20"
 inventory_mode = "managed"
-# No venue adapters: Bebop is off on Robinhood.
-inventory_adapters = []
+# Bebop's Robinhood RFQ hook; it holds OPERATOR_ROLE on the 4663 inventory.
+inventory_adapters = [
+  { venue = "bebop", operator = "0x242FdEc55623187E80A690ff15302e63dddd7130" },
+]
 # The single RaindexInventory on 4663; it owns the orders and vaults, so it
 # is the vault owner too. The bot wallet must hold OPERATOR_ROLE on it.
 inventory = "0x1eFd85E6C384fAD9B80C6D508E9098Eb91C4eD30"

@@ -6,16 +6,19 @@ mod freeze;
 mod usdc;
 mod usdc_guard;
 
+#[cfg(test)]
+pub(crate) use equity::{EquityTriggerError, InProgressGuard, StubLastPrice};
 pub(crate) use equity::{
-    GUARD_GENERATION, GuardGeneration, GuardState, LastPriceReader, RecoveryGuard,
+    FillPriceOrMark, GUARD_GENERATION, GuardGeneration, GuardState, HedgeCapacity, HeldRecovery,
+    LastPriceReader, PendingMintResume, PendingMintResumes, RecoveryGuard,
     claim_guard_for_recovery_or_orphan, remove_active_transfer,
 };
-#[cfg(test)]
-pub(crate) use equity::{InProgressGuard, StubLastPrice};
+pub(crate) use usdc_guard::UsdcCashGuards;
 
 use alloy::primitives::{Address, TxHash};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use itertools::Itertools;
 use metrics::counter;
 use sqlx::SqlitePool;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -30,8 +33,8 @@ use uuid::Uuid;
 use rain_math_float::Float;
 use st0x_bridge::corridor::{UsdcCorridor, legacy_base_cctp};
 use st0x_config::{
-    AllocationCtx, ChainAssets, ChainEquityAsset, ExecutionThreshold, OperationMode, TargetShare,
-    UsdcCorridorCtx,
+    AllocationCtx, ChainAssets, ChainEquityAsset, ExecutionThreshold, OperationMode,
+    RebalancingMode, TargetShare, UsdcCorridorCtx, UsdcCorridors,
 };
 #[cfg(test)]
 use st0x_config::{ChainCashAsset, ChainEquities};
@@ -41,7 +44,7 @@ use st0x_event_sorcery::{
 };
 #[cfg(test)]
 use st0x_event_sorcery::{StoreBuilder, test_store};
-use st0x_evm::Chain;
+use st0x_evm::{Chain, PreparedTransaction};
 use st0x_execution::{FractionalShares, HedgeFloor, Positive, SharesConversionError, Symbol};
 use st0x_finance::{HasZero, Usd, Usdc};
 #[cfg(test)]
@@ -50,17 +53,18 @@ use st0x_tokenization::{ClientRequestId, IssuerRequestId, TokenizationRequestId}
 use st0x_wrapper::{Wrapper, WrapperError};
 
 use self::allocation::{
-    ChainSlot, DeclineReason, EquityPlan, EquityPlanInput, PlannedDirection, PlannedOperation,
-    plan_equity_operation,
+    ChainSlot, DeclineReason, EquityPlan, EquityPlanInput, Participation, PlannedDirection,
+    PlannedOperation, plan_equity_operation,
 };
 use self::freeze::FreezeStatusReader;
 use self::usdc::UsdcRebalanceOperation;
-use self::usdc_guard::{ClaimRefusal, UsdcCashGuards};
+use self::usdc_guard::{CashGuardClaim, ClaimRefusal};
 #[cfg(test)]
 use crate::alerts::LogNotifier;
 #[cfg(test)]
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::conductor::job::{BackpressureStreak, QueuePushError};
+use crate::dashboard::equity_price::MarkListener;
 use crate::equity_redemption::{
     EquityRedemption, EquityRedemptionCommand, EquityRedemptionEvent, RedemptionAggregateId,
 };
@@ -69,16 +73,16 @@ use crate::inventory::projection::InventoryProjectionError;
 use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::view::InFlightEquityLocation;
 use crate::inventory::{
-    BroadcastingInventory, Inventory, InventoryDivergenceGate, InventoryError, InventoryScope,
-    InventoryView, InventoryViewError, Operator, PendingRequestOwnership,
+    BroadcastingInventory, CashAdmission, Inventory, InventoryDivergenceGate, InventoryError,
+    InventoryScope, InventoryViewError, Operator, PendingRequestOwnership,
     PendingRequestOwnershipSnapshot, PollFreshness, PortfolioAsset, PortfolioLocation, TransferOp,
     Venue,
 };
-use crate::native_gas::{ConfiguredGasReadiness, GasReadiness, TransferGasRoute};
+use crate::native_gas::{ConfiguredGasReadiness, GasReadinessFailure, TransferGasRoute};
 use crate::offchain::order::OffchainOrderId;
 use crate::position::{
-    EquityTransferReservationId, EquityTransferReservationStatus, Position, PositionCommand,
-    PositionError, PositionEvent,
+    EquityTransferReservationId, EquityTransferReservationStatus, HedgeFundingRedemption, Position,
+    PositionCommand, PositionError, PositionEvent,
 };
 #[cfg(test)]
 use crate::rebalancing::equity::EquityTransferServices;
@@ -98,8 +102,8 @@ use crate::unwrapped_equity_recovery::{
     UnwrappedEquityRecoveryJob, UnwrappedEquityRecoveryJobQueue,
 };
 use crate::usdc_rebalance::{
-    InterruptedUsdcRebalances, RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent,
-    UsdcRebalanceId, any_rebalance_holds_guard, interrupted_usdc_rebalance_ids,
+    CooldownFailure, InterruptedUsdcRebalances, RebalanceDirection, UsdcRebalance,
+    UsdcRebalanceEvent, UsdcRebalanceId, any_rebalance_holds_guard, interrupted_usdc_rebalance_ids,
 };
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 use crate::wrapped_equity_recovery::aggregate::WrappedEquityRecoveryId;
@@ -108,7 +112,9 @@ use crate::wrapped_equity_recovery::{WrappedEquityRecoveryJob, WrappedEquityReco
 pub(crate) use equity::{EquityRebalancingCheck, EquityRebalancingCheckScheduler};
 #[cfg(test)]
 pub(crate) use freeze::StubFreezeReader;
-pub(crate) use usdc::{UsdcRebalancingCheck, UsdcRebalancingCheckScheduler};
+pub(crate) use usdc::{
+    USDC_WITHDRAW_REJECTION_COOLDOWN, UsdcRebalancingCheck, UsdcRebalancingCheckScheduler,
+};
 
 /// Bundle of the equity + USDC schedulers so constructors and plumbing
 /// functions can pass them as a single argument instead of two.
@@ -186,11 +192,12 @@ pub(crate) enum RebalancingServiceError {
 }
 
 /// Why a manual USDC resume (`transfer resume --kind usdc`, routed through
-/// the bot) could not be enqueued. Distinguishes operator-actionable
-/// refusals (unknown id, direction mismatch, already terminal), single-flight
-/// conflicts (another transfer in flight, another guard holder), and
-/// transient infrastructure failures, mirroring the recoverability split the
-/// API maps onto HTTP statuses for `UsdcRecheckError`.
+/// the bot) or a manual USDC transfer start (`capital transfer-usdc`) could
+/// not be enqueued. Distinguishes operator actionable refusals (unknown id,
+/// direction mismatch, already terminal), single flight conflicts (another
+/// transfer in flight, another guard holder), and transient infrastructure
+/// failures, mirroring the recoverability split the API maps onto HTTP
+/// statuses for `UsdcRecheckError`.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum UsdcResumeError {
     #[error(
@@ -218,7 +225,7 @@ pub(crate) enum UsdcResumeError {
     AlreadyInFlight { row_id: String, age_secs: i64 },
     #[error(
         "another USDC transfer still holds the corridor guard (for an Alpaca-outbound \
-         resume, an Alpaca-outbound transfer on any corridor counts); reconcile or \
+         transfer, an Alpaca-outbound transfer on any corridor counts); reconcile or \
          resume that one first"
     )]
     GuardHeldElsewhere,
@@ -230,21 +237,39 @@ pub(crate) enum UsdcResumeError {
     #[error("USDC rebalancing stores are not wired yet (conductor still starting)")]
     NotReady,
     #[error(
+        "the USDC corridor's signing wallets are not gas ready ({0}); fund a wallet \
+         that is below its gas threshold, or retry if its balance could not be read"
+    )]
+    GasNotReady(#[source] GasReadinessFailure),
+    #[error(
+        "an unresolved cash snapshot divergence blocks fresh USDC transfers; retry once \
+         the inventory poller has reconciled it"
+    )]
+    CashDivergenceEngaged,
+    #[error(
+        "the cash balance is restart tainted, which blocks fresh USDC transfers; retry \
+         once the inventory poller has re-based it on the broker"
+    )]
+    CashRestartTainted,
+    #[error(
         "USDC transfer corridor mismatch: transfer {id} runs on the {recorded} corridor, \
-         this build serves {served}; nothing was enqueued"
+         this build serves {}; nothing was enqueued",
+        .served.iter().join(", ")
     )]
     CorridorNotServed {
         id: UsdcRebalanceId,
         recorded: UsdcCorridor,
-        served: UsdcCorridor,
+        served: BTreeSet<UsdcCorridor>,
     },
+    #[error("{0}; nothing was enqueued")]
+    CorridorChoice(#[from] st0x_config::ManualCorridorError),
     #[error("aggregate error: {0}")]
     Aggregate(#[source] Box<st0x_event_sorcery::SendError<UsdcRebalance>>),
     #[error(transparent)]
     Database(#[from] sqlx::Error),
     #[error(transparent)]
     ApalisDatabase(#[from] sqlx_apalis::Error),
-    #[error("failed to enqueue the resume job: {0}")]
+    #[error("failed to enqueue the USDC transfer job: {0}")]
     Queue(#[from] QueuePushError),
 }
 
@@ -299,13 +324,12 @@ pub(crate) struct RebalancingServiceConfig {
     /// Bound on the age of a chain's inventory snapshot before that chain's
     /// imbalance evaluations are skipped as stale.
     pub(crate) inventory_staleness_bound: Duration,
-    /// The corridor new cash transfers run on and its band; `None` while
-    /// USDC mode is disabled.
-    pub(crate) usdc: Option<UsdcCorridorCtx>,
-    /// The corridor this build's cash transfer service carries, whatever the
-    /// USDC mode. A transfer recorded on another one is held, never re-armed.
-    pub(crate) served_usdc_corridor: UsdcCorridor,
+    /// The corridors new cash transfers run on, each with its band, and the
+    /// ones this build's cash transfer services carry whatever the USDC mode.
+    /// A transfer recorded on an unserved one is held, never re-armed.
+    pub(crate) usdc: UsdcCorridors,
     pub(crate) transfer_timeout: Duration,
+    pub(crate) recovery_hold_alert_after: Duration,
     /// Every hedged chain's asset table and minimum. The planner slots a
     /// symbol on each chain that rebalances it; the USDC trigger reads the
     /// primary's cash entry.
@@ -322,18 +346,21 @@ pub(crate) struct RebalancingServiceConfig {
 impl RebalancingServiceConfig {
     /// Whitelist gate for the equity rebalancing trigger: a symbol is
     /// planned only when some hedged chain lists it with
-    /// `rebalancing = "enabled"`. Symbols observed in inventory but absent
-    /// from every table are skipped cleanly instead of falling through to
-    /// the `WrapperService` `SymbolNotConfigured` error backstop.
+    /// `rebalancing = "enabled"` or `"paused"`; the planner never starts an
+    /// operation on a paused listing but still counts its inventory.
+    /// Symbols observed in inventory but absent from every table are
+    /// skipped cleanly instead of falling through to the `WrapperService`
+    /// `SymbolNotConfigured` error backstop.
     fn rebalances_equity(&self, symbol: &Symbol) -> bool {
         self.chains
             .values()
-            .any(|chain| chain.assets.is_rebalancing_enabled(symbol))
+            .any(|chain| chain.assets.rebalancing_mode(symbol).keeps_services())
     }
 
-    /// Every hedged chain whose listing of `symbol` rebalances it. A
-    /// hedge-only listing (`rebalancing = "disabled"`) is neither slotted
-    /// nor counted: its prefunded inventory is outside the planner's total.
+    /// Every hedged chain whose listing of `symbol` rebalances it, enabled or
+    /// paused. A hedge-only listing (`rebalancing = "disabled"`) is neither
+    /// slotted nor counted: its prefunded inventory is outside the planner's
+    /// total.
     fn rebalancing_listings<'config>(
         &'config self,
         symbol: &'config Symbol,
@@ -350,7 +377,7 @@ impl RebalancingServiceConfig {
                 .equities
                 .symbols
                 .get(symbol)
-                .filter(|listing| listing.rebalancing == OperationMode::Enabled)
+                .filter(|listing| listing.rebalancing.keeps_services())
                 .map(|listing| (*chain, config, listing))
         })
     }
@@ -359,6 +386,62 @@ impl RebalancingServiceConfig {
         self.chains
             .get(&chain)
             .is_some_and(|config| config.assets.is_wrapped_equity_recovery_enabled(symbol))
+    }
+}
+
+/// Whether a non-terminal recovery job of `job_type` already covers
+/// `symbol` on `chain`. A failed lookup counts as pending, skipping the
+/// enqueue rather than risking a duplicate.
+///
+/// Status-scoped rather than an apalis idempotency key: apalis's
+/// `ON CONFLICT(job_type, idempotency_key) DO NOTHING` never surfaces a
+/// unique-violation, and its index spans all statuses, so a key would
+/// silently wedge a symbol behind its own `Done` row until the hourly
+/// cleanup -- starving the next-poll re-dispatch the guard-contention skip
+/// relies on. The serialized `symbol` is matched exactly (json_extract, not
+/// a LIKE substring) so a queued job for a ticker containing this symbol
+/// (GOOGL vs GOOG) cannot suppress a distinct recovery. A row queued before
+/// jobs named their chain runs on Base, so it blocks only Base.
+async fn recovery_job_pending(
+    pool: &apalis_sqlite::SqlitePool,
+    job_type: &str,
+    chain: Chain,
+    symbol: &Symbol,
+) -> bool {
+    let existing: Result<(i64,), _> = sqlx_apalis::query_as(
+        "SELECT COUNT(*) FROM Jobs \
+         WHERE job_type = ? \
+         AND status IN ('Pending', 'Queued', 'Running') \
+         AND json_extract(job, '$.symbol') = ? \
+         AND COALESCE(json_extract(job, '$.chain'), ?) = ?",
+    )
+    .bind(job_type)
+    .bind(symbol.to_string())
+    .bind(crate::onchain::legacy_chain().as_str())
+    .bind(chain.as_str())
+    .fetch_one(pool)
+    .await;
+
+    match existing {
+        Ok((0,)) => false,
+        Ok((count,)) => {
+            debug!(
+                target: "rebalance",
+                %chain, %symbol, %count, job_type,
+                "Skipped recovery job enqueue: a non-terminal row for this symbol and chain \
+                 already exists",
+            );
+            true
+        }
+        Err(error) => {
+            warn!(
+                target: "rebalance",
+                %chain, %symbol, %error, job_type,
+                "Failed to query existing recovery job rows; skipping enqueue to avoid \
+                 duplicates",
+            );
+            true
+        }
     }
 }
 
@@ -680,6 +763,12 @@ impl RedemptionTracking {
                 self.stage = RedemptionTrackingStage::VaultWithdrawSubmitted;
                 self.last_progress_at = *submitted_at;
             }
+            // The adopted tx is still confirmed in the withdraw stage; the
+            // adoption itself is operator progress on it.
+            EquityRedemptionEvent::VaultWithdrawReplacementAdopted { adopted_at, .. } => {
+                self.stage = RedemptionTrackingStage::VaultWithdrawSubmitted;
+                self.last_progress_at = *adopted_at;
+            }
             EquityRedemptionEvent::WithdrawnFromRaindex { withdrawn_at, .. } => {
                 self.stage = RedemptionTrackingStage::WithdrawnFromRaindex;
                 self.last_progress_at = *withdrawn_at;
@@ -705,7 +794,8 @@ impl RedemptionTracking {
                 self.stage = RedemptionTrackingStage::TokensUnwrapped;
                 self.last_progress_at = *unwrapped_at;
             }
-            EquityRedemptionEvent::SendPending { pending_at, .. } => {
+            EquityRedemptionEvent::SendPending { pending_at }
+            | EquityRedemptionEvent::SendPrepared { pending_at, .. } => {
                 self.stage = RedemptionTrackingStage::SendPending;
                 self.last_progress_at = *pending_at;
             }
@@ -733,7 +823,10 @@ impl RedemptionTracking {
             | EquityRedemptionEvent::RedemptionRejected { .. }
             | EquityRedemptionEvent::ProviderCompletionRecovered { .. }
             | EquityRedemptionEvent::OperatorReconciled { .. }
-            | EquityRedemptionEvent::Completed { .. } => {}
+            | EquityRedemptionEvent::Completed { .. }
+            // A fee replacement means the send is still stuck, so it does not
+            // restart the send's timeout.
+            | EquityRedemptionEvent::SendReplaced { .. } => {}
         }
 
         Ok(())
@@ -769,13 +862,14 @@ fn mint_event_tokenization_request_id(
 }
 
 /// Marker left behind by a transfer timeout cleanup. Records when the
-/// cleanup ran and which symbol's inflight it cleared, so a late completion
-/// event for the tombstoned aggregate can release the symbol's inflight
+/// cleanup ran and which symbol and chain's inflight it cleared, so a late
+/// completion event for the tombstoned aggregate can release that inflight
 /// suppression without any tracking context (cleanup drops the tracking
 /// entry, and completion events do not carry the symbol).
 #[derive(Debug, Clone)]
 struct TimeoutTombstone {
     symbol: Symbol,
+    chain: Chain,
     timed_out_at: DateTime<Utc>,
 }
 
@@ -800,6 +894,15 @@ enum EquitySettlementOutcome {
     DeferredToSnapshot,
 }
 
+impl From<EquitySettlementOutcome> for usdc::CashLedgerState {
+    fn from(outcome: EquitySettlementOutcome) -> Self {
+        match outcome {
+            EquitySettlementOutcome::Reconciled => Self::Reconciled,
+            EquitySettlementOutcome::DeferredToSnapshot => Self::AwaitingSnapshot,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ZombieJobKillOutcome {
     Killed,
@@ -815,6 +918,8 @@ struct SnapshotReconciliation {
     accepted_onchain_cash: Option<ReconciliationGeneration>,
     accepted_offchain_equity: Option<ReconciliationGeneration>,
 }
+
+type InflightSuppression = HashMap<(Symbol, Chain), DateTime<Utc>>;
 
 /// Service that folds CQRS events into rebalancing state and
 /// schedules follow-up imbalance checks. Also serves as the apalis
@@ -834,21 +939,36 @@ pub(crate) struct RebalancingService {
     /// config, mirroring `set_stores`); `None` only in tests that do not
     /// exercise the gate.
     freeze_status: RwLock<Option<Arc<dyn FreezeStatusReader>>>,
-    /// Fresh USDC-transfer gas admission, attached by the conductor through
-    /// `set_gas_readiness`. `Unwired` is fail-closed in production so a missed
-    /// startup wiring step cannot move funds without checking native gas.
-    gas_readiness: RwLock<ConfiguredGasReadiness>,
+    /// Fresh USDC-transfer gas admission per corridor chain, attached by the
+    /// conductor through `set_usdc_gas_readiness`. A chain without an entry
+    /// is `Unwired`, fail-closed in production so a missed startup wiring
+    /// step cannot move funds without checking native gas.
+    usdc_gas_readiness: RwLock<BTreeMap<Chain, ConfiguredGasReadiness>>,
     /// Per-chain gas admission for equity candidates, attached through
     /// `set_equity_gas_readiness`; a chain without an entry is `Unwired`.
     equity_gas_readiness: RwLock<BTreeMap<Chain, ConfiguredGasReadiness>>,
     /// When each `(symbol, chain)` pair last dispatched an operation, so a
     /// transfer truncated by a limit is not re-planned every tick.
     equity_cooldowns: RwLock<HashMap<(Symbol, Chain), DateTime<Utc>>>,
-    /// Each symbol's last onchain fill price, attached through
+    /// When a Base->Alpaca vault withdraw on a chain last failed without
+    /// starting (see `usdc::USDC_WITHDRAW_REJECTION_COOLDOWN`). The `None`
+    /// key holds every chain, for a failure whose corridor is unknown.
+    usdc_withdraw_rejections: RwLock<HashMap<Option<Chain>, DateTime<Utc>>>,
+    /// When a USD->USDC conversion last failed before its Alpaca withdrawal.
+    /// Holds Alpaca->Base planning on every corridor for the configured
+    /// conversion cooldown (see `UsdcCorridors::conversion_failure_cooldown`).
+    usdc_conversion_failed_at: RwLock<Option<DateTime<Utc>>>,
+    /// Shared with the Base->Alpaca job: at most one under-funded page per
+    /// chain per cooldown, cleared when a transfer on the chain completes or
+    /// an operator acts.
+    underfunded_alerts: crate::rebalancing::usdc::UnderfundedAlertLatch,
+    /// Each symbol's price for valuing the minimum, attached through
     /// `set_last_price_reader`; without one no minimum can be valued and
     /// every plan declines.
     last_prices: RwLock<Option<Arc<dyn LastPriceReader>>>,
     pub(crate) equity_in_progress: Arc<std::sync::RwLock<HashMap<Symbol, equity::GuardState>>>,
+    pub(crate) pending_mint_resumes: Arc<PendingMintResumes>,
+    recovery_hold_alerts: RwLock<HashMap<(Symbol, Chain), RecoveryHoldAlert>>,
     /// Symbols the inventory poller flagged with a pending snapshot
     /// divergence. Read here to suppress new equity transfers so a mint or
     /// redemption that would fail at the broker cannot mark the symbol busy
@@ -889,7 +1009,10 @@ pub(crate) struct RebalancingService {
     /// Tracks USDC rebalance lifecycle data needed to settle inventory on
     /// terminal events with the actual amount received.
     usdc_tracking: Arc<RwLock<HashMap<UsdcRebalanceId, usdc::UsdcRebalanceTracking>>>,
-    suppressed_inflight_symbols: Arc<RwLock<HashMap<Symbol, DateTime<Utc>>>>,
+    /// When the inflight of each `(symbol, chain)` was last cleared by a
+    /// timeout or terminal failure. Provider polls fetched before that
+    /// moment are stale for the pair and are filtered out.
+    suppressed_inflight_symbols: Arc<RwLock<InflightSuppression>>,
     timed_out_mints: Arc<RwLock<HashMap<IssuerRequestId, TimeoutTombstone>>>,
     timed_out_redemptions: Arc<RwLock<HashMap<RedemptionAggregateId, TimeoutTombstone>>>,
     /// Terminal transfer reservations whose release is pending. Lifecycle
@@ -935,6 +1058,12 @@ pub(crate) struct RebalancingService {
     /// silence the page about stranded funds: the alert is re-attempted on every
     /// sweep until one delivery succeeds, while the error log stays one-shot.
     post_burn_timeout_alerted: Arc<RwLock<HashSet<UsdcRebalanceId>>>,
+    /// Redemption ids whose timeout page for a pending send to the issuer was delivered.
+    issuer_send_timeout_alerted: Arc<RwLock<HashSet<RedemptionAggregateId>>>,
+    /// Timed-out `TokensUnwrapped` redemptions whose `FailTransfer` the sweep
+    /// is committing before it tears tracking and inventory down. The reactor
+    /// skips their `TransferFailed`, which the sweep's teardown replaces.
+    redemption_timeout_failing: Arc<RwLock<HashSet<RedemptionAggregateId>>>,
     /// Ids of AlpacaToBase transfers the sweep holds before their burn that are
     /// already logged; the same one shot log as `post_burn_timeout_logged`.
     unconfirmed_burn_hold_logged: Arc<RwLock<HashSet<UsdcRebalanceId>>>,
@@ -1030,10 +1159,10 @@ enum UsdcTimeoutCleanup {
 /// guard: `Reconciled`, or a state holding no guard on a corridor this build
 /// does not serve (an operator failed it before its burn, say), which no
 /// other path would ever release.
-fn releases_tracked_guard(state: &UsdcRebalance, served_corridor: UsdcCorridor) -> bool {
+fn releases_tracked_guard(state: &UsdcRebalance, corridors: &UsdcCorridors) -> bool {
     match state {
         UsdcRebalance::Reconciled { .. } => true,
-        held => held.corridor() != served_corridor && !held.holds_rebalance_guard(),
+        held => !corridors.serves(held.corridor()) && !held.holds_rebalance_guard(),
     }
 }
 
@@ -1077,6 +1206,11 @@ fn alpaca_to_base_hold_without_confirmed_burn(state: &UsdcRebalance) -> Option<&
 /// Outcome of examining a tracked redemption during the timeout sweep.
 #[derive(Debug)]
 enum RedemptionTimeoutCleanup {
+    PageIssuerSend {
+        tracking: RedemptionTracking,
+        /// The send's newest signed candidate; `None` for a legacy send.
+        newest_send: Option<PreparedTransaction>,
+    },
     /// The durable aggregate is `Reconciled`: an operator's `transfer reconcile`
     /// (a separate-process CLI, or the in-process API via bare `send_command`)
     /// wrote `OperatorReconciled` to the store, but the live reactor never
@@ -1085,12 +1219,21 @@ enum RedemptionTimeoutCleanup {
     Reconciled {
         tracking: RedemptionTracking,
         /// Whether the reconciled redemption still held a signed vault
-        /// withdrawal whose wallet nonce reservation must be released.
+        /// withdrawal or send to the issuer whose wallet nonce reservation must be
+        /// released.
         held_prepared: bool,
     },
     /// The transfer genuinely timed out at a non-submission stage and must be
     /// force-resolved.
     TimedOut {
+        tracking: RedemptionTracking,
+        elapsed: Duration,
+    },
+    /// A transfer timed out at a pre-send stage (`WithdrawnFromRaindex`
+    /// through `TokensUnwrapped`). Its tracking and inventory stay in place
+    /// until `FailTransfer` commits, because a send signed meanwhile makes the
+    /// failure invalid and the teardown unsafe.
+    FailBeforeTeardown {
         tracking: RedemptionTracking,
         elapsed: Duration,
     },
@@ -1133,6 +1276,53 @@ struct RearmCandidate {
     policy: RearmPolicy,
 }
 
+/// The page for a recovery hold that outlived `recovery_hold_alert_after`:
+/// what holds the symbol, the mint its recovery retries and the last error,
+/// and where the operator's steps are.
+fn recovery_hold_alert_message(
+    symbol: &Symbol,
+    chain: Chain,
+    held_since: DateTime<Utc>,
+    pending: Option<PendingMintResume>,
+) -> String {
+    let detail = pending.map_or_else(
+        || {
+            format!(
+                "No mint retry is recorded for it; check the wrapped and unwrapped equity \
+                 recovery logs for {symbol} on {chain}."
+            )
+        },
+        |PendingMintResume {
+             recovery,
+             mint_id,
+             failure,
+             ..
+         }| format!("{recovery} keeps retrying mint {mint_id}; last error: {failure}."),
+    );
+
+    format!(
+        "Recovery has held {symbol} on {chain} since {held_since}; no new rebalancing of \
+         {symbol} starts on any chain until it finishes. {detail} Pausing the listing does not \
+         end the hold. See \"Recovery Holds a Symbol\" in docs/cli-ops.md."
+    )
+}
+
+struct RecoveryHoldAlert {
+    first_seen: DateTime<Utc>,
+    delivery: RecoveryHoldAlertDelivery,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecoveryHoldAlertDelivery {
+    Pending,
+    InProgress,
+    /// Pages again `recovery_hold_alert_after` after `at` while the hold
+    /// stands.
+    Delivered {
+        at: DateTime<Utc>,
+    },
+}
+
 impl RebalancingService {
     pub(crate) fn new(
         config: RebalancingServiceConfig,
@@ -1160,11 +1350,16 @@ impl RebalancingService {
             registry_ids,
             inventory,
             freeze_status: RwLock::new(None),
-            gas_readiness: RwLock::new(ConfiguredGasReadiness::default()),
+            usdc_gas_readiness: RwLock::new(BTreeMap::new()),
             equity_gas_readiness: RwLock::new(BTreeMap::new()),
             equity_cooldowns: RwLock::new(HashMap::new()),
+            usdc_withdraw_rejections: RwLock::new(HashMap::new()),
+            usdc_conversion_failed_at: RwLock::new(None),
+            underfunded_alerts: crate::rebalancing::usdc::UnderfundedAlertLatch::default(),
             last_prices: RwLock::new(None),
             equity_in_progress: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            pending_mint_resumes: Arc::default(),
+            recovery_hold_alerts: RwLock::new(HashMap::new()),
             divergence_gate: Arc::default(),
             usdc_guards: Arc::default(),
             usdc_driver_pause: Arc::new(usdc_driver_pause),
@@ -1197,6 +1392,8 @@ impl RebalancingService {
             requested_stage_timeout_alerted: Arc::new(RwLock::new(HashSet::new())),
             post_burn_timeout_logged: Arc::new(RwLock::new(HashSet::new())),
             post_burn_timeout_alerted: Arc::new(RwLock::new(HashSet::new())),
+            issuer_send_timeout_alerted: Arc::new(RwLock::new(HashSet::new())),
+            redemption_timeout_failing: Arc::new(RwLock::new(HashSet::new())),
             unconfirmed_burn_hold_logged: Arc::new(RwLock::new(HashSet::new())),
             unconfirmed_burn_hold_alerted: Arc::new(RwLock::new(HashSet::new())),
             corridor_not_served_alerted: Arc::new(RwLock::new(HashSet::new())),
@@ -1248,8 +1445,13 @@ impl RebalancingService {
         *self.freeze_status.write().await = Some(reader);
     }
 
-    pub(crate) async fn set_gas_readiness(&self, readiness: Arc<GasReadiness>) {
-        *self.gas_readiness.write().await = ConfiguredGasReadiness::Wired(readiness);
+    /// Attach one gas check per USDC corridor chain; a fresh transfer on a
+    /// chain without one is refused.
+    pub(crate) async fn set_usdc_gas_readiness(
+        &self,
+        readiness: BTreeMap<Chain, ConfiguredGasReadiness>,
+    ) {
+        *self.usdc_gas_readiness.write().await = readiness;
     }
 
     /// Attach one gas check per chain an equity transfer can run on; the
@@ -1292,8 +1494,34 @@ impl RebalancingService {
         }
     }
 
-    async fn transfer_gas_is_ready(&self, route: TransferGasRoute) -> bool {
-        let readiness = self.gas_readiness.read().await.clone();
+    /// Proves the signing wallets of the USDC corridor on `chain` (its own
+    /// chain's wallet and the Ethereum wallet) can pay gas, for the operator
+    /// started corridor moves (a manual transfer start and a manual CCTP
+    /// burn), which refuse outright where the trigger skips. A chain without
+    /// a wired check fails closed, as in `usdc_transfer_gas_is_ready`.
+    pub(crate) async fn ensure_usdc_corridor_gas_ready(
+        &self,
+        chain: Chain,
+    ) -> Result<(), GasReadinessFailure> {
+        let readiness = self
+            .usdc_gas_readiness
+            .read()
+            .await
+            .get(&chain)
+            .cloned()
+            .unwrap_or(ConfiguredGasReadiness::Unwired);
+        readiness.ensure_ready(TransferGasRoute::Usdc).await
+    }
+
+    async fn usdc_transfer_gas_is_ready(&self, chain: Chain) -> bool {
+        let readiness = self
+            .usdc_gas_readiness
+            .read()
+            .await
+            .get(&chain)
+            .cloned()
+            .unwrap_or(ConfiguredGasReadiness::Unwired);
+        let route = TransferGasRoute::Usdc;
 
         match readiness.ensure_ready(route).await {
             Ok(()) => true,
@@ -1301,6 +1529,7 @@ impl RebalancingService {
                 warn!(
                     target: "rebalance",
                     ?route,
+                    %chain,
                     %error,
                     "Skipped fresh transfer because its signing wallet is not gas-ready"
                 );
@@ -1431,7 +1660,7 @@ impl RebalancingService {
         Ok(())
     }
 
-    async fn retry_pending_equity_transfer_reservation_restores(
+    pub(super) async fn retry_pending_equity_transfer_reservation_restores(
         &self,
     ) -> Result<(), RebalancingServiceError> {
         if self
@@ -1570,6 +1799,7 @@ impl RebalancingService {
         self.retry_pending_equity_transfer_reservation_restores()
             .await?;
         self.prune_timeout_markers(now).await;
+        self.alert_stuck_recovery_holds(now).await;
         self.expire_stuck_mints(now).await?;
         self.expire_stuck_redemptions(now).await?;
         self.expire_stuck_usdc_rebalances(now).await?;
@@ -1605,6 +1835,79 @@ impl RebalancingService {
             .write()
             .await
             .retain(|_, timed_out_at| !Self::timeout_marker_expired(*timed_out_at, now));
+    }
+
+    async fn alert_stuck_recovery_holds(&self, now: DateTime<Utc>) {
+        let slots = match self.equity_in_progress.read() {
+            Ok(guard) => guard.clone(),
+            Err(poison) => poison.into_inner().clone(),
+        };
+        let mut alerts = self.recovery_hold_alerts.write().await;
+        // Keep the timer while the hold stands or that chain's recovery
+        // attempt owns the slot, so a recovery that keeps failing still pages
+        // at the original deadline. Drop it once the slot is empty or owned by
+        // anything else, so a later hold pages only after a fresh threshold.
+        alerts.retain(|(symbol, chain), _| match slots.get(symbol) {
+            Some(
+                equity::GuardState::HeldForRecovery { chain: held_chain }
+                | equity::GuardState::Recovering {
+                    chain: held_chain, ..
+                },
+            ) => chain == held_chain,
+            Some(equity::GuardState::ActiveTransfer { .. }) | None => false,
+        });
+        let mut pending = Vec::new();
+        for (symbol, state) in slots {
+            let (equity::GuardState::HeldForRecovery { chain }
+            | equity::GuardState::Recovering { chain, .. }) = state
+            else {
+                continue;
+            };
+            let alert = alerts
+                .entry((symbol.clone(), chain))
+                .or_insert(RecoveryHoldAlert {
+                    first_seen: now,
+                    delivery: RecoveryHoldAlertDelivery::Pending,
+                });
+            let due_since = match alert.delivery {
+                RecoveryHoldAlertDelivery::Pending => alert.first_seen,
+                RecoveryHoldAlertDelivery::Delivered { at } => at,
+                RecoveryHoldAlertDelivery::InProgress => continue,
+            };
+            if Self::elapsed_since_timeout_start(due_since, now)
+                .is_none_or(|elapsed| elapsed < self.config.recovery_hold_alert_after)
+            {
+                continue;
+            }
+            alert.delivery = RecoveryHoldAlertDelivery::InProgress;
+            pending.push((symbol, chain, alert.first_seen));
+        }
+        drop(alerts);
+        for (symbol, chain, first_seen) in pending {
+            let message = recovery_hold_alert_message(
+                &symbol,
+                chain,
+                first_seen,
+                self.pending_mint_resumes.get(&symbol, chain),
+            );
+            let delivery = match self.notifier.notify(&message).await {
+                Ok(()) => RecoveryHoldAlertDelivery::Delivered { at: now },
+                Err(error) => {
+                    warn!(target: "rebalance", %symbol, %chain, ?error,
+                        "Failed to deliver recovery hold alert; retrying next sweep");
+                    RecoveryHoldAlertDelivery::Pending
+                }
+            };
+            if let Some(alert) = self
+                .recovery_hold_alerts
+                .write()
+                .await
+                .get_mut(&(symbol, chain))
+                && alert.first_seen == first_seen
+            {
+                alert.delivery = delivery;
+            }
+        }
     }
 
     async fn expire_stuck_mints(&self, now: DateTime<Utc>) -> Result<(), RebalancingServiceError> {
@@ -1675,46 +1978,33 @@ impl RebalancingService {
 
             let symbol = pending_tracking.symbol;
 
-            // Steady-state skip: if recovery already owns the slot, leave the
-            // mint untouched -- recovery drives it to terminal, and removing its
-            // tracking or failing it would clear the guard and allow a
-            // double-mint while the tokens are still unwrapped in the wallet. A
-            // concurrent flip to `HeldForRecovery` AFTER this read is closed
-            // atomically at the clear below.
-            let held_for_recovery = {
+            // Steady-state skip: if recovery holds or is running on the slot,
+            // leave the mint untouched -- recovery drives it to terminal, and
+            // removing its tracking or failing it would clear the guard and
+            // allow a double-mint while the tokens are still in the wallet. A
+            // concurrent recovery handoff or claim AFTER this read is closed
+            // atomically inside `cleanup_timed_out_mint`, which claims the slot
+            // before any teardown.
+            let recovery_owned = {
                 let guard = match self.equity_in_progress.read() {
                     Ok(guard) => guard,
                     Err(poison) => poison.into_inner(),
                 };
-                guard.get(&symbol) == Some(&equity::GuardState::HeldForRecovery)
+                match guard.get(&symbol) {
+                    Some(
+                        equity::GuardState::HeldForRecovery { .. }
+                        | equity::GuardState::Recovering { .. },
+                    ) => true,
+                    Some(equity::GuardState::ActiveTransfer { .. }) | None => false,
+                }
             };
-            if held_for_recovery {
+            if recovery_owned {
                 continue;
             }
 
             let Some((tracking, elapsed)) = self.cleanup_timed_out_mint(&id, now).await? else {
                 continue;
             };
-
-            // Atomically clear the guard UNLESS recovery claimed the slot during
-            // the async cleanup above. Holding the write lock across the re-check
-            // and the clear closes the TOCTOU race: a concurrent
-            // `mark_held_for_recovery` can flip `ActiveTransfer` ->
-            // `HeldForRecovery` after the steady-state check, and a non-atomic
-            // clear would then drop a recovery-owned guard and fail a mint whose
-            // tokens are still in the wallet -- re-opening the double-mint window
-            // this guard exists to close. If recovery now owns the slot, leave
-            // the guard and skip the failure event.
-            if !self.clear_equity_in_progress_unless_held_for_recovery(&symbol) {
-                debug!(
-                    target: "rebalance",
-                    aggregate_id = %id,
-                    %symbol,
-                    "Timed-out mint flipped to HeldForRecovery during cleanup; \
-                     recovery now owns it -- leaving guard and skipping failure event"
-                );
-                continue;
-            }
 
             let elapsed_secs = elapsed.as_secs();
             error!(
@@ -1774,16 +2064,18 @@ impl RebalancingService {
             tracking
                 .iter()
                 .filter_map(|(id, tracking)| {
-                    // Withdrawal-submission stages are ALWAYS selected so the
-                    // durable `Reconciled` check runs every tick regardless of
-                    // elapsed time; they are never force-failed on timeout
-                    // because their withdrawal may have landed. Every other stage
-                    // is selected only once it exceeds `transfer_timeout`.
+                    // Withdrawal-submission and send-to-issuer stages are ALWAYS
+                    // selected so the durable `Reconciled` check runs every tick
+                    // regardless of elapsed time; they are never force-failed on
+                    // timeout because their transaction may have landed. Every
+                    // other stage is selected only once it exceeds
+                    // `transfer_timeout`.
                     if matches!(
                         tracking.stage,
                         RedemptionTrackingStage::VaultWithdrawPending
                             | RedemptionTrackingStage::VaultWithdrawSubmitting
                             | RedemptionTrackingStage::VaultWithdrawSubmitted
+                            | RedemptionTrackingStage::SendPending
                     ) {
                         return Some(id.clone());
                     }
@@ -1801,6 +2093,13 @@ impl RebalancingService {
             };
 
             match cleanup {
+                RedemptionTimeoutCleanup::PageIssuerSend {
+                    tracking,
+                    newest_send,
+                } => {
+                    self.page_timed_out_issuer_send(&id, &tracking, newest_send.as_ref(), now)
+                        .await;
+                }
                 RedemptionTimeoutCleanup::Reconciled {
                     tracking,
                     held_prepared,
@@ -1819,7 +2118,8 @@ impl RebalancingService {
                         .await;
                     if held_prepared {
                         // The reconciled redemption still held a signed vault
-                        // withdrawal, so its wallet nonce is still reserved. The
+                        // withdrawal or send to the issuer, so its wallet nonce is still
+                        // reserved. The
                         // sweep holds no wallet, so it enqueues a resume job whose
                         // terminal branch discards the reservation. Always enqueue:
                         // the release is ownership checked and idempotent, so a
@@ -1840,6 +2140,10 @@ impl RebalancingService {
                         })
                         .await;
                     }
+                }
+                RedemptionTimeoutCleanup::FailBeforeTeardown { tracking, elapsed } => {
+                    self.fail_then_tear_down_timed_out_redemption(&id, &tracking, elapsed, now)
+                        .await?;
                 }
                 RedemptionTimeoutCleanup::TimedOut { tracking, elapsed } => {
                     let elapsed_secs = elapsed.as_secs();
@@ -1905,6 +2209,64 @@ impl RebalancingService {
             }
         }
 
+        Ok(())
+    }
+
+    async fn fail_then_tear_down_timed_out_redemption(
+        &self,
+        id: &RedemptionAggregateId,
+        tracking: &RedemptionTracking,
+        elapsed: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<(), RebalancingServiceError> {
+        let elapsed_secs = elapsed.as_secs();
+        let store = self.redemption_store.read().await.as_ref().map(Arc::clone);
+        let fail_succeeded = match store {
+            Some(store) => {
+                let reason = format!(
+                    "Transfer timed out after {elapsed_secs}s at stage {}",
+                    tracking.stage
+                );
+                match store
+                    .send(id, EquityRedemptionCommand::FailTransfer { reason })
+                    .await
+                {
+                    Ok(()) => true,
+                    Err(error) => {
+                        warn!(
+                            target: "rebalance",
+                            %id, %error,
+                            "Failed to emit timeout failure event for redemption"
+                        );
+                        false
+                    }
+                }
+            }
+            None => false,
+        };
+
+        if !self
+            .finish_deferred_redemption_timeout(id, tracking, fail_succeeded, now)
+            .await?
+        {
+            return Ok(());
+        }
+
+        error!(
+            target: "rebalance",
+            aggregate_id = %id,
+            symbol = %tracking.symbol,
+            stage = %tracking.stage,
+            elapsed_secs,
+            outcome = "timeout",
+            "Redemption transfer timed out; clearing trigger guard and inventory inflight"
+        );
+        self.clear_equity_in_progress(&tracking.symbol);
+        // The teardown runs only once the failure is durable, whichever writer
+        // committed it. The reactor skipped that `TransferFailed`, so this path
+        // owns the release.
+        self.release_timed_out_redemption_reservation(id, &tracking.symbol)
+            .await;
         Ok(())
     }
 
@@ -2210,7 +2572,7 @@ impl RebalancingService {
             return;
         }
 
-        let served = self.config.served_usdc_corridor;
+        let served = self.config.usdc.served().iter().join(", ");
         let outbound = match direction {
             RebalanceDirection::AlpacaToBase => {
                 " Alpaca-outbound transfers are blocked on every corridor until it clears."
@@ -2220,7 +2582,7 @@ impl RebalancingService {
         let message = format!(
             "USDC transfer corridor mismatch: transfer {id} runs on the {corridor} corridor, \
              which this build does not serve (it serves {served}). It holds the {corridor} \
-             guard and is not re-armed; deploy a build that serves {corridor} \
+             guard and is not re-armed; deploy a build and config that serve {corridor} \
              (docs/cli-ops.md).{outbound}"
         );
 
@@ -2329,24 +2691,31 @@ impl RebalancingService {
     async fn retire_stale_suppression_and_collect_active_symbols(
         &self,
         fetched_at: DateTime<Utc>,
-    ) -> HashSet<Symbol> {
+    ) -> HashSet<(Symbol, Chain)> {
         let mut suppressed_symbols = self.suppressed_inflight_symbols.write().await;
         suppressed_symbols.retain(|_, cleared_at| *cleared_at >= fetched_at);
         suppressed_symbols.keys().cloned().collect()
     }
 
+    /// Drops suppressed entries from a provider inflight snapshot. Mints sit
+    /// in the broker's single offchain slot, so a suppression on any chain
+    /// drops the symbol's mint entry. Redemptions sit on their own chain's
+    /// slot, so only a suppression on `redemption_chain` drops one.
     fn filter_suppressed_inflight_snapshot(
-        mints: &std::collections::BTreeMap<Symbol, FractionalShares>,
-        redemptions: &std::collections::BTreeMap<Symbol, FractionalShares>,
-        active_suppressed_symbols: &HashSet<Symbol>,
+        mints: &BTreeMap<Symbol, FractionalShares>,
+        redemptions: &BTreeMap<Symbol, FractionalShares>,
+        redemption_chain: Chain,
+        active_suppressed: &HashSet<(Symbol, Chain)>,
     ) -> (
-        std::collections::BTreeMap<Symbol, FractionalShares>,
-        std::collections::BTreeMap<Symbol, FractionalShares>,
+        BTreeMap<Symbol, FractionalShares>,
+        BTreeMap<Symbol, FractionalShares>,
     ) {
         let filtered_mints = mints
             .iter()
             .filter(|(symbol, _)| {
-                let keep = !active_suppressed_symbols.contains(*symbol);
+                let keep = !active_suppressed
+                    .iter()
+                    .any(|(suppressed, _)| suppressed == *symbol);
 
                 if !keep {
                     debug!(
@@ -2361,15 +2730,30 @@ impl RebalancingService {
             .map(|(symbol, quantity)| (symbol.clone(), *quantity))
             .collect();
 
-        let filtered_redemptions = redemptions
+        let filtered_redemptions = Self::filter_suppressed_inflight_redemptions(
+            redemptions,
+            redemption_chain,
+            active_suppressed,
+        );
+
+        (filtered_mints, filtered_redemptions)
+    }
+
+    fn filter_suppressed_inflight_redemptions(
+        redemptions: &BTreeMap<Symbol, FractionalShares>,
+        chain: Chain,
+        active_suppressed: &HashSet<(Symbol, Chain)>,
+    ) -> BTreeMap<Symbol, FractionalShares> {
+        redemptions
             .iter()
             .filter(|(symbol, _)| {
-                let keep = !active_suppressed_symbols.contains(*symbol);
+                let keep = !active_suppressed.contains(&((*symbol).clone(), chain));
 
                 if !keep {
                     debug!(
                         target: "rebalance",
                         %symbol,
+                        %chain,
                         "Ignoring inflight redemption snapshot after timeout cleanup"
                     );
                 }
@@ -2377,9 +2761,7 @@ impl RebalancingService {
                 keep
             })
             .map(|(symbol, quantity)| (symbol.clone(), *quantity))
-            .collect();
-
-        (filtered_mints, filtered_redemptions)
+            .collect()
     }
 
     async fn cleanup_timed_out_mint(
@@ -2402,24 +2784,41 @@ impl RebalancingService {
             return Ok(None);
         }
 
+        // Claim the slot before any teardown, with the inventory lock held so
+        // no new transfer can record inflight between the claim and the clear.
+        // A recovery handoff that lands after the claim finds no entry and
+        // retries, leaving the tokens to the orphan path; one that landed
+        // before it keeps the slot, and the tracking, inflight and active mint
+        // stay intact for recovery to finish the mint.
         let mut inventory = self.inventory.write().await;
-        *inventory = inventory
+        let cleared = inventory
             .clone()
-            .clear_equity_inflight(&tracking.symbol, Venue::Hedging, now)?
+            .clear_equity_inflight_at(&tracking.symbol, tracking.chain, Venue::Hedging, now)?
             .clear_active_mint(&tracking.symbol);
+        if !self.clear_equity_in_progress_unless_recovery_owned(&tracking.symbol) {
+            debug!(
+                target: "rebalance",
+                aggregate_id = %id,
+                symbol = %tracking.symbol,
+                "Timed-out mint was handed to recovery; leaving tracking, inventory and guard"
+            );
+            return Ok(None);
+        }
+        *inventory = cleared;
         drop(inventory);
 
         self.timed_out_mints.write().await.insert(
             id.clone(),
             TimeoutTombstone {
                 symbol: tracking.symbol.clone(),
+                chain: tracking.chain,
                 timed_out_at: now,
             },
         );
         self.suppressed_inflight_symbols
             .write()
             .await
-            .insert(tracking.symbol.clone(), now);
+            .insert((tracking.symbol.clone(), tracking.chain), now);
         tracking_guard.remove(id);
         drop(tracking_guard);
 
@@ -2437,85 +2836,57 @@ impl RebalancingService {
             return Ok(None);
         };
 
-        // Withdrawal-submission stages are never force-failed on timeout, but
-        // they are checked for a durable `Reconciled` on every tick. An
-        // operator's reconcile writes `OperatorReconciled` through bare
-        // `send_command`, which dispatches no reactor, so the live bot would
-        // otherwise never clear the guard, inflight, and reservation until a
-        // restart. Mirror `on_redemption`'s terminal reconcile cleanup here.
-        if matches!(
+        // Withdrawal-submission and send-to-issuer stages are never force-failed
+        // on timeout, because their transaction may have landed, but they are
+        // checked for a durable `Reconciled` on every tick. An operator's
+        // reconcile writes `OperatorReconciled` through bare `send_command`,
+        // which dispatches no reactor, so the live bot would otherwise never
+        // clear the guard, inflight, and reservation until a restart.
+        let submission_stage = matches!(
             tracking.stage,
             RedemptionTrackingStage::VaultWithdrawPending
                 | RedemptionTrackingStage::VaultWithdrawSubmitting
                 | RedemptionTrackingStage::VaultWithdrawSubmitted
-        ) {
-            let store = self.redemption_store.read().await.as_ref().map(Arc::clone);
-            let Some(store) = store else {
+                | RedemptionTrackingStage::SendPending
+        );
+        if submission_stage || tracking.stage == RedemptionTrackingStage::TokensUnwrapped {
+            let Some(durable) = self.load_redemption_for_sweep(id).await else {
                 return Ok(None);
             };
-            match store.load(id).await {
-                Ok(Some(EquityRedemption::Reconciled {
+            match durable {
+                EquityRedemption::Reconciled {
                     withdrawal_nonce_hash,
+                    issuer_send_nonce_hash,
                     ..
-                })) => {
-                    // Cancel the MarketMaking inflight (the shares never left the
-                    // vault, per the operator's verified-dead reconcile) and clear
-                    // the active redemption, exactly like `on_redemption`'s
-                    // `OperatorReconciled` terminal path. Drop tracking first, then
-                    // apply; re-insert on error so the next tick retries rather
-                    // than latching the guard with no entry to re-select.
+                } => {
                     tracking_guard.remove(id);
                     drop(tracking_guard);
-
-                    if let Err(error) = self
-                        .apply_equity_update_or_defer(
-                            &tracking.symbol,
-                            tracking.chain,
-                            Venue::MarketMaking,
-                            Self::cancel_equity_transfer_update(
-                                Venue::MarketMaking,
-                                tracking.quantity,
-                            ),
-                        )
+                    let held_prepared =
+                        withdrawal_nonce_hash.is_some() || issuer_send_nonce_hash.is_some();
+                    return self
+                        .apply_swept_redemption_reconcile(id, tracking, held_prepared, now)
                         .await
-                    {
-                        self.redemption_tracking
-                            .write()
-                            .await
-                            .insert(id.clone(), tracking);
-                        return Err(error);
-                    }
-                    {
-                        let mut inventory = self.inventory.write().await;
-                        *inventory = inventory.clone().clear_active_redemption(&tracking.symbol);
-                    }
-
-                    // Tombstone so a late reactor `OperatorReconciled` (should the
-                    // in-process path ever route through the store) is ignored
-                    // instead of cancelling the inflight a second time.
-                    self.timed_out_redemptions.write().await.insert(
-                        id.clone(),
-                        TimeoutTombstone {
-                            symbol: tracking.symbol.clone(),
-                            timed_out_at: now,
-                        },
-                    );
-                    return Ok(Some(RedemptionTimeoutCleanup::Reconciled {
+                        .map(Some);
+                }
+                durable @ EquityRedemption::SendPending {
+                    unwrapped_at,
+                    first_send_signed_at,
+                    ..
+                } => {
+                    drop(tracking_guard);
+                    // Page on the clock fee replacements stop on, the durable
+                    // first signing time, even when the reactor has not yet
+                    // applied `SendPrepared` to the tracking. A legacy send has
+                    // no signing time, as in `recover_redemption_state`.
+                    let mut tracking = tracking;
+                    tracking.last_progress_at = first_send_signed_at.unwrap_or(unwrapped_at);
+                    return Ok(Some(RedemptionTimeoutCleanup::PageIssuerSend {
                         tracking,
-                        held_prepared: withdrawal_nonce_hash.is_some(),
+                        newest_send: durable.reconcilable_signed_tx().cloned(),
                     }));
                 }
-                Ok(Some(_) | None) => return Ok(None),
-                Err(load_error) => {
-                    warn!(
-                        target: "rebalance",
-                        id = %id,
-                        ?load_error,
-                        "Failed to load EquityRedemption during reconcile sweep; \
-                         preserving guard"
-                    );
-                    return Ok(None);
-                }
+                _ if submission_stage => return Ok(None),
+                _ => {}
             }
         }
 
@@ -2528,6 +2899,221 @@ impl RebalancingService {
             return Ok(None);
         }
 
+        // The driver commits without the event gate, so while this sweep holds
+        // it the tracked stage can lag the durable one: a redemption tracked at
+        // any pre-send stage may already be `TokensUnwrapped`, or past
+        // `PrepareSend` with `FailTransfer` refused. Tearing down first would
+        // release the guard and inflight while a signed send can still move
+        // the tokens, so the failure is committed first and the teardown
+        // follows it.
+        let fails_before_teardown = match tracking.stage {
+            RedemptionTrackingStage::WithdrawnFromRaindex
+            | RedemptionTrackingStage::UnwrapPending
+            | RedemptionTrackingStage::UnwrapSubmitted
+            | RedemptionTrackingStage::TokensUnwrapped => true,
+            RedemptionTrackingStage::VaultWithdrawPending
+            | RedemptionTrackingStage::VaultWithdrawSubmitting
+            | RedemptionTrackingStage::VaultWithdrawSubmitted
+            | RedemptionTrackingStage::SendPending
+            | RedemptionTrackingStage::TokensSent
+            | RedemptionTrackingStage::Detected => false,
+        };
+        if fails_before_teardown {
+            // Another sweep that already claimed this failure owns it: a
+            // second `FailTransfer` could commit after that sweep released the
+            // marker, and the reactor would then credit the shares back.
+            if !self
+                .redemption_timeout_failing
+                .write()
+                .await
+                .insert(id.clone())
+            {
+                debug!(
+                    target: "rebalance",
+                    %id,
+                    "Another timeout sweep is failing this redemption; skipping"
+                );
+                return Ok(None);
+            }
+            return Ok(Some(RedemptionTimeoutCleanup::FailBeforeTeardown {
+                tracking,
+                elapsed,
+            }));
+        }
+
+        self.tear_down_timed_out_redemption(id, &tracking, &mut tracking_guard, now)
+            .await?;
+        drop(tracking_guard);
+
+        Ok(Some(RedemptionTimeoutCleanup::TimedOut {
+            tracking,
+            elapsed,
+        }))
+    }
+
+    /// Loads the durable redemption for the timeout sweep. A load error keeps
+    /// the guard: the sweep retries on its next tick.
+    async fn load_redemption_for_sweep(
+        &self,
+        id: &RedemptionAggregateId,
+    ) -> Option<EquityRedemption> {
+        let store = self
+            .redemption_store
+            .read()
+            .await
+            .as_ref()
+            .map(Arc::clone)?;
+        match store.load(id).await {
+            Ok(durable) => durable,
+            Err(load_error) => {
+                warn!(
+                    target: "rebalance",
+                    id = %id,
+                    ?load_error,
+                    "Failed to load EquityRedemption during the timeout sweep; preserving guard"
+                );
+                None
+            }
+        }
+    }
+
+    /// Clears reconciled inflight and the active redemption. A pending issuer
+    /// send has already left the vault, so its shares are not credited back.
+    /// The caller re-inserts tracking on error so the next tick retries.
+    async fn apply_swept_redemption_reconcile(
+        &self,
+        id: &RedemptionAggregateId,
+        tracking: RedemptionTracking,
+        held_prepared: bool,
+        now: DateTime<Utc>,
+    ) -> Result<RedemptionTimeoutCleanup, RebalancingServiceError> {
+        if let Err(error) = self
+            .reconcile_redemption_inventory(
+                &tracking.symbol,
+                tracking.chain,
+                tracking.quantity,
+                tracking.stage,
+            )
+            .await
+        {
+            self.redemption_tracking
+                .write()
+                .await
+                .insert(id.clone(), tracking);
+            return Err(error);
+        }
+        {
+            let mut inventory = self.inventory.write().await;
+            *inventory = inventory.clone().clear_active_redemption(&tracking.symbol);
+        }
+
+        // Tombstone so a late reactor `OperatorReconciled` (should the
+        // in-process path ever route through the store) is ignored instead of
+        // cancelling the inflight a second time.
+        self.timed_out_redemptions.write().await.insert(
+            id.clone(),
+            TimeoutTombstone {
+                symbol: tracking.symbol.clone(),
+                chain: tracking.chain,
+                timed_out_at: now,
+            },
+        );
+        Ok(RedemptionTimeoutCleanup::Reconciled {
+            tracking,
+            held_prepared,
+        })
+    }
+
+    /// Pages once when a pending send to the issuer outlives `transfer_timeout`. The
+    /// redemption keeps its guard, inflight, and reservation: a signed send can
+    /// still land, and a legacy one may already have landed unrecorded.
+    async fn page_timed_out_issuer_send(
+        &self,
+        id: &RedemptionAggregateId,
+        tracking: &RedemptionTracking,
+        newest_send: Option<&PreparedTransaction>,
+        now: DateTime<Utc>,
+    ) {
+        let Some(elapsed) = Self::elapsed_since_timeout_start(tracking.last_progress_at, now)
+        else {
+            return;
+        };
+        if elapsed < self.config.transfer_timeout
+            || self.issuer_send_timeout_alerted.read().await.contains(id)
+        {
+            return;
+        }
+
+        let chain = tracking.chain;
+        let elapsed_secs = elapsed.as_secs();
+        let message = newest_send.map_or_else(
+            || {
+                format!(
+                    "Equity redemption {id} on {chain} has a legacy pending send to the issuer \
+                     with no recorded transaction after {elapsed_secs}s. The transfer keeps its \
+                     guard and inflight, and recovery will not sign again. Find the previous \
+                     binary's transfer onchain and follow \"Legacy pending send to the issuer\" in \
+                     docs/cli-ops.md: it says what to do whether or not the transfer landed, \
+                     before you close it with `stox transfer reconcile --kind redemption --id \
+                     {id}`."
+                )
+            },
+            |send| {
+                let tx_hash = send.tx_hash();
+                let nonce = send.nonce();
+                let fees = send.fees_per_gas().map_or_else(
+                    || "unreadable fees".to_string(),
+                    |(max_fee, priority_fee)| {
+                        format!(
+                            "maxFeePerGas {max_fee} wei, maxPriorityFeePerGas {priority_fee} wei"
+                        )
+                    },
+                );
+                format!(
+                    "Equity redemption {id} on {chain} has a signed redemption transfer to the \
+                     issuer whose newest copy {tx_hash} (nonce {nonce}, {fees}) has not \
+                     confirmed after {elapsed_secs}s. \
+                     The transfer keeps its guard, inflight, and reservation. Recovery keeps \
+                     driving it: every failed attempt is redriven, slower after four hours, and \
+                     each one rebroadcasts the newest copy and confirms whichever copy mines. \
+                     From now on recovery no longer fee-replaces the send, so it will not outbid \
+                     a cancel. Verify the send onchain; if any copy mined, leave it, because \
+                     recovery records the outcome. If the newest copy reverted, wait for its \
+                     required confirmations and reconcile with no --superseding-tx. To abandon \
+                     it, send a 0-value self-transfer at nonce {nonce} from the bot wallet, \
+                     with both fees at least 10% above the newest copy's and above the \
+                     current market fee, and wait for that to confirm; only then reconcile the \
+                     redemption naming that self-transfer (`stox transfer reconcile --kind \
+                     redemption --id {id} --superseding-tx <cancel>`), which releases its \
+                     reservation and the wallet's hold on its nonce."
+                )
+            },
+        );
+
+        if let Err(error) = self.notifier().notify(&message).await {
+            warn!(
+                target: "rebalance",
+                %id,
+                %error,
+                "Failed to notify about a timed-out send to the issuer"
+            );
+        } else {
+            self.issuer_send_timeout_alerted
+                .write()
+                .await
+                .insert(id.clone());
+        }
+    }
+
+    /// Clears a timed-out redemption's MarketMaking inflight and active entry,
+    /// tombstones it so late reactor events are ignored, and drops tracking.
+    async fn tear_down_timed_out_redemption(
+        &self,
+        id: &RedemptionAggregateId,
+        tracking: &RedemptionTracking,
+        tracking_guard: &mut HashMap<RedemptionAggregateId, RedemptionTracking>,
+        now: DateTime<Utc>,
+    ) -> Result<(), RebalancingServiceError> {
         let mut inventory = self.inventory.write().await;
         *inventory = inventory
             .clone()
@@ -2539,20 +3125,56 @@ impl RebalancingService {
             id.clone(),
             TimeoutTombstone {
                 symbol: tracking.symbol.clone(),
+                chain: tracking.chain,
                 timed_out_at: now,
             },
         );
         self.suppressed_inflight_symbols
             .write()
             .await
-            .insert(tracking.symbol.clone(), now);
+            .insert((tracking.symbol.clone(), tracking.chain), now);
         tracking_guard.remove(id);
-        drop(tracking_guard);
+        Ok(())
+    }
 
-        Ok(Some(RedemptionTimeoutCleanup::TimedOut {
-            tracking,
-            elapsed,
-        }))
+    /// Completes a pre-send timeout after its `FailTransfer` attempt.
+    /// When the attempt failed because a send was signed meanwhile, the
+    /// redemption keeps its tracking, guard, and inflight. The same rule holds
+    /// for a failed or missing reload: teardown needs a confirmed `Failed`.
+    /// Returns whether the teardown ran.
+    async fn finish_deferred_redemption_timeout(
+        &self,
+        id: &RedemptionAggregateId,
+        tracking: &RedemptionTracking,
+        fail_succeeded: bool,
+        now: DateTime<Utc>,
+    ) -> Result<bool, RebalancingServiceError> {
+        let _event_sync_guard = self.redemption_event_sync.lock().await;
+        self.redemption_timeout_failing.write().await.remove(id);
+
+        if !fail_succeeded
+            && !matches!(
+                self.load_redemption_for_sweep(id).await,
+                Some(EquityRedemption::Failed { .. })
+            )
+        {
+            warn!(
+                target: "rebalance",
+                %id,
+                symbol = %tracking.symbol,
+                "Timed-out redemption failure is not durably confirmed; keeping ownership"
+            );
+            return Ok(false);
+        }
+
+        let mut tracking_guard = self.redemption_tracking.write().await;
+        if !tracking_guard.contains_key(id) {
+            return Ok(false);
+        }
+        self.tear_down_timed_out_redemption(id, tracking, &mut tracking_guard, now)
+            .await?;
+        drop(tracking_guard);
+        Ok(true)
     }
 
     async fn cleanup_timed_out_usdc_rebalance(
@@ -2572,7 +3194,6 @@ impl RebalancingService {
         };
 
         if tracking.is_post_burn() {
-            let served_corridor = self.config.served_usdc_corridor;
             // Post-burn: check durable state FIRST, regardless of elapsed time.
             // The Reconciled check is always safe: it only fires when the
             // aggregate is actually Reconciled and clearing the guard at that
@@ -2583,7 +3204,7 @@ impl RebalancingService {
             let usdc_store = self.usdc_store.read().await.as_ref().map(Arc::clone);
             if let Some(store) = usdc_store {
                 match store.load(id).await {
-                    Ok(Some(state)) if releases_tracked_guard(&state, served_corridor) => {
+                    Ok(Some(state)) if releases_tracked_guard(&state, &self.config.usdc) => {
                         // Durable state is Reconciled (or, on a corridor this
                         // build does not serve, any state that holds no guard):
                         // the CLI's separate-process
@@ -2604,28 +3225,31 @@ impl RebalancingService {
                         // Both inventory mutations (inflight clear and active
                         // rebalance clear) are chained in a single lock
                         // acquisition so there is never a transient state where
-                        // inflight is zeroed but active_usdc_rebalance is still
+                        // inflight is zeroed but its active entry is still
                         // set.
                         tracking_guard.remove(id);
                         drop(tracking_guard);
 
                         let mut inventory = self.inventory.write().await;
-                        let result =
-                            if inventory.owns_usdc_rebalance_slot(id, tracking.corridor.chain()) {
-                                inventory
-                                    .clone()
-                                    .clear_usdc_inflight(tracking.source_venue(), now)
-                                    .map(InventoryView::clear_active_usdc_rebalance)
-                            } else {
-                                Ok(inventory.clone())
-                            };
+                        let result = if inventory.active_usdc_rebalance_entry(id).is_some() {
+                            inventory
+                                .clone()
+                                .clear_usdc_inflight_at(
+                                    tracking.corridor.chain(),
+                                    tracking.source_venue(),
+                                    now,
+                                )
+                                .map(|view| view.clear_active_usdc_rebalance(id))
+                        } else {
+                            Ok(inventory.clone())
+                        };
 
                         match result {
                             Ok(updated) => *inventory = updated,
                             Err(error) => {
                                 drop(inventory);
                                 // In practice this branch cannot be triggered:
-                                // `clear_usdc_inflight` only fails when the
+                                // `clear_usdc_inflight_at` only fails when the
                                 // resulting inflight would be negative
                                 // (`Inventory::set_inflight` guards against
                                 // this), and zeroing inflight always produces a
@@ -2651,7 +3275,8 @@ impl RebalancingService {
                         return Ok(Some(UsdcTimeoutCleanup::Cleared { tracking, elapsed }));
                     }
                     Ok(Some(state))
-                        if state.corridor() != served_corridor && state.holds_rebalance_guard() =>
+                        if !self.config.usdc.serves(state.corridor())
+                            && state.holds_rebalance_guard() =>
                     {
                         return Ok(Some(UsdcTimeoutCleanup::HeldForUnservedCorridor {
                             corridor: state.corridor(),
@@ -2785,11 +3410,11 @@ impl RebalancingService {
         }
 
         let mut inventory = self.inventory.write().await;
-        if inventory.owns_usdc_rebalance_slot(id, tracking.corridor.chain()) {
+        if inventory.active_usdc_rebalance_entry(id).is_some() {
             *inventory = inventory
                 .clone()
-                .clear_usdc_inflight(tracking.source_venue(), now)?
-                .clear_active_usdc_rebalance();
+                .clear_usdc_inflight_at(tracking.corridor.chain(), tracking.source_venue(), now)?
+                .clear_active_usdc_rebalance(id);
         }
         drop(inventory);
 
@@ -2974,11 +3599,32 @@ impl RebalancingService {
                 Some(Self::filter_suppressed_inflight_snapshot(
                     mints,
                     redemptions,
+                    Chain::Base,
                     &active_suppressed_symbols,
+                ))
+            }
+            ChainInflightRedemptions {
+                chain, redemptions, ..
+            } => {
+                let active_suppressed_symbols = self
+                    .retire_stale_suppression_and_collect_active_symbols(fetched_at)
+                    .await;
+
+                Some((
+                    BTreeMap::new(),
+                    Self::filter_suppressed_inflight_redemptions(
+                        redemptions,
+                        *chain,
+                        &active_suppressed_symbols,
+                    ),
                 ))
             }
             _ => None,
         };
+        // Reconciliation is evaluated under the inventory write lock: a fill
+        // raises a pending cash read's floor under the same lock, so a read
+        // accepted here cannot miss a fill already in the view.
+        let mut inventory = self.inventory.write().await;
         let SnapshotReconciliation {
             protected_onchain_equity_symbols,
             protected_offchain_equity_symbols,
@@ -2992,7 +3638,6 @@ impl RebalancingService {
             .cloned()
             .collect::<BTreeSet<_>>();
 
-        let mut inventory = self.inventory.write().await;
         let resolve_offchain_reconciliation = accepted_offchain_equity_reconciliation.is_some()
             && match &event {
                 OffchainEquityReconciled {
@@ -3082,13 +3727,30 @@ impl RebalancingService {
             | EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
-            | BaseWalletWrappedEquity { .. } => inventory.clone().apply_snapshot_event(&event, now),
+            | BaseWalletWrappedEquity { .. }
+            | ChainWalletUnwrappedEquity { .. }
+            | ChainWalletWrappedEquity { .. } => {
+                inventory.clone().apply_snapshot_event(&event, now)
+            }
 
             InflightEquity { .. } => {
                 if let Some((mints, redemptions)) = &filtered_inflight {
                     inventory
                         .clone()
                         .apply_inflight_snapshot(mints, redemptions, fetched_at, now)
+                } else {
+                    Ok(inventory.clone())
+                }
+            }
+
+            ChainInflightRedemptions { chain, .. } => {
+                if let Some((_, redemptions)) = &filtered_inflight {
+                    inventory.clone().apply_inflight_redemptions_at(
+                        *chain,
+                        redemptions,
+                        fetched_at,
+                        now,
+                    )
                 } else {
                     Ok(inventory.clone())
                 }
@@ -3206,31 +3868,42 @@ impl RebalancingService {
         let recovery_reason = Arc::new(inventory_error);
 
         let now = Utc::now();
-        let mut suppression_guard = if matches!(&event, InflightEquity { .. }) {
+        let mut suppression_guard = if matches!(
+            &event,
+            InflightEquity { .. } | ChainInflightRedemptions { .. }
+        ) {
             Some(self.suppressed_inflight_symbols.write().await)
         } else {
             None
         };
+        let mut active_suppressed_symbols = || {
+            let fetched_at = event.timestamp();
+            suppression_guard
+                .as_mut()
+                .map_or_else(HashSet::new, |suppressed| {
+                    suppressed.retain(|_, cleared_at| *cleared_at >= fetched_at);
+                    suppressed.keys().cloned().collect()
+                })
+        };
         let filtered_inflight = match &event {
             InflightEquity {
+                mints, redemptions, ..
+            } => Some(Self::filter_suppressed_inflight_snapshot(
                 mints,
                 redemptions,
-                fetched_at,
-            } => {
-                let active_suppressed_symbols =
-                    suppression_guard
-                        .as_mut()
-                        .map_or_else(HashSet::new, |suppressed| {
-                            suppressed.retain(|_, cleared_at| *cleared_at >= *fetched_at);
-                            suppressed.keys().cloned().collect()
-                        });
-
-                Some(Self::filter_suppressed_inflight_snapshot(
-                    mints,
+                Chain::Base,
+                &active_suppressed_symbols(),
+            )),
+            ChainInflightRedemptions {
+                chain, redemptions, ..
+            } => Some((
+                BTreeMap::new(),
+                Self::filter_suppressed_inflight_redemptions(
                     redemptions,
-                    &active_suppressed_symbols,
-                ))
-            }
+                    *chain,
+                    &active_suppressed_symbols(),
+                ),
+            )),
             _ => None,
         };
         let mut inventory = self.inventory.write().await;
@@ -3240,8 +3913,18 @@ impl RebalancingService {
         // plain default() here would clear the open-hedge block for every
         // symbol and re-open the double-apply race — and since the force
         // path below skips gated symbols, a wiped gated balance would have
-        // no writer left to restore it.
-        *inventory = inventory.reset_preserving_offchain_order_state();
+        // no writer left to restore it. A provider inflight event also keeps
+        // the inflight the other provider events own, since only it is
+        // reapplied below.
+        *inventory = match &event {
+            InflightEquity { .. } => {
+                inventory.reset_carrying_other_provider_inflight(Chain::Base, now)
+            }
+            ChainInflightRedemptions { chain, .. } => {
+                inventory.reset_carrying_other_provider_inflight(*chain, now)
+            }
+            _ => inventory.reset_preserving_offchain_order_state(),
+        };
 
         let updated = match &event {
             // The reconcile events never reach here at runtime -- the early
@@ -3261,7 +3944,9 @@ impl RebalancingService {
             | EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
-            | BaseWalletWrappedEquity { .. } => {
+            | BaseWalletWrappedEquity { .. }
+            | ChainWalletUnwrappedEquity { .. }
+            | ChainWalletWrappedEquity { .. } => {
                 inventory
                     .clone()
                     .force_apply_snapshot_event(&event, now, recovery_reason)
@@ -3274,6 +3959,21 @@ impl RebalancingService {
                     inventory
                         .clone()
                         .apply_inflight_snapshot(mints, redemptions, *fetched_at, now)
+                } else {
+                    Ok(inventory.clone())
+                }
+            }
+
+            ChainInflightRedemptions {
+                chain, fetched_at, ..
+            } => {
+                if let Some((_, redemptions)) = &filtered_inflight {
+                    inventory.clone().apply_inflight_redemptions_at(
+                        *chain,
+                        redemptions,
+                        *fetched_at,
+                        now,
+                    )
                 } else {
                     Ok(inventory.clone())
                 }
@@ -3345,162 +4045,29 @@ impl RebalancingService {
             | OffchainCashWithdrawable { .. } => {
                 self.usdc_scheduler.enqueue_check().await;
             }
-            // Wrapped equity in the bot wallet (outside Raindex) triggers
-            // a recovery dispatch job per symbol with a positive balance.
-            // Gated on the per-symbol `wrapped_equity_recovery` config so
-            // tests that pre-stage wallet wtSTOCK (e.g. for orderbook
-            // mechanics) can opt out.
+            // Wrapped equity in a chain's bot wallet (outside Raindex)
+            // triggers a recovery dispatch job per symbol with a positive
+            // balance on that chain.
             BaseWalletWrappedEquity { balances, .. } => {
-                let primary_chain = self.inventory.read().await.primary_chain();
-                for (symbol, amount) in balances {
-                    if *amount == FractionalShares::ZERO {
-                        continue;
-                    }
-                    if !self
-                        .config
-                        .wrapped_equity_recovery_enabled(primary_chain, symbol)
-                    {
-                        continue;
-                    }
-
-                    let mut queue = self.wrapped_equity_recovery_queue.clone();
-                    let job_type = std::any::type_name::<WrappedEquityRecoveryJob>();
-
-                    // Match the serialized `symbol` field exactly (json_extract, not
-                    // a LIKE substring) so a queued job for a ticker that contains
-                    // this symbol as a substring (e.g. GOOGL vs GOOG) can't suppress
-                    // a distinct recovery.
-                    let existing: Result<(i64,), _> = sqlx_apalis::query_as(
-                        "SELECT COUNT(*) FROM Jobs \
-                         WHERE job_type = ? \
-                         AND status IN ('Pending', 'Queued', 'Running') \
-                         AND json_extract(job, '$.symbol') = ?",
-                    )
-                    .bind(job_type)
-                    .bind(symbol.to_string())
-                    .fetch_one(queue.pool())
+                self.enqueue_wrapped_equity_recovery(Chain::Base, balances)
                     .await;
-
-                    match existing {
-                        Ok((count,)) if count > 0 => {
-                            debug!(
-                                target: "rebalance",
-                                %symbol, %count,
-                                "Skipped WrappedEquityRecoveryJob enqueue: a non-terminal \
-                                 row for this symbol already exists",
-                            );
-                            continue;
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            warn!(
-                                target: "rebalance",
-                                %symbol, %error,
-                                "Failed to query existing WrappedEquityRecoveryJob rows; \
-                                 skipping enqueue to avoid duplicates",
-                            );
-                            continue;
-                        }
-                    }
-
-                    let recovery_id = WrappedEquityRecoveryId(Uuid::new_v4());
-                    if let Err(error) = queue
-                        .push(WrappedEquityRecoveryJob {
-                            symbol: symbol.clone(),
-                            recovery_id: recovery_id.clone(),
-                            backpressure_streak: BackpressureStreak::default(),
-                        })
-                        .await
-                    {
-                        warn!(
-                            target: "rebalance",
-                            %symbol, %recovery_id, ?error,
-                            "Failed to enqueue WrappedEquityRecoveryJob",
-                        );
-                    }
-                }
             }
-            // Unwrapped equity (tSTOCK) in the bot wallet triggers a
-            // recovery dispatch per symbol with a positive balance.
-            // Gated per-symbol on `wrapped_equity_recovery` -- the same
-            // config flag covers both detection paths since they share
-            // the same "auto-recover misplaced equity" intent.
+            ChainWalletWrappedEquity {
+                chain, balances, ..
+            } => {
+                self.enqueue_wrapped_equity_recovery(*chain, balances).await;
+            }
+            // Unwrapped equity (tSTOCK) in a chain's bot wallet triggers a
+            // recovery dispatch per symbol with a positive balance there.
             BaseWalletUnwrappedEquity { balances, .. } => {
-                let primary_chain = self.inventory.read().await.primary_chain();
-                for (symbol, amount) in balances {
-                    if *amount == FractionalShares::ZERO {
-                        continue;
-                    }
-                    if !self
-                        .config
-                        .wrapped_equity_recovery_enabled(primary_chain, symbol)
-                    {
-                        continue;
-                    }
-
-                    let mut queue = self.unwrapped_equity_recovery_queue.clone();
-                    let job_type = std::any::type_name::<UnwrappedEquityRecoveryJob>();
-
-                    // Status-scoped dedup, mirroring the wrapped path: only a
-                    // non-terminal row blocks a re-enqueue. apalis's
-                    // `ON CONFLICT(job_type, idempotency_key) DO NOTHING` never
-                    // surfaces a unique-violation, and its index spans all
-                    // statuses, so an idempotency key would silently wedge a
-                    // symbol behind its own `Done` row until the hourly cleanup
-                    // -- starving the next-poll re-dispatch the guard-contention
-                    // skip relies on. Match the serialized `symbol` field
-                    // exactly (json_extract, not a LIKE substring) so a queued
-                    // job for a ticker that contains this symbol as a substring
-                    // (e.g. GOOGL vs GOOG) can't suppress a distinct recovery.
-                    let existing: Result<(i64,), _> = sqlx_apalis::query_as(
-                        "SELECT COUNT(*) FROM Jobs \
-                         WHERE job_type = ? \
-                         AND status IN ('Pending', 'Queued', 'Running') \
-                         AND json_extract(job, '$.symbol') = ?",
-                    )
-                    .bind(job_type)
-                    .bind(symbol.to_string())
-                    .fetch_one(queue.pool())
+                self.enqueue_unwrapped_equity_recovery(Chain::Base, balances)
                     .await;
-
-                    match existing {
-                        Ok((count,)) if count > 0 => {
-                            debug!(
-                                target: "rebalance",
-                                %symbol, %count,
-                                "Skipped UnwrappedEquityRecoveryJob enqueue: a non-terminal \
-                                 row for this symbol already exists",
-                            );
-                            continue;
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            warn!(
-                                target: "rebalance",
-                                %symbol, %error,
-                                "Failed to query existing UnwrappedEquityRecoveryJob rows; \
-                                 skipping enqueue to avoid duplicates",
-                            );
-                            continue;
-                        }
-                    }
-
-                    let recovery_id = UnwrappedEquityRecoveryId(Uuid::new_v4());
-                    if let Err(error) = queue
-                        .push(UnwrappedEquityRecoveryJob {
-                            symbol: symbol.clone(),
-                            recovery_id: recovery_id.clone(),
-                            backpressure_streak: BackpressureStreak::default(),
-                        })
-                        .await
-                    {
-                        warn!(
-                            target: "rebalance",
-                            %symbol, %recovery_id, ?error,
-                            "Failed to enqueue UnwrappedEquityRecoveryJob",
-                        );
-                    }
-                }
+            }
+            ChainWalletUnwrappedEquity {
+                chain, balances, ..
+            } => {
+                self.enqueue_unwrapped_equity_recovery(*chain, balances)
+                    .await;
             }
             // Wallet-read USDC events update `inflight_cash` for
             // visibility but don't drive triggers here.
@@ -3515,8 +4082,119 @@ impl RebalancingService {
             // Inflight snapshots don't trigger rebalancing -- they
             // indicate transfers already in progress, not new balances
             // to rebalance.
-            | InflightEquity { .. } => {}
+            | InflightEquity { .. }
+            | ChainInflightRedemptions { .. } => {}
         }
+    }
+
+    /// Enqueues a `WrappedEquityRecoveryJob` on `chain` for each symbol with
+    /// a positive wrapped balance in that chain's wallet. Gated on the
+    /// chain's per-symbol `wrapped_equity_recovery` config so tests that
+    /// pre-stage wallet wtSTOCK (e.g. for orderbook mechanics) can opt out.
+    async fn enqueue_wrapped_equity_recovery(
+        &self,
+        chain: Chain,
+        balances: &BTreeMap<Symbol, FractionalShares>,
+    ) {
+        let primary_chain = self.inventory.read().await.primary_chain();
+        if !self.recovers_wallet_equity_on(chain, primary_chain) {
+            debug!(
+                target: "rebalance",
+                %chain,
+                "Skipping wallet equity recovery: the chain has no equity services, so its \
+                 wallet is not polled and cannot drive a recovery job"
+            );
+            return;
+        }
+        for (symbol, amount) in balances {
+            if *amount == FractionalShares::ZERO
+                || !self.config.wrapped_equity_recovery_enabled(chain, symbol)
+            {
+                continue;
+            }
+
+            let mut queue = self.wrapped_equity_recovery_queue.clone();
+            let job_type = std::any::type_name::<WrappedEquityRecoveryJob>();
+            if recovery_job_pending(queue.pool(), job_type, chain, symbol).await {
+                continue;
+            }
+
+            let recovery_id = WrappedEquityRecoveryId(Uuid::new_v4());
+            if let Err(error) = queue
+                .push(WrappedEquityRecoveryJob {
+                    chain,
+                    symbol: symbol.clone(),
+                    recovery_id: recovery_id.clone(),
+                    backpressure_streak: BackpressureStreak::default(),
+                })
+                .await
+            {
+                warn!(
+                    target: "rebalance",
+                    %chain, %symbol, %recovery_id, ?error,
+                    "Failed to enqueue WrappedEquityRecoveryJob",
+                );
+            }
+        }
+    }
+
+    /// Enqueues an `UnwrappedEquityRecoveryJob` on `chain` for each symbol
+    /// with a positive unwrapped balance in that chain's wallet. The same
+    /// `wrapped_equity_recovery` flag gates both detection paths since they
+    /// share the same "auto-recover misplaced equity" intent.
+    async fn enqueue_unwrapped_equity_recovery(
+        &self,
+        chain: Chain,
+        balances: &BTreeMap<Symbol, FractionalShares>,
+    ) {
+        let primary_chain = self.inventory.read().await.primary_chain();
+        if !self.recovers_wallet_equity_on(chain, primary_chain) {
+            debug!(
+                target: "rebalance",
+                %chain,
+                "Skipping wallet equity recovery: the chain has no equity services, so its \
+                 wallet is not polled and cannot drive a recovery job"
+            );
+            return;
+        }
+        for (symbol, amount) in balances {
+            if *amount == FractionalShares::ZERO
+                || !self.config.wrapped_equity_recovery_enabled(chain, symbol)
+            {
+                continue;
+            }
+
+            let mut queue = self.unwrapped_equity_recovery_queue.clone();
+            let job_type = std::any::type_name::<UnwrappedEquityRecoveryJob>();
+            if recovery_job_pending(queue.pool(), job_type, chain, symbol).await {
+                continue;
+            }
+
+            let recovery_id = UnwrappedEquityRecoveryId(Uuid::new_v4());
+            if let Err(error) = queue
+                .push(UnwrappedEquityRecoveryJob {
+                    chain,
+                    symbol: symbol.clone(),
+                    recovery_id: recovery_id.clone(),
+                    backpressure_streak: BackpressureStreak::default(),
+                })
+                .await
+            {
+                warn!(
+                    target: "rebalance",
+                    %chain, %symbol, %recovery_id, ?error,
+                    "Failed to enqueue UnwrappedEquityRecoveryJob",
+                );
+            }
+        }
+    }
+
+    /// Whether wallet balances on `chain` drive recovery jobs: the primary
+    /// chain, and every chain built with equity services. That is the set the
+    /// wallet poller reads, including a chain kept only to finish
+    /// unfinished equity work, so a balance it records is never dropped here.
+    fn recovers_wallet_equity_on(&self, chain: Chain, primary_chain: Chain) -> bool {
+        chain == primary_chain || self.registry_ids.contains_key(&chain)
     }
 
     /// Re-drives recovery producers from the already-hydrated inventory view.
@@ -3526,52 +4204,50 @@ impl RebalancingService {
     /// balances, so a positive tSTOCK/wtSTOCK balance that was persisted before
     /// restart would otherwise wait forever for a new event.
     pub(crate) async fn enqueue_recovery_for_current_wallet_balances(&self) {
-        let (wrapped, unwrapped) = {
+        let mut balances = Vec::new();
+        {
             let view = self.inventory.read().await;
-            let primary = view.primary_chain();
-            let mut wrapped = BTreeMap::new();
-            let mut unwrapped = BTreeMap::new();
-
-            let listed = self
-                .config
-                .chains
-                .get(&primary)
-                .into_iter()
-                .flat_map(|config| config.assets.equities.symbols.keys());
-            for symbol in listed {
-                if let Some(amount) =
-                    view.inflight_equity_at(symbol, InFlightEquityLocation::BaseWalletWrapped)
-                {
-                    wrapped.insert(symbol.clone(), amount);
+            for (chain, config) in &self.config.chains {
+                if !self.recovers_wallet_equity_on(*chain, view.primary_chain()) {
+                    continue;
                 }
-                if let Some(amount) =
-                    view.inflight_equity_at(symbol, InFlightEquityLocation::BaseWalletUnwrapped)
-                {
-                    unwrapped.insert(symbol.clone(), amount);
+                let mut wrapped = BTreeMap::new();
+                let mut unwrapped = BTreeMap::new();
+                for symbol in config.assets.equities.symbols.keys() {
+                    if let Some(amount) = view
+                        .inflight_equity_at(symbol, InFlightEquityLocation::WalletWrapped(*chain))
+                    {
+                        wrapped.insert(symbol.clone(), amount);
+                    }
+                    if let Some(amount) = view
+                        .inflight_equity_at(symbol, InFlightEquityLocation::WalletUnwrapped(*chain))
+                    {
+                        unwrapped.insert(symbol.clone(), amount);
+                    }
                 }
+                balances.push((*chain, wrapped, unwrapped));
             }
-
-            (wrapped, unwrapped)
-        };
+        }
 
         let fetched_at = Utc::now();
 
-        if !wrapped.is_empty() {
-            self.enqueue_checks_for_snapshot(&InventorySnapshotEvent::BaseWalletWrappedEquity {
-                balances: wrapped,
-                fetched_at,
-            })
-            .await;
-        }
+        for (chain, wrapped, unwrapped) in balances {
+            if !wrapped.is_empty() {
+                self.enqueue_checks_for_snapshot(&InventorySnapshotEvent::wallet_wrapped_equity(
+                    chain, wrapped, fetched_at,
+                ))
+                .await;
+            }
 
-        if !unwrapped.is_empty() {
-            self.enqueue_checks_for_snapshot(&InventorySnapshotEvent::BaseWalletUnwrappedEquity {
-                balances: unwrapped,
-                fetched_at,
-            })
-            .await;
+            if !unwrapped.is_empty() {
+                self.enqueue_checks_for_snapshot(&InventorySnapshotEvent::wallet_unwrapped_equity(
+                    chain, unwrapped, fetched_at,
+                ))
+                .await;
+            }
         }
     }
+
     async fn apply_onchain_fill_to_inventory(
         &self,
         symbol: Symbol,
@@ -3606,9 +4282,8 @@ impl RebalancingService {
                 // poll is forced through aggregate deduplication and replaces
                 // the slot from authoritative chain state before rebalancing
                 // can resume.
-                let (primary_chain, equity_reconciled, usdc_reconciled) = {
+                let (equity_reconciled, usdc_reconciled) = {
                     let mut inventory = self.inventory.write().await;
-                    let primary_chain = inventory.primary_chain();
                     let equity_slot_seeded =
                         inventory.onchain_equity_slot_seeded(&symbol, trade_id.chain);
                     let usdc_slot_seeded = inventory.onchain_usdc_slot_seeded(trade_id.chain);
@@ -3740,9 +4415,18 @@ impl RebalancingService {
                             timestamp,
                         )?;
                     }
+                    // A cash read pending for this chain must not be resolved
+                    // by a read pinned below this fill: it would replace the
+                    // balance without the debit or credit just applied. The
+                    // floor is raised in the same inventory write, and the
+                    // snapshot reactor checks it under that lock too.
+                    if apply_usdc_leg && let Some(block_number) = *block_number {
+                        self.divergence_gate
+                            .raise_pending_onchain_cash_floor(trade_id.chain, block_number);
+                    }
                     *inventory = updated;
                     drop(inventory);
-                    (primary_chain, equity_reconciled, usdc_reconciled)
+                    (equity_reconciled, usdc_reconciled)
                 };
 
                 if !equity_reconciled {
@@ -3754,12 +4438,12 @@ impl RebalancingService {
                 }
                 if !usdc_reconciled {
                     self.divergence_gate
-                        .request_onchain_cash_reconcile(trade_id.chain, *block_number);
+                        .request_onchain_cash_reconcile(trade_id.chain, *block_number)
+                        .await;
                 }
                 self.schedule_fill_checks(
                     symbol,
                     trade_id.chain,
-                    primary_chain,
                     equity_reconciled,
                     usdc_reconciled,
                 )
@@ -4006,11 +4690,14 @@ impl PendingRequestOwnership for RebalancingService {
                 .collect(),
             redemption_tokenizations: redemption_tracking
                 .values()
-                .filter_map(|tracking| tracking.tokenization_request_id.clone())
+                .filter_map(|tracking| {
+                    let id = tracking.tokenization_request_id.clone()?;
+                    Some((id, tracking.chain))
+                })
                 .collect(),
             redemption_txs: redemption_tracking
                 .values()
-                .filter_map(|tracking| tracking.redemption_tx)
+                .filter_map(|tracking| Some((tracking.redemption_tx?, tracking.chain)))
                 .collect(),
         }
     }
@@ -4026,9 +4713,15 @@ pub(crate) enum RecoveryRollback {
     /// The rebuild touched no inventory balances (called on a non-failed
     /// aggregate). Rollback only drops the tracking + in-progress guard.
     TrackingOnly,
-    /// Redemption recovery restored a released (zero) in-flight without
-    /// changing available. Rollback clears the chain's in-flight again.
-    ClearRestoredRedemptionInflight { chain: Chain },
+    /// Redemption recovery restores released exposure or claims one seeded
+    /// failure. Rollback removes only the added exposure and restores the seeded identity.
+    RestoreRedemptionInventory {
+        chain: Chain,
+        added: FractionalShares,
+        stranded: Option<crate::equity_redemption::StrandedRedemption>,
+        timed_out_at: Option<DateTime<Utc>>,
+        suppressed_at: Option<DateTime<Utc>>,
+    },
     /// The rebuild moved available -> in-flight via `Start` (an explicitly
     /// failed transfer that had cancelled its in-flight back to available).
     /// Rollback cancels the in-flight back to available.
@@ -4124,23 +4817,48 @@ impl RebalancingService {
         Ok((store, threshold))
     }
 
+    /// Reserves `symbol` for the planned `direction`. A redemption brings the
+    /// broker shares, so it also carries how many shares the broker can sell
+    /// today: the Position then admits it over a due sell hedge that the
+    /// broker can place none of, which otherwise waits for this very
+    /// redemption.
+    /// With no broker reading the capacity is unknown, so the redemption keeps
+    /// the strict rule.
     async fn try_reserve_equity_transfer(
         &self,
         symbol: &Symbol,
         reservation_id: EquityTransferReservationId,
+        direction: PlannedDirection,
     ) -> Result<bool, equity::EquityTriggerError> {
         let (store, threshold) = self.position_authority().await?;
-        match store
-            .send(
-                symbol,
-                PositionCommand::ReserveEquityTransfer {
+        let hedgeable = match direction {
+            PlannedDirection::Mint => None,
+            PlannedDirection::Redemption => self.hedgeable_shares(symbol).await?,
+        };
+        if hedgeable.is_none() && direction == PlannedDirection::Redemption {
+            warn!(
+                target: "rebalance",
+                %symbol,
+                "No broker balance for the redemption's hedge funding check; \
+                 reserving under the strict rule"
+            );
+        }
+        let command = hedgeable.map_or_else(
+            || PositionCommand::ReserveEquityTransfer {
+                symbol: symbol.clone(),
+                threshold,
+                reservation_id,
+            },
+            |hedgeable| {
+                PositionCommand::ReserveHedgeFundingRedemption(HedgeFundingRedemption {
                     symbol: symbol.clone(),
                     threshold,
                     reservation_id,
-                },
-            )
-            .await
-        {
+                    hedgeable,
+                })
+            },
+        );
+        match store.send(symbol, command).await {
             Ok(()) => Ok(true),
             Err(AggregateError::UserError(LifecycleError::Apply(error)))
                 if matches!(
@@ -4152,6 +4870,13 @@ impl RebalancingService {
                         | PositionError::EquityTransferHedgeEligibilityUnknown { .. }
                 ) =>
             {
+                // A due hedge holding a redemption back is otherwise
+                // indistinguishable from an idle symbol, so it is counted next
+                // to the planner's own decline reasons.
+                if matches!(error, PositionError::EquityTransferBlockedByHedge { .. }) {
+                    counter!("equity_plan_declined_total", "reason" => "blocked_by_hedge")
+                        .increment(1);
+                }
                 debug!(
                     target: "rebalance",
                     %symbol,
@@ -4215,10 +4940,7 @@ impl RebalancingService {
         symbol: &Symbol,
         probes: &mut BTreeMap<Chain, ChainReadiness>,
     ) -> Result<EquityPlan, equity::EquityTriggerError> {
-        let (venues, primary_chain) = {
-            let inventory = self.inventory.read().await;
-            (inventory.equity_venues(symbol)?, inventory.primary_chain())
-        };
+        let venues = self.inventory.read().await.equity_venues(symbol)?;
 
         let mut listing_chains = BTreeSet::new();
         let mut onchain = BTreeMap::new();
@@ -4238,18 +4960,34 @@ impl RebalancingService {
             let target = listing
                 .target_share
                 .or_else(|| self.config.allocation.targets.get(&chain).copied());
-            let (enabled, target) = target.map_or_else(
+            let (participation, target) = target.map_or_else(
                 || {
                     error!(
                         target: "rebalance",
                         %symbol,
                         %chain,
-                        "A rebalancing-enabled listing has no target share; treating it as \
+                        "A rebalancing listing (enabled or paused) has no target share; treating it as \
                          disabled -- config validation should have refused this"
                     );
-                    (false, TargetShare::ZERO)
+                    (Participation::NoTarget, TargetShare::ZERO)
                 },
-                |target| (true, target),
+                |target| {
+                    let participation = match listing.rebalancing {
+                        RebalancingMode::Enabled => Participation::Plans,
+                        RebalancingMode::Paused => Participation::Paused,
+                        RebalancingMode::Disabled => {
+                            error!(
+                                target: "rebalance",
+                                %symbol,
+                                %chain,
+                                "A disabled listing reached the rebalancing slots; \
+                                 rebalancing_listings should have filtered it out"
+                            );
+                            Participation::NoTarget
+                        }
+                    };
+                    (participation, target)
+                },
             );
 
             onchain.insert(
@@ -4264,7 +5002,7 @@ impl RebalancingService {
                     // Both probed only once the planner picks the chain.
                     gas_ready: true,
                     registry_known: true,
-                    enabled,
+                    participation,
                 },
             );
         }
@@ -4293,7 +5031,6 @@ impl RebalancingService {
                 hedge_floor: self.config.hedge_floor.for_symbol(symbol),
                 cooldowns,
                 last_price,
-                primary_chain,
             },
             probes,
         )
@@ -4381,14 +5118,13 @@ impl RebalancingService {
     /// chain: a fill on a chain whose listing rebalances the symbol moves
     /// that chain's slot, so it schedules the symbol's check, while a
     /// hedge-only listing is prefunded and outside the planner's total. USDC
-    /// still rebalances on the primary chain only. A clamped leg waits for
-    /// the next pinned snapshot instead of sizing a transfer from an
-    /// acknowledged intermediate balance.
+    /// rebalances on each active corridor's chain, so only a fill on one of
+    /// them schedules its check. A clamped leg waits for the next pinned snapshot
+    /// instead of sizing a transfer from an acknowledged intermediate balance.
     async fn schedule_fill_checks(
         &self,
         symbol: Symbol,
         fill_chain: Chain,
-        primary_chain: Chain,
         equity_reconciled: bool,
         usdc_reconciled: bool,
     ) {
@@ -4400,7 +5136,12 @@ impl RebalancingService {
             self.equity_scheduler.enqueue_check(symbol).await;
         }
 
-        if fill_chain == primary_chain && usdc_reconciled {
+        let on_corridor_chain = self
+            .config
+            .usdc
+            .active()
+            .any(|usdc| usdc.corridor.chain() == fill_chain);
+        if on_corridor_chain && usdc_reconciled {
             self.usdc_scheduler.enqueue_check().await;
         }
     }
@@ -4439,8 +5180,7 @@ impl RebalancingService {
             (
                 DeclineReason::ChainUnpolled { chain }
                 | DeclineReason::ChainStale { chain }
-                | DeclineReason::NotInRegistry { chain }
-                | DeclineReason::RedemptionUnrecoverable { chain },
+                | DeclineReason::NotInRegistry { chain },
                 _,
             ) => {
                 warn!(
@@ -4454,7 +5194,8 @@ impl RebalancingService {
             (
                 DeclineReason::BelowMinimum { chain }
                 | DeclineReason::NoGas { chain }
-                | DeclineReason::CoolingDown { chain },
+                | DeclineReason::CoolingDown { chain }
+                | DeclineReason::Paused { chain },
                 _,
             ) => {
                 info!(
@@ -4693,7 +5434,7 @@ impl RebalancingService {
                 );
                 *inventory = inventory
                     .clone()
-                    .clear_equity_inflight(symbol, venue, now)?;
+                    .clear_equity_inflight_at(symbol, chain, venue, now)?;
                 EquitySettlementOutcome::DeferredToSnapshot
             }
             Err(error) => return Err(error.into()),
@@ -4708,6 +5449,41 @@ impl RebalancingService {
         }
 
         Ok(outcome)
+    }
+
+    async fn reconcile_redemption_inventory(
+        &self,
+        symbol: &Symbol,
+        chain: Chain,
+        quantity: FractionalShares,
+        stage: RedemptionTrackingStage,
+    ) -> Result<EquitySettlementOutcome, RebalancingServiceError> {
+        if matches!(
+            stage,
+            RedemptionTrackingStage::VaultWithdrawPending
+                | RedemptionTrackingStage::VaultWithdrawSubmitting
+                | RedemptionTrackingStage::VaultWithdrawSubmitted
+        ) {
+            return self
+                .apply_equity_update_or_defer(
+                    symbol,
+                    chain,
+                    Venue::MarketMaking,
+                    Self::cancel_equity_transfer_update(Venue::MarketMaking, quantity),
+                )
+                .await;
+        }
+        let mut inventory = self.inventory.write().await;
+        *inventory = inventory.clone().clear_equity_inflight_at(
+            symbol,
+            chain,
+            Venue::MarketMaking,
+            Utc::now(),
+        )?;
+        drop(inventory);
+        self.divergence_gate
+            .request_onchain_equity_reconcile(chain, symbol, None);
+        Ok(EquitySettlementOutcome::DeferredToSnapshot)
     }
 
     /// Sets `active_mints[symbol] = id` while the aggregate is alive,
@@ -4775,22 +5551,22 @@ impl RebalancingService {
             Completed { .. } | ProviderCompletionRecovered { .. } => Some(
                 Self::complete_equity_transfer_update(Venue::MarketMaking, quantity),
             ),
-            // `TransferFailed` cancels the inflight the withdraw opened, returning
-            // the shares to available. A redemption reconciled directly from
-            // `VaultWithdrawSubmitting` never withdrew from the vault either, so it
-            // cancels identically. `OperatorReconciled` only reaches this fold for
-            // the submitting origin: reconcile from `Failed` has its tracking removed
-            // by `TransferFailed`, so `on_redemption` early-returns before calling
-            // `redemption_inventory_update`.
-            TransferFailed { .. } | OperatorReconciled { .. } => Some(
-                Self::cancel_equity_transfer_update(Venue::MarketMaking, quantity),
-            ),
-            VaultWithdrawSubmitted { .. }
+            // A transfer failure cancels the inflight opened by withdrawal.
+            // Operator reconciliation is handled separately using its origin stage.
+            TransferFailed { .. } => Some(Self::cancel_equity_transfer_update(
+                Venue::MarketMaking,
+                quantity,
+            )),
+            OperatorReconciled { .. }
+            | VaultWithdrawSubmitted { .. }
+            | VaultWithdrawReplacementAdopted { .. }
             | WithdrawnFromRaindex { .. }
             | UnwrapPending { .. }
             | UnwrapSubmitted { .. }
             | TokensUnwrapped { .. }
             | SendPending { .. }
+            | SendPrepared { .. }
+            | SendReplaced { .. }
             | TokensSent { .. }
             | DetectionFailed { .. }
             | Detected { .. }
@@ -4965,17 +5741,16 @@ impl RebalancingService {
         // remains authoritative; it reuses this plan's registry and gas
         // probes.
         let mut probes = BTreeMap::new();
-        if self
+        let Some(preflight) = self
             .plan_equity_operation_or_skip(symbol, &mut probes)
             .await?
-            .is_none()
-        {
+        else {
             return Ok(());
-        }
+        };
 
         let reservation_id = EquityTransferReservationId::generate();
         if !self
-            .try_reserve_equity_transfer(symbol, reservation_id)
+            .try_reserve_equity_transfer(symbol, reservation_id, preflight.direction)
             .await?
         {
             return Ok(());
@@ -4988,6 +5763,20 @@ impl RebalancingService {
             else {
                 return Ok(false);
             };
+
+            // The reservation was admitted for the preflight direction: a
+            // redemption may hold it over a due sell hedge, which a mint must
+            // never do.
+            if operation.direction != preflight.direction {
+                debug!(
+                    target: "rebalance",
+                    %symbol,
+                    reserved = ?preflight.direction,
+                    planned = ?operation.direction,
+                    "Skipped equity dispatch: direction changed after reservation"
+                );
+                return Ok(false);
+            }
 
             // The restart taint needs no matching re-check: it is only seeded
             // at boot, so it cannot appear during planning. Snapshot divergence
@@ -5102,11 +5891,12 @@ impl RebalancingService {
         Ok(registry.token_by_symbol(symbol))
     }
 
-    /// Returns USDC rebalancing parameters if rebalancing is enabled in
-    /// config, reading the cash asset of the corridor's chain.
-    fn usdc_rebalancing_params(&self) -> Option<(UsdcCorridorCtx, Option<Usdc>, Option<Usd>)> {
-        let usdc = self.config.usdc?;
-
+    /// Returns `usdc`'s rebalancing parameters if its chain's cash asset
+    /// rebalances: that chain's per-transfer limit and the broker reserve.
+    fn usdc_rebalancing_params(
+        &self,
+        usdc: &UsdcCorridorCtx,
+    ) -> Option<(Option<Usdc>, Option<Usd>)> {
         let cash = self
             .config
             .chains
@@ -5121,7 +5911,7 @@ impl RebalancingService {
         let usdc_limit = cash.operational_limit.map(Positive::inner);
         let reserved = self.config.cash_reserved.map(Positive::inner);
 
-        Some((usdc, usdc_limit, reserved))
+        Some((usdc_limit, reserved))
     }
 
     /// Sizes the transfer the corridor's imbalance calls for, if any.
@@ -5143,7 +5933,8 @@ impl RebalancingService {
         .ok()
     }
 
-    /// Checks inventory for USDC imbalance and triggers operation if needed.
+    /// Checks every active corridor, in chain order, for a USDC imbalance
+    /// and triggers the operation each one needs.
     pub(crate) async fn check_and_trigger_usdc(&self) {
         // Hold a claim on the driver for the whole check so an operator
         // operation's pause waits for an active check. A check already queued
@@ -5154,10 +5945,15 @@ impl RebalancingService {
 
         self.expire_stuck_operations_with_logging().await;
 
-        let Some((usdc, usdc_limit, reserved)) = self.usdc_rebalancing_params() else {
+        let corridors: Vec<_> = self
+            .config
+            .usdc
+            .active()
+            .filter_map(|usdc| Some((usdc, self.usdc_rebalancing_params(usdc)?)))
+            .collect();
+        if corridors.is_empty() {
             return;
-        };
-        let chain = usdc.corridor.chain();
+        }
 
         // A pending cash divergence means the Hedging USDC balance the
         // imbalance math reads is suspect: a bridge sized off it moves the
@@ -5166,14 +5962,18 @@ impl RebalancingService {
         // restart-tainted cash balance is suspect for the same reason (the
         // hydrated number may or may not contain a straddling fill's cash
         // leg), with the same resolution path.
-        if self.divergence_gate.is_cash_engaged() {
+        //
+        // The admission is taken before any sizing and redeemed right before
+        // each enqueue, so a gate engaged at any point in between refuses
+        // the dispatch even if it was released again.
+        let Some(admission) = self.divergence_gate.cash_admission() else {
             warn!(
                 target: "rebalance",
                 "Skipped USDC trigger: unresolved cash snapshot divergence \
                  pending reconciliation"
             );
             return;
-        }
+        };
         if self.is_restart_cash_tainted().await {
             warn!(
                 target: "rebalance",
@@ -5182,6 +5982,46 @@ impl RebalancingService {
             );
             return;
         }
+
+        for (usdc, (usdc_limit, reserved)) in corridors {
+            self.check_and_trigger_usdc_corridor(usdc, usdc_limit, reserved, admission)
+                .await;
+        }
+    }
+
+    /// Whether the conversion cooldown holds `operation`: only an
+    /// Alpaca->Base transfer converts USD to USDC, so only it is held.
+    async fn conversion_cooldown_holds(
+        &self,
+        chain: Chain,
+        operation: UsdcRebalanceOperation,
+    ) -> bool {
+        let UsdcRebalanceOperation::AlpacaToBase { amount } = operation else {
+            return false;
+        };
+        if !self.usdc_conversion_cooling_down(Utc::now()).await {
+            return false;
+        }
+
+        debug!(
+            target: "rebalance",
+            %chain,
+            ?amount,
+            "Skipped USDC trigger: a USD->USDC conversion failed within the cooldown"
+        );
+        true
+    }
+
+    /// Checks one corridor for a USDC imbalance and dispatches the transfer
+    /// it needs under that corridor's guard.
+    async fn check_and_trigger_usdc_corridor(
+        &self,
+        usdc: &UsdcCorridorCtx,
+        usdc_limit: Option<Usdc>,
+        reserved: Option<Usd>,
+        admission: CashAdmission,
+    ) {
+        let chain = usdc.corridor.chain();
 
         // Cross-chain staleness rule, mirroring the equity trigger: the
         // bridge must not be sized off a chain with no recent successful
@@ -5205,9 +6045,26 @@ impl RebalancingService {
             return;
         }
 
-        let Some(sized) = self.size_usdc_operation(&usdc, usdc_limit, reserved).await else {
+        let Some(sized) = self.size_usdc_operation(usdc, usdc_limit, reserved).await else {
             return;
         };
+
+        if let UsdcRebalanceOperation::BaseToAlpaca { amount } = sized
+            && self.usdc_withdraw_cooling_down(chain, Utc::now()).await
+        {
+            info!(
+                target: "rebalance",
+                %chain,
+                ?amount,
+                "Skipped USDC trigger: a vault withdraw on this chain failed without \
+                 starting within the cooldown"
+            );
+            return;
+        }
+
+        if self.conversion_cooldown_holds(chain, sized).await {
+            return;
+        }
 
         // The id is minted before the claim so the guard records which
         // transfer holds it; a refused or undispatched claim leaves no row.
@@ -5225,10 +6082,31 @@ impl RebalancingService {
             }
         };
 
+        self.dispatch_claimed_usdc_operation(
+            usdc, usdc_limit, reserved, admission, sized, id, guard,
+        )
+        .await;
+    }
+
+    /// Sizes the USDC operation again under the corridor's claim and enqueues
+    /// its transfer, unless the imbalance or a gate changed since `sized` was
+    /// read before the claim.
+    async fn dispatch_claimed_usdc_operation(
+        &self,
+        usdc: &UsdcCorridorCtx,
+        usdc_limit: Option<Usdc>,
+        reserved: Option<Usd>,
+        admission: CashAdmission,
+        sized: UsdcRebalanceOperation,
+        id: UsdcRebalanceId,
+        guard: CashGuardClaim,
+    ) {
+        let chain = usdc.corridor.chain();
+
         // Size again under the claim: a holder released between the read
         // above and the claim may have settled funds that read did not see.
         // A dropped claim releases on return.
-        let Some(operation) = self.size_usdc_operation(&usdc, usdc_limit, reserved).await else {
+        let Some(operation) = self.size_usdc_operation(usdc, usdc_limit, reserved).await else {
             return;
         };
         if operation.direction() != sized.direction() {
@@ -5241,23 +6119,30 @@ impl RebalancingService {
             return;
         }
 
-        // Re-check immediately before dispatch: the poller may have engaged
-        // the cash gate during the awaits in the imbalance build (mirrors
-        // the equity trigger's pre-dispatch re-checks). The restart taint
-        // needs no re-check: it is only seeded at boot, so it cannot appear
-        // during the build.
-        if self.divergence_gate.is_cash_engaged() {
-            warn!(
-                target: "rebalance",
-                "Skipped USDC trigger before dispatch: cash snapshot \
-                 divergence detected during operation sizing"
-            );
+        // Again under the claim: a conversion that failed after the read
+        // above holds before its guard is released, so a claim taken on that
+        // guard sees the hold here.
+        if self.conversion_cooldown_holds(chain, operation).await {
             return;
         }
 
-        if !self.transfer_gas_is_ready(TransferGasRoute::Usdc).await {
+        if !self.usdc_transfer_gas_is_ready(usdc.corridor.chain()).await {
             return;
         }
+
+        // Redeem the admission taken before sizing and hold the gate through
+        // the enqueue: a cash engagement since then, even one released
+        // again, refuses, and none can land until the job row is written,
+        // so no transfer goes out sized off a balance the gate has flagged.
+        // The restart taint needs no re-check: it is only seeded at boot.
+        let Some(cash_dispatch) = self.divergence_gate.hold_cash_admission(admission).await else {
+            warn!(
+                target: "rebalance",
+                "Skipped USDC trigger before dispatch: the cash gate engaged \
+                 while the operation was being sized"
+            );
+            return;
+        };
 
         let dispatched = match operation {
             UsdcRebalanceOperation::BaseToAlpaca { amount } => {
@@ -5269,6 +6154,7 @@ impl RebalancingService {
                     .await
             }
         };
+        drop(cash_dispatch);
 
         if !dispatched {
             return;
@@ -5457,6 +6343,31 @@ impl RebalancingService {
             }
             ZombieJobKillOutcome::StillInFlight => Ok(true),
         }
+    }
+
+    /// Kills the Base->Alpaca job rows still queued for `id`, a transfer an
+    /// operator failed through the API. A queued row counts as an in-flight
+    /// USDC transfer, so without this no transfer is planned on the corridor
+    /// until the row next runs and finds the aggregate failed. The API route
+    /// holds the USDC driver paused, so no row is running. Returns how many
+    /// rows were killed.
+    pub(crate) async fn kill_queued_usdc_hedging_jobs(
+        &self,
+        id: &UsdcRebalanceId,
+    ) -> Result<u64, sqlx_apalis::Error> {
+        let result = sqlx_apalis::query(
+            "UPDATE Jobs SET status='Killed', done_at=strftime('%s','now') \
+             WHERE job_type = ? \
+             AND json_extract(CAST(job AS TEXT), '$.id') = ? \
+             AND (status IN ('Pending', 'Queued') \
+                  OR (status = 'Failed' AND attempts < max_attempts))",
+        )
+        .bind(std::any::type_name::<TransferUsdcToHedging>())
+        .bind(id.to_string())
+        .execute(self.transfer_usdc_to_hedging_queue.pool())
+        .await?;
+
+        Ok(result.rows_affected())
     }
 
     /// Terminates a zombie apalis Jobs row by setting its status to `Killed`.
@@ -5731,11 +6642,11 @@ impl RebalancingService {
             });
         }
 
-        if state.corridor() != self.config.served_usdc_corridor {
+        if !self.config.usdc.serves(state.corridor()) {
             return Err(UsdcResumeError::CorridorNotServed {
                 id: id.clone(),
                 recorded: state.corridor(),
-                served: self.config.served_usdc_corridor,
+                served: self.config.usdc.served().clone(),
             });
         }
 
@@ -5894,6 +6805,8 @@ impl RebalancingService {
                     claim.defuse();
                 }
                 self.usdc_guards.hold(corridor.chain(), id, direction);
+                // An operator resuming a USDC transfer re-arms the under-funded page.
+                self.underfunded_alerts.reset_all();
                 info!(
                     target: "rebalance",
                     %id,
@@ -5905,6 +6818,186 @@ impl RebalancingService {
             }
             // A dropped `claim` releases a guard this call claimed; a
             // pre-existing latch stays held.
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Starts a new manual USDC transfer of `amount` in `direction` under a
+    /// freshly minted id, for the apalis worker to drive, on the served
+    /// corridor `chain` names (it may be left out while the build serves one
+    /// corridor), picked the way `st0x-cli transfer-usdc` picks it. The worker
+    /// treats the id's empty state as a fresh transfer, exactly as it does for
+    /// a trigger enqueue. Shares the single flight gates of
+    /// [`Self::resume_usdc_transfer`] in the same order, so a manual start
+    /// cannot race the trigger, a resume, or a transfer in flight, and then
+    /// applies the trigger's fresh dispatch gates (no engaged cash divergence,
+    /// no restart tainted cash balance, gas readiness) before the corridor
+    /// claim, since unlike a resume it starts a fresh transfer.
+    pub(crate) async fn start_manual_usdc_transfer(
+        &self,
+        pool: &SqlitePool,
+        direction: RebalanceDirection,
+        amount: Positive<Usdc>,
+        chain: Option<Chain>,
+    ) -> Result<UsdcRebalanceId, UsdcResumeError> {
+        // The operator supplies the amount (a resume reads the persisted
+        // one), so `Positive` refuses a zero or negative amount before any
+        // gate runs.
+        let amount = amount.inner();
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let corridor = st0x_config::manual_transfer_corridor(self.config.usdc.served(), chain)?;
+        let chain = corridor.chain();
+
+        let store = self.usdc_store.read().await.as_ref().map(Arc::clone);
+        let Some(store) = store else {
+            warn!(
+                target: "rebalance",
+                %id,
+                "Manual USDC transfer refused: stores not wired yet"
+            );
+            return Err(UsdcResumeError::NotReady);
+        };
+
+        // An unreadable transfer latches every corridor; the durable gates
+        // below would count it as a holder and misreport it as a conflict.
+        if self.usdc_guards.is_latched() {
+            return Err(UsdcResumeError::EveryCorridorLatched);
+        }
+
+        // Single flight gate 1, as for a resume: any live or retryable USDC
+        // transfer job row on this corridor, in either direction, refuses,
+        // and so does, for an Alpaca outbound start, an Alpaca outbound row
+        // on any corridor.
+        let queue_pool = self.transfer_usdc_to_market_making_queue.pool();
+        if let Some((row_id, age_secs)) =
+            Self::in_flight_usdc_transfer(queue_pool, Some(&store), chain, direction).await?
+        {
+            return Err(UsdcResumeError::AlreadyInFlight { row_id, age_secs });
+        }
+
+        // Single flight gate 2, with no `except` id: a resume exempts its own
+        // id's latch, but a fresh id has none, so every durable holder refuses.
+        if any_rebalance_holds_guard(pool, &store, None, chain, direction).await? {
+            return Err(UsdcResumeError::GuardHeldElsewhere);
+        }
+
+        // The trigger's other fresh dispatch gates. An active transfer marks the
+        // cash venue busy, which freezes the counter that resolves a divergence
+        // and aborts the forced reconcile, so a manual start in either state
+        // would keep the trigger blocked for the whole transfer.
+        let Some(admission) = self.divergence_gate.cash_admission() else {
+            warn!(
+                target: "rebalance",
+                %id,
+                "Manual USDC transfer refused: unresolved cash snapshot divergence"
+            );
+            return Err(UsdcResumeError::CashDivergenceEngaged);
+        };
+        if self.is_restart_cash_tainted().await {
+            warn!(
+                target: "rebalance",
+                %id,
+                "Manual USDC transfer refused: cash balance is restart tainted"
+            );
+            return Err(UsdcResumeError::CashRestartTainted);
+        }
+
+        // The worker gates gas itself before any withdrawal, but only after the
+        // enqueue: without this check the route would answer with an id whose
+        // job parks on the gas retry interval while its claim holds the
+        // corridor guard and blocks the rebalancer. Refusing here mirrors the
+        // trigger's fresh dispatch skip, and before the claim nothing needs
+        // releasing.
+        if let Err(failure) = self.ensure_usdc_corridor_gas_ready(chain).await {
+            warn!(
+                target: "rebalance",
+                %id,
+                %failure,
+                "Manual USDC transfer refused: its signing wallets are not gas ready"
+            );
+            return Err(UsdcResumeError::GasNotReady(failure));
+        }
+
+        // Every refusal refuses, including `CorridorHeld`, which a resume
+        // tolerates. A resume joins another in memory holder because its id
+        // already owns the transfer; a fresh id owns nothing, so joining would
+        // run two transfers on one corridor.
+        let claim = self
+            .usdc_guards
+            .try_claim(chain, &id, direction)
+            .map_err(|refusal| {
+                warn!(target: "rebalance", %id, %refusal, "Manual USDC transfer refused");
+                match refusal {
+                    ClaimRefusal::Unclassified => UsdcResumeError::EveryCorridorLatched,
+                    ClaimRefusal::CorridorHeld
+                    | ClaimRefusal::AlpacaOutboundElsewhere
+                    | ClaimRefusal::CorridorUnread => UsdcResumeError::GuardHeldElsewhere,
+                }
+            })?;
+
+        // Redeem the admission and hold the gate through the push, like the
+        // trigger's dispatch: a cash engagement during the awaits above
+        // refuses, and none can land until the job row is written.
+        // Returning drops `claim`, which releases the corridor. The restart
+        // taint is only seeded at boot, so it cannot appear here.
+        let Some(cash_dispatch) = self.divergence_gate.hold_cash_admission(admission).await else {
+            warn!(
+                target: "rebalance",
+                %id,
+                "Manual USDC transfer refused: cash snapshot divergence engaged \
+                 during the preflight"
+            );
+            return Err(UsdcResumeError::CashDivergenceEngaged);
+        };
+
+        // A plain push, as in the trigger's fresh dispatch: the id is fresh, so
+        // an idempotency key could never collide. Single flight comes from the
+        // job row gate and the corridor claim above.
+        let push = match direction {
+            RebalanceDirection::AlpacaToBase => {
+                self.transfer_usdc_to_market_making_queue
+                    .clone()
+                    .push(TransferUsdcToMarketMaking {
+                        id: id.clone(),
+                        amount,
+                        corridor,
+                        revert_redrive_attempts: 0,
+                        backpressure_streak: BackpressureStreak::default(),
+                    })
+                    .await
+            }
+            RebalanceDirection::BaseToAlpaca => {
+                self.transfer_usdc_to_hedging_queue
+                    .clone()
+                    .push(TransferUsdcToHedging {
+                        id: id.clone(),
+                        amount,
+                        corridor,
+                        revert_redrive_attempts: 0,
+                        backpressure_streak: BackpressureStreak::default(),
+                    })
+                    .await
+            }
+        };
+        drop(cash_dispatch);
+
+        match push {
+            Ok(()) => {
+                // No `usdc_guards.hold` as in a resume: a resume may hold no
+                // claim (it joined another holder), while this claim is always
+                // fresh and already records `id` as the holder, so defusing it
+                // keeps the hold, as in `check_and_trigger_usdc`.
+                claim.defuse();
+                info!(
+                    target: "rebalance",
+                    %id,
+                    ?direction,
+                    %amount,
+                    "Enqueued manual USDC transfer for the transfer worker"
+                );
+                Ok(id)
+            }
+            // The dropped `claim` releases the guard this call claimed.
             Err(error) => Err(error.into()),
         }
     }
@@ -6477,7 +7570,7 @@ impl RebalancingService {
         false
     }
 
-    async fn cancel_pending_equity_transfer_reservation_restore(
+    pub(super) async fn cancel_pending_equity_transfer_reservation_restore(
         &self,
         reservation_id: EquityTransferReservationId,
     ) {
@@ -6738,10 +7831,23 @@ impl RebalancingService {
         self.equity_cooldowns.write().await.clear();
     }
 
+    /// How long a transfer may go without progress before the sweep acts on
+    /// it; a pending send to the issuer is paged at this point.
+    pub(crate) fn transfer_timeout(&self) -> Duration {
+        self.config.transfer_timeout
+    }
+
     /// The operator alert channel, exposed so startup recovery can page when it
     /// skips a step it must not block on.
     pub(crate) fn notifier(&self) -> &Arc<dyn crate::alerts::Notifier> {
         &self.notifier
+    }
+
+    /// The under-funded withdraw page latch the Base->Alpaca job shares.
+    pub(crate) const fn underfunded_alerts(
+        &self,
+    ) -> &crate::rebalancing::usdc::UnderfundedAlertLatch {
+        &self.underfunded_alerts
     }
 
     /// Clears the in-progress flag for an equity symbol.
@@ -6762,21 +7868,20 @@ impl RebalancingService {
     ///
     /// Returns `true` after removing an `ActiveTransfer` (or absent) guard so
     /// the caller can fail the mint and free the symbol for a fresh rebalance.
-    /// Returns `false` without touching a `HeldForRecovery` slot: recovery owns
-    /// the mint and will drive it to terminal. Holding the lock across the
-    /// check and the clear closes the TOCTOU race where a concurrent
-    /// `mark_held_for_recovery` flips `ActiveTransfer` -> `HeldForRecovery`
+    /// Returns `false` without touching a `HeldForRecovery` or `Recovering`
+    /// slot: recovery owns the mint and will drive it to terminal. Holding the
+    /// lock across the check and the clear closes the TOCTOU race where a
+    /// concurrent `mark_held_for_recovery` or recovery claim changes the slot
     /// between a separate check and clear.
-    pub(crate) fn clear_equity_in_progress_unless_held_for_recovery(
-        &self,
-        symbol: &Symbol,
-    ) -> bool {
+    pub(crate) fn clear_equity_in_progress_unless_recovery_owned(&self, symbol: &Symbol) -> bool {
         let mut guard = match self.equity_in_progress.write() {
             Ok(guard) => guard,
             Err(poison) => poison.into_inner(),
         };
         match guard.get(symbol) {
-            Some(equity::GuardState::HeldForRecovery) => false,
+            Some(
+                equity::GuardState::HeldForRecovery { .. } | equity::GuardState::Recovering { .. },
+            ) => false,
             Some(equity::GuardState::ActiveTransfer { .. }) | None => {
                 guard.remove(symbol);
                 true
@@ -6785,10 +7890,13 @@ impl RebalancingService {
     }
 
     /// Marks the slot as `ActiveTransfer` (startup recovery and tracking-rebuild
-    /// paths that re-establish a live transfer's guard on restart).
+    /// paths that re-establish a live transfer's guard on restart). With the
+    /// generation counter exhausted, the slot is instead held for `chain`'s
+    /// recovery, the chain the transfer runs on.
     fn mark_equity_active_transfer(
         &self,
         symbol: &Symbol,
+        chain: Chain,
         next_generation: impl FnOnce() -> Option<equity::GuardGeneration>,
     ) {
         let mut guard = match self.equity_in_progress.write() {
@@ -6799,10 +7907,14 @@ impl RebalancingService {
             error!(
                 target: "rebalance",
                 %symbol,
+                %chain,
                 "Equity guard generation counter exhausted during startup recovery; \
                  holding the symbol for operator recovery"
             );
-            guard.insert(symbol.clone(), equity::GuardState::HeldForRecovery);
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::HeldForRecovery { chain },
+            );
             return;
         };
         guard.insert(
@@ -6816,13 +7928,16 @@ impl RebalancingService {
     /// Used during startup reconstruction for post-receipt mint states when
     /// recovery is enabled: instead of `ActiveTransfer` (which would block
     /// the recovery job), we set `HeldForRecovery` so `claim_guard_for_recovery_or_orphan`
-    /// can claim the slot and resume.
-    fn mark_equity_held_for_recovery(&self, symbol: &Symbol) {
+    /// can claim the slot and resume on `chain`, the chain holding the tokens.
+    fn mark_equity_held_for_recovery(&self, symbol: &Symbol, chain: Chain) {
         let mut guard = match self.equity_in_progress.write() {
             Ok(guard) => guard,
             Err(poison) => poison.into_inner(),
         };
-        guard.insert(symbol.clone(), equity::GuardState::HeldForRecovery);
+        guard.insert(
+            symbol.clone(),
+            equity::GuardState::HeldForRecovery { chain },
+        );
     }
 
     /// Releases the in-progress guard and tracking for a mint whose recovery
@@ -6873,6 +7988,112 @@ impl RebalancingService {
     /// re-enqueues a transfer job keyed by the existing id. The live/row-existence
     /// checks make this idempotent with apalis's own re-pick of still-owned rows.
     /// See ADR 2.
+    /// Restores the withdraw cooldown, and the forced onchain cash reconcile,
+    /// for a Base->Alpaca withdrawal rejected before broadcast within the
+    /// cooldown before this start: the offline `fail-usdc-transfer`, or a
+    /// rejection the previous process recorded, never reached this process's
+    /// reactor. An aggregate that cannot be loaded holds every chain, as an
+    /// unknown chain does at runtime.
+    async fn restore_withdrawal_rejection_cooldowns(
+        &self,
+        pool: &SqlitePool,
+        usdc_store: &Store<UsdcRebalance>,
+    ) -> Result<(), RebalancingServiceError> {
+        let recent = crate::usdc_rebalance::recent_failures(
+            pool,
+            CooldownFailure::Withdrawal,
+            Utc::now(),
+            usdc::USDC_WITHDRAW_REJECTION_COOLDOWN,
+        )
+        .await?;
+        for id in recent {
+            match usdc_store.load(&id).await {
+                Ok(Some(UsdcRebalance::WithdrawalFailed {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    withdrawal_ref: None,
+                    corridor,
+                    failed_at,
+                    ..
+                })) => {
+                    let chain = corridor.chain();
+                    self.hold_after_withdraw_rejection(Some(chain), failed_at)
+                        .await;
+                    self.enqueue_cooldown_expiry_check(
+                        failed_at,
+                        usdc::USDC_WITHDRAW_REJECTION_COOLDOWN,
+                    )
+                    .await;
+                    info!(target: "rebalance", %id, %chain, %failed_at, "Restored the withdraw cooldown of a recent rejected withdrawal");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(target: "rebalance", %id, ?error, "Failed to load a recent failed withdrawal; holding Base->Alpaca planning on every chain for the cooldown");
+                    let now = Utc::now();
+                    self.hold_after_withdraw_rejection(None, now).await;
+                    self.enqueue_cooldown_expiry_check(now, usdc::USDC_WITHDRAW_REJECTION_COOLDOWN)
+                        .await;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Restores the cooldowns that recent failed transfers started before
+    /// this start: the withdraw cooldowns and the conversion cooldown.
+    async fn restore_failure_cooldowns(
+        &self,
+        pool: &SqlitePool,
+        usdc_store: &Store<UsdcRebalance>,
+    ) -> Result<(), RebalancingServiceError> {
+        self.restore_withdrawal_rejection_cooldowns(pool, usdc_store)
+            .await?;
+        self.restore_conversion_failure_cooldown(pool, usdc_store)
+            .await
+    }
+
+    /// Restores the conversion cooldown for an Alpaca->Base USD->USDC
+    /// conversion that failed before its withdrawal within the cooldown
+    /// before this start, so a restart does not lift the hold. An aggregate
+    /// that cannot be loaded holds Alpaca->Base planning from now.
+    async fn restore_conversion_failure_cooldown(
+        &self,
+        pool: &SqlitePool,
+        usdc_store: &Store<UsdcRebalance>,
+    ) -> Result<(), RebalancingServiceError> {
+        let cooldown = self.config.usdc.conversion_failure_cooldown();
+        let recent = crate::usdc_rebalance::recent_failures(
+            pool,
+            CooldownFailure::Conversion,
+            Utc::now(),
+            cooldown,
+        )
+        .await?;
+        for id in recent {
+            match usdc_store.load(&id).await {
+                Ok(Some(UsdcRebalance::ConversionFailed {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    failed_at,
+                    ..
+                })) => {
+                    self.hold_after_conversion_failure(failed_at).await;
+                    self.enqueue_cooldown_expiry_check(failed_at, cooldown)
+                        .await;
+                    info!(target: "rebalance", %id, %failed_at, "Restored the conversion cooldown of a recent failed Alpaca->Base conversion");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(target: "rebalance", %id, ?error, "Failed to load a recent failed conversion; holding Alpaca->Base planning for the cooldown");
+                    let now = Utc::now();
+                    self.hold_after_conversion_failure(now).await;
+                    self.enqueue_cooldown_expiry_check(now, cooldown).await;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub(crate) async fn recover_usdc_guard(
         &self,
         pool: &SqlitePool,
@@ -6882,6 +8103,7 @@ impl RebalancingService {
             ids: candidate_ids,
             unparseable,
         } = interrupted_usdc_rebalance_ids(pool).await?;
+        self.restore_failure_cooldowns(pool, usdc_store).await?;
 
         let mut held = Vec::new();
         let mut held_tracking = Vec::new();
@@ -6900,7 +8122,7 @@ impl RebalancingService {
                 // it retries the page and releases the guard once reconciled.
                 Ok(Some(entity))
                     if entity.holds_rebalance_guard()
-                        && entity.corridor() != self.config.served_usdc_corridor =>
+                        && !self.config.usdc.serves(entity.corridor()) =>
                 {
                     self.page_unserved_corridor_once(&id, entity.corridor(), entity.direction())
                         .await;
@@ -7505,8 +8727,7 @@ impl RebalancingService {
                 // claim_guard_for_recovery_or_orphan can claim the slot. When recovery
                 // is disabled, ActiveTransfer is correct — resume_interrupted_transfers
                 // will call resume_mint and the transfer job retries normally. The
-                // recovery jobs run on the primary chain only, so a mint on any other
-                // chain is never held: nothing would ever release it.
+                // recovery jobs run on the chain holding the mint's tokens.
                 //
                 // TokensWrapped and VaultDepositSubmitted are always reconstructed as
                 // ActiveTransfer: the deposit is idempotent and resume_interrupted_transfers
@@ -7514,16 +8735,16 @@ impl RebalancingService {
                 let is_pre_wrap_post_receipt_state =
                     matches!(entity, TokensReceived { .. } | WrapSubmitted { .. });
 
-                let primary_chain = self.inventory.read().await.primary_chain();
                 if is_pre_wrap_post_receipt_state
-                    && entity.chain() == primary_chain
                     && self
                         .config
-                        .wrapped_equity_recovery_enabled(primary_chain, symbol)
+                        .wrapped_equity_recovery_enabled(entity.chain(), symbol)
                 {
-                    self.mark_equity_held_for_recovery(symbol);
+                    self.mark_equity_held_for_recovery(symbol, entity.chain());
                 } else {
-                    self.mark_equity_active_transfer(symbol, || equity::GUARD_GENERATION.next());
+                    self.mark_equity_active_transfer(symbol, entity.chain(), || {
+                        equity::GUARD_GENERATION.next()
+                    });
                 }
 
                 let mut inventory = self.inventory.write().await;
@@ -7624,7 +8845,7 @@ impl RebalancingService {
                     .suppressed_inflight_symbols
                     .read()
                     .await
-                    .get(symbol)
+                    .get(&(symbol.clone(), entity.chain()))
                     .copied();
                 (
                     Box::new(Inventory::set_inflight(Venue::Hedging, quantity)),
@@ -7679,9 +8900,11 @@ impl RebalancingService {
             let recovery_guard = if reuses_self_owned_guard {
                 None
             } else {
-                let Some(guard) =
-                    claim_guard_for_recovery_or_orphan(&self.equity_in_progress, symbol)
-                else {
+                let Some(guard) = claim_guard_for_recovery_or_orphan(
+                    &self.equity_in_progress,
+                    symbol,
+                    entity.chain(),
+                ) else {
                     warn!(
                         target: "rebalance",
                         id = %id,
@@ -7707,7 +8930,7 @@ impl RebalancingService {
             self.suppressed_inflight_symbols
                 .write()
                 .await
-                .remove(symbol);
+                .remove(&(symbol.clone(), entity.chain()));
         }
 
         self.mint_tracking.write().await.insert(
@@ -7743,7 +8966,7 @@ impl RebalancingService {
     ) -> Result<(), RebalancingServiceError> {
         match rollback {
             RecoveryRollback::TrackingOnly
-            | RecoveryRollback::ClearRestoredRedemptionInflight { .. } => {}
+            | RecoveryRollback::RestoreRedemptionInventory { .. } => {}
             RecoveryRollback::CancelInflight => {
                 self.apply_equity_update(
                     symbol,
@@ -7769,6 +8992,7 @@ impl RebalancingService {
                     id.clone(),
                     TimeoutTombstone {
                         symbol: symbol.clone(),
+                        chain,
                         timed_out_at,
                     },
                 );
@@ -7776,7 +9000,7 @@ impl RebalancingService {
                     self.suppressed_inflight_symbols
                         .write()
                         .await
-                        .insert(symbol.clone(), suppressed_at);
+                        .insert((symbol.clone(), chain), suppressed_at);
                 }
             }
         }
@@ -7831,7 +9055,7 @@ impl RebalancingService {
             self.suppressed_inflight_symbols
                 .read()
                 .await
-                .get(symbol)
+                .get(&(symbol.clone(), entity.chain()))
                 .copied()
         } else {
             None
@@ -7842,7 +9066,7 @@ impl RebalancingService {
         // its first event records an active ID. A stale self-owned redemption
         // already holds that guard and reuses it.
         let recovery_guard;
-        let previous = {
+        let (added, stranded) = {
             let mut inventory = self.inventory.write().await;
             if inventory.active_mint(symbol).is_some()
                 || matches!(inventory.active_redemption(symbol), Some(active) if active != id)
@@ -7868,9 +9092,11 @@ impl RebalancingService {
             recovery_guard = if reuses_self_owned_guard {
                 None
             } else {
-                let Some(guard) =
-                    claim_guard_for_recovery_or_orphan(&self.equity_in_progress, symbol)
-                else {
+                let Some(guard) = claim_guard_for_recovery_or_orphan(
+                    &self.equity_in_progress,
+                    symbol,
+                    entity.chain(),
+                ) else {
                     warn!(
                         target: "rebalance",
                         id = %id,
@@ -7889,11 +9115,23 @@ impl RebalancingService {
                     symbol: symbol.clone(),
                     chain: entity.chain(),
                 })?;
-            if timed_out_at.is_some() || previous.is_zero()? {
-                *inventory = inventory.clone().update_equity_at(
+            let mut updated = inventory.clone();
+            let stranded = updated.claim_stranded_redemption(id);
+            let floor = updated.stranded_redemption_quantity(symbol, entity.chain())?;
+            if stranded.is_none()
+                && (timed_out_at.is_some()
+                    || previous.is_zero()?
+                    || (!floor.is_zero()? && !reuses_self_owned_guard))
+            {
+                let restored = if floor.is_zero()? {
+                    quantity
+                } else {
+                    (previous + quantity)?
+                };
+                updated = updated.update_equity_at(
                     symbol,
                     entity.chain(),
-                    Inventory::set_inflight(Venue::MarketMaking, quantity),
+                    Inventory::set_inflight(Venue::MarketMaking, restored),
                     Utc::now(),
                 )?;
             } else if previous.inner().lt(quantity.inner())? {
@@ -7905,29 +9143,28 @@ impl RebalancingService {
                     .into(),
                 );
             }
+            let restored = updated
+                .equity_inflight_at(symbol, Venue::MarketMaking, entity.chain())
+                .unwrap_or(FractionalShares::ZERO);
+            let added = (restored - previous)?;
+            *inventory = updated;
             drop(inventory);
-            previous
+            (added, stranded)
         };
 
-        let rollback = if let Some(timed_out_at) = timed_out_at {
-            // The inventory update succeeded; now consume the timeout markers.
+        if timed_out_at.is_some() {
             self.timed_out_redemptions.write().await.remove(id);
             self.suppressed_inflight_symbols
                 .write()
                 .await
-                .remove(symbol);
-
-            RecoveryRollback::RestoreTombstone {
-                chain: entity.chain(),
-                timed_out_at,
-                suppressed_at,
-            }
-        } else if previous.is_zero()? {
-            RecoveryRollback::ClearRestoredRedemptionInflight {
-                chain: entity.chain(),
-            }
-        } else {
-            RecoveryRollback::TrackingOnly
+                .remove(&(symbol.clone(), entity.chain()));
+        }
+        let rollback = RecoveryRollback::RestoreRedemptionInventory {
+            chain: entity.chain(),
+            added,
+            stranded,
+            timed_out_at,
+            suppressed_at,
         };
 
         self.redemption_tracking.write().await.insert(
@@ -7959,40 +9196,70 @@ impl RebalancingService {
         rollback: RecoveryRollback,
     ) -> Result<(), RebalancingServiceError> {
         match rollback {
-            RecoveryRollback::TrackingOnly | RecoveryRollback::CancelInflight => {}
-            RecoveryRollback::ClearRestoredRedemptionInflight { chain } => {
-                self.apply_equity_update(
-                    symbol,
-                    chain,
-                    Inventory::set_inflight(Venue::MarketMaking, FractionalShares::ZERO),
-                )
-                .await?;
-            }
-            RecoveryRollback::RestoreTombstone {
+            RecoveryRollback::TrackingOnly
+            | RecoveryRollback::CancelInflight
+            | RecoveryRollback::RestoreTombstone { .. } => {}
+            RecoveryRollback::RestoreRedemptionInventory {
                 chain,
+                added,
+                stranded,
                 timed_out_at,
                 suppressed_at,
             } => {
                 let mut inventory = self.inventory.write().await;
-                *inventory = inventory.clone().clear_equity_inflight_at(
-                    symbol,
-                    chain,
-                    Venue::MarketMaking,
-                    Utc::now(),
-                )?;
+                if !added.is_zero()? {
+                    let current = inventory
+                        .equity_inflight_at(symbol, Venue::MarketMaking, chain)
+                        .unwrap_or(FractionalShares::ZERO);
+                    let remaining = if current.inner().lt(added.inner())? {
+                        FractionalShares::ZERO
+                    } else {
+                        (current - added)?
+                    };
+                    let floor = inventory.stranded_redemption_quantity(symbol, chain)?;
+                    let remaining = if remaining.inner().lt(floor.inner())? {
+                        floor
+                    } else {
+                        remaining
+                    };
+                    *inventory = inventory.clone().update_equity_at(
+                        symbol,
+                        chain,
+                        Inventory::set_inflight(Venue::MarketMaking, remaining),
+                        Utc::now(),
+                    )?;
+                }
+                if let Some(stranded) = stranded {
+                    inventory.restore_stranded_redemption_claim(id, stranded);
+                    let floor = inventory.stranded_redemption_quantity(symbol, chain)?;
+                    let current = inventory
+                        .equity_inflight_at(symbol, Venue::MarketMaking, chain)
+                        .unwrap_or(FractionalShares::ZERO);
+                    if current.inner().lt(floor.inner())? {
+                        *inventory = inventory.clone().update_equity_at(
+                            symbol,
+                            chain,
+                            Inventory::set_inflight(Venue::MarketMaking, floor),
+                            Utc::now(),
+                        )?;
+                    }
+                }
                 drop(inventory);
-                self.timed_out_redemptions.write().await.insert(
-                    id.clone(),
-                    TimeoutTombstone {
-                        symbol: symbol.clone(),
-                        timed_out_at,
-                    },
-                );
+                if let Some(timed_out_at) = timed_out_at {
+                    self.timed_out_redemptions.write().await.insert(
+                        id.clone(),
+                        TimeoutTombstone {
+                            symbol: symbol.clone(),
+                            chain,
+                            timed_out_at,
+                        },
+                    );
+                }
                 if let Some(suppressed_at) = suppressed_at {
                     self.suppressed_inflight_symbols
                         .write()
                         .await
-                        .insert(symbol.clone(), suppressed_at);
+                        .insert((symbol.clone(), chain), suppressed_at);
                 }
             }
         }
@@ -8079,9 +9346,17 @@ impl RebalancingService {
                         None,
                         None,
                     ),
-                    SendPending { unwrapped_at, .. } => (
+                    // The live tracking starts a signed send's timeout when it is
+                    // first signed (`SendPrepared`), and fee replacements stop on
+                    // that clock, so the page after a restart uses it too. A
+                    // legacy send has no signing time.
+                    SendPending {
+                        unwrapped_at,
+                        first_send_signed_at,
+                        ..
+                    } => (
                         RedemptionTrackingStage::SendPending,
-                        *unwrapped_at,
+                        first_send_signed_at.unwrap_or(*unwrapped_at),
                         None,
                         None,
                     ),
@@ -8121,7 +9396,9 @@ impl RebalancingService {
                         last_progress_at,
                     },
                 );
-                self.mark_equity_active_transfer(symbol, || equity::GUARD_GENERATION.next());
+                self.mark_equity_active_transfer(symbol, entity.chain(), || {
+                    equity::GUARD_GENERATION.next()
+                });
 
                 let mut inventory = self.inventory.write().await;
                 let updated = inventory.clone().update_equity_at(
@@ -8165,7 +9442,7 @@ impl RebalancingService {
             self.suppressed_inflight_symbols
                 .write()
                 .await
-                .remove(&tombstone.symbol);
+                .remove(&(tombstone.symbol.clone(), tombstone.chain));
             warn!(
                 target: "rebalance",
                 id = %id,
@@ -8264,7 +9541,7 @@ impl RebalancingService {
         // against the post-rebalance inventory.
         if is_terminal {
             self.equity_scheduler.cancel_pending().await;
-            self.usdc_scheduler.cancel_pending().await;
+            self.cancel_pending_usdc_checks(settlement.into()).await;
             match settlement {
                 EquitySettlementOutcome::Reconciled => {
                     self.usdc_scheduler.enqueue_check().await;
@@ -8291,6 +9568,13 @@ impl RebalancingService {
     ) -> Result<(), RebalancingServiceError> {
         let event_sync_guard = self.redemption_event_sync.lock().await;
 
+        if matches!(event, EquityRedemptionEvent::TransferFailed { .. })
+            && self.redemption_timeout_failing.read().await.contains(&id)
+        {
+            debug!(target: "rebalance", id = %id, "Timeout sweep owns this TransferFailed; skipping");
+            return Ok(());
+        }
+
         // Bind before the `if let` so the map's read guard drops here -- the
         // escalation arm below re-locks the same map for writing.
         let tombstone = self.timed_out_redemptions.read().await.get(&id).cloned();
@@ -8309,7 +9593,7 @@ impl RebalancingService {
             self.suppressed_inflight_symbols
                 .write()
                 .await
-                .remove(&tombstone.symbol);
+                .remove(&(tombstone.symbol.clone(), tombstone.chain));
             warn!(
                 target: "rebalance",
                 id = %id,
@@ -8351,18 +9635,21 @@ impl RebalancingService {
                     "Redemption unwrapped more than tracked (NAV appreciation); \
                      updating inflight to actual"
                 );
-                // set_inflight replaces rather than adds, so it works even when
-                // available is 0 (full-position NAV redemption). No last_rebalancing
-                // bump needed: redemptions are detection-based -- Alpaca reports the
-                // redemption only after the bot sends the actual unwrapped amount, so
-                // any inflight snapshot reports that same amount and an overwrite is
-                // a no-op.
-                self.apply_equity_update(
+                // Set the slot to the actual quantity plus any older failed
+                // redemption that shares it after startup. Absolute, so a slot
+                // wiped by a recovery reset still releases cleanly on completion.
+                let now = Utc::now();
+                let mut inventory = self.inventory.write().await;
+                let stranded =
+                    inventory.stranded_redemption_quantity(&existing.symbol, existing.chain)?;
+                let inflight = (stranded + actual_quantity)?;
+                *inventory = inventory.clone().update_equity_at(
                     &existing.symbol,
                     existing.chain,
-                    Inventory::set_inflight(Venue::MarketMaking, actual_quantity),
-                )
-                .await?;
+                    Inventory::set_inflight(Venue::MarketMaking, inflight),
+                    now,
+                )?;
+                drop(inventory);
             }
         }
 
@@ -8373,17 +9660,27 @@ impl RebalancingService {
         };
         let symbol = tracking.symbol;
 
-        let settlement = match Self::redemption_inventory_update(&event, tracking.quantity) {
-            Some(update) => {
-                self.apply_equity_update_or_defer(
-                    &symbol,
-                    tracking.chain,
-                    Venue::MarketMaking,
-                    update,
-                )
-                .await?
+        let settlement = if matches!(event, EquityRedemptionEvent::OperatorReconciled { .. }) {
+            self.reconcile_redemption_inventory(
+                &symbol,
+                tracking.chain,
+                tracking.quantity,
+                tracking.stage,
+            )
+            .await?
+        } else {
+            match Self::redemption_inventory_update(&event, tracking.quantity) {
+                Some(update) => {
+                    self.apply_equity_update_or_defer(
+                        &symbol,
+                        tracking.chain,
+                        Venue::MarketMaking,
+                        update,
+                    )
+                    .await?
+                }
+                None => EquitySettlementOutcome::Reconciled,
             }
-            None => EquitySettlementOutcome::Reconciled,
         };
 
         // When a new redemption transfer starts, clear the previous poll
@@ -8397,7 +9694,7 @@ impl RebalancingService {
             let mut inventory = self.inventory.write().await;
             *inventory = inventory
                 .clone()
-                .clear_previous_inflight_redemption_marker(&symbol);
+                .clear_previous_inflight_redemption_marker(&symbol, tracking.chain);
         }
 
         self.update_active_redemption(&id, &symbol, tracking.chain, &event)
@@ -8421,8 +9718,8 @@ impl RebalancingService {
                         Venue::MarketMaking,
                         cleared_at,
                     )?
-                    .clear_previous_inflight_redemption_marker(&symbol);
-                suppressed.insert(symbol.clone(), cleared_at);
+                    .clear_previous_inflight_redemption_marker(&symbol, tracking.chain);
+                suppressed.insert((symbol.clone(), tracking.chain), cleared_at);
                 drop(inventory);
                 drop(suppressed);
             }
@@ -8446,7 +9743,7 @@ impl RebalancingService {
         // a fresh USDC check against the post-rebalance inventory.
         if is_terminal {
             self.equity_scheduler.cancel_pending().await;
-            self.usdc_scheduler.cancel_pending().await;
+            self.cancel_pending_usdc_checks(settlement.into()).await;
             match settlement {
                 EquitySettlementOutcome::Reconciled => {
                     self.usdc_scheduler.enqueue_check().await;
@@ -8517,11 +9814,14 @@ impl RebalancingService {
             VaultWithdrawPending { .. }
             | VaultWithdrawSubmitting { .. }
             | VaultWithdrawSubmitted { .. }
+            | VaultWithdrawReplacementAdopted { .. }
             | WithdrawnFromRaindex { .. }
             | UnwrapPending { .. }
             | UnwrapSubmitted { .. }
             | TokensUnwrapped { .. }
             | SendPending { .. }
+            | SendPrepared { .. }
+            | SendReplaced { .. }
             | TokensSent { .. }
             | Detected { .. } => false,
         }
@@ -8581,6 +9881,8 @@ pub(crate) async fn wire_usdc_reactor_store(
     pool: &sqlx::SqlitePool,
     apalis_pool: &apalis_sqlite::SqlitePool,
 ) -> (Arc<RebalancingService>, Arc<Store<UsdcRebalance>>) {
+    use crate::inventory::InventoryView;
+
     let (event_sender, _) = broadcast::channel(16);
     let inventory = Arc::new(BroadcastingInventory::new(
         InventoryView::default(),
@@ -8590,14 +9892,12 @@ pub(crate) async fn wire_usdc_reactor_store(
         poll_freshness: PollFreshness::always_fresh(),
         inventory_staleness_bound: Duration::from_secs(300),
         allocation: AllocationCtx::base_test(),
-        usdc: Some(UsdcCorridorCtx {
-            corridor: UsdcCorridor::BASE_CCTP,
-            threshold: st0x_config::ImbalanceThreshold {
-                target: float!(0.5),
-                deviation: float!(0.2),
-            },
+        usdc: UsdcCorridors::base_cctp(st0x_config::ImbalanceThreshold {
+            target: float!(0.5),
+            deviation: float!(0.2),
         }),
         transfer_timeout: Duration::from_secs(30 * 60),
+        recovery_hold_alert_after: Duration::from_secs(60 * 60),
         chains: BTreeMap::from([(
             Chain::Base,
             ChainRebalancingConfig::for_test(ChainAssets {
@@ -8611,7 +9911,6 @@ pub(crate) async fn wire_usdc_reactor_store(
         )]),
         cash_reserved: None,
         hedge_floor: HedgeFloor::default(),
-        served_usdc_corridor: UsdcCorridor::BASE_CCTP,
     };
     let service = Arc::new(RebalancingService::new(
         config,
@@ -8650,6 +9949,42 @@ pub(crate) async fn wire_usdc_reactor_store(
     (service, usdc_store)
 }
 
+#[async_trait]
+impl MarkListener for RebalancingService {
+    async fn mark_available(&self, symbol: &Symbol) {
+        debug!(target: "rebalance", %symbol, "Mark available; checking equity again");
+        self.equity_scheduler.enqueue_check(symbol.clone()).await;
+    }
+}
+
+#[async_trait]
+impl HedgeCapacity for RebalancingService {
+    /// Matches the broker's sell preflight for a whole-share asset: available
+    /// shares truncated to whole shares, less the floor rounded up to whole
+    /// shares. That is never above what the broker would sell, so a starved
+    /// hedge always reads as starved. For a fractional asset it can read low,
+    /// down to zero under one whole share, which lets a redemption go ahead of
+    /// a sell of that fraction. An unpolled
+    /// broker is unknown, not empty.
+    async fn hedgeable_shares(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<Option<FractionalShares>, equity::EquityTriggerError> {
+        let offchain = self.inventory.read().await.equity_venues(symbol)?.offchain;
+        let Some(balance) = offchain else {
+            return Ok(None);
+        };
+
+        let (available, _) = balance.available().truncate_to_decimals(0)?;
+        let floor = self.config.hedge_floor.whole_share_floor_for(symbol)?;
+        if available.inner().lte(floor.inner())? {
+            return Ok(Some(FractionalShares::ZERO));
+        }
+
+        Ok(Some((available - floor)?))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, B256, TxHash, U256, address, fixed_bytes};
@@ -8657,16 +9992,17 @@ mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
     use futures_util::poll;
     use rain_math_float::Float;
+    use serde_json::json;
     use sqlx::SqlitePool;
     use st0x_bridge::corridor::HopKind;
     use st0x_config::{
         ChainCashAsset, ChainEquities, ChainEquityAsset, ExecutionThreshold, ImbalanceThreshold,
-        OperationMode,
+        OperationMode, RebalancingMode,
     };
     use st0x_dto::Statement;
     use st0x_event_sorcery::{
-        EntityList, Never, Reactor, ReactorHarness, StoreBuilder, TestStore, deps, send_command,
-        test_store,
+        EntityList, Never, Reactor, ReactorHarness, StoreBuilder, TestStore, deps, replay,
+        send_command, test_store,
     };
     use st0x_evm::Chain;
     use st0x_execution::{
@@ -8690,6 +10026,7 @@ mod tests {
     use crate::alerts::{CapturingNotifier, LogNotifier};
     use crate::conductor::job::Job;
     use crate::conductor::job::TaskIdentity;
+    use crate::dashboard::equity_price::EquityPriceStore;
     use crate::equity_redemption::{
         DetectionFailure, EquityRedemptionCommand, UnwrappedProvenance, redemption_aggregate_id,
     };
@@ -8697,8 +10034,10 @@ mod tests {
         InventorySnapshot, InventorySnapshotCommand, InventorySnapshotEvent, InventorySnapshotId,
     };
     use crate::inventory::view::{EquityReconcileBusy, InFlightEquityLocation, Operator};
-    use crate::inventory::{InventoryError, InventoryView, TransferOp, Venue};
+    use crate::inventory::{ActiveUsdcRebalance, InventoryError, InventoryView, TransferOp, Venue};
     use crate::mint_authorization::ConfiguredMintAuthorizer;
+    use crate::native_gas::GasReadiness;
+    use crate::native_gas::GasReadinessFailure;
     use crate::offchain::order::OffchainOrderId;
     use crate::onchain::mock::MockRaindex;
     use crate::position::{
@@ -8708,10 +10047,10 @@ mod tests {
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::rebalancing::equity::{
         MintError, MintTransferError, ResumeEquityToMarketMaking, TransferEquityToMarketMakingCtx,
-        TransferEquityToMarketMakingJobError,
     };
     use crate::rebalancing::usdc::{
-        ResumeBaseToAlpaca, TransferUsdcToHedgingCtx, UsdcTransferError,
+        ResumeAlpacaToBase, ResumeBaseToAlpaca, TransferUsdcToHedgingCtx,
+        TransferUsdcToMarketMakingCtx, UnrecordedGuardRelease, UsdcTransferError,
     };
     use crate::test_utils::rebalancing_enabled_equities;
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
@@ -8726,13 +10065,16 @@ mod tests {
         let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
 
-        trigger.mark_equity_active_transfer(&symbol, || None);
+        trigger.mark_equity_active_transfer(&symbol, Chain::Robinhood, || None);
 
-        assert!(matches!(
+        assert_eq!(
             trigger.equity_in_progress.read().unwrap().get(&symbol),
-            Some(equity::GuardState::HeldForRecovery)
-        ));
-        assert!(!trigger.clear_equity_in_progress_unless_held_for_recovery(&symbol));
+            Some(&equity::GuardState::HeldForRecovery {
+                chain: Chain::Robinhood
+            }),
+            "the operator hold must name the transfer's chain so its recovery can claim it"
+        );
+        assert!(!trigger.clear_equity_in_progress_unless_recovery_owned(&symbol));
     }
 
     #[test]
@@ -8789,20 +10131,17 @@ mod tests {
 
     fn test_config() -> RebalancingServiceConfig {
         RebalancingServiceConfig {
-            served_usdc_corridor: UsdcCorridor::BASE_CCTP,
             poll_freshness: PollFreshness::always_fresh(),
             inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
             hedge_floor: HedgeFloor::default(),
             allocation: AllocationCtx::base_test(),
-            usdc: Some(UsdcCorridorCtx {
-                corridor: UsdcCorridor::BASE_CCTP,
-                threshold: ImbalanceThreshold {
-                    target: float!(0.5),
-                    deviation: float!(0.2),
-                },
+            usdc: UsdcCorridors::base_cctp(ImbalanceThreshold {
+                target: float!(0.5),
+                deviation: float!(0.2),
             }),
             transfer_timeout: Duration::from_secs(30 * 60),
+            recovery_hold_alert_after: Duration::from_secs(60 * 60),
             chains: BTreeMap::from([(
                 Chain::Base,
                 ChainRebalancingConfig::for_test(ChainAssets {
@@ -8861,7 +10200,7 @@ mod tests {
         balances.insert(symbol.clone(), FractionalShares::new(float!(5)));
         let now = Utc::now();
         let inventory_view = InventoryView::default().set_inflight_equity_at_location(
-            InFlightEquityLocation::BaseWalletUnwrapped,
+            InFlightEquityLocation::WalletUnwrapped(Chain::Base),
             &balances,
             now,
             now,
@@ -8882,7 +10221,7 @@ mod tests {
                     tokenized_equity_derivative: Address::random(),
                     vault_ids: Vec::new(),
                     trading: OperationMode::Enabled,
-                    rebalancing: OperationMode::Enabled,
+                    rebalancing: RebalancingMode::Enabled,
                     wrapped_equity_recovery: OperationMode::Enabled,
                     operational_limit: None,
                     target_share: None,
@@ -8932,7 +10271,7 @@ mod tests {
         balances.insert(symbol.clone(), FractionalShares::new(float!(5)));
         let now = Utc::now();
         let inventory_view = InventoryView::default().set_inflight_equity_at_location(
-            InFlightEquityLocation::BaseWalletUnwrapped,
+            InFlightEquityLocation::WalletUnwrapped(Chain::Base),
             &balances,
             now,
             now,
@@ -8953,7 +10292,7 @@ mod tests {
                     tokenized_equity_derivative: Address::random(),
                     vault_ids: Vec::new(),
                     trading: OperationMode::Disabled,
-                    rebalancing: OperationMode::Disabled,
+                    rebalancing: RebalancingMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Enabled,
                     operational_limit: None,
                     target_share: None,
@@ -9003,7 +10342,7 @@ mod tests {
         balances.insert(symbol.clone(), FractionalShares::new(float!(5)));
         let now = Utc::now();
         let inventory_view = InventoryView::default().set_inflight_equity_at_location(
-            InFlightEquityLocation::BaseWalletWrapped,
+            InFlightEquityLocation::WalletWrapped(Chain::Base),
             &balances,
             now,
             now,
@@ -9024,7 +10363,7 @@ mod tests {
                     tokenized_equity_derivative: Address::random(),
                     vault_ids: Vec::new(),
                     trading: OperationMode::Disabled,
-                    rebalancing: OperationMode::Disabled,
+                    rebalancing: RebalancingMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
                     target_share: None,
@@ -9065,6 +10404,389 @@ mod tests {
             jobs, 0,
             "recovery-disabled symbols must not enqueue wallet recovery jobs",
         );
+    }
+
+    fn recovery_listing(recovery: OperationMode) -> ChainEquityAsset {
+        ChainEquityAsset {
+            tokenized_equity: Address::random(),
+            tokenized_equity_derivative: Address::random(),
+            vault_ids: Vec::new(),
+            trading: OperationMode::Enabled,
+            rebalancing: RebalancingMode::Enabled,
+            wrapped_equity_recovery: recovery,
+            operational_limit: None,
+            target_share: None,
+        }
+    }
+
+    /// A service whose Base and Robinhood listings of AAPL each carry the
+    /// given recovery flag.
+    async fn base_and_robinhood_recovery_service(
+        inventory_view: InventoryView,
+        base_recovery: OperationMode,
+        robinhood_recovery: OperationMode,
+    ) -> RebalancingService {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let mut config = test_config();
+        config
+            .chains
+            .get_mut(&Chain::Base)
+            .unwrap()
+            .assets
+            .equities
+            .symbols
+            .insert(aapl.clone(), recovery_listing(base_recovery));
+        config.chains.insert(
+            Chain::Robinhood,
+            ChainRebalancingConfig::for_test(ChainAssets {
+                equities: ChainEquities {
+                    symbols: HashMap::from([(aapl, recovery_listing(robinhood_recovery))]),
+                    operational_limit: None,
+                },
+                cash: None,
+            }),
+        );
+
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        RebalancingService::new(
+            config,
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            [Chain::Base, Chain::Robinhood]
+                .into_iter()
+                .map(|chain| {
+                    (
+                        chain,
+                        VaultRegistryId {
+                            chain,
+                            orderbook: TEST_ORDERBOOK,
+                            owner: TEST_ORDER_OWNER,
+                        },
+                    )
+                })
+                .collect(),
+            Arc::new(BroadcastingInventory::new(inventory_view, event_sender)),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
+            RebalancingSchedulers::new(&apalis_pool),
+            Arc::new(crate::alerts::LogNotifier),
+        )
+    }
+
+    async fn queued_job_payloads<T: serde::de::DeserializeOwned>(
+        pool: &apalis_sqlite::SqlitePool,
+    ) -> Vec<serde_json::Value> {
+        let rows: Vec<(Vec<u8>,)> =
+            sqlx_apalis::query_as("SELECT job FROM Jobs WHERE job_type = ? ORDER BY rowid")
+                .bind(std::any::type_name::<T>())
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        rows.into_iter()
+            .map(|(job,)| serde_json::from_slice(&job).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn hedge_only_secondary_does_not_recover_a_hydrated_wallet_balance() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let balances = BTreeMap::from([(symbol.clone(), FractionalShares::new(float!(5)))]);
+        let now = Utc::now();
+        let view = InventoryView::default()
+            .set_inflight_equity_at_location(
+                InFlightEquityLocation::WalletWrapped(Chain::Robinhood),
+                &balances,
+                now,
+                now,
+            )
+            .set_inflight_equity_at_location(
+                InFlightEquityLocation::WalletUnwrapped(Chain::Robinhood),
+                &balances,
+                now,
+                now,
+            );
+        let mut service = base_and_robinhood_recovery_service(
+            view,
+            OperationMode::Enabled,
+            OperationMode::Enabled,
+        )
+        .await;
+        service
+            .config
+            .chains
+            .get_mut(&Chain::Robinhood)
+            .unwrap()
+            .assets
+            .equities
+            .symbols
+            .get_mut(&symbol)
+            .unwrap()
+            .rebalancing = RebalancingMode::Disabled;
+        service.registry_ids.remove(&Chain::Robinhood);
+        service.enqueue_recovery_for_current_wallet_balances().await;
+        service
+            .enqueue_checks_for_snapshot(&InventorySnapshotEvent::wallet_wrapped_equity(
+                Chain::Robinhood,
+                balances.clone(),
+                now,
+            ))
+            .await;
+        service
+            .enqueue_checks_for_snapshot(&InventorySnapshotEvent::wallet_unwrapped_equity(
+                Chain::Robinhood,
+                balances,
+                now,
+            ))
+            .await;
+        assert_eq!(
+            queued_job_payloads::<WrappedEquityRecoveryJob>(
+                service.wrapped_equity_recovery_queue.pool()
+            )
+            .await,
+            Vec::<serde_json::Value>::new()
+        );
+        assert_eq!(
+            queued_job_payloads::<UnwrappedEquityRecoveryJob>(
+                service.unwrapped_equity_recovery_queue.pool()
+            )
+            .await,
+            Vec::<serde_json::Value>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn secondary_kept_for_unfinished_work_recovers_its_wallet_balance() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let balances = BTreeMap::from([(symbol.clone(), FractionalShares::new(float!(5)))]);
+        let now = Utc::now();
+        let view = InventoryView::default()
+            .set_inflight_equity_at_location(
+                InFlightEquityLocation::WalletWrapped(Chain::Robinhood),
+                &balances,
+                now,
+                now,
+            )
+            .set_inflight_equity_at_location(
+                InFlightEquityLocation::WalletUnwrapped(Chain::Robinhood),
+                &balances,
+                now,
+                now,
+            );
+        let mut service = base_and_robinhood_recovery_service(
+            view,
+            OperationMode::Enabled,
+            OperationMode::Enabled,
+        )
+        .await;
+        service
+            .config
+            .chains
+            .get_mut(&Chain::Robinhood)
+            .unwrap()
+            .assets
+            .equities
+            .symbols
+            .get_mut(&symbol)
+            .unwrap()
+            .rebalancing = RebalancingMode::Disabled;
+        service.enqueue_recovery_for_current_wallet_balances().await;
+        service
+            .enqueue_checks_for_snapshot(&InventorySnapshotEvent::wallet_wrapped_equity(
+                Chain::Robinhood,
+                balances.clone(),
+                now,
+            ))
+            .await;
+        service
+            .enqueue_checks_for_snapshot(&InventorySnapshotEvent::wallet_unwrapped_equity(
+                Chain::Robinhood,
+                balances,
+                now,
+            ))
+            .await;
+        // Its listing is disabled, but the chain keeps equity services for
+        // unfinished work, so its wallet is polled and its balance recovered.
+        assert_eq!(
+            queued_job_payloads::<WrappedEquityRecoveryJob>(
+                service.wrapped_equity_recovery_queue.pool()
+            )
+            .await
+            .len(),
+            1
+        );
+        assert_eq!(
+            queued_job_payloads::<UnwrappedEquityRecoveryJob>(
+                service.unwrapped_equity_recovery_queue.pool()
+            )
+            .await
+            .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn wallet_recovery_jobs_dedupe_per_symbol_and_chain() {
+        let service = base_and_robinhood_recovery_service(
+            InventoryView::default(),
+            OperationMode::Enabled,
+            OperationMode::Enabled,
+        )
+        .await;
+        let balances = BTreeMap::from([(
+            Symbol::new("AAPL").unwrap(),
+            FractionalShares::new(float!(5)),
+        )]);
+        let now = Utc::now();
+
+        for _ in 0..2 {
+            service
+                .enqueue_checks_for_snapshot(&InventorySnapshotEvent::ChainWalletWrappedEquity {
+                    chain: Chain::Robinhood,
+                    balances: balances.clone(),
+                    fetched_at: now,
+                })
+                .await;
+            service
+                .enqueue_checks_for_snapshot(&InventorySnapshotEvent::BaseWalletWrappedEquity {
+                    balances: balances.clone(),
+                    fetched_at: now,
+                })
+                .await;
+        }
+
+        let jobs = queued_job_payloads::<WrappedEquityRecoveryJob>(
+            service.wrapped_equity_recovery_queue.pool(),
+        )
+        .await;
+        let chains: Vec<_> = jobs.iter().map(|job| job["chain"].clone()).collect();
+        assert_eq!(
+            chains,
+            vec![json!("robinhood"), json!("base")],
+            "one job per chain for the same symbol, each stamped with its chain",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_queued_recovery_job_without_a_chain_blocks_only_base() {
+        let service = base_and_robinhood_recovery_service(
+            InventoryView::default(),
+            OperationMode::Enabled,
+            OperationMode::Enabled,
+        )
+        .await;
+        let aapl = Symbol::new("AAPL").unwrap();
+        let mut queue = service.unwrapped_equity_recovery_queue.clone();
+        queue
+            .push(UnwrappedEquityRecoveryJob {
+                chain: Chain::Base,
+                symbol: aapl.clone(),
+                recovery_id: UnwrappedEquityRecoveryId(Uuid::new_v4()),
+                backpressure_streak: BackpressureStreak::default(),
+            })
+            .await
+            .unwrap();
+        let mut legacy = queued_job_payloads::<UnwrappedEquityRecoveryJob>(queue.pool())
+            .await
+            .remove(0);
+        legacy.as_object_mut().unwrap().remove("chain").unwrap();
+        sqlx_apalis::query("UPDATE Jobs SET job = ? WHERE job_type = ?")
+            .bind(serde_json::to_vec(&legacy).unwrap())
+            .bind(std::any::type_name::<UnwrappedEquityRecoveryJob>())
+            .execute(queue.pool())
+            .await
+            .unwrap();
+
+        let balances = BTreeMap::from([(aapl, FractionalShares::new(float!(5)))]);
+        let now = Utc::now();
+        service
+            .enqueue_checks_for_snapshot(&InventorySnapshotEvent::BaseWalletUnwrappedEquity {
+                balances: balances.clone(),
+                fetched_at: now,
+            })
+            .await;
+        service
+            .enqueue_checks_for_snapshot(&InventorySnapshotEvent::ChainWalletUnwrappedEquity {
+                chain: Chain::Robinhood,
+                balances,
+                fetched_at: now,
+            })
+            .await;
+
+        let chains: Vec<_> = queued_job_payloads::<UnwrappedEquityRecoveryJob>(queue.pool())
+            .await
+            .iter()
+            .map(|job| job.get("chain").cloned())
+            .collect();
+        assert_eq!(
+            chains,
+            vec![None, Some(json!("robinhood"))],
+            "the chainless row runs on Base, so it blocks Base but not Robinhood",
+        );
+    }
+
+    #[tokio::test]
+    async fn wallet_recovery_is_gated_on_the_wallets_own_chain() {
+        let service = base_and_robinhood_recovery_service(
+            InventoryView::default(),
+            OperationMode::Enabled,
+            OperationMode::Disabled,
+        )
+        .await;
+
+        service
+            .enqueue_checks_for_snapshot(&InventorySnapshotEvent::ChainWalletUnwrappedEquity {
+                chain: Chain::Robinhood,
+                balances: BTreeMap::from([(
+                    Symbol::new("AAPL").unwrap(),
+                    FractionalShares::new(float!(5)),
+                )]),
+                fetched_at: Utc::now(),
+            })
+            .await;
+
+        let jobs = queued_job_payloads::<UnwrappedEquityRecoveryJob>(
+            service.unwrapped_equity_recovery_queue.pool(),
+        )
+        .await;
+        assert!(
+            jobs.is_empty(),
+            "Robinhood's disabled recovery must not be overridden by Base's flag: {jobs:?}",
+        );
+    }
+
+    /// A persisted Robinhood wallet balance survives a restart: hydration
+    /// restores it to Robinhood's slot and the startup scan enqueues a
+    /// recovery on Robinhood for it.
+    #[tokio::test]
+    async fn startup_recovery_scan_enqueues_a_persisted_balance_on_its_own_chain() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let persisted =
+            replay::<InventorySnapshot>(vec![InventorySnapshotEvent::ChainWalletWrappedEquity {
+                chain: Chain::Robinhood,
+                balances: BTreeMap::from([(aapl.clone(), FractionalShares::new(float!(4)))]),
+                fetched_at: Utc::now(),
+            }])
+            .unwrap()
+            .unwrap();
+        let service = base_and_robinhood_recovery_service(
+            InventoryView::default(),
+            OperationMode::Enabled,
+            OperationMode::Enabled,
+        )
+        .await;
+        persisted.hydrate_inventory(&service.inventory).await;
+
+        service.enqueue_recovery_for_current_wallet_balances().await;
+
+        let jobs = queued_job_payloads::<WrappedEquityRecoveryJob>(
+            service.wrapped_equity_recovery_queue.pool(),
+        )
+        .await;
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        assert_eq!(jobs[0]["chain"], json!("robinhood"));
+        assert_eq!(jobs[0]["symbol"], json!("AAPL"));
     }
 
     #[tokio::test]
@@ -9154,7 +10876,7 @@ mod tests {
                                 tokenized_equity_derivative: Address::ZERO,
                                 vault_ids: Vec::new(),
                                 trading: OperationMode::Disabled,
-                                rebalancing: OperationMode::Enabled,
+                                rebalancing: RebalancingMode::Enabled,
                                 wrapped_equity_recovery: OperationMode::Enabled,
                                 operational_limit: None,
                                 target_share: None,
@@ -9252,7 +10974,7 @@ mod tests {
                 accepted_at: now,
                 received_at: now,
             },
-            equity::GuardState::HeldForRecovery,
+            equity::GuardState::HeldForRecovery { chain: Chain::Base },
             "TokensReceived + recovery enabled must reconstruct as HeldForRecovery",
         )
         .await;
@@ -9276,7 +10998,7 @@ mod tests {
                 received_at: now,
                 wrap_tx_hash: TxHash::ZERO,
             },
-            equity::GuardState::HeldForRecovery,
+            equity::GuardState::HeldForRecovery { chain: Chain::Base },
             "WrapSubmitted + recovery enabled must reconstruct as HeldForRecovery",
         )
         .await;
@@ -9384,11 +11106,8 @@ mod tests {
         .await;
     }
 
-    /// The recovery jobs run on the primary chain only, so a secondary-chain
-    /// mint held for recovery would block its symbol forever. It reconstructs
-    /// as `ActiveTransfer` even with recovery enabled on the primary.
     #[tokio::test]
-    async fn recover_mint_state_holds_only_a_primary_chain_mint_for_recovery() {
+    async fn recover_mint_state_uses_the_mints_own_chain_recovery_flag() {
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
         let trigger = make_trigger_with_recovery_enabled(&symbol).await;
@@ -9422,8 +11141,283 @@ mod tests {
             .cloned();
         assert!(
             matches!(guard, Some(equity::GuardState::ActiveTransfer { .. })),
-            "a HyperEVM mint must not be held for a primary-chain recovery: {guard:?}"
+            "a HyperEVM mint whose own chain does not enable recovery must not be held: {guard:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn recover_secondary_mint_restores_its_own_chain_hold() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let mut config = test_config();
+        let mut assets = ChainAssets::default();
+        assets.equities.symbols.insert(
+            symbol.clone(),
+            ChainEquityAsset {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: Address::ZERO,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Paused,
+                wrapped_equity_recovery: OperationMode::Enabled,
+                operational_limit: None,
+                target_share: None,
+            },
+        );
+        config
+            .chains
+            .insert(Chain::HyperEvm, ChainRebalancingConfig::for_test(assets));
+        let trigger = make_trigger_with_inventory_config(InventoryView::default(), config).await;
+        let id = issuer_request_id("restart-secondary-held");
+        trigger
+            .recover_mint_state(
+                &id,
+                &TokenizedEquityMint::TokensReceived {
+                    chain: Chain::HyperEvm,
+                    symbol: symbol.clone(),
+                    quantity: float!(5),
+                    wallet: Address::ZERO,
+                    issuer_request_id: id.clone(),
+                    tokenization_request_id: tokenization_request_id("restart-secondary-held"),
+                    tx_hash: TxHash::ZERO,
+                    shares_minted: U256::from(5u64),
+                    fees: None,
+                    requested_at: now,
+                    accepted_at: now,
+                    received_at: now,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            trigger.equity_in_progress.read().unwrap().get(&symbol),
+            Some(&equity::GuardState::HeldForRecovery {
+                chain: Chain::HyperEvm
+            })
+        );
+        let recovery_guard = equity::claim_guard_for_recovery_or_orphan(
+            &trigger.equity_in_progress,
+            &symbol,
+            Chain::HyperEvm,
+        )
+        .unwrap();
+        drop(recovery_guard);
+        assert_eq!(
+            trigger.equity_in_progress.read().unwrap().get(&symbol),
+            Some(&equity::GuardState::HeldForRecovery {
+                chain: Chain::HyperEvm
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_hold_alert_names_chain_retries_repeats_and_preserves_hold() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let notifier = Arc::new(FlakyNotifier {
+            remaining_failures: std::sync::atomic::AtomicUsize::new(1),
+            delivered: std::sync::Mutex::new(Vec::new()),
+        });
+        let trigger = make_trigger_with_inventory_config_and_notifier(
+            InventoryView::default(),
+            test_config(),
+            notifier.clone(),
+        )
+        .await;
+        trigger.mark_equity_held_for_recovery(&symbol, Chain::HyperEvm);
+        trigger.alert_stuck_recovery_holds(now).await;
+        trigger
+            .alert_stuck_recovery_holds(now + ChronoDuration::minutes(59))
+            .await;
+        assert_eq!(notifier.delivered.lock().unwrap().len(), 0);
+        trigger
+            .alert_stuck_recovery_holds(now + ChronoDuration::hours(1))
+            .await;
+        assert_eq!(notifier.delivered.lock().unwrap().len(), 0);
+        trigger
+            .alert_stuck_recovery_holds(now + ChronoDuration::hours(1))
+            .await;
+        trigger
+            .alert_stuck_recovery_holds(now + ChronoDuration::minutes(119))
+            .await;
+        let delivered = notifier.delivered.lock().unwrap().clone();
+        assert_eq!(delivered.len(), 1);
+        assert!(delivered[0].contains("AAPL"));
+        assert!(delivered[0].contains("hyperevm"));
+        assert!(!delivered[0].contains("Pause the listing on"));
+        trigger
+            .alert_stuck_recovery_holds(now + ChronoDuration::hours(2))
+            .await;
+        assert_eq!(notifier.delivered.lock().unwrap().len(), 2);
+        assert_eq!(
+            trigger.equity_in_progress.read().unwrap().get(&symbol),
+            Some(&equity::GuardState::HeldForRecovery {
+                chain: Chain::HyperEvm
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_hold_alert_keeps_its_deadline_through_failed_recovery_attempts() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let notifier = Arc::new(FlakyNotifier {
+            remaining_failures: std::sync::atomic::AtomicUsize::new(0),
+            delivered: std::sync::Mutex::new(Vec::new()),
+        });
+        let trigger = make_trigger_with_inventory_config_and_notifier(
+            InventoryView::default(),
+            test_config(),
+            notifier.clone(),
+        )
+        .await;
+        trigger.mark_equity_held_for_recovery(&symbol, Chain::HyperEvm);
+        trigger.alert_stuck_recovery_holds(now).await;
+
+        for minutes in [20, 40] {
+            let attempt = equity::claim_guard_for_recovery_or_orphan(
+                &trigger.equity_in_progress,
+                &symbol,
+                Chain::HyperEvm,
+            )
+            .unwrap();
+            trigger
+                .alert_stuck_recovery_holds(now + ChronoDuration::minutes(minutes))
+                .await;
+            drop(attempt);
+        }
+        assert_eq!(
+            trigger.equity_in_progress.read().unwrap().get(&symbol),
+            Some(&equity::GuardState::HeldForRecovery {
+                chain: Chain::HyperEvm
+            })
+        );
+        assert_eq!(notifier.delivered.lock().unwrap().len(), 0);
+
+        trigger
+            .alert_stuck_recovery_holds(now + ChronoDuration::hours(1))
+            .await;
+        assert_eq!(notifier.delivered.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recovery_hold_alert_fires_while_recovery_is_still_active() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let notifier = Arc::new(FlakyNotifier {
+            remaining_failures: std::sync::atomic::AtomicUsize::new(0),
+            delivered: std::sync::Mutex::new(Vec::new()),
+        });
+        let trigger = make_trigger_with_inventory_config_and_notifier(
+            InventoryView::default(),
+            test_config(),
+            notifier.clone(),
+        )
+        .await;
+        trigger.mark_equity_held_for_recovery(&symbol, Chain::HyperEvm);
+        let attempt = equity::claim_guard_for_recovery_or_orphan(
+            &trigger.equity_in_progress,
+            &symbol,
+            Chain::HyperEvm,
+        )
+        .unwrap();
+        trigger.alert_stuck_recovery_holds(now).await;
+        trigger
+            .alert_stuck_recovery_holds(now + ChronoDuration::hours(1))
+            .await;
+        trigger
+            .alert_stuck_recovery_holds(now + ChronoDuration::minutes(90))
+            .await;
+        assert_eq!(notifier.delivered.lock().unwrap().len(), 1);
+        drop(attempt);
+    }
+
+    #[tokio::test]
+    async fn recovery_hold_alert_names_the_pending_mint_and_its_last_error() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let notifier = Arc::new(FlakyNotifier {
+            remaining_failures: std::sync::atomic::AtomicUsize::new(0),
+            delivered: std::sync::Mutex::new(Vec::new()),
+        });
+        let trigger = make_trigger_with_inventory_config_and_notifier(
+            InventoryView::default(),
+            test_config(),
+            notifier.clone(),
+        )
+        .await;
+        trigger.mark_equity_held_for_recovery(&symbol, Chain::HyperEvm);
+        let recovery_id = crate::wrapped_equity_recovery::WrappedEquityRecoveryId(Uuid::new_v4());
+        let mint_id = issuer_request_id("held-mint");
+        trigger.pending_mint_resumes.record(
+            &symbol,
+            PendingMintResume {
+                chain: Chain::HyperEvm,
+                recovery: HeldRecovery::Wrapped(recovery_id.clone()),
+                mint_id: mint_id.clone(),
+                failure: crate::rebalancing::equity::MintResumeFailure {
+                    kind: crate::rebalancing::equity::ResumeFailureKind::Retryable,
+                    message: "rpc timed out".to_string(),
+                },
+            },
+        );
+
+        trigger.alert_stuck_recovery_holds(now).await;
+        trigger
+            .alert_stuck_recovery_holds(now + ChronoDuration::hours(1))
+            .await;
+
+        let delivered = notifier.delivered.lock().unwrap().clone();
+        let [message] = delivered.as_slice() else {
+            panic!("expected one page, got {delivered:?}");
+        };
+        assert!(message.contains(&format!("wrapped equity recovery {recovery_id}")));
+        assert!(message.contains(&mint_id.to_string()));
+        assert!(message.contains("rpc timed out"));
+        assert!(message.contains("Recovery Holds a Symbol"));
+    }
+
+    #[tokio::test]
+    async fn recovery_hold_alert_restarts_its_deadline_after_recovery_releases_the_slot() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let notifier = Arc::new(FlakyNotifier {
+            remaining_failures: std::sync::atomic::AtomicUsize::new(0),
+            delivered: std::sync::Mutex::new(Vec::new()),
+        });
+        let trigger = make_trigger_with_inventory_config_and_notifier(
+            InventoryView::default(),
+            test_config(),
+            notifier.clone(),
+        )
+        .await;
+        trigger.mark_equity_held_for_recovery(&symbol, Chain::HyperEvm);
+        trigger.alert_stuck_recovery_holds(now).await;
+        trigger
+            .alert_stuck_recovery_holds(now + ChronoDuration::hours(1))
+            .await;
+        assert_eq!(notifier.delivered.lock().unwrap().len(), 1);
+
+        equity::claim_guard_for_recovery_or_orphan(
+            &trigger.equity_in_progress,
+            &symbol,
+            Chain::HyperEvm,
+        )
+        .unwrap()
+        .release();
+        trigger
+            .alert_stuck_recovery_holds(now + ChronoDuration::hours(1))
+            .await;
+
+        trigger.mark_equity_held_for_recovery(&symbol, Chain::HyperEvm);
+        trigger
+            .alert_stuck_recovery_holds(now + ChronoDuration::hours(1))
+            .await;
+        assert_eq!(notifier.delivered.lock().unwrap().len(), 1);
+        trigger
+            .alert_stuck_recovery_holds(now + ChronoDuration::hours(2))
+            .await;
+        assert_eq!(notifier.delivered.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -9478,9 +11472,9 @@ mod tests {
         assert!(
             ownership
                 .redemption_tokenizations
-                .contains(&tokenization_request_id("TOK-2"))
+                .contains_key(&tokenization_request_id("TOK-2"))
         );
-        assert!(ownership.redemption_txs.contains(&redemption_tx));
+        assert!(ownership.redemption_txs.contains_key(&redemption_tx));
 
         let inflight = {
             let inventory = trigger.inventory.read().await;
@@ -9613,6 +11607,7 @@ mod tests {
             mint_id.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: Utc::now(),
             },
         );
@@ -9677,7 +11672,8 @@ mod tests {
             )
             .unwrap()
             .set_active_redemption(symbol.clone(), Chain::Base, id.clone());
-        trigger.mark_equity_active_transfer(&symbol, || equity::GUARD_GENERATION.next());
+        trigger
+            .mark_equity_active_transfer(&symbol, Chain::Base, || equity::GUARD_GENERATION.next());
         trigger.redemption_tracking.write().await.insert(
             id.clone(),
             RedemptionTracking {
@@ -9768,7 +11764,8 @@ mod tests {
             )
             .unwrap()
             .set_active_mint(symbol.clone(), Chain::Base, mint_id.clone());
-        trigger.mark_equity_active_transfer(&symbol, || equity::GUARD_GENERATION.next());
+        trigger
+            .mark_equity_active_transfer(&symbol, Chain::Base, || equity::GUARD_GENERATION.next());
         trigger.mint_tracking.write().await.insert(
             mint_id.clone(),
             MintTracking {
@@ -10031,6 +12028,7 @@ mod tests {
             redemption_id.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: Utc::now(),
             },
         );
@@ -10208,7 +12206,8 @@ mod tests {
         *trigger.inventory.write().await = InventoryView::default()
             .with_equity(symbol.clone(), shares(0), shares(100))
             .set_active_mint(symbol.clone(), Chain::Base, recovering.clone());
-        trigger.mark_equity_active_transfer(&symbol, || equity::GUARD_GENERATION.next());
+        trigger
+            .mark_equity_active_transfer(&symbol, Chain::Base, || equity::GUARD_GENERATION.next());
         let guard_before = trigger
             .equity_in_progress
             .read()
@@ -10270,6 +12269,7 @@ mod tests {
             recovering.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: tombstone_at,
             },
         );
@@ -10380,6 +12380,7 @@ mod tests {
             recovering.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: tombstone_at,
             },
         );
@@ -10449,6 +12450,7 @@ mod tests {
             recovering.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: tombstone_at,
             },
         );
@@ -10617,10 +12619,12 @@ mod tests {
             recovering.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: tombstone_at,
             },
         );
-        trigger.mark_equity_active_transfer(&symbol, || equity::GUARD_GENERATION.next());
+        trigger
+            .mark_equity_active_transfer(&symbol, Chain::Base, || equity::GUARD_GENERATION.next());
         let guard_before = trigger
             .equity_in_progress
             .read()
@@ -10777,6 +12781,7 @@ mod tests {
             mint_id.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: tombstone_at,
             },
         );
@@ -10784,7 +12789,7 @@ mod tests {
             .suppressed_inflight_symbols
             .write()
             .await
-            .insert(symbol.clone(), tombstone_at);
+            .insert((symbol.clone(), Chain::Base), tombstone_at);
 
         let failed = TokenizedEquityMint::Failed {
             chain: Chain::Base,
@@ -10839,7 +12844,7 @@ mod tests {
                 .suppressed_inflight_symbols
                 .read()
                 .await
-                .contains_key(&symbol)
+                .contains_key(&(symbol.clone(), Chain::Base))
         );
         let inventory = trigger.inventory.read().await;
         assert_eq!(
@@ -10875,6 +12880,7 @@ mod tests {
             redemption_id.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: tombstone_at,
             },
         );
@@ -10882,7 +12888,7 @@ mod tests {
             .suppressed_inflight_symbols
             .write()
             .await
-            .insert(symbol.clone(), tombstone_at);
+            .insert((symbol.clone(), Chain::Base), tombstone_at);
 
         let failed = EquityRedemption::Failed {
             chain: Chain::Base,
@@ -10983,6 +12989,7 @@ mod tests {
             redemption_id.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: tombstone_at,
             },
         );
@@ -10990,7 +12997,7 @@ mod tests {
             .suppressed_inflight_symbols
             .write()
             .await
-            .insert(symbol.clone(), tombstone_at);
+            .insert((symbol.clone(), Chain::Base), tombstone_at);
 
         let failed = EquityRedemption::Failed {
             chain: Chain::Ethereum,
@@ -11077,6 +13084,7 @@ mod tests {
             redemption_id.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: tombstone_at,
             },
         );
@@ -11084,7 +13092,7 @@ mod tests {
             .suppressed_inflight_symbols
             .write()
             .await
-            .insert(symbol.clone(), tombstone_at);
+            .insert((symbol.clone(), Chain::Base), tombstone_at);
 
         let failed = EquityRedemption::Failed {
             chain: Chain::HyperEvm,
@@ -11162,7 +13170,7 @@ mod tests {
                 .suppressed_inflight_symbols
                 .read()
                 .await
-                .get(&symbol),
+                .get(&(symbol.clone(), Chain::Base)),
             Some(&tombstone_at)
         );
         assert!(
@@ -11646,7 +13654,7 @@ mod tests {
             .unwrap();
 
         let ownership = trigger.pending_request_ownership().await;
-        assert!(ownership.redemption_txs.contains(&redemption_tx));
+        assert!(ownership.redemption_txs.contains_key(&redemption_tx));
 
         trigger
             .on_redemption(
@@ -11664,9 +13672,9 @@ mod tests {
         assert!(
             ownership
                 .redemption_tokenizations
-                .contains(&tokenization_request_id)
+                .contains_key(&tokenization_request_id)
         );
-        assert!(ownership.redemption_txs.contains(&redemption_tx));
+        assert!(ownership.redemption_txs.contains_key(&redemption_tx));
 
         trigger
             .on_redemption(
@@ -11682,9 +13690,9 @@ mod tests {
         assert!(
             !ownership
                 .redemption_tokenizations
-                .contains(&tokenization_request_id)
+                .contains_key(&tokenization_request_id)
         );
-        assert!(!ownership.redemption_txs.contains(&redemption_tx));
+        assert!(!ownership.redemption_txs.contains_key(&redemption_tx));
     }
 
     #[tokio::test]
@@ -11752,11 +13760,11 @@ mod tests {
                 .unwrap();
 
             let ownership = trigger.pending_request_ownership().await;
-            assert!(ownership.redemption_txs.contains(&redemption_tx));
+            assert!(ownership.redemption_txs.contains_key(&redemption_tx));
             assert!(
                 ownership
                     .redemption_tokenizations
-                    .contains(&tokenization_request_id)
+                    .contains_key(&tokenization_request_id)
             );
 
             trigger
@@ -11766,13 +13774,13 @@ mod tests {
 
             let ownership = trigger.pending_request_ownership().await;
             assert!(
-                !ownership.redemption_txs.contains(&redemption_tx),
+                !ownership.redemption_txs.contains_key(&redemption_tx),
                 "redemption_tx must drop after terminal event {terminal_event:?}"
             );
             assert!(
                 !ownership
                     .redemption_tokenizations
-                    .contains(&tokenization_request_id),
+                    .contains_key(&tokenization_request_id),
                 "redemption tokenization id must drop after terminal event {terminal_event:?}"
             );
         }
@@ -11915,14 +13923,14 @@ mod tests {
 
         let trigger = RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
                 allocation: test_config().allocation,
-                usdc: None,
+                usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: test_config().transfer_timeout,
+                recovery_hold_alert_after: test_config().recovery_hold_alert_after,
                 chains: BTreeMap::from([(
                     Chain::Base,
                     ChainRebalancingConfig::for_test(ChainAssets::default()),
@@ -12018,7 +14026,7 @@ mod tests {
             .symbols
             .get_mut(&symbol)
             .expect("AAPL is configured")
-            .rebalancing = OperationMode::Disabled;
+            .rebalancing = RebalancingMode::Disabled;
 
         let trigger = make_imbalanced_trigger_with_equities(&symbol, equities).await;
 
@@ -12034,6 +14042,103 @@ mod tests {
             0,
             "Disabled asset should not trigger equity rebalancing"
         );
+    }
+
+    /// A symbol configured with `rebalancing = "paused"` passes the whitelist
+    /// and is planned, but the imbalance starts no job: the planner records a
+    /// `paused` decline for the chain instead.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn paused_asset_starts_no_equity_operation() {
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let mut equities = rebalancing_enabled_equities(&["AAPL"]);
+        equities
+            .symbols
+            .get_mut(&symbol)
+            .expect("AAPL is configured")
+            .rebalancing = RebalancingMode::Paused;
+
+        let trigger = make_imbalanced_trigger_with_equities(&symbol, equities).await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 0);
+        assert_eq!(count_pending_equity_redemption_jobs(&trigger).await, 0);
+        assert!(
+            logs_contain("reason=\"paused\"") && logs_contain("chain=base"),
+            "the paused listing must be planned and declined by name"
+        );
+    }
+
+    #[tokio::test]
+    async fn restarted_trigger_dispatches_again_after_enabled_paused_enabled_cycle() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mut trigger =
+            make_imbalanced_trigger_with_equities(&symbol, rebalancing_enabled_equities(&["AAPL"]))
+                .await;
+        let queue_pool = trigger
+            .transfer_equity_to_market_making_queue
+            .pool()
+            .clone();
+        let (position, threshold) = trigger.position_authority().await.unwrap();
+        let projection = trigger.position_projection.read().await.clone().unwrap();
+
+        for (mode, expected_jobs) in [
+            (RebalancingMode::Enabled, 1),
+            (RebalancingMode::Paused, 0),
+            (RebalancingMode::Enabled, 1),
+        ] {
+            let mut config = trigger.config.clone();
+            config
+                .chains
+                .get_mut(&Chain::Base)
+                .unwrap()
+                .assets
+                .equities
+                .symbols
+                .get_mut(&symbol)
+                .unwrap()
+                .rebalancing = mode;
+            let restarted = Arc::new(RebalancingService::new(
+                config,
+                trigger.vault_registry.clone(),
+                trigger.registry_ids.clone(),
+                trigger.inventory.clone(),
+                trigger.wrappers.clone(),
+                RebalancingSchedulers::new(&queue_pool),
+                trigger.notifier.clone(),
+            ));
+            restarted
+                .set_position_authority(position.clone(), projection.clone(), threshold)
+                .await;
+            restarted
+                .set_last_price_reader(Arc::new(StubLastPrice(float!(100))))
+                .await;
+            drop(trigger);
+            trigger = restarted;
+
+            trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+            let jobs = take_pending_equity_mint_jobs(&trigger).await;
+            assert_eq!(jobs.len(), expected_jobs, "restarted in {mode} mode");
+            assert_eq!(count_pending_equity_redemption_jobs(&trigger).await, 0);
+            for job in jobs {
+                assert_eq!(job.symbol, symbol);
+                assert_eq!(job.chain, Chain::Base);
+                // Drain the admitted queue work before the next restart, leaving
+                // the same imbalance so the next mode is what decides dispatch.
+                assert!(
+                    trigger
+                        .release_terminal_equity_transfer(
+                            &symbol,
+                            EquityTransferReservationId::from_uuid(job.issuer_request_id.0),
+                        )
+                        .await
+                        .unwrap()
+                );
+            }
+        }
     }
 
     /// A symbol observed in inventory but absent from the equity assets
@@ -12104,7 +14209,7 @@ mod tests {
             .symbols
             .get_mut(&symbol)
             .expect("AAPL is configured")
-            .rebalancing = OperationMode::Disabled;
+            .rebalancing = RebalancingMode::Disabled;
         let config = RebalancingServiceConfig {
             chains: BTreeMap::from([
                 (
@@ -12147,6 +14252,86 @@ mod tests {
         assert_eq!(jobs.len(), 1, "Base alone is under its target");
         assert_eq!(jobs[0].chain, Chain::Base);
         assert_eq!(jobs[0].quantity, shares(30));
+    }
+
+    /// A paused listing still counts in the planner's total, so its chain
+    /// must stay polled: a stale paused Robinhood slot declines the symbol
+    /// even though Base is fresh and under its target.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn stale_paused_secondary_declines_the_symbol() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(80))
+            .update_equity_at(
+                &symbol,
+                Chain::Robinhood,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
+                Utc::now(),
+            )
+            .unwrap();
+        let mut paused = rebalancing_enabled_equities(&["AAPL"]);
+        paused
+            .symbols
+            .get_mut(&symbol)
+            .expect("AAPL is configured")
+            .rebalancing = RebalancingMode::Paused;
+        let freshness = PollFreshness::new();
+        freshness.set_observed(
+            PortfolioLocation::MarketMaking(Chain::Base),
+            PortfolioAsset::Equity(symbol.clone()),
+            Utc::now(),
+        );
+        freshness.set_observed(
+            PortfolioLocation::MarketMaking(Chain::Robinhood),
+            PortfolioAsset::Equity(symbol.clone()),
+            Utc::now() - chrono::Duration::seconds(301),
+        );
+        let config = RebalancingServiceConfig {
+            poll_freshness: freshness,
+            inventory_staleness_bound: Duration::from_secs(300),
+            chains: BTreeMap::from([
+                (
+                    Chain::Base,
+                    ChainRebalancingConfig::for_test(ChainAssets {
+                        equities: rebalancing_enabled_equities(&["AAPL"]),
+                        cash: None,
+                    }),
+                ),
+                (
+                    Chain::Robinhood,
+                    ChainRebalancingConfig::for_test(ChainAssets {
+                        equities: paused,
+                        cash: None,
+                    }),
+                ),
+            ]),
+            ..test_config()
+        };
+        let trigger = make_trigger_with_inventory_registry_and_wrappers(
+            inventory,
+            &symbol,
+            BTreeMap::from([
+                (
+                    Chain::Base,
+                    Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+                ),
+                (
+                    Chain::Robinhood,
+                    Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+                ),
+            ]),
+            config,
+        )
+        .await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 0);
+        assert!(
+            logs_contain("chain_stale") && logs_contain("chain=robinhood"),
+            "the stale paused chain must decline the symbol by name"
+        );
     }
 
     /// Cross-chain staleness rule: an equity evaluation must not run off a
@@ -12617,11 +14802,10 @@ mod tests {
         );
 
         // Verify clear works on HeldForRecovery.
-        trigger
-            .equity_in_progress
-            .write()
-            .unwrap()
-            .insert(symbol.clone(), equity::GuardState::HeldForRecovery);
+        trigger.equity_in_progress.write().unwrap().insert(
+            symbol.clone(),
+            equity::GuardState::HeldForRecovery { chain: Chain::Base },
+        );
         trigger.clear_equity_in_progress(&symbol);
         assert!(
             !trigger
@@ -12904,6 +15088,21 @@ mod tests {
         .fetch_one(service.transfer_usdc_to_market_making_queue.pool())
         .await
         .expect("count pending TransferUsdcToMarketMaking jobs")
+    }
+
+    async fn pending_transfer_usdc_to_hedging_job(
+        service: &RebalancingService,
+    ) -> TransferUsdcToHedging {
+        let job_type = std::any::type_name::<TransferUsdcToHedging>();
+        let payload: Vec<u8> = sqlx_apalis::query_scalar(
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(job_type)
+        .fetch_one(service.transfer_usdc_to_hedging_queue.pool())
+        .await
+        .expect("fetch pending TransferUsdcToHedging job");
+
+        serde_json::from_slice(&payload).expect("deserialize TransferUsdcToHedging")
     }
 
     async fn pending_transfer_usdc_to_market_making_job(
@@ -14818,6 +17017,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn adopted_withdrawal_replacement_holds_the_guard_until_completion() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
+                Utc::now(),
+            )
+            .unwrap();
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = redemption_aggregate_id("adopted-replacement");
+        harness
+            .receive::<EquityRedemption>(
+                id.clone(),
+                make_vault_withdraw_submitting(&symbol, float!(10)),
+            )
+            .await
+            .unwrap();
+        {
+            let mut guard = trigger.equity_in_progress.write().unwrap();
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer {
+                    generation: equity::GuardGeneration::default(),
+                },
+            );
+        }
+
+        harness
+            .receive::<EquityRedemption>(
+                id.clone(),
+                EquityRedemptionEvent::VaultWithdrawReplacementAdopted {
+                    replacement_tx: TxHash::repeat_byte(0x5E),
+                    replaced_tx: TxHash::repeat_byte(0x11),
+                    reason: "wallet sped up the withdrawal".to_string(),
+                    adopted_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol),
+            "adopting a replacement continues the redemption, so the guard stays held"
+        );
+
+        harness
+            .receive::<EquityRedemption>(id, make_redemption_completed())
+            .await
+            .unwrap();
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol),
+            "the adopted redemption's completion must release the guard"
+        );
+    }
+
+    #[tokio::test]
     async fn mint_accepted_via_reactor_blocks_imbalance_detection() {
         let symbol = Symbol::new("AAPL").unwrap();
         // 20 onchain, 80 offchain = 20% ratio -> TooMuchOffchain triggers Mint
@@ -15573,7 +17838,7 @@ mod tests {
                 .symbols
                 .get_mut(&symbol)
                 .expect("AAPL is configured")
-                .rebalancing = OperationMode::Disabled;
+                .rebalancing = RebalancingMode::Disabled;
             let mut config = test_config();
             config.chains.insert(
                 Chain::Robinhood,
@@ -15636,11 +17901,79 @@ mod tests {
 
     /// A fill on a secondary chain whose listing rebalances the symbol moves
     /// that chain's own slot and so its deviation from its target, which the
-    /// planner manages: it asks for the symbol's equity check. USDC still
-    /// rebalances on the primary chain only.
+    /// planner manages: it asks for the symbol's equity check. USDC
+    /// rebalances only on the configured corridor's chain, Base here.
     #[tokio::test]
     async fn rebalancing_secondary_chain_fill_schedules_the_equity_check() {
         let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = hyperevm_fill_trigger(&symbol, test_config()).await;
+
+        assert_eq!(
+            count_pending_equity_check_jobs(&trigger).await,
+            1,
+            "a rebalancing secondary's fill must schedule the symbol's equity check"
+        );
+        assert_eq!(
+            count_pending_usdc_check_jobs(&trigger).await,
+            0,
+            "a fill off the corridor chain must not schedule the USDC check"
+        );
+    }
+
+    /// A fill on the cash corridor's chain moves that chain's vault cash, so
+    /// it schedules the USDC check even when the chain is not the primary.
+    #[tokio::test]
+    async fn corridor_chain_fill_schedules_the_usdc_check() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let config = RebalancingServiceConfig {
+            usdc: UsdcCorridors::for_test(
+                OperationMode::Enabled,
+                [UsdcCorridorCtx {
+                    corridor: UsdcCorridor::HubRouted {
+                        chain: Chain::HyperEvm,
+                        hop: HopKind::Relay,
+                    },
+                    threshold: ImbalanceThreshold {
+                        target: float!(0.5),
+                        deviation: float!(0.2),
+                    },
+                }],
+            ),
+            ..test_config()
+        };
+
+        let trigger = hyperevm_fill_trigger(&symbol, config).await;
+
+        assert_eq!(count_pending_usdc_check_jobs(&trigger).await, 1);
+    }
+
+    /// With several active corridors, a fill on any of their chains, not
+    /// just the first, schedules the USDC check.
+    #[tokio::test]
+    async fn fill_on_an_active_corridor_chain_schedules_the_usdc_check() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let config = RebalancingServiceConfig {
+            usdc: UsdcCorridors::for_test(
+                OperationMode::Enabled,
+                [
+                    active_corridor(Chain::Base, HopKind::Cctp),
+                    active_corridor(Chain::HyperEvm, HopKind::Relay),
+                ],
+            ),
+            ..test_config()
+        };
+
+        let trigger = hyperevm_fill_trigger(&symbol, config).await;
+
+        assert_eq!(count_pending_usdc_check_jobs(&trigger).await, 1);
+    }
+
+    /// Seeds a HyperEVM slot whose listing rebalances `symbol`, then applies
+    /// a HyperEVM fill.
+    async fn hyperevm_fill_trigger(
+        symbol: &Symbol,
+        mut config: RebalancingServiceConfig,
+    ) -> Arc<RebalancingService> {
         let now = Utc::now();
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(50), shares(50))
@@ -15665,7 +17998,6 @@ mod tests {
                 now,
             )
             .unwrap();
-        let mut config = test_config();
         config.chains.insert(
             Chain::HyperEvm,
             ChainRebalancingConfig::for_test(ChainAssets {
@@ -15673,9 +18005,9 @@ mod tests {
                 cash: None,
             }),
         );
-        let reactor = make_trigger_with_inventory_registry_and_wrappers(
+        let trigger = make_trigger_with_inventory_registry_and_wrappers(
             inventory,
-            &symbol,
+            symbol,
             BTreeMap::from([
                 (
                     Chain::Base,
@@ -15689,10 +18021,8 @@ mod tests {
             config,
         )
         .await;
-        let trigger = reactor.clone();
-        let harness = ReactorHarness::new(reactor.clone());
 
-        harness
+        ReactorHarness::new(trigger.clone())
             .receive::<Position>(
                 symbol.clone(),
                 make_onchain_fill_on_chain(shares(10), Direction::Buy, Chain::HyperEvm),
@@ -15700,16 +18030,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            count_pending_equity_check_jobs(&trigger).await,
-            1,
-            "a rebalancing secondary's fill must schedule the symbol's equity check"
-        );
-        assert_eq!(
-            count_pending_usdc_check_jobs(&trigger).await,
-            0,
-            "USDC rebalancing still runs on the primary chain only"
-        );
+        trigger
     }
 
     /// Before a hedged secondary's first poll, no snapshot has seeded its
@@ -16179,7 +18500,8 @@ mod tests {
 
         trigger
             .divergence_gate()
-            .request_onchain_cash_reconcile(Chain::Base, Some(101));
+            .request_onchain_cash_reconcile(Chain::Base, Some(101))
+            .await;
 
         trigger
             .on_snapshot(InventorySnapshotEvent::OnchainUsdc {
@@ -17129,11 +19451,11 @@ mod tests {
         drop(inventory);
     }
 
-    /// Terminal settlement must credit the configured primary chain's
-    /// onchain slot: with inventory keyed under Ethereum, a Base-hardcoded
+    /// Terminal settlement must credit the transfer's corridor chain slot:
+    /// with the corridor and inventory keyed under Ethereum, a Base-hardcoded
     /// credit would leave the Ethereum slot at its seeded balance.
     #[tokio::test]
-    async fn terminal_deposit_credits_the_configured_primary_chain_slot() {
+    async fn terminal_deposit_credits_a_non_base_corridor_chain_slot() {
         let inventory =
             InventoryView::for_primary_chain(Chain::Ethereum).with_usdc(usdc(100), usdc(900));
         let trigger = make_trigger_with_inventory(inventory).await;
@@ -17143,7 +19465,7 @@ mod tests {
         harness
             .receive::<UsdcRebalance>(
                 id.clone(),
-                make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(500)),
+                make_usdc_initiated_on(ETHEREUM_CCTP, RebalanceDirection::AlpacaToBase, usdc(500)),
             )
             .await
             .unwrap();
@@ -17169,11 +19491,11 @@ mod tests {
     }
 
     /// Cancelling a failed onchain-sourced rebalance must release and credit
-    /// back the configured primary chain's slot. The mid-flight assertion
+    /// back the transfer's corridor chain slot. The mid-flight assertion
     /// pins the debit to the Ethereum slot; the final one pins the
     /// cancel's release and credit-back to the same slot.
     #[tokio::test]
-    async fn terminal_cancel_releases_the_configured_primary_chain_slot() {
+    async fn terminal_cancel_releases_a_non_base_corridor_chain_slot() {
         let inventory =
             InventoryView::for_primary_chain(Chain::Ethereum).with_usdc(usdc(900), usdc(100));
         let trigger = make_trigger_with_inventory(inventory).await;
@@ -17182,12 +19504,12 @@ mod tests {
 
         trigger
             .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+            .hold(Chain::Ethereum, &id, RebalanceDirection::BaseToAlpaca);
 
         harness
             .receive::<UsdcRebalance>(
                 id.clone(),
-                make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(400)),
+                make_usdc_initiated_on(ETHEREUM_CCTP, RebalanceDirection::BaseToAlpaca, usdc(400)),
             )
             .await
             .unwrap();
@@ -17244,6 +19566,293 @@ mod tests {
             "a Reconciled settlement must enqueue exactly one fresh USDC \
              imbalance check against the post-rebalance inventory"
         );
+    }
+
+    /// Seeds a Base vault read pinned at block 100 holding 1,000 USDC against
+    /// 1,000 at Alpaca, then settles a 500 USDC AlpacaToBase transfer whose
+    /// vault deposit is in block 110. The view then reads 1,500 onchain
+    /// against 500 offchain (75% onchain, past the 70% band) until a vault
+    /// read at or past block 110 replaces it. The settlement's check is left
+    /// queued.
+    async fn settle_vault_credit_in_block_110() -> (
+        Arc<RebalancingService>,
+        ReactorHarness<Arc<RebalancingService>>,
+        Symbol,
+    ) {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(1000), usdc(1000));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        apply_and_dispatch_snapshot(
+            Arc::clone(&trigger),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
+                usdc_balance: usdc(1000),
+                fetched_at: Utc::now(),
+                block_number: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        for event in [
+            make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(500)),
+            make_usdc_bridged_with_amounts(usdc(500), Usdc::ZERO),
+            UsdcRebalanceEvent::DepositConfirmed {
+                direction: RebalanceDirection::AlpacaToBase,
+                deposit_confirmed_at: Utc::now(),
+                vault_deposit_block: Some(110),
+            },
+        ] {
+            harness
+                .receive::<UsdcRebalance>(id.clone(), event)
+                .await
+                .unwrap();
+        }
+
+        (trigger, harness, symbol)
+    }
+
+    /// Applies the forced vault read the poller sends for a pending cash
+    /// reconcile request, pinned at `block_number`.
+    async fn apply_pinned_base_usdc_read(
+        trigger: &Arc<RebalancingService>,
+        usdc_balance: Usdc,
+        block_number: u64,
+    ) {
+        let generation = trigger
+            .divergence_gate()
+            .claim_pending_onchain_cash_reconcile(Chain::Base)
+            .expect("a pending cash read request");
+        apply_and_dispatch_snapshot(
+            Arc::clone(trigger),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::OnchainUsdcReconciled {
+                chain: Chain::Base,
+                usdc_balance,
+                fetched_at: Utc::now(),
+                block_number: Some(block_number),
+                generation,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A fill in the vault deposit's own block spent the credit before the
+    /// fill reader delivered it. Neither the check the settlement enqueues
+    /// nor the one the late fill enqueues may plan a transfer, and the read
+    /// at the deposit block (1,050 onchain against 500) is inside the band.
+    #[tokio::test]
+    async fn same_block_deposit_and_spend_plans_no_transfer() {
+        let (trigger, harness, symbol) = settle_vault_credit_in_block_110().await;
+
+        assert_eq!(usdc::drain_pending_usdc_jobs(&trigger).await, 1);
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+
+        harness
+            .receive::<Position>(
+                symbol,
+                make_onchain_fill_in_block(shares(3), Direction::Buy, Some(110)),
+            )
+            .await
+            .unwrap();
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+
+        apply_pinned_base_usdc_read(&trigger, usdc(1050), 110).await;
+        assert_eq!(usdc::drain_pending_usdc_jobs(&trigger).await, 1);
+
+        assert!(!trigger.divergence_gate().is_cash_engaged());
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+    }
+
+    /// A fill from before the deposit's block reaching the reactor inside
+    /// the gap triggers a check that must plan nothing. The read at the
+    /// deposit block contains that fill and the deposit block's spend, so
+    /// its check plans off 1,350 onchain against 500, not the 1,650 the
+    /// view showed, and the spend arriving later is absorbed.
+    #[tokio::test]
+    async fn fill_triggered_check_waits_for_a_read_at_the_deposit_block() {
+        let (trigger, harness, symbol) = settle_vault_credit_in_block_110().await;
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_onchain_fill_in_block(shares(1), Direction::Sell, Some(105)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(usdc::drain_pending_usdc_jobs(&trigger).await, 1);
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+
+        apply_pinned_base_usdc_read(&trigger, usdc(1350), 110).await;
+        assert_eq!(usdc::drain_pending_usdc_jobs(&trigger).await, 1);
+        assert_eq!(
+            take_pending_usdc_transfer_jobs(&trigger).await,
+            vec![UsdcRebalanceOperation::BaseToAlpaca { amount: usdc(425) }]
+        );
+
+        harness
+            .receive::<Position>(
+                symbol,
+                make_onchain_fill_in_block(shares(2), Direction::Buy, Some(110)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .onchain_usdc_available_at(Chain::Base),
+            Some(usdc(1350))
+        );
+    }
+
+    /// A periodic snapshot inside the gap triggers a check that must plan
+    /// nothing, and a vault read pinned below the deposit block cannot
+    /// release the hold: it may miss the deposit block's spend.
+    #[tokio::test]
+    async fn snapshot_triggered_check_waits_for_a_read_at_the_deposit_block() {
+        let (trigger, _harness, _symbol) = settle_vault_credit_in_block_110().await;
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+
+        apply_and_dispatch_snapshot(
+            Arc::clone(&trigger),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::OffchainCashWithdrawable {
+                cash_withdrawable_cents: Some(50_000),
+                fetched_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(usdc::drain_pending_usdc_jobs(&trigger).await, 1);
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+
+        apply_pinned_base_usdc_read(&trigger, usdc(1500), 109).await;
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+        assert!(trigger.divergence_gate().is_cash_engaged());
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+
+        apply_pinned_base_usdc_read(&trigger, usdc(1350), 110).await;
+        assert_eq!(usdc::drain_pending_usdc_jobs(&trigger).await, 1);
+        assert_eq!(
+            take_pending_usdc_transfer_jobs(&trigger).await,
+            vec![UsdcRebalanceOperation::BaseToAlpaca { amount: usdc(425) }]
+        );
+    }
+
+    /// A fill underflow can force a vault read in while the transfer is still
+    /// inflight. A read at block 120 already contains the deposit made in
+    /// block 110 and its spend, so the credit then counts the deposit twice
+    /// (1,550 onchain against 500). The view rejects any read below 120, so
+    /// a read at 115 must not release the gate; the read at 121 does, and
+    /// its 1,050 against 500 is inside the band.
+    #[tokio::test]
+    async fn deposit_credit_waits_past_a_forced_read_applied_while_inflight() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(1000), usdc(1000));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        for event in [
+            make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(500)),
+            make_usdc_bridged_with_amounts(usdc(500), Usdc::ZERO),
+        ] {
+            harness
+                .receive::<UsdcRebalance>(id.clone(), event)
+                .await
+                .unwrap();
+        }
+        trigger
+            .divergence_gate()
+            .request_onchain_cash_reconcile(Chain::Base, Some(110))
+            .await;
+        apply_pinned_base_usdc_read(&trigger, usdc(1050), 120).await;
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+
+        harness
+            .receive::<UsdcRebalance>(
+                id,
+                UsdcRebalanceEvent::DepositConfirmed {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    deposit_confirmed_at: Utc::now(),
+                    vault_deposit_block: Some(110),
+                },
+            )
+            .await
+            .unwrap();
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+
+        apply_pinned_base_usdc_read(&trigger, usdc(1050), 115).await;
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+        assert!(trigger.divergence_gate().is_cash_engaged());
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+
+        apply_pinned_base_usdc_read(&trigger, usdc(1050), 121).await;
+        assert_eq!(usdc::drain_pending_usdc_jobs(&trigger).await, 1);
+        assert!(!trigger.divergence_gate().is_cash_engaged());
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+    }
+
+    /// A fill that applies its cash leg cleanly while the deposit's read is
+    /// pending raises the read's floor to its block. A read pinned at block
+    /// 120 predates the block 121 spend, so it must not replace the balance
+    /// (1,050 after the spend) with 1,500 or release the gate; the read at
+    /// 121 contains the spend and does.
+    #[tokio::test]
+    async fn deposit_read_pinned_below_an_applied_fill_keeps_the_gate() {
+        let (trigger, harness, symbol) = settle_vault_credit_in_block_110().await;
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+
+        harness
+            .receive::<Position>(
+                symbol,
+                make_onchain_fill_in_block(shares(3), Direction::Buy, Some(121)),
+            )
+            .await
+            .unwrap();
+        let onchain_usdc = || async {
+            trigger
+                .inventory
+                .read()
+                .await
+                .onchain_usdc_available_at(Chain::Base)
+        };
+        assert_eq!(onchain_usdc().await, Some(usdc(1050)));
+
+        apply_pinned_base_usdc_read(&trigger, usdc(1500), 120).await;
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+        assert_eq!(onchain_usdc().await, Some(usdc(1050)));
+        assert!(trigger.divergence_gate().is_cash_engaged());
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+
+        apply_pinned_base_usdc_read(&trigger, usdc(1050), 121).await;
+        assert_eq!(usdc::drain_pending_usdc_jobs(&trigger).await, 1);
+        assert!(!trigger.divergence_gate().is_cash_engaged());
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
     }
 
     #[tokio::test]
@@ -18172,6 +20781,572 @@ mod tests {
         );
     }
 
+    fn positive_usdc(n: i64) -> Positive<Usdc> {
+        Positive::new(usdc(n)).unwrap()
+    }
+
+    /// Happy path: a manual start enqueues exactly one job of the direction's
+    /// type under the fresh id it returns, with the operator's amount, and
+    /// holds the corridor guard for that id so the trigger cannot start a
+    /// second transfer beside it.
+    #[tokio::test]
+    async fn manual_start_enqueues_one_job_under_the_fresh_id_and_holds_the_guard() {
+        let (trigger, pool, _store) = make_resume_trigger().await;
+
+        let id = trigger
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::AlpacaToBase,
+                positive_usdc(250),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let rows = market_making_job_rows(&trigger).await;
+        assert_eq!(rows.len(), 1, "exactly one job row must be enqueued");
+        let job: TransferUsdcToMarketMaking = serde_json::from_slice(&rows[0].1).unwrap();
+        assert_eq!(job.id, id, "the job must carry the returned id");
+        assert_eq!(
+            job.amount,
+            usdc(250),
+            "the job must carry the operator's amount"
+        );
+        assert_eq!(job.corridor, UsdcCorridor::BASE_CCTP);
+        assert!(
+            trigger.usdc_guards.is_held(Chain::Base),
+            "the start must hold the Base guard"
+        );
+        // A claim by the holder itself succeeds and leaves its hold in place,
+        // while any other id is refused: the returned id is the holder.
+        drop(
+            trigger
+                .usdc_guards
+                .try_claim(Chain::Base, &id, RebalanceDirection::AlpacaToBase)
+                .expect("the returned id must hold the Base guard"),
+        );
+        assert!(
+            matches!(
+                trigger.usdc_guards.try_claim(
+                    Chain::Base,
+                    &UsdcRebalanceId(Uuid::new_v4()),
+                    RebalanceDirection::AlpacaToBase
+                ),
+                Err(ClaimRefusal::CorridorHeld)
+            ),
+            "another id must be refused while the returned id holds the guard"
+        );
+    }
+
+    /// The `BaseToAlpaca` routing arm enqueues on the hedging queue only.
+    #[tokio::test]
+    async fn manual_start_routes_base_to_alpaca_to_the_hedging_queue() {
+        let (trigger, pool, _store) = make_resume_trigger().await;
+
+        let id = trigger
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::BaseToAlpaca,
+                positive_usdc(75),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let hedging_rows: Vec<(String, Vec<u8>)> =
+            sqlx_apalis::query_as("SELECT status, job FROM Jobs WHERE job_type = ?")
+                .bind(std::any::type_name::<TransferUsdcToHedging>())
+                .fetch_all(trigger.transfer_usdc_to_hedging_queue.pool())
+                .await
+                .unwrap();
+        assert_eq!(hedging_rows.len(), 1, "exactly one hedging job row");
+        let job: TransferUsdcToHedging = serde_json::from_slice(&hedging_rows[0].1).unwrap();
+        assert_eq!(job.id, id);
+        assert_eq!(job.amount, usdc(75));
+        assert!(
+            market_making_job_rows(&trigger).await.is_empty(),
+            "a BaseToAlpaca start must not touch the market making queue"
+        );
+    }
+
+    /// Single flight gate 1: another transfer's live job row refuses the
+    /// start, and nothing is enqueued or held.
+    #[tokio::test]
+    async fn manual_start_is_refused_while_another_transfer_job_is_in_flight() {
+        let (trigger, pool, _store) = make_resume_trigger().await;
+        trigger
+            .transfer_usdc_to_hedging_queue
+            .clone()
+            .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
+                id: UsdcRebalanceId(Uuid::new_v4()),
+                amount: usdc(50),
+                revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
+            })
+            .await
+            .unwrap();
+
+        let error = trigger
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::AlpacaToBase,
+                positive_usdc(250),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcResumeError::AlreadyInFlight { .. }),
+            "a live job row in either direction must refuse; got: {error:?}"
+        );
+        assert!(market_making_job_rows(&trigger).await.is_empty());
+        assert!(!trigger.usdc_guards.is_held(Chain::Base));
+    }
+
+    /// The in memory claim refuses a held corridor, unlike a resume: another
+    /// id holding the guard with no durable record (a racing trigger claim)
+    /// passes both durable gates, and only the claim stops a second transfer.
+    #[tokio::test]
+    async fn manual_start_is_refused_while_another_id_holds_the_corridor_guard() {
+        let (trigger, pool, _store) = make_resume_trigger().await;
+        let other = UsdcRebalanceId(Uuid::new_v4());
+        trigger
+            .usdc_guards
+            .hold(Chain::Base, &other, RebalanceDirection::BaseToAlpaca);
+
+        let error = trigger
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::BaseToAlpaca,
+                positive_usdc(250),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcResumeError::GuardHeldElsewhere),
+            "a held corridor must refuse a fresh id; got: {error:?}"
+        );
+        let hedging_rows: i64 = sqlx_apalis::query_scalar("SELECT COUNT(*) FROM Jobs")
+            .fetch_one(trigger.transfer_usdc_to_hedging_queue.pool())
+            .await
+            .unwrap();
+        assert_eq!(hedging_rows, 0, "a refused start must not enqueue anything");
+    }
+
+    /// While an unreadable transfer latches every corridor, a manual start is
+    /// refused with that reason, not as a conflict with another holder.
+    #[tokio::test]
+    async fn manual_start_is_refused_while_every_corridor_is_latched() {
+        let (trigger, pool, store) = make_resume_trigger().await;
+        insert_unloadable_usdc_candidate(&pool).await;
+        trigger.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        let error = trigger
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::AlpacaToBase,
+                positive_usdc(250),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcResumeError::EveryCorridorLatched),
+            "got {error:?}"
+        );
+        assert!(market_making_job_rows(&trigger).await.is_empty());
+    }
+
+    /// A manual start is a fresh transfer, so signing wallets below their gas
+    /// thresholds refuse it, as the trigger's fresh dispatch skips it: nothing
+    /// is enqueued and no guard is left claimed.
+    #[tokio::test]
+    async fn manual_start_is_refused_while_the_signing_wallets_are_not_gas_ready() {
+        let (trigger, pool, _store) = make_resume_trigger().await;
+        trigger
+            .set_usdc_gas_readiness(BTreeMap::from([(
+                Chain::Base,
+                ConfiguredGasReadiness::Wired(crate::native_gas::GasReadiness::for_test(
+                    U256::MAX,
+                    U256::from(1_u64),
+                    U256::ZERO,
+                    U256::from(1_u64),
+                )),
+            )]))
+            .await;
+
+        let error = trigger
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::AlpacaToBase,
+                positive_usdc(250),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcResumeError::GasNotReady(_)),
+            "got {error:?}"
+        );
+        assert!(market_making_job_rows(&trigger).await.is_empty());
+        assert!(
+            !trigger.usdc_guards.is_held(Chain::Base),
+            "a gas refusal must leave no corridor guard claimed"
+        );
+    }
+
+    /// Like the trigger's fresh dispatch, a manual start refuses while a cash
+    /// snapshot divergence is engaged: the transfer would mark the venue busy
+    /// and freeze the counter that resolves the divergence.
+    #[tokio::test]
+    async fn manual_start_is_refused_while_a_cash_divergence_is_engaged() {
+        let (trigger, pool, _store) = make_resume_trigger().await;
+        trigger
+            .divergence_gate()
+            .engage_cash(InventoryScope::Hedging)
+            .await;
+
+        let error = trigger
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::AlpacaToBase,
+                positive_usdc(250),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcResumeError::CashDivergenceEngaged),
+            "got {error:?}"
+        );
+        assert!(market_making_job_rows(&trigger).await.is_empty());
+    }
+
+    /// Like the trigger's fresh dispatch, a manual start refuses while the
+    /// cash balance is restart tainted, as it is when a hedge order was open
+    /// at boot.
+    #[tokio::test]
+    async fn manual_start_is_refused_while_the_cash_balance_is_restart_tainted() {
+        let (trigger, pool, _store) = make_resume_trigger().await;
+        trigger
+            .inventory
+            .write_without_broadcast()
+            .await
+            .set_pending_offchain_orders(HashMap::from([(
+                Symbol::new("AAPL").unwrap(),
+                OffchainOrderId::new(),
+            )]));
+
+        let error = trigger
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::AlpacaToBase,
+                positive_usdc(250),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcResumeError::CashRestartTainted),
+            "got {error:?}"
+        );
+        assert!(market_making_job_rows(&trigger).await.is_empty());
+    }
+
+    /// Fails every attempt of an Alpaca to Base transfer the way a refused
+    /// gas check does: with no retry interval, so apalis spends the whole
+    /// retry budget. With `record_start` it first records the transfer's
+    /// start (`InitiateConversion`) for its id, as a failure after the first
+    /// event would leave it.
+    struct FailingAlpacaToBase {
+        record_start: Option<Arc<Store<UsdcRebalance>>>,
+    }
+
+    #[async_trait]
+    impl ResumeAlpacaToBase for FailingAlpacaToBase {
+        async fn resume_alpaca_to_base(
+            &self,
+            id: &UsdcRebalanceId,
+            amount: Usdc,
+            corridor: UsdcCorridor,
+        ) -> Result<(), UsdcTransferError> {
+            if let Some(store) = &self.record_start
+                && store.load(id).await.unwrap().is_none()
+            {
+                store
+                    .send(
+                        id,
+                        UsdcRebalanceCommand::InitiateConversion {
+                            corridor,
+                            direction: RebalanceDirection::AlpacaToBase,
+                            amount,
+                            order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            Err(UsdcTransferError::GasReadiness(
+                GasReadinessFailure::Unwired,
+            ))
+        }
+    }
+
+    /// Runs the market making worker, with the release wired to `trigger`'s
+    /// guards and `store`, until its one job row is a dead letter.
+    async fn run_market_making_job_until_dead_letter(
+        trigger: &RebalancingService,
+        store: &Arc<Store<UsdcRebalance>>,
+        transfer: FailingAlpacaToBase,
+    ) {
+        let queue = trigger.transfer_usdc_to_market_making_queue.clone();
+        let notifier: Arc<dyn crate::alerts::Notifier> = Arc::new(LogNotifier);
+        let ctx = Arc::new(TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(transfer),
+            job_queue: queue.clone(),
+            max_burn_revert_redrives: 1,
+            notifier: Arc::clone(&notifier),
+            driver_gate: crate::rebalancing::usdc::UsdcDriverGate::unpaused(),
+            unrecorded_guards: Some(UnrecordedGuardRelease {
+                guards: Arc::clone(&trigger.usdc_guards),
+                store: Arc::clone(store),
+            }),
+        });
+        let worker_queue = queue.clone();
+        let monitor = apalis::prelude::Monitor::new()
+            .should_restart(|_ctx, _error, _attempt| false)
+            .register(move |index| {
+                crate::conductor::job::build_best_effort_worker!(
+                    ::<TransferUsdcToMarketMakingCtx, TransferUsdcToMarketMaking>,
+                    index,
+                    worker_queue.clone(),
+                    ctx.clone(),
+                    notifier.clone(),
+                    crate::conductor::job::FailureInjector::new(),
+                )
+            });
+        let monitor_handle = tokio::spawn(async move { monitor.run().await });
+
+        crate::test_utils::wait_for_terminal_job::<TransferUsdcToMarketMaking>(queue.pool()).await;
+        monitor_handle.abort();
+    }
+
+    /// A transfer whose job exhausts its retries before recording any event
+    /// frees its corridor guard on the last attempt, so the next start on
+    /// that corridor is not refused until a restart.
+    #[tokio::test]
+    async fn a_transfer_job_dead_before_its_first_event_frees_the_corridor_guard() {
+        let (trigger, pool, store) = make_resume_trigger().await;
+        let first = trigger
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::AlpacaToBase,
+                positive_usdc(250),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(trigger.usdc_guards.is_held(Chain::Base));
+
+        run_market_making_job_until_dead_letter(
+            &trigger,
+            &store,
+            FailingAlpacaToBase { record_start: None },
+        )
+        .await;
+
+        assert_eq!(
+            store.load(&first).await.unwrap(),
+            None,
+            "the dead job must have recorded nothing"
+        );
+        assert!(
+            !trigger.usdc_guards.is_held(Chain::Base),
+            "a transfer that recorded nothing must free its corridor guard"
+        );
+        let second = trigger
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::AlpacaToBase,
+                positive_usdc(250),
+                None,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("the corridor must take a new start: {error:?}"));
+        assert_ne!(second, first);
+    }
+
+    /// A transfer that recorded its start before its job died keeps the
+    /// corridor guard: something may already have moved, so only the reactor,
+    /// the sweep, or the operator may free it, and a new start is refused.
+    #[tokio::test]
+    async fn a_transfer_job_dead_after_its_first_event_keeps_the_corridor_guard() {
+        let (trigger, pool, store) = make_resume_trigger().await;
+        let first = trigger
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::AlpacaToBase,
+                positive_usdc(250),
+                None,
+            )
+            .await
+            .unwrap();
+
+        run_market_making_job_until_dead_letter(
+            &trigger,
+            &store,
+            FailingAlpacaToBase {
+                record_start: Some(Arc::clone(&store)),
+            },
+        )
+        .await;
+
+        let recorded = store.load(&first).await.unwrap();
+        assert!(
+            matches!(recorded, Some(UsdcRebalance::Converting { .. })),
+            "the dead job must have recorded the transfer's start, got {recorded:?}"
+        );
+        assert!(
+            trigger.usdc_guards.is_held(Chain::Base),
+            "a transfer that recorded its start must keep its corridor guard"
+        );
+        let error = trigger
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::AlpacaToBase,
+                positive_usdc(250),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, UsdcResumeError::GuardHeldElsewhere),
+            "got {error:?}"
+        );
+    }
+
+    /// Fails every attempt of a Base to Alpaca transfer the way a refused gas
+    /// check does, with no retry interval, so apalis spends the whole budget.
+    struct FailingBaseToAlpaca;
+
+    #[async_trait]
+    impl ResumeBaseToAlpaca for FailingBaseToAlpaca {
+        async fn resume_base_to_alpaca(
+            &self,
+            _id: &UsdcRebalanceId,
+            _amount: Usdc,
+            _corridor: UsdcCorridor,
+        ) -> Result<(), UsdcTransferError> {
+            Err(UsdcTransferError::GasReadiness(
+                GasReadinessFailure::Unwired,
+            ))
+        }
+    }
+
+    /// The hedging direction's terminal attempt frees the guard of a transfer
+    /// that recorded nothing, like the market making one.
+    #[tokio::test]
+    async fn a_base_to_alpaca_job_dead_before_its_first_event_frees_the_corridor_guard() {
+        let (trigger, pool, store) = make_resume_trigger().await;
+        let first = trigger
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::BaseToAlpaca,
+                positive_usdc(75),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(trigger.usdc_guards.is_held(Chain::Base));
+
+        let queue = trigger.transfer_usdc_to_hedging_queue.clone();
+        let notifier: Arc<dyn crate::alerts::Notifier> = Arc::new(LogNotifier);
+        let ctx = Arc::new(TransferUsdcToHedgingCtx {
+            transfer: Arc::new(FailingBaseToAlpaca),
+            timeout: Duration::from_secs(60),
+            job_queue: queue.clone(),
+            max_burn_revert_redrives: 1,
+            notifier: Arc::clone(&notifier),
+            driver_gate: crate::rebalancing::usdc::UsdcDriverGate::unpaused(),
+            unrecorded_guards: Some(UnrecordedGuardRelease {
+                guards: Arc::clone(&trigger.usdc_guards),
+                store: Arc::clone(&store),
+            }),
+            underfunded_alerts: crate::rebalancing::usdc::UnderfundedAlertLatch::default(),
+        });
+        let worker_queue = queue.clone();
+        let monitor = apalis::prelude::Monitor::new()
+            .should_restart(|_ctx, _error, _attempt| false)
+            .register(move |index| {
+                crate::conductor::job::build_best_effort_worker!(
+                    ::<TransferUsdcToHedgingCtx, TransferUsdcToHedging>,
+                    index,
+                    worker_queue.clone(),
+                    ctx.clone(),
+                    notifier.clone(),
+                    crate::conductor::job::FailureInjector::new(),
+                )
+            });
+        let monitor_handle = tokio::spawn(async move { monitor.run().await });
+        crate::test_utils::wait_for_terminal_job::<TransferUsdcToHedging>(queue.pool()).await;
+        monitor_handle.abort();
+
+        assert_eq!(store.load(&first).await.unwrap(), None);
+        assert!(
+            !trigger.usdc_guards.is_held(Chain::Base),
+            "a Base to Alpaca transfer that recorded nothing must free its corridor guard"
+        );
+    }
+
+    /// The terminal attempt keeps the guard while another live job row still
+    /// drives the same id, even though nothing was recorded: that row will
+    /// run the transfer, so freeing the guard would let a second one start.
+    #[tokio::test]
+    async fn a_terminal_attempt_keeps_the_guard_while_another_row_drives_the_id() {
+        let (trigger, pool, store) = make_resume_trigger().await;
+        let id = trigger
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::AlpacaToBase,
+                positive_usdc(250),
+                None,
+            )
+            .await
+            .unwrap();
+        let rows = market_making_job_rows(&trigger).await;
+        let job: TransferUsdcToMarketMaking = serde_json::from_slice(&rows[0].1).unwrap();
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(FailingAlpacaToBase { record_start: None }),
+            job_queue: trigger.transfer_usdc_to_market_making_queue.clone(),
+            max_burn_revert_redrives: 1,
+            notifier: Arc::new(LogNotifier),
+            driver_gate: crate::rebalancing::usdc::UsdcDriverGate::unpaused(),
+            unrecorded_guards: Some(UnrecordedGuardRelease {
+                guards: Arc::clone(&trigger.usdc_guards),
+                store: Arc::clone(&store),
+            }),
+        };
+
+        // The enqueued row is still pending and is not the dying one.
+        Job::on_terminal_attempt(&job, &ctx, &TaskIdentity::for_test("the-dying-row"))
+            .await
+            .unwrap();
+
+        assert_eq!(job.id, id);
+        assert!(
+            trigger.usdc_guards.is_held(Chain::Base),
+            "a live sibling row for the same id must keep the guard"
+        );
+    }
+
     #[tokio::test]
     async fn base_to_alpaca_usdc_failures_cancel_inflight_end_to_end() {
         struct Scenario {
@@ -18670,7 +21845,10 @@ mod tests {
                     Utc::now(),
                 )
                 .unwrap()
-                .set_active_usdc_rebalance(id.clone());
+                .set_active_usdc_rebalance(
+                    id.clone(),
+                    base_usdc_rebalance(RebalanceDirection::BaseToAlpaca),
+                );
         }
         trigger
             .usdc_guards
@@ -18739,7 +21917,10 @@ mod tests {
                     Utc::now(),
                 )
                 .unwrap()
-                .set_active_usdc_rebalance(id.clone());
+                .set_active_usdc_rebalance(
+                    id.clone(),
+                    base_usdc_rebalance(RebalanceDirection::AlpacaToBase),
+                );
         }
         trigger
             .usdc_guards
@@ -18782,6 +21963,48 @@ mod tests {
 
     /// A `Reconciled` aggregate is a clearing terminal: startup guard recovery
     /// must NOT re-latch the guard for it (the opposite of a post-burn failure).
+    /// A withdrawal rejected before broadcast while the bot was down (the
+    /// offline `fail-usdc-transfer`) never reached the reactor, so startup
+    /// restores its cooldown and forced vault read.
+    #[tokio::test]
+    async fn recover_usdc_guard_restores_a_recent_withdrawal_rejection() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::BeginWithdrawal {
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: usdc(400),
+                    from_block: 52_027_377,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::RejectWithdrawal {
+                    reason: "no withdraw landed".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert!(
+            service
+                .usdc_withdraw_cooling_down(Chain::Base, Utc::now())
+                .await
+        );
+        assert!(service.divergence_gate().is_cash_engaged());
+        assert!(!service.usdc_guards.is_held(Chain::Base));
+    }
+
     #[tokio::test]
     async fn recover_usdc_guard_does_not_relatch_for_reconciled() {
         let pool = crate::test_utils::setup_test_db().await;
@@ -19504,6 +22727,523 @@ mod tests {
         ));
     }
 
+    async fn trigger_with_stranded_and_active_redemptions() -> (
+        Arc<RebalancingService>,
+        Symbol,
+        RedemptionAggregateId,
+        RedemptionAggregateId,
+    ) {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let stranded = redemption_aggregate_id("startup-stranded");
+        let active = redemption_aggregate_id("restored-active");
+        let now = Utc::now();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .update_equity_at(
+                &symbol,
+                Chain::Base,
+                Inventory::set_inflight(Venue::MarketMaking, shares(3)),
+                now,
+            )
+            .unwrap()
+            .update_equity_at(
+                &symbol,
+                Chain::HyperEvm,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(45)),
+                now,
+            )
+            .unwrap()
+            .update_equity_at(
+                &symbol,
+                Chain::HyperEvm,
+                Inventory::set_inflight(Venue::MarketMaking, shares(5)),
+                now,
+            )
+            .unwrap()
+            .seed_stranded_redemption(&stranded, &symbol, Chain::HyperEvm, shares(7), now)
+            .unwrap()
+            .set_active_redemption(symbol.clone(), Chain::HyperEvm, active.clone());
+        let trigger = make_trigger_with_inventory(inventory).await;
+        trigger.redemption_tracking.write().await.insert(
+            active.clone(),
+            RedemptionTracking {
+                symbol: symbol.clone(),
+                chain: Chain::HyperEvm,
+                quantity: shares(5),
+                tokenization_request_id: Some(tokenization_request_id("restored-provider")),
+                redemption_tx: Some(TxHash::random()),
+                stage: RedemptionTrackingStage::UnwrapPending,
+                last_progress_at: now - ChronoDuration::hours(24),
+            },
+        );
+        trigger.mark_equity_active_transfer(&symbol, Chain::HyperEvm, || {
+            equity::GUARD_GENERATION.next()
+        });
+        (trigger, symbol, stranded, active)
+    }
+
+    #[tokio::test]
+    async fn restored_active_redemption_nav_and_completion_preserve_stranded_exposure() {
+        let (trigger, symbol, _, active) = trigger_with_stranded_and_active_redemptions().await;
+        trigger
+            .on_redemption(
+                active.clone(),
+                EquityRedemptionEvent::TokensUnwrapped {
+                    quantity: Some(float!(6)),
+                    underlying_token: UnwrappedProvenance::Attested {
+                        attested: UnwrappedToken::unchecked(Address::random()),
+                    },
+                    unwrap_tx_hash: TxHash::random(),
+                    unwrapped_amount: U256::from(6_000_000_000_000_000_000_u128),
+                    unwrap_block: None,
+                    unwrapped_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            trigger.inventory.read().await.equity_inflight_at(
+                &symbol,
+                Venue::MarketMaking,
+                Chain::HyperEvm
+            ),
+            Some(shares(13))
+        );
+        {
+            let mut view = trigger.inventory.write().await;
+            *view = view
+                .clone()
+                .apply_inflight_redemptions_at(
+                    Chain::HyperEvm,
+                    &BTreeMap::from([(symbol.clone(), shares(6))]),
+                    Utc::now(),
+                    Utc::now(),
+                )
+                .unwrap()
+                .apply_inflight_redemptions_at(
+                    Chain::HyperEvm,
+                    &BTreeMap::new(),
+                    Utc::now(),
+                    Utc::now(),
+                )
+                .unwrap();
+            assert_eq!(
+                view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::HyperEvm),
+                Some(shares(13))
+            );
+            drop(view);
+        }
+        trigger
+            .on_redemption(active, make_redemption_completed())
+            .await
+            .unwrap();
+        let view = trigger.inventory.read().await;
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::HyperEvm),
+            Some(shares(7))
+        );
+        assert_eq!(
+            view.equity_available(&symbol, Venue::Hedging),
+            Some(shares(56))
+        );
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Base),
+            Some(shares(3))
+        );
+        drop(view);
+    }
+
+    #[tokio::test]
+    async fn nav_surplus_after_reset_wiped_the_active_slot_restores_absolute_inflight() {
+        let (trigger, symbol, _, active) = trigger_with_stranded_and_active_redemptions().await;
+        {
+            let mut view = trigger.inventory.write().await;
+            *view = view
+                .clone()
+                .update_equity_at(
+                    &symbol,
+                    Chain::HyperEvm,
+                    Inventory::set_inflight(Venue::MarketMaking, shares(7)),
+                    Utc::now(),
+                )
+                .unwrap();
+            drop(view);
+        }
+        trigger
+            .on_redemption(
+                active.clone(),
+                EquityRedemptionEvent::TokensUnwrapped {
+                    quantity: Some(float!(6)),
+                    underlying_token: UnwrappedProvenance::Attested {
+                        attested: UnwrappedToken::unchecked(Address::random()),
+                    },
+                    unwrap_tx_hash: TxHash::random(),
+                    unwrapped_amount: U256::from(6_000_000_000_000_000_000_u128),
+                    unwrap_block: None,
+                    unwrapped_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            trigger.inventory.read().await.equity_inflight_at(
+                &symbol,
+                Venue::MarketMaking,
+                Chain::HyperEvm
+            ),
+            Some(shares(13))
+        );
+
+        trigger
+            .on_redemption(active, make_redemption_completed())
+            .await
+            .unwrap();
+        let view = trigger.inventory.read().await;
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::HyperEvm),
+            Some(shares(7))
+        );
+        assert_eq!(
+            view.equity_available(&symbol, Venue::Hedging),
+            Some(shares(56))
+        );
+        drop(view);
+    }
+
+    #[tokio::test]
+    async fn restored_active_redemption_failures_preserve_stranded_exposure() {
+        for failure in [make_detection_failed(), make_redemption_rejected()] {
+            let (trigger, symbol, _, active) = trigger_with_stranded_and_active_redemptions().await;
+            trigger.on_redemption(active, failure).await.unwrap();
+            let view = trigger.inventory.read().await;
+            assert_eq!(
+                view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::HyperEvm),
+                Some(shares(7))
+            );
+            assert_eq!(
+                view.stranded_redemption_quantity(&symbol, Chain::HyperEvm)
+                    .unwrap(),
+                shares(7)
+            );
+            assert_eq!(
+                view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Base),
+                Some(shares(3))
+            );
+            drop(view);
+        }
+    }
+
+    #[tokio::test]
+    async fn restored_active_redemption_underflow_preserves_stranded_exposure() {
+        let (trigger, symbol, _, active) = trigger_with_stranded_and_active_redemptions().await;
+        {
+            let mut view = trigger.inventory.write().await;
+            *view = view
+                .clone()
+                .update_equity_at(
+                    &symbol,
+                    Chain::HyperEvm,
+                    Inventory::set_inflight(Venue::MarketMaking, shares(8)),
+                    Utc::now(),
+                )
+                .unwrap();
+            drop(view);
+        }
+        trigger
+            .on_redemption(active, make_redemption_completed())
+            .await
+            .unwrap();
+        let view = trigger.inventory.read().await;
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::HyperEvm),
+            Some(shares(7))
+        );
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Base),
+            Some(shares(3))
+        );
+        assert_eq!(
+            view.stranded_redemption_quantity(&symbol, Chain::HyperEvm)
+                .unwrap(),
+            shares(7)
+        );
+        drop(view);
+        assert!(
+            trigger
+                .divergence_gate
+                .has_pending_onchain_equity_reconcile(Chain::HyperEvm)
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_response_after_underflow_keeps_stranded_inflight_and_clears_gate() {
+        let (trigger, symbol, _, active) = trigger_with_stranded_and_active_redemptions().await;
+        {
+            let mut view = trigger.inventory.write().await;
+            *view = view
+                .clone()
+                .update_equity_at(
+                    &symbol,
+                    Chain::HyperEvm,
+                    Inventory::set_inflight(Venue::MarketMaking, shares(8)),
+                    Utc::now(),
+                )
+                .unwrap();
+            drop(view);
+        }
+        trigger
+            .on_redemption(active, make_redemption_completed())
+            .await
+            .unwrap();
+        let generations = trigger
+            .divergence_gate
+            .claim_pending_onchain_equity_reconciles(Chain::HyperEvm);
+        assert!(generations.contains_key(&symbol));
+
+        trigger
+            .on_snapshot(InventorySnapshotEvent::OnchainEquityReconciled {
+                chain: Chain::HyperEvm,
+                balances: BTreeMap::from([(symbol.clone(), shares(40))]),
+                fetched_at: Utc::now(),
+                block_number: None,
+                generations,
+            })
+            .await
+            .unwrap();
+
+        let view = trigger.inventory.read().await;
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::HyperEvm),
+            Some(shares(7))
+        );
+        assert_eq!(
+            view.onchain_equity_available_at(&symbol, Chain::HyperEvm),
+            Some(shares(40))
+        );
+        drop(view);
+        assert!(
+            !trigger
+                .divergence_gate
+                .has_pending_onchain_equity_reconcile(Chain::HyperEvm)
+        );
+
+        // Leave the stranded exposure as the symbol's only inflight.
+        {
+            let mut view = trigger.inventory.write().await;
+            *view = view
+                .clone()
+                .update_equity_at(
+                    &symbol,
+                    Chain::Base,
+                    Inventory::set_inflight(Venue::MarketMaking, FractionalShares::ZERO),
+                    Utc::now(),
+                )
+                .unwrap();
+            drop(view);
+        }
+        let (_, generation) = trigger
+            .divergence_gate
+            .claim_pending_offchain_equity_reconciles()
+            .into_iter()
+            .find(|(pending, _)| pending == &symbol)
+            .unwrap();
+        trigger
+            .on_snapshot(InventorySnapshotEvent::OffchainEquityReconciled {
+                symbol: symbol.clone(),
+                position: shares(55),
+                fetched_at: Utc::now(),
+                ledger_position: Some(shares(50)),
+                consecutive_polls: 0,
+                generation: Some(generation),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_available(&symbol, Venue::Hedging),
+            Some(shares(55)),
+            "stranded exposure must not keep the broker reconcile busy"
+        );
+        assert!(!trigger.divergence_gate.is_engaged(&symbol));
+    }
+
+    #[tokio::test]
+    async fn restored_active_redemption_timeout_preserves_stranded_exposure() {
+        let (trigger, symbol, _, active) = trigger_with_stranded_and_active_redemptions().await;
+        let cleanup = trigger
+            .cleanup_timed_out_redemption(&active, Utc::now())
+            .await
+            .unwrap();
+        let Some(RedemptionTimeoutCleanup::FailBeforeTeardown { tracking, .. }) = cleanup else {
+            panic!("a pre-send timeout fails before its teardown, got {cleanup:?}");
+        };
+        assert!(
+            trigger
+                .finish_deferred_redemption_timeout(&active, &tracking, true, Utc::now())
+                .await
+                .unwrap()
+        );
+        let view = trigger.inventory.read().await;
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::HyperEvm),
+            Some(shares(7))
+        );
+        assert_eq!(
+            view.stranded_redemption_quantity(&symbol, Chain::HyperEvm)
+                .unwrap(),
+            shares(7)
+        );
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Base),
+            Some(shares(3))
+        );
+        drop(view);
+    }
+
+    #[tokio::test]
+    async fn stranded_redemption_recovery_claim_rollback_and_completion_preserve_ownership() {
+        let (trigger, symbol, stranded, active) =
+            trigger_with_stranded_and_active_redemptions().await;
+        trigger
+            .on_redemption(active, make_redemption_completed())
+            .await
+            .unwrap();
+        let failed = EquityRedemption::Failed {
+            chain: Chain::HyperEvm,
+            symbol: symbol.clone(),
+            quantity: float!(7),
+            raindex_withdraw_tx: None,
+            redemption_tx: Some(TxHash::random()),
+            tokenization_request_id: Some(tokenization_request_id("old-stranded-provider")),
+            reason: Some("rejected".to_string()),
+            started_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+        let claim = trigger
+            .rebuild_redemption_tracking_for_recovery(&stranded, &failed)
+            .await
+            .unwrap();
+        let RecoveryClaim::Guarded { rollback, guard } = claim else {
+            panic!("recovery must carry its guard")
+        };
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .stranded_redemption_quantity(&symbol, Chain::HyperEvm)
+                .unwrap(),
+            shares(0)
+        );
+        trigger
+            .rollback_redemption_tracking_for_recovery(&stranded, &symbol, rollback)
+            .await
+            .unwrap();
+        drop(guard);
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .stranded_redemption_quantity(&symbol, Chain::HyperEvm)
+                .unwrap(),
+            shares(7)
+        );
+        let claim = trigger
+            .rebuild_redemption_tracking_for_recovery(&stranded, &failed)
+            .await
+            .unwrap();
+        trigger
+            .on_redemption(
+                stranded,
+                EquityRedemptionEvent::ProviderCompletionRecovered {
+                    tokenization_request_id: tokenization_request_id("old-stranded-provider"),
+                    recovered_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        drop(claim);
+        let view = trigger.inventory.read().await;
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::HyperEvm),
+            Some(shares(0))
+        );
+        assert_eq!(
+            view.stranded_redemption_quantity(&symbol, Chain::HyperEvm)
+                .unwrap(),
+            shares(0)
+        );
+        assert_eq!(
+            view.equity_available(&symbol, Venue::Hedging),
+            Some(shares(62))
+        );
+        drop(view);
+    }
+
+    #[tokio::test]
+    async fn later_failed_redemption_recovery_does_not_claim_older_stranded_exposure() {
+        let (trigger, symbol, _, active) = trigger_with_stranded_and_active_redemptions().await;
+        trigger
+            .on_redemption(active.clone(), make_redemption_rejected())
+            .await
+            .unwrap();
+        let failed = EquityRedemption::Failed {
+            chain: Chain::HyperEvm,
+            symbol: symbol.clone(),
+            quantity: float!(5),
+            raindex_withdraw_tx: None,
+            redemption_tx: Some(TxHash::random()),
+            tokenization_request_id: Some(tokenization_request_id("later-failed-provider")),
+            reason: Some("rejected".to_string()),
+            started_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+        let claim = trigger
+            .rebuild_redemption_tracking_for_recovery(&active, &failed)
+            .await
+            .unwrap();
+        {
+            let view = trigger.inventory.read().await;
+            assert_eq!(
+                view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::HyperEvm),
+                Some(shares(12))
+            );
+            assert_eq!(
+                view.stranded_redemption_quantity(&symbol, Chain::HyperEvm)
+                    .unwrap(),
+                shares(7)
+            );
+            drop(view);
+        }
+        trigger
+            .on_redemption(
+                active,
+                EquityRedemptionEvent::ProviderCompletionRecovered {
+                    tokenization_request_id: tokenization_request_id("later-failed-provider"),
+                    recovered_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        drop(claim);
+        let view = trigger.inventory.read().await;
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::HyperEvm),
+            Some(shares(7))
+        );
+        assert_eq!(
+            view.stranded_redemption_quantity(&symbol, Chain::HyperEvm)
+                .unwrap(),
+            shares(7)
+        );
+        drop(view);
+    }
+
     #[tokio::test]
     async fn redemption_nav_surplus_updates_tracking_and_inflight() {
         // When TokensUnwrapped delivers more than tracked (NAV appreciation),
@@ -20157,15 +23897,35 @@ mod tests {
         Usdc::new(float!(&n.to_string()))
     }
 
+    fn base_usdc_rebalance(direction: RebalanceDirection) -> ActiveUsdcRebalance {
+        ActiveUsdcRebalance::Known {
+            chain: Chain::Base,
+            direction,
+        }
+    }
+
     fn make_usdc_initiated(direction: RebalanceDirection, amount: Usdc) -> UsdcRebalanceEvent {
+        make_usdc_initiated_on(UsdcCorridor::BASE_CCTP, direction, amount)
+    }
+
+    fn make_usdc_initiated_on(
+        corridor: UsdcCorridor,
+        direction: RebalanceDirection,
+        amount: Usdc,
+    ) -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::Initiated {
-            corridor: UsdcCorridor::BASE_CCTP,
+            corridor,
             direction,
             amount,
             withdrawal_ref: TransferRef::OnchainTx(TxHash::random()),
             initiated_at: Utc::now(),
         }
     }
+
+    const ETHEREUM_CCTP: UsdcCorridor = UsdcCorridor::HubRouted {
+        chain: Chain::Ethereum,
+        hop: HopKind::Cctp,
+    };
 
     fn make_usdc_conversion_initiated(
         direction: RebalanceDirection,
@@ -20283,6 +24043,7 @@ mod tests {
         UsdcRebalanceEvent::DepositConfirmed {
             direction,
             deposit_confirmed_at: Utc::now(),
+            vault_deposit_block: None,
         }
     }
 
@@ -20706,7 +24467,10 @@ mod tests {
                 Utc::now(),
             )
             .unwrap()
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::AlpacaToBase),
+            );
         let reactor = make_trigger_with_inventory_config(
             inventory,
             test_config_with_timeout(Duration::from_secs(1)),
@@ -22011,6 +25775,40 @@ mod tests {
         );
     }
 
+    /// The operator exit kills only the failed transfer's queued rows, so the
+    /// corridor stops counting it as in flight.
+    #[tokio::test]
+    async fn kill_queued_usdc_hedging_jobs_kills_only_that_transfers_rows() {
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        let failed = UsdcRebalanceId(Uuid::new_v4());
+        let other = UsdcRebalanceId(Uuid::new_v4());
+        for id in [&failed, &other] {
+            service
+                .transfer_usdc_to_hedging_queue
+                .clone()
+                .push(TransferUsdcToHedging {
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    id: id.clone(),
+                    amount: usdc(100),
+                    revert_redrive_attempts: 0,
+                    backpressure_streak: BackpressureStreak::default(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let killed = service
+            .kill_queued_usdc_hedging_jobs(&failed)
+            .await
+            .unwrap();
+
+        assert_eq!(killed, 1);
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&service).await,
+            1
+        );
+    }
+
     #[tokio::test]
     async fn kill_zombie_job_is_noop_when_row_not_failed_retryable() {
         // kill_zombie_job's WHERE clause requires status='Failed' AND attempts <
@@ -22606,9 +26404,9 @@ mod tests {
         }
     }
 
-    /// Services for Base and HyperEVM, each listing `symbol` with wrapped
-    /// equity recovery enabled, so the test proves it is the chain and not
-    /// the recovery flag that keeps a secondary-chain mint out of the handoff.
+    /// Services for Base and HyperEVM, each listing `symbol` with rebalancing
+    /// and wrapped equity recovery enabled, the only rebalancing listing the
+    /// config loader accepts.
     fn recovery_enabled_services_on_both_chains(symbol: &Symbol) -> EquityTransferServices {
         let equities = ChainEquities {
             operational_limit: None,
@@ -22619,7 +26417,7 @@ mod tests {
                     tokenized_equity_derivative: Address::ZERO,
                     vault_ids: Vec::new(),
                     trading: OperationMode::Disabled,
-                    rebalancing: OperationMode::Enabled,
+                    rebalancing: RebalancingMode::Enabled,
                     wrapped_equity_recovery: OperationMode::Enabled,
                     operational_limit: None,
                     target_share: None,
@@ -22649,13 +26447,13 @@ mod tests {
         }
     }
 
-    /// A secondary-chain mint stuck after receipt is never handed to the
-    /// primary-chain recovery jobs, so an exhausted transfer job leaves the
-    /// symbol guard and the Position reservation in place. The transfer
-    /// timeout sweep is the durable owner that unlatches it on any chain: it
-    /// fails the mint, clears the guard and releases the reservation.
+    /// A secondary-chain mint that fails after receipt is held for that
+    /// chain's recovery. The transfer timeout sweep must leave it alone while
+    /// it is held and while a recovery attempt has claimed it, however long
+    /// the recovery takes: failing it would release the guard and the
+    /// reservation while recovery still moves the tokens.
     #[tokio::test]
-    async fn secondary_chain_mint_exhausted_after_receipt_is_unlatched_by_the_transfer_timeout() {
+    async fn secondary_chain_mint_held_after_receipt_survives_the_transfer_timeout() {
         let symbol = Symbol::new("AAPL").unwrap();
         let id = issuer_request_id("exhausted-secondary-mint");
         let service = make_trigger_with_inventory(InventoryView::default().with_equity(
@@ -22732,7 +26530,6 @@ mod tests {
             mint_store: mint_store.clone(),
             position_authority: Some((position_store, ExecutionThreshold::whole_share())),
             transfer_services: services,
-            primary_chain: Chain::Base,
             job_queue: service.transfer_equity_to_market_making_queue.clone(),
         };
         let job = TransferEquityToMarketMaking {
@@ -22745,65 +26542,84 @@ mod tests {
             position_reservation_retry_attempts: 0,
         };
 
-        let error = Job::perform(&job, &ctx).await.unwrap_err();
-        assert!(
-            matches!(
-                error,
-                TransferEquityToMarketMakingJobError::Transfer(MintTransferError::PostReceipt(_))
-            ),
-            "a secondary-chain PostReceipt must propagate for retry, got {error:?}"
-        );
-
-        Job::on_terminal_attempt(
-            &job,
-            &ctx,
-            &TaskIdentity::for_test("exhausted-secondary-mint"),
-        )
-        .await
-        .unwrap();
+        Job::perform(&job, &ctx).await.unwrap();
+        let held = equity::GuardState::HeldForRecovery {
+            chain: Chain::HyperEvm,
+        };
         assert_eq!(
             service.equity_in_progress.read().unwrap().get(&symbol),
-            Some(&equity::GuardState::ActiveTransfer { generation }),
-            "exhaustion keeps the guard while the mint aggregate is live"
+            Some(&held)
         );
-        assert_eq!(
-            position_projection
-                .load(&symbol)
-                .await
-                .unwrap()
-                .unwrap()
-                .equity_transfer_reservation
-                .unwrap()
-                .status,
-            EquityTransferReservationStatus::Confirmed
-        );
+
+        let assert_mint_untouched = async || {
+            assert!(matches!(
+                mint_store.load(&id).await.unwrap().unwrap(),
+                TokenizedEquityMint::TokensReceived { .. }
+            ));
+            assert!(service.mint_tracking.read().await.contains_key(&id));
+            assert_eq!(
+                position_projection
+                    .load(&symbol)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .equity_transfer_reservation
+                    .unwrap()
+                    .status,
+                EquityTransferReservationStatus::Confirmed
+            );
+        };
 
         service
             .expire_stuck_operations(Utc::now() + ChronoDuration::hours(24))
             .await
             .unwrap();
-
         assert_eq!(
             service.equity_in_progress.read().unwrap().get(&symbol),
-            None,
-            "the transfer timeout must release the exhausted secondary-chain mint's guard"
+            Some(&held)
         );
-        let mint = mint_store.load(&id).await.unwrap().unwrap();
-        assert!(
-            matches!(mint, TokenizedEquityMint::Failed { .. }),
-            "the transfer timeout must fail the mint, got {mint:?}"
-        );
+        assert_mint_untouched().await;
+
+        let recovery_guard = equity::claim_guard_for_recovery_or_orphan(
+            &service.equity_in_progress,
+            &symbol,
+            Chain::HyperEvm,
+        )
+        .unwrap();
+        let claimed = service
+            .equity_in_progress
+            .read()
+            .unwrap()
+            .get(&symbol)
+            .cloned();
+        assert!(matches!(
+            claimed,
+            Some(equity::GuardState::Recovering {
+                chain: Chain::HyperEvm,
+                ..
+            })
+        ));
+
+        service
+            .expire_stuck_operations(Utc::now() + ChronoDuration::hours(48))
+            .await
+            .unwrap();
         assert_eq!(
-            position_projection
-                .load(&symbol)
-                .await
+            service
+                .equity_in_progress
+                .read()
                 .unwrap()
-                .unwrap()
-                .equity_transfer_reservation,
-            None,
-            "the transfer timeout must release the Position reservation"
+                .get(&symbol)
+                .cloned(),
+            claimed
         );
-        assert!(!service.mint_tracking.read().await.contains_key(&id));
+        assert_mint_untouched().await;
+
+        drop(recovery_guard);
+        assert_eq!(
+            service.equity_in_progress.read().unwrap().get(&symbol),
+            Some(&held)
+        );
     }
 
     #[tokio::test]
@@ -23102,6 +26918,9 @@ mod tests {
             &id,
             EquityRedemptionCommand::Reconcile {
                 reason: "withdrawal verified dead onchain".to_string(),
+                proven_withdrawal: Some(
+                    crate::equity_redemption::prepared_withdrawal_for_test().tx_hash(),
+                ),
             },
             equity_services,
         )
@@ -23109,6 +26928,769 @@ mod tests {
         .unwrap();
 
         (service, id, symbol)
+    }
+
+    struct LiveRedemption {
+        service: Arc<RebalancingService>,
+        store: Arc<Store<EquityRedemption>>,
+        pool: SqlitePool,
+        services: EquityTransferServices,
+        id: RedemptionAggregateId,
+        symbol: Symbol,
+        notifier: Arc<CapturingNotifier>,
+    }
+
+    /// Drives a redemption to `TokensUnwrapped` through a store with the
+    /// trigger wired as its reactor, so tracking, inflight, and the symbol
+    /// guard are what the live bot would hold.
+    async fn live_redemption_at_tokens_unwrapped(label: &str) -> LiveRedemption {
+        let symbol = Symbol::new("tAAPL").unwrap();
+        let id = redemption_aggregate_id(label);
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
+                Utc::now(),
+            )
+            .unwrap();
+        let notifier = Arc::new(CapturingNotifier::default());
+        let service = make_trigger_with_inventory_config_and_notifier(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(60)),
+            notifier.clone(),
+        )
+        .await;
+        let ten_shares = U256::from(10_000_000_000_000_000_000_u128);
+        let services = EquityTransferServices {
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(
+                        MockRaindex::new().with_withdraw_transfer(Address::ZERO, ten_shares),
+                    ),
+                    vault_lookup: Arc::new(MockVaultLookup::new()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        };
+        let pool = crate::test_utils::setup_test_db().await;
+        let (mint_store, _) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+            .with(service.clone())
+            .build(services.clone())
+            .await
+            .unwrap();
+        let (store, _) = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .with(service.clone())
+            .build(services.clone())
+            .await
+            .unwrap();
+        service
+            .set_stores(
+                mint_store,
+                store.clone(),
+                Arc::new(test_store::<UsdcRebalance>(pool.clone(), ())),
+            )
+            .await;
+
+        store
+            .send(
+                &id,
+                EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
+                    symbol: symbol.clone(),
+                    quantity: float!(10),
+                    token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
+                    amount: ten_shares,
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                },
+            )
+            .await
+            .unwrap();
+        for command in [
+            EquityRedemptionCommand::RecordWithdrawSubmission {
+                tx_hash: crate::equity_redemption::prepared_withdrawal_for_test().tx_hash(),
+            },
+            EquityRedemptionCommand::ConfirmWithdraw,
+            EquityRedemptionCommand::UnwrapTokens,
+            EquityRedemptionCommand::SubmitUnwrap,
+            EquityRedemptionCommand::ConfirmUnwrap,
+        ] {
+            store.send(&id, command).await.unwrap();
+        }
+        service.equity_in_progress.write().unwrap().insert(
+            symbol.clone(),
+            equity::GuardState::ActiveTransfer {
+                generation: equity::GuardGeneration::default(),
+            },
+        );
+
+        LiveRedemption {
+            service,
+            store,
+            pool,
+            services,
+            id,
+            symbol,
+            notifier,
+        }
+    }
+
+    fn prepare_send_command() -> EquityRedemptionCommand {
+        EquityRedemptionCommand::PrepareSend {
+            prepared: st0x_evm::PreparedTransaction::for_test(TxHash::repeat_byte(0x5e), 7),
+            redemption_wallet: Address::repeat_byte(0x77),
+        }
+    }
+
+    async fn market_making_equity(
+        service: &RebalancingService,
+        symbol: &Symbol,
+    ) -> (Option<FractionalShares>, Option<FractionalShares>) {
+        let inventory = service.inventory.read().await;
+        (
+            inventory.equity_inflight(symbol, Venue::MarketMaking),
+            inventory.equity_available(symbol, Venue::MarketMaking),
+        )
+    }
+
+    async fn assert_redemption_still_owned(live: &LiveRedemption) {
+        assert!(
+            live.service
+                .redemption_tracking
+                .read()
+                .await
+                .contains_key(&live.id),
+            "the redemption must stay tracked"
+        );
+        assert!(
+            !live
+                .service
+                .timed_out_redemptions
+                .read()
+                .await
+                .contains_key(&live.id),
+            "the redemption must not be tombstoned"
+        );
+        assert!(
+            live.service
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&live.symbol),
+            "the symbol guard must stay held"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_signed_send_keeps_ownership_and_pages_until_its_receipt_confirms() {
+        let live = live_redemption_at_tokens_unwrapped("signed-send-timeout").await;
+        live.store
+            .send(&live.id, prepare_send_command())
+            .await
+            .unwrap();
+        let before = market_making_equity(&live.service, &live.symbol).await;
+        let past_timeout = Utc::now() + ChronoDuration::minutes(2);
+
+        live.service
+            .expire_stuck_redemptions(past_timeout)
+            .await
+            .unwrap();
+        live.service
+            .expire_stuck_redemptions(past_timeout)
+            .await
+            .unwrap();
+
+        assert_redemption_still_owned(&live).await;
+        assert_eq!(
+            market_making_equity(&live.service, &live.symbol).await,
+            before
+        );
+        let pages = live.notifier.messages();
+        assert_eq!(
+            pages.len(),
+            1,
+            "the timeout must page exactly once, got {pages:?}"
+        );
+        assert!(
+            pages[0].contains("0-value self-transfer at nonce 7")
+                && pages[0].contains(&format!(
+                    "stox transfer reconcile --kind redemption --id {}",
+                    live.id
+                )),
+            "the page must give the nonce-consume step before reconcile, got {}",
+            pages[0]
+        );
+
+        // The send lands after the timeout: the normal path records it.
+        live.store
+            .send(&live.id, EquityRedemptionCommand::SendTokens)
+            .await
+            .unwrap();
+        assert!(matches!(
+            live.store.load(&live.id).await.unwrap(),
+            Some(EquityRedemption::TokensSent { .. })
+        ));
+        assert_eq!(
+            live.service
+                .redemption_tracking
+                .read()
+                .await
+                .get(&live.id)
+                .map(|tracking| tracking.stage),
+            Some(RedemptionTrackingStage::TokensSent)
+        );
+        assert_redemption_still_owned(&live).await;
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_legacy_send_pending_keeps_ownership_and_pages() {
+        let live = live_redemption_at_tokens_unwrapped("legacy-send-timeout").await;
+        // A legacy row is only ever loaded from history, so no reactor saw it.
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+             SELECT 'EquityRedemption', ?1, MAX(sequence) + 1, \
+             'EquityRedemptionEvent::SendPending', '1', \
+             '{\"SendPending\":{\"pending_at\":\"2026-01-01T00:00:00Z\"}}', '{}' \
+             FROM events WHERE aggregate_id = ?1",
+        )
+        .bind(live.id.to_string())
+        .execute(&live.pool)
+        .await
+        .unwrap();
+        live.service
+            .redemption_tracking
+            .write()
+            .await
+            .get_mut(&live.id)
+            .unwrap()
+            .stage = RedemptionTrackingStage::SendPending;
+        let before = market_making_equity(&live.service, &live.symbol).await;
+
+        live.service
+            .expire_stuck_redemptions(Utc::now() + ChronoDuration::minutes(2))
+            .await
+            .unwrap();
+
+        assert_redemption_still_owned(&live).await;
+        assert_eq!(
+            market_making_equity(&live.service, &live.symbol).await,
+            before
+        );
+        let pages = live.notifier.messages();
+        assert!(
+            pages
+                .iter()
+                .any(|page| page.contains("legacy pending send to the issuer")
+                    && page.contains(&format!(
+                        "stox transfer reconcile --kind redemption --id {}",
+                        live.id
+                    ))),
+            "got {pages:?}"
+        );
+    }
+
+    /// The driver commits `PrepareSend` while its `SendPending` reactor waits
+    /// behind the sweep, so tracking still says `TokensUnwrapped`. The commit
+    /// is made through a store with no reactor to hold that state. The sweep's
+    /// `FailTransfer` is refused and the redemption must stay owned.
+    #[tokio::test]
+    async fn a_send_signed_behind_a_stale_tracked_stage_keeps_ownership() {
+        let live = live_redemption_at_tokens_unwrapped("signed-behind-stale-stage").await;
+        st0x_event_sorcery::send_command::<EquityRedemption>(
+            &live.pool,
+            &live.id,
+            prepare_send_command(),
+            live.services.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            live.service
+                .redemption_tracking
+                .read()
+                .await
+                .get(&live.id)
+                .map(|tracking| tracking.stage),
+            Some(RedemptionTrackingStage::TokensUnwrapped)
+        );
+        let before = market_making_equity(&live.service, &live.symbol).await;
+
+        live.service
+            .expire_stuck_redemptions(Utc::now() + ChronoDuration::minutes(2))
+            .await
+            .unwrap();
+
+        assert_redemption_still_owned(&live).await;
+        assert_eq!(
+            market_making_equity(&live.service, &live.symbol).await,
+            before
+        );
+        assert!(matches!(
+            live.store.load(&live.id).await.unwrap(),
+            Some(EquityRedemption::SendPending {
+                prepared_send: Some(_),
+                ..
+            })
+        ));
+        assert!(
+            live.service
+                .redemption_timeout_failing
+                .read()
+                .await
+                .is_empty()
+        );
+    }
+
+    /// The tracked stage can lag several driver commits behind the durable
+    /// one: here tracking still says `UnwrapSubmitted` while the driver has
+    /// confirmed the unwrap and signed the send. The sweep must not tear down
+    /// before its `FailTransfer`, which the signed send refuses.
+    #[tokio::test]
+    async fn a_send_signed_behind_a_tracked_unwrap_keeps_ownership() {
+        let live = live_redemption_at_tokens_unwrapped("signed-behind-tracked-unwrap").await;
+        st0x_event_sorcery::send_command::<EquityRedemption>(
+            &live.pool,
+            &live.id,
+            prepare_send_command(),
+            live.services.clone(),
+        )
+        .await
+        .unwrap();
+        live.service
+            .redemption_tracking
+            .write()
+            .await
+            .get_mut(&live.id)
+            .unwrap()
+            .stage = RedemptionTrackingStage::UnwrapSubmitted;
+        let before = market_making_equity(&live.service, &live.symbol).await;
+
+        live.service
+            .expire_stuck_redemptions(Utc::now() + ChronoDuration::minutes(2))
+            .await
+            .unwrap();
+
+        assert_redemption_still_owned(&live).await;
+        assert_eq!(
+            market_making_equity(&live.service, &live.symbol).await,
+            before
+        );
+        assert!(matches!(
+            live.store.load(&live.id).await.unwrap(),
+            Some(EquityRedemption::SendPending {
+                prepared_send: Some(_),
+                ..
+            })
+        ));
+        assert!(
+            live.service
+                .redemption_timeout_failing
+                .read()
+                .await
+                .is_empty()
+        );
+    }
+
+    /// Two sweeps can time out the same redemption. Only the one that claims
+    /// the failure marker fails it; the other skips, so it can never commit a
+    /// `FailTransfer` after the owner released the marker.
+    #[tokio::test]
+    async fn a_second_sweep_skips_a_redemption_another_sweep_is_failing() {
+        let live = live_redemption_at_tokens_unwrapped("concurrent-timeout-sweeps").await;
+        live.service
+            .redemption_timeout_failing
+            .write()
+            .await
+            .insert(live.id.clone());
+
+        let cleanup = live
+            .service
+            .cleanup_timed_out_redemption(&live.id, Utc::now() + ChronoDuration::minutes(2))
+            .await
+            .unwrap();
+
+        assert!(cleanup.is_none(), "got {cleanup:?}");
+        assert_redemption_still_owned(&live).await;
+        assert!(
+            live.service
+                .redemption_timeout_failing
+                .read()
+                .await
+                .contains(&live.id),
+            "the owning sweep's marker must stay in place"
+        );
+        assert!(matches!(
+            live.store.load(&live.id).await.unwrap(),
+            Some(EquityRedemption::TokensUnwrapped { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_failed_timeout_write_keeps_ownership_when_live_or_unreadable() {
+        let live = live_redemption_at_tokens_unwrapped("failed-timeout-write").await;
+        let tracking = live.service.redemption_tracking.read().await[&live.id].clone();
+        let before = market_making_equity(&live.service, &live.symbol).await;
+        assert!(
+            !live
+                .service
+                .finish_deferred_redemption_timeout(&live.id, &tracking, false, Utc::now())
+                .await
+                .unwrap()
+        );
+        assert_redemption_still_owned(&live).await;
+        live.pool.close().await;
+        assert!(
+            !live
+                .service
+                .finish_deferred_redemption_timeout(&live.id, &tracking, false, Utc::now())
+                .await
+                .unwrap()
+        );
+        assert_redemption_still_owned(&live).await;
+        assert_eq!(
+            market_making_equity(&live.service, &live.symbol).await,
+            before
+        );
+    }
+
+    /// Another writer fails the redemption while the sweep owns its
+    /// `TransferFailed`, so the reactor skips the event and the sweep's own
+    /// `FailTransfer` is refused. The teardown must still release the Position
+    /// reservation, or the symbol's next equity transfer cannot reserve.
+    #[tokio::test]
+    async fn a_timeout_failed_by_another_writer_still_releases_the_reservation() {
+        let live = live_redemption_at_tokens_unwrapped("failed-by-another-writer").await;
+        let reservation_id = EquityTransferReservationId::from_uuid(live.id.0);
+        seed_confirmed_transfer_reservation(&live.service, &live.symbol, reservation_id).await;
+        let tracking = live.service.redemption_tracking.read().await[&live.id].clone();
+        live.service
+            .redemption_timeout_failing
+            .write()
+            .await
+            .insert(live.id.clone());
+        live.store
+            .send(
+                &live.id,
+                EquityRedemptionCommand::FailTransfer {
+                    reason: "operator failed the transfer".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        live.service
+            .fail_then_tear_down_timed_out_redemption(
+                &live.id,
+                &tracking,
+                Duration::from_secs(120),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !live
+                .service
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&live.symbol)
+        );
+        let position = live
+            .service
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap()
+            .load(&live.symbol)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(position.equity_transfer_reservation, None);
+    }
+
+    /// After a restart the pending send's timeout restarts from its first
+    /// signing, the clock fee replacements stop on, not from the unwrap: a page
+    /// that fired earlier would say replacements stopped while they continue.
+    #[tokio::test]
+    async fn a_restart_restores_the_issuer_send_timeout_from_its_first_signing() {
+        let live = live_redemption_at_tokens_unwrapped("restart-send-clock").await;
+        let first_signed_at = Utc::now() + ChronoDuration::minutes(10);
+        live.store
+            .send(
+                &live.id,
+                EquityRedemptionCommand::PrepareSendAt {
+                    prepared: st0x_evm::PreparedTransaction::for_test(TxHash::repeat_byte(0x5f), 8),
+                    redemption_wallet: Address::repeat_byte(0x77),
+                    pending_at: first_signed_at,
+                },
+            )
+            .await
+            .unwrap();
+        let entity = live.store.load(&live.id).await.unwrap().unwrap();
+        live.service
+            .redemption_tracking
+            .write()
+            .await
+            .remove(&live.id);
+
+        live.service
+            .recover_redemption_state(&live.id, &entity)
+            .await
+            .unwrap();
+
+        let tracking = live.service.redemption_tracking.read().await[&live.id].clone();
+        assert_eq!(tracking.stage, RedemptionTrackingStage::SendPending);
+        assert_eq!(tracking.last_progress_at, first_signed_at);
+    }
+
+    /// A send the driver signed after the sweep read a `TokensUnwrapped`
+    /// tracking is paged on its durable first signing time, not the unwrap:
+    /// fee replacements stop on that clock, so an earlier page would say they
+    /// stopped while they continue.
+    #[tokio::test]
+    async fn the_sweep_pages_a_send_the_tracking_has_not_seen_from_its_first_signing() {
+        let live = live_redemption_at_tokens_unwrapped("unseen-send-clock").await;
+        let first_signed_at = Utc::now() + ChronoDuration::minutes(10);
+        // Bare `send_command` dispatches no reactor, so the tracking stays at
+        // `TokensUnwrapped` with the unwrap as its progress time.
+        st0x_event_sorcery::send_command::<EquityRedemption>(
+            &live.pool,
+            &live.id,
+            EquityRedemptionCommand::PrepareSendAt {
+                prepared: st0x_evm::PreparedTransaction::for_test(TxHash::repeat_byte(0x60), 9),
+                redemption_wallet: Address::repeat_byte(0x77),
+                pending_at: first_signed_at,
+            },
+            live.services.clone(),
+        )
+        .await
+        .unwrap();
+
+        live.service
+            .expire_stuck_redemptions(Utc::now() + ChronoDuration::minutes(2))
+            .await
+            .unwrap();
+        assert!(
+            live.notifier.messages().is_empty(),
+            "paged before the send's own timeout: {:?}",
+            live.notifier.messages()
+        );
+
+        live.service
+            .expire_stuck_redemptions(first_signed_at + ChronoDuration::minutes(2))
+            .await
+            .unwrap();
+        assert_eq!(live.notifier.messages().len(), 1);
+        assert_redemption_still_owned(&live).await;
+    }
+
+    #[tokio::test]
+    async fn issuer_timeout_notification_is_deferred_outside_the_reactor_gate() {
+        let live = live_redemption_at_tokens_unwrapped("deferred-send-page").await;
+        live.store
+            .send(&live.id, prepare_send_command())
+            .await
+            .unwrap();
+        let now = Utc::now() + ChronoDuration::minutes(2);
+        let cleanup = live
+            .service
+            .cleanup_timed_out_redemption(&live.id, now)
+            .await
+            .unwrap()
+            .unwrap();
+        let RedemptionTimeoutCleanup::PageIssuerSend {
+            tracking,
+            newest_send,
+        } = cleanup
+        else {
+            panic!("expected a deferred page");
+        };
+        assert!(live.notifier.messages().is_empty());
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            live.store
+                .send(&live.id, EquityRedemptionCommand::SendTokens),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        live.service
+            .page_timed_out_issuer_send(&live.id, &tracking, newest_send.as_ref(), now)
+            .await;
+        assert_eq!(live.notifier.messages().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_unwrapped_redemption_fails_before_its_teardown() {
+        let live = live_redemption_at_tokens_unwrapped("unwrapped-timeout").await;
+        let (_, available_before) = market_making_equity(&live.service, &live.symbol).await;
+
+        live.service
+            .expire_stuck_redemptions(Utc::now() + ChronoDuration::minutes(2))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            live.store.load(&live.id).await.unwrap(),
+            Some(EquityRedemption::Failed { .. })
+        ));
+        assert!(
+            !live
+                .service
+                .redemption_tracking
+                .read()
+                .await
+                .contains_key(&live.id)
+        );
+        assert!(
+            live.service
+                .timed_out_redemptions
+                .read()
+                .await
+                .contains_key(&live.id)
+        );
+        assert!(
+            !live
+                .service
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&live.symbol)
+        );
+        // The timeout teardown clears the inflight for snapshots to heal; the
+        // reactor's `TransferFailed` cancel would have returned it to available.
+        assert_eq!(
+            market_making_equity(&live.service, &live.symbol).await,
+            (Some(shares(0)), available_before)
+        );
+        assert!(
+            live.service
+                .redemption_timeout_failing
+                .read()
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_and_legacy_send_reconciliation_does_not_credit_vault_availability() {
+        for signed in [false, true] {
+            let live = live_redemption_at_tokens_unwrapped(if signed {
+                "signed-reactor-reconcile"
+            } else {
+                "legacy-reactor-reconcile"
+            })
+            .await;
+            if signed {
+                live.store
+                    .send(&live.id, prepare_send_command())
+                    .await
+                    .unwrap();
+            } else {
+                sqlx::query("INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) SELECT 'EquityRedemption', ?1, MAX(sequence) + 1, 'EquityRedemptionEvent::SendPending', '1', '{\"SendPending\":{\"pending_at\":\"2026-01-01T00:00:00Z\"}}', '{}' FROM events WHERE aggregate_id = ?1")
+                    .bind(live.id.to_string()).execute(&live.pool).await.unwrap();
+                live.service
+                    .redemption_tracking
+                    .write()
+                    .await
+                    .get_mut(&live.id)
+                    .unwrap()
+                    .stage = RedemptionTrackingStage::SendPending;
+            }
+            let (_, available_before) = market_making_equity(&live.service, &live.symbol).await;
+            live.store
+                .send(
+                    &live.id,
+                    EquityRedemptionCommand::Reconcile {
+                        reason: "verified the send to the issuer onchain".to_string(),
+                        proven_withdrawal: signed.then(|| TxHash::repeat_byte(0x5e)),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                market_making_equity(&live.service, &live.symbol).await,
+                (Some(FractionalShares::new(float!(0))), available_before)
+            );
+            assert!(
+                live.service
+                    .divergence_gate
+                    .claim_pending_onchain_equity_reconciles(Chain::Base)
+                    .contains_key(&live.symbol)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_sweep_observes_an_operator_reconcile_of_a_signed_send() {
+        let live = live_redemption_at_tokens_unwrapped("signed-send-reconcile").await;
+        live.store
+            .send(&live.id, prepare_send_command())
+            .await
+            .unwrap();
+        let (_, available_before) = market_making_equity(&live.service, &live.symbol).await;
+        st0x_event_sorcery::send_command::<EquityRedemption>(
+            &live.pool,
+            &live.id,
+            EquityRedemptionCommand::Reconcile {
+                reason: "nonce 7 consumed by a 0-value self-transfer".to_string(),
+                proven_withdrawal: Some(TxHash::repeat_byte(0x5e)),
+            },
+            live.services.clone(),
+        )
+        .await
+        .unwrap();
+
+        live.service
+            .expire_stuck_redemptions(Utc::now())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            market_making_equity(&live.service, &live.symbol).await,
+            (Some(FractionalShares::new(float!(0))), available_before)
+        );
+        assert!(
+            !live
+                .service
+                .redemption_tracking
+                .read()
+                .await
+                .contains_key(&live.id)
+        );
+        assert!(
+            !live
+                .service
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&live.symbol)
+        );
+        let payloads: Vec<Vec<u8>> = sqlx_apalis::query_scalar(
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferEquityToHedging>())
+        .fetch_all(live.service.transfer_equity_to_hedging_queue.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            payloads.len(),
+            1,
+            "the reconciled send's nonce must be released through a resume job"
+        );
     }
 
     #[tokio::test]
@@ -24251,7 +28833,10 @@ mod tests {
                 now,
             )
             .unwrap()
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::BaseToAlpaca),
+            );
         let trigger = make_trigger_with_inventory_config(
             inventory,
             test_config_with_timeout(Duration::from_secs(1)),
@@ -24314,7 +28899,7 @@ mod tests {
         );
 
         // Source-venue inflight for BaseToAlpaca is MarketMaking (USDC left the
-        // Base chain). The sweep zeroes it via clear_usdc_inflight (inlined in
+        // Base chain). The sweep zeroes it via clear_usdc_inflight_at (inlined in
         // the Reconciled branch of cleanup_timed_out_usdc_rebalance).
         // active_usdc_rebalance must also be cleared (invariant from the
         // pre-burn timeout path; the Reconciled sweep path must match).
@@ -24377,7 +28962,10 @@ mod tests {
                 now,
             )
             .unwrap()
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::BaseToAlpaca),
+            );
         let trigger = make_trigger_with_inventory_config(
             inventory,
             // Use a 30-minute timeout so that `last_progress_at = now` is
@@ -24496,7 +29084,10 @@ mod tests {
                 now,
             )
             .unwrap()
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::BaseToAlpaca),
+            );
         let trigger = make_trigger_with_inventory_config(
             inventory,
             test_config_with_timeout(Duration::from_secs(1800)),
@@ -24772,7 +29363,10 @@ mod tests {
                 now,
             )
             .unwrap()
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::BaseToAlpaca),
+            );
         let trigger = make_trigger_with_inventory_config(
             inventory,
             test_config_with_timeout(Duration::from_secs(1)),
@@ -25077,7 +29671,10 @@ mod tests {
                 now,
             )
             .unwrap()
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::AlpacaToBase),
+            );
         let trigger = make_trigger_with_inventory_config(
             inventory,
             test_config_with_timeout(Duration::from_secs(1)),
@@ -25561,7 +30158,10 @@ mod tests {
                 Utc::now(),
             )
             .unwrap()
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::BaseToAlpaca),
+            );
         let trigger = make_trigger_with_inventory_config(
             inventory,
             test_config_with_timeout(Duration::from_secs(1)),
@@ -25738,7 +30338,12 @@ mod tests {
             .await
             .unwrap();
         store
-            .send(&id, UsdcRebalanceCommand::ConfirmDeposit)
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmDeposit {
+                    vault_deposit_block: None,
+                },
+            )
             .await
             .unwrap();
         store
@@ -25770,7 +30375,10 @@ mod tests {
                 Utc::now(),
             )
             .unwrap()
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::BaseToAlpaca),
+            );
         let trigger = make_trigger_with_inventory_config(
             inventory,
             test_config_with_timeout(Duration::from_secs(1)),
@@ -25918,7 +30526,10 @@ mod tests {
                 Utc::now(),
             )
             .unwrap()
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::AlpacaToBase),
+            );
         let trigger = make_trigger_with_inventory_config(
             inventory,
             test_config_with_timeout(Duration::from_secs(1)),
@@ -26521,7 +31132,10 @@ mod tests {
                 now,
             )
             .unwrap()
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::AlpacaToBase),
+            );
         let trigger = make_trigger_with_inventory_config(
             inventory,
             test_config_with_timeout(Duration::from_secs(1)),
@@ -28427,6 +33041,10 @@ mod tests {
              AlpacaToBase pre-burn ConversionFailed does not hold the guard, \
              so the running bot must clear it without a restart"
         );
+        assert!(
+            trigger.usdc_conversion_cooling_down(Utc::now()).await,
+            "the cleared pre-withdrawal conversion failure starts the conversion cooldown"
+        );
     }
 
     /// Regression guard for the durable fallback: a BaseToAlpaca
@@ -28470,7 +33088,9 @@ mod tests {
             UsdcRebalanceCommand::InitiateDeposit {
                 deposit: TransferRef::OnchainTx(mint_tx),
             },
-            UsdcRebalanceCommand::ConfirmDeposit,
+            UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            },
             UsdcRebalanceCommand::InitiatePostDepositConversion {
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
                 amount: usdc(399),
@@ -28509,6 +33129,10 @@ mod tests {
             "the durable fallback must hold the transfer's own corridor for a genuinely \
              post-burn (BaseToAlpaca post-deposit) conversion failure"
         );
+        assert!(
+            !trigger.usdc_conversion_cooling_down(Utc::now()).await,
+            "a post-deposit conversion failure starts no conversion cooldown"
+        );
     }
 
     #[tokio::test]
@@ -28535,6 +33159,10 @@ mod tests {
         assert!(
             !trigger.usdc_tracking.read().await.contains_key(&id),
             "a conversion failure with no prior tracking should not fabricate a context"
+        );
+        assert!(
+            !trigger.usdc_conversion_cooling_down(Utc::now()).await,
+            "a failure kept as possibly post-burn starts no conversion cooldown"
         );
 
         let inventory = trigger.inventory.read().await;
@@ -28756,22 +33384,22 @@ mod tests {
 
     #[tokio::test]
     async fn usdc_rebalancing_disabled_when_cash_ratio_absent() {
-        // Regression: when usdc is None, startup must not require assets.cash.vault_id.
-        // The trigger returns no USDC rebalancing params, so no USDC vault lookup occurs.
+        // No cash table on the corridor's chain returns no params, so startup needs no
+        // cash vault_id.
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let wrapper = Arc::new(MockWrapper::new());
 
         let schedulers = RebalancingSchedulers::new(&apalis_pool);
         let trigger = RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: None,
+                usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(30 * 60),
+                recovery_hold_alert_after: Duration::from_secs(60 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
                     ChainRebalancingConfig::for_test(ChainAssets::default()),
@@ -28798,8 +33426,16 @@ mod tests {
             Arc::new(crate::alerts::LogNotifier),
         );
 
+        let base_cctp = UsdcCorridorCtx {
+            corridor: UsdcCorridor::BASE_CCTP,
+            threshold: ImbalanceThreshold {
+                target: float!(0.5),
+                deviation: float!(0.2),
+            },
+        };
+        assert_eq!(trigger.config.usdc.active().count(), 0);
         assert!(
-            trigger.usdc_rebalancing_params().is_none(),
+            trigger.usdc_rebalancing_params(&base_cctp).is_none(),
             "Expected usdc_rebalancing_params to be None when cash ratio is absent"
         );
     }
@@ -28818,8 +33454,9 @@ mod tests {
             .as_mut()
             .unwrap()
             .rebalancing = OperationMode::Disabled;
+        let base_cctp = *trigger.config.usdc.active().next().unwrap();
 
-        assert!(trigger.usdc_rebalancing_params().is_none());
+        assert!(trigger.usdc_rebalancing_params(&base_cctp).is_none());
     }
 
     /// Spy reactor that records all dispatched events for verification.
@@ -28938,7 +33575,12 @@ mod tests {
             .unwrap();
 
         store
-            .send(&id, UsdcRebalanceCommand::ConfirmDeposit)
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmDeposit {
+                    vault_deposit_block: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -29032,7 +33674,12 @@ mod tests {
             .unwrap();
 
         store
-            .send(&id, UsdcRebalanceCommand::ConfirmDeposit)
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmDeposit {
+                    vault_deposit_block: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -29269,6 +33916,7 @@ mod tests {
                 UsdcRebalanceEvent::DepositConfirmed {
                     direction: RebalanceDirection::AlpacaToBase,
                     deposit_confirmed_at: chrono::Utc::now(),
+                    vault_deposit_block: None,
                 },
             )
             .await
@@ -29357,7 +34005,12 @@ mod tests {
             .unwrap();
 
         store
-            .send(&id, UsdcRebalanceCommand::ConfirmDeposit)
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmDeposit {
+                    vault_deposit_block: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -29904,6 +34557,7 @@ mod tests {
                 mints,
                 redemptions: BTreeMap::new(),
                 fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
             },
         )
         .await
@@ -29984,6 +34638,7 @@ mod tests {
                 mints: BTreeMap::new(),
                 redemptions: BTreeMap::new(),
                 fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
             },
         )
         .await
@@ -30060,6 +34715,7 @@ mod tests {
             mints: BTreeMap::new(),
             redemptions: BTreeMap::from([(symbol.clone(), shares(10))]),
             fetched_at: Utc::now(),
+            base_redemptions_chain_scoped: true,
         };
         trigger.on_snapshot(pending.clone()).await.unwrap();
 
@@ -30081,6 +34737,7 @@ mod tests {
                 mints: BTreeMap::new(),
                 redemptions: BTreeMap::new(),
                 fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
             },
         )
         .await
@@ -30126,6 +34783,7 @@ mod tests {
             mints: BTreeMap::new(),
             redemptions: BTreeMap::from([(symbol.clone(), shares(10))]),
             fetched_at: Utc::now(),
+            base_redemptions_chain_scoped: true,
         };
         reactor.on_snapshot(pending.clone()).await.unwrap();
         reactor
@@ -30168,6 +34826,7 @@ mod tests {
             mints: BTreeMap::new(),
             redemptions: BTreeMap::from([(symbol.clone(), shares(10))]),
             fetched_at: Utc::now(),
+            base_redemptions_chain_scoped: true,
         };
         let inventory_guard = reactor.inventory.write().await;
         let recovering = reactor.clone();
@@ -30309,6 +34968,7 @@ mod tests {
                 mints: BTreeMap::new(),
                 redemptions: BTreeMap::new(),
                 fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
             },
         )
         .await
@@ -30384,6 +35044,7 @@ mod tests {
                 mints: BTreeMap::new(),
                 redemptions: BTreeMap::new(),
                 fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
             },
         )
         .await
@@ -30461,6 +35122,7 @@ mod tests {
                 mints: BTreeMap::new(),
                 redemptions: BTreeMap::new(),
                 fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
             },
         )
         .await
@@ -30617,6 +35279,7 @@ mod tests {
                 mints: mints.clone(),
                 redemptions: BTreeMap::new(),
                 fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
             },
         )
         .await
@@ -30630,6 +35293,7 @@ mod tests {
                 mints,
                 redemptions: BTreeMap::new(),
                 fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
             },
         )
         .await
@@ -30645,6 +35309,72 @@ mod tests {
             0,
             "Inflight still present should not trigger recheck"
         );
+    }
+
+    #[tokio::test]
+    async fn chain_inflight_reactor_suppresses_only_the_redemptions_chain() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let fetched_at = Utc::now();
+        for suppressed_chain in [Chain::Base, Chain::Robinhood] {
+            let inventory = InventoryView::default()
+                .with_equity(symbol.clone(), shares(50), shares(50))
+                .update_equity_at(
+                    &symbol,
+                    Chain::Robinhood,
+                    Inventory::available(Venue::MarketMaking, Operator::Add, shares(50)),
+                    fetched_at,
+                )
+                .unwrap();
+            let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+            reactor.suppressed_inflight_symbols.write().await.insert(
+                (symbol.clone(), suppressed_chain),
+                fetched_at + chrono::Duration::seconds(1),
+            );
+            apply_and_dispatch_snapshot(
+                reactor.clone(),
+                InventorySnapshotId {
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+                InventorySnapshotEvent::ChainInflightRedemptions {
+                    chain: Chain::Robinhood,
+                    redemptions: BTreeMap::from([(symbol.clone(), shares(7))]),
+                    fetched_at,
+                },
+            )
+            .await
+            .unwrap();
+            let expected = if suppressed_chain == Chain::Robinhood {
+                FractionalShares::ZERO
+            } else {
+                shares(7)
+            };
+            let view = reactor.inventory.read().await;
+            assert_eq!(
+                view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Robinhood),
+                Some(expected)
+            );
+            assert_eq!(
+                view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Base),
+                Some(FractionalShares::ZERO)
+            );
+            drop(view);
+        }
+    }
+
+    #[test]
+    fn secondary_suppression_filters_shared_mints_but_keeps_base_redemptions() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let pending = BTreeMap::from([(symbol.clone(), shares(7))]);
+        let suppressed = HashSet::from([(symbol, Chain::Robinhood)]);
+        let (mints, redemptions) = RebalancingService::filter_suppressed_inflight_snapshot(
+            &pending,
+            &pending,
+            Chain::Base,
+            &suppressed,
+        );
+        assert!(mints.is_empty());
+        assert_eq!(redemptions, pending);
     }
 
     #[tokio::test]
@@ -30724,6 +35454,7 @@ mod tests {
                 mints: stale_mints,
                 redemptions: BTreeMap::new(),
                 fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
             },
         )
         .await
@@ -30822,6 +35553,7 @@ mod tests {
                 mints: BTreeMap::new(),
                 redemptions: stale_redemptions,
                 fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
             },
         )
         .await
@@ -30952,6 +35684,7 @@ mod tests {
                     mints: BTreeMap::new(),
                     redemptions,
                     fetched_at: stale_snapshot_time,
+                    base_redemptions_chain_scoped: true,
                 },
             ),
         )
@@ -30987,6 +35720,7 @@ mod tests {
                     mints: BTreeMap::new(),
                     redemptions: newer_redemptions,
                     fetched_at: newer_snapshot_time,
+                    base_redemptions_chain_scoped: true,
                 },
             ),
         )
@@ -31006,7 +35740,7 @@ mod tests {
                 .suppressed_inflight_symbols
                 .read()
                 .await
-                .contains_key(&symbol),
+                .contains_key(&(symbol.clone(), Chain::Base)),
             "a newer inflight snapshot should retire suppression for the symbol"
         );
     }
@@ -31086,6 +35820,7 @@ mod tests {
                     mints: BTreeMap::new(),
                     redemptions: stale_redemptions,
                     fetched_at: cleared_at,
+                    base_redemptions_chain_scoped: true,
                 },
             ),
         )
@@ -31106,7 +35841,7 @@ mod tests {
                 .suppressed_inflight_symbols
                 .read()
                 .await
-                .contains_key(&symbol),
+                .contains_key(&(symbol.clone(), Chain::Base)),
             "suppression should remain active until a newer inflight poll arrives"
         );
     }
@@ -31154,11 +35889,11 @@ mod tests {
 
         // Before timeout the redemption is owned, so a poll would count it.
         let ownership = trigger.pending_request_ownership().await;
-        assert!(ownership.redemption_txs.contains(&redemption_tx));
+        assert!(ownership.redemption_txs.contains_key(&redemption_tx));
         assert!(
             ownership
                 .redemption_tokenizations
-                .contains(&tokenization_request_id)
+                .contains_key(&tokenization_request_id)
         );
 
         trigger.expire_stuck_operations(Utc::now()).await.unwrap();
@@ -31166,11 +35901,11 @@ mod tests {
         // After timeout it is no longer owned: a provider poll that STILL lists
         // this request treats it as external and does not re-introduce inflight.
         let ownership = trigger.pending_request_ownership().await;
-        assert!(!ownership.redemption_txs.contains(&redemption_tx));
+        assert!(!ownership.redemption_txs.contains_key(&redemption_tx));
         assert!(
             !ownership
                 .redemption_tokenizations
-                .contains(&tokenization_request_id)
+                .contains_key(&tokenization_request_id)
         );
 
         assert_eq!(
@@ -31246,6 +35981,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timed_out_mint_cleanup_leaves_a_mint_handed_to_recovery_untouched() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .update_equity(
+                &symbol,
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, shares(10)),
+                now,
+            )
+            .unwrap();
+        let reactor = make_trigger_with_inventory_and_registry_config(
+            inventory,
+            &symbol,
+            test_config_with_timeout(Duration::from_secs(60)),
+        )
+        .await;
+        let trigger = reactor.clone();
+        let id = issuer_request_id("timed-out-mint-handed-off");
+
+        trigger.mint_tracking.write().await.insert(
+            id.clone(),
+            MintTracking {
+                chain: Chain::Base,
+                symbol: symbol.clone(),
+                quantity: shares(10),
+                tokenization_request_id: None,
+                stage: MintTrackingStage::TokensReceived,
+                last_progress_at: now - ChronoDuration::minutes(5),
+            },
+        );
+
+        // The handoff lands after the sweep read `ActiveTransfer` and before
+        // the cleanup runs.
+        trigger.equity_in_progress.write().unwrap().insert(
+            symbol.clone(),
+            equity::GuardState::HeldForRecovery { chain: Chain::Base },
+        );
+
+        let cleanup = trigger.cleanup_timed_out_mint(&id, now).await.unwrap();
+
+        assert!(cleanup.is_none());
+        assert!(trigger.mint_tracking.read().await.contains_key(&id));
+        assert!(!trigger.timed_out_mints.read().await.contains_key(&id));
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(10)),
+        );
+        assert!(matches!(
+            trigger.equity_in_progress.read().unwrap().get(&symbol),
+            Some(equity::GuardState::HeldForRecovery { chain: Chain::Base })
+        ));
+    }
+
+    #[tokio::test]
     async fn timed_out_mint_cleanup_tombstones_before_late_requested_event() {
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
@@ -31299,7 +36093,7 @@ mod tests {
                 .suppressed_inflight_symbols
                 .read()
                 .await
-                .contains_key(&symbol),
+                .contains_key(&(symbol.clone(), Chain::Base)),
             "inflight suppression should already exist after cleanup"
         );
 
@@ -31398,6 +36192,7 @@ mod tests {
             id.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: Utc::now(),
             },
         );
@@ -31469,7 +36264,7 @@ mod tests {
                 .suppressed_inflight_symbols
                 .read()
                 .await
-                .contains_key(&symbol),
+                .contains_key(&(symbol.clone(), Chain::Base)),
             "inflight suppression should already exist after cleanup"
         );
 
@@ -31655,6 +36450,7 @@ mod tests {
             id.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: Utc::now(),
             },
         );
@@ -31684,7 +36480,10 @@ mod tests {
                 now,
             )
             .unwrap()
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::BaseToAlpaca),
+            );
         let trigger = make_trigger_with_inventory(inventory).await;
 
         trigger.usdc_tracking.write().await.insert(
@@ -31764,7 +36563,10 @@ mod tests {
                 now,
             )
             .unwrap()
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::BaseToAlpaca),
+            );
         let trigger = make_trigger_with_inventory(inventory).await;
 
         trigger.usdc_tracking.write().await.insert(
@@ -31856,7 +36658,7 @@ mod tests {
             .suppressed_inflight_symbols
             .write()
             .await
-            .insert(symbol.clone(), cleared_at);
+            .insert((symbol.clone(), Chain::Base), cleared_at);
 
         trigger
             .on_snapshot_recovery(
@@ -31869,6 +36671,7 @@ mod tests {
                     mints: BTreeMap::new(),
                     redemptions: BTreeMap::from([(symbol.clone(), shares(10))]),
                     fetched_at: cleared_at,
+                    base_redemptions_chain_scoped: true,
                 },
             )
             .await
@@ -31887,8 +36690,202 @@ mod tests {
                 .suppressed_inflight_symbols
                 .read()
                 .await
-                .contains_key(&symbol),
+                .contains_key(&(symbol.clone(), Chain::Base)),
             "stale recovery snapshots should keep suppression active"
+        );
+    }
+
+    #[tokio::test]
+    async fn redemption_recovery_rollback_preserves_a_concurrent_provider_clear() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        for (added, current, stranded, expected) in
+            [(0, 0, None, 0), (3, 6, None, 3), (0, 0, Some(7), 7)]
+        {
+            let inventory = InventoryView::default()
+                .with_equity(symbol.clone(), shares(50), shares(50))
+                .update_equity_at(
+                    &symbol,
+                    Chain::Base,
+                    Inventory::set_inflight(Venue::MarketMaking, shares(current)),
+                    Utc::now(),
+                )
+                .unwrap();
+            let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+            trigger
+                .rollback_redemption_tracking_for_recovery(
+                    &RedemptionAggregateId::generate(),
+                    &symbol,
+                    RecoveryRollback::RestoreRedemptionInventory {
+                        chain: Chain::Base,
+                        added: shares(added),
+                        stranded: stranded.map(|quantity| {
+                            crate::equity_redemption::StrandedRedemption {
+                                symbol: symbol.clone(),
+                                chain: Chain::Base,
+                                quantity: shares(quantity),
+                            }
+                        }),
+                        timed_out_at: None,
+                        suppressed_at: None,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                trigger.inventory.read().await.equity_inflight_at(
+                    &symbol,
+                    Venue::MarketMaking,
+                    Chain::Base,
+                ),
+                Some(shares(expected)),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn redemption_recovery_rollback_preserves_an_unrelated_stranded_floor() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mut inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .update_equity_at(
+                &symbol,
+                Chain::Base,
+                Inventory::set_inflight(Venue::MarketMaking, shares(7)),
+                Utc::now(),
+            )
+            .unwrap();
+        inventory.restore_stranded_redemption_claim(
+            &RedemptionAggregateId::generate(),
+            crate::equity_redemption::StrandedRedemption {
+                symbol: symbol.clone(),
+                chain: Chain::Base,
+                quantity: shares(7),
+            },
+        );
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        trigger
+            .rollback_redemption_tracking_for_recovery(
+                &RedemptionAggregateId::generate(),
+                &symbol,
+                RecoveryRollback::RestoreRedemptionInventory {
+                    chain: Chain::Base,
+                    added: shares(5),
+                    stranded: None,
+                    timed_out_at: None,
+                    suppressed_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            trigger.inventory.read().await.equity_inflight_at(
+                &symbol,
+                Venue::MarketMaking,
+                Chain::Base,
+            ),
+            Some(shares(7)),
+        );
+    }
+
+    #[tokio::test]
+    async fn inflight_recovery_keeps_the_other_provider_events_inflight() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let tsla = Symbol::new("TSLA").unwrap();
+        let now = Utc::now();
+        let inventory = InventoryView::default()
+            .with_equity(aapl.clone(), shares(50), shares(50))
+            .with_equity(tsla.clone(), shares(50), shares(50))
+            .apply_inflight_snapshot(
+                &BTreeMap::from([(aapl.clone(), shares(2))]),
+                &BTreeMap::from([(tsla.clone(), shares(3))]),
+                now,
+                now,
+            )
+            .unwrap()
+            .apply_inflight_redemptions_at(
+                Chain::Robinhood,
+                &BTreeMap::from([(aapl.clone(), shares(7))]),
+                now,
+                now,
+            )
+            .unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &aapl).await;
+        let recovery_error = || {
+            RebalancingServiceError::Inventory(InventoryViewError::Equity(
+                InventoryError::NegativeInflight {
+                    value: FractionalShares::new(float!(-1)),
+                },
+            ))
+        };
+        let assert_all_inflight = |view: &InventoryView| {
+            assert_eq!(view.equity_inflight(&aapl, Venue::Hedging), Some(shares(2)));
+            assert_eq!(
+                view.equity_inflight_at(&tsla, Venue::MarketMaking, Chain::Base),
+                Some(shares(3))
+            );
+            assert_eq!(
+                view.equity_inflight_at(&aapl, Venue::MarketMaking, Chain::Robinhood),
+                Some(shares(7))
+            );
+        };
+
+        trigger
+            .on_snapshot_recovery(
+                recovery_error(),
+                InventorySnapshotEvent::ChainInflightRedemptions {
+                    chain: Chain::Robinhood,
+                    redemptions: BTreeMap::from([(aapl.clone(), shares(7))]),
+                    fetched_at: now,
+                },
+            )
+            .await
+            .unwrap();
+        let view = trigger.inventory.read().await.clone();
+        assert_all_inflight(&view);
+        assert_eq!(
+            view.equity_available(&aapl, Venue::Hedging),
+            Some(shares(50))
+        );
+        assert_eq!(
+            view.onchain_equity_available_at(&tsla, Chain::Base),
+            Some(shares(50))
+        );
+        let later = now + ChronoDuration::seconds(1);
+        let cleared = view
+            .apply_inflight_snapshot(&BTreeMap::new(), &BTreeMap::new(), later, later)
+            .unwrap();
+        assert_eq!(
+            cleared.equity_inflight(&aapl, Venue::Hedging),
+            Some(FractionalShares::ZERO),
+            "the carried mint keeps its poll marker"
+        );
+        assert_eq!(
+            cleared.equity_inflight_at(&tsla, Venue::MarketMaking, Chain::Base),
+            Some(FractionalShares::ZERO),
+            "the carried Base redemption keeps its poll marker"
+        );
+
+        trigger
+            .on_snapshot_recovery(
+                recovery_error(),
+                InventorySnapshotEvent::InflightEquity {
+                    mints: BTreeMap::from([(aapl.clone(), shares(2))]),
+                    redemptions: BTreeMap::from([(tsla.clone(), shares(3))]),
+                    fetched_at: now,
+                    base_redemptions_chain_scoped: true,
+                },
+            )
+            .await
+            .unwrap();
+        let view = trigger.inventory.read().await.clone();
+        assert_all_inflight(&view);
+        let cleared = view
+            .apply_inflight_redemptions_at(Chain::Robinhood, &BTreeMap::new(), later, later)
+            .unwrap();
+        assert_eq!(
+            cleared.equity_inflight_at(&aapl, Venue::MarketMaking, Chain::Robinhood),
+            Some(FractionalShares::ZERO),
+            "the carried Robinhood redemption keeps its poll marker"
         );
     }
 
@@ -31936,6 +36933,7 @@ mod tests {
                     mints: BTreeMap::from([(symbol.clone(), shares(10))]),
                     redemptions: BTreeMap::new(),
                     fetched_at,
+                    base_redemptions_chain_scoped: true,
                 },
             )
             .await
@@ -31950,7 +36948,7 @@ mod tests {
                 .suppressed_inflight_symbols
                 .read()
                 .await
-                .contains_key(&symbol),
+                .contains_key(&(symbol.clone(), Chain::Base)),
             "recovery timeout sweep should suppress the stale inflight snapshot"
         );
 
@@ -31983,11 +36981,12 @@ mod tests {
             .suppressed_inflight_symbols
             .write()
             .await
-            .insert(symbol.clone(), stale_time);
+            .insert((symbol.clone(), Chain::Base), stale_time);
         trigger.timed_out_mints.write().await.insert(
             mint_id,
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: stale_time,
             },
         );
@@ -31995,6 +36994,7 @@ mod tests {
             redemption_id,
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: stale_time,
             },
         );
@@ -32256,6 +37256,7 @@ mod tests {
                 UsdcRebalanceEvent::DepositConfirmed {
                     direction: RebalanceDirection::AlpacaToBase,
                     deposit_confirmed_at: Utc::now(),
+                    vault_deposit_block: None,
                 },
             )
             .await
@@ -32353,7 +37354,7 @@ mod tests {
         // snapshots fetched before the stamp are rejected.
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(0), shares(136))
-            .clear_equity_inflight(&symbol, Venue::Hedging, now)
+            .clear_equity_inflight_at(&symbol, Chain::Base, Venue::Hedging, now)
             .unwrap();
 
         let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
@@ -32558,7 +37559,8 @@ mod tests {
 
         trigger
             .divergence_gate()
-            .engage_cash(InventoryScope::Hedging);
+            .engage_cash(InventoryScope::Hedging)
+            .await;
 
         trigger.check_and_trigger_usdc().await;
         assert_eq!(
@@ -32584,12 +37586,15 @@ mod tests {
         let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
         let trigger = make_trigger_with_inventory(inventory).await;
         trigger
-            .set_gas_readiness(crate::native_gas::GasReadiness::for_test(
-                U256::MAX,
-                U256::from(1_u64),
-                U256::ZERO,
-                U256::from(1_u64),
-            ))
+            .set_usdc_gas_readiness(BTreeMap::from([(
+                Chain::Base,
+                ConfiguredGasReadiness::Wired(crate::native_gas::GasReadiness::for_test(
+                    U256::MAX,
+                    U256::from(1_u64),
+                    U256::ZERO,
+                    U256::from(1_u64),
+                )),
+            )]))
             .await;
 
         trigger.check_and_trigger_usdc().await;
@@ -32604,7 +37609,12 @@ mod tests {
         );
 
         trigger
-            .set_gas_readiness(crate::native_gas::GasReadiness::always_ready_for_test())
+            .set_usdc_gas_readiness(BTreeMap::from([(
+                Chain::Base,
+                ConfiguredGasReadiness::Wired(
+                    crate::native_gas::GasReadiness::always_ready_for_test(),
+                ),
+            )]))
             .await;
         trigger.check_and_trigger_usdc().await;
 
@@ -32627,7 +37637,7 @@ mod tests {
         // cash snapshots fetched before the stamp are rejected.
         let inventory = InventoryView::default()
             .with_usdc(usdc(500), usdc(500))
-            .clear_usdc_inflight(Venue::Hedging, now)
+            .clear_usdc_inflight_at(Chain::Base, Venue::Hedging, now)
             .unwrap();
 
         let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
@@ -32722,7 +37732,10 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
             .with_usdc(usdc(0), usdc(500))
-            .set_active_usdc_rebalance(UsdcRebalanceId(Uuid::new_v4()));
+            .set_active_usdc_rebalance(
+                UsdcRebalanceId(Uuid::new_v4()),
+                base_usdc_rebalance(RebalanceDirection::AlpacaToBase),
+            );
 
         let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
 
@@ -32914,6 +37927,297 @@ mod tests {
             panic!("Expected exactly one redemption job, got {dispatched:?}");
         };
         assert_eq!(job.symbol, symbol);
+    }
+
+    async fn price_by_fill_or(trigger: &RebalancingService, marks: EquityPriceStore) {
+        let fills = trigger.position_projection.read().await.clone().unwrap();
+        trigger
+            .set_last_price_reader(Arc::new(FillPriceOrMark { fills, marks }))
+            .await;
+    }
+
+    /// An operator seeded the vault at listing (SPY in production), so the
+    /// symbol is over target but has never filled. The pricing service's mark
+    /// values the minimum operation instead.
+    #[tokio::test]
+    async fn equity_check_values_a_never_filled_symbol_at_its_mark() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(26), shares(1))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        price_by_fill_or(
+            &trigger,
+            EquityPriceStore::with_live_mark(symbol.clone(), float!(766.59)),
+        )
+        .await;
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+
+        let dispatched = take_pending_equity_redemption_jobs(&trigger).await;
+        let [job] = dispatched.as_slice() else {
+            panic!("Expected exactly one redemption job, got {dispatched:?}");
+        };
+        assert_eq!(job.symbol, symbol);
+    }
+
+    #[tokio::test]
+    async fn fill_price_wins_over_the_mark() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        acknowledge_onchain_buy(&trigger, &symbol, 1).await;
+        let reader = FillPriceOrMark {
+            fills: trigger.position_projection.read().await.clone().unwrap(),
+            marks: EquityPriceStore::with_live_mark(symbol.clone(), float!(766.59)),
+        };
+
+        let price = reader.last_price(&symbol).await.unwrap().unwrap();
+
+        assert_eq!(price.price.format().unwrap(), "100");
+    }
+
+    #[tokio::test]
+    async fn equity_check_declines_a_never_filled_symbol_without_a_mark() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(26), shares(1))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        price_by_fill_or(&trigger, EquityPriceStore::new([])).await;
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+
+        assert_eq!(count_pending_equity_redemption_jobs(&trigger).await, 0);
+    }
+
+    /// Makes `symbol` due a sell hedge of `shares`, as an onchain buy does.
+    async fn acknowledge_onchain_buy(trigger: &RebalancingService, symbol: &Symbol, amount: i64) {
+        let (store, threshold) = trigger.position_authority().await.unwrap();
+        store
+            .send(
+                symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold,
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: shares(amount),
+                    direction: Direction::Buy,
+                    price_usdc: float!(100),
+                    block_timestamp: Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// The production deadlock: the broker holds no share above its floor, so
+    /// it can place none of the due sell hedge of 50, and the over-target
+    /// vault's redemption is what brings the broker those shares. (A broker
+    /// that can sell some places that partial hedge first.)
+    #[tokio::test]
+    async fn equity_check_redeems_to_fund_a_sell_hedge_the_broker_cannot_fill() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(80), shares(0))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        acknowledge_onchain_buy(&trigger, &symbol, 50).await;
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+
+        let dispatched = take_pending_equity_redemption_jobs(&trigger).await;
+        let [job] = dispatched.as_slice() else {
+            panic!("Expected exactly one redemption job, got {dispatched:?}");
+        };
+        assert_eq!(job.symbol, symbol);
+    }
+
+    /// For a whole-share asset the broker truncates 1.9 shares to 1 and
+    /// rounds the 0.01 floor up to 1, so it cannot sell even one share. The
+    /// trigger must read that as starved, not as one sellable share.
+    #[tokio::test]
+    async fn equity_check_reads_a_fractional_broker_balance_as_the_broker_does() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(
+                symbol.clone(),
+                shares(80),
+                FractionalShares::new(float!(1.9)),
+            )
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let config = RebalancingServiceConfig {
+            hedge_floor: HedgeFloor::new(FractionalShares::new(float!(0.01)), HashMap::new()),
+            ..test_config()
+        };
+        let trigger =
+            make_trigger_with_inventory_and_registry_config(inventory, &symbol, config).await;
+        acknowledge_onchain_buy(&trigger, &symbol, 1).await;
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+
+        assert_eq!(count_pending_equity_redemption_jobs(&trigger).await, 1);
+    }
+
+    /// A broker that can fill the sell keeps the hedge first: the redemption
+    /// would only delay it.
+    #[tokio::test]
+    async fn equity_check_waits_for_a_sell_hedge_the_broker_can_fill() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(300), shares(60))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        acknowledge_onchain_buy(&trigger, &symbol, 50).await;
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+
+        assert_eq!(count_pending_equity_redemption_jobs(&trigger).await, 0);
+    }
+
+    #[tokio::test]
+    async fn equity_check_does_not_mint_while_a_hedge_is_due() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(80))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        acknowledge_onchain_buy(&trigger, &symbol, 50).await;
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+
+        assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 0);
+    }
+
+    /// Prices every symbol at 100. On its first read, in the first plan of a
+    /// check, it replaces the inventory with `moved_to`, as onchain activity
+    /// can between the two plans. On its second read, in the plan after the
+    /// reservation, it records whether the Position held a reservation then.
+    struct InventoryMovingPrice {
+        inventory: Arc<BroadcastingInventory>,
+        position: Arc<Store<Position>>,
+        moved_to: tokio::sync::Mutex<Option<InventoryView>>,
+        reads: std::sync::atomic::AtomicU32,
+        reserved_during_replan: tokio::sync::Mutex<Option<bool>>,
+    }
+
+    #[async_trait]
+    impl LastPriceReader for InventoryMovingPrice {
+        async fn last_price(
+            &self,
+            symbol: &Symbol,
+        ) -> Result<Option<crate::position::PriceObservation>, ProjectionError<Position>> {
+            let read = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if read == 0 {
+                let moved_to = self.moved_to.lock().await.take();
+                if let Some(moved_to) = moved_to {
+                    *self.inventory.write().await = moved_to;
+                }
+            } else if read == 1 {
+                let reserved = self
+                    .position
+                    .load(symbol)
+                    .await
+                    .unwrap()
+                    .is_some_and(|position| position.equity_transfer_reservation.is_some());
+                *self.reserved_during_replan.lock().await = Some(reserved);
+            }
+            Ok(Some(crate::position::PriceObservation {
+                price: float!(100),
+                observed_at: Utc::now(),
+            }))
+        }
+    }
+
+    /// The reservation was admitted for a redemption over a due sell hedge
+    /// the broker can place none of. When the plan after the reservation is a
+    /// mint, nothing is dispatched and the reservation is released: a mint
+    /// would take the shares that hedge needs. The broker holds 0.9 shares,
+    /// which its whole share count reads as none, so the reservation is
+    /// admitted, yet the fraction is enough for the second plan to mint.
+    #[tokio::test]
+    async fn equity_check_does_not_mint_on_a_reservation_admitted_for_a_redemption() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let broker = FractionalShares::new(float!(0.9));
+        let redemption_inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(80), broker)
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let mint_inventory = InventoryView::default()
+            .with_equity(symbol.clone(), FractionalShares::ZERO, broker)
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let trigger = make_trigger_with_inventory_and_registry(redemption_inventory, &symbol).await;
+        acknowledge_onchain_buy(&trigger, &symbol, 500).await;
+        let (store, _) = trigger.position_authority().await.unwrap();
+        let price = Arc::new(InventoryMovingPrice {
+            inventory: Arc::clone(&trigger.inventory),
+            position: Arc::clone(&store),
+            moved_to: tokio::sync::Mutex::new(Some(mint_inventory)),
+            reads: std::sync::atomic::AtomicU32::new(0),
+            reserved_during_replan: tokio::sync::Mutex::new(None),
+        });
+        trigger.set_last_price_reader(price.clone()).await;
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *price.reserved_during_replan.lock().await,
+            Some(true),
+            "the redemption must have been admitted before the plan turned into a mint"
+        );
+        assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 0);
+        assert_eq!(count_pending_equity_redemption_jobs(&trigger).await, 0);
+        assert_eq!(
+            store
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None,
+            "the reservation admitted for the redemption must be released"
+        );
     }
 
     #[tokio::test]
@@ -34676,7 +39980,10 @@ mod tests {
         // was never rebuilt before the deposit settles.
         let inventory = InventoryView::default()
             .with_usdc(usdc(5000), usdc(5000))
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::AlpacaToBase),
+            );
         let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
@@ -34771,7 +40078,10 @@ mod tests {
         // reservation was never rebuilt before the conversion settles.
         let inventory = InventoryView::default()
             .with_usdc(usdc(5000), usdc(5000))
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::BaseToAlpaca),
+            );
         let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
@@ -34874,7 +40184,10 @@ mod tests {
                 Utc::now(),
             )
             .unwrap()
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::AlpacaToBase),
+            );
         let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
@@ -34948,7 +40261,10 @@ mod tests {
         // underflows instead of confirm_inflight).
         let inventory = InventoryView::default()
             .with_usdc(usdc(5000), usdc(5000))
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::AlpacaToBase),
+            );
         let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
@@ -35009,6 +40325,900 @@ mod tests {
             "a DeferredToSnapshot cancel must skip the immediate \
              enqueue_check, leaving the fresh imbalance check to the next \
              periodic snapshot poll rather than a duplicate immediate check"
+        );
+    }
+
+    /// A withdrawal rejected before broadcast (`RejectWithdrawal`) fails with
+    /// no tracking: nothing moved, so the guard clears and inventory is
+    /// untouched. The plan rested on a vault balance the vault could not
+    /// cover, so later checks (a stale snapshot, a fill) must not plan the
+    /// same withdraw: USDC dispatch waits for a forced vault read fetched
+    /// after the rejection, and Base->Alpaca planning on the chain waits for
+    /// the cooldown.
+    #[tokio::test]
+    async fn withdrawal_failed_without_tracking_holds_base_to_alpaca_planning() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let before_rejection = Utc::now();
+        // 900 onchain, 100 offchain = TooMuchOnchain -> Base->Alpaca.
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(900), usdc(100))
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::BaseToAlpaca),
+            );
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        trigger
+            .usdc_guards
+            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_withdrawal_failed())
+            .await
+            .unwrap();
+
+        assert!(!trigger.usdc_guards.is_held(Chain::Base));
+        assert_eq!(trigger.inventory.read().await.active_usdc_rebalance(), None);
+        let available = {
+            let inventory = trigger.inventory.read().await;
+            (
+                inventory.usdc_available(Venue::MarketMaking),
+                inventory.usdc_available(Venue::Hedging),
+            )
+        };
+        assert_eq!(available, (Some(usdc(900)), Some(usdc(100))));
+        let delayed_checks: i64 = sqlx_apalis::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ? \
+             AND run_at >= strftime('%s', 'now') + 1790",
+        )
+        .bind(std::any::type_name::<UsdcRebalancingCheck>())
+        .fetch_one(trigger.usdc_scheduler.queue().pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            (
+                count_pending_usdc_check_jobs(&trigger).await,
+                delayed_checks
+            ),
+            (1, 1),
+            "the terminal event queues no immediate check, only one at the cooldown's end"
+        );
+        assert!(
+            trigger.divergence_gate().is_cash_engaged(),
+            "the rejection must request a forced vault read"
+        );
+
+        // A snapshot read before the rejection reaches the trigger late.
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
+                usdc_balance: usdc(900),
+                fetched_at: before_rejection,
+                block_number: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+        trigger.check_and_trigger_usdc().await;
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0,
+            "a check after a stale snapshot must not plan the same withdraw again"
+        );
+        assert!(trigger.divergence_gate().is_cash_engaged());
+
+        // The forced read, fetched after the rejection, is admitted even though
+        // the balance did not change.
+        let generation = trigger
+            .divergence_gate()
+            .claim_pending_onchain_cash_reconcile(Chain::Base)
+            .expect("cash reconciliation request");
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::OnchainUsdcReconciled {
+                chain: Chain::Base,
+                usdc_balance: usdc(900),
+                fetched_at: Utc::now(),
+                block_number: Some(101),
+                generation,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!trigger.divergence_gate().is_cash_engaged());
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+        trigger.check_and_trigger_usdc().await;
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0,
+            "the cooldown still holds Base->Alpaca planning on the chain"
+        );
+
+        let after_cooldown = Utc::now()
+            + chrono::Duration::from_std(usdc::USDC_WITHDRAW_REJECTION_COOLDOWN).unwrap();
+        assert!(
+            !trigger
+                .usdc_withdraw_cooling_down(Chain::Base, after_cooldown)
+                .await
+        );
+        trigger.check_and_trigger_usdc().await;
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            1,
+            "planning resumes after the fresh read and the cooldown"
+        );
+    }
+
+    /// Marks every pending Alpaca->Base transfer row done and returns the
+    /// transfer ids, so the next trigger cycle sees no in-flight row.
+    async fn take_pending_alpaca_to_base_ids(service: &RebalancingService) -> Vec<UsdcRebalanceId> {
+        let pool = service.transfer_usdc_to_market_making_queue.pool().clone();
+        let rows: Vec<(String, Vec<u8>)> = sqlx_apalis::query_as(
+            "SELECT id, job FROM Jobs WHERE status = 'Pending' AND job_type = ? ORDER BY run_at",
+        )
+        .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        let mut ids = Vec::with_capacity(rows.len());
+        for (row_id, payload) in rows {
+            let job: TransferUsdcToMarketMaking = serde_json::from_slice(&payload).unwrap();
+            sqlx_apalis::query("UPDATE Jobs SET status = 'Done' WHERE id = ?")
+                .bind(row_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            ids.push(job.id);
+        }
+
+        ids
+    }
+
+    async fn fail_alpaca_to_base_conversion(
+        harness: &ReactorHarness<Arc<RebalancingService>>,
+        id: &UsdcRebalanceId,
+    ) {
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_conversion_initiated(RebalanceDirection::AlpacaToBase, usdc(400)),
+            )
+            .await
+            .unwrap();
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_conversion_failed())
+            .await
+            .unwrap();
+    }
+
+    /// Starts a conversion cooldown as a live failure does: the hold, then the
+    /// delayed check for its end.
+    async fn start_conversion_cooldown(service: &RebalancingService, failed_at: DateTime<Utc>) {
+        service.hold_after_conversion_failure(failed_at).await;
+        service
+            .enqueue_cooldown_expiry_check(
+                failed_at,
+                service.config.usdc.conversion_failure_cooldown(),
+            )
+            .await;
+    }
+
+    /// Starts a Base withdraw cooldown as a live rejection does: the hold,
+    /// then the delayed check for its end.
+    async fn start_withdraw_cooldown(service: &RebalancingService, rejected_at: DateTime<Utc>) {
+        service
+            .hold_after_withdraw_rejection(Some(Chain::Base), rejected_at)
+            .await;
+        service
+            .enqueue_cooldown_expiry_check(rejected_at, usdc::USDC_WITHDRAW_REJECTION_COOLDOWN)
+            .await;
+    }
+
+    async fn count_usdc_checks_delayed_at_least(service: &RebalancingService, secs: i64) -> i64 {
+        sqlx_apalis::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ? \
+             AND run_at >= strftime('%s', 'now') + ?",
+        )
+        .bind(std::any::type_name::<UsdcRebalancingCheck>())
+        .bind(secs)
+        .fetch_one(service.usdc_scheduler.queue().pool())
+        .await
+        .unwrap()
+    }
+
+    /// A conversion that keeps failing (an empty `USDC/USD` book) starts one
+    /// Alpaca->Base transfer per cooldown window instead of one per check,
+    /// and the first check after the window starts the transfer again.
+    #[tokio::test]
+    async fn failing_alpaca_to_base_conversion_dispatches_once_per_cooldown() {
+        // 100 onchain, 900 offchain = TooMuchOffchain -> Alpaca->Base.
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(100), usdc(900))
+            .with_withdrawable_cash_cents(90_000);
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let cooldown =
+            ChronoDuration::from_std(trigger.config.usdc.conversion_failure_cooldown()).unwrap();
+
+        for window in 0..2 {
+            trigger.check_and_trigger_usdc().await;
+            let ids = take_pending_alpaca_to_base_ids(&trigger).await;
+            assert_eq!(
+                ids.len(),
+                1,
+                "window {window}: the first check starts one transfer"
+            );
+
+            fail_alpaca_to_base_conversion(&harness, &ids[0]).await;
+            assert!(!trigger.usdc_guards.is_held(Chain::Base));
+            assert!(trigger.usdc_conversion_cooling_down(Utc::now()).await);
+
+            for _ in 0..3 {
+                trigger.check_and_trigger_usdc().await;
+            }
+            assert_eq!(
+                take_pending_alpaca_to_base_ids(&trigger).await,
+                Vec::new(),
+                "window {window}: checks inside the cooldown start no transfer"
+            );
+
+            // The window ends: the failure is now one cooldown old.
+            *trigger.usdc_conversion_failed_at.write().await = Some(Utc::now() - cooldown);
+        }
+
+        trigger.check_and_trigger_usdc().await;
+        assert_eq!(
+            take_pending_alpaca_to_base_ids(&trigger).await.len(),
+            1,
+            "the first check after the cooldown starts the transfer"
+        );
+    }
+
+    /// The failed conversion moved nothing, so inventory is untouched. The
+    /// terminal event queues the usual fresh check, which the cooldown keeps
+    /// from planning Alpaca->Base again, and one at the cooldown's end.
+    #[tokio::test]
+    async fn alpaca_to_base_conversion_failure_queues_a_check_at_the_cooldown_end() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(100), usdc(900))
+            .with_withdrawable_cash_cents(90_000);
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        trigger
+            .usdc_guards
+            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+
+        fail_alpaca_to_base_conversion(&harness, &id).await;
+
+        assert!(!trigger.usdc_guards.is_held(Chain::Base));
+        assert_eq!(trigger.inventory.read().await.active_usdc_rebalance(), None);
+        let available = {
+            let inventory = trigger.inventory.read().await;
+            (
+                inventory.usdc_available(Venue::MarketMaking),
+                inventory.usdc_available(Venue::Hedging),
+            )
+        };
+        assert_eq!(available, (Some(usdc(100)), Some(usdc(900))));
+        assert_eq!(
+            (
+                count_pending_usdc_check_jobs(&trigger).await,
+                count_usdc_checks_delayed_at_least(&trigger, 295).await,
+            ),
+            (2, 1),
+            "the fresh check, and one at the cooldown's end"
+        );
+
+        trigger.check_and_trigger_usdc().await;
+        assert_eq!(
+            take_pending_alpaca_to_base_ids(&trigger).await,
+            Vec::new(),
+            "the fresh check plans no Alpaca->Base transfer during the cooldown"
+        );
+    }
+
+    /// A conversion failure stamped earlier than the one holding planning
+    /// does not shorten the hold.
+    #[tokio::test]
+    async fn earlier_conversion_failure_does_not_shorten_the_cooldown() {
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
+        let later = Utc::now();
+        let earlier = later - ChronoDuration::minutes(4);
+
+        trigger.hold_after_conversion_failure(later).await;
+        trigger.hold_after_conversion_failure(earlier).await;
+
+        let cooldown =
+            ChronoDuration::from_std(trigger.config.usdc.conversion_failure_cooldown()).unwrap();
+        assert!(
+            trigger
+                .usdc_conversion_cooling_down(later + cooldown - ChronoDuration::seconds(1))
+                .await
+        );
+        assert!(!trigger.usdc_conversion_cooling_down(later + cooldown).await);
+    }
+
+    /// The conversion runs only on the Alpaca->Base leg: its cooldown leaves
+    /// Base->Alpaca planning alone.
+    #[tokio::test]
+    async fn conversion_cooldown_does_not_hold_base_to_alpaca() {
+        // 900 onchain, 100 offchain = TooMuchOnchain -> Base->Alpaca.
+        let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
+        let trigger = make_trigger_with_inventory(inventory).await;
+        trigger.hold_after_conversion_failure(Utc::now()).await;
+
+        trigger.check_and_trigger_usdc().await;
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            1
+        );
+    }
+
+    /// Cancelling the pending checks after a terminal event (USDC, mint or
+    /// redemption) queues again the delayed check of every running cooldown:
+    /// otherwise a quiet market would wait for the next fill or balance
+    /// change to plan again.
+    #[tokio::test]
+    async fn cancelling_pending_usdc_checks_keeps_every_cooldown_expiry_check() {
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
+        let now = Utc::now();
+        start_withdraw_cooldown(&trigger, now).await;
+        start_conversion_cooldown(&trigger, now).await;
+        trigger.usdc_scheduler.enqueue_check().await;
+
+        trigger
+            .cancel_pending_usdc_checks(usdc::CashLedgerState::Reconciled)
+            .await;
+
+        assert_eq!(
+            (
+                count_pending_usdc_check_jobs(&trigger).await,
+                count_usdc_checks_delayed_at_least(&trigger, 295).await,
+                count_usdc_checks_delayed_at_least(&trigger, 1790).await,
+            ),
+            (2, 2, 1),
+            "one check at each cooldown's end, and the stale immediate check dropped"
+        );
+    }
+
+    /// A terminal event that left the cash ledger stale must not re-queue a
+    /// cooldown check that runs before a post-settlement poll: it would size
+    /// a transfer from the pre-settlement balances.
+    #[tokio::test]
+    async fn cancelling_with_a_stale_ledger_delays_cooldown_checks_past_the_staleness_bound() {
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
+        let cooldown =
+            ChronoDuration::from_std(trigger.config.usdc.conversion_failure_cooldown()).unwrap();
+        start_conversion_cooldown(
+            &trigger,
+            Utc::now() - cooldown + ChronoDuration::seconds(10),
+        )
+        .await;
+        let bound_secs = i64::try_from(trigger.config.inventory_staleness_bound.as_secs()).unwrap();
+
+        trigger
+            .cancel_pending_usdc_checks(usdc::CashLedgerState::AwaitingSnapshot)
+            .await;
+
+        assert_eq!(
+            (
+                count_pending_usdc_check_jobs(&trigger).await,
+                count_usdc_checks_delayed_at_least(&trigger, bound_secs).await,
+            ),
+            (1, 1),
+            "the nearly expired cooldown's check waits out the staleness bound"
+        );
+    }
+
+    /// A cooldown check that is due but still pending (a busy worker) is kept
+    /// by a deferred cancel, moved past the staleness bound.
+    #[tokio::test]
+    async fn deferred_cancel_keeps_an_overdue_cooldown_check() {
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
+        trigger.usdc_scheduler.enqueue_check().await;
+        // Strictly past the bound, whatever the whole-second rounding of `run_at`.
+        let past_bound_secs =
+            i64::try_from(trigger.config.inventory_staleness_bound.as_secs()).unwrap() + 4;
+
+        trigger
+            .cancel_pending_usdc_checks(usdc::CashLedgerState::AwaitingSnapshot)
+            .await;
+
+        assert_eq!(
+            (
+                count_pending_usdc_check_jobs(&trigger).await,
+                count_usdc_checks_delayed_at_least(&trigger, past_bound_secs).await,
+            ),
+            (1, 1),
+            "the overdue check is kept, strictly after the staleness bound"
+        );
+    }
+
+    /// A conversion check that a deferred cancel pushed past the conversion
+    /// end survives later deferred cancels next to a longer withdraw cooldown.
+    #[tokio::test]
+    async fn deferred_cancels_keep_a_conversion_check_next_to_a_withdraw_cooldown() {
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
+        let cooldown =
+            ChronoDuration::from_std(trigger.config.usdc.conversion_failure_cooldown()).unwrap();
+        start_withdraw_cooldown(&trigger, Utc::now()).await;
+        start_conversion_cooldown(
+            &trigger,
+            Utc::now() - cooldown + ChronoDuration::seconds(10),
+        )
+        .await;
+        let bound_secs = i64::try_from(trigger.config.inventory_staleness_bound.as_secs()).unwrap();
+
+        for cancel in 0..2 {
+            trigger
+                .cancel_pending_usdc_checks(usdc::CashLedgerState::AwaitingSnapshot)
+                .await;
+            assert_eq!(
+                (
+                    count_pending_usdc_check_jobs(&trigger).await,
+                    count_usdc_checks_delayed_at_least(&trigger, bound_secs).await,
+                    count_usdc_checks_delayed_at_least(&trigger, 1790).await,
+                ),
+                (2, 2, 1),
+                "cancel {cancel}: the conversion check after the bound, the withdraw check at its end"
+            );
+
+            *trigger.usdc_conversion_failed_at.write().await = None;
+        }
+    }
+
+    /// Each deferred cancel can push a cooldown's check past its end; every
+    /// later cancel, however many, must queue it again rather than drop it.
+    #[tokio::test]
+    async fn chained_deferred_cancels_keep_a_check_pushed_past_the_cooldown() {
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
+        let cooldown =
+            ChronoDuration::from_std(trigger.config.usdc.conversion_failure_cooldown()).unwrap();
+        start_conversion_cooldown(
+            &trigger,
+            Utc::now() - cooldown + ChronoDuration::seconds(10),
+        )
+        .await;
+        let bound_secs = i64::try_from(trigger.config.inventory_staleness_bound.as_secs()).unwrap();
+
+        for cancel in 0..3 {
+            trigger
+                .cancel_pending_usdc_checks(usdc::CashLedgerState::AwaitingSnapshot)
+                .await;
+            assert_eq!(
+                (
+                    count_pending_usdc_check_jobs(&trigger).await,
+                    count_usdc_checks_delayed_at_least(&trigger, bound_secs).await,
+                ),
+                (1, 1),
+                "cancel {cancel}: the cooldown's check is queued again, after the staleness bound"
+            );
+
+            // Later cancels land after the hold expired, and a check that ran
+            // since has cleared it, so only the queued check is left to keep.
+            *trigger.usdc_conversion_failed_at.write().await = None;
+        }
+    }
+
+    /// A terminal mint that reconciles the ledger keeps a running cooldown's
+    /// check at the cooldown's end, next to the fresh check.
+    #[tokio::test]
+    async fn reconciled_terminal_mint_keeps_the_cooldown_check_at_its_end() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(0), shares(90)),
+            &symbol,
+        )
+        .await;
+        let id = issuer_request_id("mint-terminal-during-cooldown");
+        trigger.mint_tracking.write().await.insert(
+            id.clone(),
+            MintTracking {
+                chain: Chain::Base,
+                symbol,
+                quantity: shares(10),
+                tokenization_request_id: None,
+                stage: MintTrackingStage::Requested,
+                last_progress_at: Utc::now(),
+            },
+        );
+        let cooldown =
+            ChronoDuration::from_std(trigger.config.usdc.conversion_failure_cooldown()).unwrap();
+        start_conversion_cooldown(
+            &trigger,
+            Utc::now() - cooldown + ChronoDuration::seconds(10),
+        )
+        .await;
+        let bound_secs = i64::try_from(trigger.config.inventory_staleness_bound.as_secs()).unwrap();
+
+        trigger
+            .on_mint(id, make_mint_acceptance_failed())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (
+                count_pending_usdc_check_jobs(&trigger).await,
+                count_usdc_checks_delayed_at_least(&trigger, 10).await,
+                count_usdc_checks_delayed_at_least(&trigger, bound_secs).await,
+            ),
+            (2, 1, 0),
+            "the fresh check, and one at the cooldown's end, before the staleness bound"
+        );
+    }
+
+    /// A terminal redemption that leaves the ledger to the next snapshot
+    /// queues a running cooldown's check again, after the staleness bound.
+    #[tokio::test]
+    async fn deferred_terminal_redemption_delays_the_cooldown_check_past_the_staleness_bound() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(90), shares(0)),
+            &symbol,
+        )
+        .await;
+        let id = redemption_aggregate_id("redemption-deferred-during-cooldown");
+        trigger.equity_in_progress.write().unwrap().insert(
+            symbol.clone(),
+            equity::GuardState::ActiveTransfer {
+                generation: equity::GuardGeneration::default(),
+            },
+        );
+        trigger.redemption_tracking.write().await.insert(
+            id.clone(),
+            RedemptionTracking {
+                chain: Chain::Base,
+                symbol,
+                quantity: shares(10),
+                tokenization_request_id: None,
+                redemption_tx: Some(TxHash::random()),
+                stage: RedemptionTrackingStage::TokensSent,
+                last_progress_at: Utc::now(),
+            },
+        );
+        let cooldown =
+            ChronoDuration::from_std(trigger.config.usdc.conversion_failure_cooldown()).unwrap();
+        start_conversion_cooldown(
+            &trigger,
+            Utc::now() - cooldown + ChronoDuration::seconds(10),
+        )
+        .await;
+        let bound_secs = i64::try_from(trigger.config.inventory_staleness_bound.as_secs()).unwrap();
+
+        trigger
+            .on_redemption(id, make_redemption_completed())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (
+                count_pending_usdc_check_jobs(&trigger).await,
+                count_usdc_checks_delayed_at_least(&trigger, bound_secs).await,
+            ),
+            (1, 1),
+            "no fresh check, and the cooldown's check waits out the staleness bound"
+        );
+    }
+
+    /// A conversion that fails after the check sized its transfer, but before
+    /// the check claimed the guard, installs the hold before releasing the
+    /// guard: the re-check under the claim must then refuse the dispatch.
+    #[tokio::test]
+    async fn conversion_failure_between_sizing_and_claim_holds_the_dispatch() {
+        // 100 onchain, 900 offchain = TooMuchOffchain -> Alpaca->Base.
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(100), usdc(900))
+            .with_withdrawable_cash_cents(90_000);
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let corridor = *trigger.config.usdc.active().next().unwrap();
+        let (usdc_limit, reserved) = trigger.usdc_rebalancing_params(&corridor).unwrap();
+        let admission = trigger.divergence_gate.cash_admission().unwrap();
+
+        let sized = trigger
+            .size_usdc_operation(&corridor, usdc_limit, reserved)
+            .await
+            .unwrap();
+        assert!(matches!(sized, UsdcRebalanceOperation::AlpacaToBase { .. }));
+        assert!(!trigger.conversion_cooldown_holds(Chain::Base, sized).await);
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let guard = trigger
+            .usdc_guards
+            .try_claim(Chain::Base, &id, sized.direction())
+            .unwrap();
+        trigger.hold_after_conversion_failure(Utc::now()).await;
+
+        trigger
+            .dispatch_claimed_usdc_operation(
+                &corridor, usdc_limit, reserved, admission, sized, id, guard,
+            )
+            .await;
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            0
+        );
+        assert!(!trigger.usdc_guards.is_held(Chain::Base));
+    }
+
+    /// An untracked terminal success (a transfer resumed after a restart)
+    /// settles as `DeferredToSnapshot`: the running cooldown's check is
+    /// queued again, but not before a post-settlement poll.
+    #[tokio::test]
+    async fn untracked_terminal_success_delays_the_cooldown_check_past_the_staleness_bound() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let cooldown =
+            ChronoDuration::from_std(trigger.config.usdc.conversion_failure_cooldown()).unwrap();
+        start_conversion_cooldown(
+            &trigger,
+            Utc::now() - cooldown + ChronoDuration::seconds(10),
+        )
+        .await;
+        let bound_secs = i64::try_from(trigger.config.inventory_staleness_bound.as_secs()).unwrap();
+
+        harness
+            .receive::<UsdcRebalance>(
+                id,
+                make_usdc_deposit_confirmed(RebalanceDirection::AlpacaToBase),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (
+                count_pending_usdc_check_jobs(&trigger).await,
+                count_usdc_checks_delayed_at_least(&trigger, bound_secs).await,
+            ),
+            (1, 1),
+            "no fresh check, and the cooldown's check waits out the staleness bound"
+        );
+    }
+
+    /// A conversion failure while a withdraw cooldown runs keeps the withdraw
+    /// cooldown's delayed check next to its own.
+    #[tokio::test]
+    async fn conversion_failure_keeps_a_running_withdraw_cooldown_check() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        start_withdraw_cooldown(&trigger, Utc::now()).await;
+
+        fail_alpaca_to_base_conversion(&harness, &id).await;
+
+        assert_eq!(
+            (
+                count_pending_usdc_check_jobs(&trigger).await,
+                count_usdc_checks_delayed_at_least(&trigger, 295).await,
+                count_usdc_checks_delayed_at_least(&trigger, 1790).await,
+            ),
+            (3, 2, 1),
+            "the fresh check, and one at each cooldown's end"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_usdc_guard_restores_a_recent_conversion_failure() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::InitiateConversion {
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: usdc(400),
+                    order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailConversion {
+                    reason: "no asks on USDC/USD".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert!(service.usdc_conversion_cooling_down(Utc::now()).await);
+        assert!(!service.usdc_guards.is_held(Chain::Base));
+        assert_eq!(count_usdc_checks_delayed_at_least(&service, 290).await, 1);
+    }
+
+    /// `ConversionFailed` carries no direction, so only the loaded state
+    /// keeps a BaseToAlpaca post-deposit failure from holding Alpaca->Base.
+    #[tokio::test]
+    async fn recover_usdc_guard_skips_a_base_to_alpaca_conversion_failure() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000021");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111122");
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        for command in [
+            UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: usdc(400),
+                withdrawal: TransferRef::OnchainTx(burn_tx),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceCommand::InitiateBridging { burn_tx },
+            UsdcRebalanceCommand::ReceiveAttestation {
+                attestation: vec![0x01],
+                cctp_nonce: alloy::primitives::B256::left_padding_from(&42u64.to_be_bytes()),
+                message: valid_cctp_message(),
+                mint_scan_from_block: 100,
+            },
+            UsdcRebalanceCommand::ConfirmBridging {
+                mint_tx,
+                amount_received: usdc(399),
+                fee_collected: usdc(1),
+            },
+            UsdcRebalanceCommand::InitiateDeposit {
+                deposit: TransferRef::OnchainTx(mint_tx),
+            },
+            UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            },
+            UsdcRebalanceCommand::InitiatePostDepositConversion {
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                amount: usdc(399),
+            },
+            UsdcRebalanceCommand::FailConversion {
+                reason: "conversion rejected".to_string(),
+            },
+        ] {
+            store.send(&id, command).await.unwrap();
+        }
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert!(!service.usdc_conversion_cooling_down(Utc::now()).await);
+        assert_eq!(count_usdc_checks_delayed_at_least(&service, 290).await, 0);
+    }
+
+    #[tokio::test]
+    async fn recover_usdc_guard_skips_a_conversion_failure_older_than_the_cooldown() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::InitiateConversion {
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: usdc(400),
+                    order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailConversion {
+                    reason: "no asks on USDC/USD".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let cooldown = Duration::from_millis(1);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let mut config = test_config();
+        config.usdc = config.usdc.with_conversion_failure_cooldown(cooldown);
+        let service = make_trigger_with_inventory_config(InventoryView::default(), config).await;
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert!(!service.usdc_conversion_cooling_down(Utc::now()).await);
+        assert_eq!(count_pending_usdc_check_jobs(&service).await, 0);
+    }
+
+    /// The forced read after a rejection is floored at the view's applied USDC
+    /// block: a read a lagging backend serves below it keeps the cash gate
+    /// engaged instead of clearing it while the view keeps its old balance.
+    #[tokio::test]
+    async fn forced_read_after_a_rejection_below_the_watermark_keeps_the_gate() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let trigger =
+            make_trigger_with_inventory(InventoryView::default().with_usdc(usdc(900), usdc(100)))
+                .await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            snapshot_id.clone(),
+            InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
+                usdc_balance: usdc(900),
+                fetched_at: Utc::now(),
+                block_number: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+        trigger
+            .usdc_guards
+            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_withdrawal_failed())
+            .await
+            .unwrap();
+        let generation = trigger
+            .divergence_gate()
+            .claim_pending_onchain_cash_reconcile(Chain::Base)
+            .expect("cash reconciliation request");
+
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            snapshot_id.clone(),
+            InventorySnapshotEvent::OnchainUsdcReconciled {
+                chain: Chain::Base,
+                usdc_balance: usdc(0),
+                fetched_at: Utc::now(),
+                block_number: Some(99),
+                generation,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            trigger.divergence_gate().is_cash_engaged(),
+            "a forced read below the applied block must not clear the gate"
+        );
+
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            snapshot_id,
+            InventorySnapshotEvent::OnchainUsdcReconciled {
+                chain: Chain::Base,
+                usdc_balance: usdc(0),
+                fetched_at: Utc::now(),
+                block_number: Some(100),
+                generation,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!trigger.divergence_gate().is_cash_engaged());
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .usdc_available(Venue::MarketMaking),
+            Some(usdc(0))
         );
     }
 
@@ -35111,7 +41321,10 @@ mod tests {
         // inflight survived a restart.
         let inventory = InventoryView::default()
             .with_usdc_inflight(Usdc::ZERO, Usdc::ZERO, max_positive, max_positive)
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::AlpacaToBase),
+            );
         let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
@@ -35295,85 +41508,87 @@ mod tests {
     /// `HeldForRecovery`. The recovery job owns those mints and is responsible for
     /// driving them to a terminal state; timing them out would clear the guard and
     /// allow a double-mint while the original tokens are still in the wallet.
+    /// A hold for any chain counts: the symbol has one owner across chains.
     #[tokio::test]
     async fn expire_stuck_mints_skips_held_for_recovery_mints() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let now = Utc::now();
+        for held_chain in [Chain::Base, Chain::Robinhood] {
+            let symbol = Symbol::new("AAPL").unwrap();
+            let now = Utc::now();
 
-        // Use a very short timeout so the mint would normally be cleaned up.
-        let config = test_config_with_timeout(Duration::from_secs(60));
-        let (event_sender, _) = broadcast::channel::<Statement>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(
-            InventoryView::default(),
-            event_sender,
-        ));
-        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
-        let wrapper = Arc::new(MockWrapper::new());
-        let trigger = Arc::new(RebalancingService::new(
-            config,
-            Arc::new(test_store::<VaultRegistry>(pool, ())),
-            BTreeMap::from([(
-                Chain::Base,
-                VaultRegistryId {
-                    chain: st0x_evm::Chain::Base,
-                    orderbook: TEST_ORDERBOOK,
-                    owner: TEST_ORDER_OWNER,
+            // Use a very short timeout so the mint would normally be cleaned up.
+            let config = test_config_with_timeout(Duration::from_secs(60));
+            let (event_sender, _) = broadcast::channel::<Statement>(16);
+            let inventory = Arc::new(BroadcastingInventory::new(
+                InventoryView::default(),
+                event_sender,
+            ));
+            let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+            let wrapper = Arc::new(MockWrapper::new());
+            let trigger = Arc::new(RebalancingService::new(
+                config,
+                Arc::new(test_store::<VaultRegistry>(pool, ())),
+                BTreeMap::from([(
+                    Chain::Base,
+                    VaultRegistryId {
+                        chain: st0x_evm::Chain::Base,
+                        orderbook: TEST_ORDERBOOK,
+                        owner: TEST_ORDER_OWNER,
+                    },
+                )]),
+                inventory,
+                BTreeMap::from([(Chain::Base, wrapper as Arc<dyn Wrapper>)]),
+                RebalancingSchedulers::new(&apalis_pool),
+                Arc::new(crate::alerts::LogNotifier),
+            ));
+
+            let id = issuer_request_id("held-for-recovery-timeout");
+
+            // Seed a mint tracking entry at a post-receipt stage with a stale
+            // last_progress_at so the timeout sweep would normally pick it up.
+            trigger.mint_tracking.write().await.insert(
+                id.clone(),
+                MintTracking {
+                    chain: Chain::Base,
+                    symbol: symbol.clone(),
+                    quantity: shares(10),
+                    tokenization_request_id: None,
+                    stage: MintTrackingStage::TokensReceived,
+                    last_progress_at: now - ChronoDuration::hours(2),
                 },
-            )]),
-            inventory,
-            BTreeMap::from([(Chain::Base, wrapper as Arc<dyn Wrapper>)]),
-            RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::LogNotifier),
-        ));
+            );
 
-        let id = issuer_request_id("held-for-recovery-timeout");
+            // Set the guard to HeldForRecovery for this symbol (simulating the
+            // PostReceipt handoff from the transfer job).
+            trigger.equity_in_progress.write().unwrap().insert(
+                symbol.clone(),
+                equity::GuardState::HeldForRecovery { chain: held_chain },
+            );
 
-        // Seed a mint tracking entry at a post-receipt stage with a stale
-        // last_progress_at so the timeout sweep would normally pick it up.
-        trigger.mint_tracking.write().await.insert(
-            id.clone(),
-            MintTracking {
-                chain: Chain::Base,
-                symbol: symbol.clone(),
-                quantity: shares(10),
-                tokenization_request_id: None,
-                stage: MintTrackingStage::TokensReceived,
-                last_progress_at: now - ChronoDuration::hours(2),
-            },
-        );
-
-        // Set the guard to HeldForRecovery for this symbol (simulating the
-        // PostReceipt handoff from the transfer job).
-        trigger
-            .equity_in_progress
-            .write()
-            .unwrap()
-            .insert(symbol.clone(), equity::GuardState::HeldForRecovery);
-
-        // Run expire_stuck_mints with a far-future now so the mint is well past
-        // the timeout threshold.
-        trigger
-            .expire_stuck_mints(now + ChronoDuration::hours(24))
-            .await
-            .unwrap();
-
-        // The mint tracking entry must NOT have been removed.
-        assert!(
-            trigger.mint_tracking.read().await.contains_key(&id),
-            "expire_stuck_mints must not clean up a HeldForRecovery mint"
-        );
-
-        // The guard must still be HeldForRecovery.
-        assert_eq!(
+            // Run expire_stuck_mints with a far-future now so the mint is well past
+            // the timeout threshold.
             trigger
-                .equity_in_progress
-                .read()
-                .unwrap()
-                .get(&symbol)
-                .cloned(),
-            Some(equity::GuardState::HeldForRecovery),
-            "expire_stuck_mints must not clear a HeldForRecovery guard"
-        );
+                .expire_stuck_mints(now + ChronoDuration::hours(24))
+                .await
+                .unwrap();
+
+            // The mint tracking entry must NOT have been removed.
+            assert!(
+                trigger.mint_tracking.read().await.contains_key(&id),
+                "expire_stuck_mints must not clean up a HeldForRecovery mint"
+            );
+
+            // The guard must still be HeldForRecovery.
+            assert_eq!(
+                trigger
+                    .equity_in_progress
+                    .read()
+                    .unwrap()
+                    .get(&symbol)
+                    .cloned(),
+                Some(equity::GuardState::HeldForRecovery { chain: held_chain }),
+                "expire_stuck_mints must not clear a HeldForRecovery guard"
+            );
+        }
     }
 
     #[tokio::test]
@@ -35526,21 +41741,22 @@ mod tests {
                 .suppressed_inflight_symbols
                 .read()
                 .await
-                .contains_key(&symbol)
+                .contains_key(&(symbol.clone(), Chain::Base))
         );
     }
 
-    /// `clear_equity_in_progress_unless_held_for_recovery` is the single-lock
+    /// `clear_equity_in_progress_unless_recovery_owned` is the single-lock
     /// check-and-clear that closes the timeout-sweep TOCTOU race: a concurrent
     /// `mark_held_for_recovery` can flip `ActiveTransfer` -> `HeldForRecovery`
     /// after the steady-state check but before the clear, and a non-atomic clear
     /// would drop the recovery-owned guard and fail a mint whose tokens are still
     /// in the wallet -- the double-mint this guard exists to prevent. This
-    /// verifies the invariant the race hinges on: a `HeldForRecovery` slot is
-    /// never cleared (caller skips the failure event), while an `ActiveTransfer`
-    /// or absent slot is cleared so a fresh rebalance can proceed.
+    /// verifies the invariant the race hinges on: a `HeldForRecovery` or
+    /// `Recovering` slot is never cleared (caller skips the failure event),
+    /// while an `ActiveTransfer` or absent slot is cleared so a fresh rebalance
+    /// can proceed.
     #[tokio::test]
-    async fn clear_equity_in_progress_unless_held_for_recovery_preserves_recovery_ownership() {
+    async fn clear_equity_in_progress_unless_recovery_owned_preserves_recovery_ownership() {
         let symbol = Symbol::new("AAPL").unwrap();
 
         let config = test_config_with_timeout(Duration::from_secs(60));
@@ -35570,19 +41786,33 @@ mod tests {
 
         // HeldForRecovery: recovery owns the slot -- must be left untouched and
         // signal the caller (returns false) to skip the failure event.
-        trigger
-            .equity_in_progress
-            .write()
-            .unwrap()
-            .insert(symbol.clone(), equity::GuardState::HeldForRecovery);
+        trigger.equity_in_progress.write().unwrap().insert(
+            symbol.clone(),
+            equity::GuardState::HeldForRecovery { chain: Chain::Base },
+        );
         assert!(
-            !trigger.clear_equity_in_progress_unless_held_for_recovery(&symbol),
+            !trigger.clear_equity_in_progress_unless_recovery_owned(&symbol),
             "a HeldForRecovery slot must not be cleared by the timeout path",
         );
         assert_eq!(
             trigger.equity_in_progress.read().unwrap().get(&symbol),
-            Some(&equity::GuardState::HeldForRecovery),
+            Some(&equity::GuardState::HeldForRecovery { chain: Chain::Base }),
             "the HeldForRecovery guard must remain after a refused clear",
+        );
+
+        let recovering = equity::GuardState::Recovering {
+            chain: Chain::Base,
+            generation: equity::GuardGeneration::default(),
+        };
+        trigger
+            .equity_in_progress
+            .write()
+            .unwrap()
+            .insert(symbol.clone(), recovering.clone());
+        assert!(!trigger.clear_equity_in_progress_unless_recovery_owned(&symbol));
+        assert_eq!(
+            trigger.equity_in_progress.read().unwrap().get(&symbol),
+            Some(&recovering)
         );
 
         // ActiveTransfer: a live transfer that genuinely timed out -- clear it so
@@ -35594,7 +41824,7 @@ mod tests {
             },
         );
         assert!(
-            trigger.clear_equity_in_progress_unless_held_for_recovery(&symbol),
+            trigger.clear_equity_in_progress_unless_recovery_owned(&symbol),
             "an ActiveTransfer slot must be cleared so a fresh rebalance can proceed",
         );
         assert_eq!(
@@ -35605,7 +41835,7 @@ mod tests {
 
         // Absent: clearing is a no-op that still reports success.
         assert!(
-            trigger.clear_equity_in_progress_unless_held_for_recovery(&symbol),
+            trigger.clear_equity_in_progress_unless_recovery_owned(&symbol),
             "an absent slot must report a successful (no-op) clear",
         );
     }
@@ -36064,6 +42294,7 @@ mod tests {
             id.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: Utc::now(),
             },
         );
@@ -36071,7 +42302,7 @@ mod tests {
             .suppressed_inflight_symbols
             .write()
             .await
-            .insert(symbol.clone(), Utc::now());
+            .insert((symbol.clone(), Chain::Base), Utc::now());
 
         trigger
             .on_mint(id.clone(), make_tokens_received())
@@ -36088,7 +42319,7 @@ mod tests {
                 .suppressed_inflight_symbols
                 .read()
                 .await
-                .contains_key(&symbol),
+                .contains_key(&(symbol.clone(), Chain::Base)),
             "inflight suppression must lift so snapshot polls resume \
              recording the symbol"
         );
@@ -36121,6 +42352,7 @@ mod tests {
             id.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: Utc::now(),
             },
         );
@@ -36128,7 +42360,7 @@ mod tests {
             .suppressed_inflight_symbols
             .write()
             .await
-            .insert(symbol.clone(), Utc::now());
+            .insert((symbol.clone(), Chain::Base), Utc::now());
 
         trigger
             .on_mint(id.clone(), make_mint_accepted())
@@ -36144,7 +42376,7 @@ mod tests {
                 .suppressed_inflight_symbols
                 .read()
                 .await
-                .contains_key(&symbol),
+                .contains_key(&(symbol.clone(), Chain::Base)),
             "a late non-completion event must leave inflight suppression \
              in place"
         );
@@ -36169,6 +42401,7 @@ mod tests {
             id.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: Utc::now(),
             },
         );
@@ -36176,7 +42409,7 @@ mod tests {
             .suppressed_inflight_symbols
             .write()
             .await
-            .insert(symbol.clone(), Utc::now());
+            .insert((symbol.clone(), Chain::Base), Utc::now());
 
         trigger
             .on_redemption(id.clone(), make_redemption_completed())
@@ -36193,7 +42426,7 @@ mod tests {
                 .suppressed_inflight_symbols
                 .read()
                 .await
-                .contains_key(&symbol),
+                .contains_key(&(symbol.clone(), Chain::Base)),
             "inflight suppression must lift so snapshot polls resume \
              recording the symbol"
         );
@@ -36309,25 +42542,225 @@ mod tests {
         };
         let base = test_config();
         let config = RebalancingServiceConfig {
-            usdc: Some(UsdcCorridorCtx {
-                corridor,
-                threshold: ImbalanceThreshold {
-                    target: float!(0.5),
-                    deviation: float!(0.2),
-                },
-            }),
+            usdc: UsdcCorridors::for_test(
+                OperationMode::Enabled,
+                [UsdcCorridorCtx {
+                    corridor,
+                    threshold: ImbalanceThreshold {
+                        target: float!(0.5),
+                        deviation: float!(0.2),
+                    },
+                }],
+            ),
             chains: BTreeMap::from([(Chain::Robinhood, base.chains[&Chain::Base].clone())]),
             ..base
         };
-        let inventory = InventoryView::for_primary_chain(Chain::Robinhood)
-            .with_usdc(usdc(100), usdc(900))
+        // Base, the primary, sits on target: only Robinhood's own USDC is
+        // under its band.
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(900), usdc(900))
             .with_withdrawable_cash_cents(90_000);
+        let inventory = with_onchain_usdc(inventory, Chain::Robinhood, usdc(100));
         let trigger = make_trigger_with_inventory_config(inventory, config).await;
 
         trigger.check_and_trigger_usdc().await;
 
         let job = pending_transfer_usdc_to_market_making_job(&trigger).await;
         assert_eq!(job.corridor, corridor);
+    }
+
+    fn active_corridor(chain: Chain, hop: HopKind) -> UsdcCorridorCtx {
+        UsdcCorridorCtx {
+            corridor: UsdcCorridor::HubRouted { chain, hop },
+            threshold: ImbalanceThreshold {
+                target: float!(0.5),
+                deviation: float!(0.2),
+            },
+        }
+    }
+
+    /// `base`'s cash table on each of `chains` besides Base.
+    fn with_cash_on(
+        mut config: RebalancingServiceConfig,
+        chains: &[Chain],
+    ) -> RebalancingServiceConfig {
+        let base = config.chains[&Chain::Base].clone();
+        for chain in chains {
+            config.chains.insert(*chain, base.clone());
+        }
+
+        config
+    }
+
+    fn with_onchain_usdc(inventory: InventoryView, chain: Chain, balance: Usdc) -> InventoryView {
+        let now = Utc::now();
+
+        inventory
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainUsdc {
+                    chain,
+                    usdc_balance: balance,
+                    fetched_at: now,
+                    block_number: None,
+                },
+                now,
+            )
+            .unwrap()
+    }
+
+    /// One check runs every active corridor in chain order, each against its
+    /// own band: Base over its band sends to Alpaca, HyperEVM under its band
+    /// takes the one Alpaca-outbound slot, and Robinhood, also under its
+    /// band, is refused by the guard until that transfer ends.
+    #[tokio::test]
+    async fn usdc_check_runs_every_active_corridor() {
+        let config = RebalancingServiceConfig {
+            usdc: UsdcCorridors::for_test(
+                OperationMode::Enabled,
+                [
+                    active_corridor(Chain::Base, HopKind::Cctp),
+                    active_corridor(Chain::HyperEvm, HopKind::Relay),
+                    active_corridor(Chain::Robinhood, HopKind::Relay),
+                ],
+            ),
+            ..with_cash_on(test_config(), &[Chain::HyperEvm, Chain::Robinhood])
+        };
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(9000), usdc(1000))
+            .with_withdrawable_cash_cents(100_000);
+        let inventory = with_onchain_usdc(inventory, Chain::HyperEvm, usdc(100));
+        let inventory = with_onchain_usdc(inventory, Chain::Robinhood, usdc(100));
+        let trigger = make_trigger_with_inventory_config(inventory, config).await;
+
+        trigger.check_and_trigger_usdc().await;
+
+        let to_hedging = pending_transfer_usdc_to_hedging_job(&trigger).await;
+        assert_eq!(to_hedging.corridor.chain(), Chain::Base);
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            1
+        );
+        let to_market_making = pending_transfer_usdc_to_market_making_job(&trigger).await;
+        assert_eq!(to_market_making.corridor.chain(), Chain::HyperEvm);
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            1
+        );
+        assert!(trigger.usdc_guards.is_held(Chain::Base));
+        assert!(trigger.usdc_guards.is_held(Chain::HyperEvm));
+        assert!(
+            !trigger.usdc_guards.is_held(Chain::Robinhood),
+            "a second Alpaca-outbound corridor must be refused while one runs"
+        );
+    }
+
+    /// A corridor table on a chain other than Base is looked up by its own
+    /// chain: its gas check gates its transfers, not Base's.
+    #[tokio::test]
+    async fn non_base_corridor_table_checks_its_own_chains_gas() {
+        let config = RebalancingServiceConfig {
+            usdc: UsdcCorridors::for_test(
+                OperationMode::Enabled,
+                [active_corridor(Chain::Robinhood, HopKind::Relay)],
+            ),
+            ..with_cash_on(test_config(), &[Chain::Robinhood])
+        };
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(900), usdc(900))
+            .with_withdrawable_cash_cents(90_000);
+        let inventory = with_onchain_usdc(inventory, Chain::Robinhood, usdc(100));
+        let trigger = make_trigger_with_inventory_config(inventory, config).await;
+        let low_gas = || {
+            ConfiguredGasReadiness::Wired(crate::native_gas::GasReadiness::for_test(
+                U256::ZERO,
+                U256::from(1_u64),
+                U256::MAX,
+                U256::from(1_u64),
+            ))
+        };
+        let ready = || {
+            ConfiguredGasReadiness::Wired(crate::native_gas::GasReadiness::always_ready_for_test())
+        };
+
+        trigger
+            .set_usdc_gas_readiness(BTreeMap::from([
+                (Chain::Base, ready()),
+                (Chain::Robinhood, low_gas()),
+            ]))
+            .await;
+        trigger.check_and_trigger_usdc().await;
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            0
+        );
+
+        trigger
+            .set_usdc_gas_readiness(BTreeMap::from([
+                (Chain::Base, low_gas()),
+                (Chain::Robinhood, ready()),
+            ]))
+            .await;
+        trigger.check_and_trigger_usdc().await;
+
+        let job = pending_transfer_usdc_to_market_making_job(&trigger).await;
+        assert_eq!(job.corridor, ROBINHOOD_RELAY);
+    }
+
+    /// A transfer on a non-Base corridor table is served: a manual resume
+    /// enqueues its job and latches that chain's guard.
+    #[tokio::test]
+    async fn non_base_corridor_table_is_served_on_manual_resume() {
+        let config = RebalancingServiceConfig {
+            usdc: UsdcCorridors::for_test(
+                OperationMode::Enabled,
+                [active_corridor(Chain::Robinhood, HopKind::Relay)],
+            ),
+            ..with_cash_on(test_config(), &[Chain::Robinhood])
+        };
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let inventory = with_onchain_usdc(
+            InventoryView::default().with_usdc(usdc(900), usdc(900)),
+            Chain::Robinhood,
+            usdc(500),
+        );
+        let trigger = make_trigger_with_inventory_config(inventory, config).await;
+        trigger
+            .set_stores(
+                Arc::new(test_store::<TokenizedEquityMint>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                store.clone(),
+            )
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::InitiateConversion {
+                    corridor: ROBINHOOD_RELAY,
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: usdc(400),
+                    order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                },
+            )
+            .await
+            .unwrap();
+
+        trigger
+            .resume_usdc_transfer(&pool, &id, RebalanceDirection::AlpacaToBase)
+            .await
+            .unwrap();
+
+        assert!(trigger.usdc_guards.is_held(Chain::Robinhood));
+        let job = pending_transfer_usdc_to_market_making_job(&trigger).await;
+        assert_eq!(job.corridor, ROBINHOOD_RELAY);
     }
 
     const ROBINHOOD_RELAY: UsdcCorridor = UsdcCorridor::HubRouted {
@@ -36368,6 +42801,11 @@ mod tests {
         let pages = corridor_pages(&notifier);
         assert_eq!(pages.len(), 1, "got {pages:?}");
         assert!(pages[0].contains(&id.to_string()), "{}", pages[0]);
+        assert!(
+            pages[0].contains("deploy a build and config that serve"),
+            "{}",
+            pages[0]
+        );
         assert!(
             pages[0].contains("Alpaca-outbound transfers are blocked on every corridor"),
             "a held Alpaca-outbound transfer blocks every corridor's outbound claims: {}",
@@ -36466,7 +42904,7 @@ mod tests {
             Err(UsdcTransferError::CorridorMismatch {
                 id: id.clone(),
                 recorded: ROBINHOOD_RELAY,
-                served: UsdcCorridor::BASE_CCTP,
+                served: BTreeSet::from([UsdcCorridor::BASE_CCTP]),
                 holds_guard: true,
             })
         }
@@ -36503,7 +42941,16 @@ mod tests {
         let serving = make_trigger_with_inventory_config_and_notifier(
             InventoryView::default(),
             RebalancingServiceConfig {
-                served_usdc_corridor: ROBINHOOD_RELAY,
+                usdc: UsdcCorridors::for_test(
+                    OperationMode::Disabled,
+                    [UsdcCorridorCtx {
+                        corridor: ROBINHOOD_RELAY,
+                        threshold: ImbalanceThreshold {
+                            target: float!(0.5),
+                            deviation: float!(0.2),
+                        },
+                    }],
+                ),
                 ..test_config()
             },
             notifier.clone(),
@@ -36534,6 +42981,8 @@ mod tests {
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
             driver_gate: UsdcDriverGate::unpaused(),
+            unrecorded_guards: None,
+            underfunded_alerts: crate::rebalancing::usdc::UnderfundedAlertLatch::default(),
         };
         job.perform(&unserved_build).await.unwrap();
 
@@ -37419,6 +43868,78 @@ mod tests {
         assert!(!trigger.usdc_guards.is_latched());
     }
 
+    /// The sweep that reads an unread untracked transfer also resolves its
+    /// unknown-corridor marker: a held guard names the corridor, a released
+    /// one drops the marker, which nothing else would ever clear.
+    #[tokio::test]
+    async fn sweep_read_resolves_the_unknown_marker_of_an_unread_transfer() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let held = UsdcRebalanceId(Uuid::new_v4());
+        seed_withdrawing_alpaca_to_base_on(&store, &held, usdc(400), ROBINHOOD_RELAY).await;
+        let reconciled = UsdcRebalanceId(Uuid::new_v4());
+        let burn_tx = B256::repeat_byte(0x0d);
+        for command in [
+            UsdcRebalanceCommand::Initiate {
+                corridor: ROBINHOOD_RELAY,
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: usdc(300),
+                withdrawal: TransferRef::OnchainTx(burn_tx),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceCommand::InitiateBridging { burn_tx },
+            UsdcRebalanceCommand::FailBridging {
+                reason: "stuck".to_string(),
+            },
+            UsdcRebalanceCommand::ReconcileStuckRebalance {
+                reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+            },
+        ] {
+            store.send(&reconciled, command).await.unwrap();
+        }
+        let notifier = Arc::new(CapturingNotifier::default());
+        let trigger = make_unserved_corridor_trigger(&pool, store.clone(), notifier).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let mut originals = Vec::new();
+        for id in [&held, &reconciled] {
+            let original = break_latest_usdc_event(&pool, id).await;
+            harness
+                .receive::<UsdcRebalance>(id.clone(), make_usdc_deposit_failed())
+                .await
+                .unwrap();
+            assert_eq!(
+                trigger
+                    .inventory
+                    .read()
+                    .await
+                    .active_usdc_rebalance_entry(id),
+                Some(&ActiveUsdcRebalance::Unknown)
+            );
+            originals.push((id, original));
+        }
+
+        for (id, original) in originals {
+            set_latest_usdc_event_payload(&pool, id, &original).await;
+        }
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.active_usdc_rebalance_entry(&held),
+            Some(&ActiveUsdcRebalance::Known {
+                chain: Chain::Robinhood,
+                direction: RebalanceDirection::AlpacaToBase,
+            })
+        );
+        assert_eq!(inventory.active_usdc_rebalance_entry(&reconciled), None);
+        drop(inventory);
+    }
+
     /// A live Alpaca-outbound job on another corridor blocks an
     /// Alpaca-outbound enqueue, so the rule survives a restart, while an
     /// inbound enqueue proceeds.
@@ -37462,7 +43983,7 @@ mod tests {
 
     /// Releasing another corridor's transfer, by its terminal event or by the
     /// sweep, leaves the in-flight Base transfer's inflight and active marker
-    /// alone: the inventory addresses only the primary chain.
+    /// alone: a release addresses only the released transfer's own entries.
     #[tokio::test]
     async fn releasing_another_corridors_transfer_keeps_the_base_transfers_inventory() {
         let pool = crate::test_utils::setup_test_db().await;
@@ -37550,6 +44071,311 @@ mod tests {
             Some(usdc(400)),
             "the Base transfer's inflight must survive"
         );
+        assert_eq!(inventory.active_usdc_rebalance(), Some(&base_id));
+        drop(inventory);
+    }
+
+    /// A resumed transfer with no tracking and no stored aggregate has no
+    /// known corridor, so it is busy at every chain until a tracked event
+    /// names its corridor.
+    #[tokio::test]
+    async fn unread_corridor_is_busy_everywhere_until_a_tracked_event_names_it() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let notifier = Arc::new(CapturingNotifier::default());
+        let trigger = make_unserved_corridor_trigger(&pool, store, notifier).await;
+        *trigger.inventory.write().await = InventoryView::default()
+            .with_usdc(usdc(900), usdc(100))
+            .update_usdc_at(
+                Chain::Robinhood,
+                Inventory::available(Venue::MarketMaking, Operator::Add, usdc(500)),
+                Utc::now(),
+            )
+            .unwrap();
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let base_busy = |inventory: &InventoryView| {
+            inventory
+                .cash_reconciliation_busy(InventoryScope::MarketMaking(Chain::Base), Utc::now())
+                .unwrap()
+        };
+
+        trigger
+            .on_usdc_rebalance(id.clone(), make_usdc_withdrawal_confirmed())
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.active_usdc_rebalance_entry(&id),
+            Some(&ActiveUsdcRebalance::Unknown)
+        );
+        assert_eq!(base_busy(&inventory), Some(EquityReconcileBusy::Transfer));
+        drop(inventory);
+
+        trigger
+            .on_usdc_rebalance(
+                id.clone(),
+                make_usdc_initiated_on(
+                    ROBINHOOD_RELAY,
+                    RebalanceDirection::BaseToAlpaca,
+                    usdc(300),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.active_usdc_rebalance_entry(&id),
+            Some(&ActiveUsdcRebalance::Known {
+                chain: Chain::Robinhood,
+                direction: RebalanceDirection::BaseToAlpaca,
+            })
+        );
+        assert_eq!(base_busy(&inventory), None);
+        drop(inventory);
+    }
+
+    /// A transfer on a non-primary corridor marks the broker cash busy and
+    /// reserves and settles in its own chain's slot, never the primary's.
+    #[tokio::test]
+    async fn non_primary_corridor_transfer_marks_cash_busy_and_moves_only_its_slot() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let notifier = Arc::new(CapturingNotifier::default());
+        let trigger = make_unserved_corridor_trigger(&pool, store, notifier).await;
+        *trigger.inventory.write().await = InventoryView::default()
+            .with_usdc(usdc(900), usdc(100))
+            .update_usdc_at(
+                Chain::Robinhood,
+                Inventory::available(Venue::MarketMaking, Operator::Add, usdc(500)),
+                Utc::now(),
+            )
+            .unwrap();
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                UsdcRebalanceEvent::Initiated {
+                    corridor: ROBINHOOD_RELAY,
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: usdc(300),
+                    withdrawal_ref: TransferRef::OnchainTx(TxHash::random()),
+                    initiated_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory
+                .cash_reconciliation_busy(InventoryScope::Hedging, Utc::now())
+                .unwrap(),
+            Some(EquityReconcileBusy::Transfer),
+            "the transfer must mark the broker cash busy"
+        );
+        assert_eq!(
+            inventory.onchain_usdc_inflight_at(Chain::Robinhood),
+            Some(usdc(300))
+        );
+        assert_eq!(
+            inventory.onchain_usdc_available_at(Chain::Robinhood),
+            Some(usdc(200))
+        );
+        assert_eq!(
+            inventory.usdc_inflight(Venue::MarketMaking),
+            Some(Usdc::ZERO)
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::MarketMaking),
+            Some(usdc(900))
+        );
+        drop(inventory);
+
+        harness
+            .receive::<UsdcRebalance>(
+                id,
+                make_usdc_conversion_confirmed(
+                    RebalanceDirection::BaseToAlpaca,
+                    usdc(300),
+                    usdc(299),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.onchain_usdc_inflight_at(Chain::Robinhood),
+            Some(Usdc::ZERO)
+        );
+        assert_eq!(
+            inventory.onchain_usdc_available_at(Chain::Robinhood),
+            Some(usdc(200))
+        );
+        assert_eq!(
+            inventory.usdc_inflight(Venue::MarketMaking),
+            Some(Usdc::ZERO)
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::MarketMaking),
+            Some(usdc(900))
+        );
+        assert_eq!(inventory.usdc_available(Venue::Hedging), Some(usdc(399)));
+        assert_eq!(
+            inventory
+                .cash_reconciliation_busy(InventoryScope::Hedging, Utc::now())
+                .unwrap(),
+            None
+        );
+        drop(inventory);
+    }
+
+    /// An Alpaca-to-Base transfer on the Robinhood corridor lands its USDC
+    /// in the Robinhood vault, not the primary chain's.
+    #[tokio::test]
+    async fn alpaca_to_base_settle_credits_the_corridor_chains_vault() {
+        let trigger = make_trigger_with_inventory(
+            InventoryView::default()
+                .with_usdc(usdc(100), usdc(900))
+                .update_usdc_at(
+                    Chain::Robinhood,
+                    Inventory::available(Venue::MarketMaking, Operator::Add, usdc(50)),
+                    Utc::now(),
+                )
+                .unwrap(),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        for event in [
+            UsdcRebalanceEvent::Initiated {
+                corridor: ROBINHOOD_RELAY,
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: usdc(300),
+                withdrawal_ref: TransferRef::OnchainTx(TxHash::random()),
+                initiated_at: Utc::now(),
+            },
+            make_usdc_bridged_with_amounts(usdc(299), usdc(1)),
+            make_usdc_deposit_confirmed(RebalanceDirection::AlpacaToBase),
+        ] {
+            trigger.on_usdc_rebalance(id.clone(), event).await.unwrap();
+        }
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.onchain_usdc_available_at(Chain::Robinhood),
+            Some(usdc(349))
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::MarketMaking),
+            Some(usdc(100))
+        );
+        assert_eq!(inventory.usdc_available(Venue::Hedging), Some(usdc(600)));
+        assert_eq!(inventory.usdc_inflight(Venue::Hedging), Some(Usdc::ZERO));
+        drop(inventory);
+    }
+
+    /// The pre-burn timeout of a Robinhood transfer releases its own slot and
+    /// marker; the live Base transfer keeps its inflight and marker.
+    #[tokio::test]
+    async fn sweep_clears_a_timed_out_transfers_own_chain_slot() {
+        let now = Utc::now();
+        let base_id = UsdcRebalanceId(Uuid::new_v4());
+        let robinhood_id = UsdcRebalanceId(Uuid::new_v4());
+        let start = |amount| Inventory::transfer(Venue::MarketMaking, TransferOp::Start, amount);
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(900), usdc(900))
+            .update_usdc_at(
+                Chain::Robinhood,
+                Inventory::available(Venue::MarketMaking, Operator::Add, usdc(500)),
+                now,
+            )
+            .unwrap()
+            .update_usdc_at(Chain::Base, start(usdc(400)), now)
+            .unwrap()
+            .update_usdc_at(Chain::Robinhood, start(usdc(300)), now)
+            .unwrap()
+            .set_active_usdc_rebalance(
+                base_id.clone(),
+                base_usdc_rebalance(RebalanceDirection::BaseToAlpaca),
+            )
+            .set_active_usdc_rebalance(
+                robinhood_id.clone(),
+                ActiveUsdcRebalance::Known {
+                    chain: Chain::Robinhood,
+                    direction: RebalanceDirection::BaseToAlpaca,
+                },
+            );
+        let trigger = make_trigger_with_inventory(inventory).await;
+        trigger.usdc_tracking.write().await.insert(
+            robinhood_id.clone(),
+            usdc::UsdcRebalanceTracking {
+                corridor: ROBINHOOD_RELAY,
+                direction: RebalanceDirection::BaseToAlpaca,
+                initiated_amount: usdc(300),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::WithdrawalConfirmed,
+                last_progress_at: now - ChronoDuration::minutes(40),
+            },
+        );
+
+        let cleanup = trigger
+            .cleanup_timed_out_usdc_rebalance(&robinhood_id, now)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(cleanup, Some(UsdcTimeoutCleanup::Cleared { .. })),
+            "got {cleanup:?}"
+        );
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.onchain_usdc_inflight_at(Chain::Robinhood),
+            Some(Usdc::ZERO)
+        );
+        assert_eq!(
+            inventory.usdc_inflight(Venue::MarketMaking),
+            Some(usdc(400))
+        );
+        assert_eq!(inventory.active_usdc_rebalance(), Some(&base_id));
+        drop(inventory);
+    }
+
+    /// An operator reconcile of a transfer this process never tracked has no
+    /// known corridor, so it reserved nothing here and releases nothing: the
+    /// live Base transfer's broker inflight stays.
+    #[tokio::test]
+    async fn operator_reconcile_without_tracking_touches_no_inflight() {
+        let untracked = UsdcRebalanceId(Uuid::new_v4());
+        let trigger = make_trigger_with_inventory(
+            InventoryView::default()
+                .with_usdc(usdc(100), usdc(900))
+                .set_active_usdc_rebalance(untracked.clone(), ActiveUsdcRebalance::Unknown),
+        )
+        .await;
+        let base_id = UsdcRebalanceId(Uuid::new_v4());
+        trigger
+            .on_usdc_rebalance(
+                base_id.clone(),
+                make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(400)),
+            )
+            .await
+            .unwrap();
+
+        trigger
+            .on_usdc_rebalance(
+                untracked,
+                make_usdc_operator_reconciled(RebalanceDirection::AlpacaToBase),
+            )
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(inventory.usdc_inflight(Venue::Hedging), Some(usdc(400)));
         assert_eq!(inventory.active_usdc_rebalance(), Some(&base_id));
         drop(inventory);
     }

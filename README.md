@@ -22,12 +22,14 @@ HyperEVM chain requires an explicit HYPE threshold in
 configuration. Active mode, gas valuation and automated rebalancing on HyperEVM
 remain unavailable.
 
-Robinhood Chain (4663) is declared the same way and ships as a prefunded
-hedge-only secondary: fills on its two launch equities (wtDNUT, wtFGI) are
-ingested, validated against USDG and hedged, with `rebalancing = "disabled"` on
-every asset and no inventory adapter mapped. The build can also value its gas
-(it pays gas in ETH), so `active` is reachable; rebalancing remains unavailable
-there.
+Robinhood Chain (4663) is declared the same way: fills on its two launch
+equities (wtDNUT, wtFGI) are ingested, validated against USDG and hedged, with
+Bebop's Robinhood hook mapped as the inventory adapter. The build values its gas
+(it pays gas in ETH), so `active` is reachable. Production runs it `active` and
+rebalances against Alpaca the listings the pinned token file enables there
+(DNUT); staging runs it as a prefunded hedge-only secondary with
+`rebalancing = "disabled"` on every asset. It cannot rebalance cash, because it
+has no CCTP domain.
 
 ## Features
 
@@ -175,10 +177,20 @@ cargo run --bin validate-config -- --config config/prod/st0x-hedge.toml
 cargo run --bin validate-config -- --config path/to/config.toml --secrets path/to/secrets.toml
 ```
 
-A config that names `[registry]` keeps its per-symbol tables in the token file
-in the bucket. `validate-config` never reads the bucket: pass a local copy with
-`--registry-file tokens.toml` to check those tables too. Without it the config
-is judged without them, and the report says so.
+A config that names `[registry]` keeps its per-symbol tables in the token file.
+Pass `--registry-file tokens.toml` to check those tables offline. Without a file
+or state path, `validate-config` judges config alone and reports the omission.
+The deploy gates accept `--registry-state /mnt/data/registry` and validate
+pending plus fallback, or running; they never mutate the manifest. With an
+explicit state path but no seeded state, gates fetch the token file.
+
+After the separate unpin release, accepted token changes apply by a validated
+graceful restart, with ten-second metadata polling, immutable disk records,
+ten-minute last-good promotion and fallback after two failed boots. Removed
+listings persist disabled so durable work can finish. During the first rollout,
+production remains pinned and the watcher reports changes only. See
+[asset publication](docs/how-to-add-new-asset.md#4b-publish-and-verify-adoption)
+and [registry metrics](docs/observability.md#registry-reloads).
 
 Without `--secrets` it judges the config file alone: schema (unknown keys are
 rejected), the port, chain, asset and `[rebalancing]` cross-field rules, and
@@ -460,9 +472,15 @@ nix run .#deployAll   # first deployment
 - **Release** (`.github/workflows/release-tag.yml`): pushing a `vX.Y.Z` tag
   labels the images already built and attested for that commit and cuts the
   GitHub release. It does not build or deploy.
-- **Production** is promoted from `t0.devops`, not this repo: promote a digest
-  proven in staging into `terraform/production-liquidity/images.yaml` and merge.
-  The apply requires 2 of 4 approvers (Juan, Alastair, Kais, Josh).
+- **Observability** (`.github/workflows/observability.yml`): the liquidity bot's
+  Grafana boards and alert rules in `observability/`. Every pull request that
+  touches them provisions them into a throwaway Grafana; a merge to `master`
+  ships them to the production T0 Grafana. See
+  [observability/README.md](observability/README.md).
+- **Production** bot images are promoted from `t0.devops`, not this repo:
+  promote a digest proven in staging into
+  `terraform/production-liquidity/images.yaml` and merge. The apply requires 2
+  of 4 approvers (Juan, Alastair, Kais, Josh).
 
 Track staging and production deploys in the Grafana deployments dashboard:
 https://grafana.t0trade.com/d/t0-deployments/deployments
@@ -550,10 +568,11 @@ Workspace crates:
   crates
 - **`st0x-dto`** (`crates/dto/`) - Dashboard DTOs and TypeScript binding
   generation
-- **`st0x-execution`** (`crates/execution/`) - Standalone `Executor` trait
-  abstraction with Alpaca Broker API and mock implementations
-- **`st0x-tokenization`** (`crates/tokenization/`) - Standalone `Tokenizer`
-  trait abstraction with Alpaca tokenization API and mock implementations
+- **`st0x-execution`** (`crates/execution/`) - `Executor` trait and
+  Liquidity-specific hedge policy over the released `st0x-alpaca` broker and
+  wallet clients
+- **`st0x-tokenization`** (`crates/tokenization/`) - `Tokenizer` trait and
+  onchain mint/redemption handling over the released `st0x-alpaca` client
 - **`st0x-bridge`** (`crates/bridge/`) - Cross-chain bridge abstractions and
   CCTP implementation
 - **`st0x-raindex`** (`crates/raindex/`) - `Raindex` trait and shared domain
@@ -592,8 +611,10 @@ secret/
 ├── st0x-hedge.toml.age           # encrypted core service secrets
 └── st0x-hedge-pricing.toml.age   # encrypted pricing credential overlay
 dashboard/                 # SvelteKit operations dashboard
+observability/             # Grafana boards and alert rules, shipped on merge
 .github/workflows/
 ├── ci.yaml                # Build, test, clippy, dashboard
+├── observability.yml      # Check and ship observability/
 └── cd.yaml                # Deploy to NixOS host
 ```
 
@@ -608,6 +629,10 @@ cargo clippy --workspace --all-targets --all-features -- -D clippy::all
 cargo fmt                    # format Rust code
 nix fmt                      # format Nix code (when editing .nix files)
 ```
+
+`nix run .#ci` runs the complete local verification suite, including RustSec
+dependency auditing. For the standalone audit and its regression tests, see
+[Rust dependency auditing](docs/dependency-audit.md).
 
 Debug builds use `debug = "line-tables-only"` for workspace crates and no
 debuginfo for third-party crates (workspace `Cargo.toml`), and the Linux dev
@@ -677,6 +702,7 @@ CI will fail if `bun.nix` is out of sync with `bun.lock`.
 ## Documentation
 
 - **[SPEC.md](SPEC.md)** - Complete technical specification and architecture
+- **[docs/turnkey.md](docs/turnkey.md)** - Turnkey configuration validation
 - **[docs/domain.md](docs/domain.md)** - Domain model, terminology, and naming
   conventions
 - **[AGENTS.md](AGENTS.md)** - Development guidelines for AI-assisted coding

@@ -31,6 +31,7 @@ use super::job::{
 };
 use super::monitor::executor_maintenance::ExecutorMaintenance;
 use super::monitor::gas::GasMonitor;
+use super::monitor::hedge_stall::HedgeStallMonitor;
 use super::monitor::inventory::InventoryMonitor;
 use super::monitor::order_fills::OrderFillMonitor;
 use super::{Conductor, SupervisorStartupTokens};
@@ -40,6 +41,7 @@ use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::bot_gas::{
     RecordBotGasReceiptCost, RecordBotGasReceiptCostCtx, RecordBotGasReceiptCostJobQueue,
 };
+use crate::dashboard::equity_price::EquityPriceStore;
 use crate::dashboard::{
     DashboardTradeDeliveryCtx, DashboardTradeDeliveryJobQueue, DashboardTradeHandoffMonitor,
     DeliverDashboardTrade,
@@ -65,7 +67,9 @@ use crate::portfolio_snapshot::{
     PortfolioSnapshotJobQueue,
 };
 use crate::position::Position;
-use crate::position_check::{CheckPositions, CheckPositionsCtx, CheckPositionsJobQueue};
+use crate::position_check::{
+    CheckPositions, CheckPositionsCtx, CheckPositionsJobQueue, HedgeScanHeartbeat,
+};
 use crate::rebalancing::equity::{
     DeliverMintAuthorization, DeliverMintAuthorizationCtx, DeliverMintAuthorizationJobQueue,
     ResumeTokenizationAggregate, ResumeTokenizationCtx, ResumeTokenizationJobQueue,
@@ -87,7 +91,8 @@ use crate::trading::offchain::close_flatten::{
 };
 use crate::trading::offchain::hedge::{HedgeCtx, HedgeJobQueue, PlaceHedge};
 use crate::trading::onchain::trade_accountant::{
-    AccountForDexTrade, AccountantCtx, DexTradeAccountingJobQueue, TradeAccountingError,
+    AccountForDexTrade, AccountantCtx, DeadLetterReason, DexTradeAccountingJobQueue,
+    TradeAccountingError,
 };
 use crate::unwrapped_equity_recovery::{
     UnwrappedEquityRecoveryCtx, UnwrappedEquityRecoveryJob, UnwrappedEquityRecoveryJobQueue,
@@ -166,6 +171,9 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
     /// capture job resolves each wrapped balance through the service of the
     /// chain that balance sits on.
     pub(crate) wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
+    /// The pricing service's marks; the daily capture values each symbol at
+    /// the newer of its last fill and its last mark.
+    pub(crate) equity_prices: EquityPriceStore,
     pub(crate) projection_maintenance: Arc<super::projection_pause::ProjectionMaintenance>,
     pub(crate) shutdown_token: CancellationToken,
     pub(crate) startup_token: StartupToken,
@@ -205,7 +213,9 @@ fn chain_equity_symbols(assets: &st0x_config::ChainAssets) -> HashSet<Symbol> {
         .equities
         .symbols
         .keys()
-        .filter(|symbol| assets.is_trading_enabled(symbol) || assets.is_rebalancing_enabled(symbol))
+        .filter(|symbol| {
+            assets.is_trading_enabled(symbol) || assets.rebalancing_mode(symbol).keeps_services()
+        })
         .cloned()
         .collect()
 }
@@ -532,6 +542,20 @@ where
     // placement reaches the broker must clear the scan's entries too.
     let alerted_dead_letters = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
 
+    // One heartbeat, written by the position sweep and read by the
+    // hedge-stall monitor.
+    let hedge_scan_heartbeat = Arc::new(HedgeScanHeartbeat::default());
+
+    let hedge_stall_monitor = build_hedge_stall_monitor(
+        &context.ctx,
+        context.executor.clone(),
+        context.frameworks.position_projection.clone(),
+        hedge_scan_heartbeat.clone(),
+        alerted_dead_letters.clone(),
+        close_flatten_policy.clone(),
+        notifier.clone(),
+    );
+
     let hedge_ctx = Arc::new(HedgeCtx {
         configured_executor: context.executor.to_supported_executor(),
         pool: context.pool.clone(),
@@ -569,12 +593,14 @@ where
         poll_interval,
         notifier: notifier.clone(),
         alerted_dead_letters,
+        heartbeat: hedge_scan_heartbeat,
     });
 
     let portfolio_snapshot_ctx = Arc::new(PortfolioSnapshotCtx {
         market_making: market_making_slots(&context.ctx),
         inventory: context.inventory.clone(),
         position_projection: context.frameworks.position_projection.clone(),
+        equity_prices: context.equity_prices.clone(),
         portfolio_snapshot: context.frameworks.portfolio_snapshot.clone(),
         wrappers: context.wrappers.clone(),
         wallet_transit_equity_symbols: chain_equity_symbols(&context.ctx.chains.primary().assets),
@@ -658,6 +684,7 @@ where
         hyperevm_gas_monitor: hyperevm_gas_monitor_startup,
         robinhood_gas_monitor: robinhood_gas_monitor_startup,
         trading_schedule_monitor: trading_schedule_monitor_startup,
+        hedge_stall_monitor: hedge_stall_monitor_startup,
     } = context.supervisor_startup;
 
     // Fail-fast: exit if any supervised task dies, relying on systemd restart for recovery.
@@ -773,6 +800,19 @@ where
         );
     } else {
         trading_schedule_monitor_startup.acknowledge();
+    }
+
+    log_optional_task_status("hedge-stall monitor", hedge_stall_monitor.is_some());
+    if let Some(monitor) = hedge_stall_monitor {
+        supervisor_builder = supervisor_builder.with_task(
+            "hedge-stall-monitor",
+            StartupTask {
+                task: monitor,
+                token: hedge_stall_monitor_startup,
+            },
+        );
+    } else {
+        hedge_stall_monitor_startup.acknowledge();
     }
     let supervisor = supervisor_builder.build().run();
 
@@ -1426,6 +1466,30 @@ where
     })
 }
 
+/// `None` unless `[alerts.hedge_stall]` is configured. Gated on that table
+/// alone: unlike the gas monitors, this monitor needs no wallet.
+fn build_hedge_stall_monitor<Exec>(
+    ctx: &Ctx,
+    executor: Exec,
+    position_projection: Arc<Projection<Position>>,
+    heartbeat: Arc<HedgeScanHeartbeat>,
+    alerted_dead_letters: Arc<tokio::sync::Mutex<HashSet<(Symbol, DeadLetterReason)>>>,
+    close_flatten_policy: CloseFlattenPolicy,
+    notifier: Arc<dyn Notifier>,
+) -> Option<HedgeStallMonitor<Exec>> {
+    let timings = ctx.alerts.as_ref()?.hedge_stall()?;
+    Some(HedgeStallMonitor {
+        executor,
+        position_projection,
+        heartbeat,
+        alerted_dead_letters,
+        close_flatten_policy,
+        ctx: ctx.clone(),
+        notifier,
+        timings,
+    })
+}
+
 fn log_optional_task_status(task_name: &str, is_configured: bool) {
     if is_configured {
         info!("Started {task_name} task");
@@ -1660,7 +1724,7 @@ mod tests {
     use st0x_bridge::corridor::UsdcCorridor;
     use st0x_config::{
         ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, OperationMode,
-        create_test_ctx_with_order_owner,
+        RebalancingMode, create_test_ctx_with_order_owner,
     };
     use st0x_event_sorcery::test_store;
     use st0x_execution::{FractionalShares, Symbol};
@@ -1689,11 +1753,11 @@ mod tests {
         ResumeAlpacaToBase, ResumeBaseToAlpaca, UsdcDriverGate, UsdcTransferError,
     };
     use crate::startup::StartupBarrier;
-    use crate::test_utils::{setup_test_apalis_pool, setup_test_pools};
+    use crate::test_utils::{setup_test_apalis_pool, setup_test_pools, wait_for_terminal_job};
     use crate::usdc_rebalance::UsdcRebalanceId;
     use crate::vault_lookup::MockVaultLookup;
 
-    fn equity_asset(trading: OperationMode, rebalancing: OperationMode) -> ChainEquityAsset {
+    fn equity_asset(trading: OperationMode, rebalancing: RebalancingMode) -> ChainEquityAsset {
         ChainEquityAsset {
             tokenized_equity: Address::ZERO,
             tokenized_equity_derivative: Address::ZERO,
@@ -1718,15 +1782,15 @@ mod tests {
                 symbols: HashMap::from([
                     (
                         Symbol::new("TRADE").unwrap(),
-                        equity_asset(OperationMode::Enabled, OperationMode::Disabled),
+                        equity_asset(OperationMode::Enabled, RebalancingMode::Disabled),
                     ),
                     (
                         Symbol::new("REBAL").unwrap(),
-                        equity_asset(OperationMode::Disabled, OperationMode::Enabled),
+                        equity_asset(OperationMode::Disabled, RebalancingMode::Enabled),
                     ),
                     (
                         Symbol::new("OFF").unwrap(),
-                        equity_asset(OperationMode::Disabled, OperationMode::Disabled),
+                        equity_asset(OperationMode::Disabled, RebalancingMode::Disabled),
                     ),
                 ]),
             },
@@ -1757,7 +1821,7 @@ mod tests {
                 operational_limit: None,
                 symbols: HashMap::from([(
                     Symbol::new("AAPL").unwrap(),
-                    equity_asset(OperationMode::Enabled, OperationMode::Disabled),
+                    equity_asset(OperationMode::Enabled, RebalancingMode::Disabled),
                 )]),
             },
             cash: None,
@@ -1770,7 +1834,7 @@ mod tests {
                         operational_limit: None,
                         symbols: HashMap::from([(
                             secondary_symbol.clone(),
-                            equity_asset(OperationMode::Enabled, OperationMode::Disabled),
+                            equity_asset(OperationMode::Enabled, RebalancingMode::Disabled),
                         )]),
                     },
                     cash: None,
@@ -1907,7 +1971,7 @@ mod tests {
                 operational_limit: None,
                 symbols: HashMap::from([(
                     Symbol::new("AAPL").unwrap(),
-                    equity_asset(OperationMode::Enabled, OperationMode::Disabled),
+                    equity_asset(OperationMode::Enabled, RebalancingMode::Disabled),
                 )]),
             },
             cash: Some(ChainCashAsset {
@@ -1924,7 +1988,7 @@ mod tests {
                         operational_limit: None,
                         symbols: HashMap::from([(
                             secondary_symbol.clone(),
-                            equity_asset(OperationMode::Enabled, OperationMode::Disabled),
+                            equity_asset(OperationMode::Enabled, RebalancingMode::Disabled),
                         )]),
                     },
                     cash: None,
@@ -1952,6 +2016,58 @@ mod tests {
                 (Chain::Ethereum, HashSet::from([secondary_symbol]), false),
             ],
             "each hedged chain contributes the slots its own assets table declares"
+        );
+    }
+
+    #[tokio::test]
+    async fn hedge_stall_monitor_runs_only_with_its_table_and_shares_the_heartbeat() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let (_, position_projection) = st0x_event_sorcery::StoreBuilder::<Position>::new(pool)
+            .build(())
+            .await
+            .unwrap();
+        let heartbeat = Arc::new(HedgeScanHeartbeat::default());
+        let build = |ctx: &Ctx| {
+            build_hedge_stall_monitor(
+                ctx,
+                st0x_execution::MockExecutor::new(),
+                position_projection.clone(),
+                heartbeat.clone(),
+                Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+                CloseFlattenPolicy::from_secs(300).unwrap(),
+                Arc::new(crate::alerts::LogNotifier),
+            )
+        };
+        let gas_only = AlertsCtx::for_test(
+            BTreeMap::from([
+                (Chain::Base, U256::from(100_u64)),
+                (Chain::Ethereum, U256::from(200_u64)),
+            ]),
+            Duration::from_secs(300),
+            Duration::from_secs(3600),
+        );
+        let timings = st0x_config::HedgeStallCtx {
+            poll_interval: Duration::from_secs(60),
+            stall_after: Duration::from_secs(900),
+            realert_interval: Duration::from_secs(1),
+        };
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+
+        ctx.alerts = None;
+        assert!(build(&ctx).is_none(), "no [alerts] means no monitor");
+
+        ctx.alerts = Some(gas_only.clone());
+        assert!(
+            build(&ctx).is_none(),
+            "no [alerts.hedge_stall] means no monitor"
+        );
+
+        ctx.alerts = Some(gas_only.with_hedge_stall(timings));
+        let monitor = build(&ctx).expect("a configured table must build the monitor");
+        assert_eq!(monitor.timings, timings);
+        assert!(
+            Arc::ptr_eq(&monitor.heartbeat, &heartbeat),
+            "the monitor must read the heartbeat the sweep writes"
         );
     }
 
@@ -2401,28 +2517,6 @@ mod tests {
         }
     }
 
-    async fn wait_for_terminal_job<Task: 'static>(apalis_pool: &apalis_sqlite::SqlitePool) {
-        tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                let terminal_count: i64 = sqlx_apalis::query_scalar(
-                    "SELECT COUNT(*) FROM Jobs \
-                     WHERE job_type = ? AND status IN ('Failed', 'Killed') \
-                     AND attempts >= max_attempts",
-                )
-                .bind(std::any::type_name::<Task>())
-                .fetch_one(apalis_pool)
-                .await
-                .unwrap();
-                if terminal_count == 1 {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .expect("the poison job must reach a visible terminal state");
-    }
-
     fn mint_transfer_ctx(
         transfer: Arc<dyn ResumeEquityToMarketMaking>,
         cqrs_pool: sqlx::SqlitePool,
@@ -2441,7 +2535,13 @@ mod tests {
                     wrapper,
                     mint_authorizer: ConfiguredMintAuthorizer::Disabled,
                     gas_readiness: ConfiguredGasReadiness::Unwired,
-                    equities: ChainEquities::default(),
+                    equities: ChainEquities {
+                        operational_limit: None,
+                        symbols: HashMap::from([(
+                            Symbol::new("AAPL").unwrap(),
+                            equity_asset(OperationMode::Disabled, RebalancingMode::Enabled),
+                        )]),
+                    },
                 },
             )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
@@ -2450,10 +2550,9 @@ mod tests {
         Arc::new(TransferEquityToMarketMakingCtx {
             transfer,
             equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
-            mint_store: Arc::new(test_store(cqrs_pool, services)),
+            mint_store: Arc::new(test_store(cqrs_pool, services.clone())),
             position_authority: None,
-            transfer_services: EquityTransferServices::panicking(),
-            primary_chain: Chain::Base,
+            transfer_services: services,
             job_queue,
         })
     }
@@ -2481,12 +2580,18 @@ mod tests {
                     wrapper: Arc::new(MockWrapper::new()),
                     mint_authorizer: ConfiguredMintAuthorizer::Disabled,
                     gas_readiness: ConfiguredGasReadiness::Unwired,
-                    equities: ChainEquities::default(),
+                    equities: ChainEquities {
+                        operational_limit: None,
+                        symbols: HashMap::from([(
+                            symbol.clone(),
+                            equity_asset(OperationMode::Disabled, RebalancingMode::Enabled),
+                        )]),
+                    },
                 },
             )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
-        let redemption_store = Arc::new(test_store(cqrs_pool, services));
+        let redemption_store = Arc::new(test_store(cqrs_pool, services.clone()));
 
         queue
             .push(TransferEquityToHedging {
@@ -2510,7 +2615,9 @@ mod tests {
             }),
             equity_in_progress: equity_in_progress.clone(),
             redemption_store,
+            transfer_services: services,
             position_authority: None,
+            hedge_capacity: None,
             job_queue: queue.clone(),
             notifier: Arc::new(crate::alerts::LogNotifier),
         });
@@ -2598,6 +2705,8 @@ mod tests {
             job_queue: queue.clone(),
             max_burn_revert_redrives: 1,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
+            underfunded_alerts: crate::rebalancing::usdc::UnderfundedAlertLatch::default(),
         });
         let failure_injector = FailureInjector::new();
         let monitor = register_transfer_usdc_to_hedging_worker(
@@ -2685,6 +2794,7 @@ mod tests {
             job_queue: queue.clone(),
             max_burn_revert_redrives: 1,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         });
         let monitor = register_transfer_usdc_to_market_making_worker(
             Monitor::new().should_restart(|_ctx, _error, _attempt| false),

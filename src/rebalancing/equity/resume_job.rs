@@ -27,11 +27,10 @@ use st0x_event_sorcery::SendError;
 use st0x_execution::Symbol;
 use st0x_tokenization::IssuerRequestId;
 
-use super::job::{
-    PositionReservationAuthority, has_live_sibling_equity_transfer, restore_position_reservation,
-};
+use super::job::{PositionReservationAuthority, restore_position_reservation};
 use super::{
-    CrossVenueEquityTransfer, MintError, RedemptionError, WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY,
+    CrossVenueEquityTransfer, IssuerSendRedrive, MintError, RedemptionError,
+    WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY, issuer_send_redrive, page_underlying_mismatch,
     withdrawal_reconciliation_redrive_delay,
 };
 use crate::alerts::Notifier;
@@ -39,7 +38,7 @@ use crate::alerts::Notifier;
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::bot_gas::redrive::{BotGasFailureClassifier, redrive_on_bot_gas_failure};
 use crate::conductor::job::{
-    BackpressureStreak, Job, JobQueue, Label, QueuePushError, TaskIdentity,
+    BackpressureStreak, Job, JobQueue, Label, QueuePushError, TaskIdentity, has_live_sibling_job,
 };
 use crate::equity_redemption::RedemptionAggregateId;
 use crate::position::{EquityTransferReservationId, Position, PositionCommand};
@@ -159,13 +158,9 @@ impl Job<ResumeTokenizationCtx> for ResumeTokenizationAggregate {
     type Error = ResumeTokenizationJobError;
 
     const WORKER_NAME: &'static str = "resume-tokenization-aggregate-worker";
-    /// No perform-level bound (`None`): the redemption resume path drives
-    /// `SendPending` -> `send_for_redemption`, an on-chain token transfer with
-    /// no pre-send persisted guard. `perform_bounded` dropping it after the
-    /// transfer broadcast but before `TokensSent` persists would, on retry,
-    /// re-enter `SendPending` and send the tokens a second time. `resume_mint`
-    /// (the other target) is idempotent, so leaving the whole job unbounded is
-    /// safe; actual hangs are bounded by the HTTP/RPC transport timeouts.
+    /// Signed sends to the issuer are persisted before broadcast, so retries and
+    /// cancellation rebroadcast the same envelope. Transport timeouts bound
+    /// external calls; keep this aggregate-driving worker unbounded.
     const PERFORM_TIMEOUT: Option<std::time::Duration> = None;
     const TERMINAL_FAILURE_MSG: &'static str = "Interrupted tokenization aggregate failed all resume retries; \
          the aggregate remains stuck. Operator action required.";
@@ -206,6 +201,7 @@ impl Job<ResumeTokenizationCtx> for ResumeTokenizationAggregate {
             symbol,
             *position_threshold,
             reservation_id,
+            None,
         )
         .await?
         {
@@ -249,11 +245,43 @@ impl Job<ResumeTokenizationCtx> for ResumeTokenizationAggregate {
             return Ok(());
         };
 
+        if let ResumeTokenizationTarget::Redemption(aggregate_id) = &self.target {
+            if let ResumeTokenizationJobError::Redemption(redemption_error) = &error
+                && redemption_error.is_permanent_underlying_mismatch()
+            {
+                page_underlying_mismatch(&ctx.notifier, aggregate_id, redemption_error).await;
+                warn!(
+                    target: "tokenization",
+                    resume_target = %self.target,
+                    %error,
+                    "Legacy redemption underlying does not match its vault; stopping without retries"
+                );
+                return Ok(());
+            }
+
+            if let Some(IssuerSendRedrive { tx_hash, delay }) =
+                issuer_send_redrive(ctx.transfer.redemption_store(), aggregate_id).await
+            {
+                warn!(
+                    target: "tokenization",
+                    resume_target = %self.target,
+                    ?tx_hash,
+                    ?delay,
+                    %error,
+                    "Signed send to the issuer is unresolved; scheduling a durable resume"
+                );
+                let mut job_queue = ctx.job_queue.clone();
+                job_queue.push_with_delay(self.clone(), delay).await?;
+                return Ok(());
+            }
+        }
+
         if error.is_reconciliation_pending() {
-            // Only a redemption's withdrawal confirmation is reconciliation-
-            // pending (mints never produce it), so page + slow the redrive once
-            // the durable deadline anchored on the persisted submit timestamp
-            // elapses; before it, stay silent at the 30s cadence.
+            // A redemption's withdrawal confirmation is reconciliation-pending
+            // (mints never produce it, and a pending send to the issuer was redriven
+            // above), so page + slow the redrive once the durable deadline
+            // anchored on the persisted submit timestamp elapses; before it,
+            // stay silent at the 30s cadence.
             let delay = match &self.target {
                 ResumeTokenizationTarget::Redemption(aggregate_id) => {
                     withdrawal_reconciliation_redrive_delay(
@@ -298,14 +326,48 @@ impl Job<ResumeTokenizationCtx> for ResumeTokenizationAggregate {
                 .load(id)
                 .await?
                 .is_some_and(|aggregate| !aggregate.is_terminal()),
-            ResumeTokenizationTarget::Redemption(id) => ctx
-                .transfer
-                .redemption_store
-                .load(id)
-                .await?
-                .is_some_and(|aggregate| !aggregate.is_terminal()),
+            ResumeTokenizationTarget::Redemption(id) => {
+                match ctx.transfer.redemption_store.load(id).await {
+                    Ok(aggregate) => aggregate.is_some_and(|aggregate| !aggregate.is_terminal()),
+                    // Unreadable: it may hold a signed send to the issuer, so it is
+                    // treated as live and redriven below.
+                    Err(error) => {
+                        warn!(
+                            target: "tokenization",
+                            resume_target = %self.target,
+                            ?error,
+                            %task_identity,
+                            "Terminal resume attempt could not read its redemption; treating it as live"
+                        );
+                        true
+                    }
+                }
+            }
         };
         if target_is_live {
+            // A signed send to the issuer holds its nonce until it resolves, so it must
+            // keep a driver: `perform` redrives its failures, and a budget spent
+            // anyway (its state read failed too) queues a fresh row here.
+            if let ResumeTokenizationTarget::Redemption(id) = &self.target
+                && let Some(IssuerSendRedrive { tx_hash, delay }) =
+                    issuer_send_redrive(ctx.transfer.redemption_store(), id).await
+                && !has_live_sibling_job::<Self>(ctx.job_queue.pool(), task_identity, |sibling| {
+                    sibling.target == self.target
+                })
+                .await?
+            {
+                warn!(
+                    target: "tokenization",
+                    resume_target = %self.target,
+                    ?tx_hash,
+                    ?delay,
+                    %task_identity,
+                    "Resume budget spent on an unresolved signed send to the issuer; scheduling a fresh row"
+                );
+                let mut job_queue = ctx.job_queue.clone();
+                job_queue.push_with_delay(self.clone(), delay).await?;
+                return Ok(());
+            }
             warn!(
                 target: "tokenization",
                 resume_target = %self.target,
@@ -314,11 +376,9 @@ impl Job<ResumeTokenizationCtx> for ResumeTokenizationAggregate {
             );
             return Ok(());
         }
-        if has_live_sibling_equity_transfer::<Self>(
-            ctx.job_queue.pool(),
-            task_identity,
-            |sibling| sibling.target == self.target,
-        )
+        if has_live_sibling_job::<Self>(ctx.job_queue.pool(), task_identity, |sibling| {
+            sibling.target == self.target
+        })
         .await?
         {
             warn!(
@@ -357,7 +417,9 @@ impl Job<ResumeTokenizationCtx> for ResumeTokenizationAggregate {
 mod tests {
     use alloy::primitives::{Address, B256, TxHash, U256};
     use serde_json::json;
-    use st0x_config::{ChainEquities, ExecutionThreshold};
+    use st0x_config::{
+        ChainEquities, ChainEquityAsset, ExecutionThreshold, OperationMode, RebalancingMode,
+    };
     use st0x_event_sorcery::test_store;
     use st0x_evm::Chain;
     use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor};
@@ -366,7 +428,7 @@ mod tests {
     use st0x_tokenization::mock::{MockCompletionOutcome, MockDetectionOutcome, MockTokenizer};
     use st0x_tokenization::{ClientRequestId, issuer_request_id, tokenization_request_id};
     use st0x_wrapper::{MockWrapper, Wrapper};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
 
     use super::*;
     use crate::equity_redemption::{
@@ -382,18 +444,15 @@ mod tests {
     use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintCommand};
     use crate::vault_lookup::MockVaultLookup;
 
-    /// Regression guard: `ResumeTokenizationAggregate` must keep
-    /// `PERFORM_TIMEOUT = None`. The redemption target drives `SendPending`
-    /// -> `send_for_redemption`, an on-chain transfer with no pre-send guard;
-    /// `perform_bounded` dropping it mid-send would re-send on retry. Any edit
-    /// re-imposing a bound must first make that send re-entry-safe.
+    /// The aggregate driver keeps its existing unbounded execution policy;
+    /// signed sends to the issuer now remain safe when transport calls are retried.
     #[test]
     fn resume_job_opts_out_of_perform_timeout() {
         assert_eq!(
             <ResumeTokenizationAggregate as Job<ResumeTokenizationCtx>>::PERFORM_TIMEOUT,
             None,
-            "ResumeTokenizationAggregate must not be perform-bounded: the redemption \
-             send has no safe re-entry if the future is dropped mid-flight",
+            "ResumeTokenizationAggregate must opt out of PERFORM_TIMEOUT; transport timeouts bound its \
+             external calls",
         );
     }
 
@@ -628,6 +687,106 @@ mod tests {
         );
     }
 
+    /// A provider lookup that finds no mint is inconclusive, so a
+    /// `MintRequested` mint on a paused listing stays requested and keeps its
+    /// Position reservation; the job errors for an apalis retry of the lookup.
+    #[tokio::test]
+    async fn perform_keeps_a_requested_mint_on_a_paused_listing_and_its_reservation() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
+        let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
+        let vault_lookup =
+            Arc::new(MockVaultLookup::new().with_default_vault(RaindexVaultId(B256::ZERO)));
+        let symbol = st0x_execution::Symbol::new("AAPL").unwrap();
+        let equities = ChainEquities {
+            operational_limit: None,
+            symbols: HashMap::from([(
+                symbol.clone(),
+                ChainEquityAsset {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_ids: Vec::new(),
+                    trading: OperationMode::Enabled,
+                    rebalancing: RebalancingMode::Paused,
+                    wrapped_equity_recovery: OperationMode::Disabled,
+                    operational_limit: None,
+                    target_share: None,
+                },
+            )]),
+        };
+        let transfer_services = EquityTransferServices {
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex,
+                    vault_lookup,
+                    tokenizer: tokenizer.clone(),
+                    wrapper,
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities,
+                },
+            )]),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        };
+        let mint_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
+        let redemption_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
+        let position_store = Arc::new(test_store(pool, ()));
+        let transfer = Arc::new(CrossVenueEquityTransfer::new(
+            transfer_services,
+            mint_store.clone(),
+            redemption_store,
+        ));
+        let id = issuer_request_id("resume-mint-paused-requested");
+        mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
+                    issuer_request_id: id.clone(),
+                    symbol: symbol.clone(),
+                    quantity: float!(1.0),
+                    wallet: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+
+        let ctx = ResumeTokenizationCtx {
+            transfer,
+            position_authority: (position_store.clone(), ExecutionThreshold::whole_share()),
+            job_queue: ResumeTokenizationJobQueue::new(&apalis_pool),
+            notifier: Arc::new(crate::alerts::LogNotifier),
+        };
+        let job = ResumeTokenizationAggregate {
+            target: ResumeTokenizationTarget::Mint(id.clone()),
+            symbol: Some(symbol.clone()),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+
+        let error = Job::perform(&job, &ctx).await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("not replaying the request"),
+            "an unreplayed paused mint must error for a retry, got: {error}"
+        );
+        assert_eq!(tokenizer.mint_request_call_count(), 0);
+        assert_eq!(tokenizer.mint_lookup_call_count(), 1);
+        let entity = mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::MintRequested { .. }),
+            "an inconclusive lookup must keep the mint requested, got: {entity:?}"
+        );
+        let position = position_store.load(&symbol).await.unwrap().unwrap();
+        assert!(
+            position.equity_transfer_reservation.is_some(),
+            "an inconclusive lookup must keep the Position reservation"
+        );
+    }
+
     /// `perform` on a `Redemption` target with a `Completed` aggregate returns
     /// `Ok(())` immediately (terminal no-op).
     #[tokio::test]
@@ -667,7 +826,10 @@ mod tests {
             EquityRedemptionCommand::UnwrapTokens,
             EquityRedemptionCommand::SubmitUnwrap,
             EquityRedemptionCommand::ConfirmUnwrap,
-            EquityRedemptionCommand::PrepareSend,
+            EquityRedemptionCommand::PrepareSend {
+                prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                redemption_wallet: Address::ZERO,
+            },
         ] {
             redemption_store.send(&id, cmd).await.unwrap();
         }
@@ -1086,7 +1248,10 @@ mod tests {
             EquityRedemptionCommand::UnwrapTokens,
             EquityRedemptionCommand::SubmitUnwrap,
             EquityRedemptionCommand::ConfirmUnwrap,
-            EquityRedemptionCommand::PrepareSend,
+            EquityRedemptionCommand::PrepareSend {
+                prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                redemption_wallet: Address::ZERO,
+            },
             EquityRedemptionCommand::SendTokens,
         ] {
             redemption_store.send(&id, command).await.unwrap();
@@ -1586,7 +1751,10 @@ mod tests {
             EquityRedemptionCommand::UnwrapTokens,
             EquityRedemptionCommand::SubmitUnwrap,
             EquityRedemptionCommand::ConfirmUnwrap,
-            EquityRedemptionCommand::PrepareSend,
+            EquityRedemptionCommand::PrepareSend {
+                prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                redemption_wallet: Address::ZERO,
+            },
         ] {
             redemption_store.send(&id, cmd).await.unwrap();
         }
@@ -1653,6 +1821,115 @@ mod tests {
             position.equity_transfer_reservation.is_none(),
             "a terminal generic redemption resume must release its exact reservation"
         );
+    }
+
+    /// A persisted send to the issuer whose receipt read keeps failing is
+    /// reconciliation-pending: every attempt reschedules the same job instead of
+    /// spending the retry budget, and the same bytes confirm once a read works.
+    #[tokio::test]
+    async fn an_unresolved_issuer_send_redrives_past_the_retry_budget() {
+        const RECEIPT_FAILURES: usize = 6;
+        let tokenizer = Arc::new(
+            MockTokenizer::new()
+                .with_detection_outcome(MockDetectionOutcome::Detected)
+                .with_completion_outcome(MockCompletionOutcome::Completed)
+                .with_redemption_confirmation_failures(RECEIPT_FAILURES),
+        );
+        let (ctx, _, redemption_store, tokenizer) = build_ctx_with_tokenizer(tokenizer).await;
+        let id = redemption_aggregate_id("resume-unresolved-issuer-send");
+        let symbol = st0x_execution::Symbol::new("AAPL").unwrap();
+        redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
+                    symbol: symbol.clone(),
+                    quantity: float!(1.0),
+                    token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
+                    amount: U256::from(1_000_000_000_000_000_000_u128),
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                },
+            )
+            .await
+            .unwrap();
+        let send =
+            st0x_evm::PreparedTransaction::for_test(alloy::primitives::TxHash::repeat_byte(4), 3);
+        for cmd in [
+            EquityRedemptionCommand::RecordWithdrawSubmission {
+                tx_hash: alloy::primitives::TxHash::ZERO,
+            },
+            EquityRedemptionCommand::ConfirmWithdraw,
+            EquityRedemptionCommand::UnwrapTokens,
+            EquityRedemptionCommand::SubmitUnwrap,
+            EquityRedemptionCommand::ConfirmUnwrap,
+            EquityRedemptionCommand::PrepareSend {
+                prepared: send.clone(),
+                redemption_wallet: Address::ZERO,
+            },
+        ] {
+            redemption_store.send(&id, cmd).await.unwrap();
+        }
+        let reservation_id = EquityTransferReservationId::from_uuid(id.0);
+        ctx.position_authority
+            .0
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        ctx.position_authority
+            .0
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+        let job = ResumeTokenizationAggregate {
+            target: ResumeTokenizationTarget::Redemption(id.clone()),
+            symbol: Some(symbol.clone()),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+
+        for _ in 0..RECEIPT_FAILURES {
+            Job::perform(&job, &ctx).await.unwrap();
+            assert!(matches!(
+                redemption_store.load(&id).await.unwrap(),
+                Some(EquityRedemption::SendPending {
+                    prepared_send: Some(_),
+                    ..
+                })
+            ));
+        }
+        let rescheduled: i64 = sqlx_apalis::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<ResumeTokenizationAggregate>())
+        .fetch_one(ctx.job_queue.pool())
+        .await
+        .unwrap();
+        assert_eq!(rescheduled, i64::try_from(RECEIPT_FAILURES).unwrap());
+
+        Job::perform(&job, &ctx).await.unwrap();
+
+        assert!(matches!(
+            redemption_store.load(&id).await.unwrap(),
+            Some(EquityRedemption::Completed { .. })
+        ));
+        assert_eq!(
+            tokenizer.redemption_send_broadcasts(),
+            vec![send.tx_hash(); RECEIPT_FAILURES + 1],
+            "every redrive must resend the same persisted bytes"
+        );
+        assert_eq!(tokenizer.send_for_redemption_calls().len(), 0);
     }
 
     /// Job payload for both variants serializes and deserializes correctly.

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
+use st0x_bridge::corridor::{HopKind, UsdcCorridor};
 use st0x_config::{BrokerCtx, Ctx, ExecutionThreshold, HedgedChain, OnchainWalletCtx};
 use st0x_event_sorcery::{Store, StoreBuilder};
 use st0x_evm::{
@@ -31,7 +32,9 @@ use st0x_hedge::operator::mint_authorization::{ConfiguredMintAuthorizer, VaultMo
 use st0x_hedge::operator::native_gas::{ConfiguredGasReadiness, GasReadiness};
 use st0x_hedge::operator::position::{EquityTransferReservationId, Position, PositionCommand};
 use st0x_hedge::operator::rebalancing::equity::{
-    ChainEquityServices, CrossVenueEquityTransfer, EquityTransferServices,
+    ChainEquityServices, CrossVenueEquityTransfer, EquityTransferServices, SignedRedemptionTx,
+    verify_hash_only_withdrawal_not_through, verify_signed_redemption_txs_superseded,
+    withdrawal_required_confirmations,
 };
 use st0x_hedge::operator::rebalancing::to_wrapped_equities;
 use st0x_hedge::operator::rebalancing::usdc::{
@@ -245,21 +248,20 @@ where
     result
 }
 
-/// Gas readiness for the USDC corridor (Base and Ethereum).
+/// Gas readiness for a USDC corridor: its chain's wallet and the Ethereum
+/// hub wallet.
 fn usdc_gas_readiness(
     ctx: &Ctx,
-    wallet_ctx: &OnchainWalletCtx,
+    corridor_chain: Chain,
+    chain_wallet: &Arc<dyn Wallet<Provider = RootProvider>>,
+    ethereum_wallet: &Arc<dyn Wallet<Provider = RootProvider>>,
 ) -> anyhow::Result<Arc<GasReadiness>> {
     let alerts = ctx
         .alerts
         .as_ref()
         .context("rebalancing transfer requires [alerts] gas thresholds")?;
 
-    GasReadiness::from_wallets(
-        alerts,
-        wallet_ctx.base_wallet(),
-        wallet_ctx.ethereum_wallet(),
-    )
+    GasReadiness::for_usdc_corridor(alerts, corridor_chain, chain_wallet, ethereum_wallet)
 }
 
 /// Gas readiness for an equity transfer on the selected chain: its wallet is
@@ -306,6 +308,15 @@ pub(super) fn tokenization_network_context(
     network: TokenizationNetwork,
 ) -> anyhow::Result<(Arc<dyn Wallet<Provider = RootProvider>>, Chain)> {
     let chain = Chain::from(network);
+
+    Ok((chain_wallet(wallet_ctx, chain)?, chain))
+}
+
+/// The bot wallet that signs on `chain`.
+fn chain_wallet(
+    wallet_ctx: &OnchainWalletCtx,
+    chain: Chain,
+) -> anyhow::Result<Arc<dyn Wallet<Provider = RootProvider>>> {
     let wallet = match chain {
         Chain::Base => wallet_ctx.base_wallet(),
         Chain::Ethereum => wallet_ctx.ethereum_wallet(),
@@ -315,12 +326,14 @@ pub(super) fn tokenization_network_context(
         })?,
     };
 
-    Ok((wallet.clone(), chain))
+    Ok(wallet.clone())
 }
 
 pub(super) fn require_equity_mutation_network(network: TokenizationNetwork) -> anyhow::Result<()> {
     if network == TokenizationNetwork::Robinhood {
-        anyhow::bail!("Robinhood Chain does not support automated equity transfers or donations");
+        anyhow::bail!(
+            "the CLI refuses equity transfers and donations on Robinhood Chain: until the bot's first supervised round trip there, Robinhood equity moves only through the bot"
+        );
     }
 
     Ok(())
@@ -344,7 +357,12 @@ pub(super) fn hedged_chain_context(
     ctx: &Ctx,
     network: TokenizationNetwork,
 ) -> anyhow::Result<HedgedChainContext<'_>> {
-    let chain = Chain::from(network);
+    hedged_chain_context_on(ctx, Chain::from(network))
+}
+
+/// [`hedged_chain_context`] for a chain read off a record rather than chosen
+/// by the operator.
+fn hedged_chain_context_on(ctx: &Ctx, chain: Chain) -> anyhow::Result<HedgedChainContext<'_>> {
     let Some(trading) = ctx.chains.hedged_chain(chain) else {
         anyhow::bail!(
             "{chain} has no [chains.{chain}.trading] table: vault operations need \
@@ -352,7 +370,7 @@ pub(super) fn hedged_chain_context(
         );
     };
 
-    let (wallet, chain) = tokenization_network_context(ctx.wallet()?, network)?;
+    let wallet = chain_wallet(ctx.wallet()?, chain)?;
 
     Ok(HedgedChainContext {
         chain,
@@ -542,6 +560,24 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
         }
     }
 
+    if !existing_mint {
+        let listing = ctx
+            .chains
+            .hedged_chain(chain)
+            .with_context(|| format!("{chain} has no trading services"))?
+            .assets
+            .equities
+            .symbols
+            .get(&symbol)
+            .with_context(|| format!("no equity listing for {symbol} on {chain}"))?;
+        if !listing.rebalancing.starts_operations() {
+            anyhow::bail!(
+                "equity rebalancing is {} for {symbol} on {chain}; new operations require enabled",
+                listing.rebalancing
+            );
+        }
+    }
+
     let direction_str = match direction {
         TransferDirection::ToRaindex => "Alpaca → Raindex (mint)",
         TransferDirection::ToAlpaca => "Raindex → Alpaca (redeem)",
@@ -683,6 +719,7 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::BurnRevert(_)
         | UsdcTransferError::Vault(_)
         | UsdcTransferError::InsufficientVaultLiquidity { .. }
+        | UsdcTransferError::WithdrawalRejectedUnderfunded { .. }
         | UsdcTransferError::Aggregate(_)
         | UsdcTransferError::WithdrawalFailed { .. }
         | UsdcTransferError::DepositFailed { .. }
@@ -721,9 +758,13 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::BurnRecordFailed { .. }
         | UsdcTransferError::BurnSubmitInconclusive { .. }
         | UsdcTransferError::BurnTxDropped { .. }
+        | UsdcTransferError::BurnTxAlreadyRecorded { .. }
+        | UsdcTransferError::BurnTxOwnershipUnchecked { .. }
+        | UsdcTransferError::BurnTxOwnershipLookupFailed { .. }
         | UsdcTransferError::DepositSendUnresolved { .. }
         | UsdcTransferError::DepositSendTaskPanicked { .. }
-        | UsdcTransferError::DepositSendLookup { .. } => false,
+        | UsdcTransferError::DepositSendLookup { .. }
+        | UsdcTransferError::EthereumChainMissing(_) => false,
     }
 }
 
@@ -735,6 +776,7 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
     stdout: &mut Writer,
     direction: TransferDirection,
     amount: Usdc,
+    chain: Option<Chain>,
     ctx: &Ctx,
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
@@ -749,7 +791,7 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
     // story depends on the operator still having this id if the process is killed
     // after burning, and buffered/redirected stdout could otherwise lose it.
     stdout.flush()?;
-    run_usdc_transfer(stdout, direction, id, amount, ctx, pool).await
+    run_usdc_transfer(stdout, direction, id, amount, chain, ctx, pool).await
 }
 
 /// Resumes an interrupted manual USDC transfer by enqueueing it on the
@@ -891,6 +933,7 @@ async fn run_usdc_transfer<Writer: Write>(
     direction: TransferDirection,
     id: UsdcRebalanceId,
     amount: Usdc,
+    chain: Option<Chain>,
     ctx: &Ctx,
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
@@ -909,7 +952,29 @@ async fn run_usdc_transfer<Writer: Write>(
 
     let wallet_ctx = ctx.wallet()?;
 
-    let cash = ctx.chains.primary().assets.cash.as_ref().ok_or_else(|| {
+    // The transfer runs on the served corridor's chain vault and signer.
+    let rebalancing_ctx = &ctx.rebalancing;
+    let corridor = st0x_config::manual_transfer_corridor(rebalancing_ctx.usdc.served(), chain)?;
+    let corridor_chain = corridor.chain();
+    let hedged = ctx.chains.hedged_chain(corridor_chain).with_context(|| {
+        format!("the {corridor} corridor needs a [chains.{corridor_chain}.trading] table")
+    })?;
+    let chain_wallet = match corridor {
+        UsdcCorridor::HubRouted {
+            chain: Chain::Base,
+            hop: HopKind::Cctp,
+        } => wallet_ctx.base_wallet(),
+        UsdcCorridor::HubRouted {
+            chain: Chain::Base,
+            hop: HopKind::Relay,
+        }
+        | UsdcCorridor::HubRouted {
+            chain: Chain::Ethereum | Chain::HyperEvm | Chain::Robinhood,
+            hop: HopKind::Cctp | HopKind::Relay,
+        } => anyhow::bail!("transfer-usdc has no bridge for the {corridor} corridor"),
+    };
+
+    let cash = hedged.assets.cash.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
             "vault_ids in [chains.<name>.trading.assets.cash] is required but not configured"
         )
@@ -930,7 +995,7 @@ async fn run_usdc_transfer<Writer: Write>(
             cash.vault_ids.len()
         )?;
     }
-    let owner = wallet_ctx.base_wallet().address();
+    let owner = chain_wallet.address();
 
     let broker_mode = if alpaca_auth.is_sandbox() {
         AlpacaBrokerApiMode::Sandbox
@@ -963,9 +1028,9 @@ async fn run_usdc_transfer<Writer: Write>(
     )?);
 
     let bridge = Arc::new(CctpBridge::try_from_ctx(CctpCtx {
-        corridor: ctx.rebalancing.cctp_corridor,
+        corridor: rebalancing_ctx.cctp_corridor,
         ethereum_wallet: wallet_ctx.ethereum_wallet().clone(),
-        base_wallet: wallet_ctx.base_wallet().clone(),
+        base_wallet: chain_wallet.clone(),
         #[cfg(any(test, feature = "test-support"))]
         circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
         #[cfg(any(test, feature = "test-support"))]
@@ -975,15 +1040,17 @@ async fn run_usdc_transfer<Writer: Write>(
     })?);
 
     let vault_service = Arc::new(RaindexService::new(
-        wallet_ctx.base_wallet().clone(),
-        st0x_hedge::operator::onchain::raindex_contracts(ctx.chains.primary()),
+        chain_wallet.clone(),
+        st0x_hedge::operator::onchain::raindex_contracts(hedged),
         owner,
     ));
 
-    let rebalancing_ctx = &ctx.rebalancing;
-    let gas_readiness = usdc_gas_readiness(ctx, wallet_ctx)?;
-    // The corridor the CCTP bridge built above carries.
-    let corridor = rebalancing_ctx.cctp_corridor.usdc_corridor();
+    let gas_readiness = usdc_gas_readiness(
+        ctx,
+        corridor_chain,
+        chain_wallet,
+        wallet_ctx.ethereum_wallet(),
+    )?;
 
     let rebalance_manager = CrossVenueCashTransfer::new(
         alpaca_broker,
@@ -992,26 +1059,15 @@ async fn run_usdc_transfer<Writer: Write>(
         vault_service,
         usdc_store,
         MarketMakingUsdcEndpoints::new(corridor, owner, RaindexVaultId(usdc_vault_id)),
-        &UsdcSettlementParams {
-            attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
-            settlement_retry_deadline: rebalancing_ctx.settlement_retry_deadline,
-            required_confirmations: ctx.chains.primary().required_confirmations,
-            ethereum_required_confirmations: Some(deposit_send_required_confirmations(
-                &ctx.chains,
-            )?),
-            reserved_cash: ctx
-                .assets
+        &UsdcSettlementParams::for_chains(
+            rebalancing_ctx,
+            &ctx.chains,
+            ctx.assets
                 .cash
                 .as_ref()
                 .map(|cash| cash.reserved)
                 .map(Positive::inner),
-            #[cfg(any(test, feature = "test-support"))]
-            circle_api_base: rebalancing_ctx.circle_api_base.clone(),
-            #[cfg(any(test, feature = "test-support"))]
-            token_messenger: rebalancing_ctx.token_messenger,
-            #[cfg(any(test, feature = "test-support"))]
-            message_transmitter: rebalancing_ctx.message_transmitter,
-        },
+        ),
         BotGasReceiptCostEnqueuer::Disabled,
     )
     .with_gas_readiness(gas_readiness)
@@ -1118,6 +1174,44 @@ fn classify_fail_bridging_reload(state: Option<&UsdcRebalance>) -> FailBridgingO
     }
 }
 
+/// Fails a BaseToAlpaca transfer at `WithdrawalSubmitting` with
+/// `RejectWithdrawal`. Its vault withdraw was never recorded as initiated, so
+/// failing it moves no inventory and clears the guard. The command cannot
+/// prove the withdraw never landed: the operator confirms on chain first that
+/// the bot wallet made no `OperatorWithdraw` after `from_block`.
+async fn reject_unsent_usdc_withdrawal<Writer: Write>(
+    stdout: &mut Writer,
+    usdc_store: &Store<UsdcRebalance>,
+    id: &UsdcRebalanceId,
+    reason: &AuditReason,
+    from_block: u64,
+) -> anyhow::Result<()> {
+    writeln!(
+        stdout,
+        "Transfer {id} is a Base->Alpaca transfer at WithdrawalSubmitting (withdrawal scan \
+         from block {from_block}). Failing it as a withdrawal that never reached the chain."
+    )?;
+
+    usdc_store
+        .send(
+            id,
+            UsdcRebalanceCommand::RejectWithdrawal {
+                reason: reason.to_string(),
+            },
+        )
+        .await?;
+
+    writeln!(
+        stdout,
+        "USDC transfer {id} transitioned to WithdrawalFailed (no withdrawal recorded). The \
+         rebalancing guard will clear on the next bot restart. If an OperatorWithdraw by the \
+         bot wallet did land after block {from_block}, its USDC is in the bot wallet and \
+         must be reconciled by hand."
+    )?;
+
+    Ok(())
+}
+
 /// Drive a pre-burn `BridgingSubmitting` or `WithdrawalComplete` USDC rebalance
 /// to `BridgingFailed { burn_tx_hash: None }`.
 ///
@@ -1151,7 +1245,13 @@ fn classify_fail_bridging_reload(state: Option<&UsdcRebalance>) -> FailBridgingO
 /// the bot running, use the live `st0x-liquidity-client debug fail-usdc-transfer`
 /// command instead; that route quiesces the USDC driver and sends through the
 /// wired store so the in memory guard is updated immediately. The live route
-/// refuses BaseToAlpaca transfers, which stay with this command.
+/// refuses BaseToAlpaca transfers past their vault withdrawal, which stay with
+/// this command.
+///
+/// A BaseToAlpaca transfer at `WithdrawalSubmitting` is failed with
+/// `RejectWithdrawal` instead (see `reject_unsent_usdc_withdrawal`), on either
+/// surface. The operator first verifies on chain that the bot wallet made no
+/// `OperatorWithdraw` after the transfer's `from_block`.
 pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
     stdout: &mut Writer,
     id: Uuid,
@@ -1171,6 +1271,15 @@ pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
              check the id and that you are pointed at the right database."
         );
     };
+
+    if let UsdcRebalance::WithdrawalSubmitting {
+        direction: RebalanceDirection::BaseToAlpaca,
+        from_block,
+        ..
+    } = state
+    {
+        return reject_unsent_usdc_withdrawal(stdout, &usdc_store, &id, reason, from_block).await;
+    }
 
     match state.pre_burn_fail_eligibility() {
         PreBurnFailEligibility::Eligible => {}
@@ -1209,8 +1318,9 @@ pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
         // a clear error instead of surfacing the internal aggregate error.
         PreBurnFailEligibility::NotAtBridgeBoundary => {
             anyhow::bail!(
-                "fail-usdc-transfer is only valid from BridgingSubmitting (no recorded burn) \
-                 or WithdrawalComplete; transfer {id} is in {state:?}. Refusing to act."
+                "fail-usdc-transfer is only valid from BridgingSubmitting (no recorded burn), \
+                 WithdrawalComplete, or a BaseToAlpaca WithdrawalSubmitting; transfer {id} is \
+                 in {state:?}. Refusing to act."
             );
         }
     }
@@ -1517,6 +1627,61 @@ pub(super) async fn verify_deposit_send_superseded_on_chain(
         deposit_send_required_confirmations(&ctx.chains)?,
     )
     .await?)
+}
+
+/// The vault withdrawal or send to the issuer a redemption reconcile checks on chain
+/// first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WithdrawalCheck<'a> {
+    /// A signed withdrawal, or every signed copy of a send to the issuer (they share
+    /// one nonce), and the tx the operator names as having taken that nonce.
+    Signed {
+        kind: SignedRedemptionTx,
+        signed: &'a [&'a PreparedTransaction],
+        superseding_tx: Option<TxHash>,
+    },
+    /// A legacy withdrawal known only by its hash. An adopted replacement is
+    /// not checked: the command refuses it.
+    HashOnly(TxHash),
+}
+
+/// Checks `check` on the bot wallet of `chain`. A signed withdrawal must be
+/// proven never to land: `superseding_tx` is the wallet's tx at its nonce,
+/// with the confirmation depth the bot's transfers on that chain use. A hash
+/// only withdrawal must not have gone through.
+pub(super) async fn verify_withdrawal_on_chain(
+    ctx: &Ctx,
+    chain: Chain,
+    check: WithdrawalCheck<'_>,
+) -> anyhow::Result<()> {
+    let HedgedChainContext {
+        wallet, trading, ..
+    } = hedged_chain_context_on(ctx, chain)?;
+    let bot_wallet = wallet.address();
+    let raindex = RaindexService::new(
+        wallet,
+        st0x_hedge::operator::onchain::raindex_contracts(trading),
+        bot_wallet,
+    );
+
+    match check {
+        WithdrawalCheck::Signed {
+            kind,
+            signed,
+            superseding_tx,
+        } => Ok(verify_signed_redemption_txs_superseded(
+            &raindex,
+            kind,
+            signed,
+            superseding_tx,
+            bot_wallet,
+            withdrawal_required_confirmations(&ctx.chains, chain)?,
+        )
+        .await?),
+        WithdrawalCheck::HashOnly(tx) => {
+            Ok(verify_hash_only_withdrawal_not_through(&raindex, tx).await?)
+        }
+    }
 }
 
 /// Resolves the tokenized-equity (tStock) address for a tokenization
@@ -1948,20 +2113,28 @@ fn connect_error(url: &str, error: reqwest::Error) -> anyhow::Error {
     }
 }
 
-/// Reconciles a mint or redemption stranded in the terminal `Failed` state to
-/// the terminal `Reconciled` state.
+/// Reconciles a mint or redemption stranded in the terminal `Failed` state,
+/// or a redemption stuck submitting its vault withdrawal, to the terminal
+/// `Reconciled` state.
 ///
-/// Loads the aggregate, verifies it is in `Failed` (bails with a clear operator
-/// error otherwise -- the aggregate command also gates this, but the preflight
-/// gives a clearer message first), and sends the `Reconcile` command. This is a
-/// pure bookkeeping resolution: the residual equity was handled out-of-band
-/// (e.g. via wrap-equity/vault-deposit), so there is no inventory side-effect.
+/// Loads the aggregate, verifies it is reconcilable (bails with a clear
+/// operator error otherwise; the aggregate command also gates this, but the
+/// preflight gives a clearer message first), and sends the `Reconcile`
+/// command. This is a pure bookkeeping resolution: the residual equity was
+/// handled out of band (e.g. via wrap-equity/vault-deposit), so there is no
+/// inventory side effect. A redemption with a signed vault withdrawal
+/// reconciles only once `verify_withdrawal` proves on its chain that the
+/// withdrawal can never land, and one holding only a withdrawal hash only
+/// once it shows that hash did not go through. `superseding_tx` applies to a
+/// redemption only; the CLI refuses it for a mint before this runs.
 pub(crate) async fn reconcile_equity_transfer_command<W: Write>(
     stdout: &mut W,
     transfer_type: TransferType,
     id: &str,
     reason: AuditReason,
+    superseding_tx: Option<TxHash>,
     pool: &SqlitePool,
+    verify_withdrawal: impl AsyncFnOnce(Chain, WithdrawalCheck<'_>) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let services = EquityTransferServices::panicking();
 
@@ -2007,17 +2180,51 @@ pub(crate) async fn reconcile_equity_transfer_command<W: Write>(
 
             if !entity.is_operator_reconcilable() {
                 anyhow::bail!(
-                    "transfer reconcile: redemption {id} is not reconcilable (must be Failed \
-                     or an unresolved vault-withdrawal submission). Refusing to act -- check \
-                     its current state on the dashboard."
+                    "transfer reconcile: redemption {id} is not reconcilable (must be Failed, \
+                     an unresolved vault-withdrawal submission, or a pending send to the issuer). \
+                     Refusing to act -- check its current state on the dashboard."
                 );
             }
+
+            // The aggregate command is pure, so the chain check is read here,
+            // before it, and the command refuses if the redemption holds
+            // another signed withdrawal or send to the issuer by then.
+            let (kind, signed) = entity.reconcilable_signed_txs();
+            let check = match (
+                entity.reconcilable_signed_tx(),
+                entity.hash_only_withdrawal(),
+                superseding_tx,
+            ) {
+                (Some(_), _, _) => Some(WithdrawalCheck::Signed {
+                    kind,
+                    signed: &signed,
+                    superseding_tx,
+                }),
+                (None, _, Some(_)) => anyhow::bail!(
+                    "transfer reconcile: --superseding-tx applies only to a redemption with a \
+                     signed vault withdrawal or send to the issuer; redemption {id} has none. \
+                     Refusing to act."
+                ),
+                (None, Some(tx), None) => Some(WithdrawalCheck::HashOnly(tx)),
+                (None, None, None) => None,
+            };
+            if let Some(check) = check {
+                verify_withdrawal(entity.chain(), check)
+                    .await
+                    .with_context(|| {
+                        format!("transfer reconcile: refusing to reconcile redemption {id}")
+                    })?;
+            }
+            let proven_withdrawal = entity
+                .reconcilable_signed_tx()
+                .map(PreparedTransaction::tx_hash);
 
             st0x_event_sorcery::send_command::<EquityRedemption>(
                 pool,
                 &redemption_id,
                 EquityRedemptionCommand::Reconcile {
                     reason: reason.into(),
+                    proven_withdrawal,
                 },
                 services,
             )
@@ -2136,13 +2343,13 @@ mod tests {
     use alloy::primitives::{Address, B256, address, b256};
     use chrono::Utc;
     use rain_math_float::Float;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use uuid::uuid;
 
     use st0x_bridge::cctp::CctpError;
-    use st0x_bridge::corridor::UsdcCorridor;
+    use st0x_bridge::corridor::{HopKind, UsdcCorridor};
     use st0x_config::AlertsCtx;
     use st0x_config::ChainRegistry;
     use st0x_config::CtxError;
@@ -2152,7 +2359,7 @@ mod tests {
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{
         ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, LogFormat, LogLevel,
-        OperationMode,
+        OperationMode, RebalancingMode,
     };
     use st0x_config::{HedgedChain, InventoryMode};
     use st0x_event_sorcery::{AggregateError, LifecycleError};
@@ -2494,6 +2701,32 @@ mod tests {
             "a backpressure-classified poll error stays in the bounded retry \
              budget rather than handing off"
         );
+    }
+
+    #[test]
+    fn burn_ownership_refusals_are_not_bot_resumable_waits() {
+        let id = UsdcRebalanceId(Uuid::from_u128(7));
+        let tx = TxHash::random();
+        let refusals = [
+            UsdcTransferError::BurnTxAlreadyRecorded {
+                id: id.clone(),
+                tx,
+                recorded_by: UsdcRebalanceId(Uuid::from_u128(8)),
+            },
+            UsdcTransferError::BurnTxOwnershipUnchecked { id: id.clone(), tx },
+            UsdcTransferError::BurnTxOwnershipLookupFailed {
+                id,
+                tx,
+                source: sqlx::Error::PoolClosed.into(),
+            },
+        ];
+
+        for refusal in &refusals {
+            assert!(
+                !is_bot_resumable_wait(refusal),
+                "{refusal} needs reconciliation, not automatic wait handoff"
+            );
+        }
     }
 
     /// `transfer resume --kind usdc` posts to the running bot's resume
@@ -2911,6 +3144,54 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn fresh_cli_equity_transfers_refuse_stopped_listings_before_wallet_access() {
+        for mode in [
+            st0x_config::RebalancingMode::Paused,
+            st0x_config::RebalancingMode::Disabled,
+        ] {
+            let mut ctx = create_base_test_ctx();
+            let symbol = Symbol::new("AAPL").unwrap();
+            ctx.chains.primary_mut().assets.equities.symbols.insert(
+                symbol.clone(),
+                st0x_config::ChainEquityAsset {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_ids: vec![],
+                    trading: st0x_config::OperationMode::Disabled,
+                    rebalancing: mode,
+                    wrapped_equity_recovery: st0x_config::OperationMode::Disabled,
+                    operational_limit: None,
+                    target_share: None,
+                },
+            );
+            let pool = setup_test_db().await;
+            for direction in [TransferDirection::ToRaindex, TransferDirection::ToAlpaca] {
+                let error = transfer_equity_command(
+                    &mut Vec::new(),
+                    TransferEquity {
+                        direction,
+                        symbol: symbol.clone(),
+                        quantity: FractionalShares::new(float!(1)),
+                        issuer_request_id: None,
+                        redemption_wallet: None,
+                        network: TokenizationNetwork::Base,
+                    },
+                    &ctx,
+                    &pool,
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "equity rebalancing is {mode} for AAPL on base; new operations require enabled"
+                    )
+                );
+            }
+        }
+    }
+
     fn create_base_test_ctx() -> Ctx {
         Ctx {
             database_url: ":memory:".to_string(),
@@ -3079,7 +3360,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "Robinhood Chain does not support automated equity transfers or donations"
+            "the CLI refuses equity transfers and donations on Robinhood Chain: until the bot's first supervised round trip there, Robinhood equity moves only through the bot"
         );
         assert!(stdout.is_empty());
     }
@@ -3087,12 +3368,20 @@ mod tests {
     #[tokio::test]
     async fn test_transfer_equity_requires_tokenization_config() {
         let mut ctx = create_alpaca_test_ctx();
-        // The trading table is now resolved first, and resolving it needs a
-        // wallet, so the missing redemption wallet is what refuses only once
-        // a wallet exists.
+        // A listing that starts operations is required before the command
+        // looks up the chain's redemption wallet. Without it, this would
+        // fail on "no equity listing" and never reach the wallet check.
         ctx.wallet = Some(OnchainWalletCtx::stub());
         let pool = setup_test_db().await;
         let symbol = Symbol::new("AAPL").unwrap();
+        let mut listing = equity_asset(Address::ZERO);
+        listing.rebalancing = RebalancingMode::Enabled;
+        ctx.chains
+            .primary_mut()
+            .assets
+            .equities
+            .symbols
+            .insert(symbol.clone(), listing);
         let quantity = FractionalShares::new(Float::parse("10.5".to_string()).unwrap());
 
         let mut stdout = Vec::new();
@@ -3455,6 +3744,43 @@ mod tests {
         );
     }
 
+    /// `--chain` picks the served corridor on that chain; it may be left out
+    /// only while one corridor is served, and an unserved chain is refused.
+    #[test]
+    fn transfer_usdc_runs_on_the_served_corridor_its_chain_names() {
+        let robinhood_relay = UsdcCorridor::HubRouted {
+            chain: Chain::Robinhood,
+            hop: HopKind::Relay,
+        };
+        let one = BTreeSet::from([UsdcCorridor::BASE_CCTP]);
+        let two = BTreeSet::from([UsdcCorridor::BASE_CCTP, robinhood_relay]);
+
+        assert_eq!(
+            st0x_config::manual_transfer_corridor(&one, None).unwrap(),
+            UsdcCorridor::BASE_CCTP
+        );
+        assert_eq!(
+            st0x_config::manual_transfer_corridor(&two, Some(Chain::Robinhood)).unwrap(),
+            robinhood_relay
+        );
+
+        let unpicked = st0x_config::manual_transfer_corridor(&two, None)
+            .unwrap_err()
+            .to_string();
+        assert!(unpicked.contains("pass --chain"), "{unpicked}");
+        let unserved = st0x_config::manual_transfer_corridor(&one, Some(Chain::HyperEvm))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            unserved.starts_with("no served USDC corridor runs on"),
+            "{unserved}"
+        );
+        let none_served = st0x_config::manual_transfer_corridor(&BTreeSet::new(), None)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(none_served, "this build serves no USDC corridor");
+    }
+
     #[tokio::test]
     async fn test_transfer_usdc_requires_wallet_config() {
         let mut ctx = create_alpaca_test_ctx();
@@ -3473,6 +3799,7 @@ mod tests {
             &mut stdout,
             TransferDirection::ToRaindex,
             amount,
+            None,
             &ctx,
             &pool,
         )
@@ -3496,6 +3823,7 @@ mod tests {
             &mut stdout,
             TransferDirection::ToRaindex,
             amount,
+            None,
             &ctx,
             &pool,
         )
@@ -3576,6 +3904,7 @@ mod tests {
             &mut stdout,
             TransferDirection::ToRaindex,
             amount,
+            None,
             &ctx,
             &pool,
         )
@@ -3603,6 +3932,7 @@ mod tests {
             &mut stdout,
             TransferDirection::ToRaindex,
             amount,
+            None,
             &ctx,
             &pool,
         )
@@ -3633,6 +3963,7 @@ mod tests {
             &mut stdout,
             TransferDirection::ToRaindex,
             amount,
+            None,
             &ctx,
             &pool,
         )
@@ -4477,7 +4808,8 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains(
-                "only valid from BridgingSubmitting (no recorded burn) or WithdrawalComplete"
+                "only valid from BridgingSubmitting (no recorded burn), WithdrawalComplete, or a \
+                 BaseToAlpaca WithdrawalSubmitting"
             ),
             "Converting state must be rejected as not in bridging phase; got: {err_msg}"
         );
@@ -4629,6 +4961,58 @@ mod tests {
         assert!(
             output.contains("restart"),
             "success message must mention 'restart'; got: {output}"
+        );
+    }
+
+    /// A Base->Alpaca transfer latched at `WithdrawalSubmitting` whose withdraw
+    /// never reached the chain must be failable: no other tool can free it.
+    #[tokio::test]
+    async fn fail_usdc_transfer_succeeds_on_base_to_alpaca_withdrawal_submitting() {
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xBEEF_2843);
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        store
+            .send(
+                &UsdcRebalanceId(id),
+                UsdcRebalanceCommand::BeginWithdrawal {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    amount: Usdc::new(Float::parse("1971.318665".to_string()).unwrap()),
+                    from_block: 52_027_377,
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut stdout = Vec::new();
+        fail_usdc_transfer_command(
+            &mut stdout,
+            id,
+            &"no withdraw landed".parse().unwrap(),
+            &pool,
+        )
+        .await
+        .expect("fail_usdc_transfer must succeed from a Base->Alpaca WithdrawalSubmitting");
+
+        let state = store.load(&UsdcRebalanceId(id)).await.unwrap().unwrap();
+        let UsdcRebalance::WithdrawalFailed {
+            ref withdrawal_ref,
+            ref reason,
+            ..
+        } = state
+        else {
+            panic!("Expected WithdrawalFailed state, got: {state:?}");
+        };
+        assert_eq!(*withdrawal_ref, None);
+        assert_eq!(reason, "no withdraw landed");
+        assert!(!state.holds_rebalance_guard());
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("52027377") && output.contains("restart"),
+            "output must name the scan block and the restart; got: {output}"
         );
     }
 
@@ -4952,7 +5336,12 @@ mod tests {
     async fn seed_to_deposit_confirmed(store: &st0x_event_sorcery::Store<UsdcRebalance>, id: Uuid) {
         seed_to_deposit_initiated(store, id).await;
         store
-            .send(&UsdcRebalanceId(id), UsdcRebalanceCommand::ConfirmDeposit)
+            .send(
+                &UsdcRebalanceId(id),
+                UsdcRebalanceCommand::ConfirmDeposit {
+                    vault_deposit_block: None,
+                },
+            )
             .await
             .unwrap();
     }
@@ -5329,7 +5718,8 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains(
-                "only valid from BridgingSubmitting (no recorded burn) or WithdrawalComplete"
+                "only valid from BridgingSubmitting (no recorded burn), WithdrawalComplete, or a \
+                 BaseToAlpaca WithdrawalSubmitting"
             ),
             "ConversionFailed{{AlpacaToBase}} must be rejected as not in bridging phase; \
              got: {err_msg}"
@@ -5387,7 +5777,8 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains(
-                "only valid from BridgingSubmitting (no recorded burn) or WithdrawalComplete"
+                "only valid from BridgingSubmitting (no recorded burn), WithdrawalComplete, or a \
+                 BaseToAlpaca WithdrawalSubmitting"
             ),
             "WithdrawalFailed state must be rejected as not in bridging phase; got: {err_msg}"
         );
@@ -5404,7 +5795,7 @@ mod tests {
                 tokenized_equity_derivative: Address::ZERO,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -5657,7 +6048,7 @@ mod tests {
             tokenized_equity_derivative: Address::ZERO,
             vault_ids: Vec::new(),
             trading: OperationMode::Enabled,
-            rebalancing: OperationMode::Disabled,
+            rebalancing: RebalancingMode::Disabled,
             wrapped_equity_recovery: OperationMode::Disabled,
             operational_limit: None,
             target_share: None,
@@ -5834,7 +6225,10 @@ mod tests {
             UnwrapTokens,
             SubmitUnwrap,
             ConfirmUnwrap,
-            PrepareSend,
+            PrepareSend {
+                prepared: st0x_hedge::operator::equity_redemption::prepared_withdrawal_for_test(),
+                redemption_wallet: Address::ZERO,
+            },
             SendTokens,
         ] {
             store.send(id, command).await.unwrap();
@@ -6120,6 +6514,7 @@ mod tests {
             id,
             EquityRedemptionCommand::Reconcile {
                 reason: "deposited manually via vault-deposit".to_string(),
+                proven_withdrawal: None,
             },
         )
         .await;
@@ -6179,7 +6574,9 @@ mod tests {
             TransferType::Mint,
             &issuer_request_id("cli-no-such-mint").to_string(),
             "handled out-of-band".parse().unwrap(),
+            None,
             &pool,
+            no_withdrawal_to_verify,
         )
         .await;
 
@@ -6213,7 +6610,9 @@ mod tests {
             TransferType::Mint,
             &id.to_string(),
             "handled out-of-band".parse().unwrap(),
+            None,
             &pool,
+            no_withdrawal_to_verify,
         )
         .await;
 
@@ -6236,7 +6635,9 @@ mod tests {
             TransferType::Mint,
             &id.to_string(),
             "wrapped manually via wrap-equity".parse().unwrap(),
+            None,
             &pool,
+            no_withdrawal_to_verify,
         )
         .await
         .unwrap();
@@ -6274,7 +6675,9 @@ mod tests {
             TransferType::Mint,
             &id.to_string(),
             "second reconcile attempt".parse().unwrap(),
+            None,
             &pool,
+            no_withdrawal_to_verify,
         )
         .await;
 
@@ -6386,7 +6789,9 @@ mod tests {
             TransferType::Redemption,
             &redemption_aggregate_id("cli-no-such-redemption").to_string(),
             "handled out-of-band".parse().unwrap(),
+            None,
             &pool,
+            no_withdrawal_to_verify,
         )
         .await;
 
@@ -6409,7 +6814,9 @@ mod tests {
             TransferType::Redemption,
             &id.to_string(),
             "handled out-of-band".parse().unwrap(),
+            None,
             &pool,
+            no_withdrawal_to_verify,
         )
         .await;
 
@@ -6420,21 +6827,97 @@ mod tests {
         );
     }
 
+    /// Redemptions without a vault withdrawal have nothing to check on chain.
+    async fn no_withdrawal_to_verify(
+        chain: Chain,
+        check: WithdrawalCheck<'_>,
+    ) -> anyhow::Result<()> {
+        panic!("no vault withdrawal to verify, got {check:?} on {chain}")
+    }
+
+    /// A signed withdrawal that can still mine is not reconciled: the CLI
+    /// names the redemption and the chain check's reason, and leaves it
+    /// unresolved.
     #[tokio::test]
-    async fn reconcile_equity_redemption_succeeds_from_submitting() {
+    async fn reconcile_equity_redemption_refuses_a_signed_withdrawal_that_can_still_mine() {
+        use st0x_hedge::operator::rebalancing::equity::WithdrawalNotSuperseded;
+
         let pool = setup_test_db().await;
-        let id = redemption_aggregate_id("cli-reconcile-from-submitting");
+        let id = redemption_aggregate_id("cli-reconcile-unproven-withdrawal");
         seed_redemption_to_submitting(&pool, &id).await;
+
+        let mut stdout = Vec::new();
+        let error = reconcile_equity_transfer_command(
+            &mut stdout,
+            TransferType::Redemption,
+            &id.to_string(),
+            "withdrawal outrun by fees".parse().unwrap(),
+            None,
+            &pool,
+            async |_, check: WithdrawalCheck<'_>| {
+                let WithdrawalCheck::Signed {
+                    signed: [prepared], ..
+                } = check
+                else {
+                    panic!("a signed withdrawal is checked as signed, got {check:?}");
+                };
+                Err(WithdrawalNotSuperseded::NoSupersedingTx {
+                    tx: prepared.tx_hash(),
+                    nonce: prepared.nonce(),
+                }
+                .into())
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").starts_with(&format!(
+                "transfer reconcile: refusing to reconcile redemption {id}: vault withdrawal"
+            )),
+            "the refusal names the redemption and the chain check's reason, got: {error:#}"
+        );
+        let entity = st0x_event_sorcery::load_entity::<EquityRedemption>(&pool, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::VaultWithdrawSubmitting { .. }),
+            "a refused reconcile leaves the redemption unresolved, got: {entity:?}"
+        );
+    }
+
+    /// Once the chain proves the signed withdrawal can never land, the
+    /// redemption reconciles; the check reads the redemption's own chain and
+    /// withdrawal, and the operator's superseding tx.
+    #[tokio::test]
+    async fn reconcile_equity_redemption_reconciles_a_signed_withdrawal_proven_superseded() {
+        let pool = setup_test_db().await;
+        let id = redemption_aggregate_id("cli-reconcile-proven-withdrawal");
+        seed_redemption_to_submitting(&pool, &id).await;
+        let cancel = TxHash::repeat_byte(0xCA);
 
         let mut stdout = Vec::new();
         reconcile_equity_transfer_command(
             &mut stdout,
             TransferType::Redemption,
             &id.to_string(),
-            "withdrawal never broadcast; verified on-chain"
-                .parse()
-                .unwrap(),
+            "cancelled at its nonce".parse().unwrap(),
+            Some(cancel),
             &pool,
+            async |chain, check: WithdrawalCheck<'_>| {
+                assert_eq!(chain, Chain::Base, "the check reads the redemption's chain");
+                assert_eq!(
+                    check,
+                    WithdrawalCheck::Signed {
+                        kind: SignedRedemptionTx::VaultWithdrawal,
+                        signed: &[&PreparedTransaction::for_test(TxHash::ZERO, 0)],
+                        superseding_tx: Some(cancel),
+                    },
+                    "the check reads the persisted withdrawal and the operator's tx"
+                );
+                Ok(())
+            },
         )
         .await
         .unwrap();
@@ -6445,7 +6928,293 @@ mod tests {
             .unwrap();
         assert!(
             matches!(entity, EquityRedemption::Reconciled { .. }),
-            "a stuck submitting redemption must reconcile, got: {entity:?}"
+            "a proven withdrawal reconciles, got: {entity:?}"
+        );
+    }
+
+    /// An adopted replacement moved the equity, so the CLI refuses to
+    /// reconcile it without reading the chain: the command refuses it.
+    #[tokio::test]
+    async fn reconcile_equity_redemption_refuses_an_adopted_replacement_without_a_chain_check() {
+        let pool = setup_test_db().await;
+        let id = redemption_aggregate_id("cli-reconcile-adopted-replacement");
+        seed_redemption_to_submitting(&pool, &id).await;
+        let speed_up = TxHash::repeat_byte(0x5E);
+        send_redemption_command(
+            &pool,
+            &id,
+            EquityRedemptionCommand::AdoptWithdrawalReplacement {
+                replacement_tx: speed_up,
+                replaced_withdrawal: TxHash::ZERO,
+                reason: "wallet sped up the withdrawal".to_string(),
+            },
+        )
+        .await;
+
+        let mut stdout = Vec::new();
+        let error = reconcile_equity_transfer_command(
+            &mut stdout,
+            TransferType::Redemption,
+            &id.to_string(),
+            "settled by hand".parse().unwrap(),
+            None,
+            &pool,
+            no_withdrawal_to_verify,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("is an adopted replacement that moved the equity"),
+            "got: {error:#}"
+        );
+        let entity = st0x_event_sorcery::load_entity::<EquityRedemption>(&pool, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::VaultWithdrawSubmitted { .. }),
+            "a refused reconcile leaves the redemption unresolved, got: {entity:?}"
+        );
+    }
+
+    /// A superseding tx names what took a signed withdrawal's nonce, so it is
+    /// refused on a redemption with none rather than silently ignored.
+    #[tokio::test]
+    async fn reconcile_equity_redemption_refuses_a_superseding_tx_without_a_signed_withdrawal() {
+        let pool = setup_test_db().await;
+        let id = redemption_aggregate_id("cli-reconcile-superseding-without-withdrawal");
+        seed_redemption_to_tokens_sent(&pool, &id).await;
+        send_redemption_command(
+            &pool,
+            &id,
+            EquityRedemptionCommand::FailDetection {
+                failure: DetectionFailure::Timeout,
+            },
+        )
+        .await;
+
+        let mut stdout = Vec::new();
+        let error = reconcile_equity_transfer_command(
+            &mut stdout,
+            TransferType::Redemption,
+            &id.to_string(),
+            "handled out-of-band".parse().unwrap(),
+            Some(TxHash::repeat_byte(0xCA)),
+            &pool,
+            no_withdrawal_to_verify,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("has none"),
+            "a superseding tx without a signed withdrawal must be refused, got: {error}"
+        );
+        let entity = st0x_event_sorcery::load_entity::<EquityRedemption>(&pool, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::Failed { .. }),
+            "a refused reconcile must not reconcile, got: {entity:?}"
+        );
+    }
+
+    /// Drives a redemption to `SendPending` holding a signed send to the issuer, and
+    /// returns that send.
+    async fn seed_redemption_to_signed_send(
+        pool: &SqlitePool,
+        id: &RedemptionAggregateId,
+    ) -> PreparedTransaction {
+        use EquityRedemptionCommand::*;
+
+        seed_redemption_to_withdrawn(pool, id).await;
+        let prepared = PreparedTransaction::for_test(TxHash::repeat_byte(9), 4);
+        let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .build(redemption_services())
+            .await
+            .unwrap();
+        for command in [
+            UnwrapTokens,
+            SubmitUnwrap,
+            ConfirmUnwrap,
+            PrepareSend {
+                prepared: prepared.clone(),
+                redemption_wallet: Address::ZERO,
+            },
+        ] {
+            store.send(id, command).await.unwrap();
+        }
+        prepared
+    }
+
+    /// A signed send to the issuer can still mine until its nonce is proven taken, so
+    /// it is not reconciled on the operator's word: the chain check runs on
+    /// the send itself and its refusal leaves the redemption unresolved.
+    #[tokio::test]
+    async fn reconcile_equity_redemption_refuses_a_signed_send_that_can_still_mine() {
+        use st0x_hedge::operator::rebalancing::equity::WithdrawalNotSuperseded;
+
+        let pool = setup_test_db().await;
+        let id = redemption_aggregate_id("cli-reconcile-unproven-send");
+        let prepared = seed_redemption_to_signed_send(&pool, &id).await;
+
+        let mut stdout = Vec::new();
+        let error = reconcile_equity_transfer_command(
+            &mut stdout,
+            TransferType::Redemption,
+            &id.to_string(),
+            "send stuck below the market fee".parse().unwrap(),
+            None,
+            &pool,
+            async |_, check: WithdrawalCheck<'_>| {
+                assert_eq!(
+                    check,
+                    WithdrawalCheck::Signed {
+                        kind: SignedRedemptionTx::IssuerSend,
+                        signed: &[&prepared],
+                        superseding_tx: None,
+                    },
+                    "the check reads the persisted send to the issuer"
+                );
+                Err(WithdrawalNotSuperseded::NoSupersedingTx {
+                    tx: prepared.tx_hash(),
+                    nonce: prepared.nonce(),
+                }
+                .into())
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").starts_with(&format!(
+                "transfer reconcile: refusing to reconcile redemption {id}:"
+            )),
+            "the refusal names the redemption, got: {error:#}"
+        );
+        let entity = st0x_event_sorcery::load_entity::<EquityRedemption>(&pool, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::SendPending { .. }),
+            "a refused reconcile leaves the send unresolved, got: {entity:?}"
+        );
+    }
+
+    /// A signed send to the issuer proven never to land (its nonce taken by the
+    /// operator's confirmed cancel) is closed through the CLI, and the
+    /// reconciled state names the send whose nonce the bot must release.
+    #[tokio::test]
+    async fn reconcile_equity_redemption_succeeds_from_a_signed_send_proven_superseded() {
+        let pool = setup_test_db().await;
+        let id = redemption_aggregate_id("cli-reconcile-signed-send");
+        let prepared = seed_redemption_to_signed_send(&pool, &id).await;
+        let cancel = TxHash::repeat_byte(0xCA);
+
+        let mut stdout = Vec::new();
+        reconcile_equity_transfer_command(
+            &mut stdout,
+            TransferType::Redemption,
+            &id.to_string(),
+            "nonce 4 consumed by a 0-value self-transfer"
+                .parse()
+                .unwrap(),
+            Some(cancel),
+            &pool,
+            async |_, check: WithdrawalCheck<'_>| {
+                assert_eq!(
+                    check,
+                    WithdrawalCheck::Signed {
+                        kind: SignedRedemptionTx::IssuerSend,
+                        signed: &[&prepared],
+                        superseding_tx: Some(cancel),
+                    },
+                    "the check reads the persisted send to the issuer and the operator's tx"
+                );
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        let entity = st0x_event_sorcery::load_entity::<EquityRedemption>(&pool, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                entity,
+                EquityRedemption::Reconciled {
+                    issuer_send_nonce_hash: Some(hash),
+                    ..
+                } if hash == prepared.tx_hash()
+            ),
+            "a dead signed send must reconcile and name its nonce, got: {entity:?}"
+        );
+    }
+
+    /// A fee-replaced send to the issuer is checked on every signed candidate, since
+    /// any of them can take the nonce, and the reconciled state names the
+    /// newest one, the candidate the reconcile proved.
+    #[tokio::test]
+    async fn reconcile_equity_redemption_checks_every_fee_replacement_of_a_send() {
+        let pool = setup_test_db().await;
+        let id = redemption_aggregate_id("cli-reconcile-replaced-send");
+        let prepared = seed_redemption_to_signed_send(&pool, &id).await;
+        let replacement =
+            PreparedTransaction::for_test(TxHash::repeat_byte(0x0A), prepared.nonce());
+        send_redemption_command(
+            &pool,
+            &id,
+            EquityRedemptionCommand::ReplaceSend {
+                replacement: replacement.clone(),
+            },
+        )
+        .await;
+        let cancel = TxHash::repeat_byte(0xCA);
+
+        let mut stdout = Vec::new();
+        reconcile_equity_transfer_command(
+            &mut stdout,
+            TransferType::Redemption,
+            &id.to_string(),
+            "nonce 4 consumed by a 0-value self-transfer"
+                .parse()
+                .unwrap(),
+            Some(cancel),
+            &pool,
+            async |_, check: WithdrawalCheck<'_>| {
+                assert_eq!(
+                    check,
+                    WithdrawalCheck::Signed {
+                        kind: SignedRedemptionTx::IssuerSend,
+                        signed: &[&prepared, &replacement],
+                        superseding_tx: Some(cancel),
+                    },
+                    "the check reads the send and its fee replacement"
+                );
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        let entity = st0x_event_sorcery::load_entity::<EquityRedemption>(&pool, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                entity,
+                EquityRedemption::Reconciled {
+                    issuer_send_nonce_hash: Some(hash),
+                    ..
+                } if hash == replacement.tx_hash()
+            ),
+            "the reconcile must name the newest candidate, got: {entity:?}"
         );
     }
 
@@ -6469,7 +7238,9 @@ mod tests {
             TransferType::Redemption,
             &id.to_string(),
             "deposited manually via vault-deposit".parse().unwrap(),
+            None,
             &pool,
+            no_withdrawal_to_verify,
         )
         .await
         .unwrap();
@@ -6505,7 +7276,9 @@ mod tests {
             TransferType::Redemption,
             &id.to_string(),
             "second reconcile attempt".parse().unwrap(),
+            None,
             &pool,
+            no_withdrawal_to_verify,
         )
         .await;
 

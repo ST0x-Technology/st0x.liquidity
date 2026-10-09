@@ -55,7 +55,8 @@
 //! **Known limitations.** [`crate::inflight_nonces::InFlightNonces`] records
 //! every successful submission from this module (base send, nonce-too-low
 //! retry, and fee-bumped resubmit), and `Wallet::await_receipt` releases the
-//! entry once the wait resolves definitively (mined, or proven dropped).
+//! generic entry once mined or classified as suspected dropped by wallet policy.
+//! This drop classification is not proof of global mempool absence.
 //! `resubmit_with_bumped_fee` and `retry_after_nonce_too_low` both consult it
 //! before falling back to any inference: a nonce this process recorded is
 //! *proven* this wallet's own, replacing what used to be only the
@@ -127,9 +128,9 @@
 //! definitive receipt or drop decision; elapsed time alone never releases a
 //! nonce that may still mine.
 
-use alloy::consensus::Transaction;
+use alloy::consensus::{Transaction, TxEnvelope};
 use alloy::eips::eip1559::Eip1559Estimation;
-use alloy::eips::eip2718::Encodable2718;
+use alloy::eips::eip2718::{Decodable2718, Encodable2718};
 use alloy::network::Ethereum;
 use alloy::primitives::{Address, Bytes, TxHash, keccak256};
 use alloy::providers::Provider;
@@ -187,11 +188,15 @@ const FEE_BUMP_PCT_PER_ATTEMPT: u64 = 15;
 /// whole padded limit, and the node admits a transaction only when the
 /// sender holds `gas_limit * max_fee_per_gas`. Raising this raises both.
 ///
-/// The padded limit is not capped at the chain's per-transaction or block gas
-/// limit. Every call we send estimates far below either, so a padded limit
-/// cannot reach them; a call estimating above two thirds of a cap would be
-/// rejected by the node.
+/// A padded estimate is not capped: every call we send estimates far below
+/// [`MAX_TX_GAS_LIMIT`]. A pinned limit is bounds-checked instead.
 const GAS_LIMIT_HEADROOM_PCT: u64 = 50;
+
+/// Intrinsic gas of any transaction; a lower gas limit cannot be included.
+const INTRINSIC_GAS: u64 = 21_000;
+
+/// EIP-7825 per-transaction gas cap (2^24); the node rejects a larger limit.
+const MAX_TX_GAS_LIMIT: u64 = 1 << 24;
 
 /// Minimum absolute headroom, in gas, added on top of `eth_estimateGas`.
 ///
@@ -217,8 +222,20 @@ pub(crate) fn pad_gas_estimate(estimate: u64) -> Result<u64, EvmError> {
         .ok_or(EvmError::GasLimitOverflow { estimate })
 }
 
-/// Pin `tx`'s gas limit to the padded `eth_estimateGas` result (see
-/// [`pad_gas_estimate`]).
+/// Where a transaction's unpadded gas limit comes from; either way the signed
+/// limit is the [`pad_gas_estimate`] of it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum GasLimitSource {
+    /// `eth_estimateGas` against current state.
+    Estimate,
+    /// A caller-supplied unpadded limit, for a call whose estimate would revert
+    /// because a transaction it depends on has not mined yet. Refused below
+    /// [`INTRINSIC_GAS`] or when padded past [`MAX_TX_GAS_LIMIT`].
+    Pinned(u64),
+}
+
+/// Pin `tx`'s gas limit to the padded `eth_estimateGas` result, or to the
+/// padded caller-supplied limit (see [`pad_gas_estimate`]).
 ///
 /// The estimate runs before the filler chain, so `tx` must carry `from`
 /// itself. `FillProvider::estimate_gas` sets it only when the provider has a
@@ -233,13 +250,23 @@ pub(crate) fn pad_gas_estimate(estimate: u64) -> Result<u64, EvmError> {
 async fn pin_padded_gas_limit<F, P>(
     provider: &FillProvider<F, P, Ethereum>,
     tx: TransactionRequest,
+    gas_limit: GasLimitSource,
 ) -> Result<TransactionRequest, EvmError>
 where
     F: TxFiller<Ethereum>,
     P: Provider<Ethereum>,
 {
-    let estimate = provider.estimate_gas(tx.clone()).await?;
-    Ok(tx.gas_limit(pad_gas_estimate(estimate)?))
+    let padded = match gas_limit {
+        GasLimitSource::Estimate => pad_gas_estimate(provider.estimate_gas(tx.clone()).await?)?,
+        GasLimitSource::Pinned(unpadded) => {
+            let padded = pad_gas_estimate(unpadded)?;
+            if unpadded < INTRINSIC_GAS || padded > MAX_TX_GAS_LIMIT {
+                return Err(EvmError::PinnedGasLimitOutOfBounds { unpadded, padded });
+            }
+            padded
+        }
+    };
+    Ok(tx.gas_limit(padded))
 }
 
 /// Scale a fee value up by `pct` percent with checked arithmetic, rounding
@@ -259,21 +286,40 @@ fn bump_fee(value: u128, pct: u64) -> Result<u128, EvmError> {
         .ok_or(EvmError::ReplacementFeeOverflow)
 }
 
+/// Accepted transaction identity and its head observed after signing,
+/// immediately before broadcasting the encoded envelope.
+#[derive(Debug)]
+pub(crate) struct BroadcastSubmission {
+    tx_hash: TxHash,
+    before_block: u64,
+}
+
 /// The provider operations [`send_with_recovery`] depends on, narrowed to
 /// a small surface so the recovery state machine can be unit-tested with
 /// a scripted mock instead of a live RPC and signing fillers.
 #[async_trait]
 pub(crate) trait TxSubmitter: Send + Sync {
-    /// Fill and sign `tx` before broadcasting it, then return its locally
-    /// computed hash. The gas limit is pinned to the padded
-    /// `eth_estimateGas` result (see [`GAS_LIMIT_HEADROOM_PCT`]). Other
-    /// pre-set fields (nonce, fees) are respected.
+    /// Observe the head at one actual submission attempt's boundary.
+    async fn current_block(&self) -> Result<u64, EvmError>;
+
+    /// Fill and sign `tx`, sample the head immediately before broadcasting,
+    /// then return that head with its locally computed hash. The gas limit is
+    /// pinned to the padded `eth_estimateGas` result (see [`GAS_LIMIT_HEADROOM_PCT`]).
+    /// Other pre-set fields (nonce, fees) are respected.
     ///
     /// Implementations must normalize an RPC "already known" response to
     /// success with that local hash: the exact signed envelope is known before
     /// broadcast, so callers never lose transaction identity or retry the
     /// business operation at a later nonce.
-    async fn submit(&self, tx: TransactionRequest) -> Result<TxHash, EvmError>;
+    ///
+    /// A failure before the raw send (gas estimation, filling, signing) is
+    /// returned as [`EvmError::RejectedBeforeBroadcast`].
+    async fn submit(
+        &self,
+        tx: TransactionRequest,
+        nonce_manager: &ResettableNonceManager,
+        address: Address,
+    ) -> Result<BroadcastSubmission, EvmError>;
 
     /// Assigns the next nonce for `address` via `nonce_manager`, mirroring
     /// what the production filler chain does automatically -- surfaced here
@@ -323,24 +369,57 @@ where
     F: TxFiller<Ethereum>,
     P: Provider<Ethereum>,
 {
-    async fn submit(&self, tx: TransactionRequest) -> Result<TxHash, EvmError> {
-        let tx = pin_padded_gas_limit(self, tx).await?;
+    async fn current_block(&self) -> Result<u64, EvmError> {
+        Ok(self.get_block_number().await?)
+    }
 
-        // `FillProvider::fill` runs the filler chain until all dependencies are
-        // satisfied, then returns the signed envelope without broadcasting.
-        let sendable = self.fill(tx).await?;
-        let envelope = sendable
-            .try_into_envelope()
-            .map_err(|_| EvmError::TransactionPreparation)?;
+    async fn submit(
+        &self,
+        tx: TransactionRequest,
+        nonce_manager: &ResettableNonceManager,
+        address: Address,
+    ) -> Result<BroadcastSubmission, EvmError> {
+        let mut allocation_guard = PreBroadcastNonceGuard {
+            nonce_manager: Some(nonce_manager),
+            address,
+        };
+        let envelope = async {
+            let tx = pin_padded_gas_limit(self, tx, GasLimitSource::Estimate).await?;
+
+            // `FillProvider::fill` runs the filler chain until all dependencies
+            // are satisfied, then returns the signed envelope without
+            // broadcasting.
+            let sendable = self.fill(tx).await?;
+            sendable
+                .try_into_envelope()
+                .map_err(|_| EvmError::TransactionPreparation)
+        }
+        .await
+        .map_err(|source| EvmError::RejectedBeforeBroadcast {
+            source: Box::new(source),
+        })?;
         let encoded = envelope.encoded_2718();
         let tx_hash = keccak256(&encoded);
+        let before_block =
+            self.get_block_number()
+                .await
+                .map_err(|source| EvmError::RejectedBeforeBroadcast {
+                    source: Box::new(EvmError::from(source)),
+                })?;
+        allocation_guard.nonce_manager = None;
 
         match self.inner().send_raw_transaction(&encoded).await {
-            Ok(_) => Ok(tx_hash),
+            Ok(_) => Ok(BroadcastSubmission {
+                tx_hash,
+                before_block,
+            }),
             Err(error) => {
                 let error = EvmError::from(error);
                 if error.is_already_known() {
-                    Ok(tx_hash)
+                    Ok(BroadcastSubmission {
+                        tx_hash,
+                        before_block,
+                    })
                 } else {
                     Err(error)
                 }
@@ -381,38 +460,33 @@ pub(crate) async fn prepare_with_nonce<F, P>(
     address: Address,
     contract: Address,
     calldata: Bytes,
+    gas_limit: GasLimitSource,
 ) -> Result<PreparedTransaction, EvmError>
 where
     F: TxFiller<Ethereum>,
     P: Provider<Ethereum>,
 {
     let _guard = send_lock.lock().await;
+    let before_block = submitter.get_block_number().await?;
     let nonce = nonce_manager
         .reserve_next_unheld_nonce(submitter, address)
         .await?;
+    let mut preparation_guard = UnreturnedPreparationGuard {
+        nonce_manager,
+        in_flight,
+        address,
+        preparation: Some(UnreturnedPreparation::Reserved(nonce)),
+    };
     let tx = TransactionRequest::default()
         .from(address)
         .to(contract)
         .input(calldata.into())
         .nonce(nonce);
-    let envelope_result: Result<_, EvmError> = async {
-        let tx = pin_padded_gas_limit(submitter, tx).await?;
-        let sendable = submitter.fill(tx).await?;
-        sendable
-            .try_into_envelope()
-            .map_err(|_| EvmError::TransactionPreparation)
-    }
-    .await;
-    let envelope = match envelope_result {
-        Ok(envelope) => envelope,
-        Err(error) => {
-            // `reserve_next_unheld_nonce` already reserved this nonce and
-            // advanced the cache. Roll back only this failed preparation;
-            // earlier persisted preparations remain reserved across the retry.
-            nonce_manager.release_prepared_nonce(address, nonce).await;
-            return Err(error);
-        }
-    };
+    let tx = pin_padded_gas_limit(submitter, tx, gas_limit).await?;
+    let sendable = submitter.fill(tx).await?;
+    let envelope = sendable
+        .try_into_envelope()
+        .map_err(|_| EvmError::TransactionPreparation)?;
     debug_assert_eq!(envelope.nonce(), nonce);
     let prepared = PreparedTransaction::from_envelope(&envelope);
     // Attribute the reserved nonce to this exact transaction at signing time,
@@ -422,7 +496,147 @@ where
     // reconcile, and a persist-failure rollback free its nonce, even when no
     // broadcast or restart ever recorded it.
     in_flight.record_durable(address, prepared.nonce(), prepared.tx_hash());
+    preparation_guard.preparation = Some(UnreturnedPreparation::Signed {
+        nonce,
+        tx_hash: prepared.tx_hash(),
+    });
+    in_flight.begin_submission_observation(address, prepared.tx_hash(), before_block);
+    in_flight
+        .observe_submission_boundary(
+            async { Ok(submitter.get_block_number().await?) },
+            address,
+            prepared.tx_hash(),
+            before_block,
+        )
+        .await;
+    preparation_guard.preparation = None;
     Ok(prepared)
+}
+
+/// Fee bump, in percent, of a replacement over the transaction it replaces.
+/// Clears the node's required replacement margin (geth's `txpool.pricebump`
+/// default is 10%).
+const REPLACEMENT_FEE_BUMP_PCT: u64 = 15;
+
+/// Whether the market fee `estimate` has risen above either fee a transaction
+/// was signed with. A tip below the market's leaves it behind competing sends
+/// even when its max fee still covers the base fee.
+fn outbid_by_market(
+    estimate: &Eip1559Estimation,
+    signed_max_fee: u128,
+    signed_priority_fee: u128,
+) -> bool {
+    estimate.max_fee_per_gas > signed_max_fee
+        || estimate.max_priority_fee_per_gas > signed_priority_fee
+}
+
+/// Re-sign `prepared` at its own nonce with higher fees, when the network's
+/// current fee estimate has risen above the max fee or the priority fee
+/// `prepared` was signed with.
+///
+/// Returns `None` while the market is at or below both fees: a send priced at
+/// the market is not stuck on its fee, so a bump would only overpay. The
+/// replacement carries the same call, gas limit, value and chain, so at most
+/// one of the two can mine. Each fee is the larger of the current estimate and
+/// the replaced fee plus [`REPLACEMENT_FEE_BUMP_PCT`].
+///
+/// Nothing is recorded or broadcast: the caller persists the replacement
+/// before [`broadcast_prepared`] records its hash at the reserved nonce.
+pub(crate) async fn prepare_fee_replacement<F, P>(
+    submitter: &FillProvider<F, P, Ethereum>,
+    send_lock: &Mutex<()>,
+    address: Address,
+    prepared: &PreparedTransaction,
+) -> Result<Option<PreparedTransaction>, EvmError>
+where
+    F: TxFiller<Ethereum>,
+    P: Provider<Ethereum>,
+{
+    let _guard = send_lock.lock().await;
+    let replaced = TxEnvelope::decode_2718_exact(prepared.raw().as_ref())
+        .map_err(|_| EvmError::TransactionPreparation)?;
+    let replaced_max_fee = replaced.max_fee_per_gas();
+    let replaced_priority_fee = replaced
+        .max_priority_fee_per_gas()
+        .ok_or(EvmError::TransactionPreparation)?;
+    let estimate = submitter.estimate_eip1559_fees().await?;
+    if !outbid_by_market(&estimate, replaced_max_fee, replaced_priority_fee) {
+        return Ok(None);
+    }
+
+    let max_fee_per_gas = estimate
+        .max_fee_per_gas
+        .max(bump_fee(replaced_max_fee, REPLACEMENT_FEE_BUMP_PCT)?);
+    let max_priority_fee_per_gas = estimate
+        .max_priority_fee_per_gas
+        .max(bump_fee(replaced_priority_fee, REPLACEMENT_FEE_BUMP_PCT)?)
+        .min(max_fee_per_gas);
+    let mut tx = TransactionRequest::default()
+        .from(address)
+        .input(replaced.input().clone().into())
+        .value(replaced.value())
+        .nonce(replaced.nonce())
+        .gas_limit(replaced.gas_limit())
+        .max_fee_per_gas(max_fee_per_gas)
+        .max_priority_fee_per_gas(max_priority_fee_per_gas);
+    if let Some(to) = replaced.to() {
+        tx = tx.to(to);
+    }
+    if let Some(chain_id) = replaced.chain_id() {
+        tx.chain_id = Some(chain_id);
+    }
+
+    let envelope = submitter
+        .fill(tx)
+        .await?
+        .try_into_envelope()
+        .map_err(|_| EvmError::TransactionPreparation)?;
+    let replacement = PreparedTransaction::from_envelope(&envelope);
+    info!(
+        target: "wallet",
+        replaced = %prepared.tx_hash(),
+        replacement = %replacement.tx_hash(),
+        nonce = replacement.nonce(),
+        replaced_max_fee,
+        max_fee_per_gas,
+        "Signed a fee replacement for a prepared transaction"
+    );
+    Ok(Some(replacement))
+}
+
+enum UnreturnedPreparation {
+    Reserved(u64),
+    Signed { nonce: u64, tx_hash: TxHash },
+}
+
+/// Synchronous rollback before the caller receives exact prepared bytes. The
+/// freshly allocated nonce is unused, and the send lock outlives this guard.
+struct UnreturnedPreparationGuard<'wallet> {
+    nonce_manager: &'wallet ResettableNonceManager,
+    in_flight: &'wallet InFlightNonces,
+    address: Address,
+    preparation: Option<UnreturnedPreparation>,
+}
+
+impl Drop for UnreturnedPreparationGuard<'_> {
+    fn drop(&mut self) {
+        let Some(preparation) = self.preparation.take() else {
+            return;
+        };
+        match preparation {
+            UnreturnedPreparation::Reserved(nonce) => {
+                self.nonce_manager
+                    .release_occupied_nonce(self.address, nonce);
+            }
+            UnreturnedPreparation::Signed { nonce, tx_hash } => {
+                self.in_flight
+                    .discard_unreturned_preparation(self.address, nonce, tx_hash);
+            }
+        }
+        self.nonce_manager.invalidate();
+        warn!(target: "wallet", address = %self.address,
+            "Unreturned preparation interrupted; releasing its unused reservation and invalidating allocation cache");
+    }
 }
 
 async fn prepared_transaction_visible<P>(provider: &P, tx_hash: TxHash) -> bool
@@ -488,10 +702,13 @@ where
         .reserve_prepared_nonce(address, prepared.nonce())
         .await;
     // Record the hash with the hold, before any early return. Persisted exact
-    // bytes retain their nonce through a definitive drop so durable recovery can
+    // bytes retain their nonce through a suspected drop so durable recovery can
     // rebroadcast them, and a hash-keyed release can always find the hold again,
     // including one re-added by a stale rebroadcast after a reconcile.
     in_flight.record_durable(address, prepared.nonce(), tx_hash);
+
+    let before_block = provider.get_block_number().await?;
+    in_flight.begin_submission_observation(address, tx_hash, before_block);
 
     match provider.send_raw_transaction(prepared.raw()).await {
         Ok(_) => {}
@@ -511,6 +728,14 @@ where
         }
     }
 
+    in_flight
+        .observe_submission_boundary(
+            async { Ok(provider.get_block_number().await?) },
+            address,
+            tx_hash,
+            before_block,
+        )
+        .await;
     info!(target: "wallet", %tx_hash, note, nonce = prepared.nonce(), "Prepared transaction broadcast");
     Ok(tx_hash)
 }
@@ -606,6 +831,10 @@ where
 /// `in_flight` its [`InFlightNonces`] record of its own unconfirmed sends,
 /// and `send_lock` serializes all sends from this wallet.
 ///
+/// Only a first attempt rejected before its raw send comes back as
+/// [`EvmError::RejectedBeforeBroadcast`]. Nonce and fee recovery drop the
+/// marker: the raw send that triggered recovery may have been accepted.
+///
 /// The nonce is assigned explicitly via [`TxSubmitter::assign_nonce`] and
 /// pinned onto the request before it is submitted, rather than left for the
 /// signing provider's own filler to assign invisibly: this is what makes the
@@ -644,10 +873,18 @@ where
         .input(calldata.clone().into())
         .nonce(nonce);
 
-    let error = match submitter.submit(tx).await {
+    let error = match submit_with_observation(
+        submitter,
+        nonce_manager,
+        in_flight,
+        address,
+        nonce,
+        tx,
+    )
+    .await
+    {
         Ok(tx_hash) => {
             info!(target: "wallet", %tx_hash, note, nonce, "Transaction submitted");
-            in_flight.record(address, nonce, tx_hash);
             return Ok(tx_hash);
         }
         Err(error) => error,
@@ -662,7 +899,7 @@ where
             contract,
             calldata,
             note,
-            error,
+            error.into_underlying(),
         )
         .await;
     }
@@ -687,6 +924,45 @@ where
         -- invalidating nonce cache to prevent nonce gap");
     nonce_manager.invalidate();
     Err(error)
+}
+
+/// Bracket each actual attempt while the caller holds the wallet send lock.
+/// Accepted identity is registered before the post-read can fail or be cancelled.
+async fn submit_with_observation<Submitter: TxSubmitter>(
+    submitter: &Submitter,
+    nonce_manager: &ResettableNonceManager,
+    in_flight: &InFlightNonces,
+    address: Address,
+    nonce: u64,
+    tx: TransactionRequest,
+) -> Result<TxHash, EvmError> {
+    let BroadcastSubmission {
+        tx_hash,
+        before_block,
+    } = submitter.submit(tx, nonce_manager, address).await?;
+    in_flight.record(address, nonce, tx_hash);
+    in_flight.begin_submission_observation(address, tx_hash, before_block);
+    in_flight
+        .observe_submission_boundary(submitter.current_block(), address, tx_hash, before_block)
+        .await;
+    Ok(tx_hash)
+}
+
+/// Until signing and the pre-broadcast head read complete, the assigned nonce
+/// is unused. Invalidate its cache on cancellation without releasing occupancy.
+struct PreBroadcastNonceGuard<'manager> {
+    nonce_manager: Option<&'manager ResettableNonceManager>,
+    address: Address,
+}
+
+impl Drop for PreBroadcastNonceGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(nonce_manager) = self.nonce_manager {
+            warn!(target: "wallet", address = %self.address,
+                "Pre-broadcast preparation interrupted; invalidating nonce allocation cache");
+            nonce_manager.invalidate();
+        }
+    }
 }
 
 /// This recovery loop's own monotonic lower bound, accumulated from its own
@@ -1080,10 +1356,19 @@ where
             .input(calldata.clone().into())
             .nonce(retry_nonce);
 
-        match submitter.submit(retry_tx).await {
+        match submit_with_observation(
+            submitter,
+            nonce_manager,
+            in_flight,
+            address,
+            retry_nonce,
+            retry_tx,
+        )
+        .await
+        .map_err(EvmError::into_underlying)
+        {
             Ok(tx_hash) => {
                 info!(target: "wallet", %tx_hash, note, attempt, nonce = retry_nonce, "Transaction submitted");
-                in_flight.record(address, retry_nonce, tx_hash);
                 return Ok(tx_hash);
             }
             Err(retry_error) if retry_error.is_nonce_too_low() => {
@@ -1236,10 +1521,19 @@ where
             "Resubmitting stuck transaction with bumped fee"
         );
 
-        let error = match submitter.submit(tx).await {
+        let error = match submit_with_observation(
+            submitter,
+            nonce_manager,
+            in_flight,
+            address,
+            nonce,
+            tx,
+        )
+        .await
+        .map_err(EvmError::into_underlying)
+        {
             Ok(tx_hash) => {
                 info!(target: "wallet", %tx_hash, note, attempt, "Replacement transaction accepted");
-                in_flight.record(address, nonce, tx_hash);
                 return Ok(tx_hash);
             }
             Err(error) => error,
@@ -1279,14 +1573,14 @@ where
 }
 
 /// Releases `tx_hash`'s [`InFlightNonces`] entry once a wait for its receipt
-/// has resolved, if the outcome is decisive; called by both wallet backends'
+/// has resolved under its ownership policy; called by both wallet backends'
 /// `await_receipt` after `wait_for_receipt` completes, mirroring how
 /// `send_with_recovery` above is this module's single shared entry point for
 /// the send side.
 ///
 /// - `Ok(_)` (mined) is definitive for the whole nonce: every competing hash
 ///   recorded at that nonce is obsolete and its occupancy is released.
-/// - A dropped-transaction error is definitive only for that attempt.
+/// - A suspected-drop error invokes the configured policy only for that attempt.
 ///   Generic hashes are removed and a final hash rewinds the allocator to fill
 ///   the gap. Durable prepared hashes remain occupied for exact rebroadcast.
 /// - Every other outcome -- most importantly `Err(EvmError::ReceiptTimeout
@@ -1295,13 +1589,13 @@ where
 ///   transaction underpriced" rejection at this same nonce be misclassified
 ///   as external and bumped/skipped past, replacing the wallet's own still-
 ///   live transaction. The entry is therefore deliberately left in place
-///   until a later confirm or drop proves otherwise.
+///   until a later confirmation or qualified drop resolves its ownership policy.
 ///
-/// Delegates the decisive/inconclusive classification to
+/// Delegates the suspected-drop classification to
 /// [`EvmError::is_transaction_dropped`] rather than matching
 /// `EvmError::TransactionDropped` here directly: that method already
 /// exhaustively matches every `EvmError` variant, so a future variant that
-/// should also be treated as decisive is a single, compiler-checked place to
+/// should also invoke this drop policy is a single, compiler-checked place to
 /// update, instead of a second copy of the classification that could
 /// silently drift from it.
 pub(crate) async fn release_in_flight_after_wait(
@@ -1326,7 +1620,7 @@ mod tests {
     use std::borrow::Cow;
     use std::collections::{HashSet, VecDeque};
     use std::sync::Mutex as StdMutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use alloy::consensus::{Receipt, ReceiptEnvelope, ReceiptWithBloom};
@@ -1335,11 +1629,16 @@ mod tests {
     use alloy::node_bindings::Anvil;
     use alloy::primitives::{Bloom, Bytes, TxHash, U64, U256, address};
     use alloy::providers::ProviderBuilder;
+    #[cfg(feature = "local-signer")]
+    use alloy::providers::SendableTx;
     use alloy::providers::ext::AnvilApi;
+    #[cfg(feature = "local-signer")]
+    use alloy::providers::fillers::FillerControlFlow;
     use alloy::providers::fillers::NonceManager;
     use alloy::providers::mock::Asserter;
     use alloy::rpc::json_rpc::ErrorPayload;
     use alloy::transports::RpcError;
+    use httpmock::MockServer;
     use tokio::time::Instant;
 
     use super::*;
@@ -1349,6 +1648,348 @@ mod tests {
     const CONTRACT: Address = address!("00000000000000000000000000000000000000c1");
     const WALLET: Address = address!("00000000000000000000000000000000000000a9");
     const STUCK_NONCE: u64 = 7;
+
+    /// A send is replaced when the market outbids either of its fees: a high
+    /// max fee with a tip below the market's still leaves it unmined.
+    #[test]
+    fn a_send_is_outbid_when_the_market_tip_rises_above_its_own() {
+        const GWEI: u128 = 1_000_000_000;
+        let market = |max_fee_per_gas, max_priority_fee_per_gas| Eip1559Estimation {
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
+        };
+
+        assert!(outbid_by_market(
+            &market(60 * GWEI, 5 * GWEI),
+            200 * GWEI,
+            GWEI
+        ));
+        assert!(outbid_by_market(
+            &market(250 * GWEI, GWEI),
+            200 * GWEI,
+            GWEI
+        ));
+        assert!(!outbid_by_market(
+            &market(200 * GWEI, GWEI),
+            200 * GWEI,
+            GWEI
+        ));
+        assert!(!outbid_by_market(
+            &market(60 * GWEI, GWEI / 2),
+            200 * GWEI,
+            GWEI
+        ));
+    }
+
+    #[cfg(feature = "local-signer")]
+    #[derive(Clone, Debug)]
+    struct PreparationFiller(Duration);
+
+    #[cfg(feature = "local-signer")]
+    impl TxFiller for PreparationFiller {
+        type Fillable = ();
+
+        fn status(&self, tx: &TransactionRequest) -> FillerControlFlow {
+            if tx.chain_id.is_some() && tx.gas_price.is_some() {
+                FillerControlFlow::Finished
+            } else {
+                FillerControlFlow::Ready
+            }
+        }
+
+        fn fill_sync(&self, _tx: &mut SendableTx<Ethereum>) {}
+
+        async fn prepare<P: Provider>(
+            &self,
+            _provider: &P,
+            _tx: &TransactionRequest,
+        ) -> alloy::transports::TransportResult<()> {
+            tokio::time::sleep(self.0).await;
+            Ok(())
+        }
+
+        async fn fill(
+            &self,
+            (): (),
+            mut tx: SendableTx<Ethereum>,
+        ) -> alloy::transports::TransportResult<SendableTx<Ethereum>> {
+            let builder = tx.as_mut_builder().unwrap();
+            builder.set_chain_id(1);
+            builder.set_gas_price(1_000_000_000);
+            Ok(tx)
+        }
+    }
+
+    #[cfg(feature = "local-signer")]
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_preparation_reclaims_fresh_nonce_without_releasing_prior_hold() {
+        let asserter = Asserter::new();
+        asserter.push_success(&U64::ZERO);
+        asserter.push_success(&U64::ZERO);
+        asserter.push_success(&U64::ZERO);
+        asserter.push_success(&U64::from(21_000));
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .filler(PreparationFiller(Duration::from_secs(1)))
+            .wallet(alloy::network::EthereumWallet::from(signer))
+            .connect_mocked_client(asserter);
+        let nonce_manager = ResettableNonceManager::default();
+        nonce_manager.set_next_nonce(WALLET, 0).await;
+        let in_flight = InFlightNonces::new(nonce_manager.clone());
+        let prior_hash = TxHash::random();
+        in_flight.record_durable(WALLET, 5, prior_hash);
+        let send_lock = Mutex::new(());
+        {
+            let preparation = prepare_with_nonce(
+                &provider,
+                &nonce_manager,
+                &in_flight,
+                &send_lock,
+                WALLET,
+                CONTRACT,
+                Bytes::new(),
+                GasLimitSource::Estimate,
+            );
+            tokio::pin!(preparation);
+            assert!(futures::poll!(&mut preparation).is_pending());
+            assert_eq!(nonce_manager.peek_next_nonce(WALLET).await, Some(1));
+        }
+        assert_eq!(nonce_manager.peek_next_nonce(WALLET).await, None);
+        assert_eq!(in_flight.ownership(WALLET, 5), NonceOwnership::Ours);
+        let next = Asserter::new();
+        next.push_success(&U64::ZERO);
+        next.push_success(&U64::ZERO);
+        let provider = ProviderBuilder::new().connect_mocked_client(next);
+        assert_eq!(
+            nonce_manager
+                .reserve_next_unheld_nonce(&provider, WALLET)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_generic_posthead_returns_accepted_hash_at_receipt_poll_bound() {
+        let tx_hash = TxHash::random();
+        let mut submitter = MockSubmitter::new(vec![Ok(tx_hash)]);
+        submitter.post_head_delay = Duration::from_secs(600);
+        *submitter.heads.lock().unwrap() = VecDeque::from([Ok(100), Ok(200)]);
+        let nonce_manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::new(nonce_manager.clone());
+        let send_lock = Mutex::new(());
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            crate::RECEIPT_POLL_INTERVAL + Duration::from_millis(1),
+            send_with_recovery(
+                &submitter,
+                &nonce_manager,
+                &in_flight,
+                &send_lock,
+                WALLET,
+                CONTRACT,
+                Bytes::new(),
+                "stalled posthead",
+            ),
+        )
+        .await;
+        assert_eq!(
+            result
+                .expect("accepted identity must not wait for a hung posthead")
+                .unwrap(),
+            tx_hash
+        );
+        assert_eq!(started.elapsed(), crate::RECEIPT_POLL_INTERVAL);
+        assert_eq!(
+            in_flight
+                .submission(WALLET, tx_hash)
+                .unwrap()
+                .submitted_after_block,
+            None
+        );
+        assert_eq!(in_flight.ownership(WALLET, 0), NonceOwnership::Ours);
+    }
+
+    #[cfg(feature = "local-signer")]
+    async fn assert_preparation_posthead_cleanup(cancel: bool) {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method("POST")
+                .json_body_includes(r#"{"method":"eth_blockNumber","id":0}"#);
+            then.json_body(serde_json::json!({"jsonrpc":"2.0","id":0,"result":"0x64"}));
+        });
+        for id in [2, 3] {
+            server.mock(|when, then| {
+                when.method("POST").json_body_includes(
+                    serde_json::json!({"method":"eth_estimateGas","id":id}).to_string(),
+                );
+                then.json_body(serde_json::json!({"jsonrpc":"2.0","id":id,"result":"0x5208"}));
+            });
+        }
+        for id in 0..3 {
+            server.mock(|when, then| {
+                when.method("POST").json_body_includes(
+                    serde_json::json!({"method":"eth_getTransactionCount","id":id}).to_string(),
+                );
+                then.json_body(serde_json::json!({"jsonrpc":"2.0","id":id,"result":"0x0"}));
+            });
+        }
+        let posthead = server.mock(|when, then| {
+            when.method("POST")
+                .json_body_includes(r#"{"method":"eth_blockNumber","id":4}"#);
+            then.delay(Duration::from_secs(10))
+                .json_body(serde_json::json!({"jsonrpc":"2.0","id":4,"result":"0xc8"}));
+        });
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let address = signer.address();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .filler(PreparationFiller(Duration::ZERO))
+            .wallet(alloy::network::EthereumWallet::from(signer))
+            .connect_http(server.url("/").parse().unwrap());
+        let nonce_manager = ResettableNonceManager::default();
+        nonce_manager.set_next_nonce(address, 0).await;
+        let in_flight = InFlightNonces::new(nonce_manager.clone());
+        let prior_hash = TxHash::random();
+        in_flight.record_durable(address, 5, prior_hash);
+        let send_lock = Mutex::new(());
+        {
+            let preparation = prepare_with_nonce(
+                &provider,
+                &nonce_manager,
+                &in_flight,
+                &send_lock,
+                address,
+                CONTRACT,
+                Bytes::new(),
+                GasLimitSource::Estimate,
+            );
+            tokio::pin!(preparation);
+            if cancel {
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    loop {
+                        tokio::select! {
+                            result = &mut preparation => panic!("preparation must still own its unfinished observation: {result:?}"),
+                            () = tokio::time::sleep(Duration::from_millis(1)) => {
+                                if posthead.calls() == 1 { break; }
+                            }
+                        }
+                    }
+                }).await.unwrap();
+                assert!(send_lock.try_lock().is_none());
+                assert_eq!(in_flight.ownership(address, 0), NonceOwnership::Ours);
+            } else {
+                let prepared = tokio::time::timeout(
+                    crate::RECEIPT_POLL_INTERVAL + Duration::from_millis(500),
+                    &mut preparation,
+                )
+                .await
+                .expect("optional posthead must not delay returning prepared bytes")
+                .unwrap();
+                assert_eq!(posthead.calls(), 1);
+                assert_eq!(
+                    in_flight
+                        .submission(address, prepared.tx_hash())
+                        .unwrap()
+                        .submitted_after_block,
+                    None
+                );
+                assert_eq!(in_flight.ownership(address, 0), NonceOwnership::Ours);
+                return;
+            }
+        }
+        assert_eq!(nonce_manager.peek_next_nonce(address).await, None);
+        assert_eq!(in_flight.ownership(address, 0), NonceOwnership::Unknown);
+        assert_eq!(in_flight.ownership(address, 5), NonceOwnership::Ours);
+        let next = Asserter::new();
+        next.push_success(&U64::ZERO);
+        next.push_success(&U64::ZERO);
+        let provider = ProviderBuilder::new().connect_mocked_client(next);
+        assert_eq!(
+            nonce_manager
+                .reserve_next_unheld_nonce(&provider, address)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[cfg(feature = "local-signer")]
+    #[tokio::test]
+    async fn cancelled_preparation_posthead_reclaims_only_unreturned_signed_transaction() {
+        assert_preparation_posthead_cleanup(true).await;
+    }
+
+    #[cfg(feature = "local-signer")]
+    #[tokio::test]
+    async fn stalled_preparation_posthead_returns_owned_bytes_with_unknown_floor() {
+        assert_preparation_posthead_cleanup(false).await;
+    }
+
+    #[tokio::test]
+    async fn stalled_prepared_broadcast_posthead_returns_hash_without_releasing_ownership() {
+        let tx_hash = prepared_tx_hash();
+        let prepared = PreparedTransaction::for_test(tx_hash, STUCK_NONCE);
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method("POST")
+                .json_body_includes(r#"{"method":"eth_blockNumber","id":0}"#);
+            then.json_body(serde_json::json!({"jsonrpc":"2.0","id":0,"result":"0x12c"}));
+        });
+        server.mock(|when, then| {
+            when.method("POST")
+                .json_body_includes(r#"{"method":"eth_sendRawTransaction"}"#);
+            then.json_body(serde_json::json!({"jsonrpc":"2.0","id":1,"result":tx_hash}));
+        });
+        server.mock(|when, then| {
+            when.method("POST")
+                .json_body_includes(r#"{"method":"eth_blockNumber","id":2}"#);
+            then.delay(Duration::from_secs(10))
+                .json_body(serde_json::json!({"jsonrpc":"2.0","id":2,"result":"0x12d"}));
+        });
+        let provider = ProviderBuilder::new().connect_http(server.url("/").parse().unwrap());
+        let nonce_manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::new(nonce_manager.clone());
+        in_flight.record_durable(WALLET, STUCK_NONCE, tx_hash);
+        in_flight.record_submission_block(WALLET, tx_hash, 500);
+        let send_lock = Mutex::new(());
+        let result = tokio::time::timeout(
+            crate::RECEIPT_POLL_INTERVAL + Duration::from_millis(500),
+            broadcast_prepared(
+                &provider,
+                &nonce_manager,
+                &in_flight,
+                &send_lock,
+                WALLET,
+                &prepared,
+                "stalled prepared posthead",
+            ),
+        )
+        .await
+        .expect("accepted prepared hash must be returned despite hung observation")
+        .unwrap();
+        assert_eq!(result, tx_hash);
+        assert_eq!(
+            in_flight
+                .submission(WALLET, tx_hash)
+                .unwrap()
+                .submitted_after_block,
+            None
+        );
+        assert_eq!(
+            in_flight.ownership(WALLET, STUCK_NONCE),
+            NonceOwnership::Ours
+        );
+        in_flight.record_submission_block(WALLET, tx_hash, 100);
+        assert_eq!(
+            in_flight
+                .submission(WALLET, tx_hash)
+                .unwrap()
+                .submitted_after_block,
+            Some(500)
+        );
+    }
 
     fn rpc_error(message: impl Into<Cow<'static, str>>) -> EvmError {
         EvmError::Transport(RpcError::ErrorResp(ErrorPayload {
@@ -1407,6 +2048,12 @@ mod tests {
         rpc_error("execution reverted")
     }
 
+    fn unsent(source: EvmError) -> EvmError {
+        EvmError::RejectedBeforeBroadcast {
+            source: Box::new(source),
+        }
+    }
+
     fn prepared_tx_hash() -> TxHash {
         TxHash::repeat_byte(0xa5)
     }
@@ -1434,6 +2081,13 @@ mod tests {
     /// records the transactions it received, and tracks peak concurrency
     /// so the serialization lock can be asserted.
     struct MockSubmitter {
+        heads: StdMutex<VecDeque<Result<u64, EvmError>>>,
+        head_reads: AtomicUsize,
+        post_head_delay: Duration,
+        delayed_head_read: Option<usize>,
+        cold_nonce_value: u64,
+        signing_complete: AtomicBool,
+        signing_head: Option<u64>,
         results: StdMutex<VecDeque<Result<TxHash, EvmError>>>,
         sent: StdMutex<Vec<TransactionRequest>>,
         active: AtomicUsize,
@@ -1454,6 +2108,13 @@ mod tests {
     impl MockSubmitter {
         fn new(results: Vec<Result<TxHash, EvmError>>) -> Self {
             Self {
+                heads: StdMutex::new(VecDeque::new()),
+                head_reads: AtomicUsize::new(0),
+                post_head_delay: Duration::ZERO,
+                delayed_head_read: None,
+                cold_nonce_value: 0,
+                signing_complete: AtomicBool::new(false),
+                signing_head: None,
                 results: StdMutex::new(results.into()),
                 sent: StdMutex::new(Vec::new()),
                 active: AtomicUsize::new(0),
@@ -1584,7 +2245,33 @@ mod tests {
 
     #[async_trait]
     impl TxSubmitter for MockSubmitter {
-        async fn submit(&self, tx: TransactionRequest) -> Result<TxHash, EvmError> {
+        async fn current_block(&self) -> Result<u64, EvmError> {
+            let read = self.head_reads.fetch_add(1, Ordering::SeqCst);
+            if read == 0
+                && self.signing_complete.load(Ordering::SeqCst)
+                && let Some(head) = self.signing_head
+            {
+                return Ok(head);
+            }
+            if self.delayed_head_read == Some(read) {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            if read > 0 && !self.post_head_delay.is_zero() {
+                tokio::time::sleep(self.post_head_delay).await;
+            }
+            self.heads.lock().unwrap().pop_front().unwrap_or(Ok(0))
+        }
+
+        async fn submit(
+            &self,
+            tx: TransactionRequest,
+            nonce_manager: &ResettableNonceManager,
+            address: Address,
+        ) -> Result<BroadcastSubmission, EvmError> {
+            let mut allocation_guard = PreBroadcastNonceGuard {
+                nonce_manager: Some(nonce_manager),
+                address,
+            };
             let active_now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(active_now, Ordering::SeqCst);
 
@@ -1593,6 +2280,14 @@ mod tests {
             }
 
             let tx = self.fill_nonce(tx).await;
+            self.signing_complete.store(true, Ordering::SeqCst);
+            let before_block =
+                self.current_block()
+                    .await
+                    .map_err(|source| EvmError::RejectedBeforeBroadcast {
+                        source: Box::new(source),
+                    })?;
+            allocation_guard.nonce_manager = None;
             self.sent.lock().expect("sent lock").push(tx);
             let result = self
                 .results
@@ -1603,8 +2298,14 @@ mod tests {
 
             self.active.fetch_sub(1, Ordering::SeqCst);
             match result {
-                Err(error) if error.is_already_known() => Ok(prepared_tx_hash()),
-                other => other,
+                Err(error) if error.is_already_known() => Ok(BroadcastSubmission {
+                    tx_hash: prepared_tx_hash(),
+                    before_block,
+                }),
+                other => other.map(|tx_hash| BroadcastSubmission {
+                    tx_hash,
+                    before_block,
+                }),
             }
         }
 
@@ -1619,11 +2320,12 @@ mod tests {
 
             if nonce_manager.peek_next_nonce(address).await.is_none() {
                 // No test in this module scripts a real cold RPC fetch for
-                // the base send's own nonce assignment; seeding 0 here
-                // stands in for "a fresh chain reports nonce 0", the same
-                // deterministic starting point every un-seeded test in this
-                // module already assumes for its address.
-                nonce_manager.set_next_nonce(address, 0).await;
+                // the base send's own nonce assignment; seeding the scripted
+                // cold nonce stands in for a latest chain nonce read.
+                // Tests use zero unless cancellation advances chain state.
+                nonce_manager
+                    .set_next_nonce(address, self.cold_nonce_value)
+                    .await;
             }
 
             let unused_provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
@@ -1855,6 +2557,7 @@ mod tests {
         let asserter = Asserter::new();
         let estimate = 21_000;
         asserter.push_success(&U64::from(estimate));
+        asserter.push_success(&U64::from(110));
         asserter.push_failure(ErrorPayload {
             code: -32000,
             message: Cow::Borrowed("already known"),
@@ -1875,11 +2578,440 @@ mod tests {
         let envelope = sendable.try_into_envelope().unwrap();
         let expected_hash = keccak256(envelope.encoded_2718());
 
-        let tx_hash = TxSubmitter::submit(wallet.signing_provider(), tx)
-            .await
-            .unwrap();
+        let nonce_manager = ResettableNonceManager::default();
+        let submission = TxSubmitter::submit(
+            wallet.signing_provider(),
+            tx,
+            &nonce_manager,
+            wallet.address(),
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(tx_hash, expected_hash);
+        assert_eq!(submission.tx_hash, expected_hash);
+        assert_eq!(submission.before_block, 110);
+    }
+
+    #[tokio::test]
+    async fn generic_broadcast_floor_is_sampled_after_slow_signing_before_lagging_posthead() {
+        let tx_hash = TxHash::random();
+        let mut submitter =
+            MockSubmitter::new(vec![Ok(tx_hash)]).with_delay(Duration::from_millis(1));
+        submitter.signing_head = Some(110);
+        *submitter.heads.lock().unwrap() = VecDeque::from([Ok(100), Ok(100)]);
+        let nonce_manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::new(nonce_manager.clone());
+        let send_lock = Mutex::new(());
+        assert_eq!(
+            send_with_recovery(
+                &submitter,
+                &nonce_manager,
+                &in_flight,
+                &send_lock,
+                WALLET,
+                CONTRACT,
+                Bytes::new(),
+                "slow signing"
+            )
+            .await
+            .unwrap(),
+            tx_hash
+        );
+        assert_eq!(
+            in_flight
+                .submission(WALLET, tx_hash)
+                .unwrap()
+                .submitted_after_block,
+            Some(110)
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_cancelled_signing_reclaims_unbroadcast_nonce() {
+        let tx_hash = TxHash::random();
+        let mut submitter =
+            MockSubmitter::new(vec![Ok(tx_hash)]).with_delay(Duration::from_secs(1));
+        let nonce_manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::new(nonce_manager.clone());
+        let send_lock = Mutex::new(());
+        {
+            let send = send_with_recovery(
+                &submitter,
+                &nonce_manager,
+                &in_flight,
+                &send_lock,
+                WALLET,
+                CONTRACT,
+                Bytes::new(),
+                "cancelled signing",
+            );
+            tokio::pin!(send);
+            assert!(matches!(
+                futures::poll!(&mut send),
+                std::task::Poll::Pending
+            ));
+            assert_eq!(submitter.sent(), Vec::<TransactionRequest>::new());
+        }
+        assert_eq!(nonce_manager.peek_next_nonce(WALLET).await, None);
+        submitter.delay = Duration::ZERO;
+        assert_eq!(
+            send_with_recovery(
+                &submitter,
+                &nonce_manager,
+                &in_flight,
+                &send_lock,
+                WALLET,
+                CONTRACT,
+                Bytes::new(),
+                "retry after cancelled signing"
+            )
+            .await
+            .unwrap(),
+            tx_hash
+        );
+        assert_eq!(in_flight.submission(WALLET, tx_hash).unwrap().nonce, 0);
+    }
+
+    #[tokio::test]
+    async fn generic_prehead_cancellation_reclaims_unused_nonce_without_releasing_owned_nonce() {
+        for existing_ownership in [false, true] {
+            let tx_hash = TxHash::random();
+            let mut submitter = MockSubmitter::new(vec![Ok(tx_hash)]);
+            submitter.delayed_head_read = Some(0);
+            let nonce_manager = ResettableNonceManager::default();
+            let in_flight = InFlightNonces::new(nonce_manager.clone());
+            let expected_nonce = u64::from(existing_ownership);
+            let existing_hash = TxHash::random();
+            if existing_ownership {
+                in_flight.record_durable(WALLET, 0, existing_hash);
+            }
+            nonce_manager.set_next_nonce(WALLET, expected_nonce).await;
+            let send_lock = Mutex::new(());
+            {
+                let send = send_with_recovery(
+                    &submitter,
+                    &nonce_manager,
+                    &in_flight,
+                    &send_lock,
+                    WALLET,
+                    CONTRACT,
+                    Bytes::new(),
+                    "cancelled prehead",
+                );
+                tokio::pin!(send);
+                assert!(matches!(
+                    futures::poll!(&mut send),
+                    std::task::Poll::Pending
+                ));
+                assert_eq!(submitter.head_reads.load(Ordering::SeqCst), 1);
+                assert_eq!(submitter.sent(), Vec::<TransactionRequest>::new());
+            }
+            assert_eq!(nonce_manager.peek_next_nonce(WALLET).await, None);
+            submitter.delayed_head_read = None;
+            assert_eq!(
+                send_with_recovery(
+                    &submitter,
+                    &nonce_manager,
+                    &in_flight,
+                    &send_lock,
+                    WALLET,
+                    CONTRACT,
+                    Bytes::new(),
+                    "reuse unused nonce"
+                )
+                .await
+                .unwrap(),
+                tx_hash
+            );
+            assert_eq!(
+                in_flight.submission(WALLET, tx_hash).unwrap().nonce,
+                expected_nonce
+            );
+            if existing_ownership {
+                assert_eq!(
+                    in_flight.submission(WALLET, existing_hash).unwrap().nonce,
+                    0
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_prehead_cancellation_reclaims_nonce_recovery_allocation() {
+        let tx_hash = TxHash::random();
+        let mut submitter = MockSubmitter::new(vec![
+            Err(rpc_error("nonce too low: next nonce 7, tx nonce 0")),
+            Ok(tx_hash),
+        ])
+        .with_pending_nonce(7);
+        submitter.delayed_head_read = Some(1);
+        let nonce_manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::new(nonce_manager.clone());
+        let send_lock = Mutex::new(());
+        {
+            let send = send_with_recovery(
+                &submitter,
+                &nonce_manager,
+                &in_flight,
+                &send_lock,
+                WALLET,
+                CONTRACT,
+                Bytes::new(),
+                "cancelled recovery prehead",
+            );
+            tokio::pin!(send);
+            assert!(matches!(
+                futures::poll!(&mut send),
+                std::task::Poll::Pending
+            ));
+            assert_eq!(submitter.head_reads.load(Ordering::SeqCst), 2);
+            assert_eq!(submitter.sent().len(), 1);
+        }
+        assert_eq!(nonce_manager.peek_next_nonce(WALLET).await, None);
+        submitter.delayed_head_read = None;
+        submitter.cold_nonce_value = 7;
+        assert_eq!(
+            send_with_recovery(
+                &submitter,
+                &nonce_manager,
+                &in_flight,
+                &send_lock,
+                WALLET,
+                CONTRACT,
+                Bytes::new(),
+                "reuse recovery nonce"
+            )
+            .await
+            .unwrap(),
+            tx_hash
+        );
+        assert_eq!(in_flight.submission(WALLET, tx_hash).unwrap().nonce, 7);
+    }
+
+    #[tokio::test]
+    async fn generic_observation_starts_after_queued_send_lock_and_preserves_fresh_floor() {
+        let tx_hash = TxHash::random();
+        let submitter = MockSubmitter::new(vec![Ok(tx_hash)]);
+        *submitter.heads.lock().unwrap() = VecDeque::from([Ok(100), Ok(100)]);
+        let nonce_manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::new(nonce_manager.clone());
+        let send_lock = Mutex::new(());
+        let guard = send_lock.lock().await;
+        let send = send_with_recovery(
+            &submitter,
+            &nonce_manager,
+            &in_flight,
+            &send_lock,
+            WALLET,
+            CONTRACT,
+            Bytes::new(),
+            "queued send",
+        );
+        tokio::pin!(send);
+        assert!(matches!(
+            futures::poll!(&mut send),
+            std::task::Poll::Pending
+        ));
+        assert_eq!(submitter.head_reads.load(Ordering::SeqCst), 0);
+        *submitter.heads.lock().unwrap() = VecDeque::from([Ok(300), Ok(100)]);
+        drop(guard);
+        assert_eq!(send.await.unwrap(), tx_hash);
+        assert_eq!(
+            in_flight
+                .submission(WALLET, tx_hash)
+                .unwrap()
+                .submitted_after_block,
+            Some(300)
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_observation_refreshes_prehead_for_successful_nonce_retry() {
+        let tx_hash = TxHash::random();
+        let submitter = MockSubmitter::new(vec![
+            Err(rpc_error("nonce too low: next nonce 7, tx nonce 0")),
+            Ok(tx_hash),
+        ])
+        .with_pending_nonce(7);
+        *submitter.heads.lock().unwrap() = VecDeque::from([Ok(100), Ok(300), Ok(100)]);
+        let nonce_manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::new(nonce_manager.clone());
+        let send_lock = Mutex::new(());
+        assert_eq!(
+            send_with_recovery(
+                &submitter,
+                &nonce_manager,
+                &in_flight,
+                &send_lock,
+                WALLET,
+                CONTRACT,
+                Bytes::new(),
+                "retry send"
+            )
+            .await
+            .unwrap(),
+            tx_hash
+        );
+        let submission = in_flight.submission(WALLET, tx_hash).unwrap();
+        assert_eq!(submission.submitted_after_block, Some(300));
+        assert_eq!(submission.nonce, 7);
+        assert_eq!(submitter.head_reads.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn generic_observation_refreshes_prehead_for_successful_fee_bump() {
+        let tx_hash = TxHash::random();
+        let submitter = MockSubmitter::new(vec![
+            Err(rpc_error("replacement transaction underpriced")),
+            Ok(tx_hash),
+        ]);
+        *submitter.heads.lock().unwrap() = VecDeque::from([Ok(100), Ok(300), Ok(100)]);
+        let nonce_manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::new(nonce_manager.clone());
+        let send_lock = Mutex::new(());
+        assert_eq!(
+            send_with_recovery(
+                &submitter,
+                &nonce_manager,
+                &in_flight,
+                &send_lock,
+                WALLET,
+                CONTRACT,
+                Bytes::new(),
+                "fee bump send"
+            )
+            .await
+            .unwrap(),
+            tx_hash
+        );
+        let submission = in_flight.submission(WALLET, tx_hash).unwrap();
+        assert_eq!(submission.submitted_after_block, Some(300));
+        assert_eq!(submission.nonce, 0);
+        assert_eq!(submitter.head_reads.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn generic_observation_failed_prehead_does_not_leave_a_nonce_gap() {
+        let tx_hash = TxHash::random();
+        let submitter = MockSubmitter::new(vec![Ok(tx_hash)]);
+        *submitter.heads.lock().unwrap() =
+            VecDeque::from([Err(rpc_error("prehead unavailable")), Ok(300), Ok(300)]);
+        let nonce_manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::new(nonce_manager.clone());
+        let send_lock = Mutex::new(());
+        let error = send_with_recovery(
+            &submitter,
+            &nonce_manager,
+            &in_flight,
+            &send_lock,
+            WALLET,
+            CONTRACT,
+            Bytes::new(),
+            "failed prehead",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.was_never_broadcast(), "got {error:?}");
+        assert!(matches!(
+            error.underlying(),
+            EvmError::Transport(RpcError::ErrorResp(ErrorPayload { code: -32000, .. }))
+        ));
+        assert_eq!(submitter.sent(), Vec::<TransactionRequest>::new());
+        assert_eq!(nonce_manager.peek_next_nonce(WALLET).await, None);
+        assert_eq!(
+            send_with_recovery(
+                &submitter,
+                &nonce_manager,
+                &in_flight,
+                &send_lock,
+                WALLET,
+                CONTRACT,
+                Bytes::new(),
+                "retry prehead"
+            )
+            .await
+            .unwrap(),
+            tx_hash
+        );
+        assert_eq!(in_flight.submission(WALLET, tx_hash).unwrap().nonce, 0);
+    }
+
+    #[tokio::test]
+    async fn generic_observation_failed_posthead_retains_success_and_ownership() {
+        let tx_hash = TxHash::random();
+        let submitter = MockSubmitter::new(vec![Ok(tx_hash)]);
+        *submitter.heads.lock().unwrap() =
+            VecDeque::from([Ok(300), Err(rpc_error("posthead unavailable"))]);
+        let nonce_manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::new(nonce_manager.clone());
+        let send_lock = Mutex::new(());
+        assert_eq!(
+            send_with_recovery(
+                &submitter,
+                &nonce_manager,
+                &in_flight,
+                &send_lock,
+                WALLET,
+                CONTRACT,
+                Bytes::new(),
+                "failed posthead"
+            )
+            .await
+            .unwrap(),
+            tx_hash
+        );
+        assert_eq!(
+            in_flight
+                .submission(WALLET, tx_hash)
+                .unwrap()
+                .submitted_after_block,
+            None
+        );
+        assert_eq!(in_flight.ownership(WALLET, 0), NonceOwnership::Ours);
+        assert_eq!(submitter.head_reads.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn generic_observation_cancelled_posthead_retains_unknown_floor_and_ownership() {
+        let tx_hash = TxHash::random();
+        let mut submitter = MockSubmitter::new(vec![Ok(tx_hash)]);
+        submitter.post_head_delay = Duration::from_secs(1);
+        *submitter.heads.lock().unwrap() = VecDeque::from([Ok(300), Ok(301)]);
+        let nonce_manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::new(nonce_manager.clone());
+        let send_lock = Mutex::new(());
+        {
+            let send = send_with_recovery(
+                &submitter,
+                &nonce_manager,
+                &in_flight,
+                &send_lock,
+                WALLET,
+                CONTRACT,
+                Bytes::new(),
+                "cancelled posthead",
+            );
+            tokio::pin!(send);
+            assert!(matches!(
+                futures::poll!(&mut send),
+                std::task::Poll::Pending
+            ));
+            assert_eq!(submitter.head_reads.load(Ordering::SeqCst), 2);
+            assert!(
+                send_lock.try_lock().is_none(),
+                "the send lock must cover the post-head observation"
+            );
+        }
+        assert_eq!(
+            in_flight
+                .submission(WALLET, tx_hash)
+                .unwrap()
+                .submitted_after_block,
+            None
+        );
+        assert_eq!(in_flight.ownership(WALLET, 0), NonceOwnership::Ours);
+        assert_eq!(nonce_manager.peek_next_nonce(WALLET).await, Some(1));
+        let _guard = send_lock.lock().await;
     }
 
     #[tokio::test]
@@ -1887,12 +3019,14 @@ mod tests {
         let tx_hash = prepared_tx_hash();
         let prepared = PreparedTransaction::for_test(tx_hash, STUCK_NONCE);
         let asserter = Asserter::new();
+        asserter.push_success(&U256::from(100));
         asserter.push_failure(ErrorPayload {
             code: -32000,
             message: Cow::Borrowed("nonce too low"),
             data: None,
         });
         asserter.push_success(&mined_receipt(tx_hash));
+        asserter.push_success(&U256::from(101));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let nonce_manager = ResettableNonceManager::default();
         let in_flight = InFlightNonces::new(nonce_manager.clone());
@@ -1934,10 +3068,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_prepared_broadcast_hides_floor_without_losing_history_or_ownership() {
+        let tx_hash = prepared_tx_hash();
+        let prepared = PreparedTransaction::for_test(tx_hash, STUCK_NONCE);
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method("POST")
+                .json_body_includes(r#"{"method":"eth_blockNumber","id":0}"#);
+            then.json_body(serde_json::json!({"jsonrpc":"2.0","id":0,"result":"0x12c"}));
+        });
+        server.mock(|when, then| {
+            when.method("POST")
+                .json_body_includes(r#"{"method":"eth_sendRawTransaction"}"#);
+            then.json_body(serde_json::json!({"jsonrpc":"2.0","id":1,"result":tx_hash}));
+        });
+        let post_head = server.mock(|when, then| {
+            when.method("POST")
+                .json_body_includes(r#"{"method":"eth_blockNumber","id":2}"#);
+            then.delay(Duration::from_secs(1))
+                .json_body(serde_json::json!({"jsonrpc":"2.0","id":2,"result":"0x12d"}));
+        });
+        let provider = ProviderBuilder::new().connect_http(server.url("/").parse().unwrap());
+        let nonce_manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::new(nonce_manager.clone());
+        let send_lock = Mutex::new(());
+        in_flight.record_durable(WALLET, STUCK_NONCE, tx_hash);
+        in_flight.record_submission_block(WALLET, tx_hash, 100);
+        {
+            let broadcast = broadcast_prepared(
+                &provider,
+                &nonce_manager,
+                &in_flight,
+                &send_lock,
+                WALLET,
+                &prepared,
+                "cancelled broadcast",
+            );
+            tokio::pin!(broadcast);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    tokio::select! {
+                        result = &mut broadcast => panic!("broadcast must remain unfinished: {result:?}"),
+                        () = tokio::time::sleep(Duration::from_millis(1)) => {
+                            if post_head.calls() == 1 {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }).await.expect("broadcast must reach its cancellation-safe observation boundary");
+        }
+        assert_eq!(
+            in_flight
+                .submission(WALLET, tx_hash)
+                .unwrap()
+                .submitted_after_block,
+            None
+        );
+        assert_eq!(
+            in_flight.ownership(WALLET, STUCK_NONCE),
+            NonceOwnership::Ours
+        );
+        in_flight.record_submission_block(WALLET, tx_hash, 50);
+        assert_eq!(
+            in_flight
+                .submission(WALLET, tx_hash)
+                .unwrap()
+                .submitted_after_block,
+            Some(300)
+        );
+    }
+
+    #[tokio::test]
     async fn nonce_too_low_without_hash_visibility_remains_reconciliation_pending() {
         let tx_hash = prepared_tx_hash();
         let prepared = PreparedTransaction::for_test(tx_hash, STUCK_NONCE);
         let asserter = Asserter::new();
+        asserter.push_success(&U256::from(100));
         asserter.push_failure(ErrorPayload {
             code: -32000,
             message: Cow::Borrowed("nonce too low"),
@@ -1991,6 +3198,7 @@ mod tests {
         let tx_hash = prepared_tx_hash();
         let prepared = PreparedTransaction::for_test(tx_hash, STUCK_NONCE);
         let asserter = Asserter::new();
+        asserter.push_success(&U256::from(100));
         asserter.push_failure(ErrorPayload {
             code: -32000,
             message: Cow::Borrowed("insufficient funds for gas * price + value"),
@@ -2030,12 +3238,14 @@ mod tests {
         let tx_hash = prepared_tx_hash();
         let prepared = PreparedTransaction::for_test(tx_hash, STUCK_NONCE);
         let asserter = Asserter::new();
+        asserter.push_success(&U256::from(100));
         asserter.push_failure(ErrorPayload {
             code: -32000,
             message: Cow::Borrowed("replacement transaction underpriced"),
             data: None,
         });
         asserter.push_success(&mined_receipt(tx_hash));
+        asserter.push_success(&U256::from(101));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let nonce_manager = ResettableNonceManager::default();
         let in_flight = InFlightNonces::new(nonce_manager.clone());
@@ -2065,6 +3275,7 @@ mod tests {
         let tx_hash = prepared_tx_hash();
         let prepared = PreparedTransaction::for_test(tx_hash, STUCK_NONCE);
         let asserter = Asserter::new();
+        asserter.push_success(&U256::from(100));
         asserter.push_failure(ErrorPayload {
             code: -32000,
             message: Cow::Borrowed("replacement transaction underpriced"),
@@ -3228,6 +4439,184 @@ mod tests {
             "expected the original revert surfaced verbatim, got {error:?}"
         );
         assert_eq!(mock.sent().len(), 1, "no resubmit for a hard revert");
+    }
+
+    #[tokio::test]
+    async fn first_send_rejected_before_broadcast_keeps_the_marker() {
+        const SEEDED_SENTINEL_NONCE: u64 = 888_888;
+        let mock = MockSubmitter::new(vec![Err(unsent(reverted()))]);
+
+        let (result, nonce_manager) = run_with_seeded_manager(&mock, SEEDED_SENTINEL_NONCE).await;
+
+        let error = result.unwrap_err();
+        assert!(error.was_never_broadcast(), "got {error:?}");
+        assert!(error.is_revert(), "the marker must not hide the revert");
+        assert_eq!(mock.sent().len(), 1, "no resubmit for a hard revert");
+        assert_eq!(
+            nonce_manager.peek_next_nonce(WALLET).await,
+            None,
+            "a rejected first send still invalidates the nonce cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_send_rejected_by_the_raw_send_is_not_marked() {
+        let mock = MockSubmitter::new(vec![Err(reverted())]);
+
+        let error = run(&mock).await.unwrap_err();
+
+        assert!(!error.was_never_broadcast(), "got {error:?}");
+    }
+
+    #[tokio::test]
+    async fn first_send_marked_nonce_too_low_still_recovers() {
+        let hash = TxHash::repeat_byte(0x34);
+        let mock = MockSubmitter::new(vec![Err(unsent(nonce_too_low_with_hint())), Ok(hash)]);
+
+        let result = run(&mock).await;
+
+        assert_eq!(result.unwrap(), hash);
+        assert_eq!(mock.sent()[1].nonce, Some(HINTED_NONCE));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nonce_too_low_retry_rejected_before_broadcast_is_not_marked() {
+        let mock = MockSubmitter::new(vec![
+            Err(nonce_too_low_with_hint()),
+            Err(unsent(reverted())),
+        ]);
+
+        let error = run(&mock).await.unwrap_err();
+
+        assert!(
+            !error.was_never_broadcast(),
+            "the base send may have been accepted before its nonce-too-low \
+             rejection, so the retry's error must not claim nothing was \
+             broadcast; got {error:?}"
+        );
+        assert!(error.is_revert());
+        assert_eq!(mock.sent().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fee_bumped_resubmit_rejected_before_broadcast_is_not_marked() {
+        let mock = MockSubmitter::new(vec![Err(underpriced()), Err(unsent(reverted()))]);
+
+        let error = run(&mock).await.unwrap_err();
+
+        assert!(
+            !error.was_never_broadcast(),
+            "a transaction already occupied the nonce, so the resubmit's error \
+             must not claim nothing was broadcast; got {error:?}"
+        );
+        assert_eq!(mock.sent().len(), 2);
+    }
+
+    #[cfg(feature = "local-signer")]
+    #[tokio::test]
+    async fn signing_provider_marks_an_estimate_revert_as_never_broadcast() {
+        let asserter = Asserter::new();
+        asserter.push_failure(ErrorPayload {
+            code: 3,
+            message: Cow::Borrowed("execution reverted"),
+            data: Some(serde_json::value::to_raw_value("0xdeadbeef").expect("valid JSON")),
+        });
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let private_key = alloy::primitives::B256::repeat_byte(1);
+        let wallet = crate::local::RawPrivateKeyWallet::new(&private_key, provider, 1).unwrap();
+        let tx = TransactionRequest::default()
+            .from(wallet.address())
+            .to(CONTRACT)
+            .nonce(0)
+            .with_chain_id(1)
+            .max_fee_per_gas(1_000_000_000)
+            .max_priority_fee_per_gas(100_000_000);
+
+        let error = TxSubmitter::submit(
+            wallet.signing_provider(),
+            tx,
+            &ResettableNonceManager::default(),
+            wallet.address(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.was_never_broadcast(), "got {error:?}");
+        assert_eq!(
+            error.revert_data(),
+            Some(Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]))
+        );
+    }
+
+    #[cfg(feature = "local-signer")]
+    #[tokio::test]
+    async fn signing_provider_marks_a_prehead_failure_as_never_broadcast() {
+        let asserter = Asserter::new();
+        asserter.push_success(&U64::from(21_000));
+        asserter.push_failure(ErrorPayload {
+            code: -32000,
+            message: Cow::Borrowed("prehead unavailable"),
+            data: None,
+        });
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let private_key = alloy::primitives::B256::repeat_byte(1);
+        let wallet = crate::local::RawPrivateKeyWallet::new(&private_key, provider, 1).unwrap();
+        let tx = TransactionRequest::default()
+            .from(wallet.address())
+            .to(CONTRACT)
+            .nonce(0)
+            .with_chain_id(1)
+            .max_fee_per_gas(1_000_000_000)
+            .max_priority_fee_per_gas(100_000_000);
+
+        let error = TxSubmitter::submit(
+            wallet.signing_provider(),
+            tx,
+            &ResettableNonceManager::default(),
+            wallet.address(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.was_never_broadcast(), "got {error:?}");
+        assert!(matches!(
+            error.underlying(),
+            EvmError::Transport(RpcError::ErrorResp(ErrorPayload { code: -32000, .. }))
+        ));
+    }
+
+    #[cfg(feature = "local-signer")]
+    #[tokio::test]
+    async fn signing_provider_does_not_mark_a_raw_send_rejection() {
+        let asserter = Asserter::new();
+        asserter.push_success(&U64::from(21_000));
+        asserter.push_success(&U64::from(100));
+        asserter.push_failure(ErrorPayload {
+            code: -32000,
+            message: Cow::Borrowed("insufficient funds for gas * price + value"),
+            data: None,
+        });
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let private_key = alloy::primitives::B256::repeat_byte(1);
+        let wallet = crate::local::RawPrivateKeyWallet::new(&private_key, provider, 1).unwrap();
+        let tx = TransactionRequest::default()
+            .from(wallet.address())
+            .to(CONTRACT)
+            .nonce(0)
+            .with_chain_id(1)
+            .max_fee_per_gas(1_000_000_000)
+            .max_priority_fee_per_gas(100_000_000);
+
+        let error = TxSubmitter::submit(
+            wallet.signing_provider(),
+            tx,
+            &ResettableNonceManager::default(),
+            wallet.address(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(!error.was_never_broadcast(), "got {error:?}");
     }
 
     #[tokio::test]

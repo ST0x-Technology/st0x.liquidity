@@ -79,13 +79,16 @@ use itertools::{Either, Itertools};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::fmt::{Display, Formatter};
+use std::num::NonZeroU32;
 use std::str::FromStr;
 use tracing::warn;
 use uuid::Uuid;
 
 use st0x_bridge::corridor::{UsdcCorridor, legacy_base_cctp};
 use st0x_dto::{TransferOperation, UsdcBridgeOperation, UsdcBridgeStatus};
-use st0x_event_sorcery::{DomainEvent, EventSourced, SendError, Store, Table};
+use st0x_event_sorcery::{
+    DomainEvent, EventSourced, EventsSinceError, SendError, Store, Table, events_since, head_rowid,
+};
 use st0x_evm::{Chain, PreparedTransaction};
 use st0x_execution::{AlpacaTransferId, ClientOrderId};
 use st0x_finance::{HasZero, Usdc};
@@ -520,7 +523,9 @@ pub enum UsdcRebalanceCommand {
         deposit_initiated_at: DateTime<Utc>,
     },
     /// Confirm successful deposit. Valid only from `DepositInitiated` state.
-    ConfirmDeposit,
+    /// `vault_deposit_block` is the block whose vault deposit credited
+    /// MarketMaking USDC (AlpacaToBase); `None` for an offchain deposit.
+    ConfirmDeposit { vault_deposit_block: Option<u64> },
     /// Test/fixture-only: identical to `ConfirmDeposit` but takes
     /// `deposit_confirmed_at` explicitly instead of stamping `Utc::now()`,
     /// so fixture seeding can backdate synthetic history.
@@ -528,6 +533,11 @@ pub enum UsdcRebalanceCommand {
     ConfirmDepositAt { deposit_confirmed_at: DateTime<Utc> },
     /// Record withdrawal failure. Valid only from `Withdrawing` state.
     FailWithdrawal { reason: String },
+    /// Fail a BaseToAlpaca transfer at `WithdrawalSubmitting` whose vault
+    /// withdraw never reached the chain: the bot proved it was rejected before
+    /// broadcast, or an operator verified on chain that none landed. Emits
+    /// `WithdrawalFailed` with no withdrawal reference.
+    RejectWithdrawal { reason: String },
     /// Record bridging failure. Valid from `Bridging` or `Attested` states.
     FailBridging { reason: String },
     /// Recover a post-burn `BridgingFailed` whose CCTP mint actually landed
@@ -726,6 +736,11 @@ pub enum UsdcRebalanceEvent {
     DepositConfirmed {
         direction: RebalanceDirection,
         deposit_confirmed_at: DateTime<Utc>,
+        /// The block of the AlpacaToBase vault deposit that credited
+        /// MarketMaking USDC. `None` for a BaseToAlpaca deposit at Alpaca and
+        /// for events recorded before the block was captured.
+        #[serde(default)]
+        vault_deposit_block: Option<u64>,
     },
     /// Deposit failed. Preserves deposit reference when available.
     DepositFailed {
@@ -917,7 +932,9 @@ pub enum UsdcRebalance {
         #[serde(default = "legacy_base_cctp")]
         corridor: UsdcCorridor,
         amount: Usdc,
-        withdrawal_ref: TransferRef,
+        /// `None` when the withdrawal was rejected before it was ever sent.
+        #[serde(default)]
+        withdrawal_ref: Option<TransferRef>,
         reason: String,
         initiated_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
@@ -2070,6 +2087,78 @@ pub(crate) async fn interrupted_usdc_rebalance_ids(
     Ok(InterruptedUsdcRebalances { ids, unparseable })
 }
 
+/// A terminal failure whose recent occurrences startup reads back to restore
+/// the cooldown it starts.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CooldownFailure {
+    /// `WithdrawalFailed`, which starts the withdraw cooldown.
+    Withdrawal,
+    /// `ConversionFailed`, which starts the conversion cooldown.
+    Conversion,
+}
+
+impl CooldownFailure {
+    const fn event_type(self) -> &'static str {
+        match self {
+            Self::Withdrawal => "UsdcRebalanceEvent::WithdrawalFailed",
+            Self::Conversion => "UsdcRebalanceEvent::ConversionFailed",
+        }
+    }
+
+    const fn failed_at_path(self) -> &'static str {
+        match self {
+            Self::Withdrawal => "$.WithdrawalFailed.failed_at",
+            Self::Conversion => "$.ConversionFailed.failed_at",
+        }
+    }
+}
+
+/// The `UsdcRebalance` aggregates that recorded `failure` less than `max_age`
+/// before `now`, so startup can restore the cooldown of a failure the process
+/// did not live through. A row whose id or `failed_at` cannot be read is
+/// skipped with a warning.
+pub(crate) async fn recent_failures(
+    pool: &SqlitePool,
+    failure: CooldownFailure,
+    now: DateTime<Utc>,
+    max_age: std::time::Duration,
+) -> Result<Vec<UsdcRebalanceId>, sqlx::Error> {
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT aggregate_id, json_extract(payload, ?) \
+         FROM events \
+         WHERE aggregate_type = 'UsdcRebalance' \
+           AND event_type = ? \
+         ORDER BY aggregate_id",
+    )
+    .bind(failure.failed_at_path())
+    .bind(failure.event_type())
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|(raw_id, raw_failed_at)| {
+            let Ok(id) = raw_id.parse::<UsdcRebalanceId>() else {
+                warn!(target: "rebalance", %raw_id, ?failure, "Unparseable UsdcRebalance aggregate_id on a failure event");
+                return None;
+            };
+            let Some(failed_at) = raw_failed_at
+                .as_deref()
+                .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+            else {
+                warn!(target: "rebalance", %id, ?failure, ?raw_failed_at, "Unreadable failed_at on a failure event");
+                return None;
+            };
+            // A `failed_at` after `now` (clock skew) counts as recent.
+            let recent = now
+                .signed_duration_since(failed_at.with_timezone(&Utc))
+                .to_std()
+                .map_or(true, |age| age < max_age);
+            recent.then_some(id)
+        })
+        .collect())
+}
+
 /// The `UsdcRebalance` aggregates whose latest event leaves a signed deposit
 /// send in `Bridged` (`DepositSendPrepared`), so
 /// startup can reserve those sends' nonces before any other send takes them.
@@ -2242,6 +2331,72 @@ pub(crate) async fn open_ethereum_credits(
     Ok(credits)
 }
 
+/// Why retained transfer history could not establish a burn's ownership.
+#[derive(Debug, thiserror::Error)]
+pub enum BurnTxOwnershipLookupError {
+    #[error("failed to read the USDC rebalance event history head: {0}")]
+    Query(#[from] sqlx::Error),
+    #[error("failed to read retained USDC rebalance events: {0}")]
+    History(#[from] EventsSinceError),
+}
+
+/// Another transfer that recorded this burn, including cleared pending hashes
+/// and terminal transfers whose current state no longer carries the burn.
+pub(crate) async fn burn_tx_recorded_elsewhere(
+    pool: &SqlitePool,
+    id: &UsdcRebalanceId,
+    burn_tx: TxHash,
+) -> Result<Option<UsdcRebalanceId>, BurnTxOwnershipLookupError> {
+    let head = head_rowid(pool).await?;
+    let page_size = NonZeroU32::MIN.saturating_add(255);
+    let mut cursor = 0;
+
+    loop {
+        let events = events_since::<UsdcRebalance>(pool, cursor, head, page_size).await?;
+        if events.is_empty() {
+            return Ok(None);
+        }
+
+        for recorded in events {
+            cursor = recorded.rowid;
+            if recorded.id != *id && recorded_burn_tx(&recorded.event) == Some(burn_tx) {
+                return Ok(Some(recorded.id));
+            }
+        }
+    }
+}
+
+fn recorded_burn_tx(event: &UsdcRebalanceEvent) -> Option<TxHash> {
+    use UsdcRebalanceEvent::*;
+
+    match event {
+        PendingBurnRecorded { burn_tx, .. } => Some(*burn_tx),
+        BridgingInitiated { burn_tx_hash, .. } | AttestationTimedOut { burn_tx_hash, .. } => {
+            Some(*burn_tx_hash)
+        }
+        BridgingFailed { burn_tx_hash, .. } => *burn_tx_hash,
+        ConversionInitiated { .. }
+        | ConversionConfirmed { .. }
+        | ConversionFailed { .. }
+        | WithdrawalSubmitting { .. }
+        | Initiated { .. }
+        | WithdrawalConfirmed { .. }
+        | WithdrawalFailed { .. }
+        | BridgingSubmitting { .. }
+        | PendingBurnCleared { .. }
+        | BridgeAttestationReceived { .. }
+        | Bridged { .. }
+        | DepositSendPrepared { .. }
+        | BridgingCompletionRecovered { .. }
+        | DepositInitiated { .. }
+        | DepositConfirmed { .. }
+        | DepositFailed { .. }
+        | DepositCompletionRecovered { .. }
+        | DepositSendAttached { .. }
+        | OperatorReconciled { .. } => None,
+    }
+}
+
 /// Another `UsdcRebalance` whose `WithdrawalConfirmed` already recorded
 /// `withdrawal_tx`, as its persisted aggregate id. A withdrawal tx pays one
 /// transfer, so a second transfer must not be credited from it.
@@ -2399,7 +2554,9 @@ impl EventSourced for UsdcRebalance {
     // `WithdrawalSubmitting`, `Initiated`) carry the transfer's `corridor`.
     // Legacy events and snapshots read as Base via CCTP, the only corridor
     // there was.
-    const SCHEMA_VERSION: u64 = 12;
+    // v13: `WithdrawalFailed.withdrawal_ref` is optional: `RejectWithdrawal`
+    // fails a withdrawal rejected before it was sent, which has no reference.
+    const SCHEMA_VERSION: u64 = 13;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use UsdcRebalanceEvent::*;
@@ -2617,7 +2774,27 @@ impl EventSourced for UsdcRebalance {
                 direction: *direction,
                 corridor: *corridor,
                 amount: *amount,
-                withdrawal_ref: withdrawal_ref.clone(),
+                withdrawal_ref: Some(withdrawal_ref.clone()),
+                reason: reason.clone(),
+                initiated_at: *initiated_at,
+                failed_at: *failed_at,
+            },
+
+            // `RejectWithdrawal`: the withdrawal never left `WithdrawalSubmitting`.
+            (
+                WithdrawalFailed { reason, failed_at },
+                Self::WithdrawalSubmitting {
+                    direction,
+                    corridor,
+                    amount,
+                    initiated_at,
+                    ..
+                },
+            ) => Self::WithdrawalFailed {
+                direction: *direction,
+                corridor: *corridor,
+                amount: *amount,
+                withdrawal_ref: None,
                 reason: reason.clone(),
                 initiated_at: *initiated_at,
                 failed_at: *failed_at,
@@ -3276,7 +3453,7 @@ impl EventSourced for UsdcRebalance {
             #[cfg(any(test, feature = "test-support"))]
             InitiatePostDepositConversionAt { .. } => Err(UsdcRebalanceError::DepositNotConfirmed),
 
-            ConfirmWithdrawal { .. } | FailWithdrawal { .. } => {
+            ConfirmWithdrawal { .. } | FailWithdrawal { .. } | RejectWithdrawal { .. } => {
                 Err(UsdcRebalanceError::WithdrawalNotInitiated)
             }
             #[cfg(any(test, feature = "test-support"))]
@@ -3308,9 +3485,10 @@ impl EventSourced for UsdcRebalance {
             #[cfg(any(test, feature = "test-support"))]
             InitiateDepositAt { .. } => Err(UsdcRebalanceError::BridgingNotCompleted),
 
-            ConfirmDeposit | FailDeposit { .. } | RecoverDeposit | AttachDepositSend { .. } => {
-                Err(UsdcRebalanceError::DepositNotInitiated)
-            }
+            ConfirmDeposit { .. }
+            | FailDeposit { .. }
+            | RecoverDeposit
+            | AttachDepositSend { .. } => Err(UsdcRebalanceError::DepositNotInitiated),
             #[cfg(any(test, feature = "test-support"))]
             ConfirmDepositAt { .. } => Err(UsdcRebalanceError::DepositNotInitiated),
 
@@ -3406,6 +3584,8 @@ impl EventSourced for UsdcRebalance {
 
             FailWithdrawal { reason } => self.transition_fail_withdrawal(reason),
 
+            RejectWithdrawal { reason } => self.transition_reject_withdrawal(reason),
+
             BeginBridging {
                 from_block,
                 burn_amount,
@@ -3492,11 +3672,13 @@ impl EventSourced for UsdcRebalance {
                 deposit_initiated_at,
             } => self.transition_initiate_deposit(deposit, deposit_initiated_at),
 
-            ConfirmDeposit => self.transition_confirm_deposit(Utc::now()),
+            ConfirmDeposit {
+                vault_deposit_block,
+            } => self.transition_confirm_deposit(Utc::now(), vault_deposit_block),
             #[cfg(any(test, feature = "test-support"))]
             ConfirmDepositAt {
                 deposit_confirmed_at,
-            } => self.transition_confirm_deposit(deposit_confirmed_at),
+            } => self.transition_confirm_deposit(deposit_confirmed_at, None),
 
             FailDeposit { reason } => self.transition_fail_deposit(reason),
             RecoverDeposit => self.transition_recover_deposit(),
@@ -3771,6 +3953,31 @@ impl UsdcRebalance {
             | Self::DepositConfirmed { .. }
             | Self::DepositFailed { .. } => Err(UsdcRebalanceError::WithdrawalAlreadyCompleted),
             _ => Err(UsdcRebalanceError::WithdrawalNotInitiated),
+        }
+    }
+
+    /// Fails a BaseToAlpaca withdrawal that never reached the chain. Valid only
+    /// from `WithdrawalSubmitting`: once a withdrawal is initiated it has a
+    /// reference and fails through `FailWithdrawal`. AlpacaToBase is refused:
+    /// its withdrawal is an Alpaca request, not a vault withdraw, and its
+    /// `WithdrawalSubmitting` follows a conversion that already moved funds.
+    fn transition_reject_withdrawal(
+        &self,
+        reason: String,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::WithdrawalSubmitting {
+                direction: RebalanceDirection::BaseToAlpaca,
+                ..
+            } => Ok(vec![WithdrawalFailed {
+                reason,
+                failed_at: Utc::now(),
+            }]),
+            _ => Err(UsdcRebalanceError::InvalidCommand {
+                command: "RejectWithdrawal".to_string(),
+                state: format!("{self:?}"),
+            }),
         }
     }
 
@@ -4275,6 +4482,7 @@ impl UsdcRebalance {
     fn transition_confirm_deposit(
         &self,
         deposit_confirmed_at: DateTime<Utc>,
+        vault_deposit_block: Option<u64>,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {
@@ -4294,6 +4502,7 @@ impl UsdcRebalance {
             Self::DepositInitiated { direction, .. } => Ok(vec![DepositConfirmed {
                 direction: *direction,
                 deposit_confirmed_at,
+                vault_deposit_block,
             }]),
             Self::DepositConfirmed { .. }
             | Self::DepositFailed { .. }
@@ -5754,6 +5963,155 @@ mod tests {
             error,
             LifecycleError::Apply(UsdcRebalanceError::WithdrawalNotInitiated)
         ));
+    }
+
+    fn base_to_alpaca_withdrawal_submitting(submitting_at: DateTime<Utc>) -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::WithdrawalSubmitting {
+            corridor: UsdcCorridor::BASE_CCTP,
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: Usdc::new(float!(1971.318665)),
+            from_block: 52_027_377,
+            submitting_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn reject_withdrawal_fails_a_base_to_alpaca_withdrawal_that_never_started() {
+        let submitting_at = Utc::now();
+        let submitting = base_to_alpaca_withdrawal_submitting(submitting_at);
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![submitting.clone()])
+            .when(UsdcRebalanceCommand::RejectWithdrawal {
+                reason: "rejected before broadcast".to_string(),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::WithdrawalFailed { reason, .. } = &events[0] else {
+            panic!("Expected WithdrawalFailed event, got {:?}", events[0]);
+        };
+        assert_eq!(reason, "rejected before broadcast");
+
+        let state = replay::<UsdcRebalance>(vec![submitting, events[0].clone()])
+            .unwrap()
+            .unwrap();
+        let UsdcRebalance::WithdrawalFailed {
+            corridor,
+            direction,
+            amount,
+            withdrawal_ref,
+            initiated_at,
+            ..
+        } = &state
+        else {
+            panic!("expected WithdrawalFailed, got {state:?}");
+        };
+        assert_eq!(*corridor, UsdcCorridor::BASE_CCTP);
+        assert_eq!(*direction, RebalanceDirection::BaseToAlpaca);
+        assert_eq!(*amount, Usdc::new(float!(1971.318665)));
+        assert_eq!(*withdrawal_ref, None);
+        assert_eq!(*initiated_at, submitting_at);
+        assert!(
+            !state.holds_rebalance_guard(),
+            "nothing left the vault, so the guard must clear"
+        );
+        assert_eq!(state.guard_recovery_tracking_data(), None);
+    }
+
+    #[test]
+    fn reject_withdrawal_refuses_an_alpaca_to_base_withdrawal_submitting() {
+        let state = UsdcRebalance::WithdrawalSubmitting {
+            corridor: UsdcCorridor::BASE_CCTP,
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc::new(float!(100)),
+            from_block: 42,
+            initiated_at: Utc::now(),
+        };
+
+        let error = state
+            .transition_reject_withdrawal("x".to_string())
+            .unwrap_err();
+
+        assert!(matches!(error, UsdcRebalanceError::InvalidCommand { .. }));
+    }
+
+    #[tokio::test]
+    async fn reject_withdrawal_refuses_an_initiated_withdrawal() {
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                base_to_alpaca_withdrawal_submitting(Utc::now()),
+                UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc::new(float!(1971.318665)),
+                    withdrawal_ref: TransferRef::OnchainTx(TxHash::repeat_byte(0xab)),
+                    initiated_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::RejectWithdrawal {
+                reason: "x".to_string(),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn reject_withdrawal_refuses_a_transfer_with_no_events() {
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given_no_previous_events()
+            .when(UsdcRebalanceCommand::RejectWithdrawal {
+                reason: "x".to_string(),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::WithdrawalNotInitiated)
+        ));
+    }
+
+    /// A v12 `WithdrawalFailed` snapshot stored `withdrawal_ref` as a bare
+    /// reference; v13 reads it as `Some`, and a missing field as `None`.
+    #[test]
+    fn withdrawal_failed_snapshot_reads_a_v12_reference_and_a_missing_one() {
+        let tx_hash = TxHash::repeat_byte(0xab);
+        let v12 = json!({
+            "WithdrawalFailed": {
+                "direction": "BaseToAlpaca",
+                "amount": "100",
+                "withdrawal_ref": { "OnchainTx": tx_hash },
+                "reason": "x",
+                "initiated_at": "2026-10-01T08:41:43Z",
+                "failed_at": "2026-10-01T08:42:43Z",
+            }
+        });
+
+        let UsdcRebalance::WithdrawalFailed { withdrawal_ref, .. } =
+            from_value::<UsdcRebalance>(v12.clone()).unwrap()
+        else {
+            panic!("expected WithdrawalFailed");
+        };
+        assert_eq!(withdrawal_ref, Some(TransferRef::OnchainTx(tx_hash)));
+
+        let mut without_ref = v12;
+        without_ref["WithdrawalFailed"]
+            .as_object_mut()
+            .unwrap()
+            .remove("withdrawal_ref");
+        let UsdcRebalance::WithdrawalFailed { withdrawal_ref, .. } =
+            from_value::<UsdcRebalance>(without_ref).unwrap()
+        else {
+            panic!("expected WithdrawalFailed");
+        };
+        assert_eq!(withdrawal_ref, None);
     }
 
     #[tokio::test]
@@ -7425,7 +7783,9 @@ mod tests {
                     deposit_initiated_at: Utc::now(),
                 },
             ])
-            .when(UsdcRebalanceCommand::ConfirmDeposit)
+            .when(UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            })
             .await
             .events();
 
@@ -7476,7 +7836,9 @@ mod tests {
                     minted_at: Utc::now(),
                 },
             ])
-            .when(UsdcRebalanceCommand::ConfirmDeposit)
+            .when(UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            })
             .await
             .then_expect_error();
 
@@ -7662,7 +8024,9 @@ mod tests {
                     deposit_initiated_at: Utc::now(),
                 },
             ])
-            .when(UsdcRebalanceCommand::ConfirmDeposit)
+            .when(UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            })
             .await
             .events();
 
@@ -7718,7 +8082,9 @@ mod tests {
                     deposit_initiated_at: Utc::now(),
                 },
             ])
-            .when(UsdcRebalanceCommand::ConfirmDeposit)
+            .when(UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            })
             .await
             .events();
 
@@ -8406,6 +8772,7 @@ mod tests {
             UsdcRebalanceEvent::DepositConfirmed {
                 direction: RebalanceDirection::BaseToAlpaca,
                 deposit_confirmed_at: Utc::now(),
+                vault_deposit_block: None,
             },
             UsdcRebalanceEvent::ConversionInitiated {
                 corridor: UsdcCorridor::BASE_CCTP,
@@ -9016,7 +9383,9 @@ mod tests {
                     failed_at: Utc::now(),
                 },
             ])
-            .when(UsdcRebalanceCommand::ConfirmDeposit)
+            .when(UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            })
             .await
             .then_expect_error();
 
@@ -9070,6 +9439,7 @@ mod tests {
                 UsdcRebalanceEvent::DepositConfirmed {
                     direction: RebalanceDirection::AlpacaToBase,
                     deposit_confirmed_at: Utc::now(),
+                    vault_deposit_block: None,
                 },
             ])
             .when(UsdcRebalanceCommand::Initiate {
@@ -9131,9 +9501,12 @@ mod tests {
                 UsdcRebalanceEvent::DepositConfirmed {
                     direction: RebalanceDirection::AlpacaToBase,
                     deposit_confirmed_at: Utc::now(),
+                    vault_deposit_block: None,
                 },
             ])
-            .when(UsdcRebalanceCommand::ConfirmDeposit)
+            .when(UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            })
             .await
             .then_expect_error();
 
@@ -9463,6 +9836,7 @@ mod tests {
                 UsdcRebalanceEvent::DepositConfirmed {
                     direction: RebalanceDirection::BaseToAlpaca,
                     deposit_confirmed_at: Utc::now(),
+                    vault_deposit_block: None,
                 },
             ])
             .when(UsdcRebalanceCommand::InitiatePostDepositConversion {
@@ -9533,6 +9907,7 @@ mod tests {
                 UsdcRebalanceEvent::DepositConfirmed {
                     direction: RebalanceDirection::AlpacaToBase,
                     deposit_confirmed_at: Utc::now(),
+                    vault_deposit_block: None,
                 },
             ])
             .when(UsdcRebalanceCommand::InitiatePostDepositConversion {
@@ -9609,6 +9984,7 @@ mod tests {
                 UsdcRebalanceEvent::DepositConfirmed {
                     direction: RebalanceDirection::BaseToAlpaca,
                     deposit_confirmed_at: Utc::now(),
+                    vault_deposit_block: None,
                 },
             ])
             .when(UsdcRebalanceCommand::InitiatePostDepositConversion {
@@ -9738,6 +10114,7 @@ mod tests {
                 UsdcRebalanceEvent::DepositConfirmed {
                     direction: RebalanceDirection::BaseToAlpaca,
                     deposit_confirmed_at: Utc::now(),
+                    vault_deposit_block: None,
                 },
             ])
             .when(UsdcRebalanceCommand::InitiatePostDepositConversionAt {
@@ -10189,6 +10566,7 @@ mod tests {
                 UsdcRebalanceEvent::DepositConfirmed {
                     direction: RebalanceDirection::BaseToAlpaca,
                     deposit_confirmed_at: Utc::now(),
+                    vault_deposit_block: None,
                 },
                 UsdcRebalanceEvent::ConversionInitiated {
                     corridor: UsdcCorridor::BASE_CCTP,
@@ -10261,6 +10639,7 @@ mod tests {
             UsdcRebalanceEvent::DepositConfirmed {
                 direction: RebalanceDirection::BaseToAlpaca,
                 deposit_confirmed_at,
+                vault_deposit_block: None,
             },
             UsdcRebalanceEvent::ConversionInitiated {
                 corridor: UsdcCorridor::BASE_CCTP,
@@ -10625,7 +11004,9 @@ mod tests {
             corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(750)),
-            withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            withdrawal_ref: Some(TransferRef::AlpacaId(
+                AlpacaTransferId::from(Uuid::new_v4()),
+            )),
             reason: "withdrawal rejected".to_string(),
             initiated_at,
             failed_at,
@@ -11385,7 +11766,7 @@ mod tests {
                 corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
-                withdrawal_ref: TransferRef::OnchainTx(BURN_TX),
+                withdrawal_ref: Some(TransferRef::OnchainTx(BURN_TX)),
                 reason: "x".to_string(),
                 initiated_at: now,
                 failed_at: now,
@@ -11754,7 +12135,7 @@ mod tests {
                 corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
-                withdrawal_ref,
+                withdrawal_ref: Some(withdrawal_ref),
                 reason: "x".to_string(),
                 initiated_at: now,
                 failed_at: now,
@@ -12384,6 +12765,30 @@ mod tests {
             panic!("Expected BridgingSubmitting");
         };
         assert_eq!(burn_amount, None, "missing field must default to None");
+    }
+
+    /// A `DepositConfirmed` persisted before the vault deposit block was
+    /// captured must still load, with no block and so no cash read request.
+    #[test]
+    fn deposit_confirmed_event_without_vault_deposit_block_deserializes_to_none() {
+        let old_event = json!({
+            "DepositConfirmed": {
+                "direction": "AlpacaToBase",
+                "deposit_confirmed_at": "2026-01-01T00:00:00Z"
+            }
+        });
+
+        let event: UsdcRebalanceEvent =
+            from_value(old_event).expect("old DepositConfirmed must still deserialize");
+
+        let UsdcRebalanceEvent::DepositConfirmed {
+            vault_deposit_block,
+            ..
+        } = event
+        else {
+            panic!("Expected DepositConfirmed");
+        };
+        assert_eq!(vault_deposit_block, None);
     }
 
     /// State-level mirror: a `BridgingSubmitting` snapshot persisted before
@@ -13229,6 +13634,242 @@ mod tests {
         assert_eq!(deposit_send, DepositSend::NotStarted);
     }
 
+    const WITHDRAWAL_TX: TxHash =
+        fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000cc");
+    const DEPOSIT_TX: TxHash =
+        fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000dd");
+
+    fn burn_ownership_commands() -> Vec<UsdcRebalanceCommand> {
+        vec![
+            UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(400)),
+                withdrawal: TransferRef::OnchainTx(WITHDRAWAL_TX),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: Some(WITHDRAWAL_TX),
+            },
+            UsdcRebalanceCommand::BeginBridging {
+                from_block: 42,
+                burn_amount: Some(Usdc::new(float!(400))),
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn burn_tx_recorded_elsewhere_retains_cleared_pending_ownership() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let mut commands = burn_ownership_commands();
+        commands.push(UsdcRebalanceCommand::RecordPendingBurn { burn_tx: BURN_TX });
+        let owner = seed_through(&store, commands).await;
+        let other = UsdcRebalanceId(Uuid::new_v4());
+
+        assert_eq!(
+            burn_tx_recorded_elsewhere(&pool, &other, BURN_TX)
+                .await
+                .unwrap(),
+            Some(owner.clone()),
+            "a known pending burn belongs to its recorded transfer"
+        );
+        store
+            .send(&owner, UsdcRebalanceCommand::ClearPendingBurn)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            burn_tx_recorded_elsewhere(&pool, &owner, BURN_TX)
+                .await
+                .unwrap(),
+            None,
+            "a transfer's own retained burn must not exclude its recovery"
+        );
+        assert_eq!(
+            burn_tx_recorded_elsewhere(&pool, &other, BURN_TX)
+                .await
+                .unwrap(),
+            Some(owner),
+            "clearing the pending hash must not make its burn unclaimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn burn_tx_recorded_elsewhere_retains_reconciled_confirmed_ownership() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let mut commands = burn_ownership_commands();
+        commands.push(UsdcRebalanceCommand::InitiateBridging { burn_tx: BURN_TX });
+        let owner = seed_through(&store, commands).await;
+        let other = UsdcRebalanceId(Uuid::new_v4());
+        assert_eq!(
+            burn_tx_recorded_elsewhere(&pool, &other, BURN_TX)
+                .await
+                .unwrap(),
+            Some(owner.clone()),
+            "a confirmed burn belongs to its recorded transfer"
+        );
+
+        for command in [
+            UsdcRebalanceCommand::FailBridging {
+                reason: "receipt unavailable".to_string(),
+            },
+            UsdcRebalanceCommand::RecoverBridging {
+                mint_tx: MINT_TX,
+                amount_received: Usdc::new(float!(399.99)),
+                fee_collected: Usdc::new(float!(0.01)),
+            },
+            UsdcRebalanceCommand::FailDeposit {
+                reason: "send unresolved".to_string(),
+            },
+            UsdcRebalanceCommand::ReconcileStuckRebalance {
+                reason: ReconcileReason::FundsMovedManually,
+            },
+        ] {
+            store.send(&owner, command).await.unwrap();
+        }
+        assert!(matches!(
+            store.load(&owner).await.unwrap(),
+            Some(UsdcRebalance::Reconciled { .. })
+        ));
+
+        assert_eq!(
+            burn_tx_recorded_elsewhere(&pool, &other, BURN_TX)
+                .await
+                .unwrap(),
+            Some(owner),
+            "a reconciled transfer still owns its confirmed burn"
+        );
+    }
+
+    #[tokio::test]
+    async fn burn_tx_recorded_elsewhere_ignores_unclaimed_and_non_burn_hashes() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let mut commands = burn_ownership_commands();
+        commands.extend([
+            UsdcRebalanceCommand::InitiateBridging { burn_tx: BURN_TX },
+            UsdcRebalanceCommand::FailBridging {
+                reason: "receipt unavailable".to_string(),
+            },
+            UsdcRebalanceCommand::RecoverBridging {
+                mint_tx: MINT_TX,
+                amount_received: Usdc::new(float!(399.99)),
+                fee_collected: Usdc::new(float!(0.01)),
+            },
+            UsdcRebalanceCommand::InitiateDeposit {
+                deposit: TransferRef::OnchainTx(DEPOSIT_TX),
+            },
+        ]);
+        seed_through(&store, commands).await;
+        let other = UsdcRebalanceId(Uuid::new_v4());
+
+        for hash in [TxHash::random(), WITHDRAWAL_TX, MINT_TX, DEPOSIT_TX] {
+            assert_eq!(
+                burn_tx_recorded_elsewhere(&pool, &other, hash)
+                    .await
+                    .unwrap(),
+                None,
+                "non-burn transaction {hash} does not establish burn ownership"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn burn_tx_recorded_elsewhere_pages_past_own_matches() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let mut commands = burn_ownership_commands();
+        commands.push(UsdcRebalanceCommand::RecordPendingBurn { burn_tx: BURN_TX });
+        let own = seed_through(&store, commands).await;
+        // Fill the first 256-event page with this transfer's history, including
+        // its own matching hash. The foreign owner is strictly on page two.
+        for _ in 4..256 {
+            store
+                .send(
+                    &own,
+                    UsdcRebalanceCommand::RecordPendingBurn {
+                        burn_tx: TxHash::random(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let mut commands = burn_ownership_commands();
+        commands.push(UsdcRebalanceCommand::RecordPendingBurn { burn_tx: BURN_TX });
+        let other = seed_through(&store, commands).await;
+
+        assert_eq!(
+            burn_tx_recorded_elsewhere(&pool, &own, BURN_TX)
+                .await
+                .unwrap(),
+            Some(other),
+            "an own-id match must not hide a foreign owner on a later page"
+        );
+        assert_eq!(
+            burn_tx_recorded_elsewhere(&pool, &own, TxHash::random())
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn burn_tx_recorded_elsewhere_database_failure_is_typed() {
+        let pool = crate::test_utils::setup_test_db().await;
+        pool.close().await;
+        let own = UsdcRebalanceId(Uuid::new_v4());
+
+        assert!(matches!(
+            burn_tx_recorded_elsewhere(&pool, &own, BURN_TX).await,
+            Err(BurnTxOwnershipLookupError::Query(sqlx::Error::PoolClosed))
+        ));
+    }
+
+    #[test]
+    fn recorded_burn_tx_matches_every_burn_hash_event() {
+        let now = Utc::now();
+        let events = [
+            UsdcRebalanceEvent::PendingBurnRecorded {
+                burn_tx: BURN_TX,
+                recorded_at: now,
+            },
+            UsdcRebalanceEvent::BridgingInitiated {
+                burn_tx_hash: BURN_TX,
+                burned_at: now,
+            },
+            UsdcRebalanceEvent::AttestationTimedOut {
+                burn_tx_hash: BURN_TX,
+                retry_deadline_at: now,
+                timed_out_at: now,
+            },
+            UsdcRebalanceEvent::BridgingFailed {
+                burn_tx_hash: Some(BURN_TX),
+                cctp_nonce: None,
+                reason: "receipt unavailable".to_string(),
+                failed_at: now,
+            },
+        ];
+
+        for event in events {
+            assert_eq!(
+                recorded_burn_tx(&event),
+                Some(BURN_TX),
+                "{} owns its burn",
+                event.event_type()
+            );
+        }
+        assert_eq!(
+            recorded_burn_tx(&UsdcRebalanceEvent::BridgingFailed {
+                burn_tx_hash: None,
+                cctp_nonce: None,
+                reason: "pre-burn failure".to_string(),
+                failed_at: now
+            }),
+            None
+        );
+    }
+
     /// Each event carrying a deposit send hash records that send for its
     /// transfer on its own, so the lookup must match every one of them.
     #[tokio::test]
@@ -13497,6 +14138,7 @@ mod tests {
             UsdcRebalanceEvent::DepositConfirmed {
                 direction: RebalanceDirection::AlpacaToBase,
                 deposit_confirmed_at: Utc::now(),
+                vault_deposit_block: None,
             },
         ])
         .unwrap()
@@ -13554,6 +14196,7 @@ mod tests {
             UsdcRebalanceEvent::DepositConfirmed {
                 direction: RebalanceDirection::BaseToAlpaca,
                 deposit_confirmed_at: Utc::now(),
+                vault_deposit_block: None,
             },
         ]
     }

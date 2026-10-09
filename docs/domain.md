@@ -97,9 +97,13 @@ and confusing.
   hands them out through `ChainRegistry::hedged`. The TOML key stays `trading`.
 - **Transport chain**: a chain with no trading table -- RPC and confirmations
   only, used as a cash corridor's hub (see USDC Corridor).
-- **Primary chain**: THE hedged chain that sets `primary = true`. It is the
-  chain the bot rebalances automatically and the endpoint of the cash corridor.
-  Its vault inventory is polled like every hedged chain's.
+- **Primary chain**: THE hedged chain that sets `primary = true`: the operator's
+  default chain. A cash corridor may be keyed by any hedged chain; each
+  corridor's cash transfer executor runs on its corridor chain's orderbook and
+  vault, and the USDC inventory state (inflight, busy marker) is kept per
+  corridor chain. Its vault inventory is polled like every hedged chain's. For
+  now it must be Base: equity wallet polling and recovery read the Base wallet,
+  so `PrimaryChainNotBase` refuses any other primary at load.
 - **Secondary chain**: any other hedged chain. Prefunded: its fills are hedged
   and its vault inventory is polled, but it is not rebalanced.
 
@@ -336,14 +340,16 @@ The type is `DeviationBand`.
 ### Minimum Operation Size
 
 The smallest equity transfer worth its gas, in dollars, valued at the last
-onchain fill price the `Position` recorded for the symbol. A candidate below it
-is dropped as `BelowMinimum` and the next candidate is evaluated. The price's
-age does not matter, since it only values this dust bound. A missing price
-declines the symbol (`PriceMissing`) before any candidate is tried, so no
-per-chain drop masks it. A symbol-wide floor decline (`FloorCapped`) reports the
-per-chain reason (`NoGas`, `CoolingDown`, `BelowMinimum`) a higher-ranked
-candidate was dropped for, when there is one. Configured as
-`[rebalancing.allocation].min_operation_usd` with a per-chain
+onchain fill price the `Position` recorded for the symbol. A symbol that has
+never filled is valued at the pricing service's live mark instead: the mid price
+of one underlying share. A candidate below it is dropped as `BelowMinimum` and
+the next candidate is evaluated. The price's age does not matter, since it only
+values this dust bound. With neither price the symbol declines (`PriceMissing`)
+before any candidate is tried, so no per-chain drop masks it; a mark that
+arrives later checks the symbol again. A symbol-wide floor decline
+(`FloorCapped`) reports the per-chain reason (`NoGas`, `CoolingDown`,
+`BelowMinimum`) a higher-ranked candidate was dropped for, when there is one.
+Configured as `[rebalancing.allocation].min_operation_usd` with a per-chain
 `min_operation_usd` override on the trading table.
 
 ### Reservation

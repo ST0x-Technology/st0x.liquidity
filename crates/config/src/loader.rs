@@ -31,14 +31,16 @@ use crate::InventoryAdapters;
 #[cfg(any(test, feature = "test-support"))]
 use crate::chain::HedgedChain;
 use crate::pricing::PricingSecrets;
+use crate::rebalancing::BaseCashVault;
 use crate::registry::{self, RegistryLive, RegistrySource, TokenFile};
+use crate::registry_state::{self, BootClaim, RegistryStateError};
 use crate::wallet::{SigningChain, SigningChains};
 use crate::{
     AlertsConfig, AlertsCtx, AllocationConfigError, BotGasValuationConfig, ChainConfig,
     ChainEquityAsset, ChainLifecycle, ChainRegistry, ChainSecrets, ExecutionThreshold,
-    HedgingAssets, InvalidThresholdError, OperationMode, OrchestratorConfig, PricingConfig,
-    PricingCtx, PricingCtxError, RebalancingConfig, RebalancingCtx, RebalancingCtxError,
-    TelemetryConfig, TelemetryCtx, UsdcRebalancing,
+    HedgeStallCtx, HedgingAssets, InvalidThresholdError, OperationMode, OrchestratorConfig,
+    PricingConfig, PricingCtx, PricingCtxError, RebalancingConfig, RebalancingCtx,
+    RebalancingCtxError, TelemetryConfig, TelemetryCtx, UsdcCorridors, UsdcRebalancing,
 };
 
 /// Alpaca minimum execution threshold: $2.
@@ -75,6 +77,9 @@ pub struct Env {
     /// the bucket. For offline checks and development; boot reads the bucket.
     #[clap(long)]
     pub registry_file: Option<PathBuf>,
+    /// Persisted registry directory. Readers never mutate the manifest.
+    #[clap(long, conflicts_with = "registry_file")]
+    pub registry_state: Option<PathBuf>,
 }
 
 /// A migration/deprecation notice produced while parsing config + secrets.
@@ -729,8 +734,26 @@ enum BrokerSecrets {
     },
 }
 
-/// Combined runtime context for the server. Assembled from plaintext config,
-/// encrypted secrets, and derived runtime state.
+/// Original configuration inputs retained for registry candidate validation.
+/// Contents remain private and are omitted from debug output.
+#[derive(Clone)]
+pub(crate) struct RegistryInputs {
+    config: String,
+    config_path: PathBuf,
+    secrets: String,
+    secrets_path: PathBuf,
+}
+
+impl std::fmt::Debug for RegistryInputs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RegistryInputs")
+            .field("config_path", &self.config_path)
+            .field("secrets_path", &self.secrets_path)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone)]
 pub struct Ctx {
     pub database_url: String,
@@ -1412,7 +1435,7 @@ impl std::fmt::Debug for Ctx {
             .field("bot_gas_valuation", &self.bot_gas_valuation)
             .field("orchestrator", &self.orchestrator);
 
-        debug_struct.finish()
+        debug_struct.finish_non_exhaustive()
     }
 }
 
@@ -1673,8 +1696,9 @@ fn validate_asset_tables(
         }
     }
 
-    // Startup seeds one vault per rebalancing-enabled equity, so a row that
-    // rebalances with no vault id crash-loops the conductor. Judged here,
+    // Startup seeds one vault per equity that keeps rebalancing services
+    // (enabled or paused), so a row with no vault id crash-loops the
+    // conductor. Judged here,
     // where every config-only path (boot, validate-config, verify-approvals,
     // the token-file refresh check) runs it.
     for config in chains.values() {
@@ -1682,7 +1706,7 @@ fn validate_asset_tables(
             continue;
         };
         for (symbol, asset) in &trading.assets.equities.symbols {
-            if asset.rebalancing == OperationMode::Enabled && asset.vault_ids.is_empty() {
+            if asset.rebalancing.keeps_services() && asset.vault_ids.is_empty() {
                 return Err(CtxError::MissingEquityVaultId {
                     symbol: symbol.clone(),
                 });
@@ -1751,6 +1775,46 @@ fn validated_polling_intervals(config: &Config) -> Result<PollingIntervalsSecs, 
     Ok(intervals)
 }
 
+/// Scans run every `position_check_secs`, so a stall window shorter than a
+/// few of them would alert on an ordinary late scan. A resting
+/// extended-hours limit order waits up to the reprice timeout, and its
+/// cancellation and replacement then take a few more scans, so the window
+/// must cover both.
+fn validate_hedge_stall_window(
+    hedge_stall: Option<HedgeStallCtx>,
+    position_check_secs: u64,
+    reprice_timeout_secs: Option<u64>,
+) -> Result<(), CtxError> {
+    let Some(hedge_stall) = hedge_stall else {
+        return Ok(());
+    };
+    let stall_after = hedge_stall.stall_after.as_secs();
+
+    let minimum = position_check_secs.saturating_mul(HEDGE_STALL_MIN_SCAN_INTERVALS);
+    if stall_after < minimum {
+        return Err(CtxError::HedgeStallShorterThanScans {
+            stall_after,
+            position_check_secs,
+            minimum,
+        });
+    }
+
+    if let Some(reprice_timeout_secs) = reprice_timeout_secs {
+        let minimum = reprice_timeout_secs.saturating_add(minimum);
+        if stall_after < minimum {
+            return Err(CtxError::HedgeStallWithinRepriceTimeout {
+                stall_after,
+                reprice_timeout_secs,
+                minimum,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+const HEDGE_STALL_MIN_SCAN_INTERVALS: u64 = 3;
+
 /// What [`validate_config`] built on the way through, handed back so
 /// [`parse_and_validate`] reuses it instead of rebuilding it (and drifting
 /// from it).
@@ -1780,6 +1844,18 @@ fn validate_config(
     tokens: TokenFile<'_>,
     startup_notices: &mut Vec<StartupNotice>,
 ) -> Result<ValidatedConfigParts, CtxError> {
+    #[cfg(feature = "wallet-turnkey")]
+    if let Some(wallet) = &config.wallet
+        && wallet.get("kind").and_then(toml::Value::as_str) == Some("turnkey")
+    {
+        st0x_evm::turnkey::TurnkeySettings::deserialize(wallet.clone()).map_err(|source| {
+            CtxError::ConfigToml {
+                path: config_path.to_path_buf(),
+                source,
+            }
+        })?;
+    }
+
     if let (Some(registry), TokenFile::Bytes(_)) = (&config.registry, tokens) {
         startup_notices.push(StartupNotice::info(format!(
             "per-symbol tables read from {} ({})",
@@ -1847,21 +1923,38 @@ fn validate_config(
 
     validate_asset_tables(&config.assets, &config.chains)?;
     let polling_intervals = validated_polling_intervals(config)?;
-    let trading_table = ChainRegistry::validate_configs(&config.chains)?;
+    let (primary_chain, trading_table) = ChainRegistry::validate_configs(&config.chains)?;
+
+    // Equity wallet polling and recovery read the Base wallet with the
+    // primary's token addresses, which are Base's only on a Base primary.
+    if primary_chain != Chain::Base {
+        return Err(CtxError::PrimaryChainNotBase {
+            primary: primary_chain,
+        });
+    }
+
     let log_query_url_template = config
         .log_query_url_template
         .clone()
         .map(LogQueryUrlTemplate::parse)
         .transpose()?;
     let alerts = AlertsCtx::new(config.alerts.clone(), &config.chains, startup_notices)?;
+    validate_hedge_stall_window(
+        alerts.as_ref().and_then(AlertsCtx::hedge_stall),
+        polling_intervals.position_check,
+        config
+            .broker
+            .as_ref()
+            .and_then(|broker| broker.extended_hours_reprice_timeout_secs),
+    )?;
 
     {
         let Some(rebalancing) = &config.rebalancing else {
             return Err(CtxError::MissingRebalancing);
         };
-        RebalancingCtx::new(rebalancing)?;
+        let rebalancing_ctx = RebalancingCtx::new(rebalancing, base_cash_vault(&config.chains))?;
         rebalancing.allocation()?.validate(&config.chains)?;
-        validate_usdc_corridor_chains(&rebalancing.usdc, &config.chains)?;
+        validate_usdc_corridor_chains(&rebalancing.usdc, &rebalancing_ctx.usdc, &config.chains)?;
 
         let minimum = *crate::ALPACA_TO_BASE_MINIMUM_TRANSFER;
 
@@ -1929,22 +2022,34 @@ fn validate_config(
     })
 }
 
-/// Checks the cash corridors against the chain tables: each corridor's chain
-/// is configured, enabled, holds a cash vault and is the primary (the cash
-/// path still runs there), and with USDC mode enabled every chain whose cash
-/// rebalances has a corridor.
-fn validate_usdc_corridor_chains(
-    usdc: &UsdcRebalancing,
-    chains: &BTreeMap<Chain, ChainConfig>,
-) -> Result<(), CtxError> {
-    let primary = chains.iter().find_map(|(chain, config)| {
-        config
-            .trading
-            .as_ref()
-            .is_some_and(|trading| trading.primary)
-            .then_some(*chain)
+/// Whether Base is an enabled hedged chain with a cash vault, which serves
+/// Base via CCTP with no corridor table.
+fn base_cash_vault(chains: &BTreeMap<Chain, ChainConfig>) -> BaseCashVault {
+    let held = chains.get(&Chain::Base).is_some_and(|base| {
+        base.lifecycle != ChainLifecycle::Disabled
+            && base
+                .trading
+                .as_ref()
+                .and_then(|trading| trading.assets.cash.as_ref())
+                .is_some_and(|cash| !cash.vault_ids.is_empty())
     });
 
+    if held {
+        BaseCashVault::Held
+    } else {
+        BaseCashVault::Absent
+    }
+}
+
+/// Checks the cash corridors against the chain tables: each corridor's chain
+/// is configured, enabled and holds a cash vault, `corridors` serves at least
+/// one corridor, and with USDC mode enabled every chain whose cash rebalances
+/// has a corridor.
+fn validate_usdc_corridor_chains(
+    usdc: &UsdcRebalancing,
+    corridors: &UsdcCorridors,
+    chains: &BTreeMap<Chain, ChainConfig>,
+) -> Result<(), CtxError> {
     for chain in usdc.corridors.keys().copied() {
         let Some(chain_config) = chains.get(&chain) else {
             return Err(CtxError::CorridorChainNotConfigured { chain });
@@ -1963,11 +2068,21 @@ fn validate_usdc_corridor_chains(
         if !has_cash_vault {
             return Err(CtxError::CorridorChainWithoutCashVault { chain });
         }
+    }
 
-        if let Some(primary) = primary
-            && primary != chain
-        {
-            return Err(CtxError::CorridorChainNotPrimary { chain, primary });
+    // A config with cash on a chain but no served corridor has no service to
+    // move it; one with no cash table at all (a CLI-only config) moves none.
+    if corridors.served().is_empty() {
+        let cash_chain = chains.iter().find(|(_, config)| {
+            config.lifecycle != ChainLifecycle::Disabled
+                && config
+                    .trading
+                    .as_ref()
+                    .is_some_and(|trading| trading.assets.cash.is_some())
+        });
+
+        if let Some((chain, _)) = cash_chain {
+            return Err(CtxError::NoServedUsdcCorridor { chain: *chain });
         }
     }
 
@@ -2050,6 +2165,7 @@ fn config_table(
                     source,
                     static_config,
                     live,
+                    inputs: None,
                 }),
             ))
         }
@@ -2086,34 +2202,139 @@ fn config_from(
     Ok((merged, registry))
 }
 
+/// Where a load takes the token file from when the config names
+/// `[registry]`.
+#[derive(Debug, Clone, Copy)]
+pub enum TokenSource<'a> {
+    /// What this host runs, read without writing anything (the CLI, the
+    /// deploy gates): the local copy when one is given, else the pinned
+    /// generation, else the state directory's running record, else the
+    /// latest bucket copy. `registry_state` names the state directory;
+    /// without it, the one beside the database. See [`fetch_token_file`].
+    Running {
+        registry_file: Option<&'a Path>,
+        registry_state: Option<&'a Path>,
+    },
+    /// The token file the server claimed for its boot with
+    /// [`claim_boot_tokens`]; `None` when the config carries its tables
+    /// inline.
+    Claimed(Option<&'a [u8]>),
+}
+
+fn read_config_table(config_path: &Path) -> Result<toml::Table, CtxError> {
+    let config_str = std::fs::read_to_string(config_path).map_err(|source| CtxError::ConfigIo {
+        path: config_path.to_path_buf(),
+        source,
+    })?;
+    toml::from_str(&config_str).map_err(|source| CtxError::ConfigToml {
+        path: config_path.to_path_buf(),
+        source,
+    })
+}
+
 /// The token file bytes a config needs, or `None` when it carries its
-/// per-symbol tables inline. A local copy wins over the bucket.
+/// per-symbol tables inline, without writing anything.
+///
+/// A local copy wins;
+/// a pinned generation is read from the bucket; otherwise the record the
+/// server on this host runs, from `registry_state` or else the state beside
+/// its database; and the latest bucket copy when that state has no running
+/// record.
 pub async fn fetch_token_file(
     config_path: &Path,
     registry_file: Option<&Path>,
+    registry_state: Option<&Path>,
 ) -> Result<Option<Vec<u8>>, CtxError> {
-    let config_str = tokio::fs::read_to_string(config_path)
-        .await
-        .map_err(|source| CtxError::ConfigIo {
-            path: config_path.to_path_buf(),
-            source,
-        })?;
+    let table = read_config_table(config_path)?;
     let registry_error = |source| CtxError::Registry {
         path: config_path.to_path_buf(),
         source,
     };
-    let table: toml::Table =
-        toml::from_str(&config_str).map_err(|source| CtxError::ConfigToml {
-            path: config_path.to_path_buf(),
-            source,
-        })?;
     let Some(source) = registry::source_of(&table).map_err(registry_error)? else {
         return Ok(None);
     };
+    if registry_file.is_none() && source.generation.is_none() {
+        let running =
+            running_tokens(&table, registry_state).map_err(|source| CtxError::RegistryState {
+                path: config_path.to_path_buf(),
+                source,
+            })?;
+        if running.is_some() {
+            return Ok(running);
+        }
+    }
     registry::load_bytes(&source, registry_file)
         .await
         .map(Some)
         .map_err(registry_error)
+}
+
+/// The running record in `registry_state`, or else in the state beside the
+/// config's database; `None` when that state has no running record.
+fn running_tokens(
+    table: &toml::Table,
+    registry_state: Option<&Path>,
+) -> Result<Option<Vec<u8>>, RegistryStateError> {
+    let state_dir = registry_state.map(Path::to_path_buf).or_else(|| {
+        table
+            .get("database_url")
+            .and_then(toml::Value::as_str)
+            .and_then(registry_state::state_dir)
+    });
+    state_dir.map_or(Ok(None), |dir| registry_state::running_effective(&dir))
+}
+
+/// The exact persisted copies a deploy may boot, without claiming an attempt.
+/// A file override wins; without state, read the configured bucket copy.
+pub async fn fetch_gate_token_files(
+    config_path: &Path,
+    registry_file: Option<&Path>,
+    state_dir: Option<&Path>,
+) -> Result<Vec<Option<Vec<u8>>>, CtxError> {
+    let table = read_config_table(config_path)?;
+    let Some(source) = registry::source_of(&table).map_err(|source| CtxError::Registry {
+        path: config_path.to_path_buf(),
+        source,
+    })?
+    else {
+        return Ok(vec![None]);
+    };
+    if source.generation.is_none()
+        && registry_file.is_none()
+        && let Some(dir) = state_dir
+    {
+        let copies = registry_state::gate_effective(dir, &table).map_err(|source| {
+            CtxError::RegistryState {
+                path: dir.to_path_buf(),
+                source,
+            }
+        })?;
+        if !copies.is_empty() {
+            return Ok(copies.into_iter().map(Some).collect());
+        }
+    }
+    registry::load_bytes(&source, registry_file)
+        .await
+        .map(|bytes| vec![Some(bytes)])
+        .map_err(|source| CtxError::Registry {
+            path: config_path.to_path_buf(),
+            source,
+        })
+}
+
+/// Claims the token file this server boots, the one boot step that writes
+/// the registry state. See [`registry_state::claim_for_boot`].
+pub async fn claim_boot_tokens(
+    config_path: &Path,
+    registry_file: Option<&Path>,
+) -> Result<BootClaim, CtxError> {
+    let table = read_config_table(config_path)?;
+    registry_state::claim_for_boot(&table, registry_file, chrono::Utc::now().timestamp())
+        .await
+        .map_err(|source| CtxError::RegistryState {
+            path: config_path.to_path_buf(),
+            source,
+        })
 }
 
 /// Judge a fresh copy of the token file against the config this instance runs.
@@ -2206,11 +2427,24 @@ fn parse_and_validate_with(
     let (wallet_inputs, wallet_meta) =
         validate_wallet_inputs(config.wallet, secrets.wallet, &chains, config_path)?;
 
+    #[cfg(feature = "wallet-turnkey")]
+    if wallet_meta.kind == "turnkey" {
+        st0x_evm::turnkey::TurnkeyCredentials::deserialize(wallet_inputs.secrets.clone()).map_err(
+            |source| CtxError::SecretsToml {
+                path: secrets_path.to_path_buf(),
+                source,
+            },
+        )?;
+    }
+
     let Some(rebalancing_config) = config.rebalancing else {
         return Err(CtxError::MissingRebalancing);
     };
 
-    let rebalancing = Box::new(RebalancingCtx::new(&rebalancing_config)?);
+    let rebalancing = Box::new(RebalancingCtx::new(
+        &rebalancing_config,
+        base_cash_vault(&config.chains),
+    )?);
     rebalancing_config.allocation()?.validate(&config.chains)?;
 
     let log_format = config.log_format.unwrap_or(LogFormat::Text);
@@ -2375,12 +2609,60 @@ fn issuance_ctx(
 }
 
 impl Ctx {
-    /// `registry_file` replaces the bucket read when the config names
-    /// `[registry]`; boot passes `None` and reads the bucket.
+    /// Judges token-dependent configuration using the exact config and secrets
+    /// this process loaded. Reuses the existing wallet without constructing one.
+    pub fn registry_candidate(&self, effective: &[u8]) -> Result<Self, CtxError> {
+        let inputs = self
+            .registry
+            .as_ref()
+            .and_then(|live| live.inputs.as_ref())
+            .ok_or(CtxError::RegistryInputsMissing)?;
+        let parts = parse_and_validate_with(
+            &inputs.config,
+            &inputs.config_path,
+            TokenFile::Bytes(effective),
+            &inputs.secrets,
+            &inputs.secrets_path,
+        )?;
+        let mut candidate = self.clone();
+        candidate.chains = parts.chains;
+        candidate.assets = parts.assets;
+        candidate.broker = parts.broker;
+        candidate.rebalancing = parts.rebalancing;
+        candidate.registry = parts.registry;
+        if let Some(live) = &mut candidate.registry {
+            live.inputs = Some(inputs.clone());
+        }
+        candidate.pricing = parts.pricing;
+        candidate.startup_notices = parts.startup_notices;
+        Ok(candidate)
+    }
+
+    #[cfg(feature = "wallet-turnkey")]
+    pub fn registry_approval_inputs(
+        &self,
+        effective: &[u8],
+    ) -> Result<Option<TurnkeyApprovalPolicyInputs>, CtxError> {
+        let inputs = self
+            .registry
+            .as_ref()
+            .and_then(|live| live.inputs.as_ref())
+            .ok_or(CtxError::RegistryInputsMissing)?;
+        Self::turnkey_approval_inputs_from_text(
+            &inputs.config,
+            &inputs.config_path,
+            TokenFile::Bytes(effective),
+            &inputs.secrets,
+            &inputs.secrets_path,
+        )
+    }
+
+    /// `tokens` says where the per-symbol tables come from when the config
+    /// names `[registry]`; loading itself writes nothing.
     pub async fn load_files(
         config_path: &Path,
         secrets_path: &Path,
-        registry_file: Option<&Path>,
+        tokens: TokenSource<'_>,
     ) -> Result<Self, CtxError> {
         let config_str = tokio::fs::read_to_string(config_path)
             .await
@@ -2394,10 +2676,18 @@ impl Ctx {
                 path: secrets_path.to_path_buf(),
                 source,
             })?;
-        let tokens = fetch_token_file(config_path, registry_file).await?;
-        let tokens = tokens
-            .as_deref()
-            .map_or(TokenFile::Skipped, TokenFile::Bytes);
+        let fetched;
+        let tokens = match tokens {
+            TokenSource::Running {
+                registry_file,
+                registry_state,
+            } => {
+                fetched = fetch_token_file(config_path, registry_file, registry_state).await?;
+                fetched.as_deref()
+            }
+            TokenSource::Claimed(claimed) => claimed,
+        }
+        .map_or(TokenFile::Skipped, TokenFile::Bytes);
 
         let parts =
             parse_and_validate_with(&config_str, config_path, tokens, &secrets_str, secrets_path)?;
@@ -2413,6 +2703,15 @@ impl Ctx {
 
         let order_owner = wallet.base_wallet().address();
 
+        let mut registry = parts.registry;
+        if let Some(live) = &mut registry {
+            live.inputs = Some(std::sync::Arc::new(RegistryInputs {
+                config: config_str,
+                config_path: config_path.to_path_buf(),
+                secrets: secrets_str,
+                secrets_path: secrets_path.to_path_buf(),
+            }));
+        }
         Ok(Self {
             database_url: parts.database_url,
             log_level: parts.log_level,
@@ -2440,7 +2739,7 @@ impl Ctx {
             telemetry: parts.telemetry,
             alerts: parts.alerts,
             startup_notices: parts.startup_notices,
-            registry: parts.registry,
+            registry,
             pricing: parts.pricing,
             rebalancing: parts.rebalancing,
             order_owner,
@@ -2545,8 +2844,25 @@ impl Ctx {
                 path: secrets_path.to_path_buf(),
                 source,
             })?;
+        Self::turnkey_approval_inputs_from_text(
+            &config_str,
+            config_path,
+            tokens,
+            &secrets_str,
+            secrets_path,
+        )
+    }
+
+    #[cfg(feature = "wallet-turnkey")]
+    fn turnkey_approval_inputs_from_text(
+        config_str: &str,
+        config_path: &Path,
+        tokens: TokenFile<'_>,
+        secrets_str: &str,
+        secrets_path: &Path,
+    ) -> Result<Option<TurnkeyApprovalPolicyInputs>, CtxError> {
         let parts =
-            parse_and_validate_with(&config_str, config_path, tokens, &secrets_str, secrets_path)?;
+            parse_and_validate_with(config_str, config_path, tokens, secrets_str, secrets_path)?;
 
         if parts.wallet_meta.kind != "turnkey" {
             return Ok(None);
@@ -2907,6 +3223,11 @@ pub enum CtxError {
         path: PathBuf,
         source: registry::RegistryError,
     },
+    #[error("registry state for config {path}")]
+    RegistryState {
+        path: PathBuf,
+        source: RegistryStateError,
+    },
     #[error("duplicate symbol {symbol} in [assets.equities].retired_symbols")]
     DuplicateRetiredSymbol { symbol: Symbol },
     #[error(
@@ -2996,10 +3317,17 @@ pub enum CtxError {
     #[error(transparent)]
     ChainRegistry(#[from] crate::chain::ChainRegistryError),
     #[error(
+        "[chains.{primary}] is the primary chain, but the primary must be Base: equity \
+         wallet polling and recovery read the Base wallet with the primary's token addresses"
+    )]
+    PrimaryChainNotBase { primary: Chain },
+    #[error(
         "the [rebalancing] config section is required; there is no global \
          rebalancing off-switch. To pause rebalancing work use the narrow \
-         controls: per-asset `rebalancing = \"disabled\"`, issuance freeze, \
-         or the `usdc` mode under [rebalancing]"
+         controls: per-asset `rebalancing = \"paused\"` keeps services until \
+         in-flight work finishes; use `rebalancing = \"disabled\"` only \
+         after draining. Issuance freeze and the `usdc` mode under \
+         [rebalancing] control their respective work"
     )]
     MissingRebalancing,
     #[error(
@@ -3021,6 +3349,8 @@ pub enum CtxError {
          entry supplying an rpc_url for every chain it signs on"
     )]
     WalletNotConfigured,
+    #[error("registry reload needs the config and secrets loaded at boot")]
+    RegistryInputsMissing,
     #[error(transparent)]
     Wallet(#[from] crate::wallet::WalletCtxError),
     #[error(
@@ -3052,10 +3382,11 @@ pub enum CtxError {
     )]
     CashRebalancingWithoutCorridor { chain: Chain },
     #[error(
-        "[rebalancing.usdc.corridors.{chain}]: cash transfers still run on the primary \
-         chain, {primary}"
+        "[chains.{chain}.trading.assets.cash] is set but no USDC corridor is served: set a \
+         [rebalancing.usdc.corridors.<chain>] table, or give \
+         [chains.base.trading.assets.cash] a vault id to serve Base via CCTP"
     )]
-    CorridorChainNotPrimary { chain: Chain, primary: Chain },
+    NoServedUsdcCorridor { chain: Chain },
     #[error(
         "vault_ids in [chains.<name>.trading.assets.cash] is required for rebalancing \
          but not configured"
@@ -3063,7 +3394,7 @@ pub enum CtxError {
     MissingCashVaultId,
     #[error(
         "vault_ids in [chains.<name>.trading.assets.equities.{symbol}] is required when \
-         rebalancing is enabled but not configured"
+         rebalancing is enabled or paused but not configured"
     )]
     MissingEquityVaultId { symbol: Symbol },
     #[error(
@@ -3085,6 +3416,26 @@ pub enum CtxError {
     ExtendedHoursWithoutCounterTrading { symbol: Symbol },
     #[error("{field} must be non-zero")]
     ZeroPollingInterval { field: &'static str },
+    #[error(
+        "[alerts.hedge_stall] stall_after ({stall_after}s) must be at least \
+         {minimum}s, three position_check_interval_secs ({position_check_secs}s) \
+         intervals"
+    )]
+    HedgeStallShorterThanScans {
+        stall_after: u64,
+        position_check_secs: u64,
+        minimum: u64,
+    },
+    #[error(
+        "[alerts.hedge_stall] stall_after ({stall_after}s) must be at least {minimum}s: \
+         [broker] extended_hours_reprice_timeout_secs ({reprice_timeout_secs}s) plus \
+         three position-check intervals"
+    )]
+    HedgeStallWithinRepriceTimeout {
+        stall_after: u64,
+        reprice_timeout_secs: u64,
+        minimum: u64,
+    },
     #[error("server_port and board_port must differ; both set to {port}")]
     ServerAndBoardPortsMatch { port: u16 },
     #[error(
@@ -3120,6 +3471,7 @@ impl CtxError {
             Self::BrokerPrivateKeyIo { .. } => "failed to read broker private key file",
             Self::ConfigToml { .. } => "failed to parse config",
             Self::Registry { .. } => "token file",
+            Self::RegistryState { .. } => "registry state",
             Self::DuplicateRetiredSymbol { .. } => "duplicate retired symbol",
             Self::ConfiguredSymbolMarkedRetired { .. } => "configured symbol marked retired",
             Self::SecretsToml { .. } => "failed to parse secrets",
@@ -3158,6 +3510,7 @@ impl CtxError {
             Self::Alerts(_) => "alerts assembly error",
             Self::Chain(_) => "chain configuration error",
             Self::ChainRegistry(_) => "chain registry error",
+            Self::PrimaryChainNotBase { .. } => "primary chain not Base",
             Self::CashOperationalLimitBelowMinimumTransfer { .. } => {
                 "cash operational limit below minimum transfer"
             }
@@ -3165,7 +3518,7 @@ impl CtxError {
             Self::CorridorChainDisabled { .. } => "USDC corridor chain disabled",
             Self::CorridorChainWithoutCashVault { .. } => "USDC corridor chain without cash vault",
             Self::CashRebalancingWithoutCorridor { .. } => "cash rebalancing without USDC corridor",
-            Self::CorridorChainNotPrimary { .. } => "USDC corridor chain not primary",
+            Self::NoServedUsdcCorridor { .. } => "no served USDC corridor",
             Self::MissingCashVaultId => "missing cash vault_ids",
             Self::ListedSymbolIsNotHedged { .. } => "listed symbol has no hedging policy",
             Self::HedgedSymbolIsNotListed { .. } => "hedged symbol is listed on no chain",
@@ -3174,10 +3527,15 @@ impl CtxError {
                 "extended hours enabled without counter-trading"
             }
             Self::ZeroPollingInterval { .. } => "zero polling interval",
+            Self::HedgeStallShorterThanScans { .. } => "hedge-stall window shorter than scans",
+            Self::HedgeStallWithinRepriceTimeout { .. } => {
+                "hedge-stall window within reprice timeout"
+            }
             Self::ServerAndBoardPortsMatch { .. } => "server_port and board_port must differ",
             Self::FloatComparison(_) => "float comparison failed",
             Self::InvalidTravelRule { .. } => "invalid travel rule config",
             Self::MissingTravelRule => "missing travel rule config",
+            Self::RegistryInputsMissing => "registry boot inputs missing",
             Self::WalletNotConfigured => "wallet not configured",
             Self::Wallet(_) => "wallet construction error",
             Self::WalletMissingChain { .. } => "wallet missing a chain entry",
@@ -3298,9 +3656,11 @@ pub fn default_test_rebalancing_ctx() -> Box<RebalancingCtx> {
             corridors: BTreeMap::new(),
             target: None,
             deviation: None,
+            conversion_failure_cooldown_secs: 300,
         },
         inventory_staleness_bound_secs: 300,
         transfer_timeout_secs: 1800,
+        recovery_hold_alert_after_secs: 3600,
         transfer_attempt_timeout_secs: 3600,
         attestation_retry_deadline_secs: 86_400,
         settlement_retry_deadline_secs: 86_400,
@@ -3308,7 +3668,7 @@ pub fn default_test_rebalancing_ctx() -> Box<RebalancingCtx> {
         freeze_check: OperationMode::Disabled,
     };
 
-    let ctx = RebalancingCtx::new(&config)
+    let ctx = RebalancingCtx::new(&config, BaseCashVault::Held)
         .unwrap_or_else(|_| unreachable!("hardcoded fixture values are valid"));
 
     Box::new(ctx)
@@ -3413,7 +3773,10 @@ mod tests {
 
     use super::*;
     use crate::chain::IngestionCutoffTag;
-    use crate::{ChainLifecycle, ChainRole, ExecutionThreshold, InventoryModeTag};
+    use crate::{
+        ChainLifecycle, ChainRole, ExecutionThreshold, InventoryAdapter, InventoryAdapterVenue,
+        InventoryModeTag, RebalancingMode,
+    };
 
     fn toml_file(content: &str) -> NamedTempFile {
         let mut file = NamedTempFile::new().unwrap();
@@ -3525,6 +3888,7 @@ mod tests {
     const REQUIRED_TOPOLOGY_SECTIONS: &str = r#"
             [rebalancing]
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -3622,6 +3986,7 @@ mod tests {
 
             [rebalancing]
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -4227,6 +4592,7 @@ mod tests {
 
             [rebalancing]
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -4380,9 +4746,16 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::ConfigToml { .. }),
@@ -4588,9 +4961,16 @@ mod tests {
         "#
         ));
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -4663,9 +5043,16 @@ mod tests {
         "#
         ));
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -4771,6 +5158,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn loader_rejects_a_hedge_stall_window_shorter_than_the_default_scans() {
+        let base = alerts_config_toml("0.05", "0.01");
+        let config = toml_file(&format!(
+            "{}\n[alerts.hedge_stall]\npoll_interval = 60\nstall_after = 179\n\
+             realert_interval = 1\n",
+            std::fs::read_to_string(base.path()).unwrap()
+        ));
+        let secrets = alpaca_secrets_toml();
+
+        let Err(error) = parse_and_validate_files(&config, &secrets) else {
+            panic!("expected HedgeStallShorterThanScans, got Ok");
+        };
+
+        assert!(
+            matches!(
+                error,
+                CtxError::HedgeStallShorterThanScans {
+                    stall_after: 179,
+                    position_check_secs: 60,
+                    minimum: 180,
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
     #[tokio::test]
     async fn alerts_config_fails_fast_on_bad_thresholds() {
         let secrets = toml_file(
@@ -4804,9 +5218,16 @@ mod tests {
             ("0.05", "not-a-number", Chain::Ethereum),
         ] {
             let config = alerts_config_toml(base_threshold, ethereum_threshold);
-            let error = Ctx::load_files(config.path(), secrets.path(), None)
-                .await
-                .unwrap_err();
+            let error = Ctx::load_files(
+                config.path(),
+                secrets.path(),
+                TokenSource::Running {
+                    registry_file: None,
+                    registry_state: None,
+                },
+            )
+            .await
+            .unwrap_err();
 
             assert!(
                 matches!(
@@ -4832,9 +5253,16 @@ mod tests {
         ));
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::MissingRebalancing),
@@ -4843,7 +5271,9 @@ mod tests {
 
         let message = error.to_string();
         assert!(
-            message.contains("per-asset") && message.contains("issuance freeze"),
+            message.contains("per-asset")
+                && message.contains("rebalancing = \"paused\"")
+                && message.contains("Issuance freeze"),
             "the error must name the supported pause controls, got: {message}"
         );
     }
@@ -4858,9 +5288,16 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::MissingTokenization),
@@ -4879,9 +5316,16 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::MissingBotGasValuation),
@@ -4897,9 +5341,16 @@ mod tests {
         let config = minimal_config_toml();
         let secrets = dry_run_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         let CtxError::SecretsToml { source, .. } = error else {
             panic!(
@@ -4938,9 +5389,16 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(error, CtxError::ConfigToml { .. }));
     }
@@ -4955,9 +5413,16 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(error, CtxError::MissingFileLogLevel));
     }
@@ -4972,9 +5437,16 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(error, CtxError::MissingLogDirectory));
     }
@@ -5044,9 +5516,16 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::ConfigToml { .. }),
@@ -5103,9 +5582,16 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::ConfigToml { .. }),
@@ -5171,9 +5657,16 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::ConfigToml { .. }),
@@ -5232,9 +5725,16 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::ConfigToml { .. }),
@@ -5292,9 +5792,16 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::ConfigToml { .. }),
@@ -5352,9 +5859,16 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::ConfigToml { .. }),
@@ -5422,9 +5936,16 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -5485,9 +6006,16 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -5509,9 +6037,16 @@ mod tests {
             ),
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         let error_text = format!("{error:#}");
         assert!(
@@ -5567,9 +6102,16 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::ServerAndBoardPortsMatch { port: 8080 }),
@@ -5645,9 +6187,16 @@ mod tests {
             "#
             ));
             let secrets = alpaca_secrets_toml();
-            let error = Ctx::load_files(config.path(), secrets.path(), None)
-                .await
-                .unwrap_err();
+            let error = Ctx::load_files(
+                config.path(),
+                secrets.path(),
+                TokenSource::Running {
+                    registry_file: None,
+                    registry_state: None,
+                },
+            )
+            .await
+            .unwrap_err();
 
             let matched = match expect {
                 "equal" => matches!(error, CtxError::OpsApiAudiencesEqual),
@@ -5745,6 +6294,7 @@ mod tests {
             extended_hours_close_flatten_window_secs = 900
             [rebalancing]
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -5778,9 +6328,16 @@ mod tests {
         "#,
         );
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
         let CtxError::CashOperationalLimitBelowMinimumTransfer {
             configured,
             minimum,
@@ -5859,6 +6416,7 @@ mod tests {
 
             [rebalancing]
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -5943,9 +6501,16 @@ mod tests {
         ));
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(error, CtxError::LogQueryUrlTemplateMissingIdPlaceholder),
             "expected LogQueryUrlTemplateMissingIdPlaceholder, got: {error:?}"
@@ -5962,9 +6527,16 @@ mod tests {
         ));
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(error, CtxError::LogQueryUrlTemplateNotAUrl { .. }),
             "expected LogQueryUrlTemplateNotAUrl, got: {error:?}"
@@ -6044,6 +6616,7 @@ mod tests {
 
             [rebalancing]
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -6077,9 +6650,16 @@ mod tests {
         "#,
         );
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(error, CtxError::SecretsToml { .. }),
             "Expected unsupported Schwab broker secrets to fail during parsing, got {error:?}"
@@ -6090,7 +6670,15 @@ mod tests {
     async fn unsupported_schwab_broker_fails_during_secret_parsing() {
         let config = minimal_config_toml();
         let secrets = unsupported_schwab_secrets_toml();
-        let result = Ctx::load_files(config.path(), secrets.path(), None).await;
+        let result = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await;
         assert!(
             matches!(result, Err(CtxError::SecretsToml { .. })),
             "Expected unsupported Schwab broker secrets to fail during parsing, got {result:?}"
@@ -6101,9 +6689,16 @@ mod tests {
     async fn unsupported_schwab_broker_with_order_owner_fails_during_secret_parsing() {
         let config = minimal_config_toml();
         let secrets = unsupported_schwab_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
         assert_eq!(
             error.kind(),
             "failed to parse secrets",
@@ -6119,9 +6714,16 @@ mod tests {
     #[cfg(feature = "wallet-private-key")]
     #[tokio::test]
     async fn example_config_and_secrets_parse_successfully() {
-        let ctx = Ctx::load_files(example_config_toml(), example_secrets_toml(), None)
-            .await
-            .unwrap();
+        let ctx = Ctx::load_files(
+            example_config_toml(),
+            example_secrets_toml(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap();
 
         // Example configs configure rebalancing with a private-key wallet;
         // a successful parse proves the required [rebalancing] section and
@@ -6245,9 +6847,16 @@ mod tests {
         );
         let secrets = secrets_only_secrets_toml(CREDENTIALS_ONLY_BROKER, API_KEY_ONLY_ISSUANCE);
 
-        let ctx = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap();
+        let ctx = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap();
 
         let BrokerCtx::AlpacaBrokerApi(alpaca) = ctx.broker;
         assert_eq!(
@@ -6282,9 +6891,16 @@ mod tests {
         );
         let secrets = secrets_only_secrets_toml("", API_KEY_ONLY_ISSUANCE);
 
-        let ctx = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap();
+        let ctx = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap();
 
         let BrokerCtx::AlpacaBrokerApi(alpaca) = ctx.broker;
         assert!(
@@ -6310,9 +6926,16 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let ctx = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap();
+        let ctx = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap();
 
         let BrokerCtx::AlpacaBrokerApi(alpaca) = ctx.broker;
         assert_eq!(
@@ -6345,9 +6968,16 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -6365,9 +6995,16 @@ mod tests {
         let config = broker_identity_config_toml(r#"type = "alpaca-broker-api-kms""#);
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::BrokerIdentityConflict { field: "type" }),
@@ -6380,9 +7017,16 @@ mod tests {
         let config = alpaca_trading_config_toml();
         let secrets = secrets_only_secrets_toml("", API_KEY_ONLY_ISSUANCE);
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::MissingBrokerType),
@@ -6399,9 +7043,16 @@ mod tests {
         let config = broker_identity_config_toml(r#"type = "dry-run""#);
         let secrets = secrets_only_secrets_toml("", API_KEY_ONLY_ISSUANCE);
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::ConfigToml { .. }),
@@ -6426,9 +7077,16 @@ mod tests {
         );
         let secrets = secrets_only_secrets_toml(CREDENTIALS_ONLY_BROKER, API_KEY_ONLY_ISSUANCE);
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -6450,9 +7108,16 @@ mod tests {
         );
         let secrets = secrets_only_secrets_toml("", API_KEY_ONLY_ISSUANCE);
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::MissingBrokerCredentials),
@@ -6473,9 +7138,16 @@ mod tests {
             api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899""#,
         );
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::IssuanceBaseUrlConflict),
@@ -6498,9 +7170,16 @@ mod tests {
             api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899""#,
         );
 
-        let ctx = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap();
+        let ctx = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap();
 
         assert_eq!(ctx.issuance.base_url.as_str(), "http://issuance.test:8000/");
     }
@@ -6517,9 +7196,16 @@ mod tests {
             API_KEY_ONLY_ISSUANCE,
         );
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::MissingIssuanceBaseUrl),
@@ -6620,6 +7306,7 @@ mod tests {
 
             [rebalancing]
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -6683,7 +7370,15 @@ mod tests {
         "#,
         );
 
-        let result = Ctx::load_files(config.path(), secrets.path(), None).await;
+        let result = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await;
         assert!(
             matches!(result, Err(CtxError::WalletNotConfigured)),
             "Expected WalletNotConfigured error, got {result:?}"
@@ -6747,6 +7442,7 @@ mod tests {
 
             [rebalancing]
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -6811,7 +7507,15 @@ mod tests {
         "#,
         );
 
-        let result = Ctx::load_files(config.path(), secrets.path(), None).await;
+        let result = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await;
         assert!(
             matches!(result, Err(CtxError::WalletNotConfigured)),
             "Expected WalletNotConfigured error, got {result:?}"
@@ -6887,6 +7591,7 @@ mod tests {
 
             [rebalancing]
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -6943,7 +7648,15 @@ mod tests {
         "#,
         );
 
-        let result = Ctx::load_files(config.path(), secrets.path(), None).await;
+        let result = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await;
         assert!(
             matches!(result, Err(CtxError::MissingTokenization)),
             "Expected MissingTokenization error, got {result:?}"
@@ -7024,6 +7737,7 @@ mod tests {
 
             [rebalancing]
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -7339,7 +8053,15 @@ mod tests {
         "#,
         );
 
-        let result = Ctx::load_files(config.path(), secrets.path(), None).await;
+        let result = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await;
         assert!(
             matches!(result, Err(CtxError::WalletSecretsMissing)),
             "Expected WalletSecretsMissing error, got {result:?}"
@@ -7404,7 +8126,7 @@ mod tests {
             [wallet]
             kind = "turnkey"
             address = "0x0000000000000000000000000000000000000001"
-            organization_id = "org-test"
+            organization_id = "00000000-0000-4000-8000-000000000001"
             kms_api_key = "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1"
         "#,
         );
@@ -7433,7 +8155,15 @@ mod tests {
         "#,
         );
 
-        let result = Ctx::load_files(config.path(), secrets.path(), None).await;
+        let result = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await;
         assert!(
             !matches!(result, Err(CtxError::WalletSecretsMissing)),
             "KMS-stamped wallet must not require [wallet] secrets, got {result:?}"
@@ -7511,7 +8241,15 @@ mod tests {
         "#,
         );
 
-        let result = Ctx::load_files(config.path(), secrets.path(), None).await;
+        let result = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await;
         let error = result.unwrap_err();
         let detail = std::error::Error::source(&error)
             .map(std::string::ToString::to_string)
@@ -7603,7 +8341,15 @@ mod tests {
         "#,
         );
 
-        let result = Ctx::load_files(config.path(), secrets.path(), None).await;
+        let result = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await;
         assert!(
             matches!(
                 result,
@@ -8233,9 +8979,16 @@ mod tests {
         "#,
         );
 
-        let err = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let err = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -8326,9 +9079,16 @@ mod tests {
         "#,
         );
 
-        let err = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let err = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -8402,6 +9162,7 @@ mod tests {
 
             [rebalancing]
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -8648,9 +9409,16 @@ mod tests {
             private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         "#,
         );
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::MissingIssuanceConfig),
@@ -8689,9 +9457,16 @@ mod tests {
             base_url = "http://issuance.test:8000"
         "#,
         );
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::SecretsToml { .. }),
@@ -8731,9 +9506,16 @@ mod tests {
             api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
         "#,
         );
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::SecretsToml { .. }),
@@ -8773,9 +9555,16 @@ mod tests {
             api_key = "0xdeadbeef"
         "#,
         );
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::InvalidIssuanceApiKey { .. }),
@@ -8818,9 +9607,16 @@ mod tests {
             api_key = "{raw_key}"
         "#
         ));
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::InvalidIssuanceApiKey { .. }),
@@ -8995,9 +9791,16 @@ mod tests {
         "#,
         );
 
-        let err = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let err = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(err, CtxError::MissingTravelRule),
@@ -9090,6 +9893,7 @@ mod tests {
 
             [rebalancing]
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -9123,15 +9927,90 @@ mod tests {
         "#,
         );
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::SecretsToml { .. }),
             "expected unsupported Schwab broker secrets to fail during parsing, got: {error:?}"
         );
         assert_eq!(error.kind(), "failed to parse secrets");
+    }
+
+    /// The fallback a failed copy leaves (the last good tables, plus the
+    /// failed copy's own listings with trading and rebalancing off and
+    /// recovery kept) passes every check boot runs, on a symbol whose
+    /// policy enables extended hours.
+    #[test]
+    fn a_fallback_from_the_production_copy_passes_the_boot_checks() {
+        let tokens = registry::fixtures::pinned_production_tokens();
+        let failed = registry::project(&registry::parse(&tokens).unwrap()).unwrap();
+        let mut last_good = failed.clone();
+        for rows in last_good.chain_rows.values_mut() {
+            rows.remove("AAPL");
+        }
+        last_good.policies.remove("AAPL");
+        let fallback = last_good.carry_forward(&failed).projection.to_token_file();
+        let config = toml_file(include_str!("../../../config/prod/st0x-hedge.toml"));
+
+        Ctx::validate_config_file(config.path(), TokenFile::Bytes(fallback.as_bytes())).unwrap();
+    }
+
+    fn hedge_stall(stall_after: u64) -> HedgeStallCtx {
+        HedgeStallCtx {
+            poll_interval: std::time::Duration::from_secs(60),
+            stall_after: std::time::Duration::from_secs(stall_after),
+            realert_interval: std::time::Duration::from_secs(1),
+        }
+    }
+
+    #[test]
+    fn hedge_stall_window_must_span_three_scans() {
+        let error = validate_hedge_stall_window(Some(hedge_stall(179)), 60, None).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::HedgeStallShorterThanScans {
+                    stall_after: 179,
+                    position_check_secs: 60,
+                    minimum: 180,
+                }
+            ),
+            "{error:?}"
+        );
+        validate_hedge_stall_window(Some(hedge_stall(180)), 60, None).unwrap();
+    }
+
+    #[test]
+    fn hedge_stall_window_must_outlast_the_reprice_timeout() {
+        let error = validate_hedge_stall_window(Some(hedge_stall(479)), 60, Some(300)).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::HedgeStallWithinRepriceTimeout {
+                    stall_after: 479,
+                    reprice_timeout_secs: 300,
+                    minimum: 480,
+                }
+            ),
+            "{error:?}"
+        );
+        validate_hedge_stall_window(Some(hedge_stall(480)), 60, Some(300)).unwrap();
+    }
+
+    #[test]
+    fn absent_hedge_stall_needs_no_window() {
+        validate_hedge_stall_window(None, 600, Some(3600)).unwrap();
     }
 
     #[test]
@@ -9184,7 +10063,7 @@ mod tests {
             "the pinned token file must give Base its equities, or the loop below checks nothing"
         );
         for (symbol, equity) in &base.assets.equities.symbols {
-            if equity.rebalancing == OperationMode::Enabled
+            if equity.rebalancing == RebalancingMode::Enabled
                 && let Some(limit) = &equity.operational_limit
                 && let Some(global) = global_limit
             {
@@ -9230,14 +10109,9 @@ mod tests {
             .unwrap();
     }
 
-    /// The shipped prod and staging configs run Robinhood Chain as a
-    /// prefunded hedge-only secondary: fills on every listed equity are
-    /// ingested and hedged, nothing is rebalanced, and Bebop is not mapped.
-    /// Both list the two launch equities; prod also lists PLBY and GRND.
-    #[test]
-    fn shipped_configs_hedge_robinhood_prefunded_without_rebalancing() {
-        let orderbook = address!("0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20");
-        let inventory = address!("0x1eFd85E6C384fAD9B80C6D508E9098Eb91C4eD30");
+    /// Robinhood's equities as the shipped configs list them, by symbol:
+    /// the two launch equities everywhere, plus PLBY, GRND, and SNES in prod.
+    fn robinhood_equities(with_prod_only: bool) -> BTreeMap<Symbol, (Address, Address)> {
         let launch_equities = [
             (
                 Symbol::new("DNUT").unwrap(),
@@ -9269,101 +10143,197 @@ mod tests {
                     address!("0xB80Bd4D599EeBBF2851d4E7F5594918B82FF1823"),
                 ),
             ),
+            (
+                Symbol::new("SNES").unwrap(),
+                (
+                    address!("0xF8bF43D61E4Cd2a5b5DfaD01BaC84693d7B95e51"),
+                    address!("0x06096908dBC38fc54509024674E4fd1891B5F7CA"),
+                ),
+            ),
         ];
-        let prod_equities: BTreeMap<Symbol, (Address, Address)> = launch_equities
+
+        launch_equities
+            .into_iter()
+            .chain(prod_only_equities.into_iter().filter(|_| with_prod_only))
+            .collect()
+    }
+
+    /// Loads a shipped config and checks the Robinhood settings prod and
+    /// staging share: the same orderbook and inventory, hedged fills on
+    /// every listed equity, Bebop's Robinhood hook as the one inventory
+    /// adapter, and the 0.001 ETH gas threshold.
+    /// Returns Robinhood and the other declared chains.
+    fn shipped_robinhood(
+        name: &str,
+        config_str: &str,
+        tokens: &[u8],
+        expected_equities: &BTreeMap<Symbol, (Address, Address)>,
+    ) -> (ChainConfig, BTreeMap<Chain, ChainConfig>) {
+        let inventory = address!("0x1eFd85E6C384fAD9B80C6D508E9098Eb91C4eD30");
+        let (config, _) = config_from(
+            config_str,
+            Path::new(name),
+            TokenFile::Bytes(tokens),
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        let alerts = AlertsCtx::new(config.alerts, &config.chains, &mut Vec::new())
+            .unwrap()
+            .unwrap_or_else(|| panic!("{name}: a hedged Robinhood requires [alerts]"));
+        assert_eq!(
+            alerts.low_balance_threshold_wei(Chain::Robinhood),
+            Some(U256::from(1_000_000_000_000_000_u64)),
+            "{name}: the Robinhood gas threshold is 0.001 ETH"
+        );
+
+        let mut chains = config.chains;
+        let robinhood = chains
+            .remove(&Chain::Robinhood)
+            .unwrap_or_else(|| panic!("{name} config must declare [chains.robinhood]"));
+
+        let trading = robinhood
+            .trading
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name} config must hedge fills on Robinhood"));
+        assert!(!trading.primary, "{name}: Robinhood is a secondary");
+        assert_eq!(
+            trading.orderbook,
+            address!("0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20"),
+            "{name}"
+        );
+        assert_eq!(trading.inventory_mode, InventoryModeTag::Managed, "{name}");
+        assert_eq!(trading.inventory, Some(inventory), "{name}");
+        assert_eq!(trading.vault_owner, inventory, "{name}");
+        assert_eq!(trading.deployment_block, 59_557_818, "{name}");
+        assert_eq!(
+            trading.ingestion_cutoff,
+            IngestionCutoffTag::Confirmations,
+            "{name}: Robinhood has no OP-Stack safe tag"
+        );
+        assert_eq!(trading.ingestion_cutoff_confirmations, Some(600), "{name}");
+        assert_eq!(
+            trading.inventory_adapters,
+            InventoryAdapters::try_new(vec![InventoryAdapter {
+                venue: InventoryAdapterVenue::Bebop,
+                operator: address!("0x242FdEc55623187E80A690ff15302e63dddd7130"),
+            }])
+            .unwrap(),
+            "{name}: Bebop's Robinhood hook is the only inventory adapter"
+        );
+
+        let equities: BTreeMap<Symbol, (Address, Address)> = trading
+            .assets
+            .equities
+            .symbols
             .iter()
-            .chain(prod_only_equities.iter())
-            .cloned()
+            .map(|(symbol, equity)| {
+                assert_eq!(equity.trading, OperationMode::Enabled, "{name} {symbol}");
+                (
+                    symbol.clone(),
+                    (equity.tokenized_equity, equity.tokenized_equity_derivative),
+                )
+            })
             .collect();
-        let staging_equities: BTreeMap<Symbol, (Address, Address)> =
-            launch_equities.iter().cloned().collect();
+        assert_eq!(&equities, expected_equities, "{name}");
 
-        for (name, config_str, tokens, expected_equities) in [
-            (
-                "prod",
-                include_str!("../../../config/prod/st0x-hedge.toml"),
-                registry::fixtures::pinned_production_tokens(),
-                &prod_equities,
-            ),
-            (
-                "staging",
-                include_str!("../../../config/staging/st0x-hedge.toml"),
-                registry::fixtures::read("tokens-staging.toml"),
-                &staging_equities,
-            ),
-        ] {
-            let (config, _) = config_from(
-                config_str,
-                Path::new(name),
-                TokenFile::Bytes(&tokens),
-                &mut Vec::new(),
-            )
-            .unwrap();
-            let robinhood = config
-                .chains
-                .get(&Chain::Robinhood)
-                .unwrap_or_else(|| panic!("{name} config must declare [chains.robinhood]"));
-            assert_eq!(robinhood.lifecycle, ChainLifecycle::Prefunded, "{name}");
+        (robinhood, chains)
+    }
 
-            let trading = robinhood
-                .trading
-                .as_ref()
-                .unwrap_or_else(|| panic!("{name} config must hedge fills on Robinhood"));
-            assert!(!trading.primary, "{name}: Robinhood is a secondary");
-            assert_eq!(trading.orderbook, orderbook, "{name}");
-            assert_eq!(trading.inventory_mode, InventoryModeTag::Managed, "{name}");
-            assert_eq!(trading.inventory, Some(inventory), "{name}");
-            assert_eq!(trading.vault_owner, inventory, "{name}");
-            assert_eq!(trading.deployment_block, 59_557_818, "{name}");
-            assert_eq!(
-                trading.ingestion_cutoff,
-                IngestionCutoffTag::Confirmations,
-                "{name}: Robinhood has no OP-Stack safe tag"
-            );
-            assert_eq!(trading.ingestion_cutoff_confirmations, Some(600), "{name}");
-            assert_eq!(
-                trading.inventory_adapters,
-                InventoryAdapters::default(),
-                "{name}: Bebop is off on Robinhood"
-            );
-            assert_eq!(
-                trading.redemption_wallet, None,
-                "{name}: a hedge-only chain redeems nothing"
-            );
+    /// Staging watches prod's Robinhood inventory on its own broker account,
+    /// so it runs Robinhood as a prefunded hedge-only secondary: nothing is
+    /// rebalanced and nothing is redeemed.
+    #[test]
+    fn shipped_staging_config_hedges_robinhood_prefunded_without_rebalancing() {
+        let (robinhood, _) = shipped_robinhood(
+            "staging",
+            include_str!("../../../config/staging/st0x-hedge.toml"),
+            &registry::fixtures::read("tokens-staging.toml"),
+            &robinhood_equities(false),
+        );
+        assert_eq!(robinhood.lifecycle, ChainLifecycle::Prefunded);
 
-            let equities: BTreeMap<Symbol, (Address, Address)> = trading
-                .assets
-                .equities
-                .symbols
-                .iter()
-                .map(|(symbol, equity)| {
-                    assert_eq!(equity.trading, OperationMode::Enabled, "{name} {symbol}");
-                    assert_eq!(
-                        equity.rebalancing,
-                        OperationMode::Disabled,
-                        "{name} {symbol}"
-                    );
-                    (
-                        symbol.clone(),
-                        (equity.tokenized_equity, equity.tokenized_equity_derivative),
-                    )
-                })
-                .collect();
-            assert_eq!(&equities, expected_equities, "{name}");
-            assert!(
-                !ChainRole::Secondary.rebalances_equity(&trading.assets),
-                "{name}: no Robinhood equity may opt into rebalancing"
-            );
-
-            let alerts = AlertsCtx::new(config.alerts, &config.chains, &mut Vec::new())
-                .unwrap()
-                .unwrap_or_else(|| panic!("{name}: a hedged Robinhood requires [alerts]"));
-            assert_eq!(
-                alerts.low_balance_threshold_wei(Chain::Robinhood),
-                Some(U256::from(1_000_000_000_000_000_u64)),
-                "{name}: the Robinhood gas threshold is 0.001 ETH"
-            );
+        let trading = robinhood.trading.unwrap();
+        assert_eq!(
+            trading.redemption_wallet, None,
+            "a hedge-only chain redeems nothing"
+        );
+        for (symbol, equity) in &trading.assets.equities.symbols {
+            assert_eq!(equity.rebalancing, RebalancingMode::Disabled, "{symbol}");
         }
+        assert!(
+            !ChainRole::Secondary.rebalances_equity(&trading.assets),
+            "no staging Robinhood equity may opt into rebalancing"
+        );
+    }
+
+    /// Prod runs Robinhood as an active secondary that rebalances DNUT, and
+    /// only DNUT, against Alpaca: with its own target share and a small
+    /// per-operation limit, and with redemptions sent to the issuer wallet
+    /// st0x.issuance signs with on every chain.
+    #[test]
+    fn shipped_prod_config_rebalances_only_dnut_on_robinhood() {
+        let (robinhood, mut chains) = shipped_robinhood(
+            "prod",
+            include_str!("../../../config/prod/st0x-hedge.toml"),
+            &registry::fixtures::pinned_production_tokens(),
+            &robinhood_equities(true),
+        );
+        assert_eq!(robinhood.lifecycle, ChainLifecycle::Active);
+
+        let trading = robinhood.trading.unwrap();
+        assert_eq!(
+            trading.redemption_wallet,
+            Some(address!("0x3d0CD66EFA66c05d86c3d4316B03eAE87ab9E8aE"))
+        );
+        let base_trading = chains.remove(&Chain::Base).unwrap().trading.unwrap();
+        assert_eq!(
+            trading.redemption_wallet, base_trading.redemption_wallet,
+            "issuance signs every chain with one key, so both chains redeem to one address"
+        );
+
+        let dnut = Symbol::new("DNUT").unwrap();
+        for (symbol, equity) in &trading.assets.equities.symbols {
+            let expected = if *symbol == dnut {
+                RebalancingMode::Enabled
+            } else {
+                RebalancingMode::Disabled
+            };
+            assert_eq!(equity.rebalancing, expected, "{symbol}");
+        }
+
+        // Both upper bands (0.45 + 0.45) leave the broker its 0.1 floor.
+        assert!(
+            base_trading.assets.equities.symbols[&dnut]
+                .target_share
+                .expect("DNUT must set its own Base target_share")
+                .inner()
+                .eq(float!(0.4))
+                .unwrap()
+        );
+
+        let dnut = &trading.assets.equities.symbols[&dnut];
+        assert_eq!(dnut.wrapped_equity_recovery, OperationMode::Enabled);
+        assert!(
+            dnut.target_share
+                .expect("DNUT must set its own Robinhood target_share")
+                .inner()
+                .eq(float!(0.4))
+                .unwrap()
+        );
+        // Also the hedge cap for Robinhood DNUT fills and for the CheckPositions
+        // backstop, which takes the tightest limit across chains. A Base DNUT
+        // fill hedges with Base's limit, which is unset.
+        assert!(
+            dnut.operational_limit
+                .expect(
+                    "DNUT must cap each Robinhood rebalancing operation and Robinhood hedge order"
+                )
+                .inner()
+                .inner()
+                .eq(float!(25))
+                .unwrap()
+        );
     }
 
     #[test]
@@ -9465,8 +10435,8 @@ mod tests {
 
     /// The deployed configs, with the token file in place, carry exactly the
     /// per-symbol tables the inline configs held the day they were replaced,
-    /// and pass every check; judged without the token file they still pass
-    /// and say what was not covered.
+    /// and preserve the migration comparison. The historical production
+    /// copy is refused until RKLB enables recovery; staging passes.
     #[test]
     fn deployed_configs_with_the_token_file_match_the_inline_ones() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -9520,13 +10490,19 @@ mod tests {
                 rows
             };
             assert_eq!(rows(&merged), rows(&inline), "{env}: per-symbol tables");
-            validate_config(
+            let validation = validate_config(
                 &merged,
                 &config_path,
                 TokenFile::Bytes(&tokens),
                 &mut notices,
-            )
-            .unwrap();
+            );
+            if env == "production" {
+                assert!(matches!(validation, Err(CtxError::ChainRegistry(
+                    crate::chain::ChainRegistryError::RebalancingRequiresRecovery { chain: Chain::Base, symbol }
+                )) if symbol == Symbol::new("RKLB").unwrap()));
+            } else {
+                validation.unwrap();
+            }
 
             let mut notices = Vec::new();
             let (table, live) =
@@ -9589,10 +10565,11 @@ mod tests {
     }
 
     /// The copy production runs is the fixture the pin names: a pin bump
-    /// without that fixture fails here, before a VM boot finds out, and the
-    /// copy must pass every check the deployed config runs.
+    /// without that fixture fails here, before a VM boot finds out. The
+    /// pinned copy passes every check, including the rule that a listing
+    /// which rebalances must enable recovery.
     #[test]
-    fn the_pinned_production_copy_passes_the_deployed_config() {
+    fn the_pinned_production_copy_passes_validation() {
         let tokens = registry::fixtures::pinned_production_tokens();
         let config_path = Path::new("config/prod/st0x-hedge.toml");
         let mut notices = Vec::new();
@@ -10113,6 +11090,7 @@ mod tests {
             realert_interval: 3600,
             chat_id: None,
             message_thread_id: None,
+            hedge_stall: None,
         });
         config
     }
@@ -10373,9 +11351,16 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let err = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let err = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, CtxError::ConfigToml { .. }),
             "Expected config parse error for unknown field, got {err:?}"
@@ -10430,9 +11415,16 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let err = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let err = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, CtxError::ConfigToml { .. }),
             "Expected config parse error for unknown assets field, got {err:?}"
@@ -10496,9 +11488,16 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let err = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let err = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, CtxError::ConfigToml { .. }),
             "Expected config parse error for unknown equity field, got {err:?}"
@@ -10552,9 +11551,16 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let err = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let err = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, CtxError::ConfigToml { .. }),
             "Expected config parse error for unknown cash field, got {err:?}"
@@ -10588,9 +11594,16 @@ mod tests {
         "#,
         );
 
-        let err = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let err = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, CtxError::SecretsToml { .. }),
             "Expected secrets parse error for unknown field, got {err:?}"
@@ -10625,9 +11638,16 @@ mod tests {
         );
 
         let secrets_path = secrets.path().to_path_buf();
-        let err = Ctx::load_files(config.path(), &secrets_path, None)
-            .await
-            .unwrap_err();
+        let err = Ctx::load_files(
+            config.path(),
+            &secrets_path,
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
         let display = err.to_string();
         assert!(
             display.contains(&secrets_path.display().to_string()),
@@ -10688,9 +11708,16 @@ mod tests {
         let secrets = alpaca_secrets_toml();
 
         let config_path = config.path().to_path_buf();
-        let err = Ctx::load_files(&config_path, secrets.path(), None)
-            .await
-            .unwrap_err();
+        let err = Ctx::load_files(
+            &config_path,
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
         let display = err.to_string();
         assert!(
             display.contains(&config_path.display().to_string()),
@@ -10726,9 +11753,16 @@ mod tests {
         "#,
         );
 
-        let err = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let err = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, CtxError::SecretsToml { .. }),
             "Expected secrets parse error for unknown broker field, got {err:?}"
@@ -11092,9 +12126,16 @@ mod tests {
         let config = equity_pricing_config_toml(true);
         let secrets = alpaca_pricing_secrets_toml();
 
-        let ctx = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap();
+        let ctx = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap();
 
         let pricing = ctx.pricing.expect("pricing context should be assembled");
         assert_eq!(pricing.ws_url.as_str(), "wss://pricing.test/ws");
@@ -11106,9 +12147,16 @@ mod tests {
         let config = equity_pricing_config_toml(false);
         let secrets = alpaca_pricing_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(
             error,
@@ -11121,14 +12169,80 @@ mod tests {
         let config = equity_pricing_config_toml(true);
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(
             error,
             CtxError::Pricing(PricingCtxError::MissingSecrets)
         ));
+    }
+
+    #[cfg(feature = "wallet-turnkey")]
+    #[test]
+    fn validate_config_file_rejects_malformed_turnkey_organization_id() {
+        let config = toml_file(
+            &String::from_utf8_lossy(minimal_config_toml_bytes()).replace(
+                "kind = \"private-key\"",
+                "kind = \"turnkey\"\norganization_id = \"not-a-uuid\"",
+            ),
+        );
+
+        let error = Ctx::validate_config_file(config.path(), TokenFile::Skipped).unwrap_err();
+        let CtxError::ConfigToml { path, source } = error else {
+            panic!("expected config parse error, got {error:?}");
+        };
+        assert_eq!(path, config.path());
+        assert!(
+            source
+                .to_string()
+                .contains("Turnkey organization ID must be a UUID")
+        );
+    }
+
+    #[cfg(feature = "wallet-turnkey")]
+    #[test]
+    fn validate_files_rejects_malformed_turnkey_private_keys_without_network() {
+        let config = toml_file(
+            &String::from_utf8_lossy(minimal_config_toml_bytes()).replace(
+                "kind = \"private-key\"",
+                "kind = \"turnkey\"\norganization_id = \"00000000-0000-4000-8000-000000000001\"",
+            ),
+        );
+        let valid_secrets = alpaca_secrets_toml();
+        let secrets_text = std::fs::read_to_string(valid_secrets.path()).unwrap();
+        for (key, expected) in [
+            ("not-hex".to_string(), "valid hexadecimal"),
+            ("deadbeef".to_string(), "32 bytes, got 4"),
+            ("00".repeat(32), "valid P-256 private key"),
+        ] {
+            let secrets = toml_file(&secrets_text.replace(
+                "private_key = \"0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"",
+                &format!("api_private_key = \"{key}\""),
+            ));
+            let error =
+                Ctx::validate_files(config.path(), secrets.path(), TokenFile::Skipped).unwrap_err();
+            let CtxError::SecretsToml { path, source } = error else {
+                panic!("expected secrets parse error, got {error:?}");
+            };
+            assert_eq!(path, secrets.path());
+            assert!(
+                source.to_string().contains(expected),
+                "unexpected error: {source}"
+            );
+            assert!(
+                !source.to_string().contains(&key),
+                "private key leaked: {source}"
+            );
+        }
     }
 
     #[cfg(feature = "wallet-turnkey")]
@@ -11191,7 +12305,7 @@ mod tests {
             [wallet]
             kind = "turnkey"
             address = "0x6666666666666666666666666666666666666666"
-            organization_id = "org-test"
+            organization_id = "00000000-0000-4000-8000-000000000001"
 
             [broker]
             counter_trade_slippage_bps = 100
@@ -11205,6 +12319,7 @@ mod tests {
 
             [rebalancing]
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -11261,7 +12376,7 @@ mod tests {
             account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
 
             [wallet]
-            api_private_key = "secret-p256-key"
+            api_private_key = "0000000000000000000000000000000000000000000000000000000000000001"
 
             [issuance]
             base_url = "http://issuance.test:8000"
@@ -11280,7 +12395,10 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(inputs.organization_id.as_str(), "org-test");
+        assert_eq!(
+            inputs.organization_id.as_str(),
+            "00000000-0000-4000-8000-000000000001"
+        );
         assert_eq!(
             inputs.wallet_address,
             address!("0x6666666666666666666666666666666666666666")
@@ -11297,8 +12415,11 @@ mod tests {
                 .is_trading_enabled(&Symbol::new("AAPL").unwrap())
         );
         assert!(inputs.kms_api_key.is_none());
-        assert!(inputs.api_private_key.is_some());
-        assert!(!format!("{inputs:?}").contains("secret-p256-key"));
+        assert_eq!(format!("{:?}", inputs.api_private_key), "Some([REDACTED])");
+        assert!(
+            !format!("{inputs:?}")
+                .contains("0000000000000000000000000000000000000000000000000000000000000001")
+        );
     }
 
     /// The deploy gate proves coverage for every chain startup grants
@@ -11401,6 +12522,7 @@ mod tests {
 
             [rebalancing]
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -11426,10 +12548,11 @@ mod tests {
             [wallet]
             kind = "turnkey"
             address = "0x6666666666666666666666666666666666666666"
-            organization_id = "org-test"
+            organization_id = "00000000-0000-4000-8000-000000000001"
             "#,
         );
-        let secrets = toml_file(
+        let api_private_key = format!("{:064x}", 1);
+        let secrets = toml_file(&format!(
             r#"
             [chains.base]
             rpc_url = "http://localhost:8545"
@@ -11450,7 +12573,7 @@ mod tests {
             account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
 
             [wallet]
-            api_private_key = "secret-p256-key"
+            api_private_key = "{api_private_key}"
 
             [issuance]
             base_url = "http://issuance.test:8000"
@@ -11459,7 +12582,7 @@ mod tests {
             [pricing]
             api_key = "pricing-oracle-test-key"
             "#,
-        );
+        ));
 
         let inputs = Ctx::load_turnkey_approval_policy_inputs(
             config.path(),
@@ -11469,6 +12592,10 @@ mod tests {
         .unwrap()
         .unwrap();
 
+        assert_eq!(
+            inputs.organization_id.as_str(),
+            "00000000-0000-4000-8000-000000000001"
+        );
         assert_eq!(
             inputs
                 .hedged
@@ -11503,6 +12630,9 @@ mod tests {
                 .map(|equity| equity.tokenized_equity),
             Some(address!("0x7777777777777777777777777777777777777777"))
         );
+        assert!(inputs.kms_api_key.is_none());
+        assert_eq!(format!("{:?}", inputs.api_private_key), "Some([REDACTED])");
+        assert!(!format!("{inputs:?}").contains(&api_private_key));
     }
 
     #[cfg(feature = "wallet-turnkey")]
@@ -12191,9 +13321,15 @@ mod tests {
         toml::from_str(include_str!("../../../config/prod/st0x-hedge.toml")).unwrap()
     }
 
+    fn validate_corridor_chains(config: &Config) -> Result<(), CtxError> {
+        let rebalancing = config.rebalancing.as_ref().unwrap();
+        let ctx = RebalancingCtx::new(rebalancing, base_cash_vault(&config.chains)).unwrap();
+
+        validate_usdc_corridor_chains(&rebalancing.usdc, &ctx.usdc, &config.chains)
+    }
+
     fn corridor_chain_error(config: &Config) -> CtxError {
-        validate_usdc_corridor_chains(&config.rebalancing.as_ref().unwrap().usdc, &config.chains)
-            .unwrap_err()
+        validate_corridor_chains(config).unwrap_err()
     }
 
     fn cash_mut(config: &mut Config, chain: Chain) -> &mut crate::ChainCashAsset {
@@ -12210,8 +13346,12 @@ mod tests {
         let config = prod_config();
         let rebalancing = config.rebalancing.as_ref().unwrap();
 
-        let usdc = RebalancingCtx::new(rebalancing).unwrap().usdc.unwrap();
+        let corridors = RebalancingCtx::new(rebalancing, base_cash_vault(&config.chains))
+            .unwrap()
+            .usdc;
+        let usdc = corridors.active().next().unwrap();
 
+        assert_eq!(corridors.active().count(), 1);
         assert_eq!(
             usdc.corridor,
             UsdcCorridor::HubRouted {
@@ -12221,7 +13361,7 @@ mod tests {
         );
         assert!(usdc.threshold.target.eq(float!(0.6)).unwrap());
         assert!(usdc.threshold.deviation.eq(float!(0.05)).unwrap());
-        validate_usdc_corridor_chains(&rebalancing.usdc, &config.chains).unwrap();
+        validate_usdc_corridor_chains(&rebalancing.usdc, &corridors, &config.chains).unwrap();
     }
 
     #[test]
@@ -12290,10 +13430,10 @@ mod tests {
         );
     }
 
-    /// The cash path still runs on the primary chain, so a corridor elsewhere
-    /// would size and guard transfers off the wrong vault.
+    /// A corridor runs on its own chain's orderbook, vault and depth, so the
+    /// corridor check accepts a corridor off the primary chain.
     #[test]
-    fn corridor_chain_other_than_primary_is_refused() {
+    fn corridor_off_the_primary_chain_passes_the_corridor_check() {
         let mut config = prod_config();
         for (chain, primary) in [(Chain::Base, false), (Chain::Robinhood, true)] {
             config
@@ -12304,18 +13444,128 @@ mod tests {
                 .primary = primary;
         }
 
-        let error = corridor_chain_error(&config);
+        validate_corridor_chains(&config).unwrap();
+    }
+
+    /// The primary must be Base whatever the USDC corridors, so an Ethereum
+    /// primary with no corridor table is refused too.
+    #[test]
+    fn full_validation_refuses_a_non_base_primary_without_a_corridor_table() {
+        let config =
+            toml_file(&toml::to_string(&ethereum_primary_without_corridor_table()).unwrap());
+
+        let error = Ctx::validate_config_file(config.path(), TokenFile::Skipped).unwrap_err();
 
         assert!(
             matches!(
                 error,
-                CtxError::CorridorChainNotPrimary {
-                    chain: Chain::Base,
-                    primary: Chain::Robinhood,
+                CtxError::PrimaryChainNotBase {
+                    primary: Chain::Ethereum
                 }
             ),
             "got {error:?}"
         );
+    }
+
+    /// With no corridor table and no Base cash vault the build has no cash
+    /// transfer service to start, so the config is refused at load, not deep
+    /// in startup.
+    #[test]
+    fn full_validation_refuses_a_config_serving_no_usdc_corridor() {
+        let mut deployed = prod_without_corridor_table();
+        deployed["chains"]["base"]["trading"]["assets"]
+            .as_table_mut()
+            .unwrap()
+            .remove("cash");
+        let config = toml_file(&toml::to_string(&deployed).unwrap());
+
+        let error = Ctx::validate_config_file(config.path(), TokenFile::Skipped).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::NoServedUsdcCorridor {
+                    chain: Chain::Robinhood
+                }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    /// Equity wallet polling and recovery read the Base wallet with the
+    /// primary's token addresses, so a non-Base primary is refused at load.
+    #[test]
+    fn full_validation_refuses_a_non_base_primary() {
+        let mut deployed: toml::Table =
+            toml::from_str(include_str!("../../../config/prod/st0x-hedge.toml")).unwrap();
+        let chains = deployed["chains"].as_table_mut().unwrap();
+        let mut ethereum_trading = chains["base"]["trading"].clone();
+        ethereum_trading
+            .as_table_mut()
+            .unwrap()
+            .insert("primary".to_string(), toml::Value::Boolean(true));
+        chains["base"]["trading"]
+            .as_table_mut()
+            .unwrap()
+            .insert("primary".to_string(), toml::Value::Boolean(false));
+        ethereum_trading["assets"]
+            .as_table_mut()
+            .unwrap()
+            .remove("cash");
+        chains["ethereum"]
+            .as_table_mut()
+            .unwrap()
+            .insert("trading".to_string(), ethereum_trading);
+        let config = toml_file(&toml::to_string(&deployed).unwrap());
+
+        let error = Ctx::validate_config_file(config.path(), TokenFile::Skipped).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::PrimaryChainNotBase {
+                    primary: Chain::Ethereum
+                }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    /// The deployed config with USDC mode disabled and no corridor table.
+    fn prod_without_corridor_table() -> toml::Table {
+        let mut deployed: toml::Table =
+            toml::from_str(include_str!("../../../config/prod/st0x-hedge.toml")).unwrap();
+        deployed["rebalancing"].as_table_mut().unwrap().insert(
+            "usdc".to_string(),
+            toml::Value::Table(toml::Table::from_iter([(
+                "mode".to_string(),
+                toml::Value::String("disabled".to_string()),
+            )])),
+        );
+
+        deployed
+    }
+
+    /// [`prod_without_corridor_table`] with Ethereum as the primary and Base
+    /// as a secondary.
+    fn ethereum_primary_without_corridor_table() -> toml::Table {
+        let mut deployed = prod_without_corridor_table();
+        let chains = deployed["chains"].as_table_mut().unwrap();
+        let mut ethereum_trading = chains["base"]["trading"].clone();
+        ethereum_trading
+            .as_table_mut()
+            .unwrap()
+            .insert("primary".to_string(), toml::Value::Boolean(true));
+        chains["base"]["trading"]
+            .as_table_mut()
+            .unwrap()
+            .insert("primary".to_string(), toml::Value::Boolean(false));
+        chains["ethereum"]
+            .as_table_mut()
+            .unwrap()
+            .insert("trading".to_string(), ethereum_trading);
+
+        deployed
     }
 
     #[test]
@@ -12324,8 +13574,7 @@ mod tests {
         cash_mut(&mut config, Chain::Robinhood).rebalancing = OperationMode::Enabled;
         config.chains.get_mut(&Chain::Robinhood).unwrap().lifecycle = ChainLifecycle::Disabled;
 
-        validate_usdc_corridor_chains(&config.rebalancing.as_ref().unwrap().usdc, &config.chains)
-            .unwrap();
+        validate_corridor_chains(&config).unwrap();
     }
 
     #[test]
@@ -12335,7 +13584,155 @@ mod tests {
         usdc.mode = OperationMode::Disabled;
         usdc.corridors.clear();
 
-        validate_usdc_corridor_chains(&config.rebalancing.as_ref().unwrap().usdc, &config.chains)
+        validate_corridor_chains(&config).unwrap();
+    }
+    fn registry_candidate_fixture() -> (Ctx, Vec<u8>) {
+        let mut config: toml::Table =
+            toml::from_str(include_str!("../../../example.config.toml")).unwrap();
+        let mut file = toml::Table::new();
+        file.insert("schema_version".into(), toml::Value::Integer(1));
+        let mut chains = toml::Table::new();
+        for (name, chain) in config["chains"].as_table_mut().unwrap() {
+            let Some(trading) = chain.get_mut("trading") else {
+                continue;
+            };
+            let equities = trading["assets"]["equities"].as_table_mut().unwrap();
+            let mut rows = toml::Table::new();
+            equities.retain(|name, value| {
+                if value.is_table() {
+                    rows.insert(name.to_string(), value.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            let mut row = toml::Table::new();
+            row.insert(
+                "assets".into(),
+                toml::Value::Table(toml::Table::from_iter([(
+                    "equities".into(),
+                    toml::Value::Table(rows),
+                )])),
+            );
+            chains.insert(name.clone(), toml::Value::Table(row));
+        }
+        file.insert("chains".into(), toml::Value::Table(chains));
+        let mut policies = toml::Table::new();
+        config["assets"]["equities"]
+            .as_table_mut()
+            .unwrap()
+            .retain(|name, value| {
+                if value.is_table() {
+                    policies.insert(name.to_string(), value.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        file.insert(
+            "assets".into(),
+            toml::Value::Table(toml::Table::from_iter([(
+                "equities".into(),
+                toml::Value::Table(policies),
+            )])),
+        );
+        config.insert(
+            "registry".into(),
+            toml::Value::Table(toml::Table::from_iter([(
+                "url".into(),
+                toml::Value::String("gs://test/tokens.toml".into()),
+            )])),
+        );
+        let bytes = file.to_string().into_bytes();
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let projection = registry::project(&file).unwrap();
+        let mut live = RegistryLive::for_test(
+            registry::source_of(&config).unwrap().unwrap(),
+            config.clone(),
+            projection,
+        );
+        live.inputs = Some(std::sync::Arc::new(RegistryInputs {
+            config: config.to_string(),
+            config_path: PathBuf::from("absent-config.toml"),
+            secrets: include_str!("../../../example.secrets.toml").into(),
+            secrets_path: PathBuf::from("absent-secrets.toml"),
+        }));
+        ctx.registry = Some(live);
+        (ctx.registry_candidate(&bytes).unwrap(), bytes)
+    }
+
+    #[test]
+    fn registry_candidate_reuses_boot_inputs_and_keeps_running_config_on_rejection() {
+        let (ctx, bytes) = registry_candidate_fixture();
+        let running = ctx.registry.as_ref().unwrap().live.clone();
+        let mut invalid = registry::parse(&bytes).unwrap();
+        invalid.insert("schema_version".into(), toml::Value::Integer(2));
+        assert!(
+            ctx.registry_candidate(invalid.to_string().as_bytes())
+                .is_err()
+        );
+        assert_eq!(ctx.registry.as_ref().unwrap().live, running);
+        assert_eq!(
+            ctx.registry_candidate(&bytes)
+                .unwrap()
+                .registry
+                .unwrap()
+                .live,
+            running
+        );
+        assert!(!format!("{ctx:?}").contains("test_secret"));
+    }
+
+    #[test]
+    fn registry_candidate_applies_a_valid_switch_without_constructing_a_wallet() {
+        let (ctx, bytes) = registry_candidate_fixture();
+        let mut file = registry::parse(&bytes).unwrap();
+        let chain = ctx.chains.primary();
+        let symbol = chain
+            .assets
+            .equities
+            .symbols
+            .iter()
+            .find(|(_, row)| row.trading == OperationMode::Enabled)
+            .unwrap()
+            .0;
+        file["chains"][chain.chain.to_string()]["assets"]["equities"][symbol.to_string()]["trading"] =
+            toml::Value::String("disabled".into());
+        file["assets"]["equities"][symbol.to_string()]["extended_hours_counter_trading"] =
+            toml::Value::String("disabled".into());
+        let candidate = ctx.registry_candidate(file.to_string().as_bytes()).unwrap();
+        assert!(!candidate.chains.primary().assets.is_trading_enabled(symbol));
+        assert!(ctx.chains.primary().assets.is_trading_enabled(symbol));
+        assert!(candidate.wallet.is_none());
+    }
+
+    /// An explicit state directory replaces the one beside the database,
+    /// even when it has no running record, so the read falls through to
+    /// the bucket instead of another host's state.
+    #[test]
+    fn an_explicit_state_directory_replaces_the_database_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let beside_database =
+            crate::registry_state::RegistryState::open(&dir.path().join("registry")).unwrap();
+        let record = beside_database
+            .write_record(7, b"source", b"database tables")
             .unwrap();
+        beside_database.mark_running(record).unwrap();
+        let explicit = dir.path().join("explicit");
+        std::fs::create_dir(&explicit).unwrap();
+        let mut table = toml::Table::new();
+        table.insert(
+            "database_url".into(),
+            toml::Value::String(format!(
+                "sqlite://{}",
+                dir.path().join("db.sqlite").display()
+            )),
+        );
+
+        assert_eq!(
+            running_tokens(&table, None).unwrap(),
+            Some(b"database tables".to_vec())
+        );
+        assert_eq!(running_tokens(&table, Some(&explicit)).unwrap(), None);
     }
 }

@@ -9,7 +9,10 @@ pub(crate) mod trigger;
 pub(crate) mod usdc;
 
 pub use spawn::to_wrapped_equities;
-pub(crate) use spawn::{BaseWallet, ChainWallets, EthereumWallet, RebalancerServices};
+pub(crate) use spawn::{
+    BaseWallet, ChainWallets, EthereumWallet, RebalancerServices, UsdcCorridorEndpoints,
+    usdc_gas_readiness_by_chain,
+};
 #[cfg(test)]
 pub(crate) use trigger::drain_pending_jobs;
 pub(crate) use trigger::{

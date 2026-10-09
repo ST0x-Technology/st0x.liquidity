@@ -4,7 +4,7 @@
 //! enclaves for low-latency signing (50-100ms). Like
 //! [`RawPrivateKeyWallet`](super::local::RawPrivateKeyWallet), it wraps
 //! the base provider with a [`WalletFiller`] -- the only difference is
-//! the signer: `TurnkeySigner` (remote signing via Turnkey API) instead
+//! the signer: `TracingTurnkeySigner` (remote signing via Turnkey API) instead
 //! of `PrivateKeySigner` (local key).
 
 use alloy::consensus::{SignableTransaction, TxEnvelope};
@@ -27,7 +27,7 @@ use serde::Serialize;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
 use tracing::{info, trace};
-use turnkey_api_key_stamper::{Stamp, StampHeader, TurnkeyP256ApiKey};
+use turnkey_api_key_stamper::{Stamp, StampHeader, StamperError, TurnkeyP256ApiKey};
 use turnkey_client::generated::{
     Activity, ActivityResponse, ActivityStatus, SignRawPayloadIntentV2, SignRawPayloadRequest,
     SignTransactionIntentV2, SignTransactionRequest,
@@ -44,20 +44,30 @@ use crate::gcp_kms_stamper::{GcpKmsStamper, GcpKmsStamperError};
 use crate::inflight_nonces::{DiscardedNonce, InFlightNonces};
 use crate::nonce::ResettableNonceManager;
 use crate::submit::{
-    broadcast_prepared, discard_prepared, prepare_with_nonce, release_in_flight_after_wait,
-    restore_prepared, restore_transaction, send_with_recovery,
+    GasLimitSource, broadcast_prepared, discard_prepared, pad_gas_estimate,
+    prepare_fee_replacement, prepare_with_nonce, release_in_flight_after_wait, restore_prepared,
+    restore_transaction, send_with_recovery,
 };
-use crate::{Evm, EvmError, PreparedTransaction, TryIntoWallet, Wallet, WalletCtx};
+use crate::{
+    Evm, EvmError, PreparedTransaction, TransactionSubmission, TryIntoWallet, Wallet, WalletCtx,
+};
 
 /// Turnkey organization identifier (non-secret, lives in plaintext
 /// config).
 #[derive(Debug, Clone, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String")]
 pub struct TurnkeyOrganizationId(String);
 
 impl TurnkeyOrganizationId {
-    pub fn new(value: String) -> Self {
-        Self(value)
+    /// Creates a validated Turnkey organization identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnkeyValueError::EmptyOrganizationId`] when `value`
+    /// contains only whitespace, or
+    /// [`TurnkeyValueError::InvalidOrganizationId`] when it is not a UUID.
+    pub fn try_new(value: String) -> Result<Self, TurnkeyValueError> {
+        value.try_into()
     }
 
     pub fn as_str(&self) -> &str {
@@ -65,22 +75,81 @@ impl TurnkeyOrganizationId {
     }
 }
 
+impl TryFrom<String> for TurnkeyOrganizationId {
+    type Error = TurnkeyValueError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let organization_id = value.trim();
+        if organization_id.is_empty() {
+            return Err(TurnkeyValueError::EmptyOrganizationId);
+        }
+
+        let organization_id = uuid::Uuid::parse_str(organization_id)
+            .map_err(TurnkeyValueError::InvalidOrganizationId)?;
+
+        Ok(Self(organization_id.hyphenated().to_string()))
+    }
+}
+
 /// Hex-encoded P-256 API private key for Turnkey authentication
 /// (secret, lives in encrypted config).
 #[derive(Clone, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String")]
 pub struct TurnkeyApiPrivateKey(String);
 
 impl TurnkeyApiPrivateKey {
-    pub fn new(value: String) -> Self {
-        Self(value)
+    /// Creates a validated P-256 API private key.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`TurnkeyValueError`] when `value` is not hexadecimal,
+    /// is not exactly 32 bytes, or is not a valid P-256 scalar.
+    /// Accepts an optional `0x` prefix and stores lowercase, unprefixed hex.
+    pub fn try_new(value: String) -> Result<Self, TurnkeyValueError> {
+        value.try_into()
     }
+}
+
+impl TryFrom<String> for TurnkeyApiPrivateKey {
+    type Error = TurnkeyValueError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let key = parse_api_private_key(&value)?;
+
+        Ok(Self(hex::encode(key.private_key())))
+    }
+}
+
+fn parse_api_private_key(value: &str) -> Result<TurnkeyP256ApiKey, TurnkeyValueError> {
+    let decoded = hex::decode(value).map_err(TurnkeyValueError::InvalidApiPrivateKeyHex)?;
+    let observed_length = decoded.len();
+    let bytes: [u8; 32] = decoded
+        .try_into()
+        .map_err(|_| TurnkeyValueError::InvalidApiPrivateKeyLength { observed_length })?;
+
+    TurnkeyP256ApiKey::from_bytes(bytes, None).map_err(TurnkeyValueError::InvalidApiPrivateKey)
 }
 
 impl std::fmt::Debug for TurnkeyApiPrivateKey {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("[REDACTED]")
     }
+}
+
+/// Invalid Turnkey configuration value.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum TurnkeyValueError {
+    #[error("Turnkey organization ID must not be empty")]
+    EmptyOrganizationId,
+    #[error("Turnkey organization ID must be a UUID")]
+    InvalidOrganizationId(#[source] uuid::Error),
+    #[error("Turnkey API private key must be valid hexadecimal")]
+    InvalidApiPrivateKeyHex(#[source] hex::FromHexError),
+    #[error("Turnkey API private key must be 32 bytes, got {observed_length}")]
+    InvalidApiPrivateKeyLength { observed_length: usize },
+    #[error("Turnkey API private key must be a valid P-256 private key")]
+    InvalidApiPrivateKey(#[source] StamperError),
 }
 
 /// Errors specific to the Turnkey signing backend.
@@ -105,6 +174,8 @@ pub enum TurnkeyRequestError {
 pub enum TracingTurnkeySignerError {
     #[error(transparent)]
     TurnkeyClient(#[from] TurnkeyRequestError),
+    #[error(transparent)]
+    TurnkeyValue(#[from] TurnkeyValueError),
     #[error(
         "Turnkey credentials ambiguous: both [wallet].kms_api_key (config) and \
          api_private_key (secrets) are set -- keep exactly one"
@@ -222,6 +293,8 @@ pub struct TurnkeyPolicySnapshot {
 pub enum TurnkeyPolicyError {
     #[error(transparent)]
     Client(#[from] TurnkeyClientError),
+    #[error(transparent)]
+    TurnkeyValue(#[from] TurnkeyValueError),
     #[error(transparent)]
     KmsStamper(#[from] GcpKmsStamperError),
     #[error(transparent)]
@@ -395,8 +468,8 @@ pub struct TurnkeyWallet<P: Provider> {
     /// too low" errors without needing to traverse the filler chain.
     nonce_manager: ResettableNonceManager,
     /// This wallet's own record of nonces it has assigned to transactions
-    /// not yet confirmed or proven dropped. Shared across clones, same as
-    /// `nonce_manager`.
+    /// not yet confirmed or released by suspected-drop policy. Shared across
+    /// clones, same as `nonce_manager`.
     in_flight: InFlightNonces,
     /// Serializes sends from this wallet so concurrent callers cannot
     /// build two transactions at the same nonce. Shared across clones so
@@ -425,7 +498,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
     /// Creates a new `TurnkeyWallet` from a context containing API
     /// credentials, wallet address, and base provider.
     ///
-    /// Constructs a `TurnkeySigner` using the P-256 API private key,
+    /// Constructs a `TracingTurnkeySigner` using the P-256 API private key,
     /// wraps it in an `EthereumWallet`, and builds the signing
     /// provider with standard fillers. The base provider is cloned
     /// and stored separately for read-only access.
@@ -579,12 +652,10 @@ impl std::fmt::Debug for ApiStamper {
 }
 
 impl ApiStamper {
-    fn local(api_private_key: &TurnkeyApiPrivateKey) -> Result<Self, TurnkeyClientError> {
+    fn local(api_private_key: &TurnkeyApiPrivateKey) -> Result<Self, TurnkeyValueError> {
         let TurnkeyApiPrivateKey(api_key_hex) = api_private_key;
-        Ok(Self::Local(TurnkeyP256ApiKey::from_strings(
-            api_key_hex,
-            None,
-        )?))
+
+        Ok(Self::Local(parse_api_private_key(api_key_hex)?))
     }
 
     async fn stamp(&self, body: &[u8]) -> Result<StampHeader, TurnkeyRequestError> {
@@ -677,6 +748,7 @@ impl TracingTurnkeyClient {
             timestamp_ms: timestamp_ms.to_string(),
             parameters: Some(params),
             organization_id,
+            generate_app_proofs: None,
         };
         let activity = self
             .process_activity(&request, "/public/v1/submit/sign_transaction")
@@ -708,6 +780,7 @@ impl TracingTurnkeyClient {
             timestamp_ms: timestamp_ms.to_string(),
             parameters: Some(params),
             organization_id,
+            generate_app_proofs: None,
         };
         let activity = self
             .process_activity(&request, "/public/v1/submit/sign_raw_payload")
@@ -753,7 +826,7 @@ impl TracingTurnkeyClient {
                 ActivityStatus::Failed => {
                     return Err(TurnkeyClientError::ActivityFailed(activity.failure).into());
                 }
-                ActivityStatus::ConsensusNeeded => {
+                ActivityStatus::ConsensusNeeded | ActivityStatus::AuthenticatorsNeeded => {
                     return Err(TurnkeyClientError::ActivityRequiresApproval(activity.id).into());
                 }
                 ActivityStatus::Unspecified
@@ -1114,6 +1187,10 @@ impl<P> Wallet for TurnkeyWallet<P>
 where
     P: Provider + Clone + Send + Sync + 'static,
 {
+    fn transaction_submission(&self, tx_hash: TxHash) -> Option<TransactionSubmission> {
+        self.in_flight.submission(self.address(), tx_hash)
+    }
+
     fn address(&self) -> Address {
         self.address
     }
@@ -1166,6 +1243,35 @@ where
             self.address,
             contract,
             calldata,
+            GasLimitSource::Estimate,
+        )
+        .await
+    }
+
+    async fn prepare_pending_with_gas_limit(
+        &self,
+        contract: Address,
+        calldata: Bytes,
+        unpadded_gas_limit: u64,
+        note: &str,
+    ) -> Result<PreparedTransaction, EvmError> {
+        info!(
+            target: "wallet",
+            %contract,
+            unpadded_gas_limit,
+            padded_gas_limit = ?pad_gas_estimate(unpadded_gas_limit).ok(),
+            note,
+            "Preparing Turnkey contract call with a pinned gas limit"
+        );
+        prepare_with_nonce(
+            &self.signing_provider,
+            &self.nonce_manager,
+            &self.in_flight,
+            &self.send_lock,
+            self.address,
+            contract,
+            calldata,
+            GasLimitSource::Pinned(unpadded_gas_limit),
         )
         .await
     }
@@ -1183,6 +1289,19 @@ where
             self.address,
             prepared,
             note,
+        )
+        .await
+    }
+
+    async fn prepare_fee_replacement(
+        &self,
+        prepared: &PreparedTransaction,
+    ) -> Result<Option<PreparedTransaction>, EvmError> {
+        prepare_fee_replacement(
+            &self.signing_provider,
+            &self.send_lock,
+            self.address,
+            prepared,
         )
         .await
     }
@@ -1234,7 +1353,10 @@ where
 
     async fn await_receipt(&self, tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
         let result =
-            crate::wait_for_receipt(&self.provider, tx_hash, self.required_confirmations).await;
+            crate::wait_for_receipt(&self.provider, tx_hash, self.required_confirmations, || {
+                self.transaction_submission(tx_hash)
+            })
+            .await;
 
         release_in_flight_after_wait(
             &self.in_flight,
@@ -1285,14 +1407,22 @@ mod tests {
     use alloy::eips::eip2718::Encodable2718;
     use alloy::eips::eip2930::AccessList;
     use alloy::node_bindings::{Anvil, AnvilInstance};
-    use alloy::primitives::{TxKind, U256};
+    use alloy::primitives::{BlockNumber, TxKind, U64, U256};
     use alloy::providers::ext::AnvilApi;
     use alloy::providers::fillers::NonceManager as _;
+    use alloy::providers::mock::Asserter;
+    use alloy::providers::{DynProvider, ProviderCall, RootProvider};
+    use alloy::rpc::client::NoParams;
+    use alloy::rpc::json_rpc::ErrorPayload;
     use alloy::rpc::types::TransactionRequest;
     use alloy::signers::Signer;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::SolValue;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use httpmock::MockServer;
+    use p256::ecdsa::signature::Verifier as _;
+    use p256::ecdsa::{Signature as P256Signature, VerifyingKey};
 
     use crate::inflight_nonces::NonceOwnership;
     use crate::submit::release_in_flight_after_wait;
@@ -1300,9 +1430,327 @@ mod tests {
 
     use super::*;
 
+    /// Keep signing, filling and broadcasting on the real chain while scripting
+    /// only the two freshness observations at the signing provider boundary.
+    #[derive(Clone)]
+    struct ScriptedHeadProvider {
+        chain: DynProvider,
+        heads: DynProvider,
+    }
+
+    impl Provider for ScriptedHeadProvider {
+        fn root(&self) -> &RootProvider {
+            self.chain.root()
+        }
+
+        fn get_block_number(&self) -> ProviderCall<NoParams, U64, BlockNumber> {
+            self.heads.get_block_number()
+        }
+    }
+
     /// Generate a fresh P-256 API key for testing.
     fn test_api_key() -> TurnkeyP256ApiKey {
         TurnkeyP256ApiKey::generate()
+    }
+
+    #[tokio::test]
+    async fn prepared_broadcast_refreshes_delayed_and_restored_submission_floors() {
+        for previous_floor in [None, Some(100), Some(300)] {
+            for post_head in [Some(200), Some(50), None] {
+                let asserter = Asserter::new();
+                asserter.push_success(&U256::from(1));
+                asserter.push_success(&U256::from(150));
+                let prepared = PreparedTransaction::for_test(TxHash::random(), 7);
+                asserter.push_success(&prepared.tx_hash());
+                if let Some(head) = post_head {
+                    asserter.push_success(&U256::from(head));
+                } else {
+                    asserter.push_failure(ErrorPayload {
+                        code: -32000,
+                        message: "post-broadcast head unavailable".into(),
+                        data: None,
+                    });
+                    asserter.push_success(&U256::from(50));
+                    asserter.push_success(&prepared.tx_hash());
+                    asserter.push_success(&U256::from(75));
+                }
+                let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+                let server = MockServer::start();
+                let wallet = TurnkeyWallet::from_client(
+                    mock_client(&server),
+                    TurnkeyOrganizationId::try_new(TEST_ORGANIZATION_ID.to_string()).unwrap(),
+                    Address::random(),
+                    provider,
+                    1,
+                )
+                .await
+                .unwrap();
+                if let Some(floor) = previous_floor {
+                    wallet.restore_prepared(&prepared).await;
+                    wallet.in_flight.record_submission_block(
+                        wallet.address(),
+                        prepared.tx_hash(),
+                        floor,
+                    );
+                }
+                assert_eq!(
+                    wallet
+                        .broadcast_prepared(&prepared, "delayed broadcast")
+                        .await
+                        .unwrap(),
+                    prepared.tx_hash()
+                );
+                let submission = wallet.transaction_submission(prepared.tx_hash()).unwrap();
+                assert_eq!(
+                    submission.submitted_after_block,
+                    post_head
+                        .map(|head| previous_floor.map_or(150, |floor| floor.max(150)).max(head))
+                );
+                assert_eq!(
+                    wallet.in_flight.ownership(wallet.address(), 7),
+                    NonceOwnership::Ours
+                );
+                if post_head.is_none() {
+                    wallet
+                        .broadcast_prepared(&prepared, "lagging retry")
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        wallet
+                            .transaction_submission(prepared.tx_hash())
+                            .unwrap()
+                            .submitted_after_block,
+                        Some(previous_floor.map_or(150, |floor| floor.max(150)))
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn submission_floor_uses_signing_provider_for_send_and_prepare() {
+        for prepare in [false, true] {
+            for post_head in [Some(200), Some(50), None] {
+                let anvil = Anvil::new().spawn();
+                let chain = ProviderBuilder::new()
+                    .connect_http(anvil.endpoint_url())
+                    .erased();
+                let signer: PrivateKeySigner = anvil.keys()[0].clone().into();
+                let asserter = Asserter::new();
+                asserter.push_success(&U256::from(100));
+                if let Some(head) = post_head {
+                    asserter.push_success(&U256::from(head));
+                } else {
+                    asserter.push_failure(ErrorPayload {
+                        code: -32000,
+                        message: "post-submission head unavailable".into(),
+                        data: None,
+                    });
+                }
+                let provider = ScriptedHeadProvider {
+                    chain,
+                    heads: ProviderBuilder::new()
+                        .connect_mocked_client(asserter.clone())
+                        .erased(),
+                };
+                let server = MockServer::start();
+                let mut wallet = TurnkeyWallet::from_client(
+                    mock_client(&server),
+                    TurnkeyOrganizationId::try_new(TEST_ORGANIZATION_ID.to_string()).unwrap(),
+                    signer.address(),
+                    provider.clone(),
+                    1,
+                )
+                .await
+                .unwrap();
+                // Keep the actual Turnkey entrypoints and nonce tracker, but isolate
+                // boundary sampling from the separately covered HTTP signing seam.
+                wallet.signing_provider = ProviderBuilder::new()
+                    .disable_recommended_fillers()
+                    .filler(GasFiller)
+                    .filler(BlobGasFiller::default())
+                    .with_nonce_management(wallet.nonce_manager.clone())
+                    .filler(ChainIdFiller::default())
+                    .wallet(EthereumWallet::from(signer))
+                    .connect_provider(provider);
+                let hash = if prepare {
+                    wallet
+                        .prepare_pending(wallet.address(), Bytes::new(), "floor regression")
+                        .await
+                        .unwrap()
+                        .tx_hash()
+                } else {
+                    wallet
+                        .send_pending(wallet.address(), Bytes::new(), "floor regression")
+                        .await
+                        .unwrap()
+                };
+                let submission = wallet
+                    .transaction_submission(hash)
+                    .expect("successful operation retains identity");
+                let expected_floor = post_head.map(|head| head.max(100));
+                assert_eq!(
+                    submission.submitted_after_block, expected_floor,
+                    "prepare={prepare}, post_head={post_head:?}"
+                );
+                assert!(
+                    asserter.read_q().is_empty(),
+                    "both signing-boundary heads must be consumed"
+                );
+                assert_eq!(submission.nonce, 0);
+                assert_eq!(
+                    wallet
+                        .in_flight
+                        .ownership(wallet.address(), submission.nonce),
+                    NonceOwnership::Ours
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn local_api_stamp_authenticates_exact_request_bytes() {
+        let api_private_key = TurnkeyApiPrivateKey::try_new(format!("0x{:064x}", 1)).unwrap();
+        let body = br#"{"type":"ACTIVITY_TYPE_SIGN_TRANSACTION_V2"}"#;
+        let StampHeader { name, value } = ApiStamper::local(&api_private_key)
+            .unwrap()
+            .stamp(body)
+            .await
+            .unwrap();
+        assert_eq!(name, "X-Stamp");
+
+        let decoded = URL_SAFE_NO_PAD.decode(value).unwrap();
+        let stamp: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(stamp.as_object().unwrap().len(), 3);
+        assert_eq!(stamp["scheme"], "SIGNATURE_SCHEME_TK_API_P256");
+        // SEC1 compressed P-256 generator: the public key for scalar one.
+        let public_key = "036b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296";
+        assert_eq!(stamp["publicKey"], public_key);
+        let verifying_key =
+            VerifyingKey::from_sec1_bytes(&hex::decode(public_key).unwrap()).unwrap();
+        let signature =
+            P256Signature::from_der(&hex::decode(stamp["signature"].as_str().unwrap()).unwrap())
+                .unwrap();
+        verifying_key.verify(body, &signature).unwrap();
+        verifying_key
+            .verify(b"modified request bytes", &signature)
+            .unwrap_err();
+    }
+
+    #[test]
+    fn api_private_key_canonicalizes_optional_hex_prefix() {
+        let canonical = format!("{:064x}", 0xab);
+
+        for value in [
+            canonical.to_uppercase(),
+            format!("0x{}", canonical.to_uppercase()),
+        ] {
+            let TurnkeyApiPrivateKey(key) = TurnkeyApiPrivateKey::try_new(value).unwrap();
+
+            assert_eq!(key, canonical);
+        }
+    }
+
+    #[test]
+    fn organization_id_trims_and_canonicalizes_uuid() {
+        let TurnkeyOrganizationId(organization_id) =
+            TurnkeyOrganizationId::try_new("  A4D3F3C8-7D52-4D8B-91E1-6F79A02D0BCE  ".to_string())
+                .unwrap();
+
+        assert_eq!(organization_id, "a4d3f3c8-7d52-4d8b-91e1-6f79a02d0bce");
+    }
+
+    #[test]
+    fn organization_id_rejects_only_whitespace() {
+        let error = TurnkeyOrganizationId::try_new("   ".to_string()).unwrap_err();
+
+        assert!(matches!(error, TurnkeyValueError::EmptyOrganizationId));
+    }
+
+    #[test]
+    fn organization_id_rejects_non_uuid() {
+        let error = TurnkeyOrganizationId::try_new("org-test".to_string()).unwrap_err();
+
+        assert!(matches!(error, TurnkeyValueError::InvalidOrganizationId(_)));
+        std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<uuid::Error>()
+            .unwrap();
+    }
+
+    #[test]
+    fn api_private_key_rejects_invalid_hex_with_source() {
+        let error = TurnkeyApiPrivateKey::try_new("not-a-private-key".to_string()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            TurnkeyValueError::InvalidApiPrivateKeyHex(_)
+        ));
+        std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<hex::FromHexError>()
+            .unwrap();
+    }
+
+    #[test]
+    fn api_private_key_rejects_valid_hex_wrong_lengths_without_panicking() {
+        for (value, expected_length) in [
+            (String::new(), 0),
+            ("deadbeef".to_string(), 4),
+            ("00".repeat(31), 31),
+            ("00".repeat(33), 33),
+        ] {
+            let error = TurnkeyApiPrivateKey::try_new(value).unwrap_err();
+
+            assert!(matches!(
+                error,
+                TurnkeyValueError::InvalidApiPrivateKeyLength { observed_length }
+                    if observed_length == expected_length
+            ));
+            assert_eq!(
+                error.to_string(),
+                format!("Turnkey API private key must be 32 bytes, got {expected_length}")
+            );
+        }
+    }
+
+    #[test]
+    fn api_private_key_rejects_invalid_scalar_with_source() {
+        let error = TurnkeyApiPrivateKey::try_new("00".repeat(32)).unwrap_err();
+
+        assert!(matches!(error, TurnkeyValueError::InvalidApiPrivateKey(_)));
+        std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<StamperError>()
+            .unwrap();
+    }
+
+    #[test]
+    fn api_private_key_debug_is_redacted() {
+        let api_private_key = TurnkeyApiPrivateKey::try_new(format!("{:064x}", 1)).unwrap();
+
+        assert_eq!(format!("{api_private_key:?}"), "[REDACTED]");
+    }
+
+    #[test]
+    fn api_stamper_rechecks_private_key_length_without_panicking() {
+        let malformed = TurnkeyApiPrivateKey("deadbeef".to_string());
+        let error = ApiStamper::local(&malformed).unwrap_err();
+
+        assert!(matches!(
+            error,
+            TurnkeyValueError::InvalidApiPrivateKeyLength { observed_length: 4 }
+        ));
+    }
+
+    const TEST_ORGANIZATION_ID: &str = "a4d3f3c8-7d52-4d8b-91e1-6f79a02d0bce";
+
+    fn test_api_private_key() -> TurnkeyApiPrivateKey {
+        let signing_key =
+            p256::ecdsa::SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let encoded = hex::encode(signing_key.to_bytes());
+
+        TurnkeyApiPrivateKey::try_new(encoded).unwrap()
     }
 
     /// Build a Turnkey client that sends requests to the mock server.
@@ -1330,11 +1778,11 @@ mod tests {
     #[tokio::test]
     async fn policy_client_rejects_ambiguous_credentials() {
         let error = TurnkeyPolicyClient::new(
-            TurnkeyOrganizationId::new("org-test".to_string()),
+            TurnkeyOrganizationId::try_new(TEST_ORGANIZATION_ID.to_string()).unwrap(),
             Some(TurnkeyKmsApiKey::new(
                 "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1".to_string(),
             )),
-            Some(TurnkeyApiPrivateKey::new("api-private-key".to_string())),
+            Some(test_api_private_key()),
         )
         .await
         .unwrap_err();
@@ -1345,7 +1793,7 @@ mod tests {
     #[tokio::test]
     async fn policy_client_rejects_missing_credentials() {
         let error = TurnkeyPolicyClient::new(
-            TurnkeyOrganizationId::new("org-test".to_string()),
+            TurnkeyOrganizationId::try_new(TEST_ORGANIZATION_ID.to_string()).unwrap(),
             None,
             None,
         )
@@ -1361,7 +1809,7 @@ mod tests {
         let policies_mock = server.mock(|when, then| {
             when.method("POST")
                 .path("/public/v1/query/list_policies")
-                .body_includes("\"organizationId\":\"org-test\"");
+                .body_includes(format!("\"organizationId\":\"{TEST_ORGANIZATION_ID}\""));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(serde_json::json!({
@@ -1387,11 +1835,11 @@ mod tests {
         let whoami_mock = server.mock(|when, then| {
             when.method("POST")
                 .path("/public/v1/query/whoami")
-                .body_includes("\"organizationId\":\"org-test\"");
+                .body_includes(format!("\"organizationId\":\"{TEST_ORGANIZATION_ID}\""));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(serde_json::json!({
-                    "organizationId": "org-test",
+                    "organizationId": TEST_ORGANIZATION_ID,
                     "organizationName": "Test",
                     "userId": "user-test",
                     "username": "Bot"
@@ -1400,7 +1848,7 @@ mod tests {
         let user_mock = server.mock(|when, then| {
             when.method("POST")
                 .path("/public/v1/query/get_user")
-                .body_includes("\"organizationId\":\"org-test\"")
+                .body_includes(format!("\"organizationId\":\"{TEST_ORGANIZATION_ID}\""))
                 .body_includes("\"userId\":\"user-test\"");
             then.status(200)
                 .header("content-type", "application/json")
@@ -1413,7 +1861,7 @@ mod tests {
                 }));
         });
         let client = TurnkeyPolicyClient::for_base_url(
-            TurnkeyOrganizationId::new("org-test".to_string()),
+            TurnkeyOrganizationId::try_new(TEST_ORGANIZATION_ID.to_string()).unwrap(),
             test_api_key(),
             server.base_url(),
         )
@@ -1451,11 +1899,11 @@ mod tests {
         let whoami_mock = server.mock(|when, then| {
             when.method("POST")
                 .path("/public/v1/query/whoami")
-                .body_includes("\"organizationId\":\"org-test\"");
+                .body_includes(format!("\"organizationId\":\"{TEST_ORGANIZATION_ID}\""));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(serde_json::json!({
-                    "organizationId": "org-test",
+                    "organizationId": TEST_ORGANIZATION_ID,
                     "organizationName": "Test",
                     "userId": "user-test",
                     "username": "Bot"
@@ -1464,14 +1912,14 @@ mod tests {
         let user_mock = server.mock(|when, then| {
             when.method("POST")
                 .path("/public/v1/query/get_user")
-                .body_includes("\"organizationId\":\"org-test\"")
+                .body_includes(format!("\"organizationId\":\"{TEST_ORGANIZATION_ID}\""))
                 .body_includes("\"userId\":\"user-test\"");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(serde_json::json!({ "user": null }));
         });
         let client = TurnkeyPolicyClient::for_base_url(
-            TurnkeyOrganizationId::new("org-test".to_string()),
+            TurnkeyOrganizationId::try_new(TEST_ORGANIZATION_ID.to_string()).unwrap(),
             test_api_key(),
             server.base_url(),
         )
@@ -1493,11 +1941,11 @@ mod tests {
         let whoami_mock = server.mock(|when, then| {
             when.method("POST")
                 .path("/public/v1/query/whoami")
-                .body_includes("\"organizationId\":\"org-test\"");
+                .body_includes(format!("\"organizationId\":\"{TEST_ORGANIZATION_ID}\""));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(serde_json::json!({
-                    "organizationId": "org-test",
+                    "organizationId": TEST_ORGANIZATION_ID,
                     "organizationName": "Test",
                     "userId": "user-test",
                     "username": "Bot"
@@ -1506,7 +1954,7 @@ mod tests {
         let user_mock = server.mock(|when, then| {
             when.method("POST")
                 .path("/public/v1/query/get_user")
-                .body_includes("\"organizationId\":\"org-test\"")
+                .body_includes(format!("\"organizationId\":\"{TEST_ORGANIZATION_ID}\""))
                 .body_includes("\"userId\":\"user-test\"");
             then.status(200)
                 .header("content-type", "application/json")
@@ -1519,7 +1967,7 @@ mod tests {
                 }));
         });
         let client = TurnkeyPolicyClient::for_base_url(
-            TurnkeyOrganizationId::new("org-test".to_string()),
+            TurnkeyOrganizationId::try_new(TEST_ORGANIZATION_ID.to_string()).unwrap(),
             test_api_key(),
             server.base_url(),
         )
@@ -1585,7 +2033,7 @@ mod tests {
         serde_json::json!({
             "activity": {
                 "id": "activity-id",
-                "organizationId": "org-test",
+                "organizationId": TEST_ORGANIZATION_ID,
                 "status": "ACTIVITY_STATUS_COMPLETED",
                 "type": "ACTIVITY_TYPE_SIGN_TRANSACTION_V2",
                 "fingerprint": "fingerprint",
@@ -1603,7 +2051,7 @@ mod tests {
         serde_json::json!({
             "activity": {
                 "id": "activity-id",
-                "organizationId": "org-test",
+                "organizationId": TEST_ORGANIZATION_ID,
                 "status": "ACTIVITY_STATUS_COMPLETED",
                 "type": "ACTIVITY_TYPE_SIGN_RAW_PAYLOAD_V2",
                 "fingerprint": "fingerprint",
@@ -1623,7 +2071,7 @@ mod tests {
         serde_json::json!({
             "activity": {
                 "id": "activity-id",
-                "organizationId": "org-test",
+                "organizationId": TEST_ORGANIZATION_ID,
                 "status": "ACTIVITY_STATUS_PENDING",
                 "type": "ACTIVITY_TYPE_SIGN_TRANSACTION_V2",
                 "fingerprint": "fingerprint"
@@ -1815,6 +2263,7 @@ mod tests {
                 .json_body_includes(
                     serde_json::json!({
                         "type": "ACTIVITY_TYPE_SIGN_RAW_PAYLOAD_V2",
+                        "generateAppProofs": null,
                         "parameters": {
                             "signWith": address.to_string(),
                             "payload": payload_json,
@@ -1831,7 +2280,7 @@ mod tests {
 
         let signer = TracingTurnkeySigner::new(
             mock_client(&server),
-            TurnkeyOrganizationId::new("org-test".to_string()),
+            TurnkeyOrganizationId::try_new(TEST_ORGANIZATION_ID.to_string()).unwrap(),
             address,
             Some(8453),
         );
@@ -1874,7 +2323,7 @@ mod tests {
 
         let signer = TracingTurnkeySigner::new(
             mock_client(&server),
-            TurnkeyOrganizationId::new("org-test".to_string()),
+            TurnkeyOrganizationId::try_new(TEST_ORGANIZATION_ID.to_string()).unwrap(),
             configured_signer.address(),
             Some(8453),
         );
@@ -2051,7 +2500,7 @@ mod tests {
 
         let wallet = TurnkeyWallet::from_client(
             mock_client(&server),
-            TurnkeyOrganizationId::new("org-test".to_string()),
+            TurnkeyOrganizationId::try_new(TEST_ORGANIZATION_ID.to_string()).unwrap(),
             address,
             provider,
             1,
@@ -2095,7 +2544,8 @@ mod tests {
                             "signWith": address.to_string(),
                             "unsignedTransaction": hex::encode(&expected_unsigned_rlp),
                             "type": "TRANSACTION_TYPE_ETHEREUM",
-                        }
+                        },
+                        "generateAppProofs": null
                     })
                     .to_string(),
                 );
@@ -2106,7 +2556,7 @@ mod tests {
 
         let signer = TracingTurnkeySigner::new(
             mock_client(&server),
-            TurnkeyOrganizationId::new("org-test".to_string()),
+            TurnkeyOrganizationId::try_new(TEST_ORGANIZATION_ID.to_string()).unwrap(),
             address,
             Some(chain_id),
         );
@@ -2153,7 +2603,7 @@ mod tests {
 
         let signer = TracingTurnkeySigner::new(
             mock_client(&server),
-            TurnkeyOrganizationId::new("org-test".to_string()),
+            TurnkeyOrganizationId::try_new(TEST_ORGANIZATION_ID.to_string()).unwrap(),
             address,
             Some(chain_id),
         );
@@ -2181,7 +2631,7 @@ mod tests {
 
         let signer = TracingTurnkeySigner::new(
             mock_client(&server),
-            TurnkeyOrganizationId::new("org-test".to_string()),
+            TurnkeyOrganizationId::try_new(TEST_ORGANIZATION_ID.to_string()).unwrap(),
             Address::random(),
             Some(1),
         );
@@ -2197,6 +2647,41 @@ mod tests {
             error,
             SignerError::TransactionChainIdMismatch { signer: 1, tx: 999 }
         ));
+    }
+
+    #[tokio::test]
+    async fn signing_activity_needing_approval_returns_its_id_without_retry() {
+        for status in [
+            "ACTIVITY_STATUS_CONSENSUS_NEEDED",
+            "ACTIVITY_STATUS_AUTHENTICATORS_NEEDED",
+        ] {
+            let server = MockServer::start();
+            let mut response = pending_activity_body();
+            response["activity"]["id"] = serde_json::json!("approval-needed-activity");
+            response["activity"]["status"] = serde_json::json!(status);
+            let mock = server.mock(|when, then| {
+                when.method("POST")
+                    .path("/public/v1/submit/sign_transaction");
+                then.status(200)
+                    .header("Content-Type", "application/json")
+                    .json_body(response);
+            });
+            let client = mock_client(&server);
+            let error = client
+                .process_activity(
+                    &serde_json::json!({"type": "ACTIVITY_TYPE_SIGN_TRANSACTION_V2"}),
+                    "/public/v1/submit/sign_transaction",
+                )
+                .await
+                .unwrap_err();
+            let TurnkeyRequestError::Client(TurnkeyClientError::ActivityRequiresApproval(id)) =
+                error
+            else {
+                panic!("expected approval requirement for {status}, got {error:?}");
+            };
+            assert_eq!(id, "approval-needed-activity");
+            mock.assert_calls(1);
+        }
     }
 
     #[tokio::test]
@@ -2217,7 +2702,7 @@ mod tests {
 
         let error = client
             .sign_transaction(
-                TurnkeyOrganizationId::new("org-test".to_string()),
+                TurnkeyOrganizationId::try_new(TEST_ORGANIZATION_ID.to_string()).unwrap(),
                 0,
                 SignTransactionIntentV2 {
                     sign_with: Address::random().to_string(),
@@ -2256,7 +2741,7 @@ mod tests {
 
         let wallet = TurnkeyWallet::from_client(
             client,
-            TurnkeyOrganizationId::new("org-test".to_string()),
+            TurnkeyOrganizationId::try_new(TEST_ORGANIZATION_ID.to_string()).unwrap(),
             Address::random(),
             provider,
             1,
@@ -2270,11 +2755,12 @@ mod tests {
             .unwrap_err();
 
         // Turnkey signer errors surface through alloy's transport
-        // layer as Transport(LocalUsageError(Signer(Other(...)))) --
-        // the signer failure happens inside `send_transaction`.
+        // layer as Transport(LocalUsageError(Signer(Other(...)))). The
+        // signer fails while filling, before any raw send, so the error is
+        // marked as never broadcast.
         assert!(
-            matches!(error, EvmError::Transport(_)),
-            "expected Transport error wrapping signer failure, got: {error:?}"
+            error.was_never_broadcast() && matches!(error.underlying(), EvmError::Transport(_)),
+            "expected a never-broadcast Transport error wrapping signer failure, got: {error:?}"
         );
         let error_str = format!("{error:?}");
         assert!(
@@ -2408,18 +2894,14 @@ mod tests {
         WalletCtx {
             settings: TurnkeySettings {
                 address: Address::random(),
-                organization_id: TurnkeyOrganizationId::new("org-test".to_string()),
+                organization_id: TurnkeyOrganizationId::try_new(TEST_ORGANIZATION_ID.to_string())
+                    .unwrap(),
                 kms_api_key: None,
             },
             credentials: TurnkeyCredentials {
                 // A random P-256 scalar, hex-encoded — the exact shape the
-                // secrets file carries. (turnkey_api_key_stamper 0.4 has no
-                // private-key accessor on its generated keys, so mint one
-                // directly with p256.)
-                api_private_key: Some(TurnkeyApiPrivateKey::new(hex::encode(
-                    p256::ecdsa::SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng)
-                        .to_bytes(),
-                ))),
+                // secrets file carries.
+                api_private_key: Some(test_api_private_key()),
             },
             provider,
             required_confirmations: 1,
@@ -2524,7 +3006,7 @@ mod tests {
 
         let wallet = TurnkeyWallet::from_client(
             client,
-            TurnkeyOrganizationId::new("org-test".to_string()),
+            TurnkeyOrganizationId::try_new(TEST_ORGANIZATION_ID.to_string()).unwrap(),
             expected_address,
             provider,
             1,
@@ -2536,7 +3018,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_hash_only_drop_releases_nonce_for_reuse() {
+    async fn known_submission_drop_releases_nonce_for_reuse() {
+        assert_generic_absence_updates_ownership(true).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_hash_only_unknown_submission_retains_nonce_after_timeout() {
+        assert_generic_absence_updates_ownership(false).await;
+    }
+
+    async fn assert_generic_absence_updates_ownership(known_submission: bool) {
         let anvil = Anvil::new().spawn();
         let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
         let address = anvil.addresses()[0];
@@ -2561,7 +3052,7 @@ mod tests {
         let server = MockServer::start();
         let wallet = TurnkeyWallet::from_client(
             mock_client(&server),
-            TurnkeyOrganizationId::new("org-test".to_string()),
+            TurnkeyOrganizationId::try_new(TEST_ORGANIZATION_ID.to_string()).unwrap(),
             address,
             provider.clone(),
             1,
@@ -2571,26 +3062,46 @@ mod tests {
         wallet.restore_transaction(tx_hash).await.unwrap();
         provider.anvil_revert(snapshot_id).await.unwrap();
 
+        if known_submission {
+            let floor = wallet.provider().get_block_number().await.unwrap();
+            wallet
+                .in_flight
+                .record_submission_block(address, tx_hash, floor);
+            wallet.provider().anvil_mine(Some(3), None).await.unwrap();
+        }
+
         let result = wait_for_receipt_with_config(
             wallet.provider(),
             tx_hash,
             1,
             ReceiptWaitConfig {
+                submission: wallet.transaction_submission(tx_hash),
                 poll_interval: Duration::from_millis(1),
                 inclusion_timeout: Duration::from_millis(100),
                 confirmation_timeout: Duration::from_millis(100),
                 dropped_grace: Duration::ZERO,
                 dropped_consecutive_misses: 1,
+                dropped_head_advance: 0,
             },
         )
         .await;
-        assert!(matches!(
-            &result,
-            Err(EvmError::TransactionDropped {
-                tx_hash: dropped_hash,
-                ..
-            }) if *dropped_hash == tx_hash
-        ));
+        match (&result, known_submission) {
+            (
+                Err(EvmError::TransactionDropped {
+                    tx_hash: actual, ..
+                }),
+                true,
+            )
+            | (
+                Err(EvmError::ReceiptTimeout {
+                    tx_hash: actual, ..
+                }),
+                false,
+            ) => assert_eq!(*actual, tx_hash),
+            _ => panic!(
+                "unexpected absence verdict with known evidence {known_submission}: {result:?}"
+            ),
+        }
         release_in_flight_after_wait(
             &wallet.in_flight,
             &wallet.send_lock,
@@ -2605,11 +3116,27 @@ mod tests {
             .get_next_nonce(wallet.provider(), address)
             .await
             .unwrap();
-        assert_eq!(next_nonce, submitted_nonce);
+        assert_eq!(
+            next_nonce,
+            if known_submission {
+                submitted_nonce
+            } else {
+                submitted_nonce + 1
+            }
+        );
     }
 
     #[tokio::test]
-    async fn restored_prepared_drop_retains_nonce_for_exact_rebroadcast() {
+    async fn known_prepared_drop_retains_nonce_for_exact_rebroadcast() {
+        assert_prepared_absence_preserves_ownership(true).await;
+    }
+
+    #[tokio::test]
+    async fn restored_prepared_unknown_submission_retains_nonce_for_exact_rebroadcast() {
+        assert_prepared_absence_preserves_ownership(false).await;
+    }
+
+    async fn assert_prepared_absence_preserves_ownership(known_submission: bool) {
         let anvil = Anvil::new().spawn();
         let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
         let signer: PrivateKeySigner = anvil.keys()[0].clone().into();
@@ -2641,7 +3168,7 @@ mod tests {
         let server = MockServer::start();
         let wallet = TurnkeyWallet::from_client(
             mock_client(&server),
-            TurnkeyOrganizationId::new("org-test".to_string()),
+            TurnkeyOrganizationId::try_new(TEST_ORGANIZATION_ID.to_string()).unwrap(),
             address,
             provider.clone(),
             1,
@@ -2655,7 +3182,7 @@ mod tests {
         wallet.await_receipt(prepared.tx_hash()).await.unwrap();
         let restarted_wallet = TurnkeyWallet::from_client(
             mock_client(&server),
-            TurnkeyOrganizationId::new("org-test".to_string()),
+            TurnkeyOrganizationId::try_new(TEST_ORGANIZATION_ID.to_string()).unwrap(),
             address,
             provider.clone(),
             1,
@@ -2665,26 +3192,46 @@ mod tests {
         restarted_wallet.restore_prepared(&prepared).await;
         provider.anvil_revert(snapshot_id).await.unwrap();
 
+        if known_submission {
+            let floor = restarted_wallet
+                .provider()
+                .get_block_number()
+                .await
+                .unwrap();
+            restarted_wallet
+                .in_flight
+                .record_submission_block(address, prepared.tx_hash(), floor);
+            restarted_wallet
+                .provider()
+                .anvil_mine(Some(3), None)
+                .await
+                .unwrap();
+        }
+
         let result = wait_for_receipt_with_config(
             restarted_wallet.provider(),
             prepared.tx_hash(),
             1,
             ReceiptWaitConfig {
+                submission: restarted_wallet.transaction_submission(prepared.tx_hash()),
                 poll_interval: Duration::from_millis(1),
                 inclusion_timeout: Duration::from_millis(100),
                 confirmation_timeout: Duration::from_millis(100),
                 dropped_grace: Duration::ZERO,
                 dropped_consecutive_misses: 1,
+                dropped_head_advance: 0,
             },
         )
         .await;
-        assert!(matches!(
-            &result,
-            Err(EvmError::TransactionDropped {
-                tx_hash: dropped_hash,
-                ..
-            }) if *dropped_hash == prepared.tx_hash()
-        ));
+        match (&result, known_submission) {
+            (Err(EvmError::TransactionDropped { tx_hash, .. }), true)
+            | (Err(EvmError::ReceiptTimeout { tx_hash, .. }), false) => {
+                assert_eq!(*tx_hash, prepared.tx_hash());
+            }
+            _ => panic!(
+                "unexpected absence verdict with known evidence {known_submission}: {result:?}"
+            ),
+        }
         release_in_flight_after_wait(
             &restarted_wallet.in_flight,
             &restarted_wallet.send_lock,
@@ -2758,11 +3305,15 @@ mod tests {
         let wallet = TurnkeyWallet::new(WalletCtx {
             settings: TurnkeySettings {
                 address,
-                organization_id: TurnkeyOrganizationId::new(org_id),
+                organization_id: TurnkeyOrganizationId::try_new(org_id)
+                    .expect("Turnkey organization ID must be a UUID"),
                 kms_api_key: None,
             },
             credentials: TurnkeyCredentials {
-                api_private_key: Some(TurnkeyApiPrivateKey::new(api_key)),
+                api_private_key: Some(
+                    TurnkeyApiPrivateKey::try_new(api_key)
+                        .expect("Turnkey API private key must be valid P-256 hex"),
+                ),
             },
             provider,
             required_confirmations: 1,
@@ -2964,13 +3515,14 @@ mod tests {
         // the exact bypass a leftover blanket raw-payload allowance would
         // permit.
         let (_, allowed_digest) = policy_probe("MintAuth", 8453, orchestrator, address);
+        let api_private_key = TurnkeyApiPrivateKey::try_new(api_key).expect("valid api key");
         let client = TracingTurnkeyClient::for_stamper(
-            ApiStamper::local(&TurnkeyApiPrivateKey::new(api_key)).expect("stamper builds"),
+            ApiStamper::local(&api_private_key).expect("stamper builds"),
         )
         .expect("client builds");
         let hex_submission = client
             .sign_raw_payload(
-                TurnkeyOrganizationId::new(org_id),
+                TurnkeyOrganizationId::try_new(org_id).expect("valid organization id"),
                 TracingTurnkeyClient::current_timestamp().expect("clock is after the epoch"),
                 SignRawPayloadIntentV2 {
                     sign_with: address.to_string(),

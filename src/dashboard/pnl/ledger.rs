@@ -139,8 +139,12 @@ impl PnlLedger {
     async fn ingest_to_head(&self) -> Result<i64, PnlLedgerError> {
         self.reconcile_version().await?;
 
-        let head = head_rowid(&self.pool).await?;
         let mut checkpoint = self.checkpoint().await?;
+        // Compaction can delete the rows at and below the checkpoint, so
+        // MAX(rowid) can drop below it. No event can take those numbers
+        // (ADR 0025), so the ledger is complete up to the checkpoint and the
+        // head it reports must never go below a head it reported before.
+        let head = head_rowid(&self.pool).await?.max(checkpoint);
         record_checkpoint_lag(head, checkpoint);
         while checkpoint < head {
             checkpoint = self.ingest_batch(checkpoint, head).await?;
@@ -693,16 +697,17 @@ mod tests {
     use uuid::Uuid;
 
     use st0x_config::ExecutionThreshold;
-    use st0x_event_sorcery::StoreBuilder;
+    use st0x_event_sorcery::{StoreBuilder, compact_events};
     use st0x_evm::Chain;
     use st0x_execution::{ExecutorOrderId, SupportedExecutor};
     use st0x_finance::{FractionalShares, Positive, Symbol, Usd, Usdc};
     use st0x_float_macro::float;
 
     use crate::bot_gas::BotGasOperationCategory;
+    use crate::inventory::InventorySnapshot;
     use crate::offchain::order::OffchainOrderId;
     use crate::position::{PositionCommand, TradeId, TriggerReason};
-    use crate::test_utils::{persist_event, setup_test_db};
+    use crate::test_utils::{persist_event, pool_migrated_up_to, setup_test_db};
     use crate::usdc_rebalance::UsdcRebalanceId;
 
     use super::*;
@@ -980,6 +985,222 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(evidence_rowid, Some(2));
+    }
+
+    /// Version of the last migration before event rowids became
+    /// `AUTOINCREMENT`, reproducing the schema that reused deleted rowids.
+    const LAST_MIGRATION_BEFORE_UNIQUE_EVENT_ROWIDS: i64 = 20_260_925_161_411;
+
+    const WRAPPED_RATIO: u64 = 1_010_000_000_000_000_000;
+
+    /// Writes an `InventorySnapshot` event row and a snapshot covering it, so
+    /// `compact_events` deletes it. Raw rows: the ledger never reads this
+    /// aggregate and compaction only looks at type, id and sequence.
+    async fn persist_compactable_inventory_event(pool: &SqlitePool, sequence: i64) {
+        sqlx::query(
+            "INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type, \
+             event_version, payload, metadata) \
+             VALUES (?1, 'inventory', ?2, 'InventorySnapshotEvent::OnchainUsdc', '1.0', '{}', '{}')",
+        )
+        .bind(InventorySnapshot::AGGREGATE_TYPE)
+        .bind(sequence)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT OR REPLACE INTO snapshots \
+             (aggregate_type, aggregate_id, last_sequence, payload, timestamp) \
+             VALUES (?1, 'inventory', ?2, '{}', '2026-05-15T14:00:00Z')",
+        )
+        .bind(InventorySnapshot::AGGREGATE_TYPE)
+        .bind(sequence)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Persists a wrapped fill at `sequence` and its basis at `sequence + 1`.
+    async fn persist_wrapped_fill(pool: &SqlitePool, log_index: u64, sequence: i64) {
+        let fill = onchain_fill(log_index, 2);
+        let PositionEvent::OnChainOrderFilled { trade_id, .. } = &fill else {
+            unreachable!("onchain_fill returns an onchain fill event");
+        };
+        let applied = PositionEvent::OnChainFillApplied {
+            trade_id: trade_id.clone(),
+            underlying_per_wrapped: Some(U256::from(WRAPPED_RATIO)),
+            applied_at: timestamp(3),
+        };
+        persist_event::<Position>(pool, "AAPL", sequence, &fill).await;
+        persist_event::<Position>(pool, "AAPL", sequence + 1, &applied).await;
+    }
+
+    async fn stored_basis(pool: &SqlitePool, log_index: i64) -> Option<String> {
+        sqlx::query_scalar(
+            "SELECT underlying_per_wrapped_fixed18 FROM pnl_onchain_fill WHERE log_index = ?1",
+        )
+        .bind(log_index)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        .flatten()
+    }
+
+    /// Compaction deletes the newest rows after the ledger has checkpointed
+    /// on them. The fill and basis written next must still reach the ledger
+    /// instead of taking the deleted rowids at or below the checkpoint.
+    #[tokio::test]
+    async fn fill_written_after_compacting_the_newest_rows_reaches_the_ledger() {
+        let pool = setup_test_db().await;
+        let ledger = PnlLedger::new(pool.clone());
+        persist_event::<Position>(&pool, "AAPL", 1, &onchain_fill(1, 0)).await;
+        persist_compactable_inventory_event(&pool, 1).await;
+        ledger.catch_up().await.unwrap();
+        assert_eq!(compact_events::<InventorySnapshot>(&pool).await.unwrap(), 1);
+
+        persist_wrapped_fill(&pool, 7, 2).await;
+        ledger.catch_up().await.unwrap();
+
+        assert_eq!(
+            stored_basis(&pool, 7).await,
+            Some(WRAPPED_RATIO.to_string())
+        );
+    }
+
+    /// Compaction of the newest rows with no event written since lowers
+    /// MAX(rowid) below the checkpoint. The head the ledger reports, which
+    /// `/pnl` validates saved `asOfRowid` values against, must not go down.
+    #[tokio::test]
+    async fn reported_head_does_not_drop_when_the_newest_rows_are_compacted() {
+        let pool = setup_test_db().await;
+        let ledger = PnlLedger::new(pool.clone());
+        persist_event::<Position>(&pool, "AAPL", 1, &onchain_fill(1, 0)).await;
+        persist_compactable_inventory_event(&pool, 1).await;
+        let LedgerHead(reported) = ledger.catch_up().await.unwrap();
+        assert_eq!(compact_events::<InventorySnapshot>(&pool).await.unwrap(), 1);
+
+        let LedgerHead(after_compaction) = ledger.catch_up().await.unwrap();
+
+        assert_eq!(after_compaction, reported);
+    }
+
+    async fn event_rows(pool: &SqlitePool) -> Vec<(i64, String, String, i64)> {
+        sqlx::query_as(
+            "SELECT rowid, aggregate_type, aggregate_id, sequence FROM events ORDER BY rowid",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// On the old schema the ledger checkpoints on the newest row and
+    /// compaction then deletes it, along with rows between surviving ones.
+    /// The upgrade must keep every surviving rowid and hand the next event a
+    /// number above that checkpoint, which no surviving row reaches.
+    #[tokio::test]
+    async fn upgrade_keeps_rowids_and_starts_above_a_checkpoint_on_deleted_rows() {
+        let pool = pool_migrated_up_to(LAST_MIGRATION_BEFORE_UNIQUE_EVENT_ROWIDS).await;
+        persist_event::<Position>(&pool, "AAPL", 1, &onchain_fill(1, 0)).await;
+        persist_compactable_inventory_event(&pool, 1).await;
+        persist_event::<Position>(&pool, "AAPL", 2, &onchain_fill(2, 0)).await;
+        persist_compactable_inventory_event(&pool, 2).await;
+        persist_compactable_inventory_event(&pool, 3).await;
+        let LedgerHead(checkpoint) = PnlLedger::new(pool.clone()).catch_up().await.unwrap();
+        assert_eq!(compact_events::<InventorySnapshot>(&pool).await.unwrap(), 3);
+        let surviving = event_rows(&pool).await;
+
+        sqlx::migrate!().run(&pool).await.unwrap();
+
+        assert_eq!(event_rows(&pool).await, surviving);
+        persist_event::<Position>(&pool, "AAPL", 3, &onchain_fill(3, 0)).await;
+        let next_rowid = event_rows(&pool).await.last().unwrap().0;
+        assert!(
+            next_rowid > checkpoint,
+            "next rowid {next_rowid} must be above checkpoint {checkpoint}"
+        );
+    }
+
+    /// A ledger that already skipped an event below its checkpoint is
+    /// rebuilt after the upgrade, by this release or by the previous one
+    /// after a rollback: both run `LEDGER_VERSION` 2.
+    #[tokio::test]
+    async fn upgrade_rebuilds_a_ledger_that_skipped_an_event() {
+        let pool = pool_migrated_up_to(LAST_MIGRATION_BEFORE_UNIQUE_EVENT_ROWIDS).await;
+        let ledger = PnlLedger::new(pool.clone());
+        persist_wrapped_fill(&pool, 7, 1).await;
+        ledger.catch_up().await.unwrap();
+        sqlx::query("DELETE FROM pnl_onchain_fill")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::migrate!().run(&pool).await.unwrap();
+        ledger.catch_up().await.unwrap();
+
+        assert_eq!(
+            stored_basis(&pool, 7).await,
+            Some(WRAPPED_RATIO.to_string())
+        );
+    }
+
+    /// Columns sorted by name, indexes with their key columns, and whether
+    /// the table declares `AUTOINCREMENT`.
+    async fn table_shape(
+        pool: &SqlitePool,
+        table: &str,
+    ) -> (
+        Vec<(String, String, i64, Option<String>, i64)>,
+        Vec<(String, i64, String)>,
+        bool,
+    ) {
+        let columns = sqlx::query_as(
+            "SELECT name, type, \"notnull\", dflt_value, pk FROM pragma_table_xinfo(?1) \
+             ORDER BY name",
+        )
+        .bind(table)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let indexes = sqlx::query_as(
+            "SELECT CASE WHEN list.origin = 'c' THEN list.name ELSE list.origin END, \
+                    list.\"unique\", \
+                    (SELECT group_concat(name, ',') FROM \
+                        (SELECT name FROM pragma_index_info(list.name) ORDER BY seqno)) \
+             FROM pragma_index_list(?1) AS list ORDER BY 1",
+        )
+        .bind(table)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let sql: String =
+            sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1")
+                .bind(table)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+
+        (
+            columns,
+            indexes,
+            sql.to_uppercase().contains("AUTOINCREMENT"),
+        )
+    }
+
+    /// This crate keeps its own copy of the event store migrations, so a
+    /// schema change event-sorcery ships (such as its `declare_rowid`
+    /// migration, ported by ADR 0025) must be mirrored here. Column order is
+    /// ignored: columns added by `ALTER TABLE` land last in either copy.
+    #[tokio::test]
+    async fn event_store_schema_matches_event_sorcery() {
+        let ours = setup_test_db().await;
+        let upstream = sqlite_es::testing::create_test_pool().await.unwrap();
+
+        for table in ["events", "snapshots"] {
+            assert_eq!(
+                table_shape(&ours, table).await,
+                table_shape(&upstream, table).await,
+                "{table}"
+            );
+        }
     }
 
     /// Interleaved multi-entity history ingested with a batch size smaller

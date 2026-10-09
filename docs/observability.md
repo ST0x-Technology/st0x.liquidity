@@ -72,3 +72,31 @@ trace!(body = %text, "Wallet assets response body");
 let assets = serde_json::from_str::<Vec<WalletAsset>>(&text)?;
 trace!(target: "wallet", asset_count = assets.len(), "Listed wallet assets");
 ```
+
+## Registry reloads
+
+`registry_applied_generation` identifies the persisted copy the process runs.
+`registry_invalid` is one while latest content is refused or unusable, and
+clears when it is applied, equivalent to running, or confirmed as running. It is
+restored by observing latest content after a restart.
+
+`registry_reloads_total{result}` counts `applied`, `unchanged`, `refused`,
+`deferred`, `start_failed` and `fallback` outcomes.
+`registry_last_reload_timestamp_seconds{result}` records the last outcome time,
+restored from the manifest at boot. A refused generation is not rejudged;
+deferred approval/RPC checks retry with backoff. Refusal, startup failure and
+fallback emit error logs with generation, SHA-256 and reason.
+
+`registry_carried_forward_symbols` counts removed rows retained as disabled.
+`conductor_completion_only_symbols` counts symbols with services retained solely
+to finish durable work. `registry_reload_held_seconds` exposes deployment hold
+age; the watcher ignores holds older than fifteen minutes.
+`registry_fetch_errors_total` counts transient token-file access failures.
+
+Production remains pinned during the state-seeding rollout. Its watcher does not
+apply updates until the separate unpin release and matching t0.devops gate
+changes land. A refused token file does not alert: whoever publishes it checks
+`registry_invalid` and the "registry candidate refused" log. Fallback, which
+also covers startup failure, alerts through
+`liquidity-token-file-fallback-production` in
+`observability/alerting/liquidity.rules.yml`.

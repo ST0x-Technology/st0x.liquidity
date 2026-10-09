@@ -1026,7 +1026,9 @@ mod tests {
     use st0x_config::ExecutionThreshold;
     use st0x_config::HedgingAssets;
     use st0x_config::create_test_ctx_with_order_owner;
-    use st0x_config::{ChainAssets, ChainEquities, ChainEquityAsset, OperationMode};
+    use st0x_config::{
+        ChainAssets, ChainEquities, ChainEquityAsset, OperationMode, RebalancingMode,
+    };
     use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder};
     use st0x_evm::IERC20::{decimalsCall, symbolCall};
     use st0x_evm::{Chain, ReadOnlyEvm, USDC_HYPEREVM};
@@ -1771,7 +1773,7 @@ mod tests {
                 tokenized_equity_derivative: equity,
                 vault_ids: vec![],
                 trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -2451,7 +2453,7 @@ mod tests {
                 tokenized_equity_derivative: equity_token,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -2602,7 +2604,7 @@ mod tests {
                 tokenized_equity_derivative: equity_token,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
-                rebalancing: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -2797,7 +2799,7 @@ mod tests {
                             tokenized_equity_derivative: equity_token,
                             vault_ids: Vec::new(),
                             trading: OperationMode::Enabled,
-                            rebalancing: OperationMode::Disabled,
+                            rebalancing: RebalancingMode::Disabled,
                             wrapped_equity_recovery: OperationMode::Disabled,
                             operational_limit,
                             target_share: None,
@@ -3026,7 +3028,7 @@ mod tests {
                 tokenized_equity_derivative: equity_token,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -3165,7 +3167,7 @@ mod tests {
                 tokenized_equity_derivative: equity_token,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,

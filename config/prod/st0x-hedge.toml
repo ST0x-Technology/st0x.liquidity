@@ -117,8 +117,11 @@ ingestion_cutoff = "safe"
 # Seconds between fill-watch poll cycles on this chain (required; was the
 # global order_fill_poll_interval with a hidden default of 5).
 order_fill_poll_interval_secs = 5
-# Exactly one hedged chain is the primary: the one whose inventory the bot
-# polls and rebalances automatically. Fills are hedged on every hedged chain.
+# Exactly one hedged chain is the primary: it must be active, it always
+# carries the rebalancing services, and it is the default --network for
+# operator commands. Each rebalancing chain polls its own wallet and
+# recovers its own transfers (Robinhood rebalances its own DNUT); fills
+# are hedged on every hedged chain.
 primary = true
 # Alpaca's issuer wallet on this chain -- ERC-20 transfers for redemption go
 # here. Per chain: a redemption delivers tokens that exist on one chain, so
@@ -144,24 +147,57 @@ required_confirmations = 12
 lifecycle = "observe-only"
 required_confirmations = 1
 
-# Robinhood Chain (an Arbitrum Orbit L2, chain id 4663): a prefunded
-# hedge-only secondary. Fills on its orderbook are ingested, validated
-# against USDG (pinned in code) and hedged on Alpaca; inventory is topped up
-# by hand and no asset may enable rebalancing (no wrapper or CCTP domain is
-# wired there). Gas is ETH.
+# Robinhood Chain (an Arbitrum Orbit L2, chain id 4663): an active
+# secondary. Fills on its orderbook are ingested, validated against USDG
+# (pinned in code) and hedged on Alpaca. Equity rebalances against Alpaca
+# (mint, wrap, deposit and back) for the listings the token file enables;
+# cash does not, since USDG has no corridor yet. Staging watches the same
+# inventory and stays hedge-only, so only prod moves it. Gas is ETH.
+#
+# Rollback: this release also ships the recovery stack (RAI-2596, release R
+# in SPEC.md), so the previous release is a binary below R. A tag rollback
+# is safe only before this release has run any equity operation on any
+# chain: every redemption it runs, on Base too, records a SendPrepared event
+# the previous release cannot load. So if the switch-on release does not
+# boot, roll back to the previous release. Once it has moved equity, the
+# stop is a paused generation on this release, or a roll forward. To pause,
+# publish a st0x.registry generation with the listing's Robinhood
+# rebalancing at "paused" and bump [registry].generation here; this file
+# cannot set it, since [registry] refuses inline equities tables. "paused"
+# still runs the Robinhood startup preflights (OPERATOR_ROLE, approvals,
+# issuer and wrapper), so it does not fix a release that fails to boot. A
+# binary rollback after that follows SPEC.md's rules for going below R.
+# Reverting only this table to "prefunded" fails validate-config while the
+# token file enables Robinhood rebalancing.
+#
+# Neither state is neutral for DNUT. "paused" keeps Robinhood's vault in
+# the total but stops it redeeming, so sells into that vault drain the
+# broker's DNUT toward the hedge floor with no planner action: keep the
+# pause short and watch the broker's DNUT position. "disabled" drops the
+# vault from the total, so Base (target 0.4, no operational_limit) is far
+# over its band and redeems down to its target, several hundred DNUT, in
+# one operation. Restoring Base DNUT to 0.5 avoids that only before the
+# switch-on mints; after them Base still holds over 0.55 of Base + Alpaca.
+# So a generation that disables Robinhood DNUT also pauses Base DNUT, or
+# sets its target_share within 0.05 of Base / (Base + Alpaca) at live
+# balances, or the operator expects that redemption.
 
 [chains.robinhood]
-lifecycle = "prefunded"
+lifecycle = "active"
 # ~1 s at the ~100 ms block cadence: enough for a load-balanced RPC to have
-# seen the startup USDG approval before it is treated as settled.
+# seen a transaction before it is treated as settled. It gates the startup
+# USDG, wrap and deposit approvals and every wrap, deposit, withdrawal,
+# unwrap and redemption transfer on 4663.
 required_confirmations = 10
 
 [chains.robinhood.trading]
 # RaindexV6 on Robinhood Chain (st0x.raindex-deploy docs/CHAINS.md).
 orderbook = "0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20"
 inventory_mode = "managed"
-# No venue adapters: Bebop is off on Robinhood.
-inventory_adapters = []
+# Bebop's Robinhood RFQ hook; it holds OPERATOR_ROLE on the 4663 inventory.
+inventory_adapters = [
+  { venue = "bebop", operator = "0x242FdEc55623187E80A690ff15302e63dddd7130" },
+]
 # The single RaindexInventory on 4663; it owns the orders and vaults, so it
 # is the vault owner too. The bot wallet must hold OPERATOR_ROLE on it.
 inventory = "0x1eFd85E6C384fAD9B80C6D508E9098Eb91C4eD30"
@@ -176,7 +212,11 @@ ingestion_cutoff = "confirmations"
 ingestion_cutoff_confirmations = 600
 order_fill_poll_interval_secs = 5
 primary = false
-# No redemption_wallet: a hedge-only chain redeems nothing.
+# Alpaca's issuer wallet on this chain, where redemption transfers go.
+# st0x.issuance signs every chain with one key and its redemption poller
+# watches transfers to that key's address, so this equals Base's. That
+# address has sent transactions on 4663 (nonce 556 on 2026-10-06).
+redemption_wallet = "0x3d0CD66EFA66c05d86c3d4316B03eAE87ab9E8aE"
 
 [chains.robinhood.trading.assets.cash]
 # The USDG vault the orders quote against; polled, never rebalanced.
@@ -244,13 +284,27 @@ deviation = 0.05
 
 # Equity allocation across the hedged chains (st0x.liquidity RAI-2082). Base
 # keeps the 50% target and 5% band the retired [rebalancing.equity] table
-# carried; Robinhood is hedge-only and Ethereum runs no orderbook, so neither
-# gets a target and the broker holds the other 50%. alpaca_floor keeps a
-# tenth of every equity's total at the broker as the hedging reserve (inert
-# beside a 50% target: a mint stops there anyway). min_operation_usd sits two
-# orders of magnitude above a Base mint's gas while still letting the cheapest
-# listings rebalance; cooldown_secs matches the inventory staleness bound, so
-# a limit-truncated transfer re-fires once per poll window, not every tick.
+# carried. Robinhood gets no chain-wide target: each listing it rebalances
+# sets its own target_share in the token file, and validation refuses one
+# that does not. Ethereum runs no orderbook. alpaca_floor only caps mints:
+# no mint takes the broker below a tenth of the equity's total. Nothing
+# redeems when the broker is under it, so a symbol rebalanced on two chains
+# needs targets whose upper bands leave the floor: DNUT's Base and Robinhood
+# rows in the token file both set target_share = 0.4, and 0.45 + 0.45 keeps
+# the broker at or above 0.1 only while Robinhood redeems as fast as it goes
+# over its band: 25 DNUT per operation (its operational_limit), one at a
+# time and at least cooldown_secs apart, about 300 an hour. Sustained sells
+# into the Robinhood vault hedge faster than that and take the broker below
+# 0.1, down to the hedge floor. The two DNUT rows also plan as one: while
+# Robinhood's DNUT poll is older than inventory_staleness_bound_secs or a
+# Robinhood DNUT transfer runs, Base DNUT neither mints nor redeems either.
+# equity_plan_declined_total has only a reason label, so watch the
+# "Declined equity plan" logs instead: symbol DNUT, chain robinhood, reason
+# chain_stale or chain_unpolled (inflight is logged per symbol, no chain).
+# min_operation_usd sits two orders of magnitude above a Base mint's gas
+# while still letting the cheapest listings rebalance; cooldown_secs matches
+# the inventory staleness bound, so a limit-truncated transfer re-fires once
+# per poll window, not every tick.
 [rebalancing.allocation]
 targets = { base = 0.5 }
 alpaca_floor = 0.1
@@ -302,8 +356,13 @@ realert_interval = 1
 [alerts.low_balance_thresholds]
 base = "0.05"
 ethereum = "0.005"
-# Robinhood only pays for the startup USDG approval (~50k gas at ~0.05 gwei,
-# under 0.00001 ETH), so 0.001 ETH is hundreds of approvals of headroom.
+# Robinhood pays for the startup approvals and about four transactions per
+# equity mint or redemption (wrap or unwrap, vault deposit or withdraw, the
+# redemption transfer). At ~0.05 gwei each is under 0.00001 ETH. This is
+# also the equity gas gate: below it, the bot refuses every Robinhood
+# operation until the wallet is topped up, so 0.001 ETH is a balance the
+# wallet must keep, not headroom it can spend. Fund it with this threshold
+# plus the expected spend.
 robinhood = "0.001"
 
 # USDC vault and rebalancing settings.
@@ -335,4 +394,4 @@ retired_symbols = []
 # [assets.equities.<SYM>]) come from st0x.registry's token file in the bucket.
 [registry]
 url = "gs://t0-artifacts-tokens/production/tokens.toml"
-generation = 1790341753647581
+generation = 1791378253362331

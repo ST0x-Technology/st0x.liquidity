@@ -2,6 +2,11 @@
 //! and trade processing. [`Conductor::run`] is the entry point.
 
 mod builder;
+mod completion;
+mod registry_candidate;
+pub(crate) use registry_candidate::{
+    CandidateContractError, validate_registry_candidate_contracts,
+};
 
 pub use builder::configured_equity_symbols;
 mod exit;
@@ -37,17 +42,20 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
+use st0x_bridge::corridor::UsdcCorridor;
 use st0x_config::{
-    AlertsCtx, BrokerCtx, ChainAssets, ChainRole, Ctx, CtxError, ExecutionThreshold, HedgedChain,
-    HedgingAssets, InventoryMode, IssuanceStatusCtx, OnchainWalletCtx, OperationMode,
-    OrchestratorAddresses, RebalancingCtx,
+    AlertsCtx, BrokerCtx, ChainAssets, ChainRegistry, ChainRole, Ctx, CtxError, ExecutionThreshold,
+    HedgedChain, HedgingAssets, InventoryMode, IssuanceStatusCtx, OnchainWalletCtx, OperationMode,
+    OrchestratorAddresses, RebalancingCtx, RebalancingMode,
 };
 use st0x_dto::Statement;
 use st0x_event_sorcery::{
     AggregateError, EventSourced, LifecycleError, Projection, ProjectionError, RetryOnBusy,
     SendError, Store, StoreBuilder, compact_events, incremental_vacuum, load_all_ids, load_entity,
 };
-use st0x_evm::{Chain, Evm, IERC20, OpenChainErrorRegistry, ReadOnlyEvm, Wallet};
+use st0x_evm::{
+    Chain, Evm, IERC20, OpenChainErrorRegistry, PreparedTransaction, ReadOnlyEvm, Wallet,
+};
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaWalletService, BuyingPowerReservationCents,
     ClientOrderId, CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason,
@@ -68,17 +76,22 @@ use crate::bot_gas::{
     BotGasCostLedger, BotGasReceiptCost, BotGasReceiptCostEnqueuer, RecordBotGasReceiptCostCtx,
     RecordBotGasReceiptCostJobQueue,
 };
+use crate::cctp_burn::{
+    CctpBurnOperation, RestoredCctpBurns, bot_cctp_bridge, restore_pending_cctp_burns,
+};
 use crate::conductor::exit::{ConductorExit, ConductorExitError, MonitorTaskError};
 use crate::conductor::job::{BACKPRESSURE_RESCHEDULE_LIMIT, BackpressureStreak};
 use crate::conductor::monitor::order_fills::{CutoffProbe, probe_cutoff_block_support};
+use crate::dashboard::equity_price::{EquityPriceStore, MarkListener};
 use crate::dashboard::pnl::{LedgerHead, PnlLedger, PnlLedgerReactor};
 use crate::dashboard::{Broadcaster, DashboardTradeDelivery};
 use crate::database_file_lock::{DatabaseFileLock, acquire_database_file_lock};
 use crate::equity_redemption::{
-    EquityRedemption, RedemptionAggregateId, interrupted_redemption_ids,
-    symbols_with_stuck_redemptions,
+    EquityRedemption, RedemptionAggregateId, interrupted_redemption_ids, stuck_redemptions,
 };
-use crate::inventory::{BroadcastingInventory, Inventory, InventorySnapshot, PollFreshness, Venue};
+use crate::inventory::{
+    BroadcastingInventory, EquityWalletPolling, InventorySnapshot, PollFreshness,
+};
 use crate::mint_authorization::{
     ConfiguredMintAuthorizer, MintAuthorizationService, VaultModeReader,
 };
@@ -124,15 +137,16 @@ use crate::rebalancing::equity::{
     ResumeTokenizationTarget, TransferEquityToHedging, TransferEquityToHedgingCtx,
     TransferEquityToMarketMaking, TransferEquityToMarketMakingCtx,
 };
-use crate::rebalancing::trigger::{GUARD_GENERATION, GuardGeneration, GuardState};
+use crate::rebalancing::trigger::{FillPriceOrMark, GUARD_GENERATION, GuardGeneration, GuardState};
 use crate::rebalancing::usdc::{
     RecheckUsdcDeposit, RecoverCctpMint, RestoredDepositSends, TransferUsdcToHedging,
     TransferUsdcToHedgingCtx, TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
-    UsdcDriverPause, UsdcSettlementParams, deposit_send_required_confirmations,
+    UnrecordedGuardRelease, UsdcDriverPause, UsdcSettlementParams,
 };
 use crate::rebalancing::{
     BaseWallet, ChainRebalancingConfig, ChainWallets, EthereumWallet, RebalancerServices,
-    RebalancingSchedulers, RebalancingService, RebalancingServiceConfig, to_wrapped_equities,
+    RebalancingSchedulers, RebalancingService, RebalancingServiceConfig, UsdcCorridorEndpoints,
+    to_wrapped_equities, usdc_gas_readiness_by_chain,
 };
 use crate::startup::StartupToken;
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
@@ -154,14 +168,18 @@ use crate::trading::onchain::skipped_fill::{
 use crate::trading::onchain::trade_accountant::{
     DexTradeAccountingJobQueue, NormalizedFillEconomicsError, TradeAccountingError,
 };
-use crate::unwrapped_equity_recovery::{UnwrappedEquityRecovery, UnwrappedEquityRecoveryServices};
+use crate::unwrapped_equity_recovery::{
+    UnwrappedEquityRecovery, UnwrappedEquityRecoveryId, UnwrappedEquityRecoveryServices,
+};
 use crate::usdc_rebalance::UsdcRebalance;
 use crate::vault_lookup::{VaultLookup, VaultRegistryLookup};
 use crate::vault_registry::{
     SeedVaultRegistry, SeedVaultRegistryCtx, SeedVaultRegistryJobQueue, VaultRegistry,
     VaultRegistryCommand, VaultRegistryId,
 };
-use crate::wrapped_equity_recovery::{WrappedEquityRecovery, WrappedEquityRecoveryServices};
+use crate::wrapped_equity_recovery::{
+    WrappedEquityRecovery, WrappedEquityRecoveryId, WrappedEquityRecoveryServices,
+};
 
 pub(crate) use builder::CqrsFrameworks;
 use manifest::{BuiltFrameworks, QueryManifest};
@@ -193,6 +211,7 @@ pub(crate) struct SupervisorStartupTokens {
     pub(crate) hyperevm_gas_monitor: StartupToken,
     pub(crate) robinhood_gas_monitor: StartupToken,
     pub(crate) trading_schedule_monitor: StartupToken,
+    pub(crate) hedge_stall_monitor: StartupToken,
 }
 
 /// Opens an apalis-side pool (sqlx 0.8) against the same database as the
@@ -1013,6 +1032,7 @@ pub(crate) struct ServerHandles {
     pub(crate) process_tx_cell: Arc<tokio::sync::OnceCell<crate::api::ProcessTxHandle>>,
     pub(crate) pnl_ledger: Arc<PnlLedger>,
     pub(crate) projection_maintenance: Arc<projection_pause::ProjectionMaintenance>,
+    pub(crate) equity_prices: EquityPriceStore,
 }
 
 async fn setup_trading_schedule(
@@ -1055,6 +1075,7 @@ impl Conductor {
             process_tx_cell,
             pnl_ledger,
             projection_maintenance,
+            equity_prices,
         }: ServerHandles,
         shutdown_token: CancellationToken,
         startup_tokens: ConductorStartupTokens,
@@ -1087,7 +1108,13 @@ impl Conductor {
         let onchain_trade =
             setup_onchain_trade_store(&pool, dashboard_delivery.broadcaster.clone()).await?;
 
-        let pnl_ledger_reactor = setup_pnl_ledger(pnl_ledger).await?;
+        // Operational alerts are structured ERROR logs; delivery to humans
+        // happens downstream in the log pipeline, so there is no per-channel
+        // transport to configure and nothing here that can fail.
+        let notifier: Arc<dyn Notifier> = Arc::new(LogNotifier);
+        info!("Operational alerts will be emitted as structured logs");
+
+        let pnl_ledger_reactor = setup_pnl_ledger(pnl_ledger, notifier.as_ref()).await;
 
         let (record_bot_gas_receipt_cost_queue, record_bot_gas_receipt_cost_ctx) =
             setup_bot_gas_receipt_cost(&pool, &apalis_pool, &ctx, pnl_ledger_reactor.clone())
@@ -1107,12 +1134,6 @@ impl Conductor {
         // their snapshots; a deferred read-to-write upgrade can fail
         // immediately instead of waiting for the current writer.
         catch_up_lifecycle_failures(&pool).await?;
-
-        // Operational alerts are structured ERROR logs; delivery to humans
-        // happens downstream in the log pipeline, so there is no per-channel
-        // transport to configure and nothing here that can fail.
-        let notifier: Arc<dyn Notifier> = Arc::new(LogNotifier);
-        info!("Operational alerts will be emitted as structured logs");
 
         // One freshness tracker shared by the inventory poller (writer), the
         // daily portfolio capture gate, and the rebalancing staleness guard
@@ -1137,6 +1158,7 @@ impl Conductor {
             cctp_mint_recovery,
             usdc_driver_pause,
             usdc_store: recovery_usdc_store,
+            cctp_burn_store,
             wrapped_equity_recovery_store,
             unwrapped_equity_recovery_store,
             mint_store,
@@ -1165,6 +1187,7 @@ impl Conductor {
                 telemetry: telemetry.clone(),
                 notifier: notifier.clone(),
                 record_bot_gas_receipt_cost_queue: record_bot_gas_receipt_cost_queue.clone(),
+                equity_prices: equity_prices.clone(),
             },
             &backfill_queues,
         ))
@@ -1287,6 +1310,7 @@ impl Conductor {
             wallet_polling,
             tokenizer,
             wrappers,
+            equity_prices,
             projection_maintenance,
             shutdown_token: shutdown_token.clone(),
             startup_token: startup_tokens.apalis_monitor,
@@ -1366,6 +1390,7 @@ impl Conductor {
             cctp_mint_recovery,
             usdc_driver_pause,
             usdc_store: recovery_usdc_store,
+            cctp_burn_store,
         });
 
         publish_process_tx_handle(
@@ -1566,21 +1591,59 @@ impl Drop for Conductor {
 /// shared with `AppState` (the /pnl handler calls `catch_up` per request);
 /// sharing keeps ingestion serialized on the instance's internal mutex. The
 /// startup catch-up performs first-deploy backfill and `LEDGER_VERSION`
-/// rebuilds here, at boot, so that cost can never land inside a command
-/// dispatch or a /pnl request; on a normal restart it is a no-op (the bot is
-/// the sole writer of its database, so no events accumulate while it is
-/// down).
-async fn setup_pnl_ledger(ledger: Arc<PnlLedger>) -> anyhow::Result<Arc<PnlLedgerReactor>> {
+/// rebuilds here, at boot, so that cost stays out of command dispatches and
+/// /pnl requests; on a normal restart it is a no-op (the bot is the sole
+/// writer of its database, so no events accumulate while it is down).
+///
+/// A failed catch up does not stop startup: the ledger is a read model and
+/// must never keep the bot from hedging. The failure pages the operator, is
+/// counted in `pnl_ledger_catch_up_failures_total`, and /pnl answers 500 and
+/// logs the ingestion error until ingestion recovers. The next caller of
+/// `catch_up` retries: the reactor inside the command dispatch of each source
+/// event, and every /pnl request. After a transient failure during a rebuild,
+/// that caller carries the rest of it: a dispatch for up to about a minute, a
+/// /pnl request for up to `PNL_CATCH_UP_TIMEOUT` before it answers 503.
+async fn setup_pnl_ledger(
+    ledger: Arc<PnlLedger>,
+    notifier: &dyn Notifier,
+) -> Arc<PnlLedgerReactor> {
     let started_at = Instant::now();
-    let LedgerHead(head) = ledger.catch_up().await?;
-    info!(
-        target: "startup",
-        head,
-        elapsed = ?started_at.elapsed(),
-        "PnL ledger caught up at startup"
-    );
+    match ledger.catch_up().await {
+        Ok(LedgerHead(head)) => info!(
+            target: "startup",
+            head,
+            elapsed = ?started_at.elapsed(),
+            "PnL ledger caught up at startup"
+        ),
+        Err(error) => {
+            // The top level message of `Database` and `Stream` hides the
+            // SQLite or payload error the operator needs; render the chain.
+            let error = format!("{:#}", anyhow::Error::from(error));
+            error!(
+                target: "startup",
+                %error,
+                elapsed = ?started_at.elapsed(),
+                "PnL ledger failed to catch up at startup; starting without it"
+            );
+            if let Err(alert_error) = notifier
+                .notify(&format!(
+                    "PnL ledger failed to catch up at startup ({error}). The bot started \
+                     without it and keeps hedging; /pnl fails until ingestion recovers. \
+                     Watch pnl_ledger_catch_up_failures_total and \
+                     pnl_ledger_checkpoint_lag_events."
+                ))
+                .await
+            {
+                warn!(
+                    target: "startup",
+                    %alert_error,
+                    "Failed to deliver PnL ledger startup alert"
+                );
+            }
+        }
+    }
 
-    Ok(Arc::new(PnlLedgerReactor::new(ledger)))
+    Arc::new(PnlLedgerReactor::new(ledger))
 }
 
 /// Builds the bot-gas cost-recording wiring (ADR 0020): the event store, the
@@ -1630,38 +1693,97 @@ fn build_record_bot_gas_receipt_cost_ctx(
     }))
 }
 
-fn base_wallet_equity_recovery_enabled(ctx: &Ctx, symbol: &Symbol) -> bool {
-    ctx.chains.primary().assets.is_trading_enabled(symbol)
-        || ctx.chains.primary().assets.is_rebalancing_enabled(symbol)
-        || ctx
-            .chains
-            .primary()
-            .assets
-            .is_wrapped_equity_recovery_enabled(symbol)
+/// Whether a chain's wallet is polled for `symbol`'s tokens: any equity the
+/// chain trades, rebalances or recovers can be left in its bot wallet.
+fn wallet_equity_polled(assets: &ChainAssets, symbol: &Symbol) -> bool {
+    assets.is_trading_enabled(symbol)
+        || assets.rebalancing_mode(symbol).keeps_services()
+        || assets.is_wrapped_equity_recovery_enabled(symbol)
 }
 
-fn base_wallet_unwrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Address> {
-    ctx.chains
-        .primary()
-        .assets
+fn wallet_unwrapped_equity_token_addresses(assets: &ChainAssets) -> HashMap<Symbol, Address> {
+    assets
         .equities
         .symbols
         .iter()
-        .filter(|(symbol, _)| base_wallet_equity_recovery_enabled(ctx, symbol))
+        .filter(|(symbol, _)| wallet_equity_polled(assets, symbol))
         .map(|(symbol, config)| (symbol.clone(), config.tokenized_equity))
         .collect()
 }
 
-fn base_wallet_wrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Address> {
-    ctx.chains
-        .primary()
-        .assets
+fn wallet_wrapped_equity_token_addresses(assets: &ChainAssets) -> HashMap<Symbol, Address> {
+    assets
         .equities
         .symbols
         .iter()
-        .filter(|(symbol, _)| base_wallet_equity_recovery_enabled(ctx, symbol))
+        .filter(|(symbol, _)| wallet_equity_polled(assets, symbol))
         .map(|(symbol, config)| (symbol.clone(), config.tokenized_equity_derivative))
         .collect()
+}
+
+/// The equity wallet of every chain that rebalances equity, on the signer
+/// its tokenization uses. A hedge-only chain moves no equity through its
+/// wallet, so it is not polled. Each chain's polling also covers the
+/// listings with unfinished equity work on it, even where trading,
+/// rebalancing and recovery are off, so that work can finish.
+fn equity_wallet_polling(
+    ctx: &Ctx,
+    tokenizations: &HedgedChainTokenizations,
+    unfinished: &completion::UnfinishedListings,
+) -> anyhow::Result<BTreeMap<Chain, EquityWalletPolling>> {
+    ctx.chains
+        .hedged()
+        .filter_map(|hedged| {
+            let tokenization = tokenizations.get(&hedged.chain)?;
+            let EquityTokenization::Rebalancing(_) = tokenization.equity else {
+                return None;
+            };
+
+            Some(completion_wallet_token_addresses(hedged, unfinished).map(
+                |(unwrapped_token_addresses, wrapped_token_addresses)| {
+                    (
+                        hedged.chain,
+                        EquityWalletPolling {
+                            wallet: tokenization.wallet.clone(),
+                            unwrapped_token_addresses,
+                            wrapped_token_addresses,
+                        },
+                    )
+                },
+            ))
+        })
+        .collect()
+}
+
+/// One chain's polled token addresses: its polled listings plus every
+/// listing with unfinished equity work on that chain.
+fn completion_wallet_token_addresses(
+    hedged: &HedgedChain,
+    unfinished: &completion::UnfinishedListings,
+) -> anyhow::Result<(HashMap<Symbol, Address>, HashMap<Symbol, Address>)> {
+    let mut unwrapped_equity_token_addresses =
+        wallet_unwrapped_equity_token_addresses(&hedged.assets);
+    let mut wrapped_equity_token_addresses = wallet_wrapped_equity_token_addresses(&hedged.assets);
+    let chain = hedged.chain;
+    for (_, symbol) in unfinished
+        .iter()
+        .filter(|(unfinished_chain, _)| *unfinished_chain == chain)
+    {
+        let asset = hedged
+            .assets
+            .equities
+            .symbols
+            .get(symbol)
+            .with_context(|| {
+                format!("unfinished equity work requires the {symbol} listing on {chain}")
+            })?;
+        unwrapped_equity_token_addresses.insert(symbol.clone(), asset.tokenized_equity);
+        wrapped_equity_token_addresses.insert(symbol.clone(), asset.tokenized_equity_derivative);
+    }
+    Ok((
+        unwrapped_equity_token_addresses,
+        wrapped_equity_token_addresses,
+    ))
 }
 
 /// The startup approval targets of every hedged chain, keyed by chain: its
@@ -1981,6 +2103,9 @@ struct RebalancingInfrastructure {
     /// recovery handle so `fail-usdc-transfer` sends `FailBridging` through the
     /// live reactor rather than a standalone store.
     usdc_store: Arc<Store<UsdcRebalance>>,
+    /// The `CctpBurnOperation` store, published on the recovery handle for
+    /// the capital `cctp-bridge` route after the startup burn restore.
+    cctp_burn_store: Arc<Store<CctpBurnOperation>>,
     wrapped_equity_recovery_store: Arc<Store<WrappedEquityRecovery>>,
     unwrapped_equity_recovery_store: Arc<Store<UnwrappedEquityRecovery>>,
     mint_store: Arc<Store<TokenizedEquityMint>>,
@@ -2013,6 +2138,7 @@ struct RebalancingDeps {
     telemetry: TelemetrySender,
     notifier: Arc<dyn crate::alerts::Notifier>,
     record_bot_gas_receipt_cost_queue: RecordBotGasReceiptCostJobQueue,
+    equity_prices: EquityPriceStore,
 }
 
 /// Position + rebalancing infrastructure produced during conductor startup.
@@ -2032,6 +2158,7 @@ struct PositionAndRebalancing {
     cctp_mint_recovery: Arc<dyn RecoverCctpMint>,
     usdc_driver_pause: Arc<UsdcDriverPause>,
     usdc_store: Arc<Store<UsdcRebalance>>,
+    cctp_burn_store: Arc<Store<CctpBurnOperation>>,
     wrapped_equity_recovery_store: Arc<Store<WrappedEquityRecovery>>,
     unwrapped_equity_recovery_store: Arc<Store<UnwrappedEquityRecovery>>,
     mint_store: Arc<Store<TokenizedEquityMint>>,
@@ -2062,7 +2189,7 @@ fn build_wrapper<Signer: Wallet + Clone>(
 
 /// The signer for `chain`. An exhaustive match, so a new variant must name
 /// its wallet here rather than silently inheriting another chain's.
-fn chain_wallet(
+pub(crate) fn chain_wallet(
     wallet_ctx: &OnchainWalletCtx,
     chain: Chain,
 ) -> anyhow::Result<&Arc<dyn Wallet<Provider = RootProvider>>> {
@@ -2113,25 +2240,53 @@ type HedgedChainTokenizations =
     BTreeMap<Chain, ChainTokenization<Arc<dyn Wallet<Provider = RootProvider>>>>;
 
 /// One [`ChainTokenization`] per hedged chain. The primary always carries
-/// the equity leg: the rebalancer, the cash corridor and the recovery jobs
-/// run on its services until chain selection moves into the global
-/// rebalancer. A secondary carries it only when one of its equities opts
+/// the equity leg: the rebalancer and the recovery jobs run on its services
+/// until chain selection moves into the global rebalancer. Each cash
+/// corridor runs on its own chain's services. A secondary carries it only when one of its equities opts
 /// into rebalancing; otherwise it is hedge-only, keeps just its signer, and
 /// is logged as such. A chain carrying the leg without its own redemption
 /// wallet refuses startup naming the chain, rather than borrowing the
 /// primary's: tokens sent to another chain's issuer address are lost.
+#[cfg(test)]
 fn build_chain_tokenizations(
     ctx: &Ctx,
     wallet_ctx: &OnchainWalletCtx,
 ) -> anyhow::Result<HedgedChainTokenizations> {
+    build_chain_tokenizations_for_completion(ctx, wallet_ctx, &BTreeSet::new())
+}
+
+fn build_chain_tokenizations_for_completion(
+    ctx: &Ctx,
+    wallet_ctx: &OnchainWalletCtx,
+    unfinished: &completion::UnfinishedListings,
+) -> anyhow::Result<HedgedChainTokenizations> {
     let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
+    for (chain, symbol) in unfinished {
+        let hedged = ctx.chains.hedged_chain(*chain).with_context(|| {
+            format!(
+                "unfinished equity work requires a hedged {chain} chain: keep {chain} \
+                     configured, with its {symbol} rebalancing \"paused\" to stop new work, \
+                     until that transfer or recovery completes"
+            )
+        })?;
+        anyhow::ensure!(
+            hedged.assets.equities.symbols.contains_key(symbol),
+            "unfinished equity work requires the {symbol} listing on {chain}: keep the listing, \
+             with rebalancing \"paused\" to stop new work, until that transfer or recovery \
+             completes"
+        );
+    }
 
     ctx.chains
         .hedged_with_roles()
         .map(|(role, hedged)| {
             let chain = hedged.chain;
             let wallet = chain_wallet(wallet_ctx, chain)?.clone();
-            let equity = if role.rebalances_equity(&hedged.assets) {
+            let equity = if role.rebalances_equity(&hedged.assets)
+                || unfinished
+                    .iter()
+                    .any(|(unfinished_chain, _)| *unfinished_chain == chain)
+            {
                 EquityTokenization::Rebalancing(build_equity_tokenization_services(
                     ctx,
                     alpaca_auth,
@@ -2195,6 +2350,32 @@ fn build_equity_tokenization_services(
     })
 }
 
+/// Secondary listings with recovery enabled, rebalancing disabled and no
+/// unfinished work: the recovery-only state a listing keeps while it drains,
+/// left in place after the work finished.
+fn idle_recovery_only_secondary_listings(
+    chains: &ChainRegistry,
+    unfinished: &completion::UnfinishedListings,
+) -> BTreeSet<(Chain, Symbol)> {
+    chains
+        .hedged_with_roles()
+        .filter(|(role, _)| *role == ChainRole::Secondary)
+        .flat_map(|(_, hedged)| {
+            hedged
+                .assets
+                .equities
+                .symbols
+                .iter()
+                .filter(|(_, equity)| {
+                    equity.wrapped_equity_recovery == OperationMode::Enabled
+                        && equity.rebalancing == RebalancingMode::Disabled
+                })
+                .map(|(symbol, _)| (hedged.chain, symbol.clone()))
+        })
+        .filter(|listing| !unfinished.contains(listing))
+        .collect()
+}
+
 impl PositionAndRebalancing {
     async fn setup(rebalancing_ctx: RebalancingCtx, deps: RebalancingDeps) -> anyhow::Result<Self> {
         // Built exactly once: the Single-Framework-Instance rule
@@ -2211,17 +2392,45 @@ impl PositionAndRebalancing {
 
         let wallet_ctx = deps.ctx.wallet()?;
         let wallets = ChainWallets::from_wallet_ctx(wallet_ctx);
-        let tokenizations = build_chain_tokenizations(&deps.ctx, wallet_ctx)?;
+        let unfinished = completion::unfinished_listings(&deps.pool).await?;
+        for (chain, symbol) in idle_recovery_only_secondary_listings(&deps.ctx.chains, &unfinished)
+        {
+            warn!(
+                %chain,
+                %symbol,
+                "Secondary listing keeps wrapped equity recovery enabled with rebalancing \
+                 disabled and has no open work; disable its recovery too. If no listing on \
+                 the chain rebalances, the chain gets no equity services and tokens stranded \
+                 there later are not recovered",
+            );
+        }
+        let completion_only = unfinished
+            .iter()
+            .filter(|(chain, symbol)| {
+                deps.ctx.chains.hedged_chain(*chain).is_some_and(|hedged| {
+                    !hedged.assets.rebalancing_mode(symbol).keeps_services()
+                        && !hedged.assets.is_wrapped_equity_recovery_enabled(symbol)
+                })
+            })
+            .count();
+        metrics::gauge!("conductor_completion_only_symbols").set(f64::from(
+            u32::try_from(completion_only).context("completion listing count exceeds u32")?,
+        ));
+        let tokenizations =
+            build_chain_tokenizations_for_completion(&deps.ctx, wallet_ctx, &unfinished)?;
 
-        // Computed before `deps` is moved into the spawn call, since
-        // `WalletPollingCtx` below also needs the config behind `deps.ctx`.
-        let unwrapped_equity_token_addresses =
-            base_wallet_unwrapped_equity_token_addresses(&deps.ctx);
-        let wrapped_equity_token_addresses = base_wallet_wrapped_equity_token_addresses(&deps.ctx);
+        // Computed before `deps` and the tokenizations are moved into the
+        // spawn call, since `WalletPollingCtx` below needs both.
+        let equity_wallets = equity_wallet_polling(&deps.ctx, &tokenizations, &unfinished)?;
 
-        let infra =
-            spawn_rebalancing_infrastructure(rebalancing_ctx, tokenizations, wallets.clone(), deps)
-                .await?;
+        let infra = spawn_rebalancing_infrastructure(
+            rebalancing_ctx,
+            tokenizations,
+            wallets.clone(),
+            deps,
+            unfinished,
+        )
+        .await?;
 
         // Seed the position_shares gauge for already-open positions: a
         // normal restart does not replay current positions through evolve(),
@@ -2233,8 +2442,7 @@ impl PositionAndRebalancing {
         let wallet_polling = crate::inventory::WalletPollingCtx {
             ethereum: Arc::new(ethereum_wallet),
             base: Arc::new(base_wallet),
-            unwrapped_equity_token_addresses,
-            wrapped_equity_token_addresses,
+            equity_wallets,
         };
 
         Ok(Self {
@@ -2251,6 +2459,7 @@ impl PositionAndRebalancing {
             cctp_mint_recovery: infra.cctp_mint_recovery,
             usdc_driver_pause: infra.usdc_driver_pause,
             usdc_store: infra.usdc_store,
+            cctp_burn_store: infra.cctp_burn_store,
             wrapped_equity_recovery_store: infra.wrapped_equity_recovery_store,
             unwrapped_equity_recovery_store: infra.unwrapped_equity_recovery_store,
             mint_store: infra.mint_store,
@@ -2387,11 +2596,13 @@ async fn wire_freeze_guard(
 /// Hands the trigger the handles only the query manifest can produce: the
 /// stores it emits timeout failures through, the Position authority that
 /// arbitrates transfer admission against hedges, and the position projection
-/// it values minimum operation sizes with.
+/// it values minimum operation sizes with, falling back to `equity_prices`
+/// for a symbol that has never filled.
 async fn attach_manifest_handles(
     rebalancing_service: &RebalancingService,
     built: &BuiltFrameworks,
     execution_threshold: ExecutionThreshold,
+    equity_prices: EquityPriceStore,
 ) {
     rebalancing_service
         .set_stores(
@@ -2408,21 +2619,26 @@ async fn attach_manifest_handles(
         )
         .await;
     rebalancing_service
-        .set_last_price_reader(built.position_projection.clone())
+        .set_last_price_reader(Arc::new(FillPriceOrMark {
+            fills: built.position_projection.clone(),
+            marks: equity_prices,
+        }))
         .await;
 }
 
 /// Wires the pre-dispatch safety checks used by fresh rebalancing transfers:
-/// the USDC corridor's gas check, one gas check per equity chain, and the
+/// one gas check per USDC corridor chain, one per equity chain, and the
 /// dividend freeze guard.
 async fn wire_transfer_admission_guards(
     rebalancing_service: &RebalancingService,
-    gas_readiness: Arc<GasReadiness>,
+    usdc_gas_readiness: BTreeMap<Chain, ConfiguredGasReadiness>,
     equity_gas_readiness: BTreeMap<Chain, ConfiguredGasReadiness>,
     freeze_check: OperationMode,
     issuance: &IssuanceStatusCtx,
 ) -> anyhow::Result<()> {
-    rebalancing_service.set_gas_readiness(gas_readiness).await;
+    rebalancing_service
+        .set_usdc_gas_readiness(usdc_gas_readiness)
+        .await;
     rebalancing_service
         .set_equity_gas_readiness(equity_gas_readiness)
         .await;
@@ -2443,12 +2659,46 @@ fn build_rebalancing_raindex_service<Signer: Wallet + Clone>(
     ))
 }
 
-/// Startup preflight for the shared-inventory rebalancing path: the bot must
-/// hold `OPERATOR_ROLE` on the configured inventory or every rebalance
-/// deposit/withdraw reverts. Fails fast with a clear error rather than burning
-/// gas reverting on the first rebalance (the shared-inventory cutover grants
-/// the role before rebalancing runs).
-///
+/// Resolves where `corridor`'s transfers run: the signer, orderbook
+/// contracts and first cash vault of the corridor's own chain, whatever the
+/// primary is, and the gas check of that chain's wallet
+/// and `ethereum_wallet`. A corridor chain without a gas threshold refuses
+/// startup by name.
+fn usdc_corridor_endpoints<Signer: Wallet + Clone>(
+    ctx: &Ctx,
+    tokenizations: &BTreeMap<Chain, ChainTokenization<Signer>>,
+    ethereum_wallet: &Signer,
+    corridor: UsdcCorridor,
+) -> anyhow::Result<UsdcCorridorEndpoints<Signer>> {
+    let chain = corridor.chain();
+    let hedged = ctx.chains.hedged_chain(chain).with_context(|| {
+        format!("the {corridor} corridor needs a [chains.{chain}.trading] table")
+    })?;
+    let tokenization = tokenizations
+        .get(&chain)
+        .with_context(|| format!("no tokenization services were built for {chain}"))?;
+    let vault_id = hedged
+        .assets
+        .cash
+        .as_ref()
+        .and_then(|cash| cash.vault_ids.first().copied())
+        .ok_or(CtxError::MissingCashVaultId)?;
+    let alerts = ctx
+        .alerts
+        .as_ref()
+        .context("rebalancing requires [alerts] gas thresholds")?;
+    let gas_readiness =
+        GasReadiness::for_usdc_corridor(alerts, chain, &tokenization.wallet, ethereum_wallet)?;
+
+    Ok(UsdcCorridorEndpoints {
+        corridor,
+        chain_wallet: tokenization.wallet.clone(),
+        contracts: crate::onchain::raindex_contracts(hedged),
+        vault_id: RaindexVaultId(vault_id),
+        gas_readiness,
+    })
+}
+
 /// Refuses an endpoint that is not the chain its registry entry names.
 ///
 /// Every address in the entry -- orderbook, inventory, vaults, tokens -- is
@@ -2456,6 +2706,7 @@ fn build_rebalancing_raindex_service<Signer: Wallet + Clone>(
 /// would route funds by addresses that mean something else there, or nothing
 /// at all. The id comes from the [`Chain`] type rather than from config: a
 /// config-supplied id would be the very value being checked.
+///
 /// The primary chain's id is confirmed inside `setup_instrumentation`; the
 /// transport chains hold funds through their signers, so a signer pointed at
 /// the wrong network must fail startup the same way.
@@ -2604,15 +2855,16 @@ async fn confirm_configured_assets_respond<P: Provider + Clone + 'static>(
         // A token at another precision answers this read and then mis-scales
         // all of them, so a wrong precision is a config error, not a variant
         // to honour.
-        anyhow::ensure!(
-            decimals == TOKENIZED_EQUITY_DECIMALS,
-            "startup read canary failed: [chains.{chain}] equity {symbol}'s {field} at \
-             {token} reports {decimals} decimals, but every equity amount the bot \
-             scales is {TOKENIZED_EQUITY_DECIMALS}-decimal share-wei; this address is \
-             not the configured equity's token",
-            chain = hedged.chain,
-            field = probed.field(),
-        );
+        if decimals != TOKENIZED_EQUITY_DECIMALS {
+            return Err(registry_candidate::ContractMismatch::Decimals {
+                chain: hedged.chain,
+                symbol: symbol.clone(),
+                token,
+                decimals,
+                field: probed.field(),
+            }
+            .into());
+        }
 
         // A live 18-decimal contract is still any contract: a typo landing on
         // another token answers both reads above and only surfaces when the
@@ -2635,14 +2887,16 @@ async fn confirm_configured_assets_respond<P: Provider + Clone + 'static>(
                         )
                     })?;
 
-                anyhow::ensure!(
-                    attested == underlying,
-                    "startup read canary failed: [chains.{chain}] equity {symbol}'s \
-                     tokenized_equity_derivative at {token} wraps {attested}, but its \
-                     tokenized_equity is {underlying}; this vault belongs to a different \
-                     equity",
-                    chain = hedged.chain,
-                );
+                if attested != underlying {
+                    return Err(registry_candidate::ContractMismatch::Underlying {
+                        chain: hedged.chain,
+                        symbol: symbol.clone(),
+                        token,
+                        expected: underlying,
+                        actual: attested,
+                    }
+                    .into());
+                }
             }
             ProbedToken::UnwrappedEquity => {}
         }
@@ -2739,31 +2993,90 @@ async fn confirm_chain_id<P: Provider>(provider: &P, chain: Chain) -> anyhow::Re
     Ok(())
 }
 
-/// Skipped in [`InventoryMode::Legacy`]: no distinct inventory contract is in
-/// play (integration tests and any not-yet-migrated setup), so there is no
-/// `OPERATOR_ROLE` to check and the orderbook allowance is the live one, not a
-/// stale artifact to revoke.
+/// Startup preflight for the shared-inventory rebalancing path: the bot must
+/// hold `OPERATOR_ROLE` on each rebalancing chain's inventory or every
+/// rebalance deposit/withdraw there reverts. Fails fast with a clear error
+/// rather than burning gas reverting on the first rebalance (the
+/// shared-inventory cutover grants the role before rebalancing runs).
+///
+/// Runs once on every equity-rebalancing or served USDC corridor chain: a
+/// secondary missing the role would mint and wrap, then revert on the
+/// deposit, leaving the wrapped shares in its wallet.
 async fn preflight_inventory_access<Signer: Wallet + Clone>(
-    raindex_service: &RaindexService<Signer>,
     ctx: &Ctx,
+    tokenizations: &BTreeMap<Chain, ChainTokenization<Signer>>,
+    served_usdc_corridors: &BTreeSet<UsdcCorridor>,
 ) -> anyhow::Result<()> {
-    let InventoryMode::Managed { inventory } = ctx.chains.primary().inventory else {
-        debug!(
-            target: "inventory",
-            "legacy inventory mode; skipping OPERATOR_ROLE preflight (no distinct inventory in play)",
+    for (hedged, inventory) in operator_role_preflight_chains(ctx, served_usdc_corridors) {
+        let chain = hedged.chain;
+        let tokenization = tokenizations.get(&chain).with_context(|| {
+            format!("no signing wallet was built for the rebalancing chain {chain}")
+        })?;
+        let raindex_service = build_rebalancing_raindex_service(
+            &tokenization.wallet,
+            hedged,
+            tokenization.wallet.address(),
         );
-        return Ok(());
-    };
 
+        preflight_chain_inventory_access(chain, inventory, &raindex_service).await?;
+    }
+
+    Ok(())
+}
+
+/// The chains whose inventory the `OPERATOR_ROLE` preflight checks, with that
+/// inventory: every managed hedged chain that rebalances equity or serves
+/// a served USDC corridor, including while new cash transfers are paused.
+///
+/// A hedge-only secondary outside those corridors makes no operator calls.
+/// [`InventoryMode::Legacy`] is skipped too: no distinct inventory contract
+/// is in play (integration tests and any not-yet-migrated setup), so there is
+/// no `OPERATOR_ROLE` to check and the orderbook allowance is the live one,
+/// not a stale artifact to revoke.
+fn operator_role_preflight_chains<'ctx>(
+    ctx: &'ctx Ctx,
+    served_usdc_corridors: &BTreeSet<UsdcCorridor>,
+) -> Vec<(&'ctx HedgedChain, Address)> {
+    ctx.chains
+        .hedged_with_roles()
+        .filter(|(role, hedged)| {
+            role.rebalances_equity(&hedged.assets)
+                || served_usdc_corridors
+                    .iter()
+                    .any(|corridor| corridor.chain() == hedged.chain)
+        })
+        .filter_map(|(_, hedged)| match hedged.inventory {
+            InventoryMode::Managed { inventory } => Some((hedged, inventory)),
+            InventoryMode::Legacy => {
+                debug!(
+                    target: "inventory",
+                    chain = %hedged.chain,
+                    "legacy inventory mode; skipping OPERATOR_ROLE preflight (no distinct \
+                     inventory in play)",
+                );
+                None
+            }
+        })
+        .collect()
+}
+
+async fn preflight_chain_inventory_access<Signer: Wallet + Clone>(
+    chain: Chain,
+    inventory: Address,
+    raindex_service: &RaindexService<Signer>,
+) -> anyhow::Result<()> {
     raindex_service
         .verify_operator_role::<OpenChainErrorRegistry>()
         .await
-        .context(
-            "OPERATOR_ROLE preflight failed: the signing wallet cannot operate the \
-             configured RaindexInventory",
-        )?;
+        .with_context(|| {
+            format!(
+                "OPERATOR_ROLE preflight failed on {chain}: the signing wallet cannot operate \
+                 the configured RaindexInventory {inventory}"
+            )
+        })?;
     info!(
         target: "inventory",
+        %chain,
         %inventory,
         "OPERATOR_ROLE preflight passed",
     );
@@ -2797,6 +3110,43 @@ fn stale_allowance_revocations(ctx: &Ctx) -> BTreeMap<Chain, Vec<Address>> {
             (chain, tokens)
         })
         .collect()
+}
+
+/// Reserves the nonce of every pending capital CCTP burn and rebroadcasts it
+/// (`restore_pending_cctp_burns`), returning the chains whose startup
+/// approvals and revokes must wait: those with a restored burn not mined yet,
+/// or both corridor chains when the burns cannot be restored at all.
+async fn restore_capital_cctp_burns(
+    ctx: &Ctx,
+    pool: &SqlitePool,
+    store: &Store<CctpBurnOperation>,
+) -> BTreeSet<Chain> {
+    let wallets = match ctx.wallet() {
+        Ok(wallets) => wallets,
+        Err(error) => {
+            warn!(%error, "No signing wallet, so no capital CCTP burn can be pending; skipping their restore");
+            return BTreeSet::new();
+        }
+    };
+    let bridge = match bot_cctp_bridge(ctx, wallets) {
+        Ok(bridge) => bridge,
+        Err(error) => {
+            error!(target: "operational_alert", alert = true, ?error, "Could not build the CCTP bridge to restore pending capital CCTP burns; their nonces are not reserved, so startup skips Ethereum and Base token approvals and allowance revokes");
+            return BTreeSet::from([Chain::Ethereum, Chain::Base]);
+        }
+    };
+    let RestoredCctpBurns {
+        restored,
+        settled,
+        unmined_chains,
+    } = restore_pending_cctp_burns(pool, store, &bridge, &ctx.chains).await;
+    info!(
+        restored,
+        settled,
+        ?unmined_chains,
+        "Reserved the nonces of the pending capital CCTP burns at startup"
+    );
+    unmined_chains
 }
 
 /// Best-effort, per hedged chain: revoke any stale pre-migration allowance
@@ -2844,7 +3194,7 @@ async fn revoke_stale_orderbook_allowances<Signer: Wallet + Clone>(
                 .revoke_orderbook_allowance::<OpenChainErrorRegistry>(token)
                 .await
             {
-                Ok(RevokeOutcome::Revoked | RevokeOutcome::AlreadyZero) => {}
+                Ok(RevokeOutcome::Revoked { .. } | RevokeOutcome::AlreadyZero) => {}
                 Err(error) => warn!(
                     target: "inventory",
                     %chain,
@@ -3035,17 +3385,16 @@ async fn build_query_frameworks(
     manifest.build(pool.clone(), equity_transfer_services).await
 }
 
-/// Builds the Alpaca wallet client, instrumented broker, and CCTP/raindex
-/// services `RebalancerServices` needs. The telemetry wrap happens here (not
-/// at a lower layer) so rebalancer Alpaca calls emit broker dependency
-/// samples, mirroring the hedge executor's own wrapping.
+/// Builds the Alpaca wallet client and instrumented broker
+/// `RebalancerServices` needs, alongside the Ethereum hub wallet. The
+/// telemetry wrap happens here (not at a lower layer) so rebalancer Alpaca
+/// calls emit broker dependency samples, mirroring the hedge executor's own
+/// wrapping.
 async fn build_rebalancer_services<Signer: Wallet + Clone>(
     alpaca_auth: &AlpacaBrokerApiCtx,
-    wallets: ChainWallets<Signer>,
-    raindex_service: Arc<RaindexService<Signer>>,
+    ethereum_wallet: Signer,
     rebalancing_ctx: &RebalancingCtx,
-    required_confirmations: u64,
-    ethereum_required_confirmations: Option<u64>,
+    chains: &ChainRegistry,
     reserved_cash: Option<Usd>,
     telemetry: TelemetrySender,
 ) -> anyhow::Result<RebalancerServices<Signer>> {
@@ -3060,27 +3409,13 @@ async fn build_rebalancer_services<Signer: Wallet + Clone>(
         telemetry,
     );
 
-    RebalancerServices::new(
+    Ok(RebalancerServices::new(
         broker,
         alpaca_wallet,
-        wallets,
+        ethereum_wallet,
         rebalancing_ctx.cctp_corridor,
-        raindex_service,
-        UsdcSettlementParams {
-            attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
-            settlement_retry_deadline: rebalancing_ctx.settlement_retry_deadline,
-            required_confirmations,
-            ethereum_required_confirmations,
-            reserved_cash,
-            #[cfg(feature = "test-support")]
-            circle_api_base: rebalancing_ctx.circle_api_base.clone(),
-            #[cfg(feature = "test-support")]
-            token_messenger: rebalancing_ctx.token_messenger,
-            #[cfg(feature = "test-support")]
-            message_transmitter: rebalancing_ctx.message_transmitter,
-        },
-    )
-    .map_err(Into::into)
+        UsdcSettlementParams::for_chains(rebalancing_ctx, chains, reserved_cash),
+    ))
 }
 
 /// The vault-registry lookup for one hedged chain. Every id is qualified by
@@ -3112,15 +3447,26 @@ struct EquityGasChain<'chain, Signer: Wallet> {
 /// startup by name rather than admitting transfers against a balance nothing
 /// checks. A chain that rebalances nothing gets no entry at all, so its
 /// `Unwired` readiness refuses a transfer there fail-closed.
+#[cfg(test)]
 fn build_equity_gas_readiness<Signer: Wallet>(
     alerts: &AlertsCtx,
     chains: &[EquityGasChain<'_, Signer>],
     base_wallet: &Signer,
     ethereum_wallet: &Signer,
 ) -> anyhow::Result<BTreeMap<Chain, ConfiguredGasReadiness>> {
+    build_equity_gas_readiness_selected(alerts, chains, base_wallet, ethereum_wallet, false)
+}
+
+fn build_equity_gas_readiness_selected<Signer: Wallet>(
+    alerts: &AlertsCtx,
+    chains: &[EquityGasChain<'_, Signer>],
+    base_wallet: &Signer,
+    ethereum_wallet: &Signer,
+    completion: bool,
+) -> anyhow::Result<BTreeMap<Chain, ConfiguredGasReadiness>> {
     chains
         .iter()
-        .filter(|entry| entry.assets.rebalances_equity())
+        .filter(|entry| completion || entry.assets.rebalances_equity())
         .map(|entry| {
             let readiness = GasReadiness::for_equity_chain(
                 alerts,
@@ -3133,41 +3479,6 @@ fn build_equity_gas_readiness<Signer: Wallet>(
             Ok((entry.chain, ConfiguredGasReadiness::Wired(readiness)))
         })
         .collect()
-}
-
-/// The pre-dispatch admission check for the USDC corridor, which spans Base
-/// and Ethereum; its equity leg is the primary chain's own wallet, kept so
-/// the check stays complete. Equity candidates are gated per chain from
-/// [`build_equity_gas_readiness`] instead, and each transfer's own chain is
-/// checked again from its [`ChainEquityServices`] entry. Only the corridor's
-/// two wallets are wired here, so a primary outside the corridor refuses
-/// startup by name.
-fn build_transfer_gas_readiness<Signer: Wallet + Clone>(
-    wallets: &ChainWallets<Signer>,
-    ctx: &Ctx,
-) -> anyhow::Result<Arc<GasReadiness>> {
-    let alerts = ctx
-        .alerts
-        .as_ref()
-        .context("rebalancing requires [alerts] gas thresholds")?;
-    let (EthereumWallet(ethereum_wallet), BaseWallet(base_wallet)) = wallets.clone().into_parts();
-    let primary_chain = ctx.chains.primary().chain;
-    let primary_wallet = match primary_chain {
-        Chain::Base => &base_wallet,
-        Chain::Ethereum => &ethereum_wallet,
-        Chain::HyperEvm | Chain::Robinhood => anyhow::bail!(
-            "the transfer gas readiness has no {primary_chain} wallet: \
-             only the Base and Ethereum signers are wired"
-        ),
-    };
-
-    GasReadiness::for_equity_chain(
-        alerts,
-        primary_chain,
-        primary_wallet,
-        &base_wallet,
-        &ethereum_wallet,
-    )
 }
 
 /// Builds the trigger service from the validated rebalancing config plus the
@@ -3203,9 +3514,9 @@ fn build_rebalancing_service(
         RebalancingServiceConfig {
             poll_freshness: deps.poll_freshness.clone(),
             inventory_staleness_bound: rebalancing_ctx.inventory_staleness_bound,
-            usdc: rebalancing_ctx.usdc,
-            served_usdc_corridor: rebalancing_ctx.cctp_corridor.usdc_corridor(),
+            usdc: rebalancing_ctx.usdc.clone(),
             transfer_timeout: rebalancing_ctx.transfer_timeout,
+            recovery_hold_alert_after: rebalancing_ctx.recovery_hold_alert_after,
             chains,
             allocation,
             cash_reserved: deps.ctx.assets.cash.as_ref().map(|cash| cash.reserved),
@@ -3279,18 +3590,27 @@ fn hedged_chain_wrappers<Signer: Wallet + Clone + 'static>(
 /// `Unwired` check when it rebalances nothing. Its ratio reader is the one
 /// exception ([`hedged_chain_wrappers`]).
 fn build_hedged_equity_services<Signer: Wallet + Clone + 'static>(
-    deps: &RebalancingDeps,
+    ctx: &Ctx,
+    vault_registry_projection: &Arc<Projection<VaultRegistry>>,
     tokenizations: &BTreeMap<Chain, ChainTokenization<Signer>>,
     wallets: &ChainWallets<Signer>,
+    unfinished: &completion::UnfinishedListings,
 ) -> anyhow::Result<HedgedEquityServices> {
     let hedged_chain = |chain: Chain| {
-        deps.ctx.chains.hedged_chain(chain).with_context(|| {
+        ctx.chains.hedged_chain(chain).with_context(|| {
             format!("{chain} has tokenization services but no [chains.{chain}.trading] table")
         })
     };
 
     let mut gas_chains = Vec::new();
     for (chain, tokenization) in tokenizations {
+        if !hedged_chain(*chain)?.assets.rebalances_equity()
+            && !unfinished
+                .iter()
+                .any(|(unfinished_chain, _)| unfinished_chain == chain)
+        {
+            continue;
+        }
         gas_chains.push(EquityGasChain {
             chain: *chain,
             assets: &hedged_chain(*chain)?.assets,
@@ -3299,18 +3619,18 @@ fn build_hedged_equity_services<Signer: Wallet + Clone + 'static>(
     }
 
     let (EthereumWallet(ethereum_wallet), BaseWallet(base_wallet)) = wallets.clone().into_parts();
-    let gas_readiness = build_equity_gas_readiness(
-        deps.ctx
-            .alerts
+    let gas_readiness = build_equity_gas_readiness_selected(
+        ctx.alerts
             .as_ref()
             .context("rebalancing requires [alerts] gas thresholds")?,
         &gas_chains,
         &base_wallet,
         &ethereum_wallet,
+        true,
     )?;
     drop(gas_chains);
 
-    let wrappers = hedged_chain_wrappers(&deps.ctx, tokenizations)?;
+    let wrappers = hedged_chain_wrappers(ctx, tokenizations)?;
     let mut chains = BTreeMap::new();
     let mut registry_ids = BTreeMap::new();
     for (chain, tokenization) in tokenizations {
@@ -3330,7 +3650,7 @@ fn build_hedged_equity_services<Signer: Wallet + Clone + 'static>(
         let (registry_id, vault_lookup) = build_rebalancing_vault_lookup(
             hedged,
             hedged.vault_owner,
-            deps.vault_registry_projection.clone(),
+            vault_registry_projection.clone(),
         );
 
         registry_ids.insert(*chain, registry_id);
@@ -3367,12 +3687,8 @@ fn build_hedged_equity_services<Signer: Wallet + Clone + 'static>(
 /// The primary chain's rebalancing services, and the shared handles the rest
 /// of the rebalancing wiring hangs off, once the startup preflights have
 /// passed.
-struct PrimaryRebalancingServices<Signer: Wallet> {
-    primary_chain: Chain,
-    market_maker_wallet: Address,
-    gas_readiness: Arc<GasReadiness>,
+struct PrimaryRebalancingServices {
     bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
-    raindex_service: Arc<RaindexService<Signer>>,
     tokenizer: Arc<dyn Tokenizer>,
     mint_authorization: MintAuthorizationInfra,
 }
@@ -3385,8 +3701,7 @@ struct PrimaryRebalancingServices<Signer: Wallet> {
 async fn build_primary_rebalancing_services<Signer: Wallet + Clone>(
     deps: &RebalancingDeps,
     tokenizations: &BTreeMap<Chain, ChainTokenization<Signer>>,
-    wallets: &ChainWallets<Signer>,
-) -> anyhow::Result<PrimaryRebalancingServices<Signer>> {
+) -> anyhow::Result<PrimaryRebalancingServices> {
     let primary_chain = deps.ctx.chains.primary().chain;
     let primary = tokenizations.get(&primary_chain).with_context(|| {
         format!("no tokenization services were built for the primary chain {primary_chain}")
@@ -3402,8 +3717,6 @@ async fn build_primary_rebalancing_services<Signer: Wallet + Clone>(
         chain = %primary.chain,
         "Initializing rebalancing infrastructure on the primary chain's tokenization services"
     );
-    let market_maker_wallet = primary.wallet.address();
-    let gas_readiness = build_transfer_gas_readiness(wallets, &deps.ctx)?;
 
     // The worker consuming this queue is always registered
     // (`build_record_bot_gas_receipt_cost_ctx` fails startup when its
@@ -3411,12 +3724,6 @@ async fn build_primary_rebalancing_services<Signer: Wallet + Clone>(
     // disagree: every enqueued row has a consumer.
     let bot_gas_enqueuer =
         BotGasReceiptCostEnqueuer::Enabled(deps.record_bot_gas_receipt_cost_queue.clone());
-
-    let raindex_service = build_rebalancing_raindex_service(
-        &primary.wallet,
-        deps.ctx.chains.primary(),
-        market_maker_wallet,
-    );
 
     // One issuance client serves the tokenization preflight's vault-mode
     // reads and both mint-authorization consumers (the saga's vault-mode
@@ -3427,7 +3734,6 @@ async fn build_primary_rebalancing_services<Signer: Wallet + Clone>(
         deps.ctx.issuance.api_key.header_value(),
     )?);
 
-    preflight_inventory_access(&raindex_service, &deps.ctx).await?;
     preflight_tokenization(&deps.ctx, tokenizations, issuance_client.as_ref()).await?;
 
     let tokenizer = primary_equity.tokenizer.clone();
@@ -3436,11 +3742,7 @@ async fn build_primary_rebalancing_services<Signer: Wallet + Clone>(
         build_mint_authorization_infra(issuance_client, &deps.apalis_pool).await?;
 
     Ok(PrimaryRebalancingServices {
-        primary_chain,
-        market_maker_wallet,
-        gas_readiness,
         bot_gas_enqueuer,
-        raindex_service,
         tokenizer,
         mint_authorization,
     })
@@ -3458,6 +3760,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
     tokenizations: BTreeMap<Chain, ChainTokenization<Signer>>,
     wallets: ChainWallets<Signer>,
     deps: RebalancingDeps,
+    unfinished: completion::UnfinishedListings,
 ) -> Pin<Box<dyn Future<Output = anyhow::Result<RebalancingInfrastructure>> + Send>> {
     let rebalancing_ctx = Arc::new(rebalancing_ctx);
 
@@ -3466,34 +3769,42 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
 
         let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &deps.ctx.broker;
 
+        preflight_inventory_access(&deps.ctx, &tokenizations, rebalancing_ctx.usdc.served())
+            .await?;
+
         let PrimaryRebalancingServices {
-            primary_chain,
-            market_maker_wallet,
-            gas_readiness,
             bot_gas_enqueuer,
-            raindex_service,
             tokenizer,
             mint_authorization,
-        } = build_primary_rebalancing_services(&deps, &tokenizations, &wallets).await?;
+        } = build_primary_rebalancing_services(&deps, &tokenizations).await?;
 
         let HedgedEquityServices {
             chains: chain_services,
             registry_ids,
             gas_readiness: equity_gas_readiness,
             wrappers,
-        } = build_hedged_equity_services(&deps, &tokenizations, &wallets)?;
+        } = build_hedged_equity_services(
+            &deps.ctx,
+            &deps.vault_registry_projection,
+            &tokenizations,
+            &wallets,
+            &unfinished,
+        )?;
+
+        let (EthereumWallet(ethereum_wallet), _) = wallets.clone().into_parts();
+        let usdc_endpoints = rebalancing_ctx
+            .usdc
+            .served()
+            .iter()
+            .map(|corridor| {
+                usdc_corridor_endpoints(&deps.ctx, &tokenizations, &ethereum_wallet, *corridor)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         let equity_transfer_services = EquityTransferServices {
             chains: chain_services,
             bot_gas_enqueuer: bot_gas_enqueuer.clone(),
         };
-
-        // The equity recovery aggregates run where the orphaned balance sits:
-        // the primary chain, until chain selection moves into the global
-        // rebalancer. They take that chain's entry rather than loose handles,
-        // so their registry, orderbook, wrapper and wallet are the same ones
-        // the saga uses there.
-        let primary_equity_services = equity_transfer_services.for_chain(primary_chain)?.clone();
 
         let rebalancing_service =
             build_rebalancing_service(&rebalancing_ctx, &deps, registry_ids, wrappers.clone());
@@ -3502,7 +3813,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
 
         wire_transfer_admission_guards(
             &rebalancing_service,
-            gas_readiness.clone(),
+            usdc_gas_readiness_by_chain(&usdc_endpoints)?,
             equity_gas_readiness,
             rebalancing_ctx.freeze_check,
             &deps.ctx.issuance,
@@ -3518,7 +3829,18 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         )
         .await?;
 
-        attach_manifest_handles(&rebalancing_service, &built, deps.ctx.execution_threshold).await;
+        // A symbol that declined for want of a price is checked again once its
+        // mark arrives; nothing else wakes it while balances are unchanged.
+        deps.equity_prices
+            .notify_marks_to(rebalancing_service.clone() as Arc<dyn MarkListener>)
+            .await;
+        attach_manifest_handles(
+            &rebalancing_service,
+            &built,
+            deps.ctx.execution_threshold,
+            deps.equity_prices,
+        )
+        .await;
 
         let recovery_transfer = Arc::new(
             CrossVenueEquityTransfer::new(
@@ -3526,6 +3848,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
                 built.mint.clone(),
                 built.redemption.clone(),
             )
+            .with_rebalancing_service(&rebalancing_service)
             .with_mint_authorization(mint_authorization.wiring),
         );
 
@@ -3534,12 +3857,21 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         let (wrapped_equity_recovery_store, unwrapped_equity_recovery_store) =
             build_equity_recovery_stores(
                 &deps.pool,
-                primary_chain,
-                primary_equity_services,
+                equity_transfer_services.clone(),
                 recovery_transfer.clone(),
                 bot_gas_enqueuer.clone(),
             )
             .await?;
+
+        // Reads only the recovery records and their job rows, so it refuses
+        // before the tokenization recovery below requeues jobs or rebroadcasts
+        // a signed withdrawal.
+        refuse_chainless_recoveries_on_non_base_primary(
+            &deps.pool,
+            &deps.apalis_pool,
+            deps.ctx.chains.primary().chain,
+        )
+        .await?;
 
         let mut resume_tokenization_queue = ResumeTokenizationJobQueue::new(&deps.apalis_pool);
 
@@ -3554,6 +3886,15 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         )
         .await?;
 
+        refuse_recoveries_stranded_by_chain_services(
+            &deps.pool,
+            &wrapped_equity_recovery_store,
+            &unwrapped_equity_recovery_store,
+            &equity_transfer_services,
+            &rebalancing_service.equity_in_progress,
+        )
+        .await?;
+
         rebalancing_service
             .recover_usdc_guard(&deps.pool, &built.usdc)
             .await?;
@@ -3561,43 +3902,24 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         let cash = deps.ctx.assets.cash.as_ref();
         let services = build_rebalancer_services(
             alpaca_auth,
-            wallets,
-            raindex_service,
+            ethereum_wallet,
             &rebalancing_ctx,
-            deps.ctx.chains.primary().required_confirmations,
-            deposit_send_required_confirmations(&deps.ctx.chains)
-                .inspect_err(|error| {
-                    warn!(target: "rebalance", %error, "Reconcile of a signed Alpaca deposit send is refused until [chains.ethereum] is configured");
-                })
-                .ok(),
+            &deps.ctx.chains,
             cash.map(|cash| cash.reserved).map(Positive::inner),
             deps.telemetry.clone(),
         )
         .await?;
 
-        let usdc_vault_id = deps
-            .ctx
-            .chains
-            .primary()
-            .assets
-            .cash
-            .as_ref()
-            .and_then(|cash| cash.vault_ids.first().copied())
-            .ok_or(CtxError::MissingCashVaultId)?;
-
-        // Cloned before `built.usdc` is consumed below: the transfer handles
-        // take one handle and the recovery handle needs another for the
-        // `fail-usdc-transfer` route.
-        let recovery_usdc_store = built.usdc.clone();
-        let usdc_handles = services.into_usdc_transfer_handles(
-            market_maker_wallet,
-            RaindexVaultId(usdc_vault_id),
-            built.usdc,
-            deps.pool.clone(),
-            bot_gas_enqueuer.clone(),
-            gas_readiness,
-            usdc_driver_gate.clone(),
-        );
+        // `built.usdc` stays with the recovery handle for the
+        // `fail-usdc-transfer` route; the transfers take their own handles.
+        let recovery_usdc_store = built.usdc;
+        let usdc_handles = services.into_usdc_corridor_transfers(
+            usdc_endpoints,
+            &recovery_usdc_store,
+            &deps.pool,
+            &bot_gas_enqueuer,
+            &usdc_driver_gate,
+        )?;
 
         // Before any job or the startup approvals can send from the Ethereum
         // wallet: a signed deposit send persisted before the restart keeps its
@@ -3616,6 +3938,15 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             unmined_restore_chains.insert(Chain::Ethereum);
         }
 
+        // Likewise for the signed burns of the capital `cctp-bridge` route:
+        // a pending burn keeps its nonce on the Ethereum or Base wallet and
+        // is rebroadcast before any other send from that wallet.
+        let cctp_burn_store = StoreBuilder::<CctpBurnOperation>::new(deps.pool.clone())
+            .build(())
+            .await?;
+        unmined_restore_chains
+            .extend(restore_capital_cctp_burns(&deps.ctx, &deps.pool, &cctp_burn_store).await);
+
         // After the nonce restores and rebroadcasts above, so a revoke neither
         // takes the nonce of a signed send persisted before the restart nor
         // waits behind one that is not mined.
@@ -3628,12 +3959,21 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             job_queue: mint_authorization.queue.clone(),
         });
 
+        // Each worker frees the corridor guard of a transfer whose job dies
+        // before recording any event, so both share the service's guards and
+        // the store those events would be in.
+        let unrecorded_guards = || UnrecordedGuardRelease {
+            guards: Arc::clone(&rebalancing_service.usdc_guards),
+            store: Arc::clone(&recovery_usdc_store),
+        };
+
         let transfer_usdc_to_market_making_ctx = Arc::new(TransferUsdcToMarketMakingCtx {
             transfer: usdc_handles.resume_alpaca_to_base,
             job_queue: deps.schedulers.transfer_usdc_to_market_making.clone(),
             max_burn_revert_redrives: rebalancing_ctx.max_burn_revert_redrives,
             notifier: deps.notifier.clone(),
             driver_gate: usdc_driver_gate.clone(),
+            unrecorded_guards: Some(unrecorded_guards()),
         });
 
         let transfer_usdc_to_hedging_ctx = Arc::new(TransferUsdcToHedgingCtx {
@@ -3643,6 +3983,8 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             max_burn_revert_redrives: rebalancing_ctx.max_burn_revert_redrives,
             notifier: deps.notifier.clone(),
             driver_gate: usdc_driver_gate,
+            unrecorded_guards: Some(unrecorded_guards()),
+            underfunded_alerts: rebalancing_service.underfunded_alerts().clone(),
         });
 
         let transfer_equity_to_market_making_ctx = Arc::new(TransferEquityToMarketMakingCtx {
@@ -3650,8 +3992,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             equity_in_progress: rebalancing_service.equity_in_progress.clone(),
             mint_store: built.mint.clone(),
             position_authority: Some((built.position.clone(), deps.ctx.execution_threshold)),
-            transfer_services: equity_transfer_services,
-            primary_chain,
+            transfer_services: equity_transfer_services.clone(),
             job_queue: deps.schedulers.transfer_equity_to_market_making.clone(),
         });
 
@@ -3659,7 +4000,9 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             transfer: recovery_transfer.clone(),
             equity_in_progress: rebalancing_service.equity_in_progress.clone(),
             redemption_store: built.redemption.clone(),
+            transfer_services: equity_transfer_services,
             position_authority: Some((built.position.clone(), deps.ctx.execution_threshold)),
+            hedge_capacity: Some(rebalancing_service.clone()),
             job_queue: deps.schedulers.transfer_equity_to_hedging.clone(),
             notifier: deps.notifier.clone(),
         });
@@ -3676,6 +4019,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             cctp_mint_recovery: usdc_handles.recover_cctp_mint,
             usdc_driver_pause,
             usdc_store: recovery_usdc_store,
+            cctp_burn_store,
             wrapped_equity_recovery_store,
             unwrapped_equity_recovery_store,
             mint_store: built.mint,
@@ -3732,13 +4076,13 @@ async fn catch_up_stage_timing_projections(
 
 /// Builds the wrapped and unwrapped equity-recovery aggregate stores.
 ///
-/// Both drive the same chain entry -- its registry, orderbook, wrapper and
-/// wallet -- and the same recovery `transfer`. Kept together because they are
-/// the recovery counterpart built from the same `recovery_transfer`.
+/// Both carry every chain's entry -- its registry, orderbook, wrapper and
+/// wallet -- and each recovery drives the entry of the chain it records.
+/// Kept together because they are the recovery counterpart built from the
+/// same `recovery_transfer`.
 async fn build_equity_recovery_stores(
     pool: &SqlitePool,
-    chain: Chain,
-    chain_services: ChainEquityServices,
+    equity: EquityTransferServices,
     transfer: Arc<CrossVenueEquityTransfer>,
     bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
 ) -> anyhow::Result<(
@@ -3747,8 +4091,7 @@ async fn build_equity_recovery_stores(
 )> {
     let wrapped_store = StoreBuilder::<WrappedEquityRecovery>::new(pool.clone())
         .build(WrappedEquityRecoveryServices {
-            chain,
-            chain_services: chain_services.clone(),
+            equity: equity.clone(),
             transfer: transfer.clone(),
             bot_gas_enqueuer: bot_gas_enqueuer.clone(),
         })
@@ -3756,8 +4099,7 @@ async fn build_equity_recovery_stores(
 
     let unwrapped_store = StoreBuilder::<UnwrappedEquityRecovery>::new(pool.clone())
         .build(UnwrappedEquityRecoveryServices {
-            chain,
-            chain_services,
+            equity,
             transfer,
             bot_gas_enqueuer,
         })
@@ -3770,23 +4112,25 @@ async fn build_equity_recovery_stores(
 ///
 /// Redemptions that ended in `DetectionFailed` or `RedemptionRejected` have
 /// tokens physically in Alpaca's wallet with no snapshot source. Setting their
-/// inflight directly prevents the system from re-triggering operations for
-/// tokens it no longer holds.
+/// inflight directly, on the chain each withdrew from, prevents the system
+/// from re-triggering operations for tokens it no longer holds.
 async fn recover_stuck_redemptions(
     pool: &SqlitePool,
     inventory: &BroadcastingInventory,
 ) -> anyhow::Result<()> {
-    let stuck_redemptions = symbols_with_stuck_redemptions(pool).await?;
+    let stuck_redemptions = stuck_redemptions(pool).await?;
 
     if stuck_redemptions.is_empty() {
         return Ok(());
     }
 
     let mut view = inventory.write().await;
-    for (symbol, quantity) in &stuck_redemptions {
-        *view = view.clone().update_equity(
-            symbol,
-            Inventory::set_inflight(Venue::MarketMaking, *quantity),
+    for (id, stranded) in &stuck_redemptions {
+        *view = view.clone().seed_stranded_redemption(
+            id,
+            &stranded.symbol,
+            stranded.chain,
+            stranded.quantity,
             Utc::now(),
         )?;
     }
@@ -3807,13 +4151,254 @@ async fn recover_stuck_redemptions(
 #[error(
     "the unfinished equity transfer {transfer} ({symbol}) is recorded on {chain}, which \
      rebalances no equity under this configuration and so gets no transfer services: it \
-     could never finish. Re-enable rebalancing for one of {chain}'s equities until the \
-     transfer completes, or resolve the transfer with the CLI"
+     could never finish. Set rebalancing for one of {chain}'s equities to \"paused\" (or \
+     \"enabled\") until the transfer completes, or resolve the transfer with the CLI"
 )]
 struct TransferStrandedByChainServices {
     chain: Chain,
     transfer: ResumeTokenizationTarget,
     symbol: Symbol,
+}
+
+/// An open equity-wallet recovery, or a symbol held for one, on a chain this
+/// configuration builds no equity services for. The recovery would wait
+/// forever for services that never come, holding the symbol, while the
+/// tokens sit in that chain's wallet.
+#[derive(Debug, thiserror::Error)]
+enum RecoveryStrandedByChainServices {
+    #[error(
+        "the open {recovery} ({symbol}) is recorded on {chain}, which rebalances no equity \
+         under this configuration and so gets no equity services: its tokens could never be \
+         recovered. Set rebalancing for one of {chain}'s equities to \"paused\" (or \
+         \"enabled\") until the recovery completes"
+    )]
+    Recovery {
+        chain: Chain,
+        recovery: StrandedRecovery,
+        symbol: Symbol,
+    },
+    #[error(
+        "{symbol} is held for a recovery on {chain}, which rebalances no equity under this \
+         configuration and so gets no equity services: the recovery could never run. Set \
+         rebalancing for one of {chain}'s equities to \"paused\" (or \"enabled\") until the \
+         recovery completes"
+    )]
+    Hold { chain: Chain, symbol: Symbol },
+}
+
+#[derive(Debug)]
+enum StrandedRecovery {
+    Wrapped(WrappedEquityRecoveryId),
+    Unwrapped(UnwrappedEquityRecoveryId),
+}
+
+impl std::fmt::Display for StrandedRecovery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Wrapped(id) => write!(formatter, "wrapped equity recovery {id}"),
+            Self::Unwrapped(id) => write!(formatter, "unwrapped equity recovery {id}"),
+        }
+    }
+}
+
+/// Refuses startup while an open equity-wallet recovery, or a symbol the
+/// startup restore held for recovery, names a chain with no equity services.
+/// The recovery jobs would otherwise reschedule forever against a chain that
+/// is not wired, and the operator would learn of it only from alerts.
+///
+/// A backstop: `completion::unfinished_listings` lists every open recovery
+/// and every hold, so `build_chain_tokenizations_for_completion` already
+/// builds equity services for its chain, or refuses startup naming the
+/// missing listing, before this runs. It fires only if that listing and
+/// these recoveries drift apart.
+async fn refuse_recoveries_stranded_by_chain_services(
+    pool: &SqlitePool,
+    wrapped_store: &Store<WrappedEquityRecovery>,
+    unwrapped_store: &Store<UnwrappedEquityRecovery>,
+    equity_services: &EquityTransferServices,
+    equity_in_progress: &RwLock<HashMap<Symbol, GuardState>>,
+) -> anyhow::Result<()> {
+    for id in crate::wrapped_equity_recovery::open_recovery_ids(pool).await? {
+        let Some(recovery) = wrapped_store.load(&id).await? else {
+            return Err(anyhow::anyhow!(
+                "Open wrapped equity recovery {id} missing from store"
+            ));
+        };
+
+        if !equity_services.chains.contains_key(&recovery.chain()) {
+            return Err(RecoveryStrandedByChainServices::Recovery {
+                chain: recovery.chain(),
+                recovery: StrandedRecovery::Wrapped(id),
+                symbol: recovery.symbol().clone(),
+            }
+            .into());
+        }
+    }
+
+    for id in crate::unwrapped_equity_recovery::open_recovery_ids(pool).await? {
+        let Some(recovery) = unwrapped_store.load(&id).await? else {
+            return Err(anyhow::anyhow!(
+                "Open unwrapped equity recovery {id} missing from store"
+            ));
+        };
+
+        if !equity_services.chains.contains_key(&recovery.chain()) {
+            return Err(RecoveryStrandedByChainServices::Recovery {
+                chain: recovery.chain(),
+                recovery: StrandedRecovery::Unwrapped(id),
+                symbol: recovery.symbol().clone(),
+            }
+            .into());
+        }
+    }
+
+    let held = equity_in_progress
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find_map(|(symbol, state)| match state {
+            GuardState::HeldForRecovery { chain }
+                if !equity_services.chains.contains_key(chain) =>
+            {
+                Some((*chain, symbol.clone()))
+            }
+            GuardState::HeldForRecovery { .. }
+            | GuardState::ActiveTransfer { .. }
+            | GuardState::Recovering { .. } => None,
+        });
+
+    if let Some((chain, symbol)) = held {
+        return Err(RecoveryStrandedByChainServices::Hold { chain, symbol }.into());
+    }
+
+    Ok(())
+}
+
+/// An open equity-wallet recovery, or a queued recovery job, persisted before
+/// recoveries named their chain, on a deployment whose primary chain is not
+/// Base. Chainless recovery data replays as Base (`legacy_chain`), but those
+/// recoveries ran on the configured primary, so replaying it here would act
+/// on the wrong chain's wallet.
+#[derive(Debug, thiserror::Error)]
+enum ChainlessRecoveryOnNonBasePrimary {
+    #[error(
+        "the open {recovery} was recorded before recoveries named their chain and replays \
+         as base, but the primary chain is {primary}: finish or fail it with a binary that \
+         predates per-chain recovery, or switch the primary back to base, before upgrading"
+    )]
+    Recovery {
+        primary: Chain,
+        recovery: StrandedRecovery,
+    },
+    #[error(
+        "the {status} {job_type} job {job_id} was queued before recovery jobs named their \
+         chain and runs as base, but the primary chain is {primary}: let it finish with a \
+         binary that predates per-chain recovery, or switch the primary back to base, before \
+         upgrading"
+    )]
+    Job {
+        primary: Chain,
+        job_type: &'static str,
+        job_id: String,
+        status: String,
+    },
+}
+
+/// Refuses startup when the primary chain is not Base and a recovery or
+/// recovery job persisted without a chain is still open. Terminal history is
+/// not checked: it never acts again, so it cannot block a later primary switch.
+async fn refuse_chainless_recoveries_on_non_base_primary(
+    pool: &SqlitePool,
+    apalis_pool: &apalis_sqlite::SqlitePool,
+    primary: Chain,
+) -> anyhow::Result<()> {
+    if primary == Chain::Base {
+        return Ok(());
+    }
+
+    let open_wrapped = crate::wrapped_equity_recovery::open_recovery_ids(pool).await?;
+    let open_unwrapped = crate::unwrapped_equity_recovery::open_recovery_ids(pool).await?;
+    let chainless = chainless_detected_recovery_ids(pool).await?;
+
+    if let Some(id) = open_wrapped
+        .into_iter()
+        .find(|id| chainless.contains(&("WrappedEquityRecovery", id.to_string())))
+    {
+        return Err(ChainlessRecoveryOnNonBasePrimary::Recovery {
+            primary,
+            recovery: StrandedRecovery::Wrapped(id),
+        }
+        .into());
+    }
+
+    if let Some(id) = open_unwrapped
+        .into_iter()
+        .find(|id| chainless.contains(&("UnwrappedEquityRecovery", id.to_string())))
+    {
+        return Err(ChainlessRecoveryOnNonBasePrimary::Recovery {
+            primary,
+            recovery: StrandedRecovery::Unwrapped(id),
+        }
+        .into());
+    }
+
+    for job_type in [
+        std::any::type_name::<crate::wrapped_equity_recovery::WrappedEquityRecoveryJob>(),
+        std::any::type_name::<crate::unwrapped_equity_recovery::UnwrappedEquityRecoveryJob>(),
+    ] {
+        let row: Option<(String, String)> = sqlx_apalis::query_as(
+            "SELECT id, status FROM Jobs \
+             WHERE job_type = ? \
+             AND (status IN ('Pending', 'Queued', 'Running') \
+             OR (status = 'Failed' AND attempts < max_attempts)) \
+             AND json_extract(CAST(job AS TEXT), '$.chain') IS NULL \
+             ORDER BY id LIMIT 1",
+        )
+        .bind(job_type)
+        .fetch_optional(apalis_pool)
+        .await?;
+
+        if let Some((job_id, status)) = row {
+            return Err(ChainlessRecoveryOnNonBasePrimary::Job {
+                primary,
+                job_type,
+                job_id,
+                status,
+            }
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
+/// `(aggregate_type, aggregate_id)` of every recovery whose `Detected` event
+/// has no `chain` key.
+async fn chainless_detected_recovery_ids(
+    pool: &SqlitePool,
+) -> Result<HashSet<(&'static str, String)>, sqlx::Error> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT aggregate_type, aggregate_id FROM events \
+         WHERE event_type IN ( \
+             'WrappedEquityRecoveryEvent::Detected', \
+             'UnwrappedEquityRecoveryEvent::Detected' \
+         ) \
+         AND json_extract(payload, '$.Detected.chain') IS NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|(aggregate_type, aggregate_id)| {
+            let aggregate_type = match aggregate_type.as_str() {
+                "WrappedEquityRecovery" => "WrappedEquityRecovery",
+                "UnwrappedEquityRecovery" => "UnwrappedEquityRecovery",
+                _ => return None,
+            };
+            Some((aggregate_type, aggregate_id))
+        })
+        .collect())
 }
 
 /// Restores a submitted withdrawal's nonce ownership, retrying a transient
@@ -4003,6 +4588,110 @@ async fn rebroadcast_restored_withdrawal(
     false
 }
 
+/// Restores the nonce of a persisted send to the issuer, every candidate of it (the
+/// send and its fee replacements), and rebroadcasts the newest's exact bytes
+/// as a best effort. Then it makes one non-blocking receipt lookup per
+/// candidate whatever the rebroadcast returned: some nodes reject an already
+/// mined transaction before their nonce check, and a replaced candidate can
+/// still mine. Returns whether a candidate is known to be mined; otherwise it
+/// pages, and the resume job confirms it. A legacy `SendPending` (no
+/// persisted send, so no candidates) always pages and counts as unmined: an
+/// older binary may have broadcast a transfer whose hash and nonce were never
+/// recorded. A send another key signed (a rotated wallet) is not restored or
+/// rebroadcast: its nonce is that key's, and reserving it would raise this
+/// wallet's next nonce past its own. It pages and gates its chain, as a CCTP
+/// burn signed by another wallet does.
+async fn restore_redemption_send(
+    tokenizer: &dyn Tokenizer,
+    notifier: &dyn Notifier,
+    redemption_id: &RedemptionAggregateId,
+    chain: Chain,
+    candidates: &[&PreparedTransaction],
+) -> bool {
+    let Some(newest) = candidates.last() else {
+        notify_or_warn(
+            notifier,
+            redemption_id,
+            &format!(
+                "Equity redemption {redemption_id} on {chain} has a legacy pending send to the \
+                 issuer with no recorded transaction. Recovery refuses to sign again and startup \
+                 approvals on {chain} are paused. Find the previous binary's transfer onchain and \
+                 follow \"Legacy pending send to the issuer\" in docs/cli-ops.md before closing it \
+                 with `stox transfer reconcile --kind redemption --id {redemption_id}`."
+            ),
+        )
+        .await;
+        return false;
+    };
+
+    let wallet = tokenizer.signing_wallet();
+    if !newest.signed_by(wallet) {
+        let tx_hash = newest.tx_hash();
+        let signer = newest.signer().map_or_else(
+            || "an unreadable signer".to_string(),
+            |signer| signer.to_string(),
+        );
+        notify_or_warn(
+            notifier,
+            redemption_id,
+            &format!(
+                "Equity redemption {redemption_id} on {chain} has a signed send {tx_hash} to the \
+                 issuer (nonce {nonce}) signed by {signer}, not the wallet that sends to the \
+                 issuer, {wallet}: was the \
+                 key rotated? It is not restored or rebroadcast from this wallet, and startup \
+                 approvals on {chain} are paused. Recovery only watches its receipt. If it \
+                 never mines, cancel it from its own key at nonce {nonce}, then reconcile with \
+                 a CLI configured with that key (`stox transfer reconcile --kind redemption \
+                 --id {redemption_id} --superseding-tx <cancel>`).",
+                nonce = newest.nonce(),
+            ),
+        )
+        .await;
+        return false;
+    }
+
+    for candidate in candidates {
+        tokenizer.restore_redemption_send(candidate).await;
+    }
+    let tx_hash = newest.tx_hash();
+    if let Err(error) = tokenizer.broadcast_redemption_send(newest).await {
+        warn!(target: "rebalance", %redemption_id, %chain, %tx_hash, %error, "Could not rebroadcast a restored send to the issuer at startup; checking its receipt");
+    }
+
+    for candidate in candidates.iter().rev() {
+        let candidate_hash = candidate.tx_hash();
+        match tokenizer.redemption_send_mined(candidate_hash).await {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(error) => {
+                warn!(target: "rebalance", %redemption_id, tx_hash = %candidate_hash, %error, "Could not read the receipt of a restored send to the issuer at startup; treating it as not mined");
+            }
+        }
+    }
+
+    notify_or_warn(
+        notifier,
+        redemption_id,
+        &format!(
+            "Equity redemption {redemption_id} on {chain} has an unresolved signed send {tx_hash} to \
+             the issuer; startup approvals on {chain} are paused and recovery will \
+             rebroadcast the same transaction"
+        ),
+    )
+    .await;
+    false
+}
+
+async fn notify_or_warn(
+    notifier: &dyn Notifier,
+    redemption_id: &RedemptionAggregateId,
+    message: &str,
+) {
+    if let Err(error) = notifier.notify(message).await {
+        warn!(target: "rebalance", %redemption_id, %error, "Could not deliver a startup alert about a send to the issuer");
+    }
+}
+
 /// Queues one resume job per interrupted mint and redemption. A transfer
 /// whose recorded chain lost its equity services refuses startup instead:
 /// queueing a resume that can only fail would strand it silently.
@@ -4147,6 +4836,22 @@ async fn recover_interrupted_tokenization_aggregates(
             .into());
         }
 
+        if matches!(&redemption, EquityRedemption::SendPending { .. })
+            && !restore_redemption_send(
+                equity_services
+                    .for_chain(redemption.chain())?
+                    .tokenizer
+                    .as_ref(),
+                rebalancing_service.notifier().as_ref(),
+                redemption_id,
+                redemption.chain(),
+                &redemption.issuer_send_candidates(),
+            )
+            .await
+        {
+            unmined_restore_chains.insert(redemption.chain());
+        }
+
         if restore_redemption_withdrawal(
             equity_services
                 .for_chain(redemption.chain())?
@@ -4165,9 +4870,19 @@ async fn recover_interrupted_tokenization_aggregates(
             .recover_redemption_state(redemption_id, &redemption)
             .await?;
 
-        let owned_by_transfer_job = transfer_redemptions
-            .iter()
-            .any(|row| row.task.aggregate_id == *redemption_id);
+        // A signed send is always driven to its receipt: a rebroadcast reuses
+        // the same bytes, and an exhausted transfer job would otherwise leave
+        // the send's nonce and reservation held with nothing driving them.
+        let signed_send = matches!(
+            &redemption,
+            EquityRedemption::SendPending {
+                prepared_send: Some(_),
+                ..
+            }
+        );
+        let owned_by_transfer_job = transfer_redemptions.iter().any(|row| {
+            row.task.aggregate_id == *redemption_id && !(signed_send && row.is_terminal())
+        });
         if !owned_by_transfer_job {
             // If cancel_all_pending silently failed above, a stale Pending row for
             // this aggregate may still exist. The duplicate Pending row is tolerated
@@ -4199,12 +4914,23 @@ async fn recover_interrupted_tokenization_aggregates(
         !row.is_terminal() || interrupted_redemptions.contains(&row.task.aggregate_id)
     });
 
+    kill_stopped_fresh_transfer_rows(
+        pool,
+        &mut transfer_mints,
+        &mut transfer_redemptions,
+        &mint_store,
+        &redemption_store,
+        equity_services,
+    )
+    .await?;
+
     let transfer_job_reservations = restore_live_transfer_job_guards(
         &rebalancing_service.equity_in_progress,
         &transfer_mints,
         &transfer_redemptions,
         &mint_store,
         &redemption_store,
+        equity_services,
     )
     .await?;
     let active_reservations = unique_transfer_reservations(
@@ -4278,12 +5004,148 @@ where
         .collect()
 }
 
+/// `rebalancing_mode` reads `disabled` for a chain with no equity services
+/// and for a symbol its table does not list. Names that cause, so the
+/// operator does not look for a `rebalancing` setting that is still enabled.
+fn warn_missing_rebalancing_listing(
+    services: &EquityTransferServices,
+    chain: Chain,
+    symbol: &Symbol,
+) {
+    match services.chains.get(&chain) {
+        None => warn!(
+            target: "rebalance",
+            %chain,
+            "No equity transfer services are wired for the chain, so every listing on it \
+             reads as disabled"
+        ),
+        Some(chain_services) if !chain_services.equities.symbols.contains_key(symbol) => warn!(
+            target: "rebalance",
+            %symbol,
+            %chain,
+            "The chain's equity table does not list the symbol, so it reads as disabled"
+        ),
+        Some(_) => {}
+    }
+}
+
+/// Kills live transfer rows that never started (no aggregate) on a listing
+/// that no longer starts operations. Their workers would abandon them on
+/// their next run, but until then the planner's in-flight check counts them
+/// for the symbol and blocks transfers on the chains that are still enabled.
+async fn kill_stopped_fresh_transfer_rows(
+    pool: &SqlitePool,
+    mints: &mut [DurableTransferJob<TransferEquityToMarketMaking>],
+    redemptions: &mut [DurableTransferJob<TransferEquityToHedging>],
+    mint_store: &Store<TokenizedEquityMint>,
+    redemption_store: &Store<EquityRedemption>,
+    services: &EquityTransferServices,
+) -> anyhow::Result<()> {
+    let mut killed_mints = HashSet::new();
+    for row in mints.iter_mut() {
+        if !row.is_terminal() && killed_mints.contains(&row.task.issuer_request_id) {
+            row.status = Status::Killed;
+            continue;
+        }
+        if row.is_terminal() {
+            continue;
+        }
+        let mode = services.rebalancing_mode(row.task.chain, &row.task.symbol);
+        if mode.starts_operations()
+            || mint_store
+                .load(&row.task.issuer_request_id)
+                .await?
+                .is_some()
+        {
+            continue;
+        }
+        kill_transfer_row::<TransferEquityToMarketMaking>(
+            pool,
+            "$.issuer_request_id",
+            &row.task.issuer_request_id.to_string(),
+        )
+        .await?;
+        warn_missing_rebalancing_listing(services, row.task.chain, &row.task.symbol);
+        warn!(
+            target: "rebalance",
+            symbol = %row.task.symbol,
+            chain = %row.task.chain,
+            issuer_request_id = %row.task.issuer_request_id,
+            %mode,
+            "Killed a fresh equity mint row on a listing that starts no operations"
+        );
+        killed_mints.insert(row.task.issuer_request_id.clone());
+        row.status = Status::Killed;
+    }
+
+    let mut killed_redemptions = HashSet::new();
+    for row in redemptions.iter_mut() {
+        if !row.is_terminal() && killed_redemptions.contains(&row.task.aggregate_id) {
+            row.status = Status::Killed;
+            continue;
+        }
+        if row.is_terminal() {
+            continue;
+        }
+        let mode = services.rebalancing_mode(row.task.chain, &row.task.symbol);
+        if mode.starts_operations()
+            || redemption_store
+                .load(&row.task.aggregate_id)
+                .await?
+                .is_some()
+        {
+            continue;
+        }
+        kill_transfer_row::<TransferEquityToHedging>(
+            pool,
+            "$.aggregate_id",
+            &row.task.aggregate_id.to_string(),
+        )
+        .await?;
+        warn_missing_rebalancing_listing(services, row.task.chain, &row.task.symbol);
+        warn!(
+            target: "rebalance",
+            symbol = %row.task.symbol,
+            chain = %row.task.chain,
+            aggregate_id = %row.task.aggregate_id,
+            %mode,
+            "Killed a fresh equity redemption row on a listing that starts no operations"
+        );
+        killed_redemptions.insert(row.task.aggregate_id.clone());
+        row.status = Status::Killed;
+    }
+
+    Ok(())
+}
+
+async fn kill_transfer_row<Task>(pool: &SqlitePool, id_path: &str, id: &str) -> anyhow::Result<()> {
+    let result = sqlx::query(
+        "UPDATE Jobs SET status = ?, done_at = strftime('%s', 'now') \
+         WHERE job_type = ? AND json_extract(CAST(job AS TEXT), ?) = ? \
+         AND status NOT IN (?, ?)",
+    )
+    .bind(Status::Killed.to_string())
+    .bind(std::any::type_name::<Task>())
+    .bind(id_path)
+    .bind(id)
+    .bind(Status::Done.to_string())
+    .bind(Status::Killed.to_string())
+    .execute(pool)
+    .await?;
+    anyhow::ensure!(
+        result.rows_affected() > 0,
+        "no live transfer row matched {id_path}={id}"
+    );
+    Ok(())
+}
+
 async fn restore_live_transfer_job_guards(
     equity_in_progress: &RwLock<HashMap<Symbol, GuardState>>,
     mints: &[DurableTransferJob<TransferEquityToMarketMaking>],
     redemptions: &[DurableTransferJob<TransferEquityToHedging>],
     mint_store: &Store<TokenizedEquityMint>,
     redemption_store: &Store<EquityRedemption>,
+    services: &EquityTransferServices,
 ) -> anyhow::Result<HashSet<(Symbol, EquityTransferReservationId)>> {
     let mut guard_owners = HashMap::new();
     let mut active_reservations = HashSet::new();
@@ -4293,7 +5155,11 @@ async fn restore_live_transfer_job_guards(
         let owns_reservation = aggregate
             .as_ref()
             .is_some_and(|aggregate| !aggregate.is_terminal())
-            || (aggregate.is_none() && !row.is_terminal());
+            || (aggregate.is_none()
+                && !row.is_terminal()
+                && services
+                    .rebalancing_mode(row.task.chain, &row.task.symbol)
+                    .starts_operations());
         if !owns_reservation {
             continue;
         }
@@ -4320,7 +5186,11 @@ async fn restore_live_transfer_job_guards(
         let owns_reservation = aggregate
             .as_ref()
             .is_some_and(|aggregate| !aggregate.is_terminal())
-            || (aggregate.is_none() && !row.is_terminal());
+            || (aggregate.is_none()
+                && !row.is_terminal()
+                && services
+                    .rebalancing_mode(row.task.chain, &row.task.symbol)
+                    .starts_operations());
         if !owns_reservation {
             continue;
         }
@@ -4437,9 +5307,11 @@ fn unique_transfer_reservations(
 
 /// Returns `true` when `mint` is a pre-wrap post-receipt state
 /// (`TokensReceived` or `WrapSubmitted`) AND its symbol's guard is
-/// `HeldForRecovery`. These mints are excluded from direct `resume_mints`
-/// because `UnwrappedEquityRecovery` owns the slot and will re-wrap and
-/// deposit the tokens; calling `resume_mint` concurrently would race.
+/// `HeldForRecovery` or `Recovering` for the mint's chain. These mints are
+/// excluded from direct `resume_mints` because `UnwrappedEquityRecovery` owns
+/// the slot and will re-wrap and deposit the tokens; calling `resume_mint`
+/// concurrently would race. A hold for another chain belongs to that chain's recovery,
+/// which cannot reach this mint's tokens.
 fn is_pre_wrap_held_for_recovery(
     mint: &TokenizedEquityMint,
     equity_in_progress: &RwLock<HashMap<Symbol, GuardState>>,
@@ -4452,7 +5324,9 @@ fn is_pre_wrap_held_for_recovery(
             Err(poison) => poison.into_inner(),
         };
         match guard.get(symbol) {
-            Some(GuardState::HeldForRecovery) => true,
+            Some(GuardState::HeldForRecovery { chain } | GuardState::Recovering { chain, .. }) => {
+                *chain == mint.chain()
+            }
             Some(GuardState::ActiveTransfer { .. }) | None => false,
         }
     } else {
@@ -6968,6 +7842,8 @@ mod tests {
     use alloy::primitives::{Address, B256, TxHash, U256, address, bytes, fixed_bytes};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
+    use alloy::rpc::json_rpc::{RequestPacket, Response, ResponsePacket, ResponsePayload};
+    use alloy::sol_types::SolCall;
     use apalis::prelude::Status;
     use rain_math_float::Float;
     use sqlx::{ConnectOptions, SqlitePool};
@@ -6982,9 +7858,9 @@ mod tests {
 
     use st0x_bridge::corridor::UsdcCorridor;
     use st0x_config::{
-        AllocationCtx, BotGasValuationConfig, ChainAssets, ChainEquities, ChainEquityAsset,
-        ExecutionThreshold, OperationMode, OrchestratorConfig, UsdcCorridorCtx,
-        create_test_ctx_with_order_owner, test_issuance_status_ctx,
+        AllocationCtx, BotGasValuationConfig, ChainAssets, ChainCashAsset, ChainEquities,
+        ChainEquityAsset, ChainRegistry, ExecutionThreshold, OperationMode, OrchestratorConfig,
+        RebalancingMode, UsdcCorridors, create_test_ctx_with_order_owner, test_issuance_status_ctx,
     };
     use st0x_dto::Statement;
     use st0x_event_sorcery::{DomainEvent, Reconciler, StoreBuilder, test_store};
@@ -7005,7 +7881,9 @@ mod tests {
 
     use super::*;
     use crate::alerts::{CapturingNotifier, NotifierError};
-    use crate::bindings::IRaindexInventory::{OperatorDeposit, OperatorWithdraw};
+    use crate::bindings::IRaindexInventory::{
+        OPERATOR_ROLECall, OperatorDeposit, OperatorWithdraw, hasRoleCall,
+    };
     use crate::bindings::IRaindexV6::{
         ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4, TakeOrderConfigV4, TakeOrderV3,
     };
@@ -7155,7 +8033,7 @@ mod tests {
                                 tokenized_equity_derivative: wrapped,
                                 vault_ids: vec![],
                                 trading: OperationMode::Enabled,
-                                rebalancing: OperationMode::Disabled,
+                                rebalancing: RebalancingMode::Disabled,
                                 wrapped_equity_recovery: OperationMode::Disabled,
                                 operational_limit: None,
                                 target_share: None,
@@ -7479,7 +8357,7 @@ mod tests {
         let mut secondary = hedged_chain_with_equities([("MSFT", unwrapped, wrapped)]);
         secondary.chain = Chain::Ethereum;
         for equity in secondary.assets.equities.symbols.values_mut() {
-            equity.rebalancing = OperationMode::Enabled;
+            equity.rebalancing = RebalancingMode::Enabled;
         }
         ctx.chains.insert_secondary(secondary);
 
@@ -7523,7 +8401,7 @@ mod tests {
         let mut recovery_only = hedged_chain_with_equities([("AAPL", unwrapped, wrapped)]);
         for equity in recovery_only.assets.equities.symbols.values_mut() {
             equity.trading = OperationMode::Disabled;
-            equity.rebalancing = OperationMode::Disabled;
+            equity.rebalancing = RebalancingMode::Disabled;
             equity.wrapped_equity_recovery = OperationMode::Enabled;
         }
 
@@ -7743,40 +8621,284 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn preflight_skips_role_check_in_legacy_mode() {
-        // Legacy mode has no distinct inventory, so the preflight must return Ok
-        // WITHOUT issuing any eth_call. The service's asserter is empty: if the
-        // preflight tried to read OPERATOR_ROLE / hasRole, the mock would error.
-        let service = mock_wallet_raindex_service(Asserter::new());
+    fn operator_role_preflight_chain_ids(ctx: &Ctx) -> Vec<Chain> {
+        operator_role_preflight_chains(ctx, &BTreeSet::from([UsdcCorridor::BASE_CCTP]))
+            .into_iter()
+            .map(|(hedged, _)| hedged.chain)
+            .collect()
+    }
+
+    fn managed(hedged: &mut HedgedChain, inventory: Address) {
+        hedged.inventory = InventoryMode::Managed { inventory };
+    }
+
+    #[test]
+    fn operator_role_preflight_skips_legacy_mode() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.chains.primary_mut().inventory = InventoryMode::Legacy;
 
-        preflight_inventory_access(&service, &ctx)
-            .await
-            .expect("legacy mode must skip the preflight and succeed");
+        assert!(
+            operator_role_preflight_chains(&ctx, &BTreeSet::from([UsdcCorridor::BASE_CCTP]))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn operator_role_preflight_covers_a_rebalancing_secondary_but_not_a_hedge_only_one() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        managed(ctx.chains.primary_mut(), Address::repeat_byte(0xAA));
+        let mut robinhood = hedged_chain_with_equities([(
+            "DNUT",
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+        )]);
+        robinhood.chain = Chain::Robinhood;
+        managed(&mut robinhood, Address::repeat_byte(0xCC));
+        ctx.chains.insert_secondary(robinhood.clone());
+
+        assert_eq!(
+            operator_role_preflight_chain_ids(&ctx),
+            vec![Chain::Base],
+            "a hedge-only secondary makes no operator calls"
+        );
+
+        for equity in robinhood.assets.equities.symbols.values_mut() {
+            equity.rebalancing = RebalancingMode::Enabled;
+        }
+        ctx.chains.insert_secondary(robinhood);
+
+        let chains =
+            operator_role_preflight_chains(&ctx, &BTreeSet::from([UsdcCorridor::BASE_CCTP]));
+        assert_eq!(
+            chains
+                .iter()
+                .map(|(hedged, inventory)| (hedged.chain, *inventory))
+                .collect::<Vec<_>>(),
+            vec![
+                (Chain::Base, Address::repeat_byte(0xAA)),
+                (Chain::Robinhood, Address::repeat_byte(0xCC)),
+            ]
+        );
+    }
+
+    /// The wallet a chain's tokenization set signs with, backed by `asserter`.
+    fn mock_chain_tokenization(
+        chain: Chain,
+        asserter: Asserter,
+    ) -> ChainTokenization<RawPrivateKeyWallet<impl alloy::providers::Provider + Clone>> {
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        chain_tokenization_with(chain, B256::repeat_byte(0x11), provider)
+    }
+
+    fn chain_tokenization_with<P: alloy::providers::Provider + Clone + 'static>(
+        chain: Chain,
+        private_key: B256,
+        provider: P,
+    ) -> ChainTokenization<RawPrivateKeyWallet<P>> {
+        let wallet = RawPrivateKeyWallet::new(&private_key, provider, chain.chain_id()).unwrap();
+
+        ChainTokenization {
+            chain,
+            role: ChainRole::Secondary,
+            wallet,
+            equity: EquityTokenization::HedgeOnly,
+        }
+    }
+
+    fn push_operator_role_granted(asserter: &Asserter) {
+        asserter.push_success(&alloy::primitives::Bytes::from(
+            <crate::bindings::IRaindexInventory::OPERATOR_ROLECall as alloy::sol_types::SolCall>::abi_encode_returns(&B256::repeat_byte(0x42)),
+        ));
+        asserter.push_success(&alloy::primitives::Bytes::from(
+            <crate::bindings::IRaindexInventory::hasRoleCall as alloy::sol_types::SolCall>::abi_encode_returns(&true),
+        ));
+    }
+
+    fn ctx_with_rebalancing_robinhood() -> Ctx {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        managed(ctx.chains.primary_mut(), Address::repeat_byte(0xAA));
+        let mut robinhood = hedged_chain_with_equities([(
+            "DNUT",
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+        )]);
+        robinhood.chain = Chain::Robinhood;
+        managed(&mut robinhood, Address::repeat_byte(0xCC));
+        for equity in robinhood.assets.equities.symbols.values_mut() {
+            equity.rebalancing = RebalancingMode::Enabled;
+        }
+        ctx.chains.insert_secondary(robinhood);
+        ctx
+    }
+
+    /// The primary holds the role, so startup reaches the rebalancing
+    /// secondary and refuses on it.
+    #[tokio::test]
+    async fn preflight_refuses_a_rebalancing_secondary_without_the_role() {
+        let ctx = ctx_with_rebalancing_robinhood();
+        let base_asserter = Asserter::new();
+        push_operator_role_granted(&base_asserter);
+        let tokenizations = BTreeMap::from([
+            (
+                Chain::Base,
+                mock_chain_tokenization(Chain::Base, base_asserter.clone()),
+            ),
+            (
+                Chain::Robinhood,
+                mock_chain_tokenization(Chain::Robinhood, Asserter::new()),
+            ),
+        ]);
+
+        let error = preflight_inventory_access(
+            &ctx,
+            &tokenizations,
+            &BTreeSet::from([UsdcCorridor::BASE_CCTP]),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("OPERATOR_ROLE preflight failed on robinhood"),
+            "the failure must name the secondary, got: {error}"
+        );
+        assert!(
+            base_asserter.read_q().is_empty(),
+            "the primary's role check must consume its own responses"
+        );
+    }
+
+    /// Answers the `OPERATOR_ROLE` preflight's two `eth_call`s and records
+    /// each call's target and calldata.
+    #[derive(Clone, Default)]
+    struct RoleCheckTransport {
+        calls: Arc<std::sync::Mutex<Vec<(Address, alloy::primitives::Bytes)>>>,
+    }
+
+    impl tower::Service<RequestPacket> for RoleCheckTransport {
+        type Response = ResponsePacket;
+        type Error = alloy::transports::TransportError;
+        type Future = alloy::transports::TransportFut<'static>;
+
+        fn poll_ready(
+            &mut self,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: RequestPacket) -> Self::Future {
+            let RequestPacket::Single(request) = request else {
+                panic!("RoleCheckTransport serves single requests only");
+            };
+            assert_eq!(request.method(), "eth_call");
+            let params: Vec<serde_json::Value> =
+                serde_json::from_str(request.params().unwrap().get()).unwrap();
+            let call = &params[0];
+            let to: Address = serde_json::from_value(call["to"].clone()).unwrap();
+            let input: alloy::primitives::Bytes = serde_json::from_value(
+                call.get("input")
+                    .or_else(|| call.get("data"))
+                    .unwrap()
+                    .clone(),
+            )
+            .unwrap();
+            let returns = match input.get(..4) {
+                Some(selector) if selector == OPERATOR_ROLECall::SELECTOR => {
+                    OPERATOR_ROLECall::abi_encode_returns(&B256::repeat_byte(0x42))
+                }
+                Some(selector) if selector == hasRoleCall::SELECTOR => {
+                    hasRoleCall::abi_encode_returns(&true)
+                }
+                _ => panic!("unexpected eth_call input {input}"),
+            };
+            self.calls.lock().unwrap().push((to, input));
+            let payload = serde_json::to_string(&alloy::primitives::Bytes::from(returns)).unwrap();
+            let response = Response {
+                id: request.id().clone(),
+                payload: ResponsePayload::Success(
+                    serde_json::value::RawValue::from_string(payload).unwrap(),
+                ),
+            };
+
+            Box::pin(async move { Ok(ResponsePacket::Single(response)) })
+        }
+    }
+
+    /// Each chain's role check asks its own inventory whether its own wallet
+    /// holds `OPERATOR_ROLE`.
+    #[tokio::test]
+    async fn preflight_checks_each_rebalancing_chain_through_its_own_wallet() {
+        let ctx = ctx_with_rebalancing_robinhood();
+        let base_transport = RoleCheckTransport::default();
+        let robinhood_transport = RoleCheckTransport::default();
+        let provider = |transport: &RoleCheckTransport| {
+            ProviderBuilder::new()
+                .connect_client(alloy::rpc::client::RpcClient::new(transport.clone(), true))
+        };
+        let base = chain_tokenization_with(
+            Chain::Base,
+            B256::repeat_byte(0x11),
+            provider(&base_transport),
+        );
+        let robinhood = chain_tokenization_with(
+            Chain::Robinhood,
+            B256::repeat_byte(0x33),
+            provider(&robinhood_transport),
+        );
+        let expected = [
+            (
+                &base_transport,
+                Address::repeat_byte(0xAA),
+                base.wallet.address(),
+            ),
+            (
+                &robinhood_transport,
+                Address::repeat_byte(0xCC),
+                robinhood.wallet.address(),
+            ),
+        ];
+        assert_ne!(expected[0].2, expected[1].2);
+        let tokenizations = BTreeMap::from([(Chain::Base, base), (Chain::Robinhood, robinhood)]);
+
+        preflight_inventory_access(
+            &ctx,
+            &tokenizations,
+            &BTreeSet::from([UsdcCorridor::BASE_CCTP]),
+        )
+        .await
+        .unwrap();
+
+        for (transport, inventory, account) in expected {
+            let calls = transport.calls.lock().unwrap().clone();
+            assert_eq!(calls.len(), 2, "{calls:?}");
+            assert!(calls.iter().all(|(to, _)| *to == inventory), "{calls:?}");
+            let has_role = hasRoleCall::abi_decode(&calls[1].1).unwrap();
+            assert_eq!(has_role.role, B256::repeat_byte(0x42));
+            assert_eq!(has_role.account, account);
+        }
     }
 
     #[tokio::test]
-    async fn preflight_attempts_role_check_in_managed_mode() {
-        // Managed mode must actually query the role: with an empty asserter the
-        // first eth_call fails, so the preflight surfaces an error (wrapped in its
-        // context). This is the mirror of the legacy test -- proving the branch on
-        // InventoryMode, not the skip. The exact MissingOperatorRole outcome is
-        // covered by the RaindexService::verify_operator_role unit tests.
+    async fn chain_preflight_failure_names_the_chain() {
+        // With an empty asserter the first eth_call fails, so the role check
+        // surfaces an error. The exact MissingOperatorRole outcome is covered
+        // by the RaindexService::verify_operator_role unit tests.
         let service = mock_wallet_raindex_service(Asserter::new());
-        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        ctx.chains.primary_mut().inventory = InventoryMode::Managed {
-            inventory: Address::repeat_byte(0xAA),
-        };
 
-        let error = preflight_inventory_access(&service, &ctx)
-            .await
-            .expect_err("managed mode must attempt the role check and surface the failure");
+        let error = preflight_chain_inventory_access(
+            Chain::Robinhood,
+            Address::repeat_byte(0xAA),
+            &service,
+        )
+        .await
+        .expect_err("the role check must fail against an empty asserter");
 
+        let message = error.to_string();
         assert!(
-            error.to_string().contains("OPERATOR_ROLE preflight failed"),
-            "managed-mode failure must carry the preflight context, got: {error}"
+            message.contains("OPERATOR_ROLE preflight failed on robinhood"),
+            "the failure must name the chain, got: {message}"
         );
     }
 
@@ -7791,14 +8913,14 @@ mod tests {
 
         Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: None,
+                usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(60),
+                recovery_hold_alert_after: Duration::from_secs(60 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
                     ChainRebalancingConfig::for_test(ChainAssets {
@@ -7876,6 +8998,82 @@ mod tests {
         Arc::new(PnlLedgerReactor::new(Arc::new(PnlLedger::new(
             pool.clone(),
         ))))
+    }
+
+    /// A send another key signed (a rotated wallet) is not restored into the
+    /// current wallet at startup: reserving that key's nonce would raise this
+    /// wallet's next nonce past its own. It pages and gates its chain.
+    #[tokio::test]
+    async fn a_startup_restore_skips_a_send_signed_by_another_wallet() {
+        use alloy::consensus::{SignableTransaction as _, TxEip1559, TxEnvelope};
+        use alloy::eips::eip2718::Encodable2718 as _;
+        use alloy::signers::SignerSync as _;
+
+        let old_key = alloy::signers::local::PrivateKeySigner::random();
+        let unsigned = TxEip1559 {
+            chain_id: 8453,
+            nonce: 900,
+            gas_limit: 80_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 1_000_000,
+            to: alloy::primitives::TxKind::Call(Address::repeat_byte(0x21)),
+            value: U256::ZERO,
+            access_list: alloy::eips::eip2930::AccessList::default(),
+            input: alloy::primitives::Bytes::from_static(&[0xa9, 0x05, 0x9c, 0xbb]),
+        };
+        let signature = old_key.sign_hash_sync(&unsigned.signature_hash()).unwrap();
+        let send = PreparedTransaction::from_raw(alloy::primitives::Bytes::from(
+            TxEnvelope::from(unsigned.into_signed(signature)).encoded_2718(),
+        ))
+        .unwrap();
+        let tokenizer = MockTokenizer::new().with_signing_wallet(Address::repeat_byte(0x4E));
+        let notifier = CapturingNotifier::default();
+        let id = redemption_aggregate_id("startup-rotated-key-send");
+
+        let restored =
+            restore_redemption_send(&tokenizer, &notifier, &id, Chain::Base, &[&send]).await;
+
+        assert!(!restored, "the send gates its chain's startup approvals");
+        assert!(tokenizer.redemption_send_restores().is_empty());
+        assert!(tokenizer.redemption_send_broadcasts().is_empty());
+        let alerts = notifier.messages();
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        assert!(
+            alerts[0].contains(&format!("signed by {}", old_key.address()))
+                && alerts[0].contains("nonce 900"),
+            "{alerts:?}"
+        );
+    }
+
+    /// A ledger that cannot catch up must not keep the bot from starting:
+    /// startup continues with the reactor wired and pages the operator with
+    /// the underlying cause, not only the ledger's top level message.
+    #[tokio::test]
+    async fn ledger_startup_failure_pages_and_does_not_stop_startup() {
+        let pool = setup_test_db().await;
+        sqlx::query(
+            "INSERT INTO events (aggregate_type, aggregate_id, sequence, \
+             event_type, event_version, payload, metadata) \
+             VALUES ('Position', 'AAPL', 1, 'PositionEvent::OnChainOrderFilled', '1.0', \
+             '{not-json', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let notifier = CapturingNotifier::default();
+
+        setup_pnl_ledger(Arc::new(PnlLedger::new(pool.clone())), &notifier).await;
+
+        let alerts = notifier.messages();
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        assert!(
+            alerts[0].contains("PnL ledger failed to catch up at startup"),
+            "{alerts:?}"
+        );
+        assert!(
+            alerts[0].contains("Undeserializable Position event payload at events rowid 1"),
+            "{alerts:?}"
+        );
     }
 
     /// Test-only mirror of the manifest's Position wiring (broadcaster,
@@ -8444,6 +9642,222 @@ mod tests {
         ));
     }
 
+    async fn insert_recovery_event(
+        pool: &SqlitePool,
+        aggregate_type: &str,
+        aggregate_id: &str,
+        sequence: i64,
+        event_type: &str,
+        payload: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type, \
+             event_version, payload, metadata) VALUES (?1, ?2, ?3, ?4, '1.0', ?5, '{}')",
+        )
+        .bind(aggregate_type)
+        .bind(aggregate_id)
+        .bind(sequence)
+        .bind(event_type)
+        .bind(payload)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_recovery_job(
+        apalis_pool: &apalis_sqlite::SqlitePool,
+        id: &str,
+        job_type: &str,
+        status: Status,
+        job: &str,
+    ) {
+        sqlx_apalis::query(
+            "INSERT INTO Jobs \
+             (job, id, job_type, status, attempts, max_attempts, run_at, priority) \
+             VALUES (?, ?, ?, ?, 0, 25, 0, 0)",
+        )
+        .bind(job.as_bytes().to_vec())
+        .bind(id)
+        .bind(job_type)
+        .bind(status.to_string())
+        .execute(apalis_pool)
+        .await
+        .unwrap();
+    }
+
+    const LEGACY_DETECTED: &str =
+        r#"{"Detected":{"symbol":"AAPL","shares":"1","detected_at":"2026-01-01T00:00:00Z"}}"#;
+
+    #[tokio::test]
+    async fn chainless_open_recovery_refuses_startup_only_on_a_non_base_primary() {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let open_legacy = UnwrappedEquityRecoveryId(uuid::Uuid::new_v4());
+        insert_recovery_event(
+            &pool,
+            "UnwrappedEquityRecovery",
+            &open_legacy.to_string(),
+            1,
+            "UnwrappedEquityRecoveryEvent::Detected",
+            LEGACY_DETECTED,
+        )
+        .await;
+
+        refuse_chainless_recoveries_on_non_base_primary(&pool, &apalis_pool, Chain::Base)
+            .await
+            .unwrap();
+
+        let error =
+            refuse_chainless_recoveries_on_non_base_primary(&pool, &apalis_pool, Chain::Ethereum)
+                .await
+                .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "the open unwrapped equity recovery {open_legacy} was recorded before \
+                 recoveries named their chain and replays as base, but the primary chain is \
+                 ethereum: finish or fail it with a binary that predates per-chain recovery, \
+                 or switch the primary back to base, before upgrading"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn chainless_terminal_or_chained_recoveries_do_not_refuse_a_non_base_primary() {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let terminal_legacy = WrappedEquityRecoveryId(uuid::Uuid::new_v4());
+        insert_recovery_event(
+            &pool,
+            "WrappedEquityRecovery",
+            &terminal_legacy.to_string(),
+            1,
+            "WrappedEquityRecoveryEvent::Detected",
+            LEGACY_DETECTED,
+        )
+        .await;
+        insert_recovery_event(
+            &pool,
+            "WrappedEquityRecovery",
+            &terminal_legacy.to_string(),
+            2,
+            "WrappedEquityRecoveryEvent::RecoveryFailed",
+            r#"{"RecoveryFailed":{"reason":"resolved","failed_at":"2026-01-01T00:00:01Z"}}"#,
+        )
+        .await;
+        insert_recovery_event(
+            &pool,
+            "WrappedEquityRecovery",
+            &WrappedEquityRecoveryId(uuid::Uuid::new_v4()).to_string(),
+            1,
+            "WrappedEquityRecoveryEvent::Detected",
+            r#"{"Detected":{"chain":"ethereum","symbol":"AAPL","shares":"1","detected_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .await;
+
+        let wrapped_job_type =
+            std::any::type_name::<crate::wrapped_equity_recovery::WrappedEquityRecoveryJob>();
+        let legacy_job = format!(
+            r#"{{"symbol":"AAPL","recovery_id":"{}"}}"#,
+            uuid::Uuid::new_v4()
+        );
+        insert_recovery_job(
+            &apalis_pool,
+            "done-legacy",
+            wrapped_job_type,
+            Status::Done,
+            &legacy_job,
+        )
+        .await;
+        insert_recovery_job(
+            &apalis_pool,
+            "pending-chained",
+            wrapped_job_type,
+            Status::Pending,
+            &format!(
+                r#"{{"chain":"ethereum","symbol":"AAPL","recovery_id":"{}"}}"#,
+                uuid::Uuid::new_v4()
+            ),
+        )
+        .await;
+
+        refuse_chainless_recoveries_on_non_base_primary(&pool, &apalis_pool, Chain::Ethereum)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn chainless_pending_recovery_job_refuses_a_non_base_primary() {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let job_type =
+            std::any::type_name::<crate::unwrapped_equity_recovery::UnwrappedEquityRecoveryJob>();
+        insert_recovery_job(
+            &apalis_pool,
+            "pending-legacy",
+            job_type,
+            Status::Pending,
+            &format!(
+                r#"{{"symbol":"AAPL","recovery_id":"{}"}}"#,
+                uuid::Uuid::new_v4()
+            ),
+        )
+        .await;
+
+        refuse_chainless_recoveries_on_non_base_primary(&pool, &apalis_pool, Chain::Base)
+            .await
+            .unwrap();
+
+        let error =
+            refuse_chainless_recoveries_on_non_base_primary(&pool, &apalis_pool, Chain::Ethereum)
+                .await
+                .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "the Pending {job_type} job pending-legacy was queued before recovery jobs \
+                 named their chain and runs as base, but the primary chain is ethereum: let it \
+                 finish with a binary that predates per-chain recovery, or switch the primary \
+                 back to base, before upgrading"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn chainless_failed_recovery_job_refuses_until_retries_are_exhausted() {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let job_type =
+            std::any::type_name::<crate::wrapped_equity_recovery::WrappedEquityRecoveryJob>();
+        insert_recovery_job(
+            &apalis_pool,
+            "failed-legacy",
+            job_type,
+            Status::Failed,
+            &format!(
+                r#"{{"symbol":"AAPL","recovery_id":"{}"}}"#,
+                uuid::Uuid::new_v4()
+            ),
+        )
+        .await;
+        sqlx_apalis::query(
+            "UPDATE Jobs SET attempts = max_attempts - 1 WHERE id = 'failed-legacy'",
+        )
+        .execute(&apalis_pool)
+        .await
+        .unwrap();
+        let error =
+            refuse_chainless_recoveries_on_non_base_primary(&pool, &apalis_pool, Chain::Ethereum)
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("the Failed"));
+        assert!(error.to_string().contains("failed-legacy"));
+
+        sqlx_apalis::query("UPDATE Jobs SET attempts = max_attempts WHERE id = 'failed-legacy'")
+            .execute(&apalis_pool)
+            .await
+            .unwrap();
+        refuse_chainless_recoveries_on_non_base_primary(&pool, &apalis_pool, Chain::Ethereum)
+            .await
+            .unwrap();
+    }
+
     async fn insert_finished_job(apalis_pool: &apalis_sqlite::SqlitePool, id: &str) {
         sqlx_apalis::query(
             "INSERT INTO Jobs \
@@ -8490,6 +9904,7 @@ mod tests {
 
         queue
             .push(UnwrappedEquityRecoveryJob {
+                chain: Chain::Base,
                 symbol: Symbol::new("AAPL").unwrap(),
                 recovery_id: UnwrappedEquityRecoveryId(uuid::Uuid::new_v4()),
                 backpressure_streak: BackpressureStreak::default(),
@@ -8526,6 +9941,7 @@ mod tests {
 
         queue
             .push(WrappedEquityRecoveryJob {
+                chain: Chain::Base,
                 symbol: Symbol::new("AAPL").unwrap(),
                 recovery_id: WrappedEquityRecoveryId(uuid::Uuid::new_v4()),
                 backpressure_streak: BackpressureStreak::default(),
@@ -8593,6 +10009,23 @@ mod tests {
         redemption_label: &str,
         raindex: MockRaindex,
     ) -> InterruptedAggregateFixture {
+        seed_interrupted_aggregates_and_build_service_with_mocks(
+            wallet_byte,
+            mint_label,
+            redemption_label,
+            raindex,
+            MockTokenizer::new(),
+        )
+        .await
+    }
+
+    async fn seed_interrupted_aggregates_and_build_service_with_mocks(
+        wallet_byte: u8,
+        mint_label: &str,
+        redemption_label: &str,
+        raindex: MockRaindex,
+        tokenizer: MockTokenizer,
+    ) -> InterruptedAggregateFixture {
         let (pool, apalis_pool) = setup_test_pools().await;
 
         let mint_id = issuer_request_id(mint_label);
@@ -8600,7 +10033,7 @@ mod tests {
 
         let raindex = Arc::new(raindex);
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
-        let tokenizer = Arc::new(MockTokenizer::new());
+        let tokenizer = Arc::new(tokenizer);
 
         let services = recovery_services(raindex.clone(), tokenizer.clone(), wrapper.clone());
 
@@ -8653,14 +10086,14 @@ mod tests {
         let notifier = Arc::new(crate::alerts::CapturingNotifier::default());
         let rebalancing_service = RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: None,
+                usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(60),
+                recovery_hold_alert_after: Duration::from_secs(60 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
                     ChainRebalancingConfig::for_test(ChainAssets {
@@ -8769,7 +10202,7 @@ mod tests {
                     tokenized_equity_derivative: Address::ZERO,
                     vault_ids: Vec::new(),
                     trading: OperationMode::Disabled,
-                    rebalancing: OperationMode::Enabled,
+                    rebalancing: RebalancingMode::Enabled,
                     wrapped_equity_recovery,
                     operational_limit: None,
                     target_share: None,
@@ -8977,6 +10410,247 @@ mod tests {
                     && message.contains("could not be rebroadcast at startup")
             }),
             "a failed rebroadcast must page about redemption {redemption_id}, got {messages:?}"
+        );
+    }
+
+    /// Advances the fixture's redemption from `VaultWithdrawSubmitting` to a
+    /// signed `SendPending` and returns the persisted send's hash.
+    async fn advance_fixture_redemption_to_signed_send(
+        pool: &SqlitePool,
+        services: &EquityTransferServices,
+        redemption_id: &RedemptionAggregateId,
+    ) -> TxHash {
+        let store = test_store::<EquityRedemption>(pool.clone(), services.clone());
+        let prepared = st0x_evm::PreparedTransaction::for_test(TxHash::repeat_byte(0x5e), 7);
+        for command in [
+            EquityRedemptionCommand::RecordWithdrawSubmission {
+                tx_hash: crate::equity_redemption::prepared_withdrawal_for_test().tx_hash(),
+            },
+            EquityRedemptionCommand::ConfirmWithdraw,
+            EquityRedemptionCommand::UnwrapTokens,
+            EquityRedemptionCommand::SubmitUnwrap,
+            EquityRedemptionCommand::ConfirmUnwrap,
+            EquityRedemptionCommand::PrepareSend {
+                prepared: prepared.clone(),
+                redemption_wallet: Address::repeat_byte(0x77),
+            },
+        ] {
+            store.send(redemption_id, command).await.unwrap();
+        }
+        prepared.tx_hash()
+    }
+
+    /// A raindex mock that confirms the fixture redemption's withdrawal, so it
+    /// can advance past `VaultWithdrawSubmitting`.
+    fn confirming_raindex(wallet_byte: u8) -> MockRaindex {
+        MockRaindex::new().with_withdraw_transfer(
+            Address::from([wallet_byte; 20]),
+            alloy::primitives::U256::from(5_000_000_000_000_000_000_u128),
+        )
+    }
+
+    async fn recover_fixture(fixture: &mut InterruptedAggregateFixture) -> BTreeSet<Chain> {
+        recover_interrupted_tokenization_aggregates(
+            &fixture.pool,
+            &fixture.rebalancing_service,
+            fixture.inventory.as_ref(),
+            Arc::new(test_store::<TokenizedEquityMint>(
+                fixture.pool.clone(),
+                fixture.services.clone(),
+            )),
+            Arc::new(test_store::<EquityRedemption>(
+                fixture.pool.clone(),
+                fixture.services.clone(),
+            )),
+            &fixture.services,
+            &mut fixture.resume_queue,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A node can reject the rebroadcast of an already mined send (Nitro checks
+    /// the fee cap before the nonce). Startup still looks up the receipt, so a
+    /// send that landed does not pause the chain's approvals.
+    #[tokio::test]
+    async fn startup_confirms_a_mined_issuer_send_even_when_its_rebroadcast_fails() {
+        let mut fixture = seed_interrupted_aggregates_and_build_service_with_mocks(
+            7,
+            "mined-send-mint",
+            "mined-send-redemption",
+            confirming_raindex(7),
+            MockTokenizer::new().with_redemption_broadcast_failure(),
+        )
+        .await;
+        let tx_hash = advance_fixture_redemption_to_signed_send(
+            &fixture.pool,
+            &fixture.services,
+            &fixture.redemption_id,
+        )
+        .await;
+
+        let unmined = recover_fixture(&mut fixture).await;
+
+        assert!(unmined.is_empty(), "got {unmined:?}");
+        assert_eq!(fixture.tokenizer.redemption_send_restores(), vec![tx_hash]);
+        assert_eq!(
+            fixture.tokenizer.redemption_send_broadcasts(),
+            vec![tx_hash]
+        );
+        let messages = fixture.notifier.messages();
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.contains("unresolved signed send")),
+            "a mined send must not page, got {messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_pages_an_unmined_issuer_send_and_returns_its_chain() {
+        let mut fixture = seed_interrupted_aggregates_and_build_service_with_mocks(
+            8,
+            "unmined-send-mint",
+            "unmined-send-redemption",
+            confirming_raindex(8),
+            MockTokenizer::new().with_redemption_receipt_missing(),
+        )
+        .await;
+        let tx_hash = advance_fixture_redemption_to_signed_send(
+            &fixture.pool,
+            &fixture.services,
+            &fixture.redemption_id,
+        )
+        .await;
+
+        let unmined = recover_fixture(&mut fixture).await;
+
+        assert_eq!(unmined, BTreeSet::from([Chain::Base]));
+        assert_eq!(fixture.tokenizer.redemption_send_restores(), vec![tx_hash]);
+        let messages = fixture.notifier.messages();
+        assert!(
+            messages.iter().any(|message| {
+                message.contains(&fixture.redemption_id.to_string())
+                    && message.contains("unresolved signed send")
+                    && message.contains(&tx_hash.to_string())
+            }),
+            "got {messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_pages_a_legacy_send_pending_with_its_reconcile_command() {
+        let mut fixture = seed_interrupted_aggregates_and_build_service_with(
+            9,
+            "legacy-send-mint",
+            "legacy-send-redemption",
+            confirming_raindex(9),
+        )
+        .await;
+        let store = test_store::<EquityRedemption>(fixture.pool.clone(), fixture.services.clone());
+        for command in [
+            EquityRedemptionCommand::RecordWithdrawSubmission {
+                tx_hash: crate::equity_redemption::prepared_withdrawal_for_test().tx_hash(),
+            },
+            EquityRedemptionCommand::ConfirmWithdraw,
+            EquityRedemptionCommand::UnwrapTokens,
+            EquityRedemptionCommand::SubmitUnwrap,
+            EquityRedemptionCommand::ConfirmUnwrap,
+        ] {
+            store.send(&fixture.redemption_id, command).await.unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+             SELECT 'EquityRedemption', ?1, MAX(sequence) + 1, \
+             'EquityRedemptionEvent::SendPending', '1', \
+             '{\"SendPending\":{\"pending_at\":\"2026-01-01T00:00:00Z\"}}', '{}' \
+             FROM events WHERE aggregate_id = ?1",
+        )
+        .bind(fixture.redemption_id.to_string())
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+
+        let unmined = recover_fixture(&mut fixture).await;
+
+        assert_eq!(unmined, BTreeSet::from([Chain::Base]));
+        assert!(fixture.tokenizer.redemption_send_broadcasts().is_empty());
+        let messages = fixture.notifier.messages();
+        assert!(
+            messages.iter().any(|message| {
+                message.contains("legacy pending send to the issuer")
+                    && message.contains(&format!(
+                        "stox transfer reconcile --kind redemption --id {}",
+                        fixture.redemption_id
+                    ))
+            }),
+            "got {messages:?}"
+        );
+    }
+
+    /// An exhausted transfer job must not keep a signed send from being driven
+    /// to its receipt: startup queues a resume for it.
+    #[tokio::test]
+    async fn startup_resumes_a_signed_send_whose_transfer_job_is_terminal() {
+        let mut fixture = seed_interrupted_aggregates_and_build_service_with(
+            10,
+            "terminal-job-mint",
+            "terminal-job-redemption",
+            confirming_raindex(10),
+        )
+        .await;
+        advance_fixture_redemption_to_signed_send(
+            &fixture.pool,
+            &fixture.services,
+            &fixture.redemption_id,
+        )
+        .await;
+        let mut redemption_queue =
+            crate::rebalancing::equity::TransferEquityToHedgingJobQueue::new(&fixture.apalis_pool);
+        redemption_queue
+            .push(TransferEquityToHedging {
+                aggregate_id: fixture.redemption_id.clone(),
+                symbol: Symbol::new("TSLA").unwrap(),
+                quantity: FractionalShares::new(float!(5)),
+                chain: Chain::Base,
+                generation: GuardGeneration::from_parts(NonZeroU32::new(1).unwrap(), 1),
+                backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
+            })
+            .await
+            .unwrap();
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = ?, attempts = max_attempts WHERE job_type = ?",
+        )
+        .bind(Status::Failed.to_string())
+        .bind(std::any::type_name::<TransferEquityToHedging>())
+        .execute(&fixture.apalis_pool)
+        .await
+        .unwrap();
+
+        recover_fixture(&mut fixture).await;
+
+        let payloads: Vec<Vec<u8>> = sqlx_apalis::query_scalar(
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<ResumeTokenizationAggregate>())
+        .fetch_all(&fixture.apalis_pool)
+        .await
+        .unwrap();
+        let targets = payloads
+            .iter()
+            .map(|job| {
+                serde_json::from_slice::<ResumeTokenizationAggregate>(job)
+                    .unwrap()
+                    .target
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            targets.contains(&ResumeTokenizationTarget::Redemption(
+                fixture.redemption_id.clone()
+            )),
+            "the signed send must be resumed despite its terminal transfer job, got {targets:?}"
         );
     }
 
@@ -9474,12 +11148,363 @@ mod tests {
         }
     }
 
+    fn queued_transfer_listing(mode: RebalancingMode) -> st0x_config::ChainEquityAsset {
+        st0x_config::ChainEquityAsset {
+            tokenized_equity: Address::ZERO,
+            tokenized_equity_derivative: Address::ZERO,
+            vault_ids: vec![],
+            trading: st0x_config::OperationMode::Disabled,
+            rebalancing: mode,
+            wrapped_equity_recovery: st0x_config::OperationMode::Disabled,
+            operational_limit: None,
+            target_share: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn stopped_fresh_transfer_rows_do_not_restore_startup_guards_or_reservations() {
+        let fixture = seed_interrupted_aggregates_and_build_service(
+            6,
+            "stopped-startup-existing-mint",
+            "stopped-startup-existing-redemption",
+        )
+        .await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        for mode in [RebalancingMode::Paused, RebalancingMode::Disabled] {
+            let mut services = fixture.services.clone();
+            services
+                .chains
+                .get_mut(&Chain::Base)
+                .unwrap()
+                .equities
+                .symbols
+                .insert(symbol.clone(), queued_transfer_listing(mode));
+            let mint_store =
+                test_store::<TokenizedEquityMint>(fixture.pool.clone(), services.clone());
+            let redemption_store =
+                test_store::<EquityRedemption>(fixture.pool.clone(), services.clone());
+            let generation = GuardGeneration::default();
+            let mint_rows = vec![DurableTransferJob {
+                task: TransferEquityToMarketMaking {
+                    issuer_request_id: issuer_request_id("stopped-startup-fresh-mint"),
+                    symbol: symbol.clone(),
+                    chain: Chain::Base,
+                    quantity: FractionalShares::new(float!(1)),
+                    generation,
+                    backpressure_streak: BackpressureStreak::default(),
+                    position_reservation_retry_attempts: 0,
+                },
+                status: Status::Pending,
+                attempts: 0,
+                max_attempts: 5,
+            }];
+            let redemption_rows = vec![DurableTransferJob {
+                task: TransferEquityToHedging {
+                    aggregate_id: redemption_aggregate_id("stopped-startup-fresh-redemption"),
+                    symbol: symbol.clone(),
+                    chain: Chain::Base,
+                    quantity: FractionalShares::new(float!(1)),
+                    generation,
+                    backpressure_streak: BackpressureStreak::default(),
+                    position_reservation_retry_attempts: 0,
+                },
+                status: Status::Pending,
+                attempts: 0,
+                max_attempts: 5,
+            }];
+            let guards = RwLock::new(HashMap::new());
+            let reservations = restore_live_transfer_job_guards(
+                &guards,
+                &mint_rows,
+                &redemption_rows,
+                &mint_store,
+                &redemption_store,
+                &services,
+            )
+            .await
+            .unwrap();
+            assert!(
+                reservations.is_empty(),
+                "stopped rows must not retain Position reservations"
+            );
+            assert!(guards.read().unwrap().is_empty());
+        }
+    }
+
+    /// A fresh mint row on a paused listing (no aggregate yet, waiting for
+    /// gas when the bot restarted) is killed at startup, so the planner's
+    /// in-flight check no longer counts it against the symbol's other chains.
+    #[tokio::test]
+    async fn startup_kills_fresh_transfer_rows_on_a_stopped_listing() {
+        let mut fixture = seed_interrupted_aggregates_and_build_service(
+            6,
+            "stopped-row-existing-mint",
+            "stopped-row-existing-redemption",
+        )
+        .await;
+        let symbol = Symbol::new("NVDA").unwrap();
+        fixture
+            .services
+            .chains
+            .get_mut(&Chain::Base)
+            .unwrap()
+            .equities
+            .symbols
+            .insert(
+                symbol.clone(),
+                queued_transfer_listing(RebalancingMode::Paused),
+            );
+        let mut queue = crate::rebalancing::equity::TransferEquityToMarketMakingJobQueue::new(
+            &fixture.apalis_pool,
+        );
+        for _ in 0..2 {
+            queue
+                .push(TransferEquityToMarketMaking {
+                    issuer_request_id: issuer_request_id("paused-fresh-mint"),
+                    symbol: symbol.clone(),
+                    chain: Chain::Base,
+                    quantity: FractionalShares::new(float!(1)),
+                    generation: GuardGeneration::default(),
+                    backpressure_streak: BackpressureStreak::default(),
+                    position_reservation_retry_attempts: 0,
+                })
+                .await
+                .unwrap();
+        }
+
+        recover_interrupted_tokenization_aggregates(
+            &fixture.pool,
+            &fixture.rebalancing_service,
+            &fixture.inventory,
+            Arc::new(test_store::<TokenizedEquityMint>(
+                fixture.pool.clone(),
+                fixture.services.clone(),
+            )),
+            Arc::new(test_store::<EquityRedemption>(
+                fixture.pool.clone(),
+                fixture.services.clone(),
+            )),
+            &fixture.services,
+            &mut fixture.resume_queue,
+        )
+        .await
+        .unwrap();
+
+        let statuses: Vec<String> = sqlx_apalis::query_scalar(
+            "SELECT status FROM Jobs WHERE job_type = ? \
+             AND json_extract(CAST(job AS TEXT), '$.symbol') = 'NVDA'",
+        )
+        .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+        .fetch_all(&fixture.apalis_pool)
+        .await
+        .unwrap();
+        assert_eq!(statuses, vec![Status::Killed.to_string(); 2]);
+        let guard = match fixture.rebalancing_service.equity_in_progress.read() {
+            Ok(guard) => guard.get(&symbol).cloned(),
+            Err(poison) => poison.into_inner().get(&symbol).cloned(),
+        };
+        assert!(guard.is_none(), "the killed row must not restore a guard");
+    }
+
+    #[tokio::test]
+    async fn startup_preserves_aggregate_backed_rows_and_kills_fresh_redemptions_when_paused() {
+        let mut fixture = seed_interrupted_aggregates_and_build_service(
+            6,
+            "paused-backed-mint",
+            "paused-backed-redemption",
+        )
+        .await;
+        for name in ["AAPL", "TSLA", "NVDA"] {
+            fixture
+                .services
+                .chains
+                .get_mut(&Chain::Base)
+                .unwrap()
+                .equities
+                .symbols
+                .insert(
+                    Symbol::new(name).unwrap(),
+                    queued_transfer_listing(RebalancingMode::Paused),
+                );
+        }
+        let mut mint_queue = crate::rebalancing::equity::TransferEquityToMarketMakingJobQueue::new(
+            &fixture.apalis_pool,
+        );
+        mint_queue
+            .push(TransferEquityToMarketMaking {
+                issuer_request_id: fixture.mint_id.clone(),
+                symbol: Symbol::new("AAPL").unwrap(),
+                chain: Chain::Base,
+                quantity: FractionalShares::new(float!(10)),
+                generation: GuardGeneration::default(),
+                backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
+            })
+            .await
+            .unwrap();
+        let mut redemption_queue =
+            crate::rebalancing::equity::TransferEquityToHedgingJobQueue::new(&fixture.apalis_pool);
+        for (id, name, quantity) in [
+            (fixture.redemption_id.clone(), "TSLA", float!(5)),
+            (
+                redemption_aggregate_id("paused-fresh-redemption"),
+                "NVDA",
+                float!(1),
+            ),
+            (
+                redemption_aggregate_id("paused-fresh-redemption"),
+                "NVDA",
+                float!(1),
+            ),
+        ] {
+            redemption_queue
+                .push(TransferEquityToHedging {
+                    aggregate_id: id,
+                    symbol: Symbol::new(name).unwrap(),
+                    chain: Chain::Base,
+                    quantity: FractionalShares::new(quantity),
+                    generation: GuardGeneration::default(),
+                    backpressure_streak: BackpressureStreak::default(),
+                    position_reservation_retry_attempts: 0,
+                })
+                .await
+                .unwrap();
+        }
+        let mint_store =
+            test_store::<TokenizedEquityMint>(fixture.pool.clone(), fixture.services.clone());
+        let redemption_store =
+            test_store::<EquityRedemption>(fixture.pool.clone(), fixture.services.clone());
+        let mut mints = load_transfer_jobs::<TransferEquityToMarketMaking>(&fixture.pool)
+            .await
+            .unwrap();
+        let mut redemptions = load_transfer_jobs::<TransferEquityToHedging>(&fixture.pool)
+            .await
+            .unwrap();
+        kill_stopped_fresh_transfer_rows(
+            &fixture.pool,
+            &mut mints,
+            &mut redemptions,
+            &mint_store,
+            &redemption_store,
+            &fixture.services,
+        )
+        .await
+        .unwrap();
+        assert_eq!(mints[0].status, Status::Pending);
+        for row in &redemptions {
+            assert_eq!(
+                row.status,
+                if row.task.aggregate_id == fixture.redemption_id {
+                    Status::Pending
+                } else {
+                    Status::Killed
+                }
+            );
+        }
+        let persisted = load_transfer_jobs::<TransferEquityToHedging>(&fixture.pool)
+            .await
+            .unwrap();
+        for row in persisted {
+            assert_eq!(
+                row.status,
+                if row.task.aggregate_id == fixture.redemption_id {
+                    Status::Pending
+                } else {
+                    Status::Killed
+                }
+            );
+        }
+        let guards = RwLock::new(HashMap::new());
+        let reservations = restore_live_transfer_job_guards(
+            &guards,
+            &mints,
+            &redemptions,
+            &mint_store,
+            &redemption_store,
+            &fixture.services,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reservations.len(), 2);
+        let guards = guards.read().unwrap();
+        for name in ["AAPL", "TSLA"] {
+            assert_eq!(
+                guards.get(&Symbol::new(name).unwrap()),
+                Some(&GuardState::ActiveTransfer {
+                    generation: GuardGeneration::default()
+                })
+            );
+        }
+        assert_eq!(guards.get(&Symbol::new("NVDA").unwrap()), None);
+        drop(guards);
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn missing_rebalancing_listing_warning_names_an_unwired_chain() {
+        let mut services = EquityTransferServices::panicking();
+        services.chains.remove(&Chain::Ethereum);
+
+        warn_missing_rebalancing_listing(&services, Chain::Ethereum, &Symbol::new("AAPL").unwrap());
+
+        assert!(logs_contain(
+            "No equity transfer services are wired for the chain"
+        ));
+        assert!(!logs_contain("does not list the symbol"));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn missing_rebalancing_listing_warning_names_an_unlisted_symbol() {
+        let services = EquityTransferServices::panicking();
+
+        warn_missing_rebalancing_listing(&services, Chain::Base, &Symbol::new("AAPL").unwrap());
+
+        assert!(logs_contain("does not list the symbol"));
+        assert!(!logs_contain("No equity transfer services are wired"));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn missing_rebalancing_listing_warning_is_silent_for_a_listed_symbol() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mut services = EquityTransferServices::panicking();
+        services
+            .chains
+            .get_mut(&Chain::Base)
+            .unwrap()
+            .equities
+            .symbols
+            .insert(
+                symbol.clone(),
+                queued_transfer_listing(RebalancingMode::Paused),
+            );
+
+        warn_missing_rebalancing_listing(&services, Chain::Base, &symbol);
+
+        assert!(!logs_contain("does not list the symbol"));
+        assert!(!logs_contain("No equity transfer services are wired"));
+    }
+
+    #[tokio::test]
+    async fn killing_a_missing_transfer_row_returns_an_error() {
+        let (pool, _apalis_pool) = setup_test_pools().await;
+        let error =
+            kill_transfer_row::<TransferEquityToHedging>(&pool, "$.aggregate_id", "missing")
+                .await
+                .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "no live transfer row matched $.aggregate_id=missing"
+        );
+    }
+
     #[tokio::test]
     async fn live_transfer_without_aggregate_restores_exact_guard_on_restart() {
         let InterruptedAggregateFixture {
             pool,
             apalis_pool,
-            services,
+            mut services,
             mint_id: _,
             redemption_id: _,
             tokenizer: _,
@@ -9496,6 +11521,12 @@ mod tests {
         .await;
         let symbol = Symbol::new("MSFT").unwrap();
         let legacy_symbol = Symbol::new("NVDA").unwrap();
+        let base = services.chains.get_mut(&Chain::Base).unwrap();
+        let listing = queued_transfer_listing(RebalancingMode::Enabled);
+        base.equities
+            .symbols
+            .insert(symbol.clone(), listing.clone());
+        base.equities.symbols.insert(legacy_symbol.clone(), listing);
         let generation = GuardGeneration::from_parts(NonZeroU32::new(7).unwrap(), 11);
         let mut transfer_queue =
             crate::rebalancing::equity::TransferEquityToMarketMakingJobQueue::new(&apalis_pool);
@@ -9585,7 +11616,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let mint_id = issuer_request_id("live-pre-wrap-owner");
         let mint_store = test_store::<TokenizedEquityMint>(pool.clone(), services.clone());
-        let redemption_store = test_store::<EquityRedemption>(pool, services);
+        let redemption_store = test_store::<EquityRedemption>(pool, services.clone());
 
         seed_mint_to_tokens_received(&mint_store, &mint_id, &symbol, Address::from([8; 20])).await;
         let generation = GuardGeneration::from_parts(NonZeroU32::new(8).unwrap(), 1);
@@ -9605,12 +11636,19 @@ mod tests {
         }];
         let guards = RwLock::new(HashMap::from([(
             symbol.clone(),
-            GuardState::HeldForRecovery,
+            GuardState::HeldForRecovery { chain: Chain::Base },
         )]));
 
-        restore_live_transfer_job_guards(&guards, &rows, &[], &mint_store, &redemption_store)
-            .await
-            .unwrap();
+        restore_live_transfer_job_guards(
+            &guards,
+            &rows,
+            &[],
+            &mint_store,
+            &redemption_store,
+            &services,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             guards.read().unwrap().get(&symbol),
             Some(&GuardState::ActiveTransfer { generation })
@@ -9625,14 +11663,21 @@ mod tests {
             )
             .await
             .unwrap();
-        guards
-            .write()
-            .unwrap()
-            .insert(symbol.clone(), GuardState::HeldForRecovery);
+        guards.write().unwrap().insert(
+            symbol.clone(),
+            GuardState::HeldForRecovery { chain: Chain::Base },
+        );
 
-        restore_live_transfer_job_guards(&guards, &rows, &[], &mint_store, &redemption_store)
-            .await
-            .unwrap();
+        restore_live_transfer_job_guards(
+            &guards,
+            &rows,
+            &[],
+            &mint_store,
+            &redemption_store,
+            &services,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             guards.read().unwrap().get(&symbol),
             Some(&GuardState::ActiveTransfer { generation })
@@ -9662,7 +11707,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let mint_id = issuer_request_id("terminal-pre-wrap-handoff");
         let mint_store = test_store::<TokenizedEquityMint>(pool.clone(), services.clone());
-        let redemption_store = test_store::<EquityRedemption>(pool, services);
+        let redemption_store = test_store::<EquityRedemption>(pool, services.clone());
         seed_mint_to_tokens_received(&mint_store, &mint_id, &symbol, Address::from([10; 20])).await;
 
         let rows = vec![DurableTransferJob {
@@ -9681,19 +11726,28 @@ mod tests {
         }];
         let guards = RwLock::new(HashMap::from([(
             symbol.clone(),
-            GuardState::HeldForRecovery,
+            GuardState::HeldForRecovery { chain: Chain::Base },
         )]));
 
-        let reservations =
-            restore_live_transfer_job_guards(&guards, &rows, &[], &mint_store, &redemption_store)
-                .await
-                .unwrap();
+        let reservations = restore_live_transfer_job_guards(
+            &guards,
+            &rows,
+            &[],
+            &mint_store,
+            &redemption_store,
+            &services,
+        )
+        .await
+        .unwrap();
 
         let restored = match guards.read() {
             Ok(guard) => guard.get(&symbol).cloned(),
             Err(poison) => poison.into_inner().get(&symbol).cloned(),
         };
-        assert_eq!(restored, Some(GuardState::HeldForRecovery));
+        assert_eq!(
+            restored,
+            Some(GuardState::HeldForRecovery { chain: Chain::Base })
+        );
         assert_eq!(
             reservations,
             HashSet::from([(symbol, EquityTransferReservationId::from_uuid(mint_id.0))])
@@ -9763,7 +11817,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let mint_id = issuer_request_id("delayed-redrive");
         let mint_store = test_store::<TokenizedEquityMint>(pool.clone(), services.clone());
-        let redemption_store = test_store::<EquityRedemption>(pool, services);
+        let redemption_store = test_store::<EquityRedemption>(pool, services.clone());
         seed_mint_to_tokens_received(&mint_store, &mint_id, &symbol, Address::from([11; 20])).await;
 
         let old_generation = GuardGeneration::from_parts(NonZeroU32::new(11).unwrap(), 1);
@@ -9793,10 +11847,16 @@ mod tests {
         ];
         let guards = RwLock::new(HashMap::new());
 
-        let reservations =
-            restore_live_transfer_job_guards(&guards, &rows, &[], &mint_store, &redemption_store)
-                .await
-                .unwrap();
+        let reservations = restore_live_transfer_job_guards(
+            &guards,
+            &rows,
+            &[],
+            &mint_store,
+            &redemption_store,
+            &services,
+        )
+        .await
+        .unwrap();
 
         let restored = match guards.read() {
             Ok(guard) => guard.get(&symbol).cloned(),
@@ -10143,10 +12203,245 @@ mod tests {
             format!(
                 "the unfinished equity transfer redemption {stranded_id} (AAPL) is recorded on \
                  ethereum, which rebalances no equity under this configuration and so gets no \
-                 transfer services: it could never finish. Re-enable rebalancing for one of \
-                 ethereum's equities until the transfer completes, or resolve the transfer \
-                 with the CLI"
+                 transfer services: it could never finish. Set rebalancing for one of \
+                 ethereum's equities to \"paused\" (or \"enabled\") until the transfer \
+                 completes, or resolve the transfer with the CLI"
             )
+        );
+    }
+
+    /// The counterpart of the above once the chain is paused instead: a
+    /// paused listing keeps the chain's equity services (see
+    /// `chain_tokenizations_keep_rebalancing_services_on_a_paused_secondary`),
+    /// so the same persisted secondary transfer is restored and queued for
+    /// resume rather than refusing startup.
+    #[tokio::test]
+    async fn persisted_secondary_transfer_resumes_when_its_chain_is_paused() {
+        let mut fixture = seed_interrupted_aggregates_and_build_service(
+            7,
+            "paused-secondary-mint",
+            "paused-secondary-redemption",
+        )
+        .await;
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.broker = alpaca_broker_ctx();
+        ctx.alerts = Some(gas_threshold_alerts());
+        ctx.chains.primary_mut().redemption_wallet = Some(Address::repeat_byte(0xb1));
+        let mut secondary = ethereum_hedged_chain(
+            Some(Address::repeat_byte(0xe1)),
+            RebalancingMode::Paused,
+            ETHEREUM_INVENTORY,
+        );
+        let equity = secondary
+            .assets
+            .equities
+            .symbols
+            .remove(&Symbol::new("TSLA").unwrap())
+            .unwrap();
+        secondary
+            .assets
+            .equities
+            .symbols
+            .insert(Symbol::new("NVDA").unwrap(), equity);
+        ctx.chains.insert_secondary(secondary);
+        let wallet_ctx = OnchainWalletCtx::stub();
+        let tokenizations = build_chain_tokenizations(&ctx, &wallet_ctx).unwrap();
+        let (_, projection) = StoreBuilder::<VaultRegistry>::new(fixture.pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let built = build_hedged_equity_services(
+            &ctx,
+            &projection,
+            &tokenizations,
+            &ChainWallets::from_wallet_ctx(&wallet_ctx),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let mut secondary = built.chains[&Chain::Ethereum].clone();
+        secondary.raindex = Arc::new(MockRaindex::new());
+        assert_ne!(
+            secondary.wallet,
+            fixture.services.chains[&Chain::Base].wallet
+        );
+        fixture.services.chains.insert(
+            Chain::Ethereum,
+            fixture.services.chains[&Chain::Base].clone(),
+        );
+
+        let paused_id = redemption_aggregate_id("paused-secondary-redemption-on-ethereum");
+        test_store::<EquityRedemption>(fixture.pool.clone(), fixture.services.clone())
+            .send(
+                &paused_id,
+                EquityRedemptionCommand::Redeem {
+                    chain: Chain::Ethereum,
+                    symbol: Symbol::new("NVDA").unwrap(),
+                    quantity: float!(3),
+                    token: Address::from([7; 20]),
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
+                    amount: U256::from(3_000_000_000_000_000_000_u128),
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                },
+            )
+            .await
+            .unwrap();
+
+        fixture.services.chains.insert(Chain::Ethereum, secondary);
+        recover_interrupted_tokenization_aggregates(
+            &fixture.pool,
+            &fixture.rebalancing_service,
+            &fixture.inventory,
+            Arc::new(test_store::<TokenizedEquityMint>(
+                fixture.pool.clone(),
+                fixture.services.clone(),
+            )),
+            Arc::new(test_store::<EquityRedemption>(
+                fixture.pool.clone(),
+                fixture.services.clone(),
+            )),
+            &fixture.services,
+            &mut fixture.resume_queue,
+        )
+        .await
+        .unwrap();
+
+        let jobs: Vec<Vec<u8>> = sqlx_apalis::query_scalar(
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<ResumeTokenizationAggregate>())
+        .fetch_all(&fixture.apalis_pool)
+        .await
+        .unwrap();
+        assert!(
+            jobs.iter().any(|job| {
+                serde_json::from_slice::<ResumeTokenizationAggregate>(job)
+                    .unwrap()
+                    .target
+                    == ResumeTokenizationTarget::Redemption(paused_id.clone())
+            }),
+            "the paused chain's transfer must be queued for resume"
+        );
+    }
+
+    /// An open wallet recovery on a chain that this configuration builds no
+    /// equity services for, or a symbol held for such a recovery, refuses
+    /// startup by name: the recovery could never run, and its tokens would
+    /// sit in that chain's wallet with the symbol held.
+    #[tokio::test]
+    async fn open_recovery_on_a_chain_without_services_refuses_startup() {
+        let fixture = seed_interrupted_aggregates_and_build_service(
+            8,
+            "stranded-recovery-mint",
+            "stranded-recovery-redemption",
+        )
+        .await;
+        let transfer = Arc::new(CrossVenueEquityTransfer::new(
+            fixture.services.clone(),
+            Arc::new(test_store::<TokenizedEquityMint>(
+                fixture.pool.clone(),
+                fixture.services.clone(),
+            )),
+            Arc::new(test_store::<EquityRedemption>(
+                fixture.pool.clone(),
+                fixture.services.clone(),
+            )),
+        ));
+        let mut with_ethereum = fixture.services.clone();
+        let base = with_ethereum.chains[&Chain::Base].clone();
+        with_ethereum.chains.insert(Chain::Ethereum, base);
+        let (wrapped_store, unwrapped_store) = build_equity_recovery_stores(
+            &fixture.pool,
+            fixture.services.clone(),
+            transfer.clone(),
+            BotGasReceiptCostEnqueuer::Disabled,
+        )
+        .await
+        .unwrap();
+        let equity_in_progress = RwLock::new(HashMap::new());
+
+        refuse_recoveries_stranded_by_chain_services(
+            &fixture.pool,
+            &wrapped_store,
+            &unwrapped_store,
+            &fixture.services,
+            &equity_in_progress,
+        )
+        .await
+        .unwrap();
+
+        // Opened while Ethereum was still wired, then left open.
+        let stranded_id = UnwrappedEquityRecoveryId(uuid::Uuid::new_v4());
+        test_store::<UnwrappedEquityRecovery>(
+            fixture.pool.clone(),
+            UnwrappedEquityRecoveryServices {
+                equity: with_ethereum,
+                transfer,
+                bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            },
+        )
+        .send(
+            &stranded_id,
+            crate::unwrapped_equity_recovery::aggregate::UnwrappedEquityRecoveryCommand::Detect {
+                chain: Chain::Ethereum,
+                symbol: Symbol::new("AAPL").unwrap(),
+                shares: FractionalShares::new(float!(2)),
+            },
+        )
+        .await
+        .unwrap();
+
+        let error = refuse_recoveries_stranded_by_chain_services(
+            &fixture.pool,
+            &wrapped_store,
+            &unwrapped_store,
+            &fixture.services,
+            &equity_in_progress,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "the open unwrapped equity recovery {stranded_id} (AAPL) is recorded on \
+                 ethereum, which rebalances no equity under this configuration and so gets no \
+                 equity services: its tokens could never be recovered. Set rebalancing for one \
+                 of ethereum's equities to \"paused\" (or \"enabled\") until the recovery \
+                 completes"
+            )
+        );
+
+        unwrapped_store
+            .send(
+                &stranded_id,
+                crate::unwrapped_equity_recovery::aggregate::UnwrappedEquityRecoveryCommand::FailRecovery {
+                    reason: "resolved by the operator".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        equity_in_progress.write().unwrap().insert(
+            Symbol::new("TSLA").unwrap(),
+            GuardState::HeldForRecovery {
+                chain: Chain::Ethereum,
+            },
+        );
+
+        let error = refuse_recoveries_stranded_by_chain_services(
+            &fixture.pool,
+            &wrapped_store,
+            &unwrapped_store,
+            &fixture.services,
+            &equity_in_progress,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "TSLA is held for a recovery on ethereum, which rebalances no equity under this \
+             configuration and so gets no equity services: the recovery could never run. Set \
+             rebalancing for one of ethereum's equities to \"paused\" (or \"enabled\") until \
+             the recovery completes"
         );
     }
 
@@ -10277,14 +12572,14 @@ mod tests {
         let vault_registry: Arc<Store<VaultRegistry>> = Arc::new(test_store(pool.clone(), ()));
         let rebalancing_service = RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: None,
+                usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(60),
+                recovery_hold_alert_after: Duration::from_secs(60 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
                     ChainRebalancingConfig::for_test(ChainAssets {
@@ -10390,14 +12685,14 @@ mod tests {
         let vault_registry2: Arc<Store<VaultRegistry>> = Arc::new(test_store(pool2.clone(), ()));
         let rebalancing_service2 = RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: None,
+                usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(60),
+                recovery_hold_alert_after: Duration::from_secs(60 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
                     ChainRebalancingConfig::for_test(ChainAssets {
@@ -10743,7 +13038,7 @@ mod tests {
     }
 
     #[test]
-    fn base_wallet_unwrapped_equity_token_addresses_skips_disabled_assets() {
+    fn wallet_unwrapped_equity_token_addresses_skips_disabled_assets() {
         let aapl = Symbol::new("AAPL").unwrap();
         let tsla = Symbol::new("TSLA").unwrap();
         let spym = Symbol::new("SPYM").unwrap();
@@ -10761,7 +13056,7 @@ mod tests {
                 tokenized_equity_derivative: Address::random(),
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -10774,7 +13069,7 @@ mod tests {
                 tokenized_equity_derivative: Address::random(),
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
-                rebalancing: OperationMode::Enabled,
+                rebalancing: RebalancingMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -10787,7 +13082,7 @@ mod tests {
                 tokenized_equity_derivative: Address::random(),
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
-                rebalancing: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -10800,7 +13095,7 @@ mod tests {
                 tokenized_equity_derivative: Address::random(),
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
-                rebalancing: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Enabled,
                 operational_limit: None,
                 target_share: None,
@@ -10818,7 +13113,7 @@ mod tests {
             cash: None,
         };
 
-        let actual = base_wallet_unwrapped_equity_token_addresses(&ctx);
+        let actual = wallet_unwrapped_equity_token_addresses(&ctx.chains.primary().assets);
 
         assert_eq!(
             actual.len(),
@@ -10835,7 +13130,7 @@ mod tests {
     }
 
     #[test]
-    fn base_wallet_wrapped_equity_token_addresses_skips_disabled_assets() {
+    fn wallet_wrapped_equity_token_addresses_skips_disabled_assets() {
         let aapl = Symbol::new("AAPL").unwrap();
         let tsla = Symbol::new("TSLA").unwrap();
         let spym = Symbol::new("SPYM").unwrap();
@@ -10853,7 +13148,7 @@ mod tests {
                 tokenized_equity_derivative: aapl_wrapped_token,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -10866,7 +13161,7 @@ mod tests {
                 tokenized_equity_derivative: tsla_wrapped_token,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
-                rebalancing: OperationMode::Enabled,
+                rebalancing: RebalancingMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -10879,7 +13174,7 @@ mod tests {
                 tokenized_equity_derivative: spym_wrapped_token,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
-                rebalancing: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -10892,7 +13187,7 @@ mod tests {
                 tokenized_equity_derivative: coin_wrapped_token,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
-                rebalancing: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Enabled,
                 operational_limit: None,
                 target_share: None,
@@ -10910,7 +13205,7 @@ mod tests {
             cash: None,
         };
 
-        let actual = base_wallet_wrapped_equity_token_addresses(&ctx);
+        let actual = wallet_wrapped_equity_token_addresses(&ctx.chains.primary().assets);
 
         assert_eq!(
             actual.len(),
@@ -11551,7 +13846,7 @@ mod tests {
                         tokenized_equity_derivative: Address::ZERO,
                         vault_ids: Vec::new(),
                         trading: OperationMode::Enabled,
-                        rebalancing: OperationMode::Disabled,
+                        rebalancing: RebalancingMode::Disabled,
                         wrapped_equity_recovery: OperationMode::Disabled,
                         operational_limit: None,
                         target_share: None,
@@ -13831,7 +16126,7 @@ mod tests {
                         tokenized_equity_derivative: Address::ZERO,
                         vault_ids: Vec::new(),
                         trading: OperationMode::Enabled,
-                        rebalancing: OperationMode::Disabled,
+                        rebalancing: RebalancingMode::Disabled,
                         wrapped_equity_recovery: OperationMode::Disabled,
                         operational_limit: None,
                         target_share: None,
@@ -15074,20 +17369,17 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: Some(UsdcCorridorCtx {
-                    corridor: UsdcCorridor::BASE_CCTP,
-                    threshold: ImbalanceThreshold {
-                        target: float!(0.5),
-                        deviation: float!(0.2),
-                    },
+                usdc: UsdcCorridors::base_cctp(ImbalanceThreshold {
+                    target: float!(0.5),
+                    deviation: float!(0.2),
                 }),
                 transfer_timeout: Duration::from_secs(30 * 60),
+                recovery_hold_alert_after: Duration::from_secs(60 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
                     ChainRebalancingConfig::for_test(ChainAssets {
@@ -15218,17 +17510,14 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: Some(UsdcCorridorCtx {
-                    corridor: UsdcCorridor::BASE_CCTP,
-                    threshold,
-                }),
+                usdc: UsdcCorridors::base_cctp(threshold),
                 transfer_timeout: Duration::from_secs(30 * 60),
+                recovery_hold_alert_after: Duration::from_secs(60 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
                     ChainRebalancingConfig::for_test(ChainAssets {
@@ -15384,20 +17673,17 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: Some(UsdcCorridorCtx {
-                    corridor: UsdcCorridor::BASE_CCTP,
-                    threshold: ImbalanceThreshold {
-                        target: float!(0.5),
-                        deviation: float!(0.2),
-                    },
+                usdc: UsdcCorridors::base_cctp(ImbalanceThreshold {
+                    target: float!(0.5),
+                    deviation: float!(0.2),
                 }),
                 transfer_timeout: Duration::from_secs(30 * 60),
+                recovery_hold_alert_after: Duration::from_secs(60 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
                     ChainRebalancingConfig::for_test(ChainAssets {
@@ -15551,20 +17837,17 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: Some(UsdcCorridorCtx {
-                    corridor: UsdcCorridor::BASE_CCTP,
-                    threshold: ImbalanceThreshold {
-                        target: float!(0.5),
-                        deviation: float!(0.2),
-                    },
+                usdc: UsdcCorridors::base_cctp(ImbalanceThreshold {
+                    target: float!(0.5),
+                    deviation: float!(0.2),
                 }),
                 transfer_timeout: Duration::from_secs(30 * 60),
+                recovery_hold_alert_after: Duration::from_secs(60 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
                     ChainRebalancingConfig::for_test(ChainAssets {
@@ -19365,11 +21648,24 @@ mod tests {
             "WrapSubmitted + ActiveTransfer must NOT be excluded"
         );
 
+        // A hold for another chain belongs to that chain's recovery, which
+        // cannot reach this mint's tokens -- the mint resumes itself.
+        equity_in_progress.write().unwrap().insert(
+            symbol.clone(),
+            GuardState::HeldForRecovery {
+                chain: Chain::Robinhood,
+            },
+        );
+        assert!(
+            !is_pre_wrap_held_for_recovery(&tokens_received, &equity_in_progress),
+            "TokensReceived held for another chain's recovery must NOT be excluded"
+        );
+
         // With HeldForRecovery -- only pre-wrap states are excluded.
         equity_in_progress
             .write()
             .unwrap()
-            .insert(symbol, GuardState::HeldForRecovery);
+            .insert(symbol, GuardState::HeldForRecovery { chain: Chain::Base });
         assert!(
             is_pre_wrap_held_for_recovery(&tokens_received, &equity_in_progress),
             "TokensReceived + HeldForRecovery must be excluded from resume_mints"
@@ -19592,7 +21888,7 @@ mod tests {
             tokenized_equity_derivative: derivative,
             vault_ids: Vec::new(),
             trading: OperationMode::Enabled,
-            rebalancing: OperationMode::Disabled,
+            rebalancing: RebalancingMode::Disabled,
             wrapped_equity_recovery: OperationMode::Disabled,
             operational_limit: None,
             target_share: None,
@@ -19609,7 +21905,7 @@ mod tests {
     /// rebalancing flag, issuer redemption wallet and inventory mode.
     fn ethereum_hedged_chain(
         redemption_wallet: Option<Address>,
-        rebalancing: OperationMode,
+        rebalancing: RebalancingMode,
         inventory: InventoryMode,
     ) -> HedgedChain {
         let mut trading = HedgedChain::test()
@@ -19628,6 +21924,85 @@ mod tests {
             cash: None,
         };
         trading
+    }
+
+    /// An Ethereum primary with no cash vault, and Base hedged with
+    /// `base_vault` as its cash vault.
+    fn ethereum_primary_with_base_cash_ctx(base_vault: B256) -> Ctx {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.chains = ChainRegistry::single_hedged_chain(ethereum_hedged_chain(
+            None,
+            RebalancingMode::Disabled,
+            ETHEREUM_INVENTORY,
+        ));
+        ctx.chains.insert_secondary(
+            HedgedChain::test()
+                .chain(Chain::Base)
+                .orderbook(Address::repeat_byte(0xb0))
+                .assets(ChainAssets {
+                    equities: ChainEquities::default(),
+                    cash: Some(ChainCashAsset {
+                        vault_ids: vec![base_vault],
+                        rebalancing: OperationMode::Enabled,
+                        operational_limit: None,
+                    }),
+                })
+                .call(),
+        );
+        ctx
+    }
+
+    /// Hedge-only Ethereum (primary) and Base tokenizations on the stub
+    /// wallets.
+    fn hedge_only_tokenizations(
+        wallet_ctx: &OnchainWalletCtx,
+    ) -> BTreeMap<Chain, ChainTokenization<Arc<dyn Wallet<Provider = RootProvider>>>> {
+        [
+            (
+                Chain::Ethereum,
+                ChainRole::Primary,
+                wallet_ctx.ethereum_wallet(),
+            ),
+            (Chain::Base, ChainRole::Secondary, wallet_ctx.base_wallet()),
+        ]
+        .into_iter()
+        .map(|(chain, role, wallet)| {
+            let tokenization = ChainTokenization {
+                chain,
+                role,
+                wallet: wallet.clone(),
+                equity: EquityTokenization::HedgeOnly,
+            };
+            (chain, tokenization)
+        })
+        .collect()
+    }
+
+    /// A corridor's transfers run on its own chain's orderbook, cash vault
+    /// and signer, not the primary chain's.
+    #[test]
+    fn usdc_transfer_runs_on_the_corridor_chains_vault() {
+        let base_vault = B256::repeat_byte(0xba);
+        let mut ctx = ethereum_primary_with_base_cash_ctx(base_vault);
+        ctx.alerts = Some(gas_threshold_alerts());
+        let wallet_ctx = OnchainWalletCtx::stub();
+
+        let endpoints = usdc_corridor_endpoints(
+            &ctx,
+            &hedge_only_tokenizations(&wallet_ctx),
+            wallet_ctx.ethereum_wallet(),
+            UsdcCorridor::BASE_CCTP,
+        )
+        .unwrap();
+
+        let base = ctx.chains.hedged_chain(Chain::Base).unwrap();
+        assert_eq!(endpoints.corridor, UsdcCorridor::BASE_CCTP);
+        assert_eq!(endpoints.contracts, crate::onchain::raindex_contracts(base));
+        assert_eq!(endpoints.vault_id, RaindexVaultId(base_vault));
+        assert_eq!(
+            endpoints.chain_wallet.address(),
+            wallet_ctx.base_wallet().address()
+        );
     }
 
     /// One set of tokenization services per hedged chain that rebalances
@@ -19652,7 +22027,7 @@ mod tests {
         };
         ctx.chains.insert_secondary(ethereum_hedged_chain(
             Some(Address::repeat_byte(0xe1)),
-            OperationMode::Enabled,
+            RebalancingMode::Enabled,
             ETHEREUM_INVENTORY,
         ));
 
@@ -19685,6 +22060,92 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn unfinished_disabled_recovery_keeps_wallet_balance_polling() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let symbol = Symbol::new("AAPL").unwrap();
+        let token = Address::repeat_byte(0xa5);
+        let wrapped = Address::repeat_byte(0xa6);
+        let mut asset = equity_asset(token, wrapped);
+        asset.trading = OperationMode::Disabled;
+        ctx.chains
+            .primary_mut()
+            .assets
+            .equities
+            .symbols
+            .insert(symbol.clone(), asset);
+        let unfinished = BTreeSet::from([(Chain::Base, symbol.clone())]);
+        let base = ctx.chains.primary();
+        let (unwrapped, derivatives) =
+            completion_wallet_token_addresses(base, &unfinished).unwrap();
+        assert_eq!(unwrapped[&symbol], token);
+        assert_eq!(derivatives[&symbol], wrapped);
+        assert!(!wallet_equity_polled(&base.assets, &symbol));
+        assert!(!wallet_unwrapped_equity_token_addresses(&base.assets).contains_key(&symbol));
+    }
+
+    #[test]
+    fn startup_flags_only_idle_recovery_only_secondary_listings() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let mut secondary =
+            ethereum_hedged_chain(None, RebalancingMode::Disabled, ETHEREUM_INVENTORY);
+        let tsla = Symbol::new("TSLA").unwrap();
+        let aapl = Symbol::new("AAPL").unwrap();
+        let mut recovery_only = secondary.assets.equities.symbols[&tsla].clone();
+        recovery_only.wrapped_equity_recovery = OperationMode::Enabled;
+        secondary
+            .assets
+            .equities
+            .symbols
+            .insert(tsla.clone(), recovery_only.clone());
+        secondary
+            .assets
+            .equities
+            .symbols
+            .insert(aapl.clone(), recovery_only);
+        ctx.chains.insert_secondary(secondary);
+
+        let unfinished = BTreeSet::from([(Chain::Ethereum, aapl)]);
+
+        assert_eq!(
+            idle_recovery_only_secondary_listings(&ctx.chains, &unfinished),
+            BTreeSet::from([(Chain::Ethereum, tsla)]),
+        );
+    }
+
+    #[test]
+    fn disabled_secondary_retains_services_for_unfinished_work_without_admission() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.broker = alpaca_broker_ctx();
+        ctx.chains.primary_mut().redemption_wallet = Some(Address::repeat_byte(0xb1));
+        ctx.chains.insert_secondary(ethereum_hedged_chain(
+            Some(Address::repeat_byte(0xe1)),
+            RebalancingMode::Disabled,
+            ETHEREUM_INVENTORY,
+        ));
+        let symbol = Symbol::new("TSLA").unwrap();
+        let unfinished = BTreeSet::from([(Chain::Ethereum, symbol)]);
+        let tokenizations =
+            build_chain_tokenizations_for_completion(&ctx, &OnchainWalletCtx::stub(), &unfinished)
+                .unwrap();
+        assert!(matches!(
+            tokenizations[&Chain::Ethereum].equity,
+            EquityTokenization::Rebalancing(_)
+        ));
+        assert!(
+            !ctx.chains
+                .hedged_chain(Chain::Ethereum)
+                .unwrap()
+                .assets
+                .rebalances_equity()
+        );
+        assert!(
+            startup_approval_targets(&ctx)[&Chain::Ethereum]
+                .iter()
+                .all(|target| target.symbol.is_none())
+        );
+    }
+
     /// A hedged chain that rebalances equity without its own issuer
     /// redemption wallet cannot redeem, so building its services fails
     /// startup naming that chain rather than borrowing the primary's wallet.
@@ -19695,7 +22156,7 @@ mod tests {
         ctx.chains.primary_mut().redemption_wallet = Some(Address::repeat_byte(0xb1));
         ctx.chains.insert_secondary(ethereum_hedged_chain(
             None,
-            OperationMode::Enabled,
+            RebalancingMode::Enabled,
             ETHEREUM_INVENTORY,
         ));
 
@@ -19711,6 +22172,37 @@ mod tests {
         ));
     }
 
+    /// A secondary whose only rebalancing listing is paused keeps its full
+    /// equity services: a transfer or recovery already under way there must
+    /// still be able to finish.
+    #[test]
+    fn chain_tokenizations_keep_rebalancing_services_on_a_paused_secondary() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.broker = alpaca_broker_ctx();
+        ctx.chains.primary_mut().redemption_wallet = Some(Address::repeat_byte(0xb1));
+        for mode in [
+            RebalancingMode::Enabled,
+            RebalancingMode::Paused,
+            RebalancingMode::Enabled,
+        ] {
+            ctx.chains.insert_secondary(ethereum_hedged_chain(
+                Some(Address::repeat_byte(0xe1)),
+                mode,
+                ETHEREUM_INVENTORY,
+            ));
+            let tokenizations = build_chain_tokenizations(&ctx, &OnchainWalletCtx::stub()).unwrap();
+            let secondary = &tokenizations[&Chain::Ethereum];
+            assert!(matches!(
+                secondary.equity,
+                EquityTokenization::Rebalancing(_)
+            ));
+            assert_eq!(
+                secondary.wallet.address(),
+                address!("0x0000000000000000000000000000000000000e78")
+            );
+        }
+    }
+
     /// A secondary that rebalances no equity is hedge-only: its fills are
     /// hedged, nothing is minted, wrapped or redeemed there, so it needs no
     /// redemption wallet and startup keeps only its signer.
@@ -19721,7 +22213,7 @@ mod tests {
         ctx.chains.primary_mut().redemption_wallet = Some(Address::repeat_byte(0xb1));
         ctx.chains.insert_secondary(ethereum_hedged_chain(
             None,
-            OperationMode::Disabled,
+            RebalancingMode::Disabled,
             ETHEREUM_INVENTORY,
         ));
 
@@ -19741,6 +22233,82 @@ mod tests {
         ));
     }
 
+    /// Every chain with equity services has its wallet polled on the signer
+    /// its tokenization uses, over that chain's own token addresses.
+    #[test]
+    fn equity_wallets_are_polled_on_every_rebalancing_chain_with_its_own_wallet() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.broker = alpaca_broker_ctx();
+        ctx.chains.primary_mut().redemption_wallet = Some(Address::repeat_byte(0xb1));
+        ctx.chains.primary_mut().assets = ChainAssets {
+            equities: ChainEquities {
+                symbols: HashMap::from([(
+                    Symbol::new("AAPL").unwrap(),
+                    equity_asset(Address::repeat_byte(0xa5), Address::repeat_byte(0xa6)),
+                )]),
+                operational_limit: None,
+            },
+            cash: None,
+        };
+        ctx.chains.insert_secondary(ethereum_hedged_chain(
+            Some(Address::repeat_byte(0xe1)),
+            RebalancingMode::Paused,
+            ETHEREUM_INVENTORY,
+        ));
+        let tokenizations = build_chain_tokenizations(&ctx, &OnchainWalletCtx::stub()).unwrap();
+
+        let polled = equity_wallet_polling(&ctx, &tokenizations, &BTreeSet::new()).unwrap();
+
+        assert_eq!(
+            polled.keys().copied().collect::<Vec<_>>(),
+            vec![Chain::Base, Chain::Ethereum]
+        );
+        let base = &polled[&Chain::Base];
+        assert_eq!(
+            base.wallet.address(),
+            tokenizations[&Chain::Base].wallet.address()
+        );
+        assert_eq!(
+            base.unwrapped_token_addresses,
+            HashMap::from([(Symbol::new("AAPL").unwrap(), Address::repeat_byte(0xa5))])
+        );
+        let ethereum = &polled[&Chain::Ethereum];
+        assert_eq!(
+            ethereum.wallet.address(),
+            address!("0x0000000000000000000000000000000000000e78")
+        );
+        assert_eq!(
+            ethereum.unwrapped_token_addresses,
+            HashMap::from([(Symbol::new("TSLA").unwrap(), Address::repeat_byte(0xe5))])
+        );
+        assert_eq!(
+            ethereum.wrapped_token_addresses,
+            HashMap::from([(Symbol::new("TSLA").unwrap(), Address::repeat_byte(0xe6))])
+        );
+    }
+
+    /// A hedge-only chain moves no equity through its wallet, so its wallet
+    /// is not polled even for the equities it trades.
+    #[test]
+    fn a_hedge_only_chains_wallet_is_not_polled_for_equity() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.broker = alpaca_broker_ctx();
+        ctx.chains.primary_mut().redemption_wallet = Some(Address::repeat_byte(0xb1));
+        ctx.chains.insert_secondary(ethereum_hedged_chain(
+            None,
+            RebalancingMode::Disabled,
+            ETHEREUM_INVENTORY,
+        ));
+        let tokenizations = build_chain_tokenizations(&ctx, &OnchainWalletCtx::stub()).unwrap();
+
+        let polled = equity_wallet_polling(&ctx, &tokenizations, &BTreeSet::new()).unwrap();
+
+        assert_eq!(
+            polled.keys().copied().collect::<Vec<_>>(),
+            vec![Chain::Base]
+        );
+    }
+
     fn ctx_with_base_and_ethereum_trading() -> Ctx {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.chains.primary_mut().assets = ChainAssets {
@@ -19755,7 +22323,7 @@ mod tests {
         };
         ctx.chains.insert_secondary(ethereum_hedged_chain(
             None,
-            OperationMode::Disabled,
+            RebalancingMode::Disabled,
             ETHEREUM_INVENTORY,
         ));
         ctx
@@ -19904,7 +22472,7 @@ mod tests {
                 tokenized_equity_derivative: Address::with_last_byte(10),
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Enabled,
+                rebalancing: RebalancingMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -19926,6 +22494,33 @@ mod tests {
             Duration::from_secs(30),
             Duration::from_secs(300),
         )
+    }
+
+    #[test]
+    fn completion_equity_gas_readiness_is_wired_with_admission_disabled() {
+        let base = st0x_evm::StubWallet::stub(Address::with_last_byte(1));
+        let ethereum = st0x_evm::StubWallet::stub(Address::with_last_byte(2));
+        let mut assets = rebalancing_equity_assets();
+        for asset in assets.equities.symbols.values_mut() {
+            asset.rebalancing = RebalancingMode::Disabled;
+        }
+        let readiness = build_equity_gas_readiness_selected(
+            &gas_threshold_alerts(),
+            &[EquityGasChain {
+                chain: Chain::Ethereum,
+                assets: &assets,
+                wallet: &ethereum,
+            }],
+            &base,
+            &ethereum,
+            true,
+        )
+        .unwrap();
+        assert!(matches!(
+            readiness[&Chain::Ethereum],
+            ConfiguredGasReadiness::Wired(_)
+        ));
+        assert!(!assets.rebalances_equity());
     }
 
     /// A chain whose equities opt into rebalancing must carry its own
@@ -19995,43 +22590,126 @@ mod tests {
         );
     }
 
-    /// The shared pre-dispatch admission check gates the equity leg on the
-    /// primary chain's own wallet, not Base's: with Ethereum as the primary
-    /// it checks the Ethereum signer.
-    #[test]
-    fn transfer_gas_readiness_checks_the_primary_chains_wallet() {
+    #[tokio::test]
+    async fn inventory_preflight_checks_a_primary_equity_and_cash_chain_once() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        ctx.alerts = Some(gas_threshold_alerts());
-        ctx.chains.primary_mut().chain = Chain::Ethereum;
-        let wallet_ctx = OnchainWalletCtx::stub();
-        let wallets = ChainWallets::from_wallet_ctx(&wallet_ctx);
+        managed(ctx.chains.primary_mut(), Address::repeat_byte(0xAA));
+        let base_asserter = Asserter::new();
+        push_operator_role_granted(&base_asserter);
+        let tokenizations = BTreeMap::from([(
+            Chain::Base,
+            mock_chain_tokenization(Chain::Base, base_asserter.clone()),
+        )]);
 
-        let readiness = build_transfer_gas_readiness(&wallets, &ctx).unwrap();
+        preflight_inventory_access(
+            &ctx,
+            &tokenizations,
+            &BTreeSet::from([UsdcCorridor::BASE_CCTP]),
+        )
+        .await
+        .unwrap();
+
+        assert!(base_asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn inventory_preflight_checks_a_cash_only_secondary_and_skips_legacy() {
+        let mut ctx = ethereum_primary_with_base_cash_ctx(B256::repeat_byte(0xba));
+        let base_asserter = Asserter::new();
+        let ethereum_asserter = Asserter::new();
+        push_operator_role_granted(&ethereum_asserter);
+        let tokenizations = BTreeMap::from([
+            (
+                Chain::Base,
+                mock_chain_tokenization(Chain::Base, base_asserter.clone()),
+            ),
+            (
+                Chain::Ethereum,
+                mock_chain_tokenization(Chain::Ethereum, ethereum_asserter.clone()),
+            ),
+        ]);
+
+        let error = preflight_inventory_access(
+            &ctx,
+            &tokenizations,
+            &BTreeSet::from([UsdcCorridor::BASE_CCTP]),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("OPERATOR_ROLE preflight failed on base")
+        );
+        assert!(ethereum_asserter.read_q().is_empty());
+
+        let mut base = ctx.chains.hedged_chain(Chain::Base).unwrap().clone();
+        base.inventory = InventoryMode::Legacy;
+        ctx.chains.insert_secondary(base);
+        push_operator_role_granted(&ethereum_asserter);
+
+        preflight_inventory_access(
+            &ctx,
+            &tokenizations,
+            &BTreeSet::from([UsdcCorridor::BASE_CCTP]),
+        )
+        .await
+        .unwrap();
+        assert!(base_asserter.read_q().is_empty());
+        assert!(ethereum_asserter.read_q().is_empty());
+    }
+
+    /// A corridor's USDC gas check reads its own chain's wallet and the
+    /// Ethereum hub wallet, not the primary's: with Ethereum as the primary
+    /// and a Base corridor it checks the Base signer.
+    #[test]
+    fn usdc_corridor_gas_readiness_checks_the_corridor_chains_wallet() {
+        let mut ctx = ethereum_primary_with_base_cash_ctx(B256::repeat_byte(0xba));
+        ctx.alerts = Some(gas_threshold_alerts());
+        let wallet_ctx = OnchainWalletCtx::stub();
+
+        let endpoints = usdc_corridor_endpoints(
+            &ctx,
+            &hedge_only_tokenizations(&wallet_ctx),
+            wallet_ctx.ethereum_wallet(),
+            UsdcCorridor::BASE_CCTP,
+        )
+        .unwrap();
 
         assert_eq!(
-            readiness.equity_route(),
-            (Chain::Ethereum, wallet_ctx.ethereum_wallet().address())
+            endpoints.gas_readiness.usdc_route(),
+            [
+                (Chain::Base, wallet_ctx.base_wallet().address()),
+                (Chain::Ethereum, wallet_ctx.ethereum_wallet().address()),
+            ]
         );
     }
 
-    /// A primary chain outside the Base/Ethereum corridor has no wallet in
-    /// the shared check, so startup refuses it by name rather than gating
-    /// its transfers on Base's balance.
+    /// A corridor chain without a gas threshold is refused by name rather
+    /// than admitting transfers against a balance nothing checks.
     #[test]
-    fn transfer_gas_readiness_refuses_a_hyperevm_primary_by_name() {
-        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        ctx.alerts = Some(gas_threshold_alerts());
-        ctx.chains.primary_mut().chain = Chain::HyperEvm;
-        let wallets = ChainWallets::from_wallet_ctx(&OnchainWalletCtx::stub());
+    fn usdc_corridor_gas_readiness_refuses_a_chain_without_a_threshold() {
+        let mut ctx = ethereum_primary_with_base_cash_ctx(B256::repeat_byte(0xba));
+        ctx.alerts = Some(st0x_config::AlertsCtx::for_test(
+            BTreeMap::from([(Chain::Ethereum, U256::from(100_u64))]),
+            Duration::from_secs(30),
+            Duration::from_secs(300),
+        ));
+        let wallet_ctx = OnchainWalletCtx::stub();
 
-        let Err(error) = build_transfer_gas_readiness(&wallets, &ctx) else {
-            panic!("a primary chain without a wired wallet must be refused");
+        let Err(error) = usdc_corridor_endpoints(
+            &ctx,
+            &hedge_only_tokenizations(&wallet_ctx),
+            wallet_ctx.ethereum_wallet(),
+            UsdcCorridor::BASE_CCTP,
+        ) else {
+            panic!("a corridor chain without a gas threshold must be refused");
         };
         let error = error.to_string();
 
         assert!(
-            error.contains("hyperevm") && error.contains("wallet"),
-            "expected the unwired chain named, got: {error}"
+            error.contains("base") && error.contains("low_balance_thresholds"),
+            "expected the missing threshold named by chain, got: {error}"
         );
     }
 
@@ -20087,7 +22765,7 @@ mod tests {
         let mut ctx = ctx_with_base_and_ethereum_trading();
         ctx.chains.insert_secondary(ethereum_hedged_chain(
             None,
-            OperationMode::Disabled,
+            RebalancingMode::Disabled,
             InventoryMode::Legacy,
         ));
         let base_orderbook = ctx.chains.primary().orderbook;
@@ -20141,7 +22819,7 @@ mod tests {
     fn startup_approval_targets_follow_a_rebalancing_secondarys_own_contracts() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         let mut ethereum =
-            ethereum_hedged_chain(None, OperationMode::Enabled, InventoryMode::Legacy);
+            ethereum_hedged_chain(None, RebalancingMode::Enabled, InventoryMode::Legacy);
         ethereum.assets.equities.symbols.insert(
             Symbol::new("NVDA").unwrap(),
             equity_asset(Address::repeat_byte(0xe8), Address::repeat_byte(0xe9)),
@@ -20206,7 +22884,7 @@ mod tests {
         let mut ctx = ctx_with_base_and_ethereum_trading();
         ctx.chains.insert_secondary(ethereum_hedged_chain(
             None,
-            OperationMode::Enabled,
+            RebalancingMode::Enabled,
             ETHEREUM_INVENTORY,
         ));
         let base_orderbook = ctx.chains.primary().orderbook;
@@ -20288,7 +22966,7 @@ mod tests {
         let mut ctx = ctx_with_base_and_ethereum_trading();
         ctx.chains.insert_secondary(ethereum_hedged_chain(
             None,
-            OperationMode::Enabled,
+            RebalancingMode::Enabled,
             ETHEREUM_INVENTORY,
         ));
         ctx.chains.insert_secondary(
@@ -20384,7 +23062,7 @@ mod tests {
             .attesting_unwrapped_token(Address::repeat_byte(0xa7));
         let mut disabled = equity_asset(underlying, vault);
         disabled.trading = OperationMode::Disabled;
-        disabled.rebalancing = OperationMode::Disabled;
+        disabled.rebalancing = RebalancingMode::Disabled;
 
         attest_chain_vaults(
             Chain::Base,
@@ -20401,7 +23079,7 @@ mod tests {
             .attesting_unwrapped_token(underlying);
         let mut rebalancing_only = equity_asset(underlying, vault);
         rebalancing_only.trading = OperationMode::Disabled;
-        rebalancing_only.rebalancing = OperationMode::Enabled;
+        rebalancing_only.rebalancing = RebalancingMode::Enabled;
 
         attest_chain_vaults(
             Chain::Base,
@@ -20472,7 +23150,7 @@ mod tests {
         .unwrap();
 
         let mut rebalanced = equity_asset(underlying, vault);
-        rebalanced.rebalancing = OperationMode::Enabled;
+        rebalanced.rebalancing = RebalancingMode::Enabled;
         let rebalanced = assets_with_equity("TSLA", rebalanced);
 
         let error = attest_chain_vaults(
@@ -20572,7 +23250,7 @@ mod tests {
     async fn orchestrator_preflight_ignores_disabled_equities() {
         let mut disabled = equity_asset(Address::repeat_byte(0xa5), Address::repeat_byte(0xa6));
         disabled.trading = OperationMode::Disabled;
-        disabled.rebalancing = OperationMode::Disabled;
+        disabled.rebalancing = RebalancingMode::Disabled;
 
         preflight_orchestrator_entries(
             Chain::Base,

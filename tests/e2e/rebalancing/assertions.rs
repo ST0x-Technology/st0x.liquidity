@@ -18,7 +18,7 @@ use sqlx::SqlitePool;
 use tokio::task::JoinHandle;
 
 use st0x_bridge::cctp::CctpAttestationMock;
-use st0x_config::{BrokerCtx, Ctx};
+use st0x_config::{BrokerCtx, ChainCtx, Ctx};
 use st0x_config::{CashHedgePolicy, EquityHedgePolicy, HedgedEquities, HedgingAssets};
 use st0x_evm::Chain;
 use st0x_evm::local::RawPrivateKeyWallet;
@@ -38,6 +38,7 @@ use st0x_hedge::mock_api::{AlpacaTokenizationMock, TokenizationStatus};
 pub(crate) use st0x_hedge::mock_api::{RedemptionOutcome, TokenizationRequestType};
 use st0x_hedge::{
     AllocationCtx, ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, OperationMode,
+    RebalancingMode,
 };
 
 pub(crate) use crate::assert::{ExpectedPosition, assert_event_subsequence};
@@ -156,7 +157,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
                     tokenized_equity_derivative: wrapped,
                     vault_ids: equity_vault_ids.get(symbol).copied().into_iter().collect(),
                     trading: OperationMode::Enabled,
-                    rebalancing: OperationMode::Enabled,
+                    rebalancing: RebalancingMode::Enabled,
                     wrapped_equity_recovery,
                     operational_limit: None,
                     target_share: None,
@@ -260,7 +261,7 @@ where
                     tokenized_equity_derivative: *wrapped,
                     vault_ids: Vec::new(),
                     trading: OperationMode::Enabled,
-                    rebalancing: OperationMode::Disabled,
+                    rebalancing: RebalancingMode::Disabled,
                     wrapped_equity_recovery,
                     operational_limit: None,
                     target_share: None,
@@ -300,7 +301,7 @@ where
         ethereum_wallet,
     );
 
-    Ctx::for_test()
+    let mut ctx = Ctx::for_test()
         .database_url(db_path.display().to_string())
         .rpc_url(base_chain.endpoint().parse()?)
         .orderbook(base_chain.orderbook)
@@ -327,8 +328,15 @@ where
             chainlink_feed: base_chain.mock_chainlink_feed,
         })
         .alerts(test_alerts())
-        .call()
-        .map_err(Into::into)
+        .call()?;
+    // The USDC withdrawal tx lands on Ethereum and is checked at its depth.
+    ctx.chains.insert_transport(ChainCtx {
+        chain: Chain::Ethereum,
+        rpc_url: ethereum_endpoint.parse()?,
+        required_confirmations: 0,
+    });
+
+    Ok(ctx)
 }
 
 pub(crate) enum EquityRebalanceType<'a> {
@@ -618,7 +626,7 @@ async fn assert_equity_redeem_rebalancing<P: Provider>(
             "EquityRedemptionEvent::UnwrapPending",
             "EquityRedemptionEvent::UnwrapSubmitted",
             "EquityRedemptionEvent::TokensUnwrapped",
-            "EquityRedemptionEvent::SendPending",
+            "EquityRedemptionEvent::SendPrepared",
             "EquityRedemptionEvent::TokensSent",
             "EquityRedemptionEvent::Detected",
             "EquityRedemptionEvent::Completed",

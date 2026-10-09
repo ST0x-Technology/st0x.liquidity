@@ -7,6 +7,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use futures_util::sink::SinkExt;
 use futures_util::stream::{SplitSink, StreamExt};
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tokio::sync::broadcast;
@@ -327,8 +328,22 @@ pub(crate) fn routes() -> Router<AppState> {
 pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
     let (equity_target, equity_deviation, usdc_target, usdc_deviation) = {
         let rebalancing = &ctx.rebalancing;
-        let (usdc_target, usdc_deviation) =
-            rebalancing.usdc.as_ref().map_or((None, None), |usdc| {
+        // The one active corridor's band whatever its chain; with several,
+        // the primary chain's, until the dashboard shows one cash band per
+        // chain.
+        let primary = ctx.chains.primary().chain;
+        let (usdc_target, usdc_deviation) = rebalancing
+            .usdc
+            .active()
+            .exactly_one()
+            .ok()
+            .or_else(|| {
+                rebalancing
+                    .usdc
+                    .active()
+                    .find(|usdc| usdc.corridor.chain() == primary)
+            })
+            .map_or((None, None), |usdc| {
                 (
                     Some(float_to_f64(usdc.threshold.target, 0.5)),
                     Some(float_to_f64(usdc.threshold.deviation, 0.3)),
@@ -339,7 +354,7 @@ pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
         let primary_target = rebalancing
             .allocation
             .targets
-            .get(&ctx.chains.primary().chain)
+            .get(&primary)
             .map(|target| float_to_f64(target.inner(), 0.5));
 
         (
@@ -401,7 +416,7 @@ pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
             st0x_dto::AssetSettings {
                 symbol: symbol.clone(),
                 counter_trading,
-                rebalancing: config.rebalancing == OperationMode::Enabled,
+                rebalancing: config.rebalancing.starts_operations(),
                 operational_limit: limit,
             }
         })
@@ -497,9 +512,14 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_tungstenite::{WebSocketStream, connect_async};
 
-    use st0x_config::{ChainAssets, ChainEquityAsset, create_test_ctx_with_order_owner};
+    use st0x_bridge::corridor::{HopKind, UsdcCorridor};
+    use st0x_config::{
+        ChainAssets, ChainEquityAsset, ImbalanceThreshold, RebalancingMode, UsdcCorridorCtx,
+        UsdcCorridors, create_test_ctx_with_order_owner,
+    };
     use st0x_dto::{Direction, Trade, TradingVenue};
     use st0x_event_sorcery::StoreBuilder;
+    use st0x_evm::Chain;
     use st0x_execution::{
         ClientOrderId, ExecutorOrderId, FractionalShares, MarketSession, Positive,
         SupportedExecutor, Symbol, Usd,
@@ -673,6 +693,33 @@ mod tests {
         assert_eq!(settings["equityDeviation"], json!(0.1));
     }
 
+    /// A single active corridor off the primary chain still shows its band.
+    #[test]
+    fn settings_from_ctx_shows_a_single_active_corridor_off_the_primary_chain() {
+        let mut ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        assert_ne!(ctx.chains.primary().chain, Chain::HyperEvm);
+        ctx.rebalancing.usdc = UsdcCorridors::for_test(
+            OperationMode::Enabled,
+            [UsdcCorridorCtx {
+                corridor: UsdcCorridor::HubRouted {
+                    chain: Chain::HyperEvm,
+                    hop: HopKind::Relay,
+                },
+                threshold: ImbalanceThreshold {
+                    target: float!(0.25),
+                    deviation: float!(0.125),
+                },
+            }],
+        );
+
+        let settings = serde_json::to_value(settings_from_ctx(&ctx)).unwrap();
+
+        assert_eq!(settings["usdcTarget"], json!(0.25));
+        assert_eq!(settings["usdcDeviation"], json!(0.125));
+    }
+
     #[test]
     fn settings_from_ctx_includes_asset_operation_flags() {
         let mut ctx = create_test_ctx_with_order_owner(address!(
@@ -686,7 +733,7 @@ mod tests {
                 tokenized_equity_derivative: address!("0x2222222222222222222222222222222222222222"),
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -732,7 +779,7 @@ mod tests {
                 tokenized_equity_derivative: address!("0x2222222222222222222222222222222222222222"),
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
-                rebalancing: OperationMode::Enabled,
+                rebalancing: RebalancingMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -751,6 +798,38 @@ mod tests {
             st0x_dto::CounterTrading::Disabled
         ));
         assert!(asset.rebalancing);
+    }
+
+    /// The dashboard flag means "starts new operations", so a paused listing
+    /// reads `false` even though its chain still finishes and recovers work.
+    #[test]
+    fn settings_from_ctx_shows_a_paused_asset_as_not_rebalancing() {
+        let mut ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        let symbol = st0x_finance::Symbol::new("RKLB").unwrap();
+        ctx.chains.primary_mut().assets.equities.symbols.insert(
+            symbol.clone(),
+            ChainEquityAsset {
+                tokenized_equity: address!("0x1111111111111111111111111111111111111111"),
+                tokenized_equity_derivative: address!("0x2222222222222222222222222222222222222222"),
+                vault_ids: Vec::new(),
+                trading: OperationMode::Enabled,
+                rebalancing: RebalancingMode::Paused,
+                wrapped_equity_recovery: OperationMode::Enabled,
+                operational_limit: None,
+                target_share: None,
+            },
+        );
+
+        let settings = settings_from_ctx(&ctx);
+        let asset = settings
+            .assets
+            .iter()
+            .find(|asset| asset.symbol == symbol)
+            .expect("RKLB settings should be present");
+
+        assert!(!asset.rebalancing);
     }
 
     async fn create_test_state() -> AppState {
@@ -773,7 +852,11 @@ mod tests {
             settings: empty_settings(),
             recovery: Arc::new(tokio::sync::OnceCell::new()),
             process_tx: Arc::new(tokio::sync::OnceCell::new()),
-            resume_lock: Arc::new(crate::api::ResumeLock(tokio::sync::Mutex::new(()))),
+            resume_lock: Arc::new(crate::api::ResumeLock(Arc::new(
+                tokio::sync::Mutex::new(()),
+            ))),
+            vault_deposit_lock: Arc::new(tokio::sync::Mutex::new(())),
+            vault_withdraw_lock: Arc::new(tokio::sync::Mutex::new(())),
             projection_maintenance: Arc::new(
                 crate::conductor::projection_pause::ProjectionMaintenance::for_test(),
             ),

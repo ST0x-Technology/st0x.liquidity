@@ -578,7 +578,7 @@
               >CT</span
             >
 
-            <span title="Automatic equity rebalancing for this asset: green enabled, red disabled, grey not configured."
+            <span title="Automatic equity rebalancing for this asset: green enabled, red disabled or paused, grey not configured."
               >Rebal</span
             >
 

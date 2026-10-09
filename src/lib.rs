@@ -26,6 +26,7 @@ use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::Layer;
 
+use st0x_config::registry_state::{Booted, SOAK};
 use st0x_config::{BrokerCtx, Ctx};
 use st0x_dto::Statement;
 
@@ -47,6 +48,7 @@ pub mod bindings;
 #[cfg(not(any(test, feature = "test-support")))]
 pub(crate) mod bindings;
 mod bot_gas;
+mod cctp_burn;
 mod conductor;
 pub(crate) mod dashboard;
 mod database_file_lock;
@@ -71,9 +73,11 @@ mod position_check;
 mod pricing_identity;
 mod quiesce;
 mod rebalancing;
-mod registry_watch;
+mod registry_boot;
+mod registry_reload;
 mod startup;
 mod telemetry;
+mod tls;
 mod trading;
 mod trading_schedule;
 #[cfg(feature = "mock")]
@@ -86,9 +90,11 @@ mod vault_registry;
 mod view_rebuild;
 mod wrapped_equity_recovery;
 
+pub use registry_boot::report_boot as report_registry_boot;
 pub use st0x_config::{
     ExtraLayer, FileLogGuard, TelemetryError, TelemetryGuard, mk_env_filter, setup_tracing,
 };
+pub use tls::install_tls_crypto_provider;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use offchain::order::{OffchainOrder, OffchainOrderId};
@@ -129,7 +135,7 @@ pub use st0x_config::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use st0x_config::{
-    ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, OperationMode,
+    ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, OperationMode, RebalancingMode,
 };
 #[cfg(feature = "test-support")]
 pub use trading::onchain::trade_accountant::AccountForDexTrade;
@@ -177,6 +183,30 @@ pub(crate) struct AppState {
     pub(crate) recovery: Arc<tokio::sync::OnceCell<api::RecoveryHandle>>,
     pub(crate) process_tx: Arc<tokio::sync::OnceCell<api::ProcessTxHandle>>,
     pub(crate) resume_lock: Arc<api::ResumeLock>,
+    /// Serializes `capital vault-deposit` requests against each other, and
+    /// nothing else, from before the decimals read until the deposit's fate is
+    /// proven (it confirmed, or mined and failed; a drop report proves
+    /// neither), or until a restart after a panic while confirming; see
+    /// `vault_withdraw_lock`.
+    /// `Raindex::submit_deposit` reads the allowance, approves exactly the
+    /// amount when it is short, then deposits, so two concurrent
+    /// requests for a token without the startup MAX grant could overwrite each
+    /// other's approval. The bot's own deposits (the USDC transfer workers) do
+    /// not take this lock, so a request can still use up a worker's exact
+    /// approval when the MAX grant is missing; the worker's deposit then
+    /// reverts and its transfer needs a redrive.
+    pub(crate) vault_deposit_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes `capital vault-withdraw` and `capital vault-withdraw-usdc`
+    /// requests against each other, from before the decimals read until the
+    /// withdraw's fate is proven (it confirmed, or mined and failed; a drop
+    /// report proves neither), or until a restart after a panic while
+    /// confirming. A failed send frees it, since
+    /// its error cannot tell whether the tx went out. Both answer at the
+    /// broadcast, often before the vault balance moves, so without it a rerun
+    /// on the strength of that balance would withdraw a second time. It lives
+    /// in memory, so a restart frees it. The bot's own
+    /// withdrawals (the USDC transfer workers) do not take this lock.
+    pub(crate) vault_withdraw_lock: Arc<tokio::sync::Mutex<()>>,
     pub(crate) projection_maintenance: Arc<conductor::projection_pause::ProjectionMaintenance>,
     pub(crate) pnl_report_admission: dashboard::pnl::PnlReportAdmission,
     pub(crate) pnl_ledger: Arc<dashboard::pnl::PnlLedger>,
@@ -194,8 +224,21 @@ pub async fn run_bot_session(ctx: Ctx) -> anyhow::Result<()> {
     run_bot_session_with_event_channel(ctx, event_sender).await
 }
 
+/// Why a server session ended after its coordinated drain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownReason {
+    Stopped,
+    Reload,
+}
+
+/// The production session. `booted` is the token-file record this server
+/// claimed at boot, marked running once startup completes and promoted after
+/// its soak.
 #[tracing::instrument(skip_all, target = "startup", level = tracing::Level::INFO)]
-pub async fn run_server_bot_session(ctx: Ctx) -> anyhow::Result<()> {
+pub async fn run_server_bot_session(
+    ctx: Ctx,
+    booted: Option<Booted>,
+) -> anyhow::Result<ShutdownReason> {
     let (event_sender, _) = broadcast::channel::<Statement>(256);
     let startup_notifier: Arc<dyn startup::StartupNotifier> =
         match startup::DeploymentStartupNotifier::from_env() {
@@ -206,6 +249,7 @@ pub async fn run_server_bot_session(ctx: Ctx) -> anyhow::Result<()> {
         ctx,
         event_sender,
         startup_notifier,
+        booted,
         #[cfg(any(test, feature = "test-support"))]
         FailureInjector::new(),
     )
@@ -221,10 +265,12 @@ pub async fn run_bot_session_with_event_channel(
         ctx,
         event_sender,
         Arc::new(startup::NoopStartupNotifier),
+        None,
         #[cfg(any(test, feature = "test-support"))]
         FailureInjector::new(),
     )
     .await
+    .map(|_| ())
 }
 
 /// Like [`run_bot_session_with_event_channel`] but accepts a caller-supplied
@@ -240,17 +286,20 @@ pub async fn run_bot_session_with_injector(
         ctx,
         event_sender,
         Arc::new(startup::NoopStartupNotifier),
+        None,
         failure_injector,
     )
     .await
+    .map(|_| ())
 }
 
 async fn run_bot_session_inner(
     ctx: Ctx,
     event_sender: broadcast::Sender<Statement>,
     startup_notifier: Arc<dyn startup::StartupNotifier>,
+    booted: Option<Booted>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ShutdownReason> {
     let pool = ctx.get_sqlite_pool().await?;
     let apalis_pool = conductor::connect_apalis_pool(&ctx.database_url).await?;
     sqlx::migrate!().set_ignore_missing(true).run(&pool).await?;
@@ -279,7 +328,7 @@ async fn run_bot_session_inner(
     let shutdown_token = CancellationToken::new();
     let recovery_cell = Arc::new(tokio::sync::OnceCell::new());
     let process_tx_cell = Arc::new(tokio::sync::OnceCell::new());
-    let resume_lock = Arc::new(api::ResumeLock(tokio::sync::Mutex::new(())));
+    let resume_lock = Arc::new(api::ResumeLock(Arc::new(tokio::sync::Mutex::new(()))));
 
     // Pre-bind both server ports synchronously so a port-in-use failure
     // surfaces at startup instead of looping in the supervisor.
@@ -305,24 +354,19 @@ async fn run_bot_session_inner(
     let projection_maintenance = conductor::projection_pause::init_projection_maintenance();
     let health = startup::HealthGate::default();
     let detached_tasks = TaskTracker::new();
-    // Owned by this session: the handle aborts the loop when this function
-    // returns on any path, so no second session ever shares its gauges.
-    let _registry_watch = ctx.registry.clone().map(|live| {
-        AbortOnDropHandle::new(tokio::spawn(registry_watch::watch(
-            live,
-            shutdown_token.clone(),
-        )))
-    });
+    let (reload_sender, reload_receiver) = tokio::sync::mpsc::channel(1);
     let state = AppState {
         ctx: ctx.clone(),
         pool: pools.cqrs.clone(),
         event_sender: event_sender.clone(),
         inventory: inventory.clone(),
-        equity_prices,
+        equity_prices: equity_prices.clone(),
         settings: dashboard::settings_from_ctx(&ctx),
         recovery: recovery_cell.clone(),
         process_tx: process_tx_cell.clone(),
         resume_lock,
+        vault_deposit_lock: Arc::new(tokio::sync::Mutex::new(())),
+        vault_withdraw_lock: Arc::new(tokio::sync::Mutex::new(())),
         projection_maintenance: projection_maintenance.clone(),
         pnl_report_admission: dashboard::pnl::pnl_report_admission(),
         pnl_ledger: pnl_ledger.clone(),
@@ -349,13 +393,8 @@ async fn run_bot_session_inner(
             .build()
             .run()
     });
-    let order_fill_monitor_tokens: std::collections::BTreeMap<_, _> = ctx
-        .chains
-        .hedged()
-        .map(|hedged| (hedged.chain, startup_barrier.token()))
-        .collect();
     let mut bot_task = tokio::spawn(Box::pin(run_conductor_session(
-        ctx,
+        ctx.clone(),
         pools,
         conductor::ServerHandles {
             event_sender,
@@ -364,24 +403,10 @@ async fn run_bot_session_inner(
             process_tx_cell,
             pnl_ledger,
             projection_maintenance,
+            equity_prices,
         },
         shutdown_token.clone(),
-        ConductorStartupTokens {
-            initialized: startup_barrier.token(),
-            apalis_monitor: startup_barrier.token(),
-            job_cleanup: startup_barrier.token(),
-            supervisor: SupervisorStartupTokens {
-                order_fill_monitors: order_fill_monitor_tokens,
-                inventory_monitor: startup_barrier.token(),
-                dashboard_trade_handoff_monitor: startup_barrier.token(),
-                executor_maintenance: startup_barrier.token(),
-                base_gas_monitor: startup_barrier.token(),
-                ethereum_gas_monitor: startup_barrier.token(),
-                hyperevm_gas_monitor: startup_barrier.token(),
-                robinhood_gas_monitor: startup_barrier.token(),
-                trading_schedule_monitor: startup_barrier.token(),
-            },
-        },
+        conductor_startup_tokens(&ctx, &startup_barrier),
         #[cfg(any(test, feature = "test-support"))]
         failure_injector,
     )));
@@ -404,14 +429,16 @@ async fn run_bot_session_inner(
         armed: true,
     };
 
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("failed to register SIGTERM handler")?;
-    let shutdown_signal = async move {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => info!(target: "shutdown", "Received SIGINT"),
-            _ = sigterm.recv() => info!(target: "shutdown", "Received SIGTERM"),
-        }
-    };
+    let signalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reloading = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_signal = registry_shutdown_signal(
+        sigterm,
+        reload_receiver,
+        signalled.clone(),
+        reloading.clone(),
+    );
     tokio::pin!(shutdown_signal);
 
     let startup_outcome = report_when_started(
@@ -423,6 +450,24 @@ async fn run_bot_session_inner(
         shutdown_signal.as_mut(),
     )
     .await?;
+    // Dropped when this session returns, so a record is promoted only while
+    // the process that booted it is still up.
+    let _soak = match (startup_outcome, booted.as_ref()) {
+        (StartupOutcome::Started, Some(booted)) => Some(registry_boot::started(booted, SOAK)?),
+        (StartupOutcome::Started | StartupOutcome::ShutdownSignal, _) => None,
+    };
+
+    let _registry_reload = match (startup_outcome, booted.as_ref()) {
+        (StartupOutcome::Started, Some(booted)) => Some(AbortOnDropHandle::new(tokio::spawn(
+            registry_reload::watch(
+                ctx.clone(),
+                booted.clone(),
+                reload_sender,
+                shutdown_token.clone(),
+            ),
+        ))),
+        _ => None,
+    };
 
     let coordinated_shutdown = async move {
         match startup_outcome {
@@ -452,9 +497,62 @@ async fn run_bot_session_inner(
         }
     };
     finish_session_shutdown(&mut session_guard, coordinated_shutdown).await?;
+    if let Some(booted) = booted.as_ref()
+        && signalled.load(std::sync::atomic::Ordering::SeqCst)
+    {
+        registry_boot::stopped_cleanly(booted, startup_outcome == StartupOutcome::Started);
+    }
 
     info!(target: "startup", "Shutdown complete");
-    Ok(())
+    Ok(if reloading.load(std::sync::atomic::Ordering::SeqCst) {
+        ShutdownReason::Reload
+    } else {
+        ShutdownReason::Stopped
+    })
+}
+
+async fn registry_shutdown_signal(
+    mut sigterm: tokio::signal::unix::Signal,
+    mut reload_receiver: tokio::sync::mpsc::Receiver<()>,
+    signalled: Arc<std::sync::atomic::AtomicBool>,
+    reloading: Arc<std::sync::atomic::AtomicBool>,
+) {
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => info!(target: "shutdown", "Received SIGINT"),
+        _ = sigterm.recv() => info!(target: "shutdown", "Received SIGTERM"),
+        Some(()) = reload_receiver.recv() => {
+            reloading.store(true, std::sync::atomic::Ordering::SeqCst);
+            info!(target: "shutdown", "Accepted registry copy: restarting gracefully");
+        },
+    }
+    signalled.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn conductor_startup_tokens(
+    ctx: &Ctx,
+    barrier: &startup::StartupBarrier,
+) -> ConductorStartupTokens {
+    ConductorStartupTokens {
+        initialized: barrier.token(),
+        apalis_monitor: barrier.token(),
+        job_cleanup: barrier.token(),
+        supervisor: SupervisorStartupTokens {
+            order_fill_monitors: ctx
+                .chains
+                .hedged()
+                .map(|hedged| (hedged.chain, barrier.token()))
+                .collect(),
+            inventory_monitor: barrier.token(),
+            dashboard_trade_handoff_monitor: barrier.token(),
+            executor_maintenance: barrier.token(),
+            base_gas_monitor: barrier.token(),
+            ethereum_gas_monitor: barrier.token(),
+            hyperevm_gas_monitor: barrier.token(),
+            robinhood_gas_monitor: barrier.token(),
+            trading_schedule_monitor: barrier.token(),
+            hedge_stall_monitor: barrier.token(),
+        },
+    }
 }
 
 /// Awaits coordinated shutdown while its cleanup guard remains armed.
@@ -915,6 +1013,24 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn registry_request_uses_the_coordinated_shutdown_signal() {
+        let sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let signalled = Arc::new(AtomicBool::new(false));
+        let reloading = Arc::new(AtomicBool::new(false));
+        sender.send(()).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            registry_shutdown_signal(sigterm, receiver, signalled.clone(), reloading.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(signalled.load(Ordering::SeqCst));
+        assert!(reloading.load(Ordering::SeqCst));
+    }
+
     #[derive(Clone)]
     struct PendingSupervisorTask;
 
@@ -981,6 +1097,7 @@ mod tests {
                 hyperevm_gas_monitor: barrier.token(),
                 robinhood_gas_monitor: barrier.token(),
                 trading_schedule_monitor: barrier.token(),
+                hedge_stall_monitor: barrier.token(),
             },
         }
     }
@@ -992,7 +1109,7 @@ mod tests {
             .run()
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn non_essential_supervisor_keeps_restarting_after_panics() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let supervisor = non_escalating_supervisor_builder()
@@ -1009,7 +1126,7 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(1), async {
             while attempts.load(Ordering::SeqCst) < 7 {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
@@ -1572,6 +1689,7 @@ mod tests {
                 projection_maintenance: Arc::new(
                     conductor::projection_pause::ProjectionMaintenance::for_test(),
                 ),
+                equity_prices: dashboard::equity_price::EquityPriceStore::new([]),
             },
             tokio_util::sync::CancellationToken::new(),
             create_test_startup_tokens(),
@@ -1612,6 +1730,7 @@ mod tests {
                 projection_maintenance: Arc::new(
                     conductor::projection_pause::ProjectionMaintenance::for_test(),
                 ),
+                equity_prices: dashboard::equity_price::EquityPriceStore::new([]),
             },
             tokio_util::sync::CancellationToken::new(),
             create_test_startup_tokens(),

@@ -535,6 +535,19 @@ mod tests {
             )
         }
 
+        async fn prepare_pending_with_gas_limit(
+            &self,
+            _contract: Address,
+            _calldata: Bytes,
+            _unpadded_gas_limit: u64,
+            _note: &str,
+        ) -> Result<PreparedTransaction, EvmError> {
+            panic!(
+                "StubWallet::prepare_pending_with_gas_limit called - use a real wallet in tests \
+                 that need transactions"
+            )
+        }
+
         async fn broadcast_prepared(
             &self,
             _prepared: &PreparedTransaction,
@@ -549,6 +562,13 @@ mod tests {
             panic!(
                 "StubWallet::discard_prepared called - use a real wallet in tests that need transactions"
             );
+        }
+
+        async fn prepare_fee_replacement(
+            &self,
+            _prepared: &PreparedTransaction,
+        ) -> Result<Option<PreparedTransaction>, EvmError> {
+            panic!("StubWallet::prepare_fee_replacement should not be called here")
         }
 
         async fn release_superseded(&self, _tx_hash: TxHash) {
@@ -821,6 +841,18 @@ mod tests {
             ))
         }
 
+        async fn prepare_pending_with_gas_limit(
+            &self,
+            _contract: Address,
+            _calldata: Bytes,
+            _unpadded_gas_limit: u64,
+            _note: &str,
+        ) -> Result<PreparedTransaction, EvmError> {
+            panic!(
+                "MockedWallet::prepare_pending_with_gas_limit should not be called in wrapper tests"
+            )
+        }
+
         async fn broadcast_prepared(
             &self,
             prepared: &PreparedTransaction,
@@ -830,6 +862,13 @@ mod tests {
         }
 
         async fn discard_prepared(&self, _tx_hash: TxHash) {}
+
+        async fn prepare_fee_replacement(
+            &self,
+            _prepared: &PreparedTransaction,
+        ) -> Result<Option<PreparedTransaction>, EvmError> {
+            panic!("MockedWallet::prepare_fee_replacement should not be called in wrapper tests")
+        }
 
         async fn release_superseded(&self, _tx_hash: TxHash) {}
 

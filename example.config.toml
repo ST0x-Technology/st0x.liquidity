@@ -108,11 +108,11 @@ extended_hours_counter_trading = "disabled"
 # a chain with no fill watcher cannot trade, and one whose gas token is not
 # ETH cannot be "active" until a price source for it exists.
 lifecycle = "active"
-# Block-confirmation depth required before a transaction this bot submits is
-# treated as settled (the primary gate for USDC rebalancing withdrawals). This
-# does NOT govern order-fill ingestion: the fill monitor caps the backfill range
-# at the configured ingestion_cutoff block, not this depth. Set explicitly per
-# chain based on observed confirmation behavior.
+# Block-confirmation depth required before a transaction this bot submits on
+# this chain is treated as settled. This does NOT govern order-fill ingestion:
+# the fill monitor caps the backfill range at the configured ingestion_cutoff
+# block, not this depth. Set explicitly per chain based on observed
+# confirmation behavior.
 required_confirmations = 3
 
 [chains.base.trading]
@@ -177,7 +177,7 @@ primary = true
 # sending them to another chain's issuer address would burn them.
 #
 # Required when [rebalancing] is configured on the primary chain and on every
-# secondary with an equity that has rebalancing = "enabled": startup builds
+# secondary with an equity that has rebalancing = "enabled" or "paused": startup builds
 # those chains' tokenization services and refuses, naming the chain, without
 # its wallet. A hedge-only secondary (every equity rebalancing = "disabled")
 # needs none, and no wrapper vault either. Also used by the alpaca-redeem and
@@ -194,6 +194,8 @@ redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 # Holds and moves USDC for the corridor; it runs no orderbook, so it has
 # no [trading] table.
 lifecycle = "active"
+# Also the depth the Alpaca withdrawal tx needs before its USDC is used in a
+# USDC rebalancing transfer, whichever chain the corridor serves.
 required_confirmations = 12
 
 # HyperEVM, same shape as Ethereum.
@@ -207,8 +209,8 @@ required_confirmations = 1
 # hedge-only secondary. Fills on its orderbook are ingested, validated against
 # USDG (its settlement stable, pinned in code) and hedged; inventory is topped
 # up by hand and the prefunded lifecycle refuses any asset that enables
-# rebalancing (no wrapper or CCTP domain is wired there anyway). Gas is ETH,
-# so "active" is reachable, but rebalancing assets stay refused by capability.
+# rebalancing. Gas is ETH, so "active" is reachable, and at "active" an
+# equity may rebalance against Alpaca. Cash cannot: there is no CCTP domain.
 [chains.robinhood]
 lifecycle = "prefunded"
 # ~1 s at Robinhood's ~100 ms block cadence: enough for a load-balanced RPC
@@ -219,8 +221,10 @@ required_confirmations = 10
 # RaindexV6 on Robinhood Chain.
 orderbook = "0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20"
 inventory_mode = "managed"
-# No venue adapters: Bebop is off on Robinhood.
-inventory_adapters = []
+# Bebop's Robinhood RFQ hook (placeholder; the shipped configs pin the real operator).
+inventory_adapters = [
+  { venue = "bebop", operator = "0x6666666666666666666666666666666666666666" },
+]
 # The single RaindexInventory on 4663; it owns the orders and vaults, so it
 # is the vault owner too.
 inventory = "0x1eFd85E6C384fAD9B80C6D508E9098Eb91C4eD30"
@@ -261,7 +265,7 @@ address = "0xfcad0b19bb29d4674531d6f115237e16afce377c"
 # [wallet]
 # kind = "turnkey"
 # address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-# organization_id = "org-example-turnkey-org-id"
+# organization_id = "00000000-0000-4000-8000-000000000001" # Replace with your organization UUID.
 #
 # Turnkey authentication comes from exactly ONE of:
 #   - api_private_key in the SECRETS file [wallet] section (stored key), or
@@ -296,12 +300,16 @@ chainlink_feed = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
 # base = "0xcccccccccccccccccccccccccccccccccccccccc"
 
 # Required: the bot does not start without this section. To pause rebalancing
-# work, use the narrow controls instead: per-asset `rebalancing = "disabled"`,
-# the issuance freeze, or `[rebalancing.usdc] mode = "disabled"`.
+# work, use the narrow controls instead: per-asset `rebalancing = "paused"`
+# (starts nothing new, still finishes and recovers work under way; set
+# `"disabled"` only once nothing is in flight), the issuance freeze, or
+# `[rebalancing.usdc] mode = "disabled"`.
 [rebalancing]
 # Transfer timeout in seconds before stuck inflight state is tombstoned and cleared.
 # 1800 = 30 minutes.
 transfer_timeout_secs = 1800
+# Alert after a recovery holds a symbol this long (seconds). 3600 = 1 hour.
+recovery_hold_alert_after_secs = 3600
 # Skip a chain's rebalancing evaluations when its inventory snapshot is
 # older than this bound (or absent, e.g. right after a restart).
 inventory_staleness_bound_secs = 300
@@ -338,6 +346,11 @@ freeze_check = "enabled"
 # "disabled" keeps the corridor tables below (still validated) in place.
 [rebalancing.usdc]
 mode = "enabled"
+# How long a USD->USDC conversion that fails before the Alpaca withdrawal
+# holds Alpaca->Base transfers on every corridor, so a conversion that keeps
+# failing (for example an empty USDC/USD book) is retried once per period
+# instead of on every check. Optional; non-zero, at most 86400 (one day). 300 = 5 minutes.
+conversion_failure_cooldown_secs = 300
 
 # One table per cash corridor, keyed by the chain whose vault it serves;
 # every corridor routes through the bot's Ethereum wallet, where Alpaca
@@ -437,3 +450,17 @@ realert_interval = 43200
 base = "0.05"
 ethereum = "0.05"
 robinhood = "0.001"
+
+# Optional hedge-stall monitor. Absent: the monitor does not run. Present:
+# every field is required. Alerts when counter-trading makes no progress on
+# standing exposure during a session that can hedge it, or when the position
+# sweep stops completing. All values are seconds.
+[alerts.hedge_stall]
+# Seconds between hedge-stall evaluations.
+poll_interval = 60
+# Seconds a stall must last before it alerts. At least three
+# position_check_interval_secs intervals, plus
+# [broker] extended_hours_reprice_timeout_secs when that is set.
+stall_after = 900
+# Minimum seconds between repeated alerts while a stall lasts.
+realert_interval = 3600

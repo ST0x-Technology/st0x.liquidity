@@ -81,7 +81,8 @@ use st0x_float_macro::float;
 use tracing::{debug, info, warn};
 
 use st0x_evm::{
-    Chain, EvmError, IntoErrorRegistry, OpenChainErrorRegistry, PreparedTransaction, Wallet,
+    Chain, EvmError, IntoErrorRegistry, MinedTx, OpenChainErrorRegistry, PreparedTransaction,
+    Wallet,
 };
 use st0x_float_serde::{deserialize_float_from_number_or_string, format_float_with_fallback};
 
@@ -456,15 +457,6 @@ pub enum UsdcTransferStatus {
     Dropped,
 }
 
-/// A mined Ethereum transaction: who sent it, at which nonce, and how deep
-/// it is (the inclusion block counts as confirmation 1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MinedTx {
-    pub from: Address,
-    pub nonce: u64,
-    pub confirmations: u64,
-}
-
 /// Errors that can occur during CCTP bridge operations.
 #[derive(Debug, thiserror::Error)]
 pub enum CctpError {
@@ -800,10 +792,8 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     }
 
     /// Applies the zero-grace, single-miss fast drop policy to both endpoints'
-    /// `burn_status`. Test-only seam: lets downstream consumers' resume tests
-    /// classify an absent recorded burn tx as `Dropped` immediately rather than
-    /// waiting out the production 30 s grace window, without exposing
-    /// `BurnDropConfig` across the crate boundary.
+    /// `burn_status`. Unknown identity or insufficient head progress remains
+    /// `Pending`; the shortened grace never bypasses canonical-state evidence.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn with_fast_burn_drop_policy(mut self) -> Self {
@@ -1302,10 +1292,150 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         self.ethereum.tx_confirmations(tx_hash).await
     }
 
-    /// Returns the sender, nonce and confirmations of `tx_hash` on Ethereum,
-    /// or `None` while the node shows no receipt for it.
+    /// Returns `tx_hash` as mined on Ethereum, or `None` while the node shows
+    /// no canonical receipt for it.
     pub async fn ethereum_mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, CctpError> {
         self.ethereum.mined_tx(tx_hash).await
+    }
+
+    /// Ensures the standing allowance, queries the fast transfer fee, and signs
+    /// the `depositForBurn` of `amount` toward `recipient` on `direction`'s
+    /// source chain without broadcasting it, so the caller can persist the
+    /// signed burn before [`broadcast_prepared_burn`](Self::broadcast_prepared_burn)
+    /// sends it. A failed persist releases the nonce through
+    /// [`discard_prepared_burn`](Self::discard_prepared_burn). The fee and the
+    /// gas price are fixed in the signed bytes, so the burn is never fee bumped.
+    pub async fn prepare_burn(
+        &self,
+        direction: BridgeDirection,
+        amount: U256,
+        recipient: Address,
+    ) -> Result<PreparedTransaction, CctpError> {
+        match direction {
+            BridgeDirection::EthereumToBase => {
+                self.ethereum
+                    .ensure_standing_allowance::<OpenChainErrorRegistry>()
+                    .await?;
+                let max_fee = self.query_fast_transfer_fee(amount, direction).await?;
+                self.ethereum
+                    .prepare_deposit_for_burn(amount, recipient, direction, max_fee)
+                    .await
+            }
+            BridgeDirection::BaseToEthereum => {
+                self.base
+                    .ensure_standing_allowance::<OpenChainErrorRegistry>()
+                    .await?;
+                let max_fee = self.query_fast_transfer_fee(amount, direction).await?;
+                self.base
+                    .prepare_deposit_for_burn(amount, recipient, direction, max_fee)
+                    .await
+            }
+        }
+    }
+
+    /// Broadcasts a burn signed by [`prepare_burn`](Self::prepare_burn). A
+    /// repeat sends the same bytes.
+    pub async fn broadcast_prepared_burn(
+        &self,
+        direction: BridgeDirection,
+        prepared: &PreparedTransaction,
+    ) -> Result<TxHash, CctpError> {
+        Ok(match direction {
+            BridgeDirection::EthereumToBase => self.ethereum.broadcast_burn(prepared).await?,
+            BridgeDirection::BaseToEthereum => self.base.broadcast_burn(prepared).await?,
+        })
+    }
+
+    /// Releases the nonce of a signed burn that was not persisted and so will
+    /// never be broadcast.
+    pub async fn discard_prepared_burn(
+        &self,
+        direction: BridgeDirection,
+        prepared: &PreparedTransaction,
+    ) {
+        match direction {
+            BridgeDirection::EthereumToBase => self.ethereum.discard_burn(prepared).await,
+            BridgeDirection::BaseToEthereum => self.base.discard_burn(prepared).await,
+        }
+    }
+
+    /// Reserves the nonce of a persisted signed burn after a restart, before
+    /// any other send from the source wallet can take it.
+    pub async fn restore_prepared_burn(
+        &self,
+        direction: BridgeDirection,
+        prepared: &PreparedTransaction,
+    ) {
+        match direction {
+            BridgeDirection::EthereumToBase => self.ethereum.restore_burn(prepared).await,
+            BridgeDirection::BaseToEthereum => self.base.restore_burn(prepared).await,
+        }
+    }
+
+    /// Releases the nonce of a signed burn whose nonce another mined tx took,
+    /// so the source wallet stops holding it.
+    pub async fn release_superseded_burn(
+        &self,
+        direction: BridgeDirection,
+        prepared: &PreparedTransaction,
+    ) {
+        match direction {
+            BridgeDirection::EthereumToBase => {
+                self.ethereum.release_superseded_burn(prepared).await;
+            }
+            BridgeDirection::BaseToEthereum => self.base.release_superseded_burn(prepared).await,
+        }
+    }
+
+    /// Returns `tx_hash` as mined on `direction`'s source chain, or `None`
+    /// while the node shows no canonical receipt for it.
+    pub async fn source_mined_tx(
+        &self,
+        direction: BridgeDirection,
+        tx_hash: TxHash,
+    ) -> Result<Option<MinedTx>, CctpError> {
+        match direction {
+            BridgeDirection::EthereumToBase => self.ethereum.mined_tx(tx_hash).await,
+            BridgeDirection::BaseToEthereum => self.base.mined_tx(tx_hash).await,
+        }
+    }
+
+    /// Whether `tx_hash`'s receipt on `direction`'s source chain carries the
+    /// CCTP `MessageSent` event, as [`confirm_burn`](crate::Bridge::confirm_burn)
+    /// requires of a burn. Reads without waiting; `None` while the node shows
+    /// no receipt.
+    pub async fn source_emitted_message_sent(
+        &self,
+        direction: BridgeDirection,
+        tx_hash: TxHash,
+    ) -> Result<Option<bool>, CctpError> {
+        match direction {
+            BridgeDirection::EthereumToBase => self.ethereum.emitted_message_sent(tx_hash).await,
+            BridgeDirection::BaseToEthereum => self.base.emitted_message_sent(tx_hash).await,
+        }
+    }
+
+    /// Whether the node on `direction`'s source chain knows `tx_hash`, mined
+    /// or still pending. `false` can be a lagging node, so it never proves the
+    /// tx is gone.
+    pub async fn source_knows_tx(
+        &self,
+        direction: BridgeDirection,
+        tx_hash: TxHash,
+    ) -> Result<bool, CctpError> {
+        match direction {
+            BridgeDirection::EthereumToBase => self.ethereum.knows_tx(tx_hash).await,
+            BridgeDirection::BaseToEthereum => self.base.knows_tx(tx_hash).await,
+        }
+    }
+
+    /// The wallet that signs `direction`'s burns. A persisted signed burn from
+    /// another address must not go through this wallet's nonce bookkeeping.
+    pub fn source_signer(&self, direction: BridgeDirection) -> Address {
+        match direction {
+            BridgeDirection::EthereumToBase => self.ethereum.owner(),
+            BridgeDirection::BaseToEthereum => self.base.owner(),
+        }
     }
 
     /// Returns the block in which `tx_hash` was mined on Ethereum, the chain
@@ -1492,10 +1622,17 @@ where
         &self,
         direction: BridgeDirection,
         tx_hash: TxHash,
+        submitted_after_block: u64,
     ) -> Result<crate::BurnTxStatus, Self::Error> {
         match direction {
-            BridgeDirection::EthereumToBase => self.ethereum.burn_status(tx_hash).await,
-            BridgeDirection::BaseToEthereum => self.base.burn_status(tx_hash).await,
+            BridgeDirection::EthereumToBase => {
+                self.ethereum
+                    .burn_status(tx_hash, submitted_after_block)
+                    .await
+            }
+            BridgeDirection::BaseToEthereum => {
+                self.base.burn_status(tx_hash, submitted_after_block).await
+            }
         }
     }
 
@@ -1543,27 +1680,60 @@ where
         AttestationResponse::from_parts(Bytes::from(message), Bytes::from(attestation))
     }
 
-    /// Scans the burn source chain for an already-submitted burn matching
-    /// `(amount, destinationDomain, recipient)` at or after `from_block`, for
-    /// crash-safe resume. Delegates to the source endpoint for the given
-    /// direction.
-    async fn find_recent_burn(
+    /// Scans the source endpoint for the recorded hash and transfer fingerprint.
+    async fn find_recorded_burn(
         &self,
         direction: BridgeDirection,
         amount: U256,
         recipient: Address,
         from_block: u64,
-    ) -> Result<Option<TxHash>, Self::Error> {
-        let dest_domain = direction.dest_domain();
+        burn_tx: TxHash,
+    ) -> Result<crate::RecordedBurnScan, Self::Error> {
         match direction {
             BridgeDirection::EthereumToBase => {
                 self.ethereum
-                    .find_recent_burn(amount, dest_domain, recipient, from_block)
+                    .find_recorded_burn(
+                        amount,
+                        direction.dest_domain(),
+                        recipient,
+                        from_block,
+                        burn_tx,
+                    )
                     .await
             }
             BridgeDirection::BaseToEthereum => {
                 self.base
-                    .find_recent_burn(amount, dest_domain, recipient, from_block)
+                    .find_recorded_burn(
+                        amount,
+                        direction.dest_domain(),
+                        recipient,
+                        from_block,
+                        burn_tx,
+                    )
+                    .await
+            }
+        }
+    }
+
+    /// Finds a matching `(amount, destinationDomain, recipient)` burn after
+    /// `from_block` for crash recovery before a hash has been recorded.
+    async fn find_recent_burns(
+        &self,
+        direction: BridgeDirection,
+        amount: U256,
+        recipient: Address,
+        from_block: u64,
+    ) -> Result<Vec<TxHash>, Self::Error> {
+        let dest_domain = direction.dest_domain();
+        match direction {
+            BridgeDirection::EthereumToBase => {
+                self.ethereum
+                    .find_recent_burns(amount, dest_domain, recipient, from_block)
+                    .await
+            }
+            BridgeDirection::BaseToEthereum => {
+                self.base
+                    .find_recent_burns(amount, dest_domain, recipient, from_block)
                     .await
             }
         }
@@ -2280,6 +2450,18 @@ mod tests {
             self.inner.prepare_pending(contract, calldata, note).await
         }
 
+        async fn prepare_pending_with_gas_limit(
+            &self,
+            contract: Address,
+            calldata: Bytes,
+            unpadded_gas_limit: u64,
+            note: &str,
+        ) -> Result<PreparedTransaction, EvmError> {
+            self.inner
+                .prepare_pending_with_gas_limit(contract, calldata, unpadded_gas_limit, note)
+                .await
+        }
+
         async fn broadcast_prepared(
             &self,
             prepared: &PreparedTransaction,
@@ -2290,6 +2472,13 @@ mod tests {
 
         async fn discard_prepared(&self, tx_hash: TxHash) {
             self.inner.discard_prepared(tx_hash).await;
+        }
+
+        async fn prepare_fee_replacement(
+            &self,
+            prepared: &PreparedTransaction,
+        ) -> Result<Option<PreparedTransaction>, EvmError> {
+            self.inner.prepare_fee_replacement(prepared).await
         }
 
         async fn release_superseded(&self, tx_hash: TxHash) {
@@ -6620,6 +6809,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recorded_burn_scan_finds_exact_hash_behind_a_newer_identical_burn() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+        let recipient = bridge.ethereum.owner();
+        let amount = U256::from(25_000_000u64);
+        let from_block = bridge
+            .source_block(BridgeDirection::BaseToEthereum)
+            .await
+            .unwrap();
+        let recorded = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::BaseToEthereum, amount, recipient)
+            .await
+            .unwrap();
+        let unrelated = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::BaseToEthereum, amount, recipient)
+            .await
+            .unwrap();
+        assert_eq!(
+            bridge
+                .find_recent_burns(
+                    BridgeDirection::BaseToEthereum,
+                    amount,
+                    recipient,
+                    from_block
+                )
+                .await
+                .unwrap(),
+            vec![unrelated.tx, recorded.tx],
+            "complete range must expose the older eligible candidate"
+        );
+        assert_eq!(
+            bridge
+                .find_recent_burn(
+                    BridgeDirection::BaseToEthereum,
+                    amount,
+                    recipient,
+                    from_block
+                )
+                .await
+                .unwrap(),
+            Some(unrelated.tx)
+        );
+        assert_eq!(
+            bridge
+                .find_recorded_burn(
+                    BridgeDirection::BaseToEthereum,
+                    amount,
+                    recipient,
+                    from_block,
+                    recorded.tx
+                )
+                .await
+                .unwrap(),
+            crate::RecordedBurnScan::Found
+        );
+        assert_eq!(
+            bridge
+                .find_recorded_burn(
+                    BridgeDirection::BaseToEthereum,
+                    amount,
+                    recipient,
+                    from_block,
+                    TxHash::random()
+                )
+                .await
+                .unwrap(),
+            crate::RecordedBurnScan::Inconclusive
+        );
+        assert_eq!(
+            bridge
+                .find_recorded_burn(
+                    BridgeDirection::BaseToEthereum,
+                    amount,
+                    Address::random(),
+                    from_block,
+                    recorded.tx
+                )
+                .await
+                .unwrap(),
+            crate::RecordedBurnScan::Inconclusive
+        );
+    }
+
+    #[tokio::test]
     async fn find_recent_burn_returns_none_for_wrong_amount_or_recipient() {
         let cctp = LocalCctp::new().await.unwrap();
         let bridge = cctp.create_bridge().await.unwrap();
@@ -7031,7 +7304,7 @@ mod tests {
         assert_eq!(
             bridge
                 .ethereum
-                .burn_status(success_receipt.transaction_hash)
+                .burn_status(success_receipt.transaction_hash, 0)
                 .await
                 .unwrap(),
             crate::BurnTxStatus::MinedSuccess
@@ -7039,7 +7312,7 @@ mod tests {
         assert_eq!(
             bridge
                 .ethereum
-                .burn_status(reverted_receipt.transaction_hash)
+                .burn_status(reverted_receipt.transaction_hash, 0)
                 .await
                 .unwrap(),
             crate::BurnTxStatus::MinedReverted
@@ -7083,7 +7356,7 @@ mod tests {
         // for a truly-absent tx), a mempool-visible tx must be Pending.
         let status = bridge
             .ethereum
-            .burn_status_with_config(pending_tx, super::evm::BurnDropConfig::fast())
+            .burn_status_with_config(pending_tx, 0, super::evm::BurnDropConfig::fast())
             .await
             .unwrap();
 
@@ -7094,30 +7367,33 @@ mod tests {
         );
     }
 
-    /// A tx absent from both the receipt lookup and the mempool, observed past the
-    /// grace window and the consecutive-miss threshold, classifies as `Dropped`
-    /// so the caller can fail closed and require operator verification. Uses a
-    /// zero grace + single miss to keep the test fast.
+    /// An absent unknown hash stays Pending even past grace on a fresh head:
+    /// without its sender/nonce, canonical state cannot qualify the absence.
     #[tokio::test]
-    async fn burn_status_reports_dropped_for_absent_tx_past_grace() {
+    async fn burn_status_reports_pending_for_unknown_absent_tx_past_grace() {
         let (_anvil, endpoint, private_key) = setup_anvil();
         let bridge = create_bridge(&endpoint, &endpoint, &private_key, USDC_ETHEREUM)
             .await
             .unwrap();
+
+        // A head beyond the submission floor is insufficient without the
+        // transaction's known sender/nonce (submitted_after_block = 0).
+        let provider = ProviderBuilder::new().connect(&endpoint).await.unwrap();
+        provider.anvil_mine(Some(5), None).await.unwrap();
 
         let unknown_tx =
             b256!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
 
         let status = bridge
             .ethereum
-            .burn_status_with_config(unknown_tx, super::evm::BurnDropConfig::fast())
+            .burn_status_with_config(unknown_tx, 0, super::evm::BurnDropConfig::fast())
             .await
             .unwrap();
 
         assert_eq!(
             status,
-            crate::BurnTxStatus::Dropped,
-            "an absent tx past the grace + consecutive-miss threshold must classify as Dropped"
+            crate::BurnTxStatus::Pending,
+            "an unknown nonce cannot authorize a drop, even beyond the submission floor"
         );
     }
 

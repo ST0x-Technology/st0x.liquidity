@@ -1,20 +1,32 @@
 use clap::Parser;
 
-use st0x_config::{Ctx, Env};
-use st0x_hedge::{apalis_board_tracing_layer, run_server_bot_session, setup_tracing};
+use st0x_config::{Ctx, Env, TokenSource, claim_boot_tokens};
+use st0x_hedge::{
+    apalis_board_tracing_layer, install_tls_crypto_provider, report_registry_boot,
+    run_server_bot_session, setup_tracing,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    install_tls_crypto_provider();
+
     let Env {
         config,
         secrets,
         registry_file,
+        ..
     } = Env::parse();
-    let ctx = Ctx::load_files(&config, &secrets, registry_file.as_deref()).await?;
+    let claim = claim_boot_tokens(&config, registry_file.as_deref()).await?;
+    let ctx = Ctx::load_files(
+        &config,
+        &secrets,
+        TokenSource::Claimed(claim.tokens.as_deref()),
+    )
+    .await?;
 
     let log_level: tracing::Level = (&ctx.log_level).into();
 
-    let (_file_log_guard, telemetry_guard) = if let Some(ref telemetry) = ctx.telemetry {
+    let (file_log_guard, telemetry_guard) = if let Some(ref telemetry) = ctx.telemetry {
         match telemetry.setup(
             log_level,
             ctx.log_format,
@@ -47,14 +59,18 @@ async fn main() -> anyhow::Result<()> {
     // (deprecation shims, absent optional sections). During Ctx::load_files
     // there was no subscriber, so logging there would have been dropped.
     ctx.emit_startup_notices();
+    report_registry_boot(&claim.outcome);
 
-    let result = run_server_bot_session(ctx).await;
+    let result = run_server_bot_session(ctx, claim.booted).await;
 
     // Explicitly drop the telemetry guard to ensure TelemetryGuard::drop runs
     // before we return. Drop flushes pending spans and shuts down the tracer
     // provider, blocking until exports complete or timeout.
     drop(telemetry_guard);
 
-    result?;
+    if result? == st0x_hedge::ShutdownReason::Reload {
+        drop(file_log_guard);
+        std::process::exit(75);
+    }
     Ok(())
 }

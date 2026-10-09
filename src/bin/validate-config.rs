@@ -9,8 +9,9 @@
 //!
 //! A config that names `[registry]` keeps its per-symbol tables in the
 //! bucket. `--registry-file` supplies a local copy so they are checked too;
-//! without it the config is judged on its own and the report says so. This
-//! binary never reads the bucket, so it stays usable on any CI runner.
+//! `--registry-state` checks persisted boot candidates. Without either option
+//! the config is judged on its own, without network access. An explicit state
+//! path with no seeded records reads the bucket, as deployment gates do.
 //!
 //! Exits 0 on success, 1 on validation failure.
 
@@ -18,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
-use st0x_config::{Ctx, CtxError, StartupNotice, TokenFile};
+use st0x_config::{Ctx, CtxError, StartupNotice, TokenFile, fetch_gate_token_files};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -40,46 +41,63 @@ struct Args {
     /// the per-symbol tables are checked too. Omit to judge the config alone.
     #[clap(long)]
     registry_file: Option<PathBuf>,
+    /// Check the persisted pending and fallback copies, or the running copy.
+    #[clap(long, conflicts_with = "registry_file")]
+    registry_state: Option<PathBuf>,
 }
 
-fn main() -> std::process::ExitCode {
+#[tokio::main]
+async fn main() -> std::process::ExitCode {
     let Args {
         config,
         secrets,
         registry_file,
+        registry_state,
     } = Args::parse();
-
-    let token_bytes = match registry_file.as_ref().map(std::fs::read).transpose() {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            eprintln!("Config validation failed: reading --registry-file: {error}");
-            return std::process::ExitCode::FAILURE;
+    let token_files = if registry_file.is_none() && registry_state.is_none() {
+        vec![None]
+    } else {
+        match fetch_gate_token_files(&config, registry_file.as_deref(), registry_state.as_deref())
+            .await
+        {
+            Ok(files) => files,
+            Err(error) => {
+                report_failure(&error);
+                return std::process::ExitCode::FAILURE;
+            }
         }
     };
-    let tokens = token_bytes
-        .as_deref()
-        .map_or(TokenFile::Skipped, TokenFile::Bytes);
-
-    let (scope, validated) = secrets.as_ref().map_or_else(
-        || ("config", Ctx::validate_config_file(&config, tokens)),
-        |secrets| {
-            (
-                "config and secrets",
-                Ctx::validate_files(&config, secrets, tokens),
-            )
-        },
-    );
-
-    match validated {
-        Ok(startup_notices) => {
-            report_success(scope, &config, &startup_notices);
-            std::process::ExitCode::SUCCESS
-        }
+    match validate_candidates(&config, secrets.as_deref(), &token_files) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             report_failure(&error);
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+fn validate_candidates(
+    config: &Path,
+    secrets: Option<&Path>,
+    files: &[Option<Vec<u8>>],
+) -> Result<(), Box<CtxError>> {
+    for bytes in files {
+        let tokens = bytes
+            .as_deref()
+            .map_or(TokenFile::Skipped, TokenFile::Bytes);
+        let (scope, validated) = secrets.map_or_else(
+            || ("config", Ctx::validate_config_file(config, tokens)),
+            |secrets| {
+                (
+                    "config and secrets",
+                    Ctx::validate_files(config, secrets, tokens),
+                )
+            },
+        );
+        let notices = validated.map_err(Box::new)?;
+        report_success(scope, config, &notices);
+    }
+    Ok(())
 }
 
 /// The plain-text report: no tracing subscriber exists in this binary, so the
@@ -99,5 +117,31 @@ fn report_failure(error: &CtxError) {
     while let Some(cause) = source {
         eprintln!("  caused by: {cause}");
         source = cause.source();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use st0x_config::registry::source_of;
+
+    use super::*;
+
+    #[test]
+    fn validates_every_boot_candidate() {
+        let config = Path::new("config/prod/st0x-hedge.toml");
+        let deployed: toml::Table =
+            toml::from_str(&std::fs::read_to_string(config).unwrap()).unwrap();
+        let pinned = source_of(&deployed).unwrap().unwrap().generation.unwrap();
+        let valid =
+            std::fs::read(format!("tests/fixtures/tokens-production-{pinned}.toml")).unwrap();
+        validate_candidates(config, None, &[Some(valid.clone())]).unwrap();
+        assert!(
+            validate_candidates(
+                config,
+                None,
+                &[Some(valid), Some(b"invalid TOML = [".to_vec())]
+            )
+            .is_err()
+        );
     }
 }

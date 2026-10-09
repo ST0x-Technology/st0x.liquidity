@@ -13,7 +13,7 @@ use thiserror::Error;
 use st0x_evm::Chain;
 use st0x_execution::Symbol;
 
-use crate::assets::{ChainAssets, ChainEquityAsset, OperationMode};
+use crate::assets::{ChainAssets, ChainEquityAsset, OperationMode, RebalancingMode};
 
 /// How far along a chain is in its bring-up.
 ///
@@ -114,10 +114,10 @@ impl fmt::Display for ChainCapability {
 ///   but no wrapper.
 /// - HyperEVM signs, watches fills and hedges prefunded inventory. It has no
 ///   CCTP domain or wrapper, and the ETH/USD feed cannot value its HYPE gas.
-/// - Robinhood (an Arbitrum Orbit L2) signs, watches fills and hedges
-///   prefunded inventory; the shipped configuration runs it hedge-only. It
-///   pays gas in ETH, so the same ETH/USD feed values it; no CCTP domain or
-///   wrapper is wired.
+/// - Robinhood (an Arbitrum Orbit L2) signs, watches fills, hedges, and
+///   rebalances equity: Alpaca's issuer serves its `robinhood` network and
+///   the wrappers are deployed there. It pays gas in ETH, so the same ETH/USD
+///   feed values it. It has no CCTP domain, so it cannot rebalance cash.
 pub fn provided_capabilities(chain: Chain) -> BTreeSet<ChainCapability> {
     use ChainCapability::*;
 
@@ -138,7 +138,13 @@ pub fn provided_capabilities(chain: Chain) -> BTreeSet<ChainCapability> {
             GasValuation,
         ]),
         Chain::HyperEvm => BTreeSet::from([FillIngestion, Hedging, WalletSigning]),
-        Chain::Robinhood => BTreeSet::from([FillIngestion, Hedging, WalletSigning, GasValuation]),
+        Chain::Robinhood => BTreeSet::from([
+            FillIngestion,
+            Hedging,
+            WalletSigning,
+            EquityRebalancing,
+            GasValuation,
+        ]),
     }
 }
 
@@ -222,13 +228,14 @@ pub enum ChainEnablementError {
         symbol: Symbol,
     },
     #[error(
-        "[chains.{chain}] is \"{lifecycle}\" while {symbol} has rebalancing = \"enabled\": \
+        "[chains.{chain}] is \"{lifecycle}\" while {symbol} has rebalancing = \"{mode}\": \
          only an active chain may rebalance equity"
     )]
     EquityRebalancingExceedsLifecycle {
         chain: Chain,
         lifecycle: ChainLifecycle,
         symbol: Symbol,
+        mode: RebalancingMode,
     },
     #[error(
         "[chains.{chain}] is \"{lifecycle}\" while cash has rebalancing = \"enabled\": \
@@ -288,13 +295,14 @@ pub fn check_enablement(
         && !lifecycle.allows_rebalancing()
         && let Some(assets) = assets
     {
-        if let Some(symbol) = first_equity_matching(assets, |equity| {
-            equity.rebalancing == OperationMode::Enabled
-        }) {
+        if let Some(symbol) =
+            first_equity_matching(assets, |equity| equity.rebalancing.keeps_services())
+        {
             return Err(ChainEnablementError::EquityRebalancingExceedsLifecycle {
                 chain,
                 lifecycle,
                 symbol: symbol.clone(),
+                mode: assets.rebalancing_mode(symbol),
             });
         }
 
@@ -411,11 +419,29 @@ mod tests {
         );
     }
 
+    fn robinhood_rebalancing_equity() -> ChainAssets {
+        let mut assets = ChainAssets::default();
+        assets.equities.symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            ChainEquityAsset {
+                tokenized_equity: alloy::primitives::Address::repeat_byte(0x11),
+                tokenized_equity_derivative: alloy::primitives::Address::repeat_byte(0x22),
+                vault_ids: vec![],
+                trading: OperationMode::Enabled,
+                rebalancing: RebalancingMode::Enabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: None,
+                target_share: None,
+            },
+        );
+        assets
+    }
+
     /// Robinhood pays gas in ETH, so the Base ETH/USD read values it and the
-    /// chain can reach `active`, unlike HyperEVM. It still has no wrapper and
-    /// no CCTP domain, so rebalancing assets are refused by capability.
+    /// chain can reach `active`, unlike HyperEVM. Its wrappers and issuer
+    /// network are wired, so it rebalances equity, but it has no CCTP domain.
     #[test]
-    fn robinhood_can_be_active_but_cannot_rebalance() {
+    fn robinhood_rebalances_equity_but_not_cash() {
         let robinhood = Chain::Robinhood;
 
         for lifecycle in [
@@ -431,24 +457,14 @@ mod tests {
                 ChainCapability::FillIngestion,
                 ChainCapability::Hedging,
                 ChainCapability::WalletSigning,
+                ChainCapability::EquityRebalancing,
                 ChainCapability::GasValuation,
             ])
         );
 
-        let mut assets = ChainAssets::default();
-        assets.equities.symbols.insert(
-            Symbol::new("AAPL").unwrap(),
-            ChainEquityAsset {
-                tokenized_equity: alloy::primitives::Address::repeat_byte(0x11),
-                tokenized_equity_derivative: alloy::primitives::Address::ZERO,
-                vault_ids: vec![],
-                trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Enabled,
-                wrapped_equity_recovery: OperationMode::Disabled,
-                operational_limit: None,
-                target_share: None,
-            },
-        );
+        let mut assets = robinhood_rebalancing_equity();
+        check_enablement(robinhood, ChainLifecycle::Active, true, Some(&assets)).unwrap();
+
         assets.cash = Some(crate::ChainCashAsset {
             vault_ids: Vec::new(),
             rebalancing: OperationMode::Enabled,
@@ -469,11 +485,27 @@ mod tests {
         assert_eq!(lifecycle, ChainLifecycle::Active);
         assert_eq!(
             missing.into_inner(),
-            vec![
-                ChainCapability::EquityRebalancing,
-                ChainCapability::CashRebalancing
-            ],
-            "no wrapper and no CCTP domain are wired for Robinhood"
+            vec![ChainCapability::CashRebalancing],
+            "Robinhood has no CCTP domain"
+        );
+    }
+
+    #[test]
+    fn prefunded_robinhood_refuses_a_rebalancing_equity() {
+        let error = check_enablement(
+            Chain::Robinhood,
+            ChainLifecycle::Prefunded,
+            true,
+            Some(&robinhood_rebalancing_equity()),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                ChainEnablementError::EquityRebalancingExceedsLifecycle { .. }
+            ),
+            "expected EquityRebalancingExceedsLifecycle, got: {error:?}"
         );
     }
 
@@ -495,7 +527,7 @@ mod tests {
                 tokenized_equity_derivative: alloy::primitives::Address::ZERO,
                 vault_ids: vec![],
                 trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Enabled,
+                rebalancing: RebalancingMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -526,7 +558,7 @@ mod tests {
                 tokenized_equity_derivative: alloy::primitives::Address::ZERO,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -565,7 +597,7 @@ mod tests {
                     tokenized_equity_derivative: alloy::primitives::Address::ZERO,
                     vault_ids: Vec::new(),
                     trading: OperationMode::Enabled,
-                    rebalancing: OperationMode::Disabled,
+                    rebalancing: RebalancingMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
                     target_share: None,
@@ -588,48 +620,58 @@ mod tests {
         ));
     }
 
+    /// A paused listing keeps the chain's equity services, so it needs an
+    /// active chain just as an enabled one does.
     #[test]
     fn non_active_lifecycles_refuse_equity_rebalancing_by_name() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let mut assets = ChainAssets::default();
-        assets.equities.symbols.insert(
-            symbol.clone(),
-            crate::ChainEquityAsset {
-                tokenized_equity: alloy::primitives::Address::ZERO,
-                tokenized_equity_derivative: alloy::primitives::Address::ZERO,
-                vault_ids: Vec::new(),
-                trading: OperationMode::Disabled,
-                rebalancing: OperationMode::Enabled,
-                wrapped_equity_recovery: OperationMode::Disabled,
-                operational_limit: None,
-                target_share: None,
-            },
-        );
-
-        for lifecycle in [ChainLifecycle::ObserveOnly, ChainLifecycle::Prefunded] {
-            let error = check_enablement(Chain::Base, lifecycle, true, Some(&assets)).unwrap_err();
-            assert_eq!(
-                error.to_string(),
-                format!(
-                    "[chains.base] is \"{lifecycle}\" while AAPL has rebalancing = \
-                     \"enabled\": only an active chain may rebalance equity"
-                )
+        for (mode, label) in [
+            (RebalancingMode::Enabled, "enabled"),
+            (RebalancingMode::Paused, "paused"),
+        ] {
+            let symbol = Symbol::new("AAPL").unwrap();
+            let mut assets = ChainAssets::default();
+            assets.equities.symbols.insert(
+                symbol.clone(),
+                crate::ChainEquityAsset {
+                    tokenized_equity: alloy::primitives::Address::ZERO,
+                    tokenized_equity_derivative: alloy::primitives::Address::ZERO,
+                    vault_ids: Vec::new(),
+                    trading: OperationMode::Disabled,
+                    rebalancing: mode,
+                    wrapped_equity_recovery: OperationMode::Disabled,
+                    operational_limit: None,
+                    target_share: None,
+                },
             );
 
-            let ChainEnablementError::EquityRebalancingExceedsLifecycle {
-                chain,
-                lifecycle: actual_lifecycle,
-                symbol: actual_symbol,
-            } = error
-            else {
-                panic!("expected EquityRebalancingExceedsLifecycle, got: {error:?}")
-            };
-            assert_eq!(chain, Chain::Base);
-            assert_eq!(actual_lifecycle, lifecycle);
-            assert_eq!(actual_symbol, symbol);
-        }
+            for lifecycle in [ChainLifecycle::ObserveOnly, ChainLifecycle::Prefunded] {
+                let error =
+                    check_enablement(Chain::Base, lifecycle, true, Some(&assets)).unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "[chains.base] is \"{lifecycle}\" while AAPL has rebalancing = \
+                         \"{label}\": only an active chain may rebalance equity"
+                    )
+                );
 
-        check_enablement(Chain::Base, ChainLifecycle::Active, true, Some(&assets)).unwrap();
+                let ChainEnablementError::EquityRebalancingExceedsLifecycle {
+                    chain,
+                    lifecycle: actual_lifecycle,
+                    symbol: actual_symbol,
+                    mode: actual_mode,
+                } = error
+                else {
+                    panic!("expected EquityRebalancingExceedsLifecycle, got: {error:?}")
+                };
+                assert_eq!(chain, Chain::Base);
+                assert_eq!(actual_lifecycle, lifecycle);
+                assert_eq!(actual_symbol, symbol);
+                assert_eq!(actual_mode, mode);
+            }
+
+            check_enablement(Chain::Base, ChainLifecycle::Active, true, Some(&assets)).unwrap();
+        }
     }
 
     #[test]
@@ -680,7 +722,7 @@ mod tests {
                 tokenized_equity_derivative: alloy::primitives::Address::ZERO,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Enabled,
+                rebalancing: RebalancingMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,

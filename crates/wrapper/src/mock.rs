@@ -21,6 +21,8 @@ enum MockFailure {
     #[default]
     None,
     Wrap,
+    /// Fails wrap operations with a transport error, which a retry can clear.
+    WrapTransportError,
     ConfirmWrap,
     RetryableConfirmWrap,
     Unwrap,
@@ -113,6 +115,14 @@ impl MockWrapper {
     pub fn failing() -> Self {
         let mut mock = Self::new();
         mock.failure = MockFailure::Wrap;
+        mock
+    }
+
+    /// Creates a mock wrapper whose wrap operations fail with a transport
+    /// error, as when the RPC node is unreachable.
+    pub fn failing_wrap_transport_error() -> Self {
+        let mut mock = Self::new();
+        mock.failure = MockFailure::WrapTransportError;
         mock
     }
 
@@ -258,6 +268,11 @@ impl Wrapper for MockWrapper {
         if self.failure == MockFailure::Wrap {
             return Err(WrapperError::MissingDepositEvent);
         }
+        if self.failure == MockFailure::WrapTransportError {
+            return Err(WrapperError::Evm(EvmError::Transport(
+                alloy::transports::RpcError::NullResp,
+            )));
+        }
         // 1:1 ratio for mock - wrapped amount equals underlying amount
         Ok((TxHash::random(), underlying_amount))
     }
@@ -301,6 +316,11 @@ impl Wrapper for MockWrapper {
     ) -> Result<TxHash, WrapperError> {
         if self.failure == MockFailure::Wrap {
             return Err(WrapperError::MissingDepositEvent);
+        }
+        if self.failure == MockFailure::WrapTransportError {
+            return Err(WrapperError::Evm(EvmError::Transport(
+                alloy::transports::RpcError::NullResp,
+            )));
         }
         let tx_hash = TxHash::random();
         self.submitted_amounts

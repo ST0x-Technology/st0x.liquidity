@@ -20,6 +20,8 @@ pub(crate) mod redrive;
 mod valuation;
 
 pub use job::BotGasReceiptCostEnqueuer;
+#[cfg(test)]
+pub(crate) use job::QueuePushFailureKind;
 pub(crate) use job::{
     BotGasEnqueueFailure, RecordBotGasReceiptCost, RecordBotGasReceiptCostCtx,
     RecordBotGasReceiptCostJobQueue,

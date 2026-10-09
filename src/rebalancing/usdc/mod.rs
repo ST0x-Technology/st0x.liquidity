@@ -5,17 +5,19 @@
 //! with matching `resume_*` paths for apalis-driven crash recovery. Each
 //! transfer handles USD/USDC conversion, withdrawal, CCTP bridging, and deposit.
 
+mod corridors;
 mod driver_pause;
 mod job;
 mod manager;
 
+pub(crate) use corridors::{CorridorTransfer, UsdcCorridorTransfers};
 pub(crate) use driver_pause::{
     DriverNotQuiesced, UsdcDriverGate, UsdcDriverPause, UsdcDriverPauseGuard, usdc_driver_pause,
 };
 pub(crate) use job::{
     ResumeAlpacaToBase, ResumeBaseToAlpaca, TransferUsdcToHedging, TransferUsdcToHedgingCtx,
     TransferUsdcToHedgingJobQueue, TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
-    TransferUsdcToMarketMakingJobQueue,
+    TransferUsdcToMarketMakingJobQueue, UnderfundedAlertLatch, UnrecordedGuardRelease,
 };
 #[cfg(test)]
 pub(crate) use manager::RecoveredCctpMint;
@@ -29,12 +31,15 @@ pub use manager::{
     verify_deposit_send_superseded,
 };
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use alloy::primitives::{Address, TxHash, U256};
 use chrono::{DateTime, Utc};
+use itertools::Itertools;
 use rain_math_float::FloatError;
 use thiserror::Error;
+use tracing::error;
 
 use st0x_bridge::cctp::CctpError;
 use st0x_bridge::corridor::UsdcCorridor;
@@ -48,7 +53,9 @@ use st0x_raindex::RaindexError;
 use crate::bot_gas::redrive::BotGasFailureClassifier;
 use crate::inventory::InventoryViewError;
 use crate::native_gas::GasReadinessFailure;
-use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceId};
+use crate::usdc_rebalance::{
+    BurnTxOwnershipLookupError, RebalanceDirection, UsdcRebalance, UsdcRebalanceId,
+};
 
 #[derive(Debug, Error)]
 pub enum UsdcTransferError {
@@ -60,6 +67,27 @@ pub enum UsdcTransferError {
     AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
     #[error("CCTP bridge error: {0}")]
     Cctp(#[from] Box<CctpError>),
+    #[error(
+        "USDC rebalance {id}: burn {tx} is already recorded by rebalance {recorded_by}; not adopting or reburning"
+    )]
+    BurnTxAlreadyRecorded {
+        id: UsdcRebalanceId,
+        tx: TxHash,
+        recorded_by: UsdcRebalanceId,
+    },
+    #[error(
+        "USDC rebalance {id}: ownership history is not wired for burn {tx}; not adopting or reburning"
+    )]
+    BurnTxOwnershipUnchecked { id: UsdcRebalanceId, tx: TxHash },
+    #[error(
+        "USDC rebalance {id}: ownership history could not be read for burn {tx}; not adopting or reburning"
+    )]
+    BurnTxOwnershipLookupFailed {
+        id: UsdcRebalanceId,
+        tx: TxHash,
+        #[source]
+        source: BurnTxOwnershipLookupError,
+    },
     /// Constructed only at the bot-gas enqueue site
     /// (`CrossVenueCashTransfer::enqueue_bot_gas_cost`), deliberately NOT via
     /// `#[from]`: the job layer treats this variant as best-effort bookkeeping
@@ -79,11 +107,14 @@ pub enum UsdcTransferError {
     /// IMPORTANT: The double-burn safety guarantee does NOT come from this
     /// classification. It comes from `resume_bridging_submitting` /
     /// `resume_bridging_submitting_ethereum` scanning for an existing burn (via
-    /// `find_recent_burn`) before attempting a new one, with the scan lower bound
-    /// (`from_block`) durably recorded in the `BeginBridging` / `BridgingSubmitting`
-    /// event before the burn call. This variant identifies errors where the EVM
+    /// `find_recent_burn`) before attempting a new one, rejecting another
+    /// transfer's historical burn claim and confirming a candidate before
+    /// adoption. The recorded hash must be confirmed reverted before an empty
+    /// scan permits reburning; a missing hash still fails closed. The scan's
+    /// durably recorded lower bound can be stale and is not ownership proof.
+    /// This variant identifies errors where the EVM
     /// produced no lasting state change (post-mining reverts, pre-flight rejections).
-    /// The safety guarantee is the scan, not this variant.
+    /// The safety guarantee is the recovery evidence, not this variant.
     #[error("CCTP burn revert (no on-chain state change): {0}")]
     BurnRevert(Box<CctpError>),
     #[error("Vault error: {0}")]
@@ -110,16 +141,35 @@ pub enum UsdcTransferError {
         source: Box<RaindexError>,
     },
     /// The shared inventory reverted a `withdraw4` because the vault could not
-    /// cover the requested amount (a concurrent clear drained it). Distinct from
-    /// the opaque `Vault` wrap so it is not redriven blindly: retrying the same
-    /// withdraw reverts again until the vault is refunded, so the job latches
-    /// the aggregate at `WithdrawalSubmitting` for operator reconciliation
-    /// (no auto-retry); the operator refunds the vault, then redrives.
+    /// cover the requested amount (a concurrent clear drained it), and a
+    /// withdraw for this transfer may have been broadcast. Distinct from the
+    /// opaque `Vault` wrap so it is not redriven blindly: the job latches the
+    /// aggregate at `WithdrawalSubmitting` (no auto-retry). A resume only
+    /// adopts a withdrawal mined after `from_block`; if the operator finds none
+    /// on chain, they fail the transfer with `fail-usdc-transfer`.
     #[error(
-        "inventory vault under-funded on withdraw of {token}: requested {requested}, vault \
-         could cover only {received}; latched for operator reconciliation"
+        "USDC rebalance {id}: inventory vault under-funded on withdraw of {token}: requested \
+         {requested}, vault could cover only {received}; a withdraw may have been broadcast \
+         after block {from_block}, latched for operator reconciliation"
     )]
     InsufficientVaultLiquidity {
+        id: UsdcRebalanceId,
+        from_block: u64,
+        token: Address,
+        requested: U256,
+        received: U256,
+    },
+    /// The shared inventory could not cover the withdraw, and the evm layer
+    /// proved the withdraw was rejected before broadcast. `RejectWithdrawal`
+    /// is committed: the transfer is failed, nothing left the vault, and the
+    /// guard clears so rebalancing can plan again.
+    #[error(
+        "USDC rebalance {id}: inventory vault under-funded on withdraw of {token}: requested \
+         {requested}, vault could cover only {received}; rejected before broadcast, transfer \
+         failed"
+    )]
+    WithdrawalRejectedUnderfunded {
+        id: UsdcRebalanceId,
         token: Address,
         requested: U256,
         received: U256,
@@ -251,24 +301,26 @@ pub enum UsdcTransferError {
     PreviouslyFailedAggregate { id: UsdcRebalanceId },
     #[error(
         "USDC transfer corridor mismatch: transfer {id} runs on the {recorded} corridor, \
-         this service serves {served}; left untouched for the operator"
+         this service serves {}; left untouched for the operator",
+        .served.iter().join(", ")
     )]
     CorridorMismatch {
         id: UsdcRebalanceId,
         recorded: UsdcCorridor,
-        served: UsdcCorridor,
+        served: BTreeSet<UsdcCorridor>,
         /// Whether the transfer still holds the rebalance guard, so a build
         /// that serves `recorded` must still resume it.
         holds_guard: bool,
     },
     #[error(
         "USDC transfer corridor mismatch: transfer {id} asks for the {requested} corridor, \
-         this service serves {served}; nothing was recorded"
+         this service serves {}; nothing was recorded",
+        .served.iter().join(", ")
     )]
     CorridorNotServed {
         id: UsdcRebalanceId,
         requested: UsdcCorridor,
-        served: UsdcCorridor,
+        served: BTreeSet<UsdcCorridor>,
     },
     #[error(
         "USDC rebalance {id} DepositInitiated has non-onchain deposit ref; \
@@ -436,6 +488,10 @@ pub enum UsdcTransferError {
         required: u64,
         actual: u64,
     },
+    /// No `[chains.ethereum]` entry, so the withdrawal tx has no depth to
+    /// reach: refused before any burn.
+    #[error(transparent)]
+    EthereumChainMissing(#[from] EthereumChainMissing),
     /// An RPC call in the settlement phase (confirmation re-check, balance read,
     /// or burn scan) failed transiently. The aggregate is in
     /// `WithdrawalComplete` or `BridgingSubmitting` -- a durable, resumable
@@ -628,9 +684,13 @@ impl UsdcTransferError {
             Self::AlpacaWallet(_)
             | Self::AlpacaBrokerApi(_)
             | Self::Cctp(_)
+            | Self::BurnTxAlreadyRecorded { .. }
+            | Self::BurnTxOwnershipUnchecked { .. }
+            | Self::BurnTxOwnershipLookupFailed { .. }
             | Self::BurnRevert(_)
             | Self::Vault(_)
             | Self::InsufficientVaultLiquidity { .. }
+            | Self::WithdrawalRejectedUnderfunded { .. }
             | Self::Aggregate(_)
             | Self::WithdrawalFailed { .. }
             | Self::DepositFailed { .. }
@@ -679,7 +739,8 @@ impl UsdcTransferError {
             | Self::DepositSendUnresolved { .. }
             | Self::DepositSendReconciliationPending { .. }
             | Self::DepositSendTaskPanicked { .. }
-            | Self::DepositSendLookup { .. } => None,
+            | Self::DepositSendLookup { .. }
+            | Self::EthereumChainMissing(_) => None,
         }
     }
 }
@@ -692,9 +753,13 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::AlpacaWallet(_)
             | Self::AlpacaBrokerApi(_)
             | Self::Cctp(_)
+            | Self::BurnTxAlreadyRecorded { .. }
+            | Self::BurnTxOwnershipUnchecked { .. }
+            | Self::BurnTxOwnershipLookupFailed { .. }
             | Self::BurnRevert(_)
             | Self::Vault(_)
             | Self::InsufficientVaultLiquidity { .. }
+            | Self::WithdrawalRejectedUnderfunded { .. }
             | Self::Aggregate(_)
             | Self::WithdrawalFailed { .. }
             | Self::DepositFailed { .. }
@@ -742,7 +807,8 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::DepositSendUnresolved { .. }
             | Self::DepositSendReconciliationPending { .. }
             | Self::DepositSendTaskPanicked { .. }
-            | Self::DepositSendLookup { .. } => false,
+            | Self::DepositSendLookup { .. }
+            | Self::EthereumChainMissing(_) => false,
         }
     }
 }
@@ -751,4 +817,51 @@ impl From<SendError<UsdcRebalance>> for UsdcTransferError {
     fn from(error: SendError<UsdcRebalance>) -> Self {
         Self::Aggregate(Box::new(error))
     }
+}
+
+/// Refuses, before any call, a transfer none of the `served` corridors
+/// carries: one recorded on another corridor, or a fresh one asking for
+/// another. The transfer is left untouched. A recorded one that holds the
+/// guard re-queues its job for a build that serves it and the rebalancing
+/// service pages once (one that holds none ends its job); a fresh one
+/// retries and dead-letters, which pages once.
+fn refuse_unserved_corridor(
+    id: &UsdcRebalanceId,
+    requested: UsdcCorridor,
+    served: &BTreeSet<UsdcCorridor>,
+    state: Option<&UsdcRebalance>,
+) -> Result<(), UsdcTransferError> {
+    let corridor = state.map_or(requested, UsdcRebalance::corridor);
+    if served.contains(&corridor) {
+        return Ok(());
+    }
+
+    Err(unserved_corridor(id, requested, served, state))
+}
+
+/// The refusal of a transfer on a corridor none of `served` carries: a
+/// mismatch for a recorded one, not served for a fresh one. Logged here,
+/// where the refusal is decided.
+fn unserved_corridor(
+    id: &UsdcRebalanceId,
+    requested: UsdcCorridor,
+    served: &BTreeSet<UsdcCorridor>,
+    state: Option<&UsdcRebalance>,
+) -> UsdcTransferError {
+    let error = state.map_or_else(
+        || UsdcTransferError::CorridorNotServed {
+            id: id.clone(),
+            requested,
+            served: served.clone(),
+        },
+        |state| UsdcTransferError::CorridorMismatch {
+            id: id.clone(),
+            recorded: state.corridor(),
+            served: served.clone(),
+            holds_guard: state.holds_rebalance_guard(),
+        },
+    );
+
+    error!(target: "rebalance", %id, "{error}");
+    error
 }

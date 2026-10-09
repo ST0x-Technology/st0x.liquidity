@@ -26,7 +26,6 @@ use std::time::Duration;
 
 use apalis_core::error::BoxDynError;
 use async_trait::async_trait;
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{info, warn};
@@ -39,25 +38,29 @@ use st0x_execution::{FractionalShares, Symbol};
 use st0x_tokenization::IssuerRequestId;
 
 use super::{
-    CrossVenueEquityTransfer, EquityTransferServices, MintTransferError, RedemptionError,
-    withdrawal_reconciliation_redrive_delay,
+    CrossVenueEquityTransfer, EquityTransferServices, IssuerSendRedrive, MintError,
+    MintTransferError, RedemptionError, WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY,
+    issuer_send_redrive, page_underlying_mismatch, withdrawal_reconciliation_redrive_delay,
 };
 #[cfg(test)]
 use super::{
-    WITHDRAWAL_RECONCILIATION_ALERT_DEADLINE,
-    WITHDRAWAL_RECONCILIATION_POST_DEADLINE_REDRIVE_DELAY, WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY,
+    WITHDRAWAL_RECONCILIATION_ALERT_DEADLINE, WITHDRAWAL_RECONCILIATION_POST_DEADLINE_REDRIVE_DELAY,
 };
 use crate::alerts::Notifier;
 #[cfg(test)]
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::bot_gas::redrive::{BotGasFailureClassifier, redrive_on_bot_gas_failure};
 use crate::conductor::job::{
-    BackpressureStreak, Job, JobQueue, Label, QueuePushError, TaskIdentity,
+    BackpressureStreak, Job, JobQueue, Label, QueuePushError, TaskIdentity, has_live_sibling_job,
 };
 use crate::equity_redemption::{EquityRedemption, RedemptionAggregateId};
-use crate::position::{EquityTransferReservationId, Position, PositionCommand, PositionError};
+use crate::position::{
+    EquityTransferReservationId, HedgeFundingRedemption, Position, PositionCommand, PositionError,
+};
 use crate::position_check::equity_transfer_retry_delay;
-use crate::rebalancing::trigger::{GuardGeneration, GuardState, remove_active_transfer};
+use crate::rebalancing::trigger::{
+    GuardGeneration, GuardState, HedgeCapacity, remove_active_transfer,
+};
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 
 /// Delay before re-enqueueing an equity transfer job after a bot-gas receipt
@@ -75,6 +78,10 @@ pub(crate) type TransferEquityToMarketMakingJobQueue = JobQueue<TransferEquityTo
 /// the job a mock seam, mirroring the USDC transfer jobs.
 #[async_trait]
 pub(crate) trait ResumeEquityToMarketMaking: Send + Sync + 'static {
+    /// Cancel an abandoned job's deferred startup reservation restore.
+    /// Test implementations without a rebalancing service have no pending restore.
+    async fn cancel_deferred_restore(&self, _reservation_id: EquityTransferReservationId) {}
+
     async fn resume_equity_to_market_making(
         &self,
         issuer_request_id: &IssuerRequestId,
@@ -86,6 +93,10 @@ pub(crate) trait ResumeEquityToMarketMaking: Send + Sync + 'static {
 
 #[async_trait]
 impl ResumeEquityToMarketMaking for CrossVenueEquityTransfer {
+    async fn cancel_deferred_restore(&self, reservation_id: EquityTransferReservationId) {
+        Self::cancel_deferred_restore(self, reservation_id).await;
+    }
+
     async fn resume_equity_to_market_making(
         &self,
         issuer_request_id: &IssuerRequestId,
@@ -100,12 +111,12 @@ impl ResumeEquityToMarketMaking for CrossVenueEquityTransfer {
 /// Dependencies the job needs to drive the mint.
 pub(crate) struct TransferEquityToMarketMakingCtx {
     pub(crate) transfer: Arc<dyn ResumeEquityToMarketMaking>,
-    /// Shared in-progress map. When a `PostReceipt` error surfaces on a
-    /// primary-chain mint whose aggregate is in a pre-wrap post-receipt state
-    /// (`TokensReceived` or `WrapSubmitted`) AND `wrapped_equity_recovery` is
-    /// enabled for the symbol, the job transitions this entry from
-    /// `ActiveTransfer` to `HeldForRecovery` and returns `Ok(())` so apalis
-    /// does not retry.
+    /// Shared in-progress map. When a `PostReceipt` error surfaces on a mint
+    /// whose aggregate is in a pre-wrap post-receipt state (`TokensReceived`
+    /// or `WrapSubmitted`) AND the mint's own chain enables
+    /// `wrapped_equity_recovery` for the symbol, the job transitions this
+    /// entry from `ActiveTransfer` to `HeldForRecovery` on that chain and
+    /// returns `Ok(())` so apalis does not retry.
     /// `UnwrappedEquityRecovery` claims the `HeldForRecovery` slot and
     /// re-wraps + deposits the tokens.
     ///
@@ -132,9 +143,6 @@ pub(crate) struct TransferEquityToMarketMakingCtx {
     /// ensures the two paths cannot disagree: if recovery is disabled,
     /// `Err(PostReceipt)` is returned instead and apalis retries.
     pub(crate) transfer_services: EquityTransferServices,
-    /// The chain the recovery jobs run on. A mint on any other chain is never
-    /// handed off: nothing would claim or release its `HeldForRecovery` slot.
-    pub(crate) primary_chain: Chain,
     /// Used to delayed-redrive on a bot-gas receipt cost enqueue failure
     /// (ADR 0017 SS4: "failure in cost recording never blocks trading")
     /// instead of consuming the apalis retry budget or handing the symbol
@@ -213,23 +221,32 @@ pub(crate) struct TransferEquityToMarketMaking {
 
 pub(crate) type PositionReservationAuthority = (Arc<Store<Position>>, ExecutionThreshold);
 
+/// Restores a transfer's missing reservation. `hedgeable` marks a redemption:
+/// the broker's sell capacity, so the Position admits it over the sell hedge
+/// it funds, as at dispatch. `None` keeps the strict rule.
 pub(super) async fn restore_position_reservation(
     store: &Store<Position>,
     symbol: &Symbol,
     threshold: ExecutionThreshold,
     reservation_id: EquityTransferReservationId,
+    hedgeable: Option<FractionalShares>,
 ) -> Result<bool, SendError<Position>> {
-    match store
-        .send(
-            symbol,
-            PositionCommand::RestoreEquityTransferReservation {
+    let command = hedgeable.map_or_else(
+        || PositionCommand::RestoreEquityTransferReservation {
+            symbol: symbol.clone(),
+            threshold,
+            reservation_id,
+        },
+        |hedgeable| {
+            PositionCommand::RestoreHedgeFundingRedemption(HedgeFundingRedemption {
                 symbol: symbol.clone(),
                 threshold,
                 reservation_id,
-            },
-        )
-        .await
-    {
+                hedgeable,
+            })
+        },
+    );
+    match store.send(symbol, command).await {
         Ok(()) => Ok(true),
         Err(AggregateError::UserError(LifecycleError::Apply(
             PositionError::PendingExecution { .. }
@@ -241,35 +258,135 @@ pub(super) async fn restore_position_reservation(
     }
 }
 
-pub(super) async fn has_live_sibling_equity_transfer<JobPayload>(
-    pool: &apalis_sqlite::SqlitePool,
-    task_identity: &TaskIdentity,
-    same_owner: impl Fn(&JobPayload) -> bool,
-) -> Result<bool, BoxDynError>
-where
-    JobPayload: DeserializeOwned,
-{
-    let payloads: Vec<Vec<u8>> = sqlx_apalis::query_scalar(
-        "SELECT job FROM Jobs \
-         WHERE id <> ? AND job_type = ? \
-         AND (status IN ('Pending', 'Queued', 'Running') \
-              OR (status = 'Failed' AND attempts < max_attempts))",
-    )
-    .bind(task_identity.as_str())
-    .bind(std::any::type_name::<JobPayload>())
-    .fetch_all(pool)
-    .await?;
-
-    for payload in payloads {
-        let sibling: JobPayload = serde_json::from_slice(&payload)?;
-        if same_owner(&sibling) {
-            return Ok(true);
+impl TransferEquityToMarketMaking {
+    async fn release_position_reservation(
+        &self,
+        ctx: &TransferEquityToMarketMakingCtx,
+    ) -> Result<(), TransferEquityToMarketMakingJobError> {
+        if let Some((position_store, _)) = &ctx.position_authority {
+            position_store
+                .send(
+                    &self.symbol,
+                    PositionCommand::ReleaseEquityTransfer {
+                        reservation_id: EquityTransferReservationId::from_uuid(
+                            self.issuer_request_id.0,
+                        ),
+                    },
+                )
+                .await?;
         }
+        Ok(())
     }
 
-    Ok(false)
-}
+    async fn restore_reservation_or_redrive(
+        &self,
+        ctx: &TransferEquityToMarketMakingCtx,
+    ) -> Result<bool, TransferEquityToMarketMakingJobError> {
+        if let Some((position_store, position_threshold)) = &ctx.position_authority
+            && !restore_position_reservation(
+                position_store,
+                &self.symbol,
+                *position_threshold,
+                EquityTransferReservationId::from_uuid(self.issuer_request_id.0),
+                None,
+            )
+            .await?
+        {
+            let retry_delay = equity_transfer_retry_delay(self.position_reservation_retry_attempts);
+            let mut retry = self.clone();
+            retry.position_reservation_retry_attempts =
+                self.position_reservation_retry_attempts.saturating_add(1);
+            warn!(
+                target: "rebalance",
+                symbol = %self.symbol,
+                issuer_request_id = %self.issuer_request_id,
+                position_reservation_retry_attempts = retry.position_reservation_retry_attempts,
+                retry_delay_secs = retry_delay.as_secs(),
+                "Hedge admission deferred equity mint reservation restoration; rescheduling"
+            );
+            let mut job_queue = ctx.job_queue.clone();
+            job_queue.push_with_delay(retry, retry_delay).await?;
+            return Ok(true);
+        }
 
+        Ok(false)
+    }
+
+    async fn abandon_if_stopped_and_fresh(
+        &self,
+        ctx: &TransferEquityToMarketMakingCtx,
+    ) -> Result<bool, TransferEquityToMarketMakingJobError> {
+        let fresh = ctx
+            .mint_store
+            .load(&self.issuer_request_id)
+            .await
+            .map_err(|error| {
+                TransferEquityToMarketMakingJobError::Transfer(MintTransferError::PreReceipt(
+                    error.into(),
+                ))
+            })?
+            .is_none();
+        let mode = ctx
+            .transfer_services
+            .rebalancing_mode(self.chain, &self.symbol);
+        if fresh && !mode.starts_operations() {
+            self.abandon_stopped_fresh_transfer(
+                ctx,
+                MintTransferError::PreReceipt(MintError::RebalancingNotEnabled {
+                    chain: self.chain,
+                    symbol: self.symbol.clone(),
+                    mode,
+                }),
+            )
+            .await?;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    async fn abandon_stopped_fresh_transfer(
+        &self,
+        ctx: &TransferEquityToMarketMakingCtx,
+        transfer_error: MintTransferError,
+    ) -> Result<(), TransferEquityToMarketMakingJobError> {
+        let aggregate = ctx
+            .mint_store
+            .load(&self.issuer_request_id)
+            .await
+            .map_err(|error| {
+                TransferEquityToMarketMakingJobError::Transfer(MintTransferError::PreReceipt(
+                    error.into(),
+                ))
+            })?;
+        if aggregate.as_ref().is_some_and(|mint| !mint.is_terminal()) {
+            return Err(transfer_error.into());
+        }
+        ctx.transfer
+            .cancel_deferred_restore(EquityTransferReservationId::from_uuid(
+                self.issuer_request_id.0,
+            ))
+            .await;
+        if let Some((position_store, _)) = &ctx.position_authority {
+            position_store
+                .send(
+                    &self.symbol,
+                    PositionCommand::ReleaseEquityTransfer {
+                        reservation_id: EquityTransferReservationId::from_uuid(
+                            self.issuer_request_id.0,
+                        ),
+                    },
+                )
+                .await?;
+        }
+        let released =
+            remove_active_transfer(&ctx.equity_in_progress, &self.symbol, self.generation);
+        info!(target: "rebalance", symbol = %self.symbol, chain = %self.chain,
+            issuer_request_id = %self.issuer_request_id, released, %transfer_error,
+            "Abandoned fresh equity mint because its listing cannot start operations");
+        Ok(())
+    }
+}
 impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
     type Output = ();
     type Error = TransferEquityToMarketMakingJobError;
@@ -293,29 +410,11 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
         &self,
         ctx: &TransferEquityToMarketMakingCtx,
     ) -> Result<Self::Output, Self::Error> {
-        if let Some((position_store, position_threshold)) = &ctx.position_authority
-            && !restore_position_reservation(
-                position_store,
-                &self.symbol,
-                *position_threshold,
-                EquityTransferReservationId::from_uuid(self.issuer_request_id.0),
-            )
-            .await?
-        {
-            let retry_delay = equity_transfer_retry_delay(self.position_reservation_retry_attempts);
-            let mut retry = self.clone();
-            retry.position_reservation_retry_attempts =
-                self.position_reservation_retry_attempts.saturating_add(1);
-            warn!(
-                target: "rebalance",
-                symbol = %self.symbol,
-                issuer_request_id = %self.issuer_request_id,
-                position_reservation_retry_attempts = retry.position_reservation_retry_attempts,
-                retry_delay_secs = retry_delay.as_secs(),
-                "Hedge admission deferred equity mint reservation restoration; rescheduling"
-            );
-            let mut job_queue = ctx.job_queue.clone();
-            job_queue.push_with_delay(retry, retry_delay).await?;
+        if self.abandon_if_stopped_and_fresh(ctx).await? {
+            return Ok(());
+        }
+
+        if self.restore_reservation_or_redrive(ctx).await? {
             return Ok(());
         }
 
@@ -335,34 +434,20 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
         // here, after the transfer command and all of its reactors have
         // committed, before the worker can return and hedging can resume.
         let Err(transfer_error) = result else {
-            if let Some((position_store, _)) = &ctx.position_authority {
-                position_store
-                    .send(
-                        &self.symbol,
-                        PositionCommand::ReleaseEquityTransfer {
-                            reservation_id: EquityTransferReservationId::from_uuid(
-                                self.issuer_request_id.0,
-                            ),
-                        },
-                    )
-                    .await?;
-            }
+            self.release_position_reservation(ctx).await?;
             return Ok(());
         };
 
+        if let MintTransferError::PreReceipt(MintError::RebalancingNotEnabled { .. }) =
+            &transfer_error
+        {
+            return self
+                .abandon_stopped_fresh_transfer(ctx, transfer_error)
+                .await;
+        }
+
         if let Some(delay) = transfer_error.gas_readiness_retry_interval() {
-            if let Some((position_store, _)) = &ctx.position_authority {
-                position_store
-                    .send(
-                        &self.symbol,
-                        PositionCommand::ReleaseEquityTransfer {
-                            reservation_id: EquityTransferReservationId::from_uuid(
-                                self.issuer_request_id.0,
-                            ),
-                        },
-                    )
-                    .await?;
-            }
+            self.release_position_reservation(ctx).await?;
             warn!(
                 target: "rebalance",
                 symbol = %self.symbol,
@@ -410,11 +495,13 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
                 // resume_mint via the transfer job is the correct path.
                 // WrappedEquityRecovery remains orphan-only (absent guard).
                 //
-                // The handoff is only done when recovery is enabled. When
-                // disabled, propagate Err so apalis retries. The recovery
-                // jobs run on the primary chain only, so a mint on any other
-                // chain is never held: nothing would ever release it, and
-                // propagating Err retries the transfer instead.
+                // The handoff is only done when the mint's own chain has
+                // wrapped equity recovery enabled. When it does not, propagate
+                // Err so apalis retries instead of holding a slot nobody
+                // recovers. Config load refuses a rebalancing listing without
+                // recovery, so this is defense in depth for a chain that is
+                // unwired or whose listing changed across a restart while the
+                // mint was in flight.
                 let state = ctx
                     .mint_store
                     .load(&self.issuer_request_id)
@@ -459,13 +546,12 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
                                 })
                         });
 
-                let on_primary_chain = self.chain == ctx.primary_chain;
-
-                if is_post_receipt_recoverable && on_primary_chain && recovery_enabled {
+                if is_post_receipt_recoverable && recovery_enabled {
                     match mark_held_for_recovery(
                         &ctx.equity_in_progress,
                         &self.symbol,
                         self.generation,
+                        self.chain,
                     ) {
                         MarkHeldResult::Transitioned | MarkHeldResult::AlreadyHeld => {
                             warn!(
@@ -487,6 +573,20 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
                                 issuer_request_id = %self.issuer_request_id,
                                 "PostReceipt handler: guard entry absent (cleared by timeout \
                                  sweeper?); propagating Err so apalis retries"
+                            );
+                            Err(TransferEquityToMarketMakingJobError::Transfer(
+                                MintTransferError::PostReceipt(mint_error),
+                            ))
+                        }
+                        MarkHeldResult::HeldForOtherChain { held_chain } => {
+                            warn!(
+                                target: "rebalance",
+                                symbol = %self.symbol,
+                                issuer_request_id = %self.issuer_request_id,
+                                chain = %self.chain,
+                                %held_chain,
+                                "PostReceipt handler: slot held for another chain's recovery; \
+                                 propagating Err so apalis retries"
                             );
                             Err(TransferEquityToMarketMakingJobError::Transfer(
                                 MintTransferError::PostReceipt(mint_error),
@@ -514,10 +614,9 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
                     }
                 } else {
                     // Aggregate is absent, pre-receipt, already terminal,
-                    // TokensWrapped/VaultDepositSubmitted, DB load failed,
-                    // recovery is disabled, or the mint is on a secondary
-                    // chain. Propagate Err so apalis retries or records a
-                    // failed job.
+                    // TokensWrapped/VaultDepositSubmitted, DB load failed, or
+                    // the mint's own chain has recovery disabled or unwired.
+                    // Propagate Err so apalis retries or records a failed job.
                     Err(TransferEquityToMarketMakingJobError::Transfer(
                         MintTransferError::PostReceipt(mint_error),
                     ))
@@ -546,14 +645,10 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
             );
             return Ok(());
         }
-        if has_live_sibling_equity_transfer::<Self>(
-            ctx.job_queue.pool(),
-            task_identity,
-            |sibling| {
-                sibling.issuer_request_id == self.issuer_request_id
-                    && sibling.generation == self.generation
-            },
-        )
+        if has_live_sibling_job::<Self>(ctx.job_queue.pool(), task_identity, |sibling| {
+            sibling.issuer_request_id == self.issuer_request_id
+                && sibling.generation == self.generation
+        })
         .await?
         {
             warn!(
@@ -599,8 +694,13 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
 enum MarkHeldResult {
     /// Successfully transitioned `ActiveTransfer` -> `HeldForRecovery`.
     Transitioned,
-    /// Slot was already `HeldForRecovery` (idempotent double-call after retry).
+    /// Slot was already `HeldForRecovery` or `Recovering` for the same chain
+    /// (idempotent double-call after retry, or recovery already owns it).
     AlreadyHeld,
+    /// Slot is held or being recovered for another chain: that chain's recovery owns
+    /// the symbol, and this transfer's tokens have no hold of their own. The
+    /// caller should propagate `Err` so apalis retries.
+    HeldForOtherChain { held_chain: Chain },
     /// Guard entry is absent (cleared by timeout sweeper before `PostReceipt`
     /// handler ran). Caller should propagate `Err` so apalis retries; the
     /// tokens remain in the wallet and the next inventory poll re-triggers
@@ -617,13 +717,17 @@ enum MarkHeldResult {
 ///
 /// Returns [`MarkHeldResult`] describing the outcome:
 /// - `Transitioned`: slot updated; call site should return `Ok(())`.
-/// - `AlreadyHeld`: slot was already held (idempotent); return `Ok(())`.
+/// - `AlreadyHeld`: slot was already held for `chain` (idempotent); return
+///   `Ok(())`.
+/// - `HeldForOtherChain`: another chain's recovery holds the slot; return
+///   `Err` for apalis retry.
 /// - `EntryAbsent`: guard was cleared externally; return `Err` for apalis retry.
 /// - `GenerationMismatch`: a newer transfer owns the slot; return `Ok(())`.
 fn mark_held_for_recovery(
     map: &RwLock<HashMap<Symbol, GuardState>>,
     symbol: &Symbol,
     expected_generation: GuardGeneration,
+    chain: Chain,
 ) -> MarkHeldResult {
     let mut poisoned = false;
     let result = {
@@ -634,17 +738,32 @@ fn mark_held_for_recovery(
                 poison.into_inner()
             }
         };
-        match guard.get(symbol) {
+        let result = match guard.get(symbol) {
             Some(GuardState::ActiveTransfer { generation })
                 if *generation == expected_generation =>
             {
-                guard.insert(symbol.clone(), GuardState::HeldForRecovery);
+                guard.insert(symbol.clone(), GuardState::HeldForRecovery { chain });
                 MarkHeldResult::Transitioned
             }
             Some(GuardState::ActiveTransfer { .. }) => MarkHeldResult::GenerationMismatch,
-            Some(GuardState::HeldForRecovery) => MarkHeldResult::AlreadyHeld,
+            Some(
+                GuardState::HeldForRecovery { chain: held_chain }
+                | GuardState::Recovering {
+                    chain: held_chain, ..
+                },
+            ) if *held_chain == chain => MarkHeldResult::AlreadyHeld,
+            Some(
+                GuardState::HeldForRecovery { chain: held_chain }
+                | GuardState::Recovering {
+                    chain: held_chain, ..
+                },
+            ) => MarkHeldResult::HeldForOtherChain {
+                held_chain: *held_chain,
+            },
             None => MarkHeldResult::EntryAbsent,
-        }
+        };
+        drop(guard);
+        result
     };
 
     if poisoned {
@@ -674,7 +793,9 @@ fn mark_held_for_recovery(
                  double-call after idempotent retry"
             );
         }
-        MarkHeldResult::Transitioned | MarkHeldResult::EntryAbsent => {}
+        MarkHeldResult::Transitioned
+        | MarkHeldResult::EntryAbsent
+        | MarkHeldResult::HeldForOtherChain { .. } => {}
     }
     result
 }
@@ -686,6 +807,10 @@ pub(crate) type TransferEquityToHedgingJobQueue = JobQueue<TransferEquityToHedgi
 /// job. Sibling of [`ResumeEquityToMarketMaking`]; same mock-seam rationale.
 #[async_trait]
 pub(crate) trait ResumeEquityToHedging: Send + Sync + 'static {
+    /// Cancel an abandoned job's deferred startup reservation restore.
+    /// Test implementations without a rebalancing service have no pending restore.
+    async fn cancel_deferred_restore(&self, _reservation_id: EquityTransferReservationId) {}
+
     async fn resume_equity_to_hedging(
         &self,
         aggregate_id: &RedemptionAggregateId,
@@ -711,10 +836,22 @@ pub(crate) trait ResumeEquityToHedging: Send + Sync + 'static {
     ) -> Result<(), RedemptionError> {
         Ok(())
     }
+
+    async fn discard_reconciled_issuer_send(
+        &self,
+        _chain: Chain,
+        _tx_hash: TxHash,
+    ) -> Result<(), RedemptionError> {
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl ResumeEquityToHedging for CrossVenueEquityTransfer {
+    async fn cancel_deferred_restore(&self, reservation_id: EquityTransferReservationId) {
+        Self::cancel_deferred_restore(self, reservation_id).await;
+    }
+
     async fn resume_equity_to_hedging(
         &self,
         aggregate_id: &RedemptionAggregateId,
@@ -732,6 +869,14 @@ impl ResumeEquityToHedging for CrossVenueEquityTransfer {
     ) -> Result<(), RedemptionError> {
         Self::discard_reconciled_withdrawal(self, chain, tx_hash).await
     }
+
+    async fn discard_reconciled_issuer_send(
+        &self,
+        chain: Chain,
+        tx_hash: TxHash,
+    ) -> Result<(), RedemptionError> {
+        Self::discard_reconciled_issuer_send(self, chain, tx_hash).await
+    }
 }
 
 /// Dependencies the redemption job needs. Symmetric to
@@ -740,17 +885,22 @@ pub(crate) struct TransferEquityToHedgingCtx {
     pub(crate) transfer: Arc<dyn ResumeEquityToHedging>,
     pub(crate) equity_in_progress: Arc<RwLock<HashMap<Symbol, GuardState>>>,
     pub(crate) redemption_store: Arc<Store<EquityRedemption>>,
+    pub(crate) transfer_services: EquityTransferServices,
     /// Position authority that restores this job's reservation before any
     /// transfer side effect and releases it after terminal completion.
     pub(crate) position_authority: Option<PositionReservationAuthority>,
+    /// The broker's sell capacity. A retry that restores a released
+    /// reservation, for example after a gas refusal, must be admitted over
+    /// the sell hedge it funds; `None` restores under the strict rule.
+    pub(crate) hedge_capacity: Option<Arc<dyn HedgeCapacity>>,
     /// Used to delayed-redrive on a bot-gas receipt cost enqueue failure
     /// (ADR 0017 SS4: "failure in cost recording never blocks trading")
     /// instead of consuming the apalis retry budget.
     pub(crate) job_queue: TransferEquityToHedgingJobQueue,
-    /// Operational-alert channel. A stuck prepared withdrawal the market
-    /// out-fees can never confirm and is never fee-bumped; once its durable
-    /// deadline elapses the reconciliation redrive pages the operator through
-    /// this notifier instead of stalling silently forever.
+    /// Operational alert channel. A stuck prepared withdrawal the market
+    /// outbids will not confirm at its fee and is never fee bumped; once its
+    /// durable deadline elapses the reconciliation redrive pages the operator
+    /// through this notifier instead of stalling silently forever.
     pub(crate) notifier: Arc<dyn Notifier>,
 }
 
@@ -809,6 +959,133 @@ pub(crate) struct TransferEquityToHedging {
 }
 
 impl TransferEquityToHedging {
+    /// Restores this job's reservation, strictly first. Only when that is
+    /// refused does it read the broker's sell capacity and restore as a
+    /// redemption funding the sell hedge, so a reservation that still exists
+    /// never depends on an inventory read. A capacity that cannot be read
+    /// counts as a refusal, so the caller defers instead of failing the job
+    /// while it may hold the reservation.
+    async fn restore_reservation(
+        &self,
+        ctx: &TransferEquityToHedgingCtx,
+        position_store: &Store<Position>,
+        threshold: ExecutionThreshold,
+    ) -> Result<bool, SendError<Position>> {
+        let reservation_id = EquityTransferReservationId::from_uuid(self.aggregate_id.0);
+        if restore_position_reservation(
+            position_store,
+            &self.symbol,
+            threshold,
+            reservation_id,
+            None,
+        )
+        .await?
+        {
+            return Ok(true);
+        }
+
+        let Some(capacity) = &ctx.hedge_capacity else {
+            return Ok(false);
+        };
+        let hedgeable = match capacity.hedgeable_shares(&self.symbol).await {
+            Ok(Some(hedgeable)) => hedgeable,
+            Ok(None) => {
+                warn!(
+                    target: "rebalance",
+                    symbol = %self.symbol,
+                    aggregate_id = %self.aggregate_id,
+                    "No broker balance for the redemption's hedge funding check; deferring"
+                );
+                return Ok(false);
+            }
+            Err(error) => {
+                warn!(
+                    target: "rebalance",
+                    symbol = %self.symbol,
+                    aggregate_id = %self.aggregate_id,
+                    %error,
+                    "Failed to read the broker's sell capacity; deferring"
+                );
+                return Ok(false);
+            }
+        };
+
+        restore_position_reservation(
+            position_store,
+            &self.symbol,
+            threshold,
+            reservation_id,
+            Some(hedgeable),
+        )
+        .await
+    }
+
+    async fn abandon_if_stopped_and_fresh(
+        &self,
+        ctx: &TransferEquityToHedgingCtx,
+    ) -> Result<bool, TransferEquityToHedgingJobError> {
+        let fresh = ctx
+            .redemption_store
+            .load(&self.aggregate_id)
+            .await
+            .map_err(|error| Box::new(RedemptionError::from(error)))?
+            .is_none();
+        let mode = ctx
+            .transfer_services
+            .rebalancing_mode(self.chain, &self.symbol);
+        if fresh && !mode.starts_operations() {
+            self.abandon_stopped_fresh_transfer(
+                ctx,
+                RedemptionError::RebalancingNotEnabled {
+                    chain: self.chain,
+                    symbol: self.symbol.clone(),
+                    mode,
+                },
+            )
+            .await?;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    async fn abandon_stopped_fresh_transfer(
+        &self,
+        ctx: &TransferEquityToHedgingCtx,
+        error: RedemptionError,
+    ) -> Result<(), TransferEquityToHedgingJobError> {
+        let aggregate = ctx
+            .redemption_store
+            .load(&self.aggregate_id)
+            .await
+            .map_err(|error| Box::new(RedemptionError::from(error)))?;
+        if aggregate
+            .as_ref()
+            .is_some_and(|redemption| !redemption.is_terminal())
+        {
+            return Err(Box::new(error).into());
+        }
+        ctx.transfer
+            .cancel_deferred_restore(EquityTransferReservationId::from_uuid(self.aggregate_id.0))
+            .await;
+        if let Some((position_store, _)) = &ctx.position_authority {
+            position_store
+                .send(
+                    &self.symbol,
+                    PositionCommand::ReleaseEquityTransfer {
+                        reservation_id: EquityTransferReservationId::from_uuid(self.aggregate_id.0),
+                    },
+                )
+                .await?;
+        }
+        let released =
+            remove_active_transfer(&ctx.equity_in_progress, &self.symbol, self.generation);
+        info!(target: "rebalance", symbol = %self.symbol, chain = %self.chain,
+            aggregate_id = %self.aggregate_id, released, %error,
+            "Abandoned fresh equity redemption because its listing cannot start operations");
+        Ok(())
+    }
+
     /// Releases the wallet nonce reservation that a reconciled redemption's
     /// signed withdrawal still holds. A reconcile is pure bookkeeping and never
     /// touches the wallet, so without this release later sends from the wallet
@@ -820,7 +1097,8 @@ impl TransferEquityToHedging {
         aggregate: &EquityRedemption,
     ) {
         let EquityRedemption::Reconciled {
-            withdrawal_nonce_hash: Some(tx_hash),
+            withdrawal_nonce_hash,
+            issuer_send_nonce_hash,
             chain,
             ..
         } = aggregate
@@ -828,24 +1106,48 @@ impl TransferEquityToHedging {
             return;
         };
 
-        match ctx
-            .transfer
-            .discard_reconciled_withdrawal(*chain, *tx_hash)
-            .await
-        {
-            Ok(()) => info!(
-                target: "rebalance",
-                symbol = %self.symbol,
-                aggregate_id = %self.aggregate_id,
-                "Requested release of the reconciled withdrawal's nonce reservation"
-            ),
-            Err(error) => warn!(
-                target: "rebalance",
-                symbol = %self.symbol,
-                aggregate_id = %self.aggregate_id,
-                %error,
-                "Failed to release a reconciled withdrawal's nonce reservation"
-            ),
+        if let Some(tx_hash) = withdrawal_nonce_hash {
+            match ctx
+                .transfer
+                .discard_reconciled_withdrawal(*chain, *tx_hash)
+                .await
+            {
+                Ok(()) => info!(
+                    target: "rebalance",
+                    symbol = %self.symbol,
+                    aggregate_id = %self.aggregate_id,
+                    "Requested release of the reconciled withdrawal's nonce reservation"
+                ),
+                Err(error) => warn!(
+                    target: "rebalance",
+                    symbol = %self.symbol,
+                    aggregate_id = %self.aggregate_id,
+                    %error,
+                    "Failed to release a reconciled withdrawal's nonce reservation"
+                ),
+            }
+        }
+
+        if let Some(tx_hash) = issuer_send_nonce_hash {
+            match ctx
+                .transfer
+                .discard_reconciled_issuer_send(*chain, *tx_hash)
+                .await
+            {
+                Ok(()) => info!(
+                    target: "rebalance",
+                    symbol = %self.symbol,
+                    aggregate_id = %self.aggregate_id,
+                    "Requested release of the nonce reservation of the reconciled send to the issuer"
+                ),
+                Err(error) => warn!(
+                    target: "rebalance",
+                    symbol = %self.symbol,
+                    aggregate_id = %self.aggregate_id,
+                    %error,
+                    "Failed to release the nonce reservation of a reconciled send to the issuer"
+                ),
+            }
         }
     }
 }
@@ -906,14 +1208,14 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
             return Ok(());
         }
 
+        if self.abandon_if_stopped_and_fresh(ctx).await? {
+            return Ok(());
+        }
+
         if let Some((position_store, position_threshold)) = &ctx.position_authority
-            && !restore_position_reservation(
-                position_store,
-                &self.symbol,
-                *position_threshold,
-                EquityTransferReservationId::from_uuid(self.aggregate_id.0),
-            )
-            .await?
+            && !self
+                .restore_reservation(ctx, position_store, *position_threshold)
+                .await?
         {
             let retry_delay = equity_transfer_retry_delay(self.position_reservation_retry_attempts);
             let mut retry = self.clone();
@@ -952,6 +1254,41 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
             }
             return Ok(());
         };
+        if let RedemptionError::RebalancingNotEnabled { .. } = &error {
+            return self.abandon_stopped_fresh_transfer(ctx, error).await;
+        }
+
+        if error.is_permanent_underlying_mismatch() {
+            // The redemption keeps its guard and reservation: its tokens sit
+            // unwrapped in the wallet until an operator ends it.
+            page_underlying_mismatch(&ctx.notifier, &self.aggregate_id, &error).await;
+            warn!(
+                target: "rebalance",
+                symbol = %self.symbol,
+                aggregate_id = %self.aggregate_id,
+                %error,
+                "Legacy redemption underlying does not match its vault; stopping without retries"
+            );
+            return Ok(());
+        }
+
+        if let Some(IssuerSendRedrive { tx_hash, delay }) =
+            issuer_send_redrive(&ctx.redemption_store, &self.aggregate_id).await
+        {
+            warn!(
+                target: "rebalance",
+                symbol = %self.symbol,
+                aggregate_id = %self.aggregate_id,
+                ?tx_hash,
+                ?delay,
+                %error,
+                "Signed send to the issuer is unresolved; scheduling a durable fresh-transfer redrive"
+            );
+            let mut job_queue = ctx.job_queue.clone();
+            job_queue.push_with_delay(self.clone(), delay).await?;
+            return Ok(());
+        }
+
         if error.is_reconciliation_pending() {
             let delay = withdrawal_reconciliation_redrive_delay(
                 &ctx.redemption_store,
@@ -1017,7 +1354,36 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
         ctx: &TransferEquityToHedgingCtx,
         task_identity: &TaskIdentity,
     ) -> Result<(), BoxDynError> {
-        let aggregate = ctx.redemption_store.load(&self.aggregate_id).await?;
+        let aggregate = match ctx.redemption_store.load(&self.aggregate_id).await {
+            Ok(aggregate) => aggregate,
+            Err(error) => {
+                // An unreadable redemption may hold a signed send to the issuer, whose
+                // nonce must keep a driver, so the last attempt queues a fresh
+                // row instead of leaving it to a restart, unless a live sibling
+                // row already drives it. The sibling check reads the job queue,
+                // not the event store, so it can succeed when this load failed.
+                if has_live_sibling_job::<Self>(ctx.job_queue.pool(), task_identity, |sibling| {
+                    sibling.aggregate_id == self.aggregate_id
+                        && sibling.generation == self.generation
+                })
+                .await?
+                {
+                    return Ok(());
+                }
+                warn!(
+                    target: "rebalance",
+                    aggregate_id = %self.aggregate_id,
+                    ?error,
+                    %task_identity,
+                    "Terminal redemption attempt could not read its redemption; scheduling a fresh row"
+                );
+                let mut job_queue = ctx.job_queue.clone();
+                job_queue
+                    .push_with_delay(self.clone(), WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY)
+                    .await?;
+                return Ok(());
+            }
+        };
         if let Some(aggregate) = &aggregate {
             // A live row that loaded a submission state just before the reconcile
             // can re-reserve the withdrawal's nonce after the release, then fail
@@ -1029,6 +1395,31 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
         if let Some(aggregate) = aggregate
             && !aggregate.is_terminal()
         {
+            // A signed send to the issuer holds its nonce until it resolves, so it must
+            // keep a driver: `perform` redrives its failures, and a budget spent
+            // anyway (its state read failed too) queues a fresh row here.
+            if let Some(IssuerSendRedrive { tx_hash, delay }) =
+                issuer_send_redrive(&ctx.redemption_store, &self.aggregate_id).await
+                && !has_live_sibling_job::<Self>(ctx.job_queue.pool(), task_identity, |sibling| {
+                    sibling.aggregate_id == self.aggregate_id
+                        && sibling.generation == self.generation
+                })
+                .await?
+            {
+                warn!(
+                    target: "rebalance",
+                    symbol = %self.symbol,
+                    aggregate_id = %self.aggregate_id,
+                    ?tx_hash,
+                    ?delay,
+                    %task_identity,
+                    "Transfer job budget spent on an unresolved signed send to the issuer; scheduling a fresh row"
+                );
+                let mut job_queue = ctx.job_queue.clone();
+                job_queue.push_with_delay(self.clone(), delay).await?;
+                return Ok(());
+            }
+
             // A submission-state redemption whose transfer job budget is now
             // exhausted has an unresolved onchain withdrawal. With no live sibling
             // to drive it, nothing exits it automatically: the sweep never
@@ -1042,27 +1433,41 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
                     | EquityRedemption::VaultWithdrawSubmitted { .. }
             );
             if unresolved_submission
-                && !has_live_sibling_equity_transfer::<Self>(
-                    ctx.job_queue.pool(),
-                    task_identity,
-                    |sibling| {
-                        sibling.aggregate_id == self.aggregate_id
-                            && sibling.generation == self.generation
-                    },
-                )
+                && !has_live_sibling_job::<Self>(ctx.job_queue.pool(), task_identity, |sibling| {
+                    sibling.aggregate_id == self.aggregate_id
+                        && sibling.generation == self.generation
+                })
                 .await?
             {
                 let message = format!(
                     "Equity redemption {} ({}) exhausted its transfer job budget while its \
                      Raindex vault withdrawal is unresolved, and no live job remains to drive \
-                     it. Verify the withdrawal onchain. To abandon it, send a 0-value \
-                     self-transfer at its nonce and wait for that to confirm (skip this if the \
-                     withdrawal itself mined and reverted); only then reconcile it \
-                     (`stox transfer reconcile --kind redemption --id {}`), which releases its \
-                     reservation and the wallet's hold on its nonce. If the withdrawal mined \
-                     successfully, do not reconcile: run `stox transfer resume --kind equity` \
-                     or restart the bot so a new resume confirms it.",
-                    self.aggregate_id, self.symbol, self.aggregate_id,
+                     it. Check the withdrawal onchain. If it mined successfully, do not \
+                     reconcile: run `stox transfer resume --kind equity` or restart the bot so \
+                     a new resume confirms it. If it mined and reverted, it used its nonce and \
+                     moved nothing: once it has the required confirmations, settle the equity \
+                     by hand and reconcile without --superseding-tx \
+                     (`stox transfer reconcile --kind redemption --id {} --reason <reason>`). \
+                     If it has no receipt but another tx from the bot wallet already mined at \
+                     its nonce and did the withdrawal (for example a wallet speed up of the \
+                     same withdraw4), do not settle by hand: adopt that tx \
+                     (`st0x-liquidity-client --env <env> debug adopt-withdrawal {} \
+                     --replacement-tx <tx> --reason <reason>`), then run \
+                     `stox transfer resume --kind equity` or \
+                     restart the bot so a new resume confirms it. If nothing mined at its \
+                     nonce, it will not confirm at its current fee but can still mine when \
+                     fees drop, so cancel it first: send a 0-value self-transfer with no \
+                     calldata (not EIP-7702) from the bot wallet at its nonce, with fees above \
+                     the withdrawal's, and wait for the required confirmations. Only then \
+                     settle the equity by hand and reconcile \
+                     (`stox transfer reconcile --kind redemption --id {} --reason <reason> \
+                     --superseding-tx <cancel tx>`), which releases its reservation and the \
+                     wallet's hold on its nonce.",
+                    self.aggregate_id,
+                    self.symbol,
+                    self.aggregate_id,
+                    self.aggregate_id,
+                    self.aggregate_id,
                 );
                 if let Err(alert_error) = ctx.notifier.notify(&message).await {
                     warn!(
@@ -1082,13 +1487,9 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
             );
             return Ok(());
         }
-        if has_live_sibling_equity_transfer::<Self>(
-            ctx.job_queue.pool(),
-            task_identity,
-            |sibling| {
-                sibling.aggregate_id == self.aggregate_id && sibling.generation == self.generation
-            },
-        )
+        if has_live_sibling_job::<Self>(ctx.job_queue.pool(), task_identity, |sibling| {
+            sibling.aggregate_id == self.aggregate_id && sibling.generation == self.generation
+        })
         .await?
         {
             warn!(
@@ -1135,7 +1536,9 @@ mod tests {
 
     use alloy::primitives::{Address, TxHash, U256};
     use serde_json::json;
-    use st0x_config::{ChainEquities, ChainEquityAsset, ExecutionThreshold, OperationMode};
+    use st0x_config::{
+        ChainEquities, ChainEquityAsset, ExecutionThreshold, OperationMode, RebalancingMode,
+    };
     use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder, test_store};
     use st0x_evm::{Chain, PreparedTransaction};
     use st0x_execution::{Direction, Positive, SupportedExecutor};
@@ -1158,6 +1561,7 @@ mod tests {
     use crate::position::TradeId;
     use crate::rebalancing::equity::ChainEquityServices;
     use crate::rebalancing::equity::{EquityTransferServices, MintError};
+    use crate::rebalancing::trigger::EquityTriggerError;
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
     use crate::vault_lookup::MockVaultLookup;
 
@@ -1222,7 +1626,7 @@ mod tests {
             tokenized_equity_derivative: Address::ZERO,
             vault_ids: vec![],
             trading: OperationMode::Disabled,
-            rebalancing: OperationMode::Enabled,
+            rebalancing: RebalancingMode::Enabled,
             wrapped_equity_recovery: recovery_mode,
             operational_limit: None,
             target_share: None,
@@ -1261,7 +1665,6 @@ mod tests {
             mint_store,
             position_authority: None,
             transfer_services,
-            primary_chain: Chain::Base,
             job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
         }
     }
@@ -1405,6 +1808,480 @@ mod tests {
     /// real push failure, not a synthesized enum variant -- so the test
     /// exercises the same error shape production code hits.
     struct BotGasEnqueueFailureMintResume(TransferEquityToMarketMakingJobQueue);
+
+    struct PausedListingResume;
+
+    #[async_trait]
+    impl ResumeEquityToMarketMaking for PausedListingResume {
+        async fn resume_equity_to_market_making(
+            &self,
+            _: &IssuerRequestId,
+            symbol: &Symbol,
+            chain: Chain,
+            _: FractionalShares,
+        ) -> Result<(), MintTransferError> {
+            Err(MintTransferError::PreReceipt(
+                MintError::RebalancingNotEnabled {
+                    chain,
+                    symbol: symbol.clone(),
+                    mode: st0x_config::RebalancingMode::Paused,
+                },
+            ))
+        }
+    }
+
+    #[async_trait]
+    impl ResumeEquityToHedging for PausedListingResume {
+        async fn resume_equity_to_hedging(
+            &self,
+            _: &RedemptionAggregateId,
+            symbol: &Symbol,
+            chain: Chain,
+            _: FractionalShares,
+        ) -> Result<(), RedemptionError> {
+            Err(RedemptionError::RebalancingNotEnabled {
+                chain,
+                symbol: symbol.clone(),
+                mode: st0x_config::RebalancingMode::Paused,
+            })
+        }
+    }
+
+    async fn paused_transfer_after_deferred_startup_restore(
+        reservation_id: EquityTransferReservationId,
+    ) -> (
+        Arc<CrossVenueEquityTransfer>,
+        Arc<crate::rebalancing::RebalancingService>,
+        Arc<Store<Position>>,
+        Symbol,
+    ) {
+        let (mut transfer, service, pool) =
+            super::super::tests::transfer_with_rebalancing_service().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mut equities = ChainEquities::default();
+        equities.symbols.insert(
+            symbol.clone(),
+            ChainEquityAsset {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: Address::ZERO,
+                vault_ids: vec![],
+                trading: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Paused,
+                wrapped_equity_recovery: OperationMode::Enabled,
+                operational_limit: None,
+                target_share: None,
+            },
+        );
+        transfer
+            .services
+            .chains
+            .get_mut(&Chain::Base)
+            .unwrap()
+            .equities = equities;
+        let (position, projection) = StoreBuilder::<Position>::new(pool).build(()).await.unwrap();
+        service
+            .set_position_authority(
+                position.clone(),
+                projection,
+                ExecutionThreshold::whole_share(),
+            )
+            .await;
+        let quantity = FractionalShares::new(float!(10));
+        position
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: quantity,
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: chrono::Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+        let order_id = OffchainOrderId::new();
+        position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: order_id,
+                    shares: Positive::new(quantity).unwrap(),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+        service
+            .recover_equity_transfer_reservations(&std::collections::HashSet::from([(
+                symbol.clone(),
+                reservation_id,
+            )]))
+            .await
+            .unwrap();
+        assert_eq!(
+            position
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None
+        );
+        position
+            .send(
+                &symbol,
+                PositionCommand::CompleteOffChainOrder {
+                    offchain_order_id: order_id,
+                    shares_filled: Positive::new(quantity).unwrap(),
+                    direction: Direction::Sell,
+                    executor_order_id: st0x_execution::ExecutorOrderId::new("startup-hedge"),
+                    price: st0x_finance::Usd::new(float!(150)),
+                    broker_timestamp: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        (Arc::new(transfer), service, position, symbol)
+    }
+
+    #[tokio::test]
+    async fn paused_mint_worker_cancels_startup_deferred_restore_before_periodic_sweep() {
+        let id = issuer_request_id("paused-startup-mint");
+        let (transfer, service, position, symbol) = paused_transfer_after_deferred_startup_restore(
+            EquityTransferReservationId::from_uuid(id.0),
+        )
+        .await;
+        let mut ctx = test_ctx(transfer.clone()).await;
+        ctx.mint_store = transfer.mint_store.clone();
+        ctx.position_authority = Some((position.clone(), ExecutionThreshold::whole_share()));
+        let job = TransferEquityToMarketMaking {
+            issuer_request_id: id.clone(),
+            symbol: symbol.clone(),
+            chain: Chain::Base,
+            quantity: FractionalShares::new(float!(5)),
+            generation: GuardGeneration::default(),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+        Job::perform(&job, &ctx).await.unwrap();
+        service
+            .retry_pending_equity_transfer_reservation_restores()
+            .await
+            .unwrap();
+        assert_eq!(
+            position
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None
+        );
+        assert!(transfer.mint_store.load(&id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn paused_redemption_worker_cancels_startup_deferred_restore_before_periodic_sweep() {
+        let id = redemption_aggregate_id("paused-startup-redemption");
+        let (transfer, service, position, symbol) = paused_transfer_after_deferred_startup_restore(
+            EquityTransferReservationId::from_uuid(id.0),
+        )
+        .await;
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let mut ctx = redemption_test_ctx(
+            transfer.clone(),
+            TransferEquityToHedgingJobQueue::new(&apalis_pool),
+        )
+        .await;
+        ctx.redemption_store = transfer.redemption_store.clone();
+        ctx.position_authority = Some((position.clone(), ExecutionThreshold::whole_share()));
+        let job = TransferEquityToHedging {
+            aggregate_id: id.clone(),
+            symbol: symbol.clone(),
+            chain: Chain::Base,
+            quantity: FractionalShares::new(float!(5)),
+            generation: GuardGeneration::default(),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+        Job::perform(&job, &ctx).await.unwrap();
+        service
+            .retry_pending_equity_transfer_reservation_restores()
+            .await
+            .unwrap();
+        assert_eq!(
+            position
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None
+        );
+        assert!(transfer.redemption_store.load(&id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn stopped_fresh_jobs_finish_before_pending_hedge_reservation_restore() {
+        for mode in [RebalancingMode::Paused, RebalancingMode::Disabled] {
+            let (position, symbol) = pending_hedge_position().await;
+            let mut mint_ctx = test_ctx(Arc::new(PausedListingResume)).await;
+            mint_ctx
+                .transfer_services
+                .chains
+                .get_mut(&Chain::Base)
+                .unwrap()
+                .equities
+                .symbols
+                .get_mut(&symbol)
+                .unwrap()
+                .rebalancing = mode;
+            mint_ctx.position_authority =
+                Some((position.clone(), ExecutionThreshold::whole_share()));
+            let mint_id = issuer_request_id("stopped-before-hedge-mint");
+            let mint = TransferEquityToMarketMaking {
+                issuer_request_id: mint_id.clone(),
+                symbol: symbol.clone(),
+                chain: Chain::Base,
+                quantity: FractionalShares::new(float!(1)),
+                generation: GuardGeneration::default(),
+                backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
+            };
+            Job::perform(&mint, &mint_ctx).await.unwrap();
+            assert!(mint_ctx.mint_store.load(&mint_id).await.unwrap().is_none());
+            let pending: i64 =
+                sqlx_apalis::query_scalar("SELECT COUNT(*) FROM Jobs WHERE status = 'Pending'")
+                    .fetch_one(mint_ctx.job_queue.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                pending, 0,
+                "stopped mint must not wait for the pending hedge"
+            );
+
+            let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+            let mut redemption_ctx = redemption_test_ctx(
+                Arc::new(PausedListingResume),
+                TransferEquityToHedgingJobQueue::new(&apalis_pool),
+            )
+            .await;
+            redemption_ctx
+                .transfer_services
+                .chains
+                .get_mut(&Chain::Base)
+                .unwrap()
+                .equities
+                .symbols
+                .get_mut(&symbol)
+                .unwrap()
+                .rebalancing = mode;
+            redemption_ctx.position_authority =
+                Some((position.clone(), ExecutionThreshold::whole_share()));
+            let redemption_id = redemption_aggregate_id("stopped-before-hedge-redemption");
+            let redemption = TransferEquityToHedging {
+                aggregate_id: redemption_id.clone(),
+                symbol: symbol.clone(),
+                chain: Chain::Base,
+                quantity: FractionalShares::new(float!(1)),
+                generation: GuardGeneration::default(),
+                backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
+            };
+            Job::perform(&redemption, &redemption_ctx).await.unwrap();
+            assert!(
+                redemption_ctx
+                    .redemption_store
+                    .load(&redemption_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let pending: i64 =
+                sqlx_apalis::query_scalar("SELECT COUNT(*) FROM Jobs WHERE status = 'Pending'")
+                    .fetch_one(&apalis_pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                pending, 0,
+                "stopped redemption must not wait for the pending hedge"
+            );
+            assert!(
+                position
+                    .load(&symbol)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .equity_transfer_reservation
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn paused_fresh_mint_worker_releases_only_its_own_claim_without_redrive() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let generation = GuardGeneration::default();
+        let newer = GuardGeneration::from_parts(NonZeroU32::new(2).unwrap(), 1);
+        for (owner, expected) in [
+            (GuardState::ActiveTransfer { generation }, None),
+            (
+                GuardState::ActiveTransfer { generation: newer },
+                Some(GuardState::ActiveTransfer { generation: newer }),
+            ),
+            (
+                GuardState::HeldForRecovery { chain: Chain::Base },
+                Some(GuardState::HeldForRecovery { chain: Chain::Base }),
+            ),
+        ] {
+            let id = issuer_request_id("paused-fresh-mint-worker");
+            let position = confirmed_position_reservation(
+                &symbol,
+                EquityTransferReservationId::from_uuid(id.0),
+            )
+            .await;
+            let mut ctx = test_ctx(Arc::new(PausedListingResume)).await;
+            ctx.transfer_services
+                .chains
+                .get_mut(&Chain::Base)
+                .unwrap()
+                .equities
+                .symbols
+                .get_mut(&symbol)
+                .unwrap()
+                .rebalancing = RebalancingMode::Paused;
+            ctx.position_authority = Some((position.clone(), ExecutionThreshold::whole_share()));
+            ctx.equity_in_progress
+                .write()
+                .unwrap()
+                .insert(symbol.clone(), owner);
+            let job = TransferEquityToMarketMaking {
+                issuer_request_id: id.clone(),
+                symbol: symbol.clone(),
+                chain: Chain::Base,
+                quantity: FractionalShares::new(float!(5)),
+                generation,
+                backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
+            };
+
+            Job::perform(&job, &ctx).await.unwrap();
+
+            assert_eq!(
+                ctx.equity_in_progress.read().unwrap().get(&symbol).cloned(),
+                expected
+            );
+            assert_eq!(
+                position
+                    .load(&symbol)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .equity_transfer_reservation,
+                None
+            );
+            assert_eq!(ctx.mint_store.load(&id).await.unwrap(), None);
+            let pending: i64 =
+                sqlx_apalis::query_scalar("SELECT COUNT(*) FROM Jobs WHERE status = 'Pending'")
+                    .fetch_one(ctx.job_queue.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                pending, 0,
+                "a paused fresh mint must finish without re-enqueueing"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn paused_fresh_redemption_worker_releases_only_its_own_claim_without_redrive() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let generation = GuardGeneration::default();
+        let newer = GuardGeneration::from_parts(NonZeroU32::new(2).unwrap(), 1);
+        for (owner, expected) in [
+            (GuardState::ActiveTransfer { generation }, None),
+            (
+                GuardState::ActiveTransfer { generation: newer },
+                Some(GuardState::ActiveTransfer { generation: newer }),
+            ),
+            (
+                GuardState::HeldForRecovery { chain: Chain::Base },
+                Some(GuardState::HeldForRecovery { chain: Chain::Base }),
+            ),
+        ] {
+            let id = redemption_aggregate_id("paused-fresh-redemption-worker");
+            let position = confirmed_position_reservation(
+                &symbol,
+                EquityTransferReservationId::from_uuid(id.0),
+            )
+            .await;
+            let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+            let mut ctx = redemption_test_ctx(
+                Arc::new(PausedListingResume),
+                TransferEquityToHedgingJobQueue::new(&apalis_pool),
+            )
+            .await;
+            ctx.transfer_services
+                .chains
+                .get_mut(&Chain::Base)
+                .unwrap()
+                .equities
+                .symbols
+                .get_mut(&symbol)
+                .unwrap()
+                .rebalancing = RebalancingMode::Paused;
+            ctx.position_authority = Some((position.clone(), ExecutionThreshold::whole_share()));
+            ctx.equity_in_progress
+                .write()
+                .unwrap()
+                .insert(symbol.clone(), owner);
+            let job = TransferEquityToHedging {
+                aggregate_id: id.clone(),
+                symbol: symbol.clone(),
+                chain: Chain::Base,
+                quantity: FractionalShares::new(float!(5)),
+                generation,
+                backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
+            };
+
+            Job::perform(&job, &ctx).await.unwrap();
+
+            assert_eq!(
+                ctx.equity_in_progress.read().unwrap().get(&symbol).cloned(),
+                expected
+            );
+            assert_eq!(
+                position
+                    .load(&symbol)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .equity_transfer_reservation,
+                None
+            );
+            assert!(ctx.redemption_store.load(&id).await.unwrap().is_none());
+            let pending: i64 =
+                sqlx_apalis::query_scalar("SELECT COUNT(*) FROM Jobs WHERE status = 'Pending'")
+                    .fetch_one(ctx.job_queue.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                pending, 0,
+                "a paused fresh redemption must finish without re-enqueueing"
+            );
+        }
+    }
 
     struct GasReadinessFailureMintResume(Duration);
 
@@ -1807,7 +2684,12 @@ mod tests {
     #[tokio::test]
     async fn perform_forwards_id_symbol_and_quantity_to_resume() {
         let stub = Arc::new(RecordingResume::success());
-        let ctx = test_ctx(Arc::clone(&stub) as Arc<dyn ResumeEquityToMarketMaking>).await;
+        let ctx = test_ctx_on_chains(
+            Arc::clone(&stub) as Arc<dyn ResumeEquityToMarketMaking>,
+            OperationMode::Enabled,
+            &[Chain::Ethereum],
+        )
+        .await;
         let job = TransferEquityToMarketMaking {
             chain: Chain::Ethereum,
             issuer_request_id: issuer_request_id("mint-forward"),
@@ -2109,18 +2991,14 @@ mod tests {
 
         assert_eq!(
             ctx.equity_in_progress.read().unwrap().get(&symbol),
-            Some(&GuardState::HeldForRecovery),
+            Some(&GuardState::HeldForRecovery { chain: Chain::Base }),
             "guard must transition to HeldForRecovery for TokensReceived so \
              UnwrappedEquityRecovery can resume the wrap+deposit"
         );
     }
 
-    /// The recovery jobs run on the primary chain only, so a mint on a
-    /// secondary chain is never handed off even with recovery enabled on
-    /// that chain: `PostReceipt` propagates as `Err` for apalis to retry
-    /// `resume_mint` and the guard stays `ActiveTransfer`.
     #[tokio::test]
-    async fn perform_post_receipt_on_a_secondary_chain_mint_is_not_held_for_recovery() {
+    async fn perform_post_receipt_on_a_secondary_chain_mint_is_held_for_its_chain() {
         let symbol = Symbol::new("AAPL").unwrap();
         let issuer_id = issuer_request_id("post-receipt-secondary-chain");
         let ctx = test_ctx_on_chains(
@@ -2168,19 +3046,12 @@ mod tests {
             position_reservation_retry_attempts: 0,
         };
 
-        let error = Job::perform(&job, &ctx).await.unwrap_err();
-
-        assert!(
-            matches!(
-                error,
-                TransferEquityToMarketMakingJobError::Transfer(MintTransferError::PostReceipt(_))
-            ),
-            "a secondary-chain PostReceipt must propagate for retry, got {error:?}"
-        );
-        let guard = ctx.equity_in_progress.read().unwrap().get(&symbol).cloned();
-        assert!(
-            matches!(guard, Some(GuardState::ActiveTransfer { .. })),
-            "a HyperEVM mint must not be held for a primary-chain recovery: {guard:?}"
+        Job::perform(&job, &ctx).await.unwrap();
+        assert_eq!(
+            ctx.equity_in_progress.read().unwrap().get(&symbol),
+            Some(&GuardState::HeldForRecovery {
+                chain: Chain::HyperEvm
+            }),
         );
     }
 
@@ -2249,7 +3120,7 @@ mod tests {
 
         assert_eq!(
             ctx.equity_in_progress.read().unwrap().get(&symbol),
-            Some(&GuardState::HeldForRecovery),
+            Some(&GuardState::HeldForRecovery { chain: Chain::Base }),
             "guard must transition to HeldForRecovery for WrapSubmitted so \
              UnwrappedEquityRecovery can confirm/resume the wrap+deposit"
         );
@@ -2580,10 +3451,10 @@ mod tests {
 
         // Pre-seed the guard as HeldForRecovery (as if a prior attempt already
         // ran and set the guard before crashing).
-        ctx.equity_in_progress
-            .write()
-            .unwrap()
-            .insert(symbol.clone(), GuardState::HeldForRecovery);
+        ctx.equity_in_progress.write().unwrap().insert(
+            symbol.clone(),
+            GuardState::HeldForRecovery { chain: Chain::Base },
+        );
 
         // Drive to TokensReceived so the aggregate IS in a recoverable state.
         ctx.mint_store
@@ -2622,7 +3493,7 @@ mod tests {
 
         assert_eq!(
             ctx.equity_in_progress.read().unwrap().get(&symbol),
-            Some(&GuardState::HeldForRecovery),
+            Some(&GuardState::HeldForRecovery { chain: Chain::Base }),
             "idempotent re-entry must leave guard in HeldForRecovery"
         );
     }
@@ -2683,6 +3554,121 @@ mod tests {
             !ctx.equity_in_progress.read().unwrap().contains_key(&symbol),
             "absent guard must remain absent after failed handoff"
         );
+    }
+
+    /// A Base mint whose symbol is held for a Robinhood recovery gets no hold
+    /// of its own: the slot is not `AlreadyHeld` for it, so the job returns
+    /// `Err` and apalis retries instead of leaving its tokens unclaimed, and
+    /// Robinhood's hold stays in place.
+    #[tokio::test]
+    async fn perform_post_receipt_propagates_err_when_guard_held_for_another_chain() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let issuer_id = issuer_request_id("post-receipt-held-elsewhere");
+        let ctx = test_ctx(Arc::new(RecordingResume::post_receipt_failure())).await;
+        let robinhood_hold = GuardState::HeldForRecovery {
+            chain: Chain::Robinhood,
+        };
+        ctx.equity_in_progress
+            .write()
+            .unwrap()
+            .insert(symbol.clone(), robinhood_hold.clone());
+
+        ctx.mint_store
+            .send(
+                &issuer_id,
+                TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
+                    issuer_request_id: issuer_id.clone(),
+                    symbol: symbol.clone(),
+                    quantity: float!(5),
+                    wallet: Address::ZERO,
+                },
+            )
+            .await
+            .expect("RequestMint must persist");
+
+        submit_requested_mint(&ctx, &issuer_id).await;
+
+        ctx.mint_store
+            .send(&issuer_id, TokenizedEquityMintCommand::Poll)
+            .await
+            .expect("Poll must transition to TokensReceived");
+
+        let job = TransferEquityToMarketMaking {
+            chain: Chain::Base,
+            issuer_request_id: issuer_id.clone(),
+            symbol: symbol.clone(),
+            quantity: FractionalShares::new(float!(5)),
+            generation: GuardGeneration::default(),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+
+        let error = Job::perform(&job, &ctx).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                TransferEquityToMarketMakingJobError::Transfer(MintTransferError::PostReceipt(_))
+            ),
+            "a hold for another chain must propagate PostReceipt for apalis retry, got {error:?}"
+        );
+        assert_eq!(
+            ctx.equity_in_progress.read().unwrap().get(&symbol),
+            Some(&robinhood_hold)
+        );
+    }
+
+    #[test]
+    fn mark_held_for_recovery_records_the_transfers_chain() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let generation = GuardGeneration::default();
+        let map = RwLock::new(HashMap::from([(
+            symbol.clone(),
+            GuardState::ActiveTransfer { generation },
+        )]));
+
+        assert!(matches!(
+            mark_held_for_recovery(&map, &symbol, generation, Chain::Robinhood),
+            MarkHeldResult::Transitioned
+        ));
+        assert_eq!(
+            map.read().unwrap().get(&symbol),
+            Some(&GuardState::HeldForRecovery {
+                chain: Chain::Robinhood
+            })
+        );
+        assert!(matches!(
+            mark_held_for_recovery(&map, &symbol, generation, Chain::Robinhood),
+            MarkHeldResult::AlreadyHeld
+        ));
+        assert!(matches!(
+            mark_held_for_recovery(&map, &symbol, generation, Chain::Base),
+            MarkHeldResult::HeldForOtherChain {
+                held_chain: Chain::Robinhood
+            }
+        ));
+    }
+
+    #[test]
+    fn mark_held_for_recovery_leaves_a_running_recovery_in_place() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let recovering = GuardState::Recovering {
+            chain: Chain::Robinhood,
+            generation: GuardGeneration::default(),
+        };
+        let map = RwLock::new(HashMap::from([(symbol.clone(), recovering.clone())]));
+
+        assert!(matches!(
+            mark_held_for_recovery(&map, &symbol, GuardGeneration::default(), Chain::Robinhood),
+            MarkHeldResult::AlreadyHeld
+        ));
+        assert!(matches!(
+            mark_held_for_recovery(&map, &symbol, GuardGeneration::default(), Chain::Base),
+            MarkHeldResult::HeldForOtherChain {
+                held_chain: Chain::Robinhood
+            }
+        ));
+        assert_eq!(map.read().unwrap().get(&symbol), Some(&recovering));
     }
 
     #[test]
@@ -2879,6 +3865,287 @@ mod tests {
                 && run_at <= after + i64::try_from(retry_interval.as_secs()).unwrap() + 5
         );
     }
+    /// A broker with no sell capacity for any symbol.
+    struct EmptyBroker;
+
+    #[async_trait]
+    impl HedgeCapacity for EmptyBroker {
+        async fn hedgeable_shares(
+            &self,
+            _symbol: &Symbol,
+        ) -> Result<Option<FractionalShares>, EquityTriggerError> {
+            Ok(Some(FractionalShares::ZERO))
+        }
+    }
+
+    /// A funding redemption releases its reservation when gas is low. Once gas
+    /// recovers, the retry must get the reservation back over the sell hedge it
+    /// funds, or the hedge and the redemption wait on each other again.
+    #[tokio::test]
+    async fn funding_redemption_resumes_after_a_gas_refusal() {
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let aggregate_id = redemption_aggregate_id("funding-low-gas");
+        let reservation_id = EquityTransferReservationId::from_uuid(aggregate_id.0);
+        let position_store = Arc::new(test_store::<Position>(
+            crate::test_utils::setup_test_db().await,
+            (),
+        ));
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(float!(10)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: chrono::Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+        for command in [
+            PositionCommand::ReserveHedgeFundingRedemption(HedgeFundingRedemption {
+                symbol: symbol.clone(),
+                threshold: ExecutionThreshold::whole_share(),
+                reservation_id,
+                hedgeable: FractionalShares::ZERO,
+            }),
+            PositionCommand::ConfirmEquityTransfer { reservation_id },
+        ] {
+            position_store.send(&symbol, command).await.unwrap();
+        }
+        let job = TransferEquityToHedging {
+            chain: Chain::Base,
+            aggregate_id: aggregate_id.clone(),
+            symbol: symbol.clone(),
+            quantity: FractionalShares::new(float!(10)),
+            generation: GuardGeneration::default(),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+        let mut ctx = redemption_test_ctx(
+            Arc::new(GasReadinessFailureRedemptionResume(Duration::from_secs(23))),
+            TransferEquityToHedgingJobQueue::new(&apalis_pool),
+        )
+        .await;
+        ctx.position_authority = Some((
+            Arc::clone(&position_store),
+            ExecutionThreshold::whole_share(),
+        ));
+        ctx.hedge_capacity = Some(Arc::new(EmptyBroker));
+
+        Job::perform(&job, &ctx).await.unwrap();
+        let released = position_store.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(released.equity_transfer_reservation, None);
+
+        let recovered = Arc::new(RecordingRedemptionResume {
+            fail: false,
+            captured: Mutex::new(None),
+        });
+        ctx.transfer = recovered.clone();
+        Job::perform(&job, &ctx).await.unwrap();
+
+        assert_eq!(
+            recovered
+                .captured
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|(id, ..)| id.clone()),
+            Some(aggregate_id),
+            "the retry must run the redemption once gas recovers"
+        );
+    }
+
+    /// A broker capacity that counts its reads and answers with `reading`,
+    /// where `Err(())` stands for a failed inventory read.
+    struct ScriptedBroker {
+        reading: Result<Option<FractionalShares>, ()>,
+        reads: std::sync::atomic::AtomicU32,
+    }
+
+    impl ScriptedBroker {
+        fn new(reading: Result<Option<FractionalShares>, ()>) -> Arc<Self> {
+            Arc::new(Self {
+                reading,
+                reads: std::sync::atomic::AtomicU32::new(0),
+            })
+        }
+
+        fn reads(&self) -> u32 {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl HedgeCapacity for ScriptedBroker {
+        async fn hedgeable_shares(
+            &self,
+            _symbol: &Symbol,
+        ) -> Result<Option<FractionalShares>, EquityTriggerError> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.reading
+                .map_err(|()| EquityTriggerError::PositionAuthorityNotWired)
+        }
+    }
+
+    /// A long 10 share position due a sell hedge, with no reservation, and a
+    /// redemption job that would fund that hedge, run with `capacity`.
+    async fn perform_released_funding_redemption(
+        capacity: Arc<ScriptedBroker>,
+    ) -> (
+        Option<crate::position::EquityTransferReservation>,
+        Arc<RecordingRedemptionResume>,
+        i64,
+    ) {
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let position_store = Arc::new(test_store::<Position>(
+            crate::test_utils::setup_test_db().await,
+            (),
+        ));
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(float!(10)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: chrono::Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+        let job = TransferEquityToHedging {
+            chain: Chain::Base,
+            aggregate_id: redemption_aggregate_id("released-funding"),
+            symbol: symbol.clone(),
+            quantity: FractionalShares::new(float!(10)),
+            generation: GuardGeneration::default(),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+        let resume = Arc::new(RecordingRedemptionResume {
+            fail: false,
+            captured: Mutex::new(None),
+        });
+        let mut ctx = redemption_test_ctx(
+            resume.clone(),
+            TransferEquityToHedgingJobQueue::new(&apalis_pool),
+        )
+        .await;
+        ctx.position_authority = Some((
+            Arc::clone(&position_store),
+            ExecutionThreshold::whole_share(),
+        ));
+        ctx.hedge_capacity = Some(capacity);
+
+        Job::perform(&job, &ctx)
+            .await
+            .expect("an unreadable broker capacity must defer, not fail the job");
+
+        let deferred: i64 = sqlx_apalis::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE job_type = ? AND status = 'Pending'",
+        )
+        .bind(std::any::type_name::<TransferEquityToHedging>())
+        .fetch_one(&apalis_pool)
+        .await
+        .unwrap();
+        let reservation = position_store
+            .load(&symbol)
+            .await
+            .unwrap()
+            .unwrap()
+            .equity_transfer_reservation;
+        (reservation, resume, deferred)
+    }
+
+    /// A missing broker reading is unknown, not zero, and a failed read is not
+    /// a job failure: either way the redemption keeps waiting and retries
+    /// later instead of jumping the hedge or burning the retry budget.
+    #[tokio::test]
+    async fn funding_restore_defers_without_a_broker_reading() {
+        for reading in [Ok(None), Err(())] {
+            let (reservation, resume, deferred) =
+                perform_released_funding_redemption(ScriptedBroker::new(reading)).await;
+
+            assert_eq!(reservation, None, "reading {reading:?}");
+            assert!(
+                resume.captured.lock().unwrap().is_none(),
+                "reading {reading:?}: the redemption must not run"
+            );
+            assert_eq!(deferred, 1, "reading {reading:?}: one delayed retry");
+        }
+    }
+
+    /// The capacity read is only for recreating a missing reservation. A job
+    /// that still holds its reservation runs without it, so an inventory miss
+    /// cannot stall a redemption that owns the symbol.
+    #[tokio::test]
+    async fn held_reservation_does_not_read_broker_capacity() {
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let aggregate_id = redemption_aggregate_id("held-reservation");
+        let position_store = confirmed_position_reservation(
+            &symbol,
+            EquityTransferReservationId::from_uuid(aggregate_id.0),
+        )
+        .await;
+        let capacity = ScriptedBroker::new(Err(()));
+        let resume = Arc::new(RecordingRedemptionResume {
+            fail: false,
+            captured: Mutex::new(None),
+        });
+        let mut ctx = redemption_test_ctx(
+            resume.clone(),
+            TransferEquityToHedgingJobQueue::new(&apalis_pool),
+        )
+        .await;
+        ctx.position_authority = Some((
+            Arc::clone(&position_store),
+            ExecutionThreshold::whole_share(),
+        ));
+        ctx.hedge_capacity = Some(capacity.clone());
+        let job = TransferEquityToHedging {
+            chain: Chain::Base,
+            aggregate_id: aggregate_id.clone(),
+            symbol,
+            quantity: FractionalShares::new(float!(10)),
+            generation: GuardGeneration::default(),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+
+        Job::perform(&job, &ctx).await.unwrap();
+
+        assert_eq!(capacity.reads(), 0);
+        assert_eq!(
+            resume
+                .captured
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|(id, ..)| id.clone()),
+            Some(aggregate_id)
+        );
+    }
+
     #[tokio::test]
     async fn fresh_redemption_reconciliation_pending_enqueues_uncapped_delayed_redrive() {
         let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
@@ -3111,6 +4378,25 @@ mod tests {
     /// Variant that also returns the redemption events pool, so a test can seed
     /// aggregate history no command path reaches without live chain services
     /// (for example a `WithdrawnFromRaindex` origin).
+    fn enabled_aapl_equities() -> ChainEquities {
+        ChainEquities {
+            operational_limit: None,
+            symbols: HashMap::from([(
+                Symbol::new("AAPL").unwrap(),
+                ChainEquityAsset {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_ids: vec![],
+                    trading: OperationMode::Disabled,
+                    rebalancing: RebalancingMode::Enabled,
+                    wrapped_equity_recovery: OperationMode::Disabled,
+                    operational_limit: None,
+                    target_share: None,
+                },
+            )]),
+        }
+    }
+
     async fn redemption_test_ctx_with_pool(
         transfer: Arc<dyn ResumeEquityToHedging>,
         job_queue: TransferEquityToHedgingJobQueue,
@@ -3127,7 +4413,7 @@ mod tests {
                     wrapper: Arc::new(MockWrapper::new()),
                     mint_authorizer: ConfiguredMintAuthorizer::Disabled,
                     gas_readiness: ConfiguredGasReadiness::Unwired,
-                    equities: ChainEquities::default(),
+                    equities: enabled_aapl_equities(),
                 },
             )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
@@ -3136,9 +4422,11 @@ mod tests {
         let ctx = TransferEquityToHedgingCtx {
             transfer,
             equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
-            redemption_store: Arc::new(test_store(pool.clone(), services)),
+            redemption_store: Arc::new(test_store(pool.clone(), services.clone())),
+            transfer_services: services,
             position_authority: None,
             job_queue,
+            hedge_capacity: None,
             notifier: Arc::new(crate::alerts::LogNotifier),
         };
         (ctx, pool)
@@ -3198,6 +4486,227 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    /// Services whose withdrawal confirms, with `tokenizer` signing the send.
+    fn signed_send_services(tokenizer: Arc<MockTokenizer>) -> EquityTransferServices {
+        let mut services = EquityTransferServices::confirming_withdrawal(
+            Address::ZERO,
+            U256::from(1_000_000_000_000_000_000_u128),
+        );
+        if let Some(base) = services.chains.get_mut(&Chain::Base) {
+            base.tokenizer = tokenizer;
+        }
+        services
+    }
+
+    /// Drives a redemption through the aggregate command path to `SendPending`
+    /// holding `send`, its signed and persisted but unconfirmed send to the issuer.
+    async fn seed_redemption_signed_send(
+        store: &Store<EquityRedemption>,
+        id: &RedemptionAggregateId,
+        send: &PreparedTransaction,
+    ) {
+        use EquityRedemptionCommand::*;
+
+        store
+            .send(
+                id,
+                Redeem {
+                    chain: Chain::Base,
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(1),
+                    token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
+                    amount: U256::from(1_000_000_000_000_000_000_u128),
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                },
+            )
+            .await
+            .unwrap();
+        for command in [
+            RecordWithdrawSubmission {
+                tx_hash: TxHash::ZERO,
+            },
+            ConfirmWithdraw,
+            UnwrapTokens,
+            SubmitUnwrap,
+            ConfirmUnwrap,
+            PrepareSend {
+                prepared: send.clone(),
+                redemption_wallet: Address::repeat_byte(0xAB),
+            },
+        ] {
+            store.send(id, command).await.unwrap();
+        }
+    }
+
+    /// A transfer job for a redemption seeded at a signed `SendPending`, driven
+    /// by `transfer`, with its own apalis pool to inspect.
+    async fn signed_send_job(
+        transfer: Option<Arc<dyn ResumeEquityToHedging>>,
+        tokenizer: Arc<MockTokenizer>,
+        label: &str,
+    ) -> (
+        TransferEquityToHedgingCtx,
+        TransferEquityToHedging,
+        sqlx_apalis::SqlitePool,
+        PreparedTransaction,
+    ) {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let services = signed_send_services(tokenizer);
+        let redemption_store = Arc::new(test_store::<EquityRedemption>(
+            pool.clone(),
+            services.clone(),
+        ));
+        let id = redemption_aggregate_id(label);
+        let send = PreparedTransaction::for_test(TxHash::repeat_byte(0x5D), 9);
+        seed_redemption_signed_send(&redemption_store, &id, &send).await;
+        let transfer = transfer.unwrap_or_else(|| {
+            Arc::new(CrossVenueEquityTransfer::new(
+                services.clone(),
+                Arc::new(test_store::<TokenizedEquityMint>(
+                    pool.clone(),
+                    services.clone(),
+                )),
+                redemption_store.clone(),
+            ))
+        });
+
+        let ctx = TransferEquityToHedgingCtx {
+            transfer,
+            equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
+            redemption_store,
+            transfer_services: services,
+            position_authority: None,
+            hedge_capacity: None,
+            job_queue: TransferEquityToHedgingJobQueue::new(&apalis_pool),
+            notifier: Arc::new(crate::alerts::LogNotifier),
+        };
+        let job = TransferEquityToHedging {
+            chain: Chain::Base,
+            aggregate_id: id,
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: FractionalShares::new(float!(1)),
+            generation: GuardGeneration::default(),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+
+        (ctx, job, apalis_pool, send)
+    }
+
+    /// Fails every drive with an error that is not reconciliation-pending, as a
+    /// `SendTokens` hitting `SQLITE_BUSY` before any broadcast does.
+    struct UnclassifiedFailureRedemptionResume;
+
+    #[async_trait]
+    impl ResumeEquityToHedging for UnclassifiedFailureRedemptionResume {
+        async fn resume_equity_to_hedging(
+            &self,
+            _aggregate_id: &RedemptionAggregateId,
+            _symbol: &Symbol,
+            _chain: Chain,
+            _quantity: FractionalShares,
+        ) -> Result<(), RedemptionError> {
+            Err(RedemptionError::UnexpectedPendingStatus)
+        }
+    }
+
+    async fn pending_transfer_rows(
+        apalis_pool: &sqlx_apalis::SqlitePool,
+    ) -> Vec<(TransferEquityToHedging, i64)> {
+        let rows: Vec<(Vec<u8>, i64)> = sqlx_apalis::query_as(
+            "SELECT job, run_at FROM Jobs WHERE job_type = ? AND status = 'Pending'",
+        )
+        .bind(std::any::type_name::<TransferEquityToHedging>())
+        .fetch_all(apalis_pool)
+        .await
+        .unwrap();
+        rows.into_iter()
+            .map(|(payload, run_at)| (serde_json::from_slice(&payload).unwrap(), run_at))
+            .collect()
+    }
+
+    /// A signed send to the issuer holds its nonce until it resolves, so any failure to
+    /// drive it is redriven instead of spending the job's retry budget: once
+    /// spent, nothing would broadcast the send until a restart.
+    #[tokio::test]
+    async fn a_signed_send_redrives_any_failure_instead_of_spending_the_budget() {
+        let (ctx, job, apalis_pool, _send) = signed_send_job(
+            Some(Arc::new(UnclassifiedFailureRedemptionResume)),
+            Arc::new(MockTokenizer::new()),
+            "signed-send-unclassified-failure",
+        )
+        .await;
+
+        let before = chrono::Utc::now().timestamp();
+        Job::perform(&job, &ctx)
+            .await
+            .expect("a failure on a signed send must redrive, not fail the attempt");
+
+        let rows = pending_transfer_rows(&apalis_pool).await;
+        let [(rescheduled, run_at)] = rows.as_slice() else {
+            panic!("expected one redrive row, got {rows:?}");
+        };
+        assert_eq!(rescheduled.aggregate_id, job.aggregate_id);
+        let delay = i64::try_from(WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY.as_secs()).unwrap();
+        assert!(
+            *run_at >= before + delay - 5,
+            "run_at={run_at} before={before}"
+        );
+    }
+
+    /// A budget spent anyway (the state read in `perform` failed too) still
+    /// leaves the signed send a driver: the terminal attempt queues a fresh row.
+    #[tokio::test]
+    async fn a_terminal_attempt_on_a_signed_send_queues_a_fresh_row() {
+        let (ctx, job, apalis_pool, _send) = signed_send_job(
+            Some(Arc::new(UnclassifiedFailureRedemptionResume)),
+            Arc::new(MockTokenizer::new()),
+            "signed-send-terminal-attempt",
+        )
+        .await;
+
+        Job::on_terminal_attempt(&job, &ctx, &TaskIdentity::for_test("signed-send-last"))
+            .await
+            .unwrap();
+
+        let rows = pending_transfer_rows(&apalis_pool).await;
+        let [(rescheduled, _)] = rows.as_slice() else {
+            panic!("expected one fresh row, got {rows:?}");
+        };
+        assert_eq!(rescheduled.aggregate_id, job.aggregate_id);
+    }
+
+    /// Reconciling a signed send (its nonce proven taken) is bookkeeping only;
+    /// the transfer job that next observes `Reconciled` releases the send's
+    /// nonce so later sends from the wallet stop queueing behind it.
+    #[tokio::test]
+    async fn a_reconciled_issuer_send_job_releases_its_nonce() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let (ctx, job, _apalis_pool, send) =
+            signed_send_job(None, tokenizer.clone(), "reconciled-issuer-send").await;
+        ctx.redemption_store
+            .send(
+                &job.aggregate_id,
+                EquityRedemptionCommand::Reconcile {
+                    reason: "nonce 9 taken by a 0-value self-transfer".to_string(),
+                    proven_withdrawal: Some(send.tx_hash()),
+                },
+            )
+            .await
+            .unwrap();
+
+        Job::perform(&job, &ctx)
+            .await
+            .expect("a reconciled redemption must terminate cleanly");
+
+        assert_eq!(
+            tokenizer.redemption_send_superseded_releases(),
+            vec![send.tx_hash()]
+        );
     }
 
     /// A resume that observes a redemption reconciled while its vault withdrawal
@@ -3308,6 +4817,7 @@ mod tests {
                 &id,
                 EquityRedemptionCommand::Reconcile {
                     reason: "withdrawal verified dead onchain".to_string(),
+                    proven_withdrawal: Some(prepared.tx_hash()),
                 },
             )
             .await
@@ -3317,7 +4827,9 @@ mod tests {
             transfer: Arc::new(transfer),
             equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
             redemption_store,
+            transfer_services: services,
             position_authority: None,
+            hedge_capacity: None,
             job_queue: TransferEquityToHedgingJobQueue::new(&apalis_pool),
             notifier: Arc::new(crate::alerts::LogNotifier),
         };
@@ -3449,7 +4961,16 @@ mod tests {
             fail: false,
             captured: Mutex::new(None),
         });
-        let ctx = redemption_test_ctx(stub.clone(), hedging_test_job_queue().await).await;
+        let mut ctx = redemption_test_ctx(stub.clone(), hedging_test_job_queue().await).await;
+        let services = ctx
+            .transfer_services
+            .chains
+            .get(&Chain::Base)
+            .unwrap()
+            .clone();
+        ctx.transfer_services
+            .chains
+            .insert(Chain::Ethereum, services);
         let job = TransferEquityToHedging {
             chain: Chain::Ethereum,
             aggregate_id: redemption_aggregate_id("redeem-forward"),
@@ -3797,10 +5318,10 @@ mod tests {
             })
         );
 
-        ctx.equity_in_progress
-            .write()
-            .unwrap()
-            .insert(symbol.clone(), GuardState::HeldForRecovery);
+        ctx.equity_in_progress.write().unwrap().insert(
+            symbol.clone(),
+            GuardState::HeldForRecovery { chain: Chain::Base },
+        );
         let current_job = TransferEquityToMarketMaking {
             issuer_request_id: issuer_request_id("held-terminal-mint-cleanup"),
             symbol: symbol.clone(),
@@ -3817,7 +5338,7 @@ mod tests {
 
         assert_eq!(
             ctx.equity_in_progress.read().unwrap().get(&symbol),
-            Some(&GuardState::HeldForRecovery)
+            Some(&GuardState::HeldForRecovery { chain: Chain::Base })
         );
     }
 
@@ -3880,7 +5401,10 @@ mod tests {
                 current_owner,
                 GuardGeneration::from_parts(NonZeroU32::new(5).unwrap(), 2),
             ),
-            (GuardState::HeldForRecovery, current_generation),
+            (
+                GuardState::HeldForRecovery { chain: Chain::Base },
+                current_generation,
+            ),
         ] {
             ctx.equity_in_progress
                 .write()

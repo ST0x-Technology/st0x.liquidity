@@ -1,5 +1,9 @@
 //! Aggregate recording automated recovery of wrapped equity tokens
-//! (wtSTOCK) found on the Base wallet outside the Raindex vault.
+//! (wtSTOCK) found on a chain's bot wallet outside the Raindex vault.
+//!
+//! Every recovery records the chain it runs on at `Detect`, and each
+//! handler resolves that chain's services from the record, never from the
+//! primary chain.
 //!
 //! See SPEC.md, section "WrappedEquityRecovery Aggregate" for the full
 //! specification and rationale.
@@ -33,10 +37,11 @@ use alloy::primitives::TxHash;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 use std::str::FromStr;
 use std::sync::Arc;
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
@@ -49,7 +54,10 @@ use crate::bot_gas::{
     BotGasEnqueueFailure, BotGasOperationCategory, BotGasReceiptCostEnqueuer, enqueue_equity_cost,
 };
 use crate::equity_redemption::RedemptionAggregateId;
-use crate::rebalancing::equity::{ChainEquityServices, CrossVenueEquityTransfer};
+use crate::rebalancing::equity::{
+    ChainEquityServices, ChainServicesMissing, CrossVenueEquityTransfer, EquityTransferServices,
+    MintError, MintResumeFailure, RedemptionError, RedemptionResumeFailure, ResumeFailureKind,
+};
 use crate::tokenized_equity_mint::TOKENIZED_EQUITY_DECIMALS;
 
 /// Aggregate identifier. Each detection creates a fresh UUID; multiple
@@ -76,12 +84,10 @@ impl FromStr for WrappedEquityRecoveryId {
 /// emits the success event iff it actually completed.
 #[derive(Clone)]
 pub(crate) struct WrappedEquityRecoveryServices {
-    /// The chain the orphaned shares sit on: the one whose entry the recovery
-    /// drives and whose gas its confirmed txs are charged to.
-    pub(crate) chain: Chain,
-    /// That chain's entry, so the recovery reads the same registry,
-    /// orderbook and wrapper the saga uses there.
-    pub(crate) chain_services: ChainEquityServices,
+    /// Every chain's entry. A recovery drives the entry of the chain it
+    /// records, so it reads the same registry, orderbook and wrapper the
+    /// saga uses there.
+    pub(crate) equity: EquityTransferServices,
     pub(crate) transfer: Arc<CrossVenueEquityTransfer>,
     /// Enqueues bot-gas cost recording for the orphan-deposit path (which
     /// calls `raindex` directly rather than through `transfer`). See ADR 0017.
@@ -91,22 +97,40 @@ pub(crate) struct WrappedEquityRecoveryServices {
 /// Domain errors returned from the aggregate's `initialize`/`transition`
 /// handlers. Most service failures (raindex/wrapper/transfer) do NOT flow
 /// through this enum -- they are recorded as `RecoveryFailed` events instead,
-/// so failures remain first-class entries in the audit trail. The one
-/// exception is `BotGasEnqueueFailed`: a bot-gas cost-recording bookkeeping
+/// so failures remain first-class entries in the audit trail. The
+/// exceptions include `MintResumePending`, which keeps unfinished mints open,
+/// `ChainServicesMissing` (see its doc), and
+/// `BotGasEnqueueFailed`: a bot-gas cost-recording bookkeeping
 /// failure inside `confirm_orphan_deposit_or_fail` is deliberately propagated
 /// as `Err` rather than folded into `RecoveryFailed`, so the job's shared
 /// `redrive_on_bot_gas_failure` mechanism can redrive it instead of
 /// permanently failing the recovery over a best-effort accounting write.
 ///
-/// NOTE: `resume_mint_or_fail`/`resume_redemption_or_fail` (the
-/// `DispatchToMint`/`DispatchToRedemption` handlers) deliberately do NOT
+/// NOTE: `resume_redemption_or_fail` (the
+/// `DispatchToRedemption` handlers) deliberately do NOT
 /// propagate a bot-gas enqueue failure this way -- see the "Known gaps"
-/// entry in SPEC.md's bot-gas section. `WrappedEquityRecoveryJob` has no
-/// `Detected` resume arm, so redriving those commands would re-send
-/// `Detect` and hit `AlreadyInitialized`, stranding the aggregate
-/// non-terminal and permanently blocking rebalancing for the symbol.
+/// entry in SPEC.md's bot-gas section. The job now resumes from `Detected`,
+/// so a redrive would no longer strand the record, but propagating the
+/// failure from these handlers is not wired yet.
 #[derive(Debug, Clone, Serialize, Deserialize, Error, PartialEq, Eq)]
 pub(crate) enum WrappedEquityRecoveryError {
+    /// `resume_mint` failed in a way a later attempt can clear. A permanent
+    /// failure is recorded as `RecoveryFailed` instead, so the hold ends.
+    #[error("mint {mint_id} resume remains pending")]
+    MintResumePending {
+        mint_id: IssuerRequestId,
+        #[source]
+        failure: MintResumeFailure,
+    },
+    /// `resume_redemption` failed in a way a later attempt can clear. A
+    /// permanent failure is recorded as `RecoveryFailed` instead, so the hold
+    /// ends.
+    #[error("redemption {redemption_id} resume remains pending")]
+    RedemptionResumePending {
+        redemption_id: RedemptionAggregateId,
+        #[source]
+        failure: RedemptionResumeFailure,
+    },
     #[error("recovery already initialized")]
     AlreadyInitialized,
     #[error("recovery not yet initialized; only Detect is valid")]
@@ -115,6 +139,11 @@ pub(crate) enum WrappedEquityRecoveryError {
     InvalidTransition { state: Box<WrappedEquityRecovery> },
     #[error("recovery is already in terminal state")]
     Terminal,
+    /// The recovery's chain has no equity services in this configuration.
+    /// Not a terminal failure: no event is recorded, so the recovery stays
+    /// open and the job retries once the chain is wired again.
+    #[error(transparent)]
+    ChainServicesMissing(#[from] ChainServicesMissing),
     /// Enqueueing the bot-gas receipt cost recording job failed after the
     /// preceding on-chain confirm step already succeeded (a local SQLite
     /// write, safe to retry since the aggregate has not advanced past the
@@ -126,8 +155,11 @@ pub(crate) enum WrappedEquityRecoveryError {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum WrappedEquityRecoveryCommand {
-    /// Initial command. Records the detection trigger; invokes no services.
+    /// Initial command. Records the detection trigger and the chain whose
+    /// wallet holds the shares. Refused with `ChainServicesMissing` when that
+    /// chain has no services, so no recovery opens that could not proceed.
     Detect {
+        chain: Chain,
         symbol: Symbol,
         shares: FractionalShares,
     },
@@ -144,24 +176,33 @@ pub(crate) enum WrappedEquityRecoveryCommand {
         redemption_id: RedemptionAggregateId,
     },
 
-    /// Orphan path. The handler resolves the wrapped-token address via
-    /// `services.chain_services.wrapper.lookup_derivative(symbol)`, looks up the
-    /// Raindex vault, calls `services.chain_services.raindex.submit_deposit(...)`, and
-    /// emits `OrphanDepositSubmitted` with the returned tx hash.
+    /// Orphan path. On the recovery's chain, the handler resolves the
+    /// wrapped-token address via `wrapper.lookup_derivative(symbol)`, looks up
+    /// the Raindex vault, calls `raindex.submit_deposit(...)`, and emits
+    /// `OrphanDepositSubmitted` with the returned tx hash.
     SubmitOrphanDeposit,
 
     /// Orphan path. The handler reads `vault_deposit_tx_hash` from the
-    /// current state and calls `services.chain_services.raindex.confirm_tx(tx_hash)`,
+    /// current state and calls the recovery chain's `raindex.confirm_tx`,
     /// emitting `OrphanDeposited` iff confirmation succeeds.
     ConfirmOrphanDeposit,
 
     /// Marks the recovery as failed with the supplied reason.
     FailRecovery { reason: String },
+
+    /// Fails a changed detection and durably records that it needs a successor.
+    FailStaleDetection { reason: String },
+
+    /// Closes an invalid detection while retaining any existing recovery hold.
+    FailInvalidDetection { reason: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum WrappedEquityRecoveryEvent {
     Detected {
+        /// Events recorded before recoveries named their chain ran on Base.
+        #[serde(default = "crate::onchain::legacy_chain")]
+        chain: Chain,
         symbol: Symbol,
         shares: FractionalShares,
         detected_at: DateTime<Utc>,
@@ -185,6 +226,16 @@ pub(crate) enum WrappedEquityRecoveryEvent {
     OrphanDeposited {
         vault_deposit_tx_hash: TxHash,
         deposited_at: DateTime<Utc>,
+    },
+
+    InvalidDetectionFailed {
+        reason: String,
+        failed_at: DateTime<Utc>,
+    },
+
+    StaleDetectionFailed {
+        reason: String,
+        failed_at: DateTime<Utc>,
     },
 
     RecoveryFailed {
@@ -206,6 +257,10 @@ impl DomainEvent for WrappedEquityRecoveryEvent {
             }
             Self::OrphanDeposited { .. } => "WrappedEquityRecoveryEvent::OrphanDeposited",
             Self::RecoveryFailed { .. } => "WrappedEquityRecoveryEvent::RecoveryFailed",
+            Self::InvalidDetectionFailed { .. } => {
+                "WrappedEquityRecoveryEvent::InvalidDetectionFailed"
+            }
+            Self::StaleDetectionFailed { .. } => "WrappedEquityRecoveryEvent::StaleDetectionFailed",
         }
         .to_string()
     }
@@ -215,15 +270,23 @@ impl DomainEvent for WrappedEquityRecoveryEvent {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum DetectionFailureDisposition {
+    RestartDetection,
+    PreserveHold,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum WrappedEquityRecovery {
     Detected {
+        chain: Chain,
         symbol: Symbol,
         shares: FractionalShares,
         detected_at: DateTime<Utc>,
     },
 
     DispatchedToMint {
+        chain: Chain,
         symbol: Symbol,
         shares: FractionalShares,
         detected_at: DateTime<Utc>,
@@ -232,6 +295,7 @@ pub(crate) enum WrappedEquityRecovery {
     },
 
     DispatchedToRedemption {
+        chain: Chain,
         symbol: Symbol,
         shares: FractionalShares,
         detected_at: DateTime<Utc>,
@@ -240,6 +304,7 @@ pub(crate) enum WrappedEquityRecovery {
     },
 
     OrphanDepositSubmitted {
+        chain: Chain,
         symbol: Symbol,
         shares: FractionalShares,
         detected_at: DateTime<Utc>,
@@ -248,6 +313,7 @@ pub(crate) enum WrappedEquityRecovery {
     },
 
     OrphanDeposited {
+        chain: Chain,
         symbol: Symbol,
         shares: FractionalShares,
         detected_at: DateTime<Utc>,
@@ -257,14 +323,29 @@ pub(crate) enum WrappedEquityRecovery {
     },
 
     Failed {
+        chain: Chain,
         symbol: Symbol,
         shares: FractionalShares,
         reason: String,
         failed_at: DateTime<Utc>,
+        #[serde(default)]
+        detection_failure: Option<DetectionFailureDisposition>,
     },
 }
 
 impl WrappedEquityRecovery {
+    /// The chain whose wallet holds the recovered shares.
+    pub(crate) fn chain(&self) -> Chain {
+        match self {
+            Self::Detected { chain, .. }
+            | Self::DispatchedToMint { chain, .. }
+            | Self::DispatchedToRedemption { chain, .. }
+            | Self::OrphanDepositSubmitted { chain, .. }
+            | Self::OrphanDeposited { chain, .. }
+            | Self::Failed { chain, .. } => *chain,
+        }
+    }
+
     pub(crate) fn symbol(&self) -> &Symbol {
         match self {
             Self::Detected { symbol, .. }
@@ -287,6 +368,42 @@ impl WrappedEquityRecovery {
     }
 }
 
+/// Every recovery whose latest event leaves it open. Startup reads them to
+/// refuse a configuration that builds no services for a chain an open
+/// recovery still has to act on.
+pub(crate) async fn open_recovery_ids(
+    pool: &SqlitePool,
+) -> Result<Vec<WrappedEquityRecoveryId>, sqlx::Error> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "WITH latest AS ( \
+             SELECT aggregate_id, MAX(sequence) AS max_seq \
+             FROM events \
+             WHERE aggregate_type = 'WrappedEquityRecovery' \
+             GROUP BY aggregate_id \
+         ) \
+         SELECT latest.aggregate_id \
+         FROM events last_ev \
+         INNER JOIN latest \
+             ON last_ev.aggregate_id = latest.aggregate_id \
+            AND last_ev.sequence = latest.max_seq \
+         WHERE last_ev.aggregate_type = 'WrappedEquityRecovery' \
+           AND last_ev.event_type IN ( \
+               'WrappedEquityRecoveryEvent::Detected', \
+               'WrappedEquityRecoveryEvent::OrphanDepositSubmitted' \
+           ) \
+         ORDER BY latest.aggregate_id",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            row.parse()
+                .map_err(|error| sqlx::Error::Decode(Box::new(error)))
+        })
+        .collect()
+}
+
 #[async_trait]
 impl EventSourced for WrappedEquityRecovery {
     type Id = WrappedEquityRecoveryId;
@@ -298,15 +415,17 @@ impl EventSourced for WrappedEquityRecovery {
 
     const AGGREGATE_TYPE: &'static str = "WrappedEquityRecovery";
     const PROJECTION: Nil = Nil;
-    const SCHEMA_VERSION: u64 = 1;
+    const SCHEMA_VERSION: u64 = 2;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         match event {
             WrappedEquityRecoveryEvent::Detected {
+                chain,
                 symbol,
                 shares,
                 detected_at,
             } => Some(Self::Detected {
+                chain: *chain,
                 symbol: symbol.clone(),
                 shares: *shares,
                 detected_at: *detected_at,
@@ -321,6 +440,7 @@ impl EventSourced for WrappedEquityRecovery {
         Ok(match (entity, event) {
             (
                 Self::Detected {
+                    chain,
                     symbol,
                     shares,
                     detected_at,
@@ -330,6 +450,7 @@ impl EventSourced for WrappedEquityRecovery {
                     dispatched_at,
                 },
             ) => Some(Self::DispatchedToMint {
+                chain: *chain,
                 symbol: symbol.clone(),
                 shares: *shares,
                 detected_at: *detected_at,
@@ -339,6 +460,7 @@ impl EventSourced for WrappedEquityRecovery {
 
             (
                 Self::Detected {
+                    chain,
                     symbol,
                     shares,
                     detected_at,
@@ -348,6 +470,7 @@ impl EventSourced for WrappedEquityRecovery {
                     dispatched_at,
                 },
             ) => Some(Self::DispatchedToRedemption {
+                chain: *chain,
                 symbol: symbol.clone(),
                 shares: *shares,
                 detected_at: *detected_at,
@@ -357,6 +480,7 @@ impl EventSourced for WrappedEquityRecovery {
 
             (
                 Self::Detected {
+                    chain,
                     symbol,
                     shares,
                     detected_at,
@@ -366,6 +490,7 @@ impl EventSourced for WrappedEquityRecovery {
                     submitted_at,
                 },
             ) => Some(Self::OrphanDepositSubmitted {
+                chain: *chain,
                 symbol: symbol.clone(),
                 shares: *shares,
                 detected_at: *detected_at,
@@ -375,6 +500,7 @@ impl EventSourced for WrappedEquityRecovery {
 
             (
                 Self::OrphanDepositSubmitted {
+                    chain,
                     symbol,
                     shares,
                     detected_at,
@@ -386,6 +512,7 @@ impl EventSourced for WrappedEquityRecovery {
                     deposited_at,
                 },
             ) => Some(Self::OrphanDeposited {
+                chain: *chain,
                 symbol: symbol.clone(),
                 shares: *shares,
                 detected_at: *detected_at,
@@ -395,14 +522,60 @@ impl EventSourced for WrappedEquityRecovery {
             }),
 
             (
-                Self::Detected { symbol, shares, .. }
-                | Self::OrphanDepositSubmitted { symbol, shares, .. },
+                Self::Detected {
+                    chain,
+                    symbol,
+                    shares,
+                    ..
+                }
+                | Self::OrphanDepositSubmitted {
+                    chain,
+                    symbol,
+                    shares,
+                    ..
+                },
                 RecoveryFailed { reason, failed_at },
             ) => Some(Self::Failed {
+                chain: *chain,
                 symbol: symbol.clone(),
                 shares: *shares,
                 reason: reason.clone(),
                 failed_at: *failed_at,
+                detection_failure: None,
+            }),
+
+            (
+                Self::Detected {
+                    chain,
+                    symbol,
+                    shares,
+                    ..
+                },
+                StaleDetectionFailed { reason, failed_at },
+            ) => Some(Self::Failed {
+                chain: *chain,
+                symbol: symbol.clone(),
+                shares: *shares,
+                reason: reason.clone(),
+                failed_at: *failed_at,
+                detection_failure: Some(DetectionFailureDisposition::RestartDetection),
+            }),
+
+            (
+                Self::Detected {
+                    chain,
+                    symbol,
+                    shares,
+                    ..
+                },
+                InvalidDetectionFailed { reason, failed_at },
+            ) => Some(Self::Failed {
+                chain: *chain,
+                symbol: symbol.clone(),
+                shares: *shares,
+                reason: reason.clone(),
+                failed_at: *failed_at,
+                detection_failure: Some(DetectionFailureDisposition::PreserveHold),
             }),
 
             _ => None,
@@ -411,11 +584,18 @@ impl EventSourced for WrappedEquityRecovery {
 
     async fn initialize(
         command: Self::Command,
-        _services: &Self::Services,
+        services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         match command {
-            WrappedEquityRecoveryCommand::Detect { symbol, shares } => {
+            WrappedEquityRecoveryCommand::Detect {
+                chain,
+                symbol,
+                shares,
+            } => {
+                services.equity.for_chain(chain)?;
+
                 Ok(vec![WrappedEquityRecoveryEvent::Detected {
+                    chain,
                     symbol,
                     shares,
                     detected_at: Utc::now(),
@@ -440,29 +620,47 @@ impl EventSourced for WrappedEquityRecovery {
         match (self, command) {
             (_, Detect { .. }) => Err(WrappedEquityRecoveryError::AlreadyInitialized),
 
-            (Self::Detected { .. }, DispatchToMint { mint_id }) => {
+            // The transfer resolves its own chain's entry; checking the
+            // recovery's chain first keeps an unwired chain from recording a
+            // terminal failure for a recovery that can still finish. The job
+            // dispatches only to a transfer on the recovery's chain
+            // (`validate_active_aggregate_quantity`), so the two match here.
+            (Self::Detected { chain, .. }, DispatchToMint { mint_id }) => {
+                services.equity.for_chain(*chain)?;
                 resume_mint_or_fail(&services.transfer, &mint_id, now).await
             }
 
-            (Self::Detected { .. }, DispatchToRedemption { redemption_id }) => {
+            (Self::Detected { chain, .. }, DispatchToRedemption { redemption_id }) => {
+                services.equity.for_chain(*chain)?;
                 resume_redemption_or_fail(&services.transfer, &redemption_id, now).await
             }
 
-            (Self::Detected { symbol, shares, .. }, SubmitOrphanDeposit) => {
-                submit_orphan_deposit_or_fail(services, symbol, *shares, now).await
+            (
+                Self::Detected {
+                    chain,
+                    symbol,
+                    shares,
+                    ..
+                },
+                SubmitOrphanDeposit,
+            ) => {
+                let chain_services = services.equity.for_chain(*chain)?;
+                submit_orphan_deposit_or_fail(chain_services, symbol, *shares, now).await
             }
 
             (
                 Self::OrphanDepositSubmitted {
+                    chain,
                     symbol,
                     vault_deposit_tx_hash,
                     ..
                 },
                 ConfirmOrphanDeposit,
             ) => {
+                let chain_services = services.equity.for_chain(*chain)?;
                 confirm_orphan_deposit_or_fail(
-                    services.chain,
-                    &services.chain_services.raindex,
+                    *chain,
+                    &chain_services.raindex,
                     &services.bot_gas_enqueuer,
                     symbol,
                     *vault_deposit_tx_hash,
@@ -479,6 +677,20 @@ impl EventSourced for WrappedEquityRecovery {
                 failed_at: now,
             }]),
 
+            (Self::Detected { .. }, FailStaleDetection { reason }) => {
+                Ok(vec![WrappedEquityRecoveryEvent::StaleDetectionFailed {
+                    reason,
+                    failed_at: now,
+                }])
+            }
+
+            (Self::Detected { .. }, FailInvalidDetection { reason }) => {
+                Ok(vec![WrappedEquityRecoveryEvent::InvalidDetectionFailed {
+                    reason,
+                    failed_at: now,
+                }])
+            }
+
             (state, _) => Err(WrappedEquityRecoveryError::InvalidTransition {
                 state: Box::new(state.clone()),
             }),
@@ -491,18 +703,42 @@ async fn resume_mint_or_fail(
     mint_id: &IssuerRequestId,
     now: DateTime<Utc>,
 ) -> Result<Vec<WrappedEquityRecoveryEvent>, WrappedEquityRecoveryError> {
-    match transfer.resume_mint(mint_id).await {
+    let result = transfer.resume_mint(mint_id).await;
+    mint_resume_outcome(mint_id, result, now)
+}
+
+/// `DispatchedToMint` once the mint resumed, `RecoveryFailed` on a
+/// permanent failure so the hold ends, and `MintResumePending` on a
+/// retryable one so the job keeps the hold and tries again.
+fn mint_resume_outcome(
+    mint_id: &IssuerRequestId,
+    result: Result<(), MintError>,
+    now: DateTime<Utc>,
+) -> Result<Vec<WrappedEquityRecoveryEvent>, WrappedEquityRecoveryError> {
+    let error = match result {
         Ok(()) => {
             info!(target: "rebalance", %mint_id, "Wrapped equity recovery: resume_mint succeeded");
-            Ok(vec![WrappedEquityRecoveryEvent::DispatchedToMint {
+            return Ok(vec![WrappedEquityRecoveryEvent::DispatchedToMint {
                 mint_id: mint_id.clone(),
                 dispatched_at: now,
-            }])
+            }]);
         }
-        Err(error) => {
-            warn!(target: "rebalance", %mint_id, ?error, "Wrapped equity recovery: resume_mint failed");
+        Err(error) => error,
+    };
+
+    let failure = MintResumeFailure::from_mint_error(&error);
+    match failure.kind {
+        ResumeFailureKind::Retryable => {
+            warn!(target: "rebalance", %mint_id, ?error, "Wrapped equity recovery: resume_mint failed; retrying");
+            Err(WrappedEquityRecoveryError::MintResumePending {
+                mint_id: mint_id.clone(),
+                failure,
+            })
+        }
+        ResumeFailureKind::Permanent => {
+            error!(target: "rebalance", %mint_id, ?error, "Wrapped equity recovery: resume_mint failed permanently; failing recovery");
             Ok(vec![WrappedEquityRecoveryEvent::RecoveryFailed {
-                reason: format!("resume_mint failed: {error}"),
+                reason: format!("resume_mint of {mint_id} failed permanently: {failure}"),
                 failed_at: now,
             }])
         }
@@ -514,7 +750,23 @@ async fn resume_redemption_or_fail(
     redemption_id: &RedemptionAggregateId,
     now: DateTime<Utc>,
 ) -> Result<Vec<WrappedEquityRecoveryEvent>, WrappedEquityRecoveryError> {
-    match transfer.resume_redemption(redemption_id).await {
+    redemption_resume_outcome(
+        redemption_id,
+        transfer.resume_redemption(redemption_id).await,
+        now,
+    )
+}
+
+/// `DispatchedToRedemption` once the redemption resumed or still resolves on
+/// its own, `RecoveryFailed` on a permanent failure so the hold ends, and
+/// `RedemptionResumePending` on a retryable one so the job keeps the hold and
+/// tries again.
+fn redemption_resume_outcome(
+    redemption_id: &RedemptionAggregateId,
+    result: Result<(), RedemptionError>,
+    now: DateTime<Utc>,
+) -> Result<Vec<WrappedEquityRecoveryEvent>, WrappedEquityRecoveryError> {
+    match result {
         Ok(()) => {
             info!(target: "rebalance", %redemption_id, "Wrapped equity recovery: resume_redemption succeeded");
             Ok(vec![WrappedEquityRecoveryEvent::DispatchedToRedemption {
@@ -522,23 +774,47 @@ async fn resume_redemption_or_fail(
                 dispatched_at: now,
             }])
         }
-        Err(error) => {
-            warn!(target: "rebalance", %redemption_id, ?error, "Wrapped equity recovery: resume_redemption failed");
-            Ok(vec![WrappedEquityRecoveryEvent::RecoveryFailed {
-                reason: format!("resume_redemption failed: {error}"),
-                failed_at: now,
+        // A redemption still resolving onchain (a pending withdrawal or issuer
+        // send, or a legacy send an operator must verify) has its own jobs
+        // driving it, so the recovery has handed it over rather than failed.
+        Err(error) if error.is_still_in_progress() => {
+            info!(target: "rebalance", %redemption_id, %error, "Wrapped equity recovery: the redemption is still resolving and drives itself");
+            Ok(vec![WrappedEquityRecoveryEvent::DispatchedToRedemption {
+                redemption_id: redemption_id.clone(),
+                dispatched_at: now,
             }])
+        }
+        Err(error) => {
+            let failure = RedemptionResumeFailure::from_redemption_error(&error);
+            match failure.kind {
+                ResumeFailureKind::Retryable => {
+                    warn!(target: "rebalance", %redemption_id, ?error, "Wrapped equity recovery: resume_redemption failed; retrying");
+                    Err(WrappedEquityRecoveryError::RedemptionResumePending {
+                        redemption_id: redemption_id.clone(),
+                        failure,
+                    })
+                }
+                ResumeFailureKind::Permanent => {
+                    error!(target: "rebalance", %redemption_id, ?error, "Wrapped equity recovery: resume_redemption failed permanently; failing recovery");
+                    Ok(vec![WrappedEquityRecoveryEvent::RecoveryFailed {
+                        reason: format!(
+                            "resume_redemption of {redemption_id} failed permanently: {failure}"
+                        ),
+                        failed_at: now,
+                    }])
+                }
+            }
         }
     }
 }
 
 async fn submit_orphan_deposit_or_fail(
-    services: &WrappedEquityRecoveryServices,
+    chain_services: &ChainEquityServices,
     symbol: &Symbol,
     shares: FractionalShares,
     now: DateTime<Utc>,
 ) -> Result<Vec<WrappedEquityRecoveryEvent>, WrappedEquityRecoveryError> {
-    let wrapped_token = match services.chain_services.wrapper.lookup_derivative(symbol) {
+    let wrapped_token = match chain_services.wrapper.lookup_derivative(symbol) {
         Ok(token) => token,
         Err(error) => {
             warn!(target: "rebalance", %symbol, ?error, "Wrapped equity recovery: lookup_derivative failed");
@@ -549,8 +825,7 @@ async fn submit_orphan_deposit_or_fail(
         }
     };
 
-    let vault_id = match services
-        .chain_services
+    let vault_id = match chain_services
         .vault_lookup
         .vault_id_for_token(wrapped_token)
         .await
@@ -576,8 +851,7 @@ async fn submit_orphan_deposit_or_fail(
         }
     };
 
-    match services
-        .chain_services
+    match chain_services
         .raindex
         .submit_deposit(wrapped_token, vault_id, raw, TOKENIZED_EQUITY_DECIMALS)
         .await
@@ -644,12 +918,12 @@ mod tests {
     use uuid::Uuid;
 
     use st0x_config::ChainEquities;
-    use st0x_event_sorcery::EventSourced;
+    use st0x_event_sorcery::{AggregateError, EventSourced, LifecycleError};
     use st0x_execution::{FractionalShares, Symbol};
     use st0x_raindex::RaindexVaultId;
     use st0x_tokenization::issuer_request_id;
     use st0x_tokenization::mock::MockTokenizer;
-    use st0x_wrapper::{MockWrapper, Wrapper};
+    use st0x_wrapper::MockWrapper;
 
     use super::*;
     use crate::bot_gas::pending_bot_gas_jobs;
@@ -680,47 +954,68 @@ mod tests {
 
     fn detected_state() -> WrappedEquityRecovery {
         WrappedEquityRecovery::Detected {
+            chain: Chain::Base,
             symbol: aapl(),
             shares: one_share(),
             detected_at: Utc::now(),
         }
     }
 
-    async fn test_services() -> WrappedEquityRecoveryServices {
-        let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
-        let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
-        let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
-        let chain_services = ChainEquityServices {
+    fn chain_services_with(raindex: Arc<dyn Raindex>) -> ChainEquityServices {
+        ChainEquityServices {
             wallet: Address::ZERO,
             raindex,
             vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper,
+            wrapper: Arc::new(MockWrapper::new()),
             mint_authorizer: ConfiguredMintAuthorizer::Disabled,
             gas_readiness: ConfiguredGasReadiness::Unwired,
             equities: ChainEquities::default(),
-        };
-        let services = EquityTransferServices {
-            chains: BTreeMap::from([(Chain::Base, chain_services.clone())]),
+        }
+    }
+
+    /// Recovery services carrying exactly `chains`, with the transfer wired
+    /// to fresh in-memory mint and redemption stores over the same entries.
+    async fn services_over(
+        chains: BTreeMap<Chain, ChainEquityServices>,
+    ) -> WrappedEquityRecoveryServices {
+        services_and_pool_over(chains).await.0
+    }
+
+    /// [`services_over`], also returning the pool the stores write to.
+    async fn services_and_pool_over(
+        chains: BTreeMap<Chain, ChainEquityServices>,
+    ) -> (WrappedEquityRecoveryServices, sqlx::SqlitePool) {
+        let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let equity = EquityTransferServices {
+            chains,
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
-        let mint_store = Arc::new(st0x_event_sorcery::test_store(
-            pool.clone(),
-            services.clone(),
-        ));
-        let redemption_store = Arc::new(st0x_event_sorcery::test_store(pool, services.clone()));
+        let mint_store = Arc::new(st0x_event_sorcery::test_store(pool.clone(), equity.clone()));
+        let redemption_store =
+            Arc::new(st0x_event_sorcery::test_store(pool.clone(), equity.clone()));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
-            services,
+            equity.clone(),
             mint_store,
             redemption_store,
         ));
-        WrappedEquityRecoveryServices {
-            chain: Chain::Base,
-            chain_services,
-            transfer,
-            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-        }
+        (
+            WrappedEquityRecoveryServices {
+                equity,
+                transfer,
+                bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            },
+            pool,
+        )
+    }
+
+    async fn test_services() -> WrappedEquityRecoveryServices {
+        services_over(BTreeMap::from([(
+            Chain::Base,
+            chain_services_with(Arc::new(MockRaindex::new())),
+        )]))
+        .await
     }
 
     #[tokio::test]
@@ -728,6 +1023,7 @@ mod tests {
         let services = test_services().await;
         let events = WrappedEquityRecovery::initialize(
             WrappedEquityRecoveryCommand::Detect {
+                chain: Chain::Base,
                 symbol: aapl(),
                 shares: one_share(),
             },
@@ -772,6 +1068,7 @@ mod tests {
     async fn confirm_orphan_deposit_completes_orphan_branch() {
         let services = test_services().await;
         let submitted = WrappedEquityRecovery::OrphanDepositSubmitted {
+            chain: Chain::Base,
             symbol: aapl(),
             shares: one_share(),
             detected_at: Utc::now(),
@@ -807,6 +1104,7 @@ mod tests {
         services.bot_gas_enqueuer = BotGasReceiptCostEnqueuer::Enabled(queue);
 
         let submitted = WrappedEquityRecovery::OrphanDepositSubmitted {
+            chain: Chain::Base,
             symbol: aapl(),
             shares: one_share(),
             detected_at: Utc::now(),
@@ -830,36 +1128,264 @@ mod tests {
         assert_eq!(jobs[0].symbol, Some(aapl()));
     }
 
-    /// A recovery on Ethereum charges its confirmed orphan deposit to
-    /// Ethereum's gas ledger, not Base's.
+    /// A recovery on Ethereum runs its orphan deposit end to end on
+    /// Ethereum's orderbook and charges the gas to Ethereum. Base's orderbook
+    /// fails every deposit, so reaching `OrphanDeposited` also shows Base was
+    /// never used.
     #[tokio::test]
-    async fn confirm_orphan_deposit_enqueues_the_bot_gas_job_on_the_recoverys_chain() {
-        let (_pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
-        let queue = crate::bot_gas::RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
-        let mut services = test_services().await;
-        services.chain = Chain::Ethereum;
-        services.bot_gas_enqueuer = BotGasReceiptCostEnqueuer::Enabled(queue);
+    async fn orphan_deposit_on_a_secondary_chain_runs_on_that_chains_services() {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let base_raindex = Arc::new(
+            MockRaindex::new().with_deposit_behavior(DepositBehavior::FailExecutionReverted),
+        );
+        let ethereum_raindex = Arc::new(MockRaindex::new());
+        let mut services = services_over(BTreeMap::from([
+            (Chain::Base, chain_services_with(base_raindex.clone())),
+            (
+                Chain::Ethereum,
+                chain_services_with(ethereum_raindex.clone()),
+            ),
+        ]))
+        .await;
+        services.bot_gas_enqueuer = BotGasReceiptCostEnqueuer::Enabled(
+            crate::bot_gas::RecordBotGasReceiptCostJobQueue::new(&apalis_pool),
+        );
+        let store = st0x_event_sorcery::test_store::<WrappedEquityRecovery>(pool, services);
+        let id = WrappedEquityRecoveryId(Uuid::new_v4());
 
-        let submitted = WrappedEquityRecovery::OrphanDepositSubmitted {
-            symbol: aapl(),
-            shares: one_share(),
-            detected_at: Utc::now(),
-            vault_deposit_tx_hash: FAKE_TX_HASH,
-            submitted_at: Utc::now(),
+        for command in [
+            WrappedEquityRecoveryCommand::Detect {
+                chain: Chain::Ethereum,
+                symbol: aapl(),
+                shares: one_share(),
+            },
+            WrappedEquityRecoveryCommand::SubmitOrphanDeposit,
+            WrappedEquityRecoveryCommand::ConfirmOrphanDeposit,
+        ] {
+            store.send(&id, command).await.unwrap();
+        }
+
+        let Some(WrappedEquityRecovery::OrphanDeposited {
+            chain,
+            vault_deposit_tx_hash,
+            ..
+        }) = store.load(&id).await.unwrap()
+        else {
+            panic!("the Ethereum recovery must finish its orphan deposit");
         };
-
-        submitted
-            .transition(
-                WrappedEquityRecoveryCommand::ConfirmOrphanDeposit,
-                &services,
-            )
-            .await
-            .expect("ConfirmOrphanDeposit should succeed from OrphanDepositSubmitted");
+        assert_eq!(chain, Chain::Ethereum);
+        assert_eq!(
+            ethereum_raindex.last_confirmed_tx(),
+            Some(vault_deposit_tx_hash)
+        );
+        assert_eq!(base_raindex.last_deposit_call(), None);
+        assert_eq!(base_raindex.last_confirmed_tx(), None);
 
         let jobs = pending_bot_gas_jobs(&apalis_pool).await;
         assert_eq!(jobs.len(), 1, "expected exactly one bot-gas job");
         assert_eq!(jobs[0].chain, Chain::Ethereum);
-        assert_eq!(jobs[0].tx_hash, FAKE_TX_HASH);
+        assert_eq!(jobs[0].tx_hash, vault_deposit_tx_hash);
+    }
+
+    /// A chain with no services cannot open a recovery, and cannot move one
+    /// already open on it: each command is refused with no event recorded,
+    /// so the recovery stays open for when the chain is wired again.
+    #[tokio::test]
+    async fn a_chain_without_services_refuses_commands_without_recording_an_event() {
+        let (pool, _apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let wired = st0x_event_sorcery::test_store::<WrappedEquityRecovery>(
+            pool.clone(),
+            services_over(BTreeMap::from([(
+                Chain::Ethereum,
+                chain_services_with(Arc::new(MockRaindex::new())),
+            )]))
+            .await,
+        );
+        let unwired =
+            st0x_event_sorcery::test_store::<WrappedEquityRecovery>(pool, test_services().await);
+
+        let refused_id = WrappedEquityRecoveryId(Uuid::new_v4());
+        let error = unwired
+            .send(
+                &refused_id,
+                WrappedEquityRecoveryCommand::Detect {
+                    chain: Chain::Ethereum,
+                    symbol: aapl(),
+                    shares: one_share(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                AggregateError::UserError(LifecycleError::Apply(
+                    WrappedEquityRecoveryError::ChainServicesMissing(ChainServicesMissing {
+                        chain: Chain::Ethereum
+                    })
+                ))
+            ),
+            "got {error:?}"
+        );
+        assert_eq!(unwired.load(&refused_id).await.unwrap(), None);
+
+        let open_id = WrappedEquityRecoveryId(Uuid::new_v4());
+        wired
+            .send(
+                &open_id,
+                WrappedEquityRecoveryCommand::Detect {
+                    chain: Chain::Ethereum,
+                    symbol: aapl(),
+                    shares: one_share(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let error = unwired
+            .send(&open_id, WrappedEquityRecoveryCommand::SubmitOrphanDeposit)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                AggregateError::UserError(LifecycleError::Apply(
+                    WrappedEquityRecoveryError::ChainServicesMissing(ChainServicesMissing {
+                        chain: Chain::Ethereum
+                    })
+                ))
+            ),
+            "got {error:?}"
+        );
+        let state = unwired.load(&open_id).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                state,
+                WrappedEquityRecovery::Detected {
+                    chain: Chain::Ethereum,
+                    ..
+                }
+            ),
+            "the refused command must leave the recovery open, got {state:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_detected_event_without_a_chain_loads_as_base() {
+        let legacy = serde_json::json!({
+            "Detected": {
+                "symbol": "AAPL",
+                "shares": "1",
+                "detected_at": "2026-01-01T00:00:00Z"
+            }
+        });
+
+        let event: WrappedEquityRecoveryEvent = serde_json::from_value(legacy).unwrap();
+        let state = WrappedEquityRecovery::originate(&event).unwrap();
+
+        assert_eq!(state.chain(), Chain::Base);
+        assert_eq!(state.symbol(), &aapl());
+    }
+
+    /// A recovery left open by a binary whose events and snapshots carried no
+    /// chain: the schema bump discards the old snapshot, replay reads the
+    /// legacy `Detected` as Base, and the recovery finishes on Base.
+    #[tokio::test]
+    async fn open_legacy_recovery_resumes_on_base_after_upgrade() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let id = WrappedEquityRecoveryId(Uuid::new_v4());
+        let deposit_tx = FAKE_TX_HASH;
+        let detected =
+            r#"{"Detected":{"symbol":"AAPL","shares":"1","detected_at":"2026-01-01T00:00:00Z"}}"#;
+        let submitted = format!(
+            r#"{{"OrphanDepositSubmitted":{{"vault_deposit_tx_hash":"{deposit_tx}","submitted_at":"2026-01-01T00:00:01Z"}}}}"#
+        );
+        let legacy_snapshot = format!(
+            r#"{{"Live":{{"OrphanDepositSubmitted":{{"symbol":"AAPL","shares":"1","detected_at":"2026-01-01T00:00:00Z","vault_deposit_tx_hash":"{deposit_tx}","submitted_at":"2026-01-01T00:00:01Z"}}}}}}"#
+        );
+        for (sequence, event_type, payload) in [
+            (
+                1,
+                "WrappedEquityRecoveryEvent::Detected",
+                detected.to_string(),
+            ),
+            (
+                2,
+                "WrappedEquityRecoveryEvent::OrphanDepositSubmitted",
+                submitted,
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type, \
+                 event_version, payload, metadata) \
+                 VALUES ('WrappedEquityRecovery', ?1, ?2, ?3, '1.0', ?4, '{}')",
+            )
+            .bind(id.to_string())
+            .bind(sequence)
+            .bind(event_type)
+            .bind(payload)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type, \
+             event_version, payload, metadata) VALUES ('SchemaRegistry', 'schema', 1, \
+             'SchemaRegistryEvent::VersionUpdated', '1.0', \
+             '{\"VersionUpdated\":{\"name\":\"WrappedEquityRecovery\",\"version\":1}}', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO snapshots (aggregate_type, aggregate_id, last_sequence, payload, \
+             timestamp) VALUES ('WrappedEquityRecovery', ?1, 2, ?2, '2026-01-01T00:00:01Z')",
+        )
+        .bind(id.to_string())
+        .bind(legacy_snapshot)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let base_raindex = Arc::new(MockRaindex::new());
+        let store = st0x_event_sorcery::StoreBuilder::<WrappedEquityRecovery>::new(pool.clone())
+            .build(
+                services_over(BTreeMap::from([(
+                    Chain::Base,
+                    chain_services_with(base_raindex.clone()),
+                )]))
+                .await,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(open_recovery_ids(&pool).await.unwrap(), vec![id.clone()]);
+        let resumed = store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                resumed,
+                WrappedEquityRecovery::OrphanDepositSubmitted {
+                    chain: Chain::Base,
+                    ..
+                }
+            ),
+            "the legacy recovery must replay as an open Base recovery, got {resumed:?}"
+        );
+
+        store
+            .send(&id, WrappedEquityRecoveryCommand::ConfirmOrphanDeposit)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store.load(&id).await.unwrap(),
+            Some(WrappedEquityRecovery::OrphanDeposited {
+                chain: Chain::Base,
+                ..
+            })
+        ));
+        assert_eq!(base_raindex.last_confirmed_tx(), Some(deposit_tx));
+        assert_eq!(open_recovery_ids(&pool).await.unwrap(), vec![]);
     }
 
     /// Acceptance criterion: an enqueue failure after a confirmed
@@ -874,6 +1400,7 @@ mod tests {
         services.bot_gas_enqueuer = BotGasReceiptCostEnqueuer::Enabled(queue);
 
         let submitted = WrappedEquityRecovery::OrphanDepositSubmitted {
+            chain: Chain::Base,
             symbol: aapl(),
             shares: one_share(),
             detected_at: Utc::now(),
@@ -900,6 +1427,7 @@ mod tests {
     async fn fail_recovery_rejected_from_terminal_state() {
         let services = test_services().await;
         let deposited = WrappedEquityRecovery::OrphanDeposited {
+            chain: Chain::Base,
             symbol: aapl(),
             shares: one_share(),
             detected_at: Utc::now(),
@@ -924,16 +1452,11 @@ mod tests {
         );
     }
 
-    /// `resume_mint` fails because no mint aggregate exists in the store ->
-    /// the handler records the failure as `RecoveryFailed`. Proves service
-    /// failures flow through events, not aggregate errors.
     #[tokio::test]
-    async fn dispatch_to_mint_records_failure_when_resume_mint_fails() {
+    async fn dispatch_to_mint_fails_the_recovery_when_the_mint_is_missing() {
         let services = test_services().await;
-        let detected = detected_state();
         let mint_id = issuer_request_id("ISS-NONEXISTENT");
-
-        let events = detected
+        let events = detected_state()
             .transition(
                 WrappedEquityRecoveryCommand::DispatchToMint {
                     mint_id: mint_id.clone(),
@@ -941,16 +1464,89 @@ mod tests {
                 &services,
             )
             .await
-            .expect(
-                "DispatchToMint should return Ok with a RecoveryFailed event on service failure",
-            );
-
+            .unwrap();
         let [WrappedEquityRecoveryEvent::RecoveryFailed { reason, .. }] = events.as_slice() else {
-            panic!("Expected single RecoveryFailed event, got {events:?}");
+            panic!("expected single RecoveryFailed event, got {events:?}");
         };
+        assert!(reason.contains(&mint_id.to_string()), "{reason}");
+    }
+
+    #[test]
+    fn a_retryable_redemption_resume_failure_keeps_the_recovery_pending() {
+        let redemption_id = redemption_aggregate_id("retryable");
+        let error = redemption_resume_outcome(
+            &redemption_id,
+            Err(RedemptionError::Alpaca(
+                st0x_tokenization::AlpacaTokenizationError::PollTimeout {
+                    elapsed: std::time::Duration::from_secs(60),
+                },
+            )),
+            Utc::now(),
+        )
+        .unwrap_err();
+        let WrappedEquityRecoveryError::RedemptionResumePending {
+            redemption_id: pending,
+            failure,
+        } = error
+        else {
+            panic!("expected RedemptionResumePending, got {error:?}");
+        };
+        assert_eq!(pending, redemption_id);
+        assert_eq!(failure.kind, ResumeFailureKind::Retryable);
+    }
+
+    #[test]
+    fn a_permanent_redemption_resume_failure_fails_the_recovery() {
+        let redemption_id = redemption_aggregate_id("rejected");
+        let events =
+            redemption_resume_outcome(&redemption_id, Err(RedemptionError::Rejected), Utc::now())
+                .unwrap();
+        let [WrappedEquityRecoveryEvent::RecoveryFailed { reason, .. }] = events.as_slice() else {
+            panic!("expected single RecoveryFailed event, got {events:?}");
+        };
+        assert!(reason.contains(&redemption_id.to_string()), "{reason}");
+    }
+
+    #[test]
+    fn a_retryable_mint_resume_failure_keeps_the_recovery_pending() {
+        let mint_id = issuer_request_id("ISS-1");
+        let error = mint_resume_outcome(
+            &mint_id,
+            Err(MintError::Raindex(
+                st0x_raindex::RaindexError::ScanInconclusive { from_block: 7 },
+            )),
+            Utc::now(),
+        )
+        .unwrap_err();
+        let WrappedEquityRecoveryError::MintResumePending {
+            mint_id: pending,
+            failure,
+        } = error
+        else {
+            panic!("expected MintResumePending, got {error:?}");
+        };
+        assert_eq!(pending, mint_id);
+        assert_eq!(failure.kind, ResumeFailureKind::Retryable);
+    }
+
+    #[test]
+    fn a_permanent_mint_resume_failure_fails_the_recovery() {
+        let mint_id = issuer_request_id("ISS-1");
+        let events = mint_resume_outcome(
+            &mint_id,
+            Err(MintError::UnknownTokenizedEquity {
+                chain: Chain::Base,
+                symbol: Symbol::new("AAPL").unwrap(),
+            }),
+            Utc::now(),
+        )
+        .unwrap();
         assert!(
-            reason.contains("resume_mint failed"),
-            "RecoveryFailed reason should mention resume_mint; got {reason:?}",
+            matches!(
+                events.as_slice(),
+                [WrappedEquityRecoveryEvent::RecoveryFailed { .. }]
+            ),
+            "{events:?}"
         );
     }
 
@@ -976,8 +1572,83 @@ mod tests {
             panic!("Expected single RecoveryFailed event, got {events:?}");
         };
         assert!(
-            reason.contains("resume_redemption failed"),
+            reason.contains(&format!(
+                "resume_redemption of {redemption_id} failed permanently"
+            )),
             "RecoveryFailed reason should mention resume_redemption; got {reason:?}",
+        );
+    }
+
+    /// A redemption still resolving onchain drives itself through its own
+    /// jobs, so dispatching to it hands the recovery over instead of recording
+    /// a failure on every detection cycle. A legacy pending send (no recorded
+    /// transaction) is one: only an operator closes it.
+    #[tokio::test]
+    async fn dispatch_to_a_redemption_still_resolving_hands_it_over() {
+        let (services, pool) = services_and_pool_over(BTreeMap::from([(
+            Chain::Base,
+            chain_services_with(Arc::new(MockRaindex::new())),
+        )]))
+        .await;
+        let redemption_id = redemption_aggregate_id("legacy-send-pending");
+        let history: [crate::equity_redemption::EquityRedemptionEvent; 3] = [
+            crate::equity_redemption::EquityRedemptionEvent::WithdrawnFromRaindex {
+                symbol: aapl(),
+                quantity: st0x_float_macro::float!(1),
+                token: Address::repeat_byte(0x11),
+                wrapped_amount: alloy::primitives::U256::from(1_000_000_000_000_000_000_u128),
+                actual_wrapped_amount: None,
+                raindex_withdraw_tx: TxHash::repeat_byte(0x12),
+                raindex_withdraw_block: None,
+                withdrawn_at: Utc::now(),
+            },
+            crate::equity_redemption::EquityRedemptionEvent::TokensUnwrapped {
+                quantity: Some(st0x_float_macro::float!(1)),
+                underlying_token: crate::equity_redemption::UnwrappedProvenance::Legacy(
+                    Address::repeat_byte(0x21),
+                ),
+                unwrap_tx_hash: TxHash::repeat_byte(0x13),
+                unwrapped_amount: alloy::primitives::U256::from(1_000_000_000_000_000_000_u128),
+                unwrap_block: None,
+                unwrapped_at: Utc::now(),
+            },
+            crate::equity_redemption::EquityRedemptionEvent::SendPending {
+                pending_at: Utc::now(),
+            },
+        ];
+        for (sequence, event) in (1_i64..).zip(history) {
+            sqlx::query(
+                "INSERT INTO events \
+                 (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, \
+                  metadata) \
+                 VALUES ('EquityRedemption', ?1, ?2, ?3, '1', ?4, '{}')",
+            )
+            .bind(redemption_id.to_string())
+            .bind(sequence)
+            .bind(st0x_event_sorcery::DomainEvent::event_type(&event))
+            .bind(serde_json::to_string(&event).unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let events = detected_state()
+            .transition(
+                WrappedEquityRecoveryCommand::DispatchToRedemption {
+                    redemption_id: redemption_id.clone(),
+                },
+                &services,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [WrappedEquityRecoveryEvent::DispatchedToRedemption { redemption_id: dispatched, .. }]
+                    if *dispatched == redemption_id
+            ),
+            "Expected the recovery to hand over, got {events:?}"
         );
     }
 
@@ -985,43 +1656,13 @@ mod tests {
     /// `RecoveryFailed` instead of advancing into `OrphanDepositSubmitted`.
     #[tokio::test]
     async fn submit_orphan_deposit_records_failure_when_raindex_reports_revert() {
-        let raindex: Arc<dyn Raindex> = Arc::new(
-            MockRaindex::new().with_deposit_behavior(DepositBehavior::FailExecutionReverted),
-        );
-        let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
-        let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
-        let chain_services = ChainEquityServices {
-            wallet: Address::ZERO,
-            raindex,
-            vault_lookup: Arc::new(mock_vault_lookup()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
-            gas_readiness: ConfiguredGasReadiness::Unwired,
-            equities: ChainEquities::default(),
-        };
-        let inner_services = EquityTransferServices {
-            chains: BTreeMap::from([(Chain::Base, chain_services.clone())]),
-            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-        };
-        let mint_store = Arc::new(st0x_event_sorcery::test_store(
-            pool.clone(),
-            inner_services.clone(),
-        ));
-        let redemption_store =
-            Arc::new(st0x_event_sorcery::test_store(pool, inner_services.clone()));
-        let transfer = Arc::new(CrossVenueEquityTransfer::new(
-            inner_services,
-            mint_store,
-            redemption_store,
-        ));
-        let services = WrappedEquityRecoveryServices {
-            chain: Chain::Base,
-            chain_services,
-            transfer,
-            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-        };
+        let services = services_over(BTreeMap::from([(
+            Chain::Base,
+            chain_services_with(Arc::new(
+                MockRaindex::new().with_deposit_behavior(DepositBehavior::FailExecutionReverted),
+            )),
+        )]))
+        .await;
 
         let events = detected_state()
             .transition(WrappedEquityRecoveryCommand::SubmitOrphanDeposit, &services)

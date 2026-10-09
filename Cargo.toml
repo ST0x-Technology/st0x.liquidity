@@ -73,7 +73,6 @@ bon = "3.9.1"
 chrono = { version = "0.4.38", features = ["serde"] }
 chrono-tz = "0.10.4"
 clap = { version = "4.5.40", features = ["derive", "env"] }
-cqrs-es = "0.4"
 flate2 = "1.0"
 futures-util = "0.3.31"
 httpmock = "0.8"
@@ -96,7 +95,6 @@ reqwest = { version = "0.12.4", features = [
   "gzip",
   "blocking",
 ] }
-rsa = { version = "0.9.10", features = ["pem"] }
 serde = { version = "1.0.197", features = ["derive"] }
 serde_json = "1.0.140"
 serial_test = "3.2.0"
@@ -106,6 +104,7 @@ sqlx = { version = "0.9.0", features = [
   "runtime-tokio",
   "tls-rustls",
 ] }
+st0x-alpaca = { git = "https://github.com/ST0x-Technology/st0x.alpaca", tag = "v0.2.1", version = "0.2.1", default-features = false }
 st0x-bridge = { path = "crates/bridge" }
 st0x-config = { path = "crates/config" }
 st0x-dto = { path = "crates/dto" }
@@ -150,8 +149,14 @@ wasm-bindgen = "=0.2.122"
 
 [workspace.dependencies.st0x-event-sorcery]
 git = "https://github.com/ST0x-Technology/event-sorcery.git"
-tag = "v0.3.0"
+tag = "v0.3.1"
 package = "event-sorcery"
+
+# Same repository and tag as st0x-event-sorcery: tests compare this crate's
+# event store schema against the one sqlite-es's migrations create.
+[workspace.dependencies.sqlite-es]
+git = "https://github.com/ST0x-Technology/event-sorcery.git"
+tag = "v0.3.1"
 
 [patch."https://github.com/rainlanguage/rain.math.float"]
 # Keep this path checkout at st0x-finance v0.3.0's pinned revision:
@@ -162,7 +167,7 @@ rain-math-float = { path = ".tmp/rain-math-float/crates/float" }
 name = "st0x-hedge"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.94"
 
 [[bin]]
 name = "verify-approvals"
@@ -225,6 +230,10 @@ rain-error-decoding.workspace = true
 rain-math-float.workspace = true
 rand.workspace = true
 reqwest.workspace = true
+rustls = { version = "0.23.40", default-features = false, features = [
+  "ring",
+  "std",
+] }
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
@@ -292,8 +301,14 @@ p256 = { version = "0.13", default-features = false, features = [
 proptest.workspace = true
 rain-math-float.workspace = true
 regex = "1.12.3"
-rsa.workspace = true
+reqwest_alpaca = { version = "0.13", package = "reqwest", default-features = false, features = [
+  "rustls",
+  "json",
+  "query",
+  "form",
+] }
 serial_test.workspace = true
+sqlite-es.workspace = true
 st0x-bridge = { workspace = true, features = ["mock"] }
 st0x-event-sorcery = { workspace = true, features = ["test-support"] }
 st0x-evm = { workspace = true, features = ["mock", "test-support"] }

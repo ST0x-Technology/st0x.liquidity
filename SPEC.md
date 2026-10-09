@@ -119,6 +119,9 @@ and the system proves market fit.
     `[rebalancing.usdc.corridors.<chain>]` with its `hop`, `target` and
     `deviation`; the chain's cash vault, per-transfer limit and confirmations
     come from the chain's own tables. Today the only corridor is Base via CCTP.
+  - Each corridor's transfers run on its own chain's orderbook, vault, wallet
+    and gas check, and the USDC check runs every active corridor in chain order,
+    each against its own band.
   - The corridor is recorded on each transfer when it starts. A transfer
     recorded before corridors existed reads as Base via CCTP, the only route
     there was.
@@ -126,6 +129,11 @@ and the system proves market fit.
     either direction, and at most one Alpaca-outbound transfer across all
     corridors, because Alpaca's withdrawable cash and its USDC inflight are
     shared. Releasing a transfer frees only the guard that transfer held.
+  - Each corridor's band is computed against the full Alpaca balance, and
+    chain-to-Alpaca transfers on different corridors are not yet sized against
+    each other, so two corridors in one tick can both move cash to Alpaca and
+    overshoot. A second corridor needs that sizing before it loads (part 3 of
+    the Robinhood corridor work).
 - **Complete Audit Trail**: All rebalancing operations tracked as events
   (CrossVenueEquityTransfer, CrossVenueCashTransfer)
 - **Integration**: Uses Alpaca for share/USDC management, Circle CCTP for
@@ -143,8 +151,44 @@ transfer stores and workers, and interrupted-transfer recovery — always starts
 
 Operators pause rebalancing with narrow, explicit controls:
 
+- **Per-asset `rebalancing = "paused"`**: the chain keeps everything the listing
+  needs to finish transfers already under way -- its equity services and startup
+  approvals -- and its inventory still counts in the planner's total, but the
+  planner starts no new mint or redemption on it (`paused`). In-flight
+  transfers, their resume jobs and recovery run to completion, and startup with
+  an unfinished transfer on a paused chain succeeds. A mint persisted but never
+  received by the issuer is the exception: the bot does not replay its request
+  on a paused chain, because that would start a new mint. A lookup that finds no
+  mint does not prove the issuer never got it, so the mint stays `MintRequested`
+  with its reservation, the resume job errors until its retries run out and
+  pages, and the operator confirms with the issuer before
+  `transfer fail --kind mint`. Wallet polling and both wrapped and unwrapped
+  wallet recovery continue on that chain. Pausing does not release a symbol hold
+  that a recovery still owns. Switching between `enabled` and `paused` needs
+  only a restart. This is the switch to stop a chain's equity operations without
+  stranding anything. Because a paused chain's inventory still counts, the chain
+  must stay polled and readable: a stale or unpolled paused slot declines the
+  whole symbol (`chain_stale`/`chain_unpolled`), and a failed ratio read on it
+  fails that symbol's check. To take a chain with a degraded RPC or indexer out
+  of the total, pause it, wait until its in-flight transfers finish, and then
+  set it to `disabled`. Pausing does not move the chain's equity: the planner
+  skips paused chains and `transfer-equity` refuses a new transfer on them. To
+  move that equity elsewhere first, use the manual vault, unwrap, and redeem
+  commands (`vault-withdraw`, `unwrap-equity`, then `alpaca-redeem` with the
+  unwrapped quantity, see docs/cli-ops.md). The Raindex vault holds the wrapped
+  derivative; redeeming without unwrap sends the wrong token. Publish
+  `rebalancing = "paused"` only after this order: deploy the bot that reads
+  `paused`, merge the `t0/check.jq` validator change, then publish `paused`. On
+  rollback, restore the token value before downgrading the binary. The dashboard
+  currently shows paused and disabled listings with the same red rebalancing
+  indicator; verify the registry mode before you set `disabled`. It displays
+  settings for the primary chain only. A listing with rebalancing `enabled` or
+  `paused` also needs `wrapped_equity_recovery = "enabled"` on every chain.
 - **Per-asset `rebalancing = "disabled"`**: removes the asset from the trigger
-  whitelist. New equity rebalancing flows do not start for that asset.
+  whitelist. New equity rebalancing flows do not start for that asset. On a
+  secondary chain where no equity is `enabled` or `paused`, the chain's equity
+  services are not built, so startup refuses an unfinished transfer there; pause
+  first and let the work finish.
 - **Issuance freeze (`Frozen`)**: stops new mints for the asset during
   maintenance or corporate actions. When `freeze_check = "enabled"`, the freeze
   also stops new liquidity-initiated rebalancing flows for the asset. When
@@ -157,8 +201,10 @@ Operators pause rebalancing with narrow, explicit controls:
 - **Circuit breakers**: stop a transfer after repeated failures and alert the
   operator.
 
-None of these controls disable hedging, inventory visibility, or the recovery of
-in-flight transfers. A pause stops new rebalancing work only.
+None of these controls disable hedging or inventory visibility. They also keep
+the recovery of in-flight transfers, except on a secondary chain where every
+equity is `disabled`: there the equity services are not built, as described
+above. A pause stops new rebalancing work only.
 
 ##### Chain Roles: Hedged (Primary or Secondary) and Transport
 
@@ -167,43 +213,47 @@ Every chain the bot touches is declared under `[chains.<name>]` with a
 config carries a `[chains.<name>.trading]` table is a **hedged** chain: the bot
 runs a fill watcher against its order book, accounts its fills and hedges them
 with offsetting broker orders. Exactly one hedged chain must set
-`primary = true` on that table -- the **primary** chain anchors USDC rebalancing
-and the operator defaults (Base). The corridor table names the cash chain; until
-cash inventory is per corridor chain, the trigger, inventory and services of the
-cash path still run on the primary chain, so a corridor keyed by another chain
-is refused at load; equity rebalancing, hedging and vault balance polling happen
-on every hedged chain. Vault balance polling runs once per hedged chain, each on
-that chain's own Raindex service, its own chain-qualified vault registry and one
-pinned block, so every hedged chain's inventory slot is seeded and corrected. A
-secondary chain's fill updates that chain's own inventory slot: inventory is not
-fungible across chains. It schedules the symbol's equity check when that chain's
-listing rebalances the symbol, never the USDC check, which still runs on the
-primary chain; a hedge-only listing is prefunded and schedules neither. The
+`primary = true` on that table -- the **primary** chain anchors the operator
+defaults (Base). The corridor table names the cash chain, whichever hedged chain
+it is; the cash transfer executor runs on that chain's orderbook, vault, wallet
+and gas check. The cash inventory state is kept per corridor chain too: its
+trigger, inflight and busy marker address that chain's vault; equity
+rebalancing, hedging and vault balance polling happen on every hedged chain.
+Vault balance polling runs once per hedged chain, each on that chain's own
+Raindex service, its own chain-qualified vault registry and one pinned block, so
+every hedged chain's inventory slot is seeded and corrected. A secondary chain's
+fill updates that chain's own inventory slot: inventory is not fungible across
+chains. It schedules the symbol's equity check when that chain's listing
+rebalances the symbol, and the USDC check only when that chain is an active cash
+corridor's chain; a hedge-only listing is prefunded and schedules neither. The
 distinction exists so that fill watching and inventory polling can go
 multi-chain before rebalancing does: it names the chain the still-single-chain
-paths use. Equity rebalancing is already per chain (see Equity Allocation
-Planner); once the USDC corridors are too, `primary` shrinks to the operator's
-default chain, or is removed. Zero or multiple primary claimants fail startup
-with a named error. Chains without a trading table are **transport** chains
-(RPC + confirmations only, e.g. Ethereum while it only carries CCTP transfers).
-Watch settings are per chain: poll interval, ingestion cutoff, asset tables with
-per-chain enable/disable flags. The periodic position check sweeps a symbol when
-any hedged chain enables it and sizes the hedge with the tightest operational
-limit among those chains (one `Position` per symbol cannot say which chain its
-fills came from; the remainder is hedged on a later tick). Startup verifies
-every hedged chain (chain-id identity, cutoff support, and each token address
-the chain's role uses answering `decimals()` on that chain's own endpoint: every
-equity's wrapped share, plus the unwrapped token of each equity the chain
-rebalances) and any failure is fatal; degraded per-chain startup is deferred to
-the chain-disable work. Each probed equity token must report 18 decimals: every
-equity quantity the bot scales is 18-decimal share-wei, so a token at another
-precision is refused by name rather than honoured. The settlement stable is not
-probed: its decimals are pinned in code beside its address. Each wrapped share
-must additionally report the equity's configured unwrapped token as its ERC-4626
-`asset()` — the same attestation the tokenization preflight makes, which a
-hedge-only chain never reaches and a rebalancing secondary makes only for the
-equities that opt in — so a typo landing on another live token refuses startup
-instead of surfacing as the first unresolvable fill.
+paths use. Equity and cash rebalancing are per chain (see Equity Allocation
+Planner and USDC Rebalancing), so `primary` is otherwise only the operator's
+default chain. For now the primary must be Base, and any other primary fails
+startup with a named error: equity wallet polling and recovery read the Base
+wallet with the primary's token addresses. Zero or multiple primary claimants
+fail startup with a named error. Chains without a trading table are
+**transport** chains (RPC + confirmations only, e.g. Ethereum while it only
+carries CCTP transfers). Watch settings are per chain: poll interval, ingestion
+cutoff, asset tables with per-chain enable/disable flags. The periodic position
+check sweeps a symbol when any hedged chain enables it and sizes the hedge with
+the tightest operational limit among those chains (one `Position` per symbol
+cannot say which chain its fills came from; the remainder is hedged on a later
+tick). Startup verifies every hedged chain (chain-id identity, cutoff support,
+and each token address the chain's role uses answering `decimals()` on that
+chain's own endpoint: every equity's wrapped share, plus the unwrapped token of
+each equity the chain rebalances) and any failure is fatal; degraded per-chain
+startup is deferred to the chain-disable work. Each probed equity token must
+report 18 decimals: every equity quantity the bot scales is 18-decimal
+share-wei, so a token at another precision is refused by name rather than
+honoured. The settlement stable is not probed: its decimals are pinned in code
+beside its address. Each wrapped share must additionally report the equity's
+configured unwrapped token as its ERC-4626 `asset()` — the same attestation the
+tokenization preflight makes, which a hedge-only chain never reaches and a
+rebalancing secondary makes only for the equities that opt in — so a typo
+landing on another live token refuses startup instead of surfacing as the first
+unresolvable fill.
 
 The lifecycle is a strict ceiling over the chain's asset settings. The hedged
 chain with `primary = true` must be `active`; startup rejects an observe-only or
@@ -224,53 +274,67 @@ unavailable. Its vault balances are polled like any hedged chain's; automated
 rebalancing remains on Base.
 
 Robinhood Chain (chain id 4663, an Arbitrum Orbit L2) is declared the same way.
-The build provides fill ingestion, hedging, signing and gas valuation on it, and
-the shipped configuration runs it as a prefunded hedge-only secondary: fills on
-its orderbook are ingested, validated against USDG and hedged, while every asset
-keeps `rebalancing = "disabled"` and no inventory adapter is mapped. Its
-settlement stable is USDG at `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168` (6
-decimals), so it is the first chain whose stable CCTP cannot carry. It pays gas
-in ETH, so the Base Chainlink ETH/USD read values its gas and `active` is
-reachable without rebalancing assets; no wrapper or CCTP domain is wired, so it
-cannot be the primary chain. Base's `safe` cutoff is OP-Stack-only: a Robinhood
-trading table must use the `confirmations` cutoff with a depth covering
-parent-chain finality.
+The build provides fill ingestion, hedging, signing, gas valuation and equity
+rebalancing on it (the wrappers are deployed and Alpaca's issuer serves its
+`robinhood` network). Fills on its orderbook are ingested, validated against
+USDG and hedged, and Bebop's Robinhood hook is mapped as the inventory adapter,
+so its fills are attributed to Bebop. The production configuration runs it as an
+`active` secondary with the issuer's `redemption_wallet`, and rebalances against
+Alpaca the listings the pinned token file enables there (DNUT); every other
+listing keeps `rebalancing = "disabled"`. Staging watches the same inventory and
+runs it as a prefunded hedge-only secondary: every listing trades, and none
+rebalances. Its settlement stable is USDG at
+`0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168` (6 decimals), so it is the first
+chain whose stable CCTP cannot carry. It pays gas in ETH, so the Base Chainlink
+ETH/USD read values its gas and `active` is reachable. Rebalancing an equity
+there needs `active`. It has no CCTP domain, so it cannot rebalance cash or be
+the primary chain. Base's `safe` cutoff is OP-Stack-only: a Robinhood trading
+table must use the `confirmations` cutoff with a depth covering parent-chain
+finality.
 
 The tokenization services are built per hedged chain, never once for Base, on
 the chain's own signing wallet. The primary, and every secondary with at least
-one rebalancing-enabled equity (the same per-asset flags that make the chain
-require the equity-rebalancing capability), get the full set: an issuer client,
-wrapper and mint authorizer bound to that chain's wallet, orderbook, asset table
-and issuer redemption wallet, plus that chain's `[orchestrator.addresses]` entry
-when the section carries one; without the entry the chain's mint authorizer is
-disabled with a startup warning and only an orchestrator-mode mint fails (see
-Mint Recipient Authorization). Such a chain must have its own redemption wallet,
-or startup fails naming the chain. A **hedge-only** secondary -- a trading table
-whose equities all have `rebalancing = "disabled"` -- needs no issuer client,
-redemption wallet or mint authorizer: only its signer is kept, for the startup
-allowance work, and startup logs the chain as hedge-only. It still gets the
-read-only ERC-4626 ratio reader over its own asset table, because vault polling
-reads its market-making vaults like any hedged chain's and those hold wrapped
-vault shares the daily portfolio capture values in underlying units. The
-rebalancing trigger plans across every hedged chain's entry and dispatches each
-operation with its chain (see Equity Allocation Planner); the portfolio snapshot
-and the wrapped- and unwrapped-equity orphan-recovery aggregates still consume
-the primary chain's entry. A secondary listing that sets
-`wrapped_equity_recovery = "enabled"` is refused at load, naming the chain and
-symbol, since no recovery would claim its stranded tokens. A mint or redemption
-transfer resolves the entry of the chain its record names (see below). The
-tokenization preflight (below) runs once per hedged chain with that chain's
-wallet, orderbook and settlement stable, as does the stale-allowance revoke on
-each chain in managed inventory mode. The startup MAX approvals run on every
-hedged chain in either mode, but only the settlement-stable grant is
-unconditional: the equity grants (underlying to wrapper vault, wrapped token to
-the deposit spender) are made only on chains that rebalance equity, since a
-hedge-only secondary has no wrapper to approve. Both deposit grants name the
-spender that chain settles deposits through -- its orderbook in legacy inventory
-mode, its `RaindexInventory` in managed mode -- so the same two token identities
-are approved, and proved by the deploy gate, in either inventory mode. A hedged
-chain for which this build has no pinned settlement stable fails startup rather
-than borrowing another chain's address.
+one equity whose rebalancing is `enabled` or `paused` (the same per-asset flags
+that make the chain require the equity-rebalancing capability), get the full
+set: an issuer client, wrapper and mint authorizer bound to that chain's wallet,
+orderbook, asset table and issuer redemption wallet, plus that chain's
+`[orchestrator.addresses]` entry when the section carries one; without the entry
+the chain's mint authorizer is disabled with a startup warning and only an
+orchestrator-mode mint fails (see Mint Recipient Authorization). Such a chain
+must have its own redemption wallet, or startup fails naming the chain. A
+**hedge-only** secondary -- a trading table whose equities all have
+`rebalancing = "disabled"` -- needs no issuer client, redemption wallet or mint
+authorizer: only its signer is kept, for the startup allowance work, and startup
+logs the chain as hedge-only. It still gets the read-only ERC-4626 ratio reader
+over its own asset table, because vault polling reads its market-making vaults
+like any hedged chain's and those hold wrapped vault shares the daily portfolio
+capture values in underlying units. The rebalancing trigger plans across every
+hedged chain's entry and dispatches each operation with its chain (see Equity
+Allocation Planner). The daily portfolio snapshot still values only the Base
+wallet, so equity waiting for recovery in a secondary wallet is not in that
+capture. Wallet polling and wrapped and unwrapped equity recovery cover each
+chain whose equity services are built. Recovery reads that chain's wallet
+balances and resumes only a mint or redemption recorded on that chain, using its
+own wallet, wrapper, issuer, and orderbook. On every chain, an equity whose
+rebalancing is `enabled` or `paused` must also have
+`wrapped_equity_recovery = "enabled"`, or config loading refuses it by chain and
+symbol. A recovery-only listing (rebalancing `disabled`, recovery `enabled`) is
+admitted on every chain. On a secondary, its recovery runs only while that
+chain's equity services are built (another listing there is `enabled` or
+`paused`, or unfinished equity work names the chain); otherwise its wallet is
+not polled. A mint or redemption transfer resolves the entry of the chain its
+record names (see below). The tokenization preflight(below) runs once per hedged
+chain with that chain's wallet, orderbook and settlement stable, as does the
+stale-allowance revoke on each chain in managed inventory mode. The startup MAX
+approvals run on every hedged chain in either mode, but only the
+settlement-stable grant is unconditional: the equity grants (underlying to
+wrapper vault, wrapped token to the deposit spender) are made only on chains
+that rebalance equity, since a hedge-only secondary has no wrapper to approve.
+Both deposit grants name the spender that chain settles deposits through -- its
+orderbook in legacy inventory mode, its `RaindexInventory` in managed mode -- so
+the same two token identities are approved, and proved by the deploy gate, in
+either inventory mode. A hedged chain for which this build has no pinned
+settlement stable fails startup rather than borrowing another chain's address.
 
 The operator CLI selects its chain the same way. Every command that itself
 submits an onchain operation takes `--network` (default `base`) and runs on that
@@ -689,37 +753,37 @@ grants the one-time MAX approvals on every hedged chain with that chain's
 wallet: that chain's settlement stable to its deposit spender on every hedged
 chain, and each wrapped equity's underlying to its wrapper vault and wrapped to
 that same deposit spender -- the chain's orderbook in legacy inventory mode, its
-`RaindexInventory` in managed mode: on the primary every equity with trading or
-rebalancing enabled, on a secondary only the equities with rebalancing enabled,
-the same selection its tokenization preflight attests (a hedge-only secondary
-has no wrapper to approve, so its allowance work is the settlement-stable grant
-alone). Only when rebalancing is configured does it also revoke any stale
-orderbook allowance, per chain in managed inventory mode, the same way (also
-after those nonce restores), and a tokenization preflight runs per hedged chain,
-read-only: the chain's issuer redemption wallet must be configured, and every
-preflighted equity's configured vault must report the configured underlying as
-its `asset()` (the same attestation a redemption's unwrap step performs). The
-preflighted equities are, on the primary, every trading- or rebalancing-enabled
-equity (the bot may wrap or redeem any of them there), and on a secondary only
-its rebalancing-enabled equities; a hedge-only secondary is skipped with a log
-line and has no redemption-wallet requirement. Each failure is fatal and names
-the chain and, where one applies, the symbol. Then, on every preflighted chain
-with no `[orchestrator.addresses]` entry, the preflight asks issuance's
-per-asset status endpoint (the freeze gate's endpoint, through the same client)
-for each preflighted equity's `vault_mode` and refuses startup naming the chain
-and symbol when one is orchestrator-mode: its first mint would stall at the
-signing step. Chains with an entry are not queried: the entry is the only
-prerequisite this bot can see, and the Turnkey `MintAuth` policy for that chain
-stays invisible at startup, so a missing policy fails the first
-orchestrator-mode mint at signing rather than at preflight. An indeterminate
-mode (issuance unreachable, asset unknown to issuance) is warned about per chain
-and symbol rather than refused: rebalancing mode never requires issuance to be
-reachable at startup (the freeze gate fails closed per cycle and has its own
-`freeze_check` escape hatch for an issuance outage), and the per-mint mode read
-fails closed on its own: a mint whose mode cannot be read stops at mode
-discovery, before any signing. The signing-step failure is the last line only
-for a known orchestrator-mode mint without its chain's entry or `MintAuth`
-policy.
+`RaindexInventory` in managed mode: on the primary every equity with trading
+enabled or rebalancing enabled or paused, on a secondary only the equities with
+rebalancing enabled or paused, the same selection its tokenization preflight
+attests (a hedge-only secondary has no wrapper to approve, so its allowance work
+is the settlement-stable grant alone). Only when rebalancing is configured does
+it also revoke any stale orderbook allowance, per chain in managed inventory
+mode, the same way (also after those nonce restores), and a tokenization
+preflight runs per hedged chain, read-only: the chain's issuer redemption wallet
+must be configured, and every preflighted equity's configured vault must report
+the configured underlying as its `asset()` (the same attestation a redemption's
+unwrap step performs). The preflighted equities are, on the primary, every
+equity with trading enabled or rebalancing enabled or paused (the bot may wrap
+or redeem any of them there), and on a secondary only its equities with
+rebalancing enabled or paused; a hedge-only secondary is skipped with a log line
+and has no redemption-wallet requirement. Each failure is fatal and names the
+chain and, where one applies, the symbol. Then, on every preflighted chain with
+no `[orchestrator.addresses]` entry, the preflight asks issuance's per-asset
+status endpoint (the freeze gate's endpoint, through the same client) for each
+preflighted equity's `vault_mode` and refuses startup naming the chain and
+symbol when one is orchestrator-mode: its first mint would stall at the signing
+step. Chains with an entry are not queried: the entry is the only prerequisite
+this bot can see, and the Turnkey `MintAuth` policy for that chain stays
+invisible at startup, so a missing policy fails the first orchestrator-mode mint
+at signing rather than at preflight. An indeterminate mode (issuance
+unreachable, asset unknown to issuance) is warned about per chain and symbol
+rather than refused: rebalancing mode never requires issuance to be reachable at
+startup (the freeze gate fails closed per cycle and has its own `freeze_check`
+escape hatch for an issuance outage), and the per-mint mode read fails closed on
+its own: a mint whose mode cannot be read stops at mode discovery, before any
+signing. The signing-step failure is the last line only for a known
+orchestrator-mode mint without its chain's entry or `MintAuth` policy.
 
 Right after it restores each of those signed sends, startup rebroadcasts its
 exact bytes ("already known" is success; it does not wait for a confirmation),
@@ -1474,15 +1538,11 @@ migration files in `migrations/`.
   enqueue failure during wrap confirmation is never misclassified as a
   wrap/deposit failure that would hand a healthy mint off to
   `UnwrappedEquityRecovery`. The wrapped/unwrapped equity-recovery aggregates'
-  `DispatchToMint`/`DispatchToRedemption` handoff to a mint/redemption resume is
-  the remaining swallowing site: a bot-gas enqueue failure there is folded into
-  the aggregate's normal `RecoveryFailed` event rather than redriven, because
-  `WrappedEquityRecoveryJob` (and, for consistency, its unwrapped twin) has no
-  resume arm for the `Detected` state a redrive would land back on -- redriving
-  would re-send `Detect`, which is rejected as `AlreadyInitialized`, stranding
-  the aggregate non-terminal and permanently blocking rebalancing for the symbol
-  (see "Known gaps" below). This differs from a downstream job's own execution
-  failures, which dead-letter without blocking the caller
+  `DispatchToRedemption` handoff to a redemption resume is the remaining lossy
+  site: a bot-gas enqueue failure there keeps the hold and retries the resume,
+  but the retry does not re-record that gas fact (see "Known gaps" below). This
+  differs from a downstream job's own execution failures, which dead-letter
+  without blocking the caller
 - Every cross-venue transfer constructor requires an explicit bot-gas enqueuer.
   Production wiring passes the durable queue-backed enqueuer, while CLI and
   test-only construction sites must explicitly pass `Disabled`; there is no
@@ -1503,6 +1563,14 @@ migration files in `migrations/`.
   approvals and order management never surface a transaction hash to the
   recording call sites, and CLI operations run in a separate binary without the
   server's job queue
+- A wrapped or unwrapped recovery whose active mint or redemption fails to
+  resume with a retryable error (RPC, confirmation, gas, node sync, a transient
+  issuer API error, a local write, including bot-gas enqueue failures) leaves
+  its recovery record in `Detected`, retains the symbol's recovery hold, and
+  retries the same job with a delay. A permanent error (missing mint or
+  redemption, broken invariant, revert, issuer rejection, config gap) records
+  `RecoveryFailed` and ends the hold. Hold alerts keep their original deadline
+  and can fire while a recovery attempt owns the slot.
 - Known gaps (deliberately deferred, tracked as follow-up work rather than
   blocking this feature): gas paid by reverted non-CCTP-burn transactions is not
   recorded, a mint's vault-deposit crash-recovery path (the narrow window
@@ -1511,18 +1579,22 @@ migration files in `migrations/`.
   sentinel, in which case that deposit's gas cost is permanently lost (logged
   loudly, not silently) rather than recorded, and the wrapped/unwrapped
   equity-recovery aggregates' `DispatchToMint`/ `DispatchToRedemption` handoff
-  swallows a bot-gas enqueue failure into `RecoveryFailed` (permanently losing
-  that mint/redemption-resume gas fact) rather than redriving it, because
-  `WrappedEquityRecoveryJob` has no resume arm for the `Detected` state a
-  redrive would land back on -- redriving would re-send `Detect`, rejected as
-  `AlreadyInitialized`, stranding the aggregate non-terminal.
-  `UnwrappedEquityRecoveryJob` already resumes safely from `Detected`
-  (`resume_from_detected`), but its aggregate folds the failure the same way for
-  consistency with its wrapped twin pending the fix below. The proper fix is to
-  add a `Detected` resume arm to `WrappedEquityRecoveryJob` mirroring
-  `UnwrappedEquityRecoveryJob::resume_from_detected`, after which both
-  aggregates can safely redrive this handoff again -- so `/pnl`'s bot-gas line
-  is a lower bound on actual gas spend, not an exact figure
+  retries the resume after a bot-gas enqueue failure without re-recording that
+  mint/redemption-resume gas fact, so the fact is lost. Both jobs now resume
+  from `Detected`. The wrapped job skips `Detect`. A record whose shares changed
+  fails as stale (`FailStaleDetection`) and queues one replacement detection
+  under an idempotent key; if that enqueue fails, the job errors, and its retry
+  finds the stale record and queues the replacement again. A record whose active
+  transfer no longer validates fails with `FailInvalidDetection`, alerts, and
+  keeps any existing hold, with no replacement. The unwrapped resume path does
+  not match that, and this is a defect, not a deliberate gap: a validation
+  failure there sends `FailRecovery`, returns `Ok`, and `perform` releases the
+  hold, so a `HeldForRecovery` slot can drop while tokens are still in the
+  wallet. It is part of the equity recovery work of
+  [RAI-2596](https://linear.app/makeitrain/issue/RAI-2596). The remaining
+  bot-gas fix is to propagate that enqueue failure from both aggregates and let
+  the shared redrive handle it. Until then `/pnl`'s bot-gas line is a lower
+  bound on actual gas spend, not an exact figure
 
 #### Reporting and Analysis
 
@@ -1820,27 +1892,48 @@ margin would become genuinely uncounted capital.
 
 **USD marks**: the settlement stable (USDC today) is treated as par (`1:1`),
 matching the reporting-currency assumption used elsewhere in `/pnl`. Equity
-balances are marked from the symbol's
-`Position.last_price: Option<PriceObservation>` as of capture time. A
-`PriceObservation` carries the fill-derived USD price and the time that price
-was economically observed: `OnChainOrderFilled` uses the fill's
-`block_timestamp`, and a priced `ManualPositionAdjusted` uses `adjusted_at`.
-This is distinct from `last_updated`, which is also advanced by non-price
-events. A symbol with a balance but no observed price is recorded with
-`usd_mark = NULL` -- never a fabricated zero. A missing or stale mark does not
-block the immutable balance capture; it immediately emits an error, increments
-an operational counter, and begins sending an operator alert through the
-configured alerting channel. In-process alert delivery cannot fail: the
-production notifier emits a structured ERROR log and its error type is
-uninhabited outside test builds, so getting the event to a human is the logging
-pipeline's responsibility (see "Structured log channel"). The per-symbol
-delivery event, the alert-only retry queue, and the bounded retry backoff are
-retained as a transport seam -- they are exercised only by test doubles that
-simulate a fallible notifier, and they would become load-bearing again if a
-fallible transport ever returns. Successful per-symbol delivery is still
-recorded as a retained aggregate event, and a crash in the narrow interval after
-the notifier accepts a message but before the delivery event commits may produce
-a duplicate log line rather than lose the incident.
+balances are marked at the newer, by observation time, of two prices of one
+underlying share, as of capture time; on a tie the fill wins:
+
+- the symbol's `Position.last_price: Option<PriceObservation>`. A
+  `PriceObservation` carries the fill-derived USD price and the time that price
+  was economically observed: `OnChainOrderFilled` uses the fill's
+  `block_timestamp`, and a priced `ManualPositionAdjusted` uses `adjusted_at`.
+  This is distinct from `last_updated`, which is also advanced by non-price
+  events.
+- the last underlying mark the pricing service sent this session (the midpoint
+  of the quote's underlying rates, stamped with the quote's source time). The
+  bot keeps it after the live quote expires and across pricing disconnects, so a
+  capture at ET midnight or at a weekend still finds a recent mark. It is
+  process-local: after a restart or config reload, a symbol has no pricing mark
+  until pricing quotes it again, and the fill alone values it meanwhile. It is
+  pricing's model mid, not a closing price, so it can differ from an operator's
+  repair mark (below).
+
+While pricing quotes a symbol, its mark is usually newer than the last fill, so
+in practice quoted symbols are valued at pricing's mid and a symbol that has not
+filled for weeks no longer goes stale. The staleness rule below applies to
+whichever price was chosen. For a pricing mark it detects a pricing outage only:
+the pricing service stamps every in-session publish with a fresh source time,
+even when the upstream price is unchanged, so an upstream price that stays
+frozen while pricing keeps publishing it never reads as stale. That costs at
+most a wrong capital denominator in `/pnl`, never a trade; detecting it would
+need pricing to send the market data's own observation time. A symbol with a
+balance but neither price is recorded with `usd_mark = NULL` -- never a
+fabricated zero. A missing or stale mark does not block the immutable balance
+capture; it immediately emits an error, increments an operational counter, and
+begins sending an operator alert through the configured alerting channel.
+In-process alert delivery cannot fail: the production notifier emits a
+structured ERROR log and its error type is uninhabited outside test builds, so
+getting the event to a human is the logging pipeline's responsibility (see
+"Structured log channel"). The per-symbol delivery event, the alert-only retry
+queue, and the bounded retry backoff are retained as a transport seam -- they
+are exercised only by test doubles that simulate a fallible notifier, and they
+would become load-bearing again if a fallible transport ever returns. Successful
+per-symbol delivery is still recorded as a retained aggregate event, and a crash
+in the narrow interval after the notifier accepts a message but before the
+delivery event commits may produce a duplicate log line rather than lose the
+incident.
 
 Captured marks are immutable facts, but operators may correct a missing or stale
 historical mark through the portfolio-snapshot `set` recovery command. The
@@ -1937,13 +2030,21 @@ edit that only the deployed service can judge is a config edit whose first check
 is a bot that will not boot, which is what the `validate-config` binary exists
 to prevent.
 
-`validate-config --config <path> [--secrets <path>] [--registry-file <path>]`
+`validate-config --config <path> [--secrets <path>] [--registry-file <path>]
+[--registry-state <dir>]`
 runs the boot path's validation and exits 0 or 1, writing a plain-text report to
-stdout and the failure with its cause chain to stderr. It starts no server,
-opens no database, and reaches no external service in either mode. A config that
-names `[registry]` keeps its per-symbol tables in the token file in the bucket;
-`--registry-file` supplies a local copy so they are checked too. Without it the
-config is judged without them and the report says so.
+stdout and the failure with its cause chain to stderr. It starts no server and
+opens no database. A config that names `[registry]` keeps its per-symbol tables
+in the token file in the bucket; `--registry-file` supplies a local copy so they
+are checked too. Without either registry option the config is judged without
+them and the report says so; config-only validation and `--registry-file` checks
+reach no external service.
+
+`--registry-state` judges the copies a restart would boot: the running record,
+or a pending record together with the fallback that would keep its added
+listings. It reads the state without writing it. It reads the bucket only when
+the config pins a `generation` (the pin is what boots) or the state directory
+holds no record yet (the latest copy is what a first boot records).
 
 The two modes differ only in how much of the input they have:
 
@@ -1985,8 +2086,12 @@ rule fails startup with a named error:
 6. `hop = "relay"` on any chain: this build has no Relay hop.
 7. USDC mode enabled and a chain that is not disabled, whose cash table enables
    rebalancing, has no corridor table: there is no implicit corridor.
-8. A corridor chain other than the primary chain, until the inventory addresses
-   each corridor's chain.
+8. No served corridor while a hedged chain has a cash table. The build serves
+   every corridor table, whatever the mode, and Base via CCTP whenever Base is a
+   hedged chain with a cash vault, so in-flight Base transfers always recover. A
+   config that holds cash but serves neither has no service to move it; one with
+   no cash table at all (the s01 CLI config) loads, and the bot refuses it at
+   startup.
 9. Transitional: `target` or `deviation` still set directly under
    `[rebalancing.usdc]` and different from the corridor's value. The released
    image reads those two keys and ignores the corridor tables, so both stay in
@@ -2021,23 +2126,57 @@ config's TOML table before it is deserialized, so every rule in
 `retired_symbols` is dropped at the merge, so retiring is one config change and
 the file's rows can go afterwards.
 
-Production pins `generation`: every roll of a release runs the same object, and
-a token change ships only with a release that bumps the pin. Staging reads the
-latest copy at every start, a crash restart included, so a staging token change
-takes effect without the deploy gates: `verify-migrations` does not run, and
-nothing refuses a file that drops a symbol the database still references. The
-order in "Retiring an asset" in `docs/how-to-add-new-asset.md` (retire in the
-config first, remove the rows after) is the only guard. A refresh loop reads the
-bucket every 60 s and never applies a change; it reports
-`registry_pending_restart` (the latest published copy differs from the running
-tables), `registry_invalid` (the copy the next start would read, the pin in
-production and the latest in staging, is gone, refused to the service account
-with a 401 or 403, too large, or would be refused), `registry_latest_refused`
-(the latest copy would be refused at boot; with a pin it is the copy a pin bump
-would move to) and `registry_fetch_errors_total` (transient read failures: the
-metadata token, 429, 5xx, the network). `verify-migrations` and
-`verify-approvals` read the same file, from the bucket on the VM or from
-`--registry-file` elsewhere.
+Token-file updates use a validated graceful process restart, so every model,
+poller, cache, subscription and per-asset service is rebuilt from one copy. The
+watcher polls bucket metadata every 10 seconds, downloads the exact observed
+generation and verifies its size and MD5. It runs boot config validation,
+refuses an existing listing's token-address changes, probes newly configured
+contracts and newly selected tokenization routes, and verifies changed startup
+approval targets read-only. Invalid bytes are refused per generation; transient
+RPC failures and missing Turnkey coverage are deferred and retried.
+
+A listing removed from the file is carried forward with trading, rebalancing and
+extended-hours counter-trading disabled. Its wrapped-equity recovery stays as it
+was, so tokens that unfinished work leaves in its wallet can still be recovered.
+Carried rows survive subsequent reloads and restarts until a reviewed
+`retired_symbols` config release removes them. New work follows the switches
+immediately; durable transfers and recoveries already admitted retain the
+services they need to finish. Already queued hedges still cover their accepted
+fills.
+
+The accepted source and effective token files are immutable, hash-verified
+records in `registry/` beside the database, with an atomically replaced
+manifest. The server alone claims boot attempts and writes this state. An
+accepted copy becomes pending before the SIGTERM drain path requests process
+exit 75; the container supervisor restarts it. Boot reads the persisted copy
+rather than the bucket's latest content. After startup and ten minutes of uptime
+it becomes last-good. Two failed pending boots fall back to last-good plus the
+listings added by pending, carried as above, retaining durable references. Clean
+shutdowns during the soak do not consume another attempt. Failed candidates can
+retry after backoff. Effective no-ops advance the generation without restarting,
+and reloads are separated by at least two minutes.
+
+The CLI reads running state without writing it. Deploy gates accept
+`--registry-state /mnt/data/registry`: they validate both pending and its
+fallback when pending exists, and running otherwise. The deployment writes a
+hold containing its id and creation timestamp before gates, preventing a new
+pending copy between validation and shutdown. The activation that wrote the hold
+removes it on exit, after the new service reports readiness or after a failure.
+Server boot leaves it in place, so an old service that restarts during the gates
+cannot accept a publication behind them. Holds expire after fifteen minutes. A
+local `--registry-file` overrides state for offline checks.
+
+Rollout retains the production generation pin while the persisted state and
+reload code are seeded from the reviewed pin; the pinned watcher remains
+report-only. Removing the pin is a separate release after the t0.devops compose
+gates pass the state path and create/clean up holds. The final configuration
+follows latest and refuses the generation key. Until that release, production
+still needs a pin bump to apply new token rows.
+
+Metrics expose applied generation, invalid latest content, reload outcomes and
+last outcome timestamps, carried-forward rows, completion-only services,
+deployment hold age and transient fetch errors. Refused content, failed startup
+and fallback log the generation, hash and reason. See `docs/observability.md`.
 
 #### Tools
 
@@ -2099,31 +2238,31 @@ systemd unit:
   chain's settlement stable to its deposit spender -- its orderbook in legacy
   inventory mode, its `RaindexInventory` in managed mode -- plus equity token to
   wrapper and wrapper to that same deposit spender for every equity the chain
-  wraps in its role: trading or rebalancing enabled on the primary, rebalancing
-  enabled on a secondary) is covered by an allow policy whose consensus the
-  authenticated API user can satisfy alone and whose target condition provably
-  applies on that chain's id. Applicable deny policies take precedence; unknown
-  allow or deny applicability, unsupported consensus, a hedged chain with no
-  pinned settlement stable, and missing coverage fail closed, naming the chain,
-  symbol, token contract, and spender. Only after both gates pass may activation
-  stop the old process and install the candidate files, so a policy or config
-  failure leaves the running bot untouched; a failed stop aborts before
-  candidate files are installed. It then verifies migrations, chowns data files,
-  writes the git-rev marker, touches the activation marker, and restarts the
-  unit. The server writes its PID to a systemd-managed runtime-directory file
-  only after Conductor has completed startup initialization and every essential
-  supervised runtime task has reached a pending run state. Activation waits for
-  that PID to match the unit's live main process with a bounded startup timeout.
-  If the process exits, readiness reporting fails, or the timeout expires first,
-  activation prints the unit status and recent journal, exits non-zero, and
-  deploy-rs rolls the profile back. The unit remains `Type=simple` so automatic
-  rollback stays compatible with service generations from before the readiness
-  handshake was introduced. The first rollout requires deploying the system
-  profile before the service profile; a service-only deploy verifies the
-  installed unit exposes the expected ready file before stopping the running bot
-  and otherwise fails immediately with the required rollout order. Outside
-  systemd, the server uses a no-op readiness notifier so local runs remain
-  available.
+  wraps in its role: trading enabled or rebalancing enabled or paused on the
+  primary, rebalancing enabled or paused on a secondary) is covered by an allow
+  policy whose consensus the authenticated API user can satisfy alone and whose
+  target condition provably applies on that chain's id. Applicable deny policies
+  take precedence; unknown allow or deny applicability, unsupported consensus, a
+  hedged chain with no pinned settlement stable, and missing coverage fail
+  closed, naming the chain, symbol, token contract, and spender. Only after both
+  gates pass may activation stop the old process and install the candidate
+  files, so a policy or config failure leaves the running bot untouched; a
+  failed stop aborts before candidate files are installed. It then verifies
+  migrations, chowns data files, writes the git-rev marker, touches the
+  activation marker, and restarts the unit. The server writes its PID to a
+  systemd-managed runtime-directory file only after Conductor has completed
+  startup initialization and every essential supervised runtime task has reached
+  a pending run state. Activation waits for that PID to match the unit's live
+  main process with a bounded startup timeout. If the process exits, readiness
+  reporting fails, or the timeout expires first, activation prints the unit
+  status and recent journal, exits non-zero, and deploy-rs rolls the profile
+  back. The unit remains `Type=simple` so automatic rollback stays compatible
+  with service generations from before the readiness handshake was introduced.
+  The first rollout requires deploying the system profile before the service
+  profile; a service-only deploy verifies the installed unit exposes the
+  expected ready file before stopping the running bot and otherwise fails
+  immediately with the required rollout order. Outside systemd, the server uses
+  a no-op readiness notifier so local runs remain available.
 - `dashboard` (kind = `static`) - frontend assets served by nginx; the deploy
   step is `systemctl reload nginx` and there is no managed systemd unit.
 - `datasette` (kind = `plain`) - read-only SQLite explorer over the hedge DB.
@@ -2138,6 +2277,22 @@ Each profile is independently deployable and rollback-able without affecting
 others. Units use a `/run/st0x/<name>.ready` marker file gated by
 `ConditionPathExists` so they only start after the per-service profile has
 finished activation, never on a bare `nixos-rebuild switch`.
+
+_Migration and replay verification_:
+
+Migration verification checks that every aggregate type persisted in either the
+event store or snapshots, including framework-maintained aggregate types, has a
+replay check under the candidate code. These types are discovered before
+clearing stale snapshots, so a snapshot-only type cannot disappear from the
+coverage check. An uncovered type fails the deploy gate and is named in the
+report. Covered compacted inventory snapshots remain available for
+reconstruction; retained event streams replay without their cached snapshots.
+Verification never mutates the source database.
+
+Removing an aggregate from runtime code does not retire its durable history. An
+uncovered retired type needs compatibility replay support so that its retained
+events and snapshots remain verifiable; the coverage guard is not permission to
+delete retained events or ignore their type.
 
 _Configuration management_:
 
@@ -2184,6 +2339,13 @@ corridor has run; once two corridors have run transfers at the same time, do not
 roll back below the first per-corridor release. It must therefore ship in a
 release before the first config that can run two corridors
 ([RAI-2488](https://linear.app/makeitrain/issue/RAI-2488)).
+
+Rollback floor for wrapped-equity recovery: `StaleDetectionFailed` and
+`InvalidDetectionFailed` are new persisted event variants. Once either is
+stored, a rollback to a previous binary cannot deserialize that event, and
+replay of that recovery fails (`SCHEMA_VERSION` only clears snapshots). Additive
+`chain` fields on the other events are ignored by older readers. Do not roll
+back below this release after a wrapped recovery has stored either event.
 
 #### CI/CD Credential Management
 
@@ -2510,11 +2672,24 @@ An aggregate may opt into event compaction only when all of these are true:
 
 Eligible aggregate types:
 
-- `InventorySnapshot`: enabled for compaction.
+- `InventorySnapshot`: enabled for compaction. Its snapshots are the durable
+  source for pruned observations, so adding chain wallet and in-flight maps uses
+  defaulted optional fields and retains its existing schema version. Do not
+  invalidate those snapshots or prune them to force event replay: older events
+  may already be gone. Both normal and forced snapshot application restore the
+  chain maps; legacy Base observations retain their compatibility path.
 - `VaultRegistry`: eligible only if a future PR also provides a snapshot-aware
   projection rebuild path.
 
 All other aggregates retain events unless this section is updated first.
+
+Compaction deletes event rows, so the event store never reuses a rowid: `events`
+takes its rowid from `AUTOINCREMENT`, and a number handed out after the
+migration that introduced it is never handed out again. Readers may use
+`events.rowid` as a global cursor (the PnL ledger checkpoint, `asOfRowid`)
+without knowing which aggregates compact. Numbers deleted before that migration
+above both the highest surviving rowid and the ledger checkpoint may be handed
+out once more (ADR 0025).
 
 **Grafana Dashboard Strategy**: Views use SQLite generated columns to expose
 JSON fields as queryable columns. Specialized views can pre-compute complex
@@ -3084,6 +3259,28 @@ enum TriggerReason {
   reservation exists, and the current net position is below the hedge threshold.
   A nonzero position whose dollar threshold cannot be valued is rejected
   fail-closed.
+- One exception to the hedge threshold: a redemption is admitted over a due sell
+  hedge that the broker can place none of. The trigger passes the broker's sell
+  capacity, counted as the broker counts it for an asset it trades only in whole
+  shares: available shares truncated to whole shares, less the hedge floor
+  rounded up to whole shares. That count is never above what the broker would
+  sell, so a starved hedge always reads as starved. The aggregate admits the
+  redemption only when the count is zero. While the broker can sell some, that
+  partial hedge goes first; once it fills, the count reads zero and the
+  redemption that brings the rest of the shares is admitted, so neither waits on
+  the other. The hedge still waits for the reservation to release. A mint, a buy
+  hedge, or a sell the broker can place any of keeps the strict rule. A
+  redemption that released its reservation to wait for gas restores it under the
+  same rule: the gas refusal comes before the redemption exists, so it is no
+  active transfer and the position checks still place the partial hedge first.
+  With no broker reading the capacity is unknown, not zero: the trigger reserves
+  under the strict rule and a restoring job waits and retries. A job reads the
+  capacity only to recreate a missing reservation, so one that still holds its
+  reservation never depends on that read, and a failed read defers the job
+  instead of failing it.
+- Each trigger reservation that Position rejects for a needed hedge increments
+  `equity_plan_declined_total{reason="blocked_by_hedge"}`, so a symbol held
+  behind a hedge is visible apart from an idle one.
 - `PlaceOffChainOrder` is rejected while any transfer reservation owns the
   symbol. A newly committed onchain fill invalidates an unconfirmed reservation;
   confirmation of that exact ID must succeed immediately before the transfer job
@@ -3580,11 +3777,16 @@ Arc<dyn Tokenizer>, wrapper: Arc<dyn Wrapper> }`
 stateDiagram-v2
     [*] --> VaultWithdrawSubmitting: Redeem (persists signed transaction)
     VaultWithdrawSubmitting --> VaultWithdrawSubmitted: RecordWithdrawSubmission
+    VaultWithdrawSubmitting --> VaultWithdrawSubmitted: AdoptWithdrawalReplacement
+    VaultWithdrawSubmitted --> VaultWithdrawSubmitted: AdoptWithdrawalReplacement
     VaultWithdrawSubmitted --> WithdrawnFromRaindex: ConfirmWithdraw
     WithdrawnFromRaindex --> TokensUnwrapped: Unwrap
     WithdrawnFromRaindex --> Failed
-    TokensUnwrapped --> TokensSent: Send
+    TokensUnwrapped --> SendPending: PrepareSend (persists signed send)
     TokensUnwrapped --> Failed
+    SendPending --> SendPending: ReplaceSend (persists fee replacement)
+    SendPending --> TokensSent: SendTokens (a candidate mined and succeeded)
+    SendPending --> Failed: SendTokens (the mined candidate reverted)
     TokensSent --> Pending
     TokensSent --> Failed
     Pending --> Completed
@@ -3606,7 +3808,16 @@ stateDiagram-v2
   records the token the vault reports as its `asset()` at the redeem block as a
   typed `UnwrappedToken`
 - `TokensUnwrapped` tracks the attested `UnwrappedToken` ready to send
-- `Send` sends unwrapped tokens to Alpaca and polls until terminal
+- `PrepareSend` persists the signed transfer to Alpaca's redemption wallet and
+  its destination (`SendPrepared`) before any broadcast, moving to `SendPending`
+- `ReplaceSend` persists a fee replacement of that transfer, signed at the same
+  nonce, before its first broadcast (`SendReplaced`); every candidate shares one
+  nonce, so at most one mines
+- `SendTokens` rebroadcasts the newest candidate and confirms whichever
+  candidate mines: success records `TokensSent`, a revert records
+  `TransferFailed` with its decoded cause. It never signs a new transfer
+- `SendPending` is never failed on timeout; it ends through `SendTokens` or an
+  operator `Reconcile` after a chain check (see below)
 - `TokensSent` tracks tokens that have been sent to Alpaca's redemption wallet
 - `Pending` indicates Alpaca detected the transfer
 - `Completed` and `Failed` are terminal states
@@ -3635,10 +3846,14 @@ enum EquityRedemption {
         wrapped_amount: U256,
         tx_hash: TxHash,
         // Retained so restart can restore nonce ownership before any wallet send.
-        // None only when replaying an event from before version 9; the nonce
-        // restores by transaction hash, but the exact bytes cannot be rebroadcast.
+        // None only when replaying an event from before version 9, or after an
+        // adoption; the nonce restores by transaction hash, but the exact bytes
+        // cannot be rebroadcast.
         prepared: Option<PreparedTransaction>,
         submitted_at: DateTime<Utc>,
+        // The signed withdrawal an adoption replaced with tx_hash; None
+        // otherwise.
+        adopted_from: Option<TxHash>,
     },
     WithdrawnFromRaindex {
         symbol: Symbol,
@@ -3658,6 +3873,30 @@ enum EquityRedemption {
         unwrapped_amount: U256,
         withdrawn_at: DateTime<Utc>,
         unwrapped_at: DateTime<Utc>,
+    },
+    SendPending {
+        symbol: Symbol,
+        chain: Chain,
+        quantity: Decimal,
+        token: Address,
+        underlying_token: UnwrappedProvenance,
+        raindex_withdraw_tx: TxHash,
+        unwrap_tx_hash: TxHash,
+        unwrapped_amount: U256,
+        unwrap_block: Option<u64>,
+        withdrawn_at: DateTime<Utc>,
+        unwrapped_at: DateTime<Utc>,
+        // The signed send and its destination, persisted before its first
+        // broadcast. None only for a legacy SendPending, whose earlier binary
+        // may already have broadcast an unrecorded transfer.
+        prepared_send: Option<PreparedRedemptionSend>,
+        // Fee replacements of prepared_send, oldest first.
+        send_replacements: Vec<PreparedTransaction>,
+        // When the newest candidate was signed; None for a legacy row.
+        last_send_signed_at: Option<DateTime<Utc>>,
+        // When the send was first signed; fee replacements stop once
+        // transfer_timeout has passed since then. None for a legacy row.
+        first_send_signed_at: Option<DateTime<Utc>>,
     },
     TokensSent {
         symbol: Symbol,
@@ -3721,7 +3960,17 @@ enum EquityRedemptionCommand {
     ConfirmWithdraw,
     // Unwraps ERC-4626 wrapped tokens after Raindex withdrawal
     UnwrapTokens,
-    // Sends unwrapped tokens to Alpaca's redemption wallet
+    // Persists the signed transfer to Alpaca's redemption wallet, without
+    // broadcasting it. Valid from TokensUnwrapped.
+    PrepareSend {
+        prepared: PreparedTransaction,
+        redemption_wallet: Address,
+    },
+    // Persists a fee replacement of the persisted send, signed at its nonce,
+    // without broadcasting it. Recording a known candidate again is a no-op.
+    ReplaceSend { replacement: PreparedTransaction },
+    // Rebroadcasts the newest persisted candidate and confirms whichever
+    // candidate mines. Never signs a new transfer.
     SendTokens,
     // Alpaca detected the token transfer
     Detect { tokenization_request_id: TokenizationRequestId },
@@ -3733,6 +3982,14 @@ enum EquityRedemptionCommand {
     RejectRedemption { reason: String },
     // Operator or timeout-driven failure before the tokens leave custody
     FailTransfer { reason: String },
+    // Operator adoption of a mined tx that took the signed withdrawal's nonce
+    // and did the withdrawal itself; the bot checks it on chain first.
+    AdoptWithdrawalReplacement {
+        replacement_tx: TxHash,
+        // The signed withdrawal the caller checked the replacement against.
+        replaced_withdrawal: TxHash,
+        reason: String,
+    },
 }
 ```
 
@@ -3790,6 +4047,24 @@ enum EquityRedemptionEvent {
         unwrapped_at: DateTime<Utc>,
     },
 
+    // Legacy: written by a binary that broadcast before recording the send.
+    // No longer emitted; such a row is never signed again and only an
+    // operator reconcile closes it.
+    SendPending {
+        pending_at: DateTime<Utc>,
+    },
+    // The signed send, persisted before any broadcast. A distinct event, so a
+    // binary that predates durable sends fails to load the stream instead of
+    // signing a second transfer.
+    SendPrepared {
+        pending_at: DateTime<Utc>,
+        prepared_send: PreparedRedemptionSend,
+    },
+    // A fee replacement of the send, persisted before its first broadcast.
+    SendReplaced {
+        replacement: PreparedTransaction,
+        replaced_at: DateTime<Utc>,
+    },
     TokensSent {
         redemption_wallet: Address,
         redemption_tx: TxHash,
@@ -3797,7 +4072,17 @@ enum EquityRedemptionEvent {
     },
     TransferFailed {
         tx_hash: Option<TxHash>,
+        // Why it failed (operator reason, or a reverted send's decoded cause).
+        reason: Option<String>,
         failed_at: DateTime<Utc>,
+    },
+    // Leaves the redemption in VaultWithdrawSubmitted with tx_hash =
+    // replacement_tx, no signed bytes, and the original submitted_at.
+    VaultWithdrawReplacementAdopted {
+        replacement_tx: TxHash,
+        replaced_tx: TxHash,
+        reason: String,
+        adopted_at: DateTime<Utc>,
     },
 
     Detected {
@@ -3825,16 +4110,110 @@ enum DetectionFailure {
     // operator's --reason so the audit trail records why.
     Operator { reason: String },
 }
+
+// The signed transfer and the issuer redemption wallet it pays.
+struct PreparedRedemptionSend {
+    prepared: PreparedTransaction,
+    redemption_wallet: Address,
+}
 ```
+
+Equity redemption sends to the issuer reserve a wallet nonce and persist the
+signed transaction and destination in a `SendPrepared` event before
+broadcasting. The state stays `SendPending` and retains this identity: a crash
+after broadcast, receipt polling failure, or storage error resumes by
+rebroadcasting the same envelope rather than signing a second transfer.
+`SendPrepared` is a distinct event so a binary that predates durable sends fails
+to load the redemption instead of signing again. Signing and its write run on a
+detached task, so a cancelled caller cannot leave a reserved nonce with no
+stored send; a failed write releases the nonce only when the send provably never
+reached storage. Preparation attests a legacy underlying and waits for the
+unwrap block before signing; neither runs again before a rebroadcast. A legacy
+underlying the vault does not attest is permanent: the transfer and resume jobs
+page once and stop instead of spending their retry budget, and the redemption
+keeps its guard. A chain with no issuer redemption wallet cannot sign the send
+at all, so the redemption fails at once (`TransferFailed`) instead of holding
+its guard until `transfer_timeout`.
+
+A signed send is never signed again with a new nonce, but it can be fee-replaced
+at its own nonce. When its newest copy has stayed unmined for 3 minutes and the
+network's fee estimate has risen above that copy's max fee, the next drive
+re-signs the same transfer (same recipient, value, calldata and gas limit) at
+the same nonce with each fee the larger of the estimate and the old fee plus
+15%, and persists it in a `SendReplaced` event before broadcasting it. Nothing
+is replaced while any copy has a receipt or a receipt lookup fails, nor once
+`transfer_timeout` has passed since the send was first signed: the operator is
+paged then (the page names the newest copy's fees) and may cancel the send at
+its nonce, which a later replacement could outbid. A replacement that fails to
+sign or persist is dropped and retried on the next drive. All copies share one
+nonce, so at most one lands. Each drive restores every copy's nonce hold, looks
+up the receipt of each replaced copy (one can still mine in place of its
+replacement), then rebroadcasts the newest and confirms it; `TokensSent` records
+whichever copy mined. A rebroadcast is best effort: whatever it returns, the
+newest copy's receipt is looked up, because some nodes reject an already mined
+transaction before their nonce check. Only a confirmed reverted receipt produces
+a transfer failure. Any other failure to drive a signed send, an uncertain
+outcome or not, is redriven without spending the job's retry budget: every 30
+seconds, and every 30 minutes once the newest copy has been unmined for 4 hours.
+A job whose budget is spent anyway (its state read failed too) queues a fresh
+row from its terminal attempt. A pending send cannot be force-failed while its
+network outcome is unknown. At startup every copy of a persisted send restores
+its nonce on its own chain, the newest is rebroadcast, and each gets one
+non-blocking receipt lookup before approvals or workers can send. A send with no
+receipt pages and suppresses startup approvals on that chain, and startup queues
+its resume even when its transfer job is exhausted. A send signed by another key
+than the wallet that sends to the issuer (a rotated key) is never restored,
+rebroadcast or fee-replaced from this wallet, since reserving that key's nonce
+would raise this wallet's next nonce past its own: startup pages and gates its
+chain, and each drive only looks up its receipts. Wallet recovery that finds a
+redemption still resolving this way hands it over (`DispatchedToRedemption`)
+instead of recording a failure. Older `SendPending` rows that predate the
+prepared send fail closed: an old binary may already have broadcast a send whose
+hash was never recorded. Recovery never signs them again; startup and the
+timeout sweep page, and the operator checks onchain whether the old transfer
+landed, follows up on its outcome, then closes the row with `transfer reconcile`
+(docs/cli-ops.md, "Legacy pending send to the issuer"). Drain or verify such
+legacy transfers before upgrading.
+
+Rollback floor for durable sends to the issuer: a build before them cannot
+replay `SendPrepared` or `SendReplaced`, nor an `OperatorReconciled` written
+from a legacy `SendPending` (it expects a send there, not a reconcile). The pre
+deploy `verify-migrations` gate replays every persisted aggregate, completed
+ones included, so once any redemption has one of these events a build before
+durable sends to the issuer fails that gate and cannot be deployed. The first
+release with durable sends to the issuer is therefore a permanent rollback floor
+from the first such event on: the first signed send, or the first legacy row an
+operator reconciles, which can come before any new send exists.
+
+The timeout sweep never fails a pending send to the issuer. After
+`transfer_timeout` it pages once and keeps the redemption's guard, inflight, and
+reservation. To abandon a signed send that will never land, the operator sends a
+0-value self-transfer at its nonce from the wallet that sends to the issuer,
+with both fees at least 10% above the newest copy's and above the market fee,
+waits for it to confirm, and then reconciles the redemption; the bot releases
+its hold on the nonce. A copy that reverted with the required confirmations
+proves every other copy dead by itself, since they share its nonce, so that
+reconcile needs no cancel. A redemption that times out in `TokensUnwrapped`
+commits `FailTransfer` before the sweep clears tracking and inventory: if the
+driver persisted a signed send in the meantime, the failure is refused and the
+redemption stays owned.
 
 The operator `fail` verb (`transfer fail --kind redemption`) dispatches per
 state: a redemption stuck before tokens leave custody takes `FailTransfer`, a
 `TokensSent` redemption takes `FailDetection { failure: Operator { reason } }`,
 and a `Pending` redemption takes `RejectRedemption { reason }`. In every case
 the replayed `Failed` state materializes the operator's reason. The verb refuses
-a redemption with a signed vault withdrawal (`VaultWithdrawSubmitting` or
-`VaultWithdrawSubmitted`): the withdrawal can still mine, so the operator
-verifies it onchain and reconciles the redemption instead.
+a redemption with a pending send to the issuer (`SendPending`), because the send
+can still mine: the operator verifies it onchain and reconciles the redemption
+instead. It also refuses a redemption with a signed vault withdrawal
+(`VaultWithdrawSubmitting` or `VaultWithdrawSubmitted`), because the withdrawal
+can still mine. Instead the operator checks it on chain: one that mined
+successfully went through and is not reconciled; one that mined and reverted is
+reconciled with no cancel once confirmed; one with no receipt, whose nonce
+another tx from the bot wallet already used to do the withdrawal itself, is
+adopted; one with no receipt and nothing at its nonce is cancelled first and
+then reconciled. Reconcile requires the chain proof described under operator
+reconciliation.
 
 Vault withdrawal submission is an irreversible uncertainty boundary. The
 orchestrator prepares and signs the transaction, then the pure aggregate
@@ -3883,6 +4262,17 @@ redemption polling, and `Wrapper` methods for ERC-4626 wrapping/unwrapping.
   `VaultWithdrawSubmitting` transaction and never broadcasts it
 - `RecordWithdrawSubmission` only from `VaultWithdrawSubmitting`
 - `ConfirmWithdraw` only from `VaultWithdrawSubmitted`
+- `AdoptWithdrawalReplacement` only from `VaultWithdrawSubmitting`, or from a
+  `VaultWithdrawSubmitted` that retains its signed bytes, and only while those
+  signed bytes are the `replaced_withdrawal` the caller checked; refused for the
+  withdrawal's own hash and for a blank reason. It emits
+  `VaultWithdrawReplacementAdopted`, leaving `VaultWithdrawSubmitted` with the
+  adopted hash, no signed bytes, the original submitted time and the replaced
+  hash in `adopted_from`, so resume restores and confirms the adopted hash and
+  never rebroadcasts the replaced withdrawal
+- `Reconcile` is refused for a `VaultWithdrawSubmitted` with `adopted_from` set:
+  the bot proved the adopted tx moved the equity, so only the redrive resolves
+  it
 - a resume from `VaultWithdrawSubmitting` always rebroadcasts the exact
   persisted bytes; retries never sign or submit a different withdrawal
 - if a later transfer step fails after withdrawal, the aggregate retains the
@@ -4141,21 +4531,22 @@ action that already succeeded. Each phase records its intent (and the relevant
 chain head) before the action, so resume can scan the chain to adopt an
 already-submitted action instead of re-issuing it.
 
-A cash transfer service serves one corridor, fixed by what the build wires
-(today Base via CCTP), whether or not USDC mode is enabled, so in-flight
-transfers always recover. A fresh transfer must ask for that corridor and
-records it on its originating command. A resume or recheck of a transfer
-recorded on another corridor, or a fresh transfer asking for another corridor,
-fails closed before any send and leaves the transfer untouched; the error starts
-with "USDC transfer corridor mismatch" and names both corridors. Automation
-treats a recorded transfer on another corridor as permanent for the build: its
-job re-queues itself every 10 minutes without a retry cost, so a build that
-serves the corridor finds a job to resume it, until the transfer holds no guard
+One cash transfer service runs per served corridor (every corridor table, and
+Base via CCTP while Base holds a cash vault; see Cash corridor rules), whether
+or not USDC mode is enabled, so in-flight transfers always recover. A fresh
+transfer must ask for a served corridor and records it on its originating
+command. A resume or recheck of a transfer recorded on a corridor the build does
+not serve, or a fresh transfer asking for one, fails closed before any send and
+leaves the transfer untouched; the error starts with "USDC transfer corridor
+mismatch" and names the recorded corridor and the served ones. Automation treats
+a recorded transfer on another corridor as permanent for the build: its job
+re-queues itself every 10 minutes without a retry cost, so a build that serves
+the corridor finds a job to resume it, until the transfer holds no guard
 (reconciled, say), when the job ends; startup recovery (even while a job is
 live) and the timeout sweep never re-arm it, and its corridor's guard stays
 held. Other corridors keep running, with two limits: an Alpaca-outbound held
 transfer blocks Alpaca-outbound claims on every corridor (its page says so), and
-because guards are keyed by chain, an unserved corridor on the served chain with
+because guards are keyed by chain, an unserved corridor on a served chain with
 another hop holds the served corridor's own guard. A fresh job asking for
 another corridor has no transfer to hold: it retries, dead-letters, and its
 dead-letter alert pages once. Startup recovery pages once per transfer per run
@@ -4171,7 +4562,8 @@ or once an operator moves it to a state that holds no guard (such as a pre-burn
   (`find_recent_withdrawal`) from the captured head and adopt it. An empty mined
   log scan is not proof of absence because the submission may still be pending
   or hidden by a load-balanced RPC backend; it remains unresolved and must never
-  trigger another withdrawal.
+  trigger another withdrawal. See "Under-funded vault withdraw" for the one case
+  that fails the transfer instead.
 - `BridgingSubmitting`: scan for an already-submitted burn (`find_recent_burn`)
   and adopt it rather than burning twice. The burn match stays by
   `(depositor, amount, destinationDomain, mintRecipient)` when transfers of
@@ -4285,7 +4677,9 @@ enum UsdcRebalanceCommand {
     // first broadcast. Refused when a send was already signed.
     PrepareDepositSend { prepared: PreparedTransaction },
     InitiateDeposit { deposit: TransferRef },
-    ConfirmDeposit,
+    // vault_deposit_block: the receipt block of the AlpacaToBase vault
+    // deposit; None for a BaseToAlpaca deposit at Alpaca.
+    ConfirmDeposit { vault_deposit_block: Option<u64> },
     // Valid from `DepositInitiated`, and from a BaseToAlpaca `Bridged` whose
     // deposit send cannot be resolved (the signed send, if any, becomes the
     // `deposit_ref`).
@@ -4387,6 +4781,9 @@ enum UsdcRebalanceEvent {
     },
     DepositConfirmed {
         deposit_confirmed_at: DateTime<Utc>,
+        // The AlpacaToBase vault deposit's block. None for a BaseToAlpaca
+        // deposit and for events recorded before the field existed.
+        vault_deposit_block: Option<u64>,
     },
     DepositFailed {
         deposit_ref: Option<TransferRef>,
@@ -4438,8 +4835,8 @@ enum BridgeStage { Burn, Attestation, Mint }
     `withdrawable cash - reserve`. The notional is truncated to whole cents,
     which is all Alpaca accepts in a USD amount, always downwards so the buy
     cannot ask for more cash than it was sized against
-  - A placement-time `403 Forbidden` carrying Alpaca code `40310000`
-    (insufficient USD balance) is a determinate rejection: no order was
+  - A placement-time `403 Forbidden` carrying Alpaca code `40310000` and an
+    "insufficient balance" message is a determinate rejection: no order was
     accepted, so the same conversion attempt re-reads withdrawable cash and
     retries rather than entering `ConversionFailed`. The resized notional is
     `min(previous notional - $0.01, fresh withdrawable cash - reserve)`, floored
@@ -4453,7 +4850,28 @@ enum BridgeStage { Burn, Attestation, Mint }
     terminal event is emitted. The correlation `client_order_id` is reused
     across all attempts. No other placement or polling error is resized or
     retried: an ambiguous response could represent an accepted live order and
-    must remain fail-closed against double spending
+    must remain fail-closed against double spending. Alpaca reuses `40310000`
+    for other rejections, such as "no available quote for symbol" when the
+    `USDC/USD` book is empty; a smaller notional cannot fix those, so the
+    conversion fails once with a `ConversionFailed` reason that includes
+    Alpaca's message
+  - Conversion cooldown: any AlpacaToBase `ConversionFailed` that clears the
+    guard (the conversion runs before the withdrawal, so nothing has left
+    Alpaca) holds Alpaca-to-Base planning on every corridor for
+    `[rebalancing.usdc]` `conversion_failure_cooldown_secs` (default 300,
+    non-zero, at most 86400), counted from the event's `failed_at`. All
+    corridors share Alpaca's one `USDC/USD` book, so an immediate retry would
+    meet the same cause: without the hold a persistent failure (for example a
+    book with no asks) starts a new transfer on every check. The trigger logs
+    one `rebalance` WARN with the failure reason when the hold starts, and runs
+    a delayed USDC check when it ends. A terminal event (USDC, mint or
+    redemption) drops the pending USDC checks that are due and keeps the delayed
+    ones, such as each cooldown's check; when that event leaves the cash ledger
+    to the next snapshot poll, it drops none and instead moves every pending
+    check to no sooner than `inventory_staleness_bound`, so no check sizes a
+    transfer from pre-settlement onchain balances. Startup restores the hold
+    from recent AlpacaToBase `ConversionFailed` events, so a restart does not
+    lift it. Base-to-Alpaca planning is not held
   - Collar: Alpaca prices a USDC/USD market order with a ~2% collar. On a `qty`
     buy the collar inflates the hold to `quantity x price x 1.02`, which rejects
     a buy sized at 100% of settled cash. On a `notional` buy the hold equals the
@@ -4509,7 +4927,13 @@ enum BridgeStage { Burn, Attestation, Mint }
     under the withdrawal threshold, which strands the USDC in the crypto wallet
     for an operator to reconcile. It also floors
     `assets.cash.operational_limit`, since that limit caps every transfer
-  - ConversionFailed is a terminal state (requires manual intervention)
+  - ConversionFailed is a terminal state. For BaseToAlpaca (post-deposit) it
+    requires manual intervention; for AlpacaToBase (pre-withdrawal) it ends the
+    transfer, and planning retries after the conversion cooldown. Two
+    AlpacaToBase failures still leave USDC for the operator to reconcile in the
+    Alpaca crypto wallet: a conversion that settles below the minimum withdrawal
+    threshold, and a resume from `Converting` with no persisted broker order ID
+    (the order may have filled)
   - ConversionComplete is terminal for BaseToAlpaca direction
 - Alpaca withdrawals/deposits are asynchronous: initiate with API call (get
   transfer_id), poll status until COMPLETE
@@ -4721,11 +5145,50 @@ The job returns `Ok` and re-enqueues itself with a 15 s delay, re-entering the
 `resume_bridging_submitting` scan-or-reburn path on the next pickup.
 
 The double-burn safety guarantee is NOT `is_revert()` classification -- it is
-the `resume_bridging_submitting` scan: `find_recent_burn` scans for an existing
-burn before re-attempting, using the `from_block` lower bound durably recorded
-in the `BridgingSubmitting` aggregate event before the burn call. Even a
-misclassified error cannot cause a double-burn because the scan adopts any
-existing burn.
+the combination of scan recovery and fail-closed handling of uncertain
+submission. `find_recent_burn` scans for an existing unclaimed mined burn before
+re-attempting, using the `from_block` lower bound durably recorded in the
+`BridgingSubmitting` aggregate event before the burn call. The scan cannot find
+a still-pending broadcast whose hash was lost; that case must fail closed rather
+than authorize a reburn. Recovery without a recorded hash, including recovery
+after a confirmed revert, must not adopt a burn already recorded by another
+transfer. The scan window can include earlier transfers when its initial RPC
+head was stale; retained transfer history supplies the ownership check. Recovery
+scans return all matching candidates, newest first, after their bounded
+repeated-scan and finality gate. Candidates claimed by another transfer are
+skipped, not adopted and not allowed to hide an older unclaimed candidate. Only
+after the complete candidate set has been checked does the existing empty-result
+rule apply: a confirmed-reverted burn may be retried; a missing recorded hash
+still fails closed. Unavailable ownership evidence fails closed, retaining the
+transfer guard and never authorizing another burn. An unclaimed scan candidate
+is durably recorded as the pending burn before confirmation, replacing any
+confirmed-reverted hash; a failed or cancelled confirmation must not leave that
+old revert authorizing another burn. The candidate must then pass `confirm_burn`
+at the configured confirmation depth with valid `MessageSent` evidence before
+adoption.
+
+Generic sends observe their submission boundary under the wallet's send lock,
+immediately around each attempted broadcast, including nonce and fee recovery
+retries. Waiting for that lock cannot leave a queued send with an old boundary.
+Gas estimation, filling, and signing finish before the pre-broadcast head read;
+signing latency cannot leave the accepted send with a pre-signing boundary.
+Prepared transactions refresh their submission boundary at every broadcast,
+including exact rebroadcast after restart. An unfinished or failed observation
+cannot reuse a stale preparation boundary to qualify absence; it stays unknown
+without releasing nonce ownership. Completed observations retain the highest
+boundary seen across preparation and broadcasts.
+
+Preparation keeps the send lock through signing and its boundary observations.
+Until the signed transaction is returned to its caller, cancellation or failure
+releases only that fresh, unused preparation's reservation and invalidates its
+cached allocation; earlier occupied nonces remain held. Optional post-operation
+head reads are bounded by the existing wallet receipt-poll interval. A failed or
+timed-out post-read returns the accepted hash or signed preparation with unknown
+freshness and retained ownership, rather than delaying durable burn-hash
+recording indefinitely. Receipt waits read live submission evidence at each drop
+check and again after canonical-state lookups. Changed or unfinished rebroadcast
+evidence resets accumulated absence and head progress; an old copied boundary
+cannot qualify a new suspected drop.
 
 A per-attempt wall-clock timeout is similarly reclassified: the hung attempt is
 aborted and the job re-enqueues with a 30 s delay. The scan alone is
@@ -4749,12 +5212,71 @@ reburning a possibly-still-pending burn. On re-pickup,
 `confirm_burn`), a still-pending burn yields a delayed redrive (never a reburn),
 and a reverted burn (which moved no funds) falls through to the scan-or-reburn
 path. A burn classified **dropped** does **not** auto-reburn: once a burn tx
-hash is durably recorded, an ambiguous "dropped" classification pages the
-operator (a terminal `BurnTxDropped` error) for manual on-chain verification,
-because a load-balanced RPC could misreport a still-pending burn as dropped and
-a reburn there would double-burn. `burn_status` mirrors the wallet's
-`wait_for_receipt` drop policy (a grace window plus consecutive mempool-absence
-misses) so a still-pending tx is never misclassified as dropped.
+hash is durably recorded, a suspected drop requires the burn-event cross-check
+below before operator reconciliation. A load-balanced RPC could misreport a
+still-pending burn as dropped, and a reburn there would double-burn.
+`burn_status` mirrors the wallet's `wait_for_receipt` drop policy (a grace
+window plus consecutive qualified mempool-absence misses). Its head-progress
+reference starts after grace; progress before grace followed by a frozen head
+does not qualify. Consecutive misses count only once the head has advanced by
+the required margin beyond that post-grace reference. A bounded further
+observation window allows fresh progress before a frozen head returns Pending.
+An inconclusive lagging-head or consumed-nonce poll resets absence progress but
+does not end that observation window or restart grace; later polls must qualify
+against a new reference. Absence only qualifies with the submitted transaction's
+known sender and nonce, a head beyond the pre-submission block, and an unused
+nonce read at that exact canonical block hash. A consumed nonce can mean a mined
+transaction hidden by a lagging receipt backend, so it stays pending. Unknown
+submission evidence, unavailable canonical state, or a frozen/lagging head
+cannot produce a dropped verdict; wallet waits time out without releasing nonce
+ownership and burn recovery redrives. Head advancement alone does not prove
+global mempool absence, so the verdict remains suspected drop and never
+authorizes automatically reburning a recorded burn.
+
+Before turning a suspected drop into terminal `BurnTxDropped`, both transfer
+directions cross-check `DepositForBurn` logs strictly after the recorded
+pre-burn head, matching depositor, amount, destination domain, recipient and the
+durably recorded transaction hash. Another identical burn is not this transfer's
+evidence; without proof of a same-nonce replacement it cannot be adopted. A drop
+during initial, retry, or adoption confirmation uses the same cross-check as a
+drop found on resume; the confirmation path cannot bypass this evidence. A match
+must pass `confirm_burn` (configured confirmation depth and `MessageSent`
+validation) before it is recorded and adopted. After an empty exact-hash scan,
+the burn must freshly qualify as dropped again using canonical unused-nonce and
+post-grace head-progress evidence. A separately returned fresh numeric head does
+not authenticate a load-balanced log backend's coverage. A receipt, visible
+transaction, consumed nonce, incomplete identity or unavailable fresh evidence
+makes the empty result inconclusive. Positive exact-hash logs remain recoverable
+through confirmation. Only this freshly qualified empty result may page for a
+dropped burn; it is point-in-time evidence, not proof against future mining.
+Inconclusive scans and transient scan or confirmation failures yield
+`SettlementCheckTransient` for delayed retry, retaining the recorded hash and
+transfer guard. Deterministic RPC or validation failures surface for operator
+action, but are not proof of a dropped burn. No scan outcome authorizes
+reburning a suspected drop.
+
+A confirmation-time suspected drop may release the wallet's nonce ownership. The
+source endpoint retains that hash's known submission evidence for automatic
+retry without retaining nonce ownership or a sticky Dropped verdict. This is a
+bounded, process-local slot for the most recently suspected burn, not durable
+history. Every later absence still needs fresh canonical unused-nonce and
+post-grace head-progress qualification. Confirmation clears the matching slot;
+restart or eviction loses the evidence conservatively, leaving an unknown hash
+Pending. A subsequently consumed sender nonce also leaves the burn Pending:
+without the original receipt or exact burn log, consumption cannot distinguish
+the original burn from another transaction. There is no unresolved-burn deadline
+alert in this policy; adding one requires a separate alerting policy, not a
+sticky Dropped verdict.
+
+A pending burn uses the same bounded scan for positive recovery evidence. Only
+the recorded hash can be confirmed and adopted. An empty or inconclusive scan,
+or any scanner failure, preserves Pending and delayed retry with its typed
+source logged; an optional recovery scan cannot exhaust a known pending burn's
+retry budget. Unavailable confirmation RPCs after an exact-hash match also
+retry, including deterministic RPC rejection. Actual invalid burn evidence, such
+as a missing `MessageSent` event, still surfaces for operator action. Pending
+scans never page as dropped and never permit reburning. Unknown identity alone
+still cannot justify a drop.
 
 **Bound**: Both revert and timeout redrives count against a shared
 `max_burn_revert_redrives` counter persisted in the job payload (durable across
@@ -4770,6 +5292,42 @@ same durable dead-letter and operator-alert path without automatic redrive.
 redrives) and at the final allowed redrive. Errors that propagate through apalis
 do not alert per attempt; the worker emits one operational alert only after the
 row reaches durable terminality.
+
+**Corridor guard of a dead letter**: A dead lettered transfer that recorded any
+event keeps its corridor guard; the reactor, the timeout sweep, or the operator
+frees it from there. A job that exhausts its retries before its transfer
+recorded any event (a gas check that refuses with no retry interval, an amount
+that cannot be converted, a failed chain head read before `BeginWithdrawal`)
+frees the guard on its last attempt instead, unless another live job row still
+drives the same id or the store cannot be read. No event means nothing was
+withdrawn, converted, or burned, and neither the reactor nor the sweep would
+ever see that id, so the guard would otherwise stay held until a restart and
+both the trigger and `capital transfer-usdc` would refuse the corridor.
+
+##### Under-funded vault withdraw
+
+The shared inventory reverts a `withdraw4` the vault cannot cover
+(`InsufficientVaultLiquidity`). Nothing leaves the vault on that revert, but
+only a revert at the first send attempt's gas estimate proves no withdraw for
+the transfer was ever sent. The wallet marks that case
+(`RejectedBeforeBroadcast`); nonce and fee recovery drop the mark, because a raw
+send before theirs may have been accepted.
+
+- Rejected before broadcast: the manager sends `RejectWithdrawal`, the transfer
+  ends in `WithdrawalFailed` with no withdrawal reference, and the guard clears.
+  Nothing is retried. The trigger then requests a forced onchain cash reconcile
+  for the chain (USDC dispatch waits for a vault read at or above the view's
+  applied block, emitted even when unchanged) and holds Base->Alpaca planning on
+  the chain for 30 minutes, so a cause a fresh read does not fix cannot loop. A
+  delayed USDC check runs when the hold ends. Startup restores the hold and the
+  forced read from recent `WithdrawalFailed` events with no withdrawal
+  reference, so a restart or the offline `fail-usdc-transfer` does not lift it.
+  The alert pages at most once per chain per 30 minutes while the cause
+  persists; a completed transfer on the chain, an operator fail or resume, or a
+  restart re-arms it at once.
+- Any other under-funded revert: the transfer latches at `WithdrawalSubmitting`
+  with one alert naming `from_block`. The operator checks the chain and either
+  resumes (a withdrawal landed) or fails it with `fail-usdc-transfer`.
 
 ##### Startup re-arm for `BridgingSubmitting` and `WithdrawalSubmitting{BaseToAlpaca}`
 
@@ -5029,24 +5587,83 @@ transfer.
 - **Total rebalancing time**: Dominated by Alpaca deposit/withdrawal (~minutes)
   rather than bridge time
 
+Provider snapshots saved before redemptions were split by chain cannot identify
+which wallet a redemption belongs to. Startup defers those legacy redemption
+totals to the first provider poll; it still restores stranded exposure from
+aggregate history. New snapshots hydrate their Base and per-chain totals
+separately. Recovering a failed provider snapshot carries other provider events'
+complete venue balances and snapshot watermarks, including available shares.
+
+#### Multichain Equity Recovery Rollout and Rollback
+
+Ship the complete recovery reader and writer stack as release R before enabling
+any secondary-chain equity operation. R is the minimum safe rollback target for
+every release after it. R refuses `enabled` and `paused` listings without
+recovery, and the production token file pinned before R has Base RKLB with
+rebalancing enabled and recovery disabled, so R refuses that pin at boot. The
+generation that disables Base RKLB rebalancing (`1791378253362331`) also enables
+Robinhood DNUT, which a pre-R binary refuses. So R and that pin ship in one
+release, together with the RAI-2780 production switch-on:
+
+1. Pin that generation in `config/prod/st0x-hedge.toml`, and add its copy as
+   `tests/fixtures/tokens-production-<generation>.toml` in the same PR.
+2. Release R only with that pin. Do not release master without it.
+3. A tag rollback from R to the release before it is safe only before R has run
+   any equity operation on any chain: every redemption R runs, on Base too,
+   persists `SendPrepared`, which older binaries cannot load. After that, stop
+   the Robinhood listing with a paused generation on R (a new st0x.registry
+   generation plus a pin bump, since `[registry]` refuses inline equities
+   tables), or roll forward. A binary rollback below R follows the rules below.
+
+The production release gate runs `validate-config` without `--registry-file`, so
+it does not check the token file and passes a pin that R refuses. Check the pin
+offline with `--registry-file` (see
+[How to add a new asset](docs/how-to-add-new-asset.md)) before deploying R.
+
+For a chain activation rollback, set the secondary listings to
+`rebalancing = "paused"`, keep recovery enabled, and let every transfer,
+provider request, resume job, recovery and wallet balance drain. Then disable
+rebalancing and recovery together. Rolling back the binary to R preserves every
+chain-qualified event and snapshot reader; it does not require deleting data. R
+itself carries the RAI-2780 switch-on, so that activation has no binary to roll
+back to: its rollback is the paused generation on R.
+
+A pre-R binary is not a safe rollback while a secondary has outstanding equity
+state, or while any chain, including Base, has a signed pending issuer send: an
+older resume ignores its optional envelope and can sign a second transfer.
+Before even considering a pre-R rollback, drain those sends and all secondary
+operations, terminalize or reconcile secondary redemptions, verify wallets hold
+no equity, disable both secondary flags, and let `InventorySnapshot` compact
+past its last chain-qualified wallet and in-flight observations. Never delete
+its snapshot to accelerate that compaction. Inventory compaction alone is not
+proof that older binaries interpret retained recovery and transfer history
+correctly; a rollback below R needs a separately verified reader/data migration
+review. Use R for routine rollback.
+
 #### Wrapped Equity Recovery
 
 **Purpose**: Automatically return wrapped equity tokens (wtSTOCK) found in the
-bot wallet on Base to a venue that participates in market making, without
-operator intervention. Wallet wtSTOCK arises whenever the normal transfer flow
-fails to deliver to its destination -- a `TokenizedEquityMint` stalled after
-wrapping but before depositing into Raindex, an `EquityRedemption` stalled after
-withdrawing from Raindex but before unwrapping, or tokens arrived at the wallet
-without any matching in-flight transfer (external deposit, prior-process crash
-after compaction).
+bot wallet on the recovery's source chain to a venue that participates in
+marketmaking, without operator intervention. Wallet wtSTOCK arises whenever the
+normal transfer flow fails to deliver to its destination -- a
+`TokenizedEquityMint` stalled after wrapping but before depositing into Raindex,
+an `EquityRedemption` stalled after withdrawing from Raindex but before
+unwrapping, or tokens arrived at the wallet without any matching in-flight
+transfer (external deposit, prior-process crash after compaction).
 
 The mechanism has three components:
 
-1. **Detection** — the inventory polling job already reads ERC-20 balances on
-   the bot wallet. When it observes a non-zero wtSTOCK balance it emits
-   `InventorySnapshotEvent::BaseWalletWrappedEquity { balances }`; the
-   rebalancing reactor consumes that event and enqueues one
-   `WrappedEquityRecoveryJob { symbol }` per symbol with a positive balance.
+1. **Detection** — the inventory polling job reads ERC-20 balances on the bot
+   wallet of every chain that rebalances equity (enabled or paused), each with
+   that chain's own wallet. A non-zero wtSTOCK balance on Base emits
+   `InventorySnapshotEvent::BaseWalletWrappedEquity { balances }`; on any other
+   chain it emits `ChainWalletWrappedEquity { chain, balances }`. The
+   rebalancing reactor consumes either event and enqueues one
+   `WrappedEquityRecoveryJob { chain, symbol }` per symbol with a positive
+   balance. A queued job is deduplicated by (symbol, chain); a queued row
+   written before jobs named their chain counts as Base. A job whose symbol has
+   an active transfer on another chain reschedules itself instead of
+   dispatching.
 2. **Dispatch** — the recovery job inspects `InventoryView` and chooses one of
    three paths based on whether an active mint or redemption owns the symbol's
    in-flight slot.
@@ -5054,14 +5671,22 @@ The mechanism has three components:
    attempt, the dispatch decision, the side-effecting steps for the orphan path,
    and the terminal outcome.
 
+Startup scans and snapshot reactors enqueue wallet recovery only for the primary
+chain and secondary chains built with equity services: an enabled or paused
+listing, or unfinished equity work on the chain. This is the same set of chains
+whose wallets are polled. A stale hydrated balance on a hedge-only secondary
+does not enqueue recovery, because that chain is not polled and has no services
+to drive the job. Each symbol's `wrapped_equity_recovery` flag still gates its
+own recovery.
+
 ##### Recovery Paths
 
 ```mermaid
 flowchart TD
-    Detect[BaseWalletWrappedEquity observed]
-    Detect --> CheckMint{InventoryView.active_mints<br/>has symbol?}
+    Detect[BaseWalletWrappedEquity or ChainWalletWrappedEquity observed on source chain]
+    Detect --> CheckMint{Active mint for symbol<br/>on this chain?}
     CheckMint -- yes --> ResumeMint[resume_mint mint_id]
-    CheckMint -- no --> CheckRedemption{InventoryView.active_redemptions<br/>has symbol?}
+    CheckMint -- no --> CheckRedemption{Active redemption for symbol<br/>on this chain?}
     CheckRedemption -- yes --> ResumeRedemption[resume_redemption id]
     CheckRedemption -- no --> Orphan[Raindex submit_deposit]
     ResumeMint --> Done[wtSTOCK back in Raindex vault]
@@ -5072,13 +5697,13 @@ flowchart TD
 
 - **Active mint** -- the wtSTOCK belongs to a `TokenizedEquityMint` that reached
   `TokensWrapped` but never deposited. The dispatcher loads the aggregate via
-  the ID stored in `InventoryView.active_mints[symbol]` and calls
-  `CrossVenueEquityTransfer::resume_mint`; the existing mint flow drives it to
-  `DepositedIntoRaindex`.
+  the ID stored in `InventoryView.active_mints[symbol]`, verifies its chain, and
+  calls `CrossVenueEquityTransfer::resume_mint`; the existing mint flow drives
+  it to `DepositedIntoRaindex`.
 - **Active redemption** -- the wtSTOCK belongs to an `EquityRedemption` that
   reached `WithdrawnFromRaindex` but never unwrapped. The dispatcher loads it
-  via `InventoryView.active_redemptions[symbol]` and calls `resume_redemption`;
-  the redemption flow continues through unwrap and send.
+  via `InventoryView.active_redemptions[symbol]`, verifies its chain, and calls
+  `resume_redemption`; the redemption flow continues through unwrap and send.
 - **Orphan deposit** -- no aggregate owns the symbol's in-flight slot, so the
   wallet wtSTOCK is unused liquidity. The market-making venue is the closest
   place to redeploy it (no broker round-trip), so the dispatcher resolves the
@@ -5099,13 +5724,58 @@ recovery job logs at debug and exits without writing an aggregate; the next
 polling tick re-evaluates. This keeps recovery dispatch from racing the
 mint/redemption tasks already driven by apalis.
 
+A mint that fails after its tokens arrive (`TokensReceived` or `WrapSubmitted`)
+on a chain that enables recovery for the symbol hands its tokens to that chain's
+recovery, primary or secondary: the transfer holds the symbol for the chain
+whose wallet holds them (`HeldForRecovery { chain }`). Only a recovery job on
+that chain claims the hold; a job on another chain reschedules, as it does for a
+live transfer. While a recovery attempt runs, the slot records that recovery
+owns it (`Recovering { chain, generation }`), so the transfer timeout sweep
+skips the mint as it does for a hold, and never fails it or releases its guard
+and reservation while recovery still moves the tokens. A failed recovery attempt
+restores the hold for the same chain. For a `WrapSubmitted` mint, wrapped
+recovery does not compare the wallet's vault shares with the mint's underlying
+quantity, which differ whenever the vault ratio is not 1; resuming the mint
+reads the wrap receipt and deposits the share count it reports.
+
+A hold blocks the symbol on every chain. When a hold, or recovery attempts on
+the held chain, keep the symbol unavailable for
+`[rebalancing].recovery_hold_alert_after_secs` (one hour when absent), the bot
+sends an operator alert naming the symbol, the chain and, when its recovery
+retries a mint, the recovery id, the mint id and the last error. It retries
+delivery on the next sweep if it fails, and pages again after each further
+interval while the hold stands. The alert does not release the hold. The timer
+restarts when the slot becomes free or another owner takes it, and on restart,
+since it is kept in memory.
+
 ##### Idempotency
 
-Each polled `BaseWalletWrappedEquity` snapshot triggers a fresh
-`WrappedEquityRecoveryJob`. If the previous recovery already drained the wallet
-the next job sees an empty balance and exits without writing an aggregate. If
-the previous recovery is still running the `equity_in_progress` guard ensures
-the new job exits.
+Each polled `BaseWalletWrappedEquity` or `ChainWalletWrappedEquity` snapshot
+triggers a fresh `WrappedEquityRecoveryJob` for its chain. If the previous
+recovery already drained the wallet the next job sees an empty balance and exits
+without writing an aggregate. If the previous recovery is still running the
+`equity_in_progress` guard ensures the new job exits.
+
+A job retried after `Detect` succeeded resumes the `Detected` record instead of
+sending `Detect` again: it dispatches from the current wallet snapshot. If the
+wallet balance differs from the detected shares, it closes the record with
+`StaleDetectionFailed` and queues one fresh recovery on the same chain and
+symbol. A queue idempotency key derived from the failed recovery ID prevents
+duplicate replacement rows after crash redelivery. Enqueue failure retries this
+typed restart decision without releasing a held slot. Invalid active mint or
+redemption validation closes the detection with `InvalidDetectionFailed`, raises
+an operational alert, and retains any existing recovery hold without queuing
+another invalid detection. Redelivery preserves that hold. A vanished wrapped
+balance without a recovery hold fails the record without replacement.
+
+A `HeldForRecovery` slot names the chain that received the tokens. Startup and
+runtime handoffs enqueue recovery on that chain, including failed post-receipt
+mints on secondary chains. Another chain's recovery cannot claim or release the
+hold, and the symbol remains excluded from new transfers on every chain while it
+is held. A hold older than `recovery_hold_alert_after` alerts as above; pausing
+keeps the recovery running and does not force-release that ownership. A Base
+transfer that waits behind a secondary hold is not allowed to claim the other
+chain's tokens.
 
 ##### WrappedEquityRecovery Aggregate
 
@@ -5113,14 +5783,28 @@ The audit trail AND the actor for recovery side effects. Persists one aggregate
 instance per detection-and-dispatch attempt -- multiple recoveries for the same
 symbol are independent aggregates, keyed by `WrappedEquityRecoveryId(Uuid)`.
 
-`Services = WrappedEquityRecoveryServices { raindex: Arc<dyn Raindex>,
-wrapper: Arc<dyn Wrapper>, transfer: Arc<CrossVenueEquityTransfer> }`
+`Services = WrappedEquityRecoveryServices { equity: EquityTransferServices,
+transfer: Arc<CrossVenueEquityTransfer>, bot_gas_enqueuer }`
 -- each command handler that needs an external side effect (orphan deposit
 submit/confirm, mint resume, redemption resume) calls the corresponding service
 inside the handler and emits the resulting event only on success. This mirrors
 `TokenizedEquityMint` and `EquityRedemption` (both use `EquityTransferServices`
 the same way) and keeps the audit trail tight: no event is recorded for a side
 effect that didn't actually happen.
+
+Every recovery records the chain whose wallet holds the shares (`chain` on
+`Detected`, and on every state). Each handler resolves that chain's entry of
+`equity` -- its wallet, orderbook, wrapper and vault lookup -- from the record,
+never from the primary chain, and charges bot gas to that chain. A `Detected`
+event persisted before the chain was recorded loads as Base. A chain with no
+entry (its rebalancing is `disabled`) is not a recovery failure: the command is
+refused with `ChainServicesMissing`, no event is recorded, and the recovery
+stays open. The job then reschedules itself and raises an operational alert
+naming the chain, symbol and recovery. At startup, an open recovery on such a
+chain, or a symbol held for recovery on one, refuses startup. The completion
+check refuses first: every open recovery and every hold is unfinished work,
+which builds equity services for its chain or refuses startup naming the listing
+it needs. A separate check that the chain got services remains as a backstop.
 
 The job's responsibility is purely orchestration -- read `InventoryView`, pick a
 dispatch path, and send the command sequence: `Detect`, then exactly one of
@@ -5139,7 +5823,7 @@ the orphan path, captures the resulting tx hash.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Detected: Detect (records symbol + shares)
+    [*] --> Detected: Detect (records chain + symbol + shares)
     Detected --> DispatchedToMint: DispatchToMint (active mint found)
     Detected --> DispatchedToRedemption: DispatchToRedemption (active redemption found)
     Detected --> OrphanDepositSubmitted: SubmitOrphanDeposit (no active transfer)
@@ -5156,9 +5840,10 @@ The dispatch-success states (`DispatchedToMint`, `DispatchedToRedemption`,
 succeeded and with which `mint_id` / `redemption_id` / `tx_hash`. No separate
 `Completed` state is needed.
 
-- `Detect` is the initialization command and records the trigger (symbol,
+- `Detect` is the initialization command and records the trigger (chain, symbol,
   wrapped share quantity, detected_at). The job sends it as soon as it observes
-  a non-zero balance for the symbol. No services are invoked.
+  a non-zero balance for the symbol. No services are invoked, but it is refused
+  when the chain has no services.
 - `DispatchToMint { mint_id }` / `DispatchToRedemption { redemption_id }`: the
   handler calls `services.transfer.resume_mint(mint_id)` (or
   `resume_redemption`) and emits the corresponding `DispatchedTo*` event only
@@ -5179,40 +5864,48 @@ succeeded and with which `mint_id` / `redemption_id` / `tx_hash`. No separate
   same hash. Requires the configured number of confirmations. The resulting
   state is terminal-success.
 - `FailRecovery { reason }`: explicit failure from any non-terminal state.
-  Records the reason for downstream investigation. Service-call failures inside
-  the dispatch handlers also emit `RecoveryFailed` (consistent with
-  `TokenizedEquityMint`'s `MintAcceptanceFailed` pattern) so failures remain
-  first-class events.
+  Records the reason for downstream investigation. Permanent service-call
+  failures inside the dispatch handlers also emit `RecoveryFailed` (consistent
+  with `TokenizedEquityMint`'s `MintAcceptanceFailed` pattern) so failures
+  remain first-class events.
 
 ###### States
 
+Every state also carries the `chain` recorded at `Detect`.
+
 ```rust
 enum WrappedEquityRecovery {
-    Detected { symbol, shares, detected_at },
-    DispatchedToMint { symbol, shares, detected_at, mint_id, dispatched_at },        // terminal
+    Detected { chain, symbol, shares, detected_at },
+    DispatchedToMint { chain, symbol, shares, detected_at, mint_id, dispatched_at },        // terminal
     DispatchedToRedemption {                                                          // terminal
-        symbol, shares, detected_at, redemption_id, dispatched_at,
+        chain, symbol, shares, detected_at, redemption_id, dispatched_at,
     },
     OrphanDepositSubmitted {
-        symbol, shares, detected_at, vault_deposit_tx_hash, submitted_at,
+        chain, symbol, shares, detected_at, vault_deposit_tx_hash, submitted_at,
     },
     OrphanDeposited {                                                                 // terminal
-        symbol, shares, detected_at, vault_deposit_tx_hash, submitted_at, deposited_at,
+        chain, symbol, shares, detected_at, vault_deposit_tx_hash, submitted_at, deposited_at,
     },
-    Failed { symbol, shares, reason, failed_at },                                     // terminal
+    Failed { chain, symbol, shares, reason, failed_at, detection_failure },                                     // terminal
 }
 ```
+
+`Failed.detection_failure` is `RestartDetection` for changed shares,
+`PreserveHold` for invalid dispatch, and absent for ordinary failures. The
+persisted event determines this disposition; job retries never parse reasons.
 
 ###### Commands
 
 ```rust
 enum WrappedEquityRecoveryCommand {
-    Detect { symbol, shares },
+    Detect { chain, symbol, shares },
     DispatchToMint { mint_id },                // services.transfer.resume_mint
     DispatchToRedemption { redemption_id },    // services.transfer.resume_redemption
-    SubmitOrphanDeposit,                       // services.{wrapper,raindex}.*
-    ConfirmOrphanDeposit,                      // services.raindex.confirm_tx
+    SubmitOrphanDeposit,                       // the chain's {wrapper,raindex}.*
+    ConfirmOrphanDeposit,                      // the chain's raindex.confirm_tx
     FailRecovery { reason },
+    FailStaleDetection { reason },
+    FailInvalidDetection { reason },
 }
 ```
 
@@ -5220,12 +5913,14 @@ enum WrappedEquityRecoveryCommand {
 
 ```rust
 enum WrappedEquityRecoveryEvent {
-    Detected { symbol, shares, detected_at },
+    Detected { chain, symbol, shares, detected_at }, // chain defaults to Base
     DispatchedToMint { mint_id, dispatched_at },
     DispatchedToRedemption { redemption_id, dispatched_at },
     OrphanDepositSubmitted { vault_deposit_tx_hash, submitted_at },
     OrphanDeposited { vault_deposit_tx_hash, deposited_at },
     RecoveryFailed { reason, failed_at },
+    StaleDetectionFailed { reason, failed_at },
+    InvalidDetectionFailed { reason, failed_at },
 }
 ```
 
@@ -5241,16 +5936,20 @@ enum WrappedEquityRecoveryEvent {
 - All dispatch handlers run their side effect inside the command handler so the
   success event is emitted iff the side effect actually completed. Service
   failures are recorded as `RecoveryFailed`.
+- A command on a chain without services is refused with no event; the recovery
+  stays open.
 - `DispatchedToMint`, `DispatchedToRedemption`, `OrphanDeposited`, and `Failed`
   are terminal states.
 
 ###### Job-level Idempotency
 
-The recovery job carries its `WrappedEquityRecoveryId` in the apalis payload
-(generated by the reactor when pushing). On retry, apalis re-runs `perform` with
-the same payload, so the job re-targets the same aggregate; the framework
-reloads its current state and the next command in the sequence picks up where
-the prior attempt stopped (e.g., if `SubmitOrphanDeposit` succeeded but
+The recovery job carries its `WrappedEquityRecoveryId` and its chain in the
+apalis payload (generated by the reactor when pushing; a payload queued before
+the chain was recorded runs as Base). A job whose loaded recovery names another
+chain fails that recovery, naming both chains. On retry, apalis re-runs
+`perform` with the same payload, so the job re-targets the same aggregate; the
+framework reloads its current state and the next command in the sequence picks
+up where the prior attempt stopped (e.g., if `SubmitOrphanDeposit` succeeded but
 `ConfirmOrphanDeposit` crashed before persisting, the retry skips submit and
 goes straight to confirm).
 
@@ -5259,21 +5958,35 @@ returning and the `OrphanDepositSubmitted` event persisting will still re-submit
 on retry. The aggregate-level guarantee is that no terminal event is recorded
 for a side effect that didn't actually succeed.
 
+The resumed `Detected` record checks only the polled `InventoryView` balance
+before it sends `SubmitOrphanDeposit` again. If the first deposit broadcast and
+landed but `OrphanDepositSubmitted` did not persist (a restart, or
+`PERFORM_TIMEOUT` dropping the future), a retry before the next wallet poll sees
+the old balance and submits a second deposit. That deposit reverts on the
+emptied wallet, and the record ends `RecoveryFailed` for a deposit that landed,
+with no bot-gas fact for it. Unlike the unwrapped job, no sweeper corrects this:
+the shares are in the vault, but the operator must read the record's failure
+against the vault balance.
+
 #### Unwrapped Equity Recovery
 
 **Purpose**: Automatically return unwrapped equity tokens (tSTOCK) found in the
-bot wallet on Base to a venue that participates in market making, without
-operator intervention. Wallet tSTOCK arises whenever the normal transfer flow
-fails to deliver the wrapped form to its destination -- a `TokenizedEquityMint`
-stalled after `TokensReceived` but before wrapping, an `EquityRedemption`
-stalled after `TokensUnwrapped` but before sending to the broker, or tokens
-arrived at the wallet without any matching in-flight transfer (external deposit,
-prior-process crash, or false-positive `TransactionDropped` from a laggy RPC
-backend that left the bot believing a wrap attempt failed).
+bot wallet on the recovery's source chain to a venue that participates in
+marketmaking, without operator intervention. Wallet tSTOCK arises whenever the
+normal transfer flow fails to deliver the wrapped form to its destination -- a
+`TokenizedEquityMint` stalled after `TokensReceived` but before wrapping, an
+`EquityRedemption` stalled after `TokensUnwrapped` but before sending to the
+broker, or tokens arrived at the wallet without any matching in-flight transfer
+(external deposit, prior-process crash, or false-positive `TransactionDropped`
+from a laggy RPC backend that left the bot believing a wrap attempt failed).
 
-The mechanism mirrors [Wrapped Equity Recovery](#wrapped-equity-recovery):
-detection from the inventory poll, dispatch by `InventoryView`, audit via a
-dedicated aggregate. It differs in two places:
+Base observations emit `BaseWalletUnwrappedEquity`; other source chains emit
+`ChainWalletUnwrappedEquity { chain, balances }`. Both enqueue
+`UnwrappedEquityRecoveryJob { chain, symbol }` and read that chain's wallet
+snapshot. The mechanism mirrors
+[Wrapped Equity Recovery](#wrapped-equity-recovery): detection from the
+inventory poll, dispatch by `InventoryView`, audit via a dedicated aggregate. It
+differs in two places:
 
 - **Orphan path also wraps**. Wrapped recovery deposits the existing wtSTOCK
   straight into the Raindex vault. Unwrapped recovery first wraps the tSTOCK
@@ -5288,10 +6001,10 @@ dedicated aggregate. It differs in two places:
 
 ```mermaid
 flowchart TD
-    Detect[BaseWalletUnwrappedEquity observed]
-    Detect --> CheckMint{InventoryView.active_mints<br/>has symbol?}
+    Detect[BaseWalletUnwrappedEquity or ChainWalletUnwrappedEquity observed on source chain]
+    Detect --> CheckMint{Active mint for symbol<br/>on this chain?}
     CheckMint -- yes --> ResumeMint[resume_mint mint_id]
-    CheckMint -- no --> CheckRedemption{InventoryView.active_redemptions<br/>has symbol?}
+    CheckMint -- no --> CheckRedemption{Active redemption for symbol<br/>on this chain?}
     CheckRedemption -- yes --> ResumeRedemption[resume_redemption id]
     CheckRedemption -- no --> OrphanWrap[Wrapper wrap]
     ResumeMint --> Done[tSTOCK wrapped + back in Raindex vault]
@@ -5304,13 +6017,13 @@ flowchart TD
 
 - **Active mint** -- the tSTOCK belongs to a `TokenizedEquityMint` that reached
   `TokensReceived` but never wrapped. The dispatcher loads the aggregate via the
-  ID stored in `InventoryView.active_mints[symbol]` and calls
-  `CrossVenueEquityTransfer::resume_mint`; the existing mint flow drives it
-  through wrap and deposit to `DepositedIntoRaindex`.
+  ID stored in `InventoryView.active_mints[symbol]`, verifies its chain, and
+  calls `CrossVenueEquityTransfer::resume_mint`; the existing mint flow drives
+  it through wrap and deposit to `DepositedIntoRaindex`.
 - **Active redemption** -- the tSTOCK belongs to an `EquityRedemption` that
   reached `TokensUnwrapped` but never sent. The dispatcher loads it via
-  `InventoryView.active_redemptions[symbol]` and calls `resume_redemption`; the
-  redemption flow finishes the broker-side transfer.
+  `InventoryView.active_redemptions[symbol]`, verifies its chain, and calls
+  `resume_redemption`; the redemption flow finishes the broker-side transfer.
 - **Orphan deposit** -- no aggregate owns the symbol's in-flight slot, so the
   wallet tSTOCK is unused liquidity. The market-making venue is the closest
   redeploy target, so the dispatcher resolves the token + wrapper-vault pair via
@@ -5332,11 +6045,13 @@ trigger uses, exactly like
 
 ##### Idempotency
 
-Each polled `BaseWalletUnwrappedEquity` snapshot triggers a fresh
-`UnwrappedEquityRecoveryJob`. If the previous recovery already wrapped and
-deposited the tokens, the next job sees an empty unwrapped balance and exits
-without writing an aggregate. The `equity_in_progress` guard prevents
-overlapping runs against the same symbol.
+Each polled `BaseWalletUnwrappedEquity` or `ChainWalletUnwrappedEquity` snapshot
+triggers a fresh `UnwrappedEquityRecoveryJob` for its chain, with the same
+(symbol, chain) dedupe and the same reschedule while another chain's transfer
+owns the symbol. If the previous recovery already wrapped and deposited the
+tokens, the next job sees an empty unwrapped balance and exits without writing
+an aggregate. The `equity_in_progress` guard prevents overlapping runs against
+the same symbol.
 
 ##### UnwrappedEquityRecovery Aggregate
 
@@ -5344,12 +6059,12 @@ The audit trail AND the actor for recovery side effects, keyed by
 `UnwrappedEquityRecoveryId(Uuid)`. Each detection-and-dispatch attempt is its
 own aggregate instance.
 
-`Services = UnwrappedEquityRecoveryServices { raindex: Arc<dyn Raindex>,
-wrapper: Arc<dyn Wrapper>, transfer: Arc<CrossVenueEquityTransfer>,
-wallet: Address }`
--- differs from `WrappedEquityRecoveryServices` by the added `wallet: Address`,
-the bot wallet on Base that is both the wrap receiver and the address the orphan
-deposit pulls wrapped tokens from.
+`Services = UnwrappedEquityRecoveryServices { equity: EquityTransferServices,
+transfer: Arc<CrossVenueEquityTransfer>, bot_gas_enqueuer }`,
+the same shape as `WrappedEquityRecoveryServices`, with the same chain rules:
+the recovery records its chain, each handler resolves that chain's entry, and an
+unwired chain refuses the command without an event. The entry's `wallet` is both
+the wrap receiver and the address the orphan deposit pulls wrapped tokens from.
 
 The job's responsibility is purely orchestration -- read `InventoryView`, pick a
 dispatch path, and send the command sequence: `Detect`, then exactly one of
@@ -5362,7 +6077,7 @@ The dispatch-success states are terminal.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Detected: Detect (records symbol + shares)
+    [*] --> Detected: Detect (records chain + symbol + shares)
     Detected --> DispatchedToMint: DispatchToMint (active mint found)
     Detected --> DispatchedToRedemption: DispatchToRedemption (active redemption found)
     Detected --> OrphanWrapSubmitted: SubmitOrphanWrap (no active transfer)
@@ -5380,22 +6095,24 @@ stateDiagram-v2
 
 ###### States
 
+Every state also carries the `chain` recorded at `Detect`.
+
 ```rust
 enum UnwrappedEquityRecovery {
-    Detected { symbol, shares, detected_at },
-    DispatchedToMint { symbol, shares, detected_at, mint_id, dispatched_at },          // terminal
+    Detected { chain, symbol, shares, detected_at },
+    DispatchedToMint { chain, symbol, shares, detected_at, mint_id, dispatched_at },          // terminal
     DispatchedToRedemption {                                                           // terminal
-        symbol, shares, detected_at, redemption_id, dispatched_at,
+        chain, symbol, shares, detected_at, redemption_id, dispatched_at,
     },
-    OrphanWrapSubmitted { symbol, shares, detected_at, wrap_tx_hash, submitted_at },
-    OrphanWrapped { symbol, shares, detected_at, wrap_tx_hash, wrapped_at },
+    OrphanWrapSubmitted { chain, symbol, shares, detected_at, wrap_tx_hash, submitted_at },
+    OrphanWrapped { chain, symbol, shares, detected_at, wrap_tx_hash, wrapped_at },
     OrphanDepositSubmitted {
-        symbol, shares, detected_at, wrap_tx_hash, vault_deposit_tx_hash, submitted_at,
+        chain, symbol, shares, detected_at, wrap_tx_hash, vault_deposit_tx_hash, submitted_at,
     },
     OrphanDeposited {                                                                  // terminal
-        symbol, shares, detected_at, vault_deposit_tx_hash, deposited_at,
+        chain, symbol, shares, detected_at, vault_deposit_tx_hash, deposited_at,
     },
-    Failed { symbol, shares, reason, failed_at },                                      // terminal
+    Failed { chain, symbol, shares, reason, failed_at },                                      // terminal
 }
 ```
 
@@ -5403,13 +6120,13 @@ enum UnwrappedEquityRecovery {
 
 ```rust
 enum UnwrappedEquityRecoveryCommand {
-    Detect { symbol, shares },
+    Detect { chain, symbol, shares },
     DispatchToMint { mint_id },                // services.transfer.resume_mint
     DispatchToRedemption { redemption_id },    // services.transfer.resume_redemption
-    SubmitOrphanWrap,                          // services.wrapper.submit_wrap
-    ConfirmOrphanWrap,                         // services.wrapper.confirm_wrap
-    SubmitOrphanDeposit,                       // services.raindex.submit_deposit
-    ConfirmOrphanDeposit,                      // services.raindex.confirm_tx
+    SubmitOrphanWrap,                          // the chain's wrapper.submit_wrap
+    ConfirmOrphanWrap,                         // the chain's wrapper.confirm_wrap
+    SubmitOrphanDeposit,                       // the chain's raindex.submit_deposit
+    ConfirmOrphanDeposit,                      // the chain's raindex.confirm_tx
     FailRecovery { reason },
 }
 ```
@@ -5418,7 +6135,7 @@ enum UnwrappedEquityRecoveryCommand {
 
 ```rust
 enum UnwrappedEquityRecoveryEvent {
-    Detected { symbol, shares, detected_at },
+    Detected { chain, symbol, shares, detected_at }, // chain defaults to Base
     DispatchedToMint { mint_id, dispatched_at },
     DispatchedToRedemption { redemption_id, dispatched_at },
     OrphanWrapSubmitted { wrap_tx_hash, submitted_at },
@@ -5449,17 +6166,18 @@ enum UnwrappedEquityRecoveryEvent {
 ###### Job-level Idempotency
 
 Same model as `WrappedEquityRecoveryJob`: the apalis payload carries the
-`UnwrappedEquityRecoveryId` so retries re-target the same aggregate and resume
-from the next non-terminal command. There is no `client_order_id` or nonce-based
-replay-protection at the wrapper layer -- `submit_wrap` takes only
-`(wrapped_token, underlying_amount, wallet)`, and wrapping is an on-chain
-ERC-4626 deposit, not a broker call. The crash-window guard is the aggregate
-state machine instead: a retry that finds `OrphanWrapSubmitted` already
-persisted resumes at `ConfirmOrphanWrap` rather than re-wrapping. The one
-un-guarded window is a wrap that lands on-chain but crashes before
-`OrphanWrapSubmitted` persists -- the aggregate is still `Detected`, so the
-retry re-submits. Funds are not lost: the surplus wtSTOCK is swept by the
-wrapped recovery path, though the original aggregate may terminate in `Failed`.
+`UnwrappedEquityRecoveryId` and the chain so retries re-target the same
+aggregate and resume from the next non-terminal command. There is no
+`client_order_id` or nonce-based replay-protection at the wrapper layer --
+`submit_wrap` takes only `(wrapped_token, underlying_amount, wallet)`, and
+wrapping is an on-chain ERC-4626 deposit, not a broker call. The crash-window
+guard is the aggregate state machine instead: a retry that finds
+`OrphanWrapSubmitted` already persisted resumes at `ConfirmOrphanWrap` rather
+than re-wrapping. The one un-guarded window is a wrap that lands on-chain but
+crashes before `OrphanWrapSubmitted` persists -- the aggregate is still
+`Detected`, so the retry re-submits. Funds are not lost: the surplus wtSTOCK is
+swept by the wrapped recovery path, though the original aggregate may terminate
+in `Failed`.
 
 #### Rebalancing Triggers
 
@@ -5497,8 +6215,9 @@ emits imbalance detection events.
     available at the broker; beside it the hedge floor keeps its fixed number of
     shares
   - Minimum operation size: `min_operation_usd`, valued at the symbol's last
-    onchain fill price (the block-timestamped `Position.last_price`),
-    overridable per chain with the trading table's `min_operation_usd`
+    onchain fill price (the block-timestamped `Position.last_price`), or at the
+    pricing service's live mark for a symbol that has never filled, overridable
+    per chain with the trading table's `min_operation_usd`
   - Cooldown: `cooldown_secs` per `(symbol, chain)` after a dispatch
   - At load, per symbol, the chain targets plus the floor must not exceed 1, and
     a positive target must exceed the band: an empty chain is only
@@ -5517,10 +6236,12 @@ trigger can vouch for: the broker balance, one slot per hedged chain that
 rebalances the symbol (its wrapped vault balance converted through that chain's
 ERC-4626 ratio, its effective target share, the band, its operational limit, its
 minimum operation size, whether its vault registry knows the token and whether
-its wallet is gas-ready), the floors, the cooling chains and the symbol's last
-onchain fill price. A hedge-only listing (`rebalancing = "disabled"`) is neither
-slotted nor counted: its prefunded inventory is outside the planner's total, so
-it never moves the other chains' targets.
+its wallet is gas-ready), the floors, the cooling chains and the symbol's price.
+A hedge-only listing (`rebalancing = "disabled"`) is neither slotted nor
+counted: its prefunded inventory is outside the planner's total, so it never
+moves the other chains' targets. A paused listing (`rebalancing = "paused"`) is
+slotted and counted like an enabled one, but is never chosen: a candidate on it
+is skipped and recorded as `paused`.
 
 - Guards, in order: the broker venue unpolled, no chain slot at all, a
   rebalancing chain without a slot, or any transfer in flight for the symbol
@@ -5534,10 +6255,10 @@ it never moves the other chains' targets.
 - Ranking: redemptions (over target) before mints, larger deviation first, ties
   by chain order. A candidate whose vault registry does not know the token
   (`not_in_registry`), whose wallet is not gas-ready, or whose chain is cooling
-  down, is skipped and the next one evaluated. So is a redemption on any chain
-  but the primary (`redemption_unrecoverable`): wallet recovery runs on the
-  primary chain only, so a failed redemption elsewhere would strand its tokens.
-  The trigger reads a chain's registry and probes its wallet's gas only once the
+  down, is skipped and the next one evaluated. Redemptions on any rebalancing
+  chain rank before mints: recovery is required at config load for both mint and
+  redemption operations, rather than relying on a primary-chain exception. The
+  trigger reads a chain's registry and probes its wallet's gas only once the
   planner picks the chain, and re-plans without that chain when either fails, so
   a symbol within its band reads neither. Each chain is read at most once per
   check: the re-plan after the Position reservation reuses the first plan's
@@ -5547,9 +6268,15 @@ it never moves the other chains' targets.
   the hedge floor available; a broker at or below that declines the whole symbol
   (the floor is symbol-wide, so no other mint could pass). The result is
   truncated to nine decimals.
-- Minimum: with no last price the plan declines; the price's age does not
-  matter, since it only values this dust bound. A candidate whose quantity times
-  price is below the chain's minimum is skipped and the next one evaluated.
+- Minimum: the price is the symbol's last onchain fill. A symbol that has never
+  filled, such as one an operator seeds at listing, uses the pricing service's
+  live mark instead: the mid price of one underlying share, from the underlying
+  rates the pricing frame carries. A frame without them gives no mark. With
+  neither price the plan declines, and a symbol whose usable mark arrives later
+  is checked again, since nothing else wakes it while balances are unchanged.
+  The price's age does not matter, since it only values this dust bound. A
+  candidate whose quantity times price is below the chain's minimum is skipped
+  and the next one evaluated.
 - Dispatch: the operation is enqueued as the chosen chain's mint or redemption
   and the `(symbol, chain)` cooldown starts. One operation per symbol is in
   flight at a time (the per-symbol lock, the job row and the transfer's first
@@ -5718,13 +6445,36 @@ transfer dispatch. It does not calculate cross-venue inventory imbalances.
 - `UsdcRebalanceEvent::WithdrawalConfirmed` - Moves USDC to inflight (leaving
   source)
 - `UsdcRebalanceEvent::DepositConfirmed` - Terminal success for AlpacaToBase;
-  moves from inflight to destination available
+  moves from inflight to destination available. The event carries the vault
+  deposit's block (`vault_deposit_block`, from the deposit receipt). In the same
+  inventory write as the credit, the reactor requests a pinned onchain cash read
+  of the corridor chain at or past that block, the same request a fill whose
+  cash leg underflows makes. The order fill reader trails the chain tip, so a
+  fill in the deposit's block or earlier may have spent the credit onchain
+  before it reaches the view. While the request is pending the cash gate skips
+  every USDC check (transfer triggered, fill triggered, snapshot triggered). The
+  next inventory poll of that chain sends `ReconcileOnchainUsdc`, which the
+  snapshot aggregate emits even for an unchanged balance; once a read pinned at
+  or past the deposit block applies, it replaces the balance, absorbs every fill
+  up to its block (ADR 0018), releases the gate, and enqueues the check (ADR
+  0024). The request asks for the higher of the deposit block and the chain's
+  applied USDC block watermark, since a read already forced in past the deposit
+  contains it and the view rejects any older read. A request already pending for
+  the chain keeps its block when it is higher or when the new request has none;
+  the onchain equity request merges its block the same way. A fill that applies
+  its cash leg while the read is pending raises the read's floor to the fill's
+  block in the same inventory write, and a read is accepted only under that
+  write lock, so a read pinned below the fill cannot replace the balance it
+  changed. An event without the block (a BaseToAlpaca deposit at Alpaca, or one
+  recorded before the block was captured) requests no read
 - `UsdcRebalanceEvent::ConversionConfirmed` - Terminal success for BaseToAlpaca;
   moves from inflight to destination available
 - `UsdcRebalanceEvent::WithdrawalFailed`, BaseToAlpaca pre-burn
   `BridgingFailed`, and AlpacaToBase `ConversionFailed` (the pre-withdrawal
   USD->USDC leg) - Reconciles inflight back to source available, because the
-  failure happened before any funds left the source venue
+  failure happened before any funds left the source venue. The AlpacaToBase
+  `ConversionFailed` also starts the conversion cooldown, so the fresh check
+  after it plans no Alpaca-to-Base transfer until the cooldown ends
 - Post-burn `UsdcRebalanceEvent::BridgingFailed`, any AlpacaToBase
   `BridgingFailed` (post-withdrawal, so the funds are off Alpaca even without
   burn evidence), `DepositFailed`, and BaseToAlpaca `ConversionFailed` (the
@@ -5740,8 +6490,8 @@ transfer dispatch. It does not calculate cross-venue inventory imbalances.
 - `InventorySnapshotEvent::OffchainCash` - Offchain cash balance fetched from
   broker
 - `InventorySnapshotEvent::InflightEquity` - Bot-owned pending tokenization
-  requests polled from Alpaca; sets inflight at Hedging (mints) and MarketMaking
-  (redemptions)
+  requests polled from Alpaca; sets inflight at Hedging for mints on every chain
+  and at Base's MarketMaking slot for Base redemptions only
   - **Ownership**: determined by active rebalancing aggregate IDs --
     `issuer_request_id` / `tokenization_request_id` for mints,
     `tokenization_request_id` / `redemption_tx` for redemptions -- not by
@@ -5753,6 +6503,13 @@ transfer dispatch. It does not calculate cross-venue inventory imbalances.
     logged for operators but do not count as inflight or block rebalancing
   - **Available balances**: unchanged -- set by separate available-balance
     snapshots
+- `InventorySnapshotEvent::ChainInflightRedemptions` - The same poll's bot-owned
+  pending redemptions on one chain other than Base, with the same ownership
+  rules; sets inflight at that chain's MarketMaking slot. It is a separate
+  variant so that an older binary fails on it instead of replaying the chain's
+  redemptions onto Base. That guard does not survive compaction: an older binary
+  reads the compacted snapshot, ignores the per-chain map, and starts normally.
+  Rolling back below the release that added it is unsupported.
 
 ##### Separation of concerns
 
@@ -5880,10 +6637,15 @@ skip the events that arrive, and failed USDC-transfer cleanups stamp
   verified heal resets the counter and releases the gate, an aborted one keeps
   both so the next quiet poll re-escalates immediately.
 - **Dispatch gating**: while engaged, the venue-level cash gate suppresses the
-  USDC rebalancing trigger (checked before the guard claim and again immediately
-  before dispatch) -- a bridge sized off a diverged cash balance would move the
-  wrong amount and mark the venue busy, freezing the very counter that resolves
-  the divergence.
+  USDC rebalancing trigger and the manual USDC transfer route. A dispatch takes
+  an admission (the gate's cash epoch) before it sizes the transfer and redeems
+  it right before its enqueue, holding the gate's dispatch lock through the job
+  row write. Every cash engagement and every onchain cash read request bumps the
+  epoch under that lock exclusively, so a dispatch refuses when the gate engaged
+  at any point after its admission, even if it was released again, and no
+  engagement can land between the final check and the enqueue. A bridge sized
+  off a diverged cash balance would move the wrong amount and mark the venue
+  busy, freezing the very counter that resolves the divergence.
 
 The shared guard machinery follows inventory ownership. Hedging is one chainless
 broker scope, so its equity suppression and snapshot-skip streaks are keyed only
@@ -5895,16 +6657,19 @@ MarketMaking equity reading on one chain is ambiguous only for a transfer that
 moves that chain's slot: inflight in the slot, or an active mint or redemption
 on that chain. Hedging inflight does not record its destination, so it is
 attributed to the active mint's chain; with no active mint it is ambiguous on
-every chain. USDC rebalancing moves cash only between Hedging and the primary
-chain's vault, so Hedging USDC inflight, an active USDC rebalance, or a read
-fetched before the last completed rebalance makes only the primary chain's
-MarketMaking cash reading ambiguous, and inflight in one chain's slot makes only
-that chain's reading ambiguous. An open hedge order or a fill applied after a
-broker read makes only the Hedging reading ambiguous. The scopes are exactly
-Hedging and one MarketMaking scope per chain; wallet transit locations are not
-scopes. Suppression is read across every scope: any engaged venue or chain makes
-a transfer unsafe to size, and a matching poll at one scope cannot release
-another venue's or chain's membership.
+every chain. USDC rebalancing moves cash between Hedging and a corridor chain's
+vault, so an active USDC rebalance makes its corridor chain's MarketMaking cash
+reading ambiguous (one whose corridor cannot be read makes every chain's reading
+ambiguous), and so does a read on any chain fetched before the last completed
+rebalance, whose timestamp is one value for every chain. Hedging USDC inflight
+is attributed to the active Alpaca-outbound transfer's chain; with none known it
+is ambiguous on every chain. Inflight in one chain's slot makes only that
+chain's reading ambiguous. An open hedge order or a fill applied after a broker
+read makes only the Hedging reading ambiguous. The scopes are exactly Hedging
+and one MarketMaking scope per chain; wallet transit locations are not scopes.
+Suppression is read across every scope: any engaged venue or chain makes a
+transfer unsafe to size, and a matching poll at one scope cannot release another
+venue's or chain's membership.
 
 Guard-skip starvation is observable at both venues. The view logs a warning
 every five consecutive skipped equity snapshots for one Hedging symbol or one
@@ -6045,7 +6810,20 @@ transfer or adopt a burn between the preflight and the send. The route does not
 read the chain, so the onchain check above still applies. Both send the same
 `FailBridging` command; the eligibility gate (`pre_burn_fail_eligibility`) is
 the single source shared by both, so both refuse the same states after the burn.
-The live route additionally refuses every BaseToAlpaca transfer.
+The live route additionally refuses every BaseToAlpaca transfer past its vault
+withdrawal.
+
+Both surfaces also accept a BaseToAlpaca transfer at `WithdrawalSubmitting`: the
+vault withdrawal intent is recorded but no withdrawal was ever initiated. For it
+they send `RejectWithdrawal { reason }`, which emits `WithdrawalFailed` with no
+withdrawal reference. No inventory moved, so the guard clears (live through the
+reactor, offline on restart), the live route kills the transfer's queued job
+rows, and the corridor's withdraw cooldown starts. The command does not read the
+chain: before using it the operator confirms on chain that the bot wallet made
+no `OperatorWithdraw` on the inventory after the transfer's `from_block`. A
+withdrawal that did land is adopted with `transfer resume` instead. The bot
+fails such a transfer itself when its withdraw was rejected before broadcast
+(see "Under-funded vault withdraw").
 
 The guard outcome depends on the direction. For a BaseToAlpaca transfer the
 vault withdrawal already moved the USDC to the market maker wallet, which the
@@ -6059,26 +6837,26 @@ transfer the withdrawal already completed, so the funds are off Alpaca:
 startup, and the operator settles the funds with
 `transfer reconcile --kind usdc`, which releases the guard. The live route
 reports this split in its `guardHeld` response field. The command is valid ONLY
-from `BridgingSubmitting` or `WithdrawalComplete` -- it is refused for all
-post-burn states (`Bridging`, `AwaitingAttestation`, `Attested`, `Bridged`,
-`DepositInitiated`, `DepositConfirmed`, `DepositFailed`, `Reconciled`, or any
-`BridgingFailed` with a recorded `burn_tx_hash`). The two surfaces differ in how
-the in-memory guard is reconciled. The live route sends `FailBridging` through
-the conductor-built wired store, so the rebalancing reactor runs in process and
-keeps the transfer's corridor guard held for the AlpacaToBase outcome, matching
-the reported `guardHeld`. The timeout sweep never clears the guard of an
-AlpacaToBase transfer past its withdrawal with no confirmed burn
-(`BridgingSubmitting`, or `BridgingFailed` with no burn): it holds the guard
-without a tombstone and pages once that the transfer has no confirmed burn and
-its funds are off Alpaca, naming the recovery step, until the operator
-reconciles. Neither state proves that no burn was broadcast: a crash between a
-burn's broadcast and its record leaves the same state. So before reconciling the
-operator verifies on chain that no burn left the market maker wallet. The
-offline CLI writes through a standalone store the (stopped) bot's reactor never
-observes, so its outcome is reconciled on the next startup: `recover_usdc_guard`
-clears a non-guard-holding aggregate and re-latches an AlpacaToBase one until
-the operator reconciles. Either way, once the guard is released automatic USDC
-rebalancing resumes.
+from `BridgingSubmitting`, `WithdrawalComplete`, or a BaseToAlpaca
+`WithdrawalSubmitting` (above) -- it is refused for all post-burn states
+(`Bridging`, `AwaitingAttestation`, `Attested`, `Bridged`, `DepositInitiated`,
+`DepositConfirmed`, `DepositFailed`, `Reconciled`, or any `BridgingFailed` with
+a recorded `burn_tx_hash`). The two surfaces differ in how the in-memory guard
+is reconciled. The live route sends `FailBridging` through the conductor-built
+wired store, so the rebalancing reactor runs in process and keeps the transfer's
+corridor guard held for the AlpacaToBase outcome, matching the reported
+`guardHeld`. The timeout sweep never clears the guard of an AlpacaToBase
+transfer past its withdrawal with no confirmed burn (`BridgingSubmitting`, or
+`BridgingFailed` with no burn): it holds the guard without a tombstone and pages
+once that the transfer has no confirmed burn and its funds are off Alpaca,
+naming the recovery step, until the operator reconciles. Neither state proves
+that no burn was broadcast: a crash between a burn's broadcast and its record
+leaves the same state. So before reconciling the operator verifies on chain that
+no burn left the market maker wallet. The offline CLI writes through a
+standalone store the (stopped) bot's reactor never observes, so its outcome is
+reconciled on the next startup: `recover_usdc_guard` clears a non-guard-holding
+aggregate and re-latches an AlpacaToBase one until the operator reconciles.
+Either way, once the guard is released automatic USDC rebalancing resumes.
 
 **Operator reconciliation of a stranded post-burn failure**: A USDC rebalance
 that fails after the CCTP burn holds the rebalancing guard, blocking further
@@ -6114,38 +6892,124 @@ declared resolved by sending the `Reconcile { reason }` command, which emits
 Unlike USDC, the equity aggregates hold no in-progress guard, so the `Reconcile`
 command emits **no reactor effect and dispatches no inventory update** -- it is
 a pure bookkeeping terminal transition. The one exception is the wallet nonce of
-a reconciled redemption's signed vault withdrawal, described below. One nuance
-for redemptions: a redemption that ended in `DetectionFailed` /
-`RedemptionRejected` has its stranded exposure seeded into live inflight at
-startup (see `symbols_with_stuck_redemptions`). Reconcile moves the latest event
-to `OperatorReconciled`, so that redemption is no longer seeded as stuck on the
-**next** restart; the running process's live inflight retains the startup-seeded
-amount until then. Mint failures and pre-send redemption failures settle
-inventory at failure time, so they need no such clearing. A mint's `Reconciled`
-is valid ONLY from `Failed`. A redemption's `Reconciled` is valid from `Failed`
-and from the withdrawal submission states (`VaultWithdrawPending`,
-`VaultWithdrawSubmitting`, `VaultWithdrawSubmitted`); every other state is
-rejected.
+a reconciled redemption's signed vault withdrawal or send to the issuer,
+described below. One nuance for redemptions: a redemption that ended in
+`DetectionFailed` / `RedemptionRejected` has its stranded exposure seeded into
+live inflight at startup (see `stuck_redemptions`). Reconcile moves the latest
+event to `OperatorReconciled`, so that redemption is no longer seeded as stuck
+on the **next** restart; the running process's live inflight retains the
+startup-seeded amount until then. Mint failures and pre-send redemption failures
+settle inventory at failure time, so they need no such clearing. A mint's
+`Reconciled` is valid ONLY from `Failed`. A redemption's `Reconciled` is valid
+from `Failed`, from the withdrawal submission states (`VaultWithdrawPending`,
+`VaultWithdrawSubmitting`, `VaultWithdrawSubmitted`), and from `SendPending` (a
+signed send to the issuer, or a legacy one with no recorded transaction); every
+other state is rejected.
 
 A redemption reconciled from a submission state can still hold a wallet nonce
-reservation for its signed withdrawal. `Reconciled` retains that withdrawal's tx
-hash (`withdrawal_nonce_hash`), and the running bot releases the reservation by
-hash without a restart: the redemption's resume job releases it when it loads
-`Reconciled`, in `perform` and in its terminal attempt, and the timeout sweep
-enqueues a resume job for a reconcile it observes (a failed enqueue is kept and
-retried on later sweep ticks). The release is ownership-checked and idempotent.
-It does not cancel the signed withdrawal, so the operator reconciles only after
-another transaction from the bot wallet has mined at the withdrawal's nonce. A
-withdrawal that is only missing from a mempool can still mine, so the operator
-first sends a 0-value self-transfer at that nonce and waits for it to confirm. A
-withdrawal that itself mined and reverted, or mined with no matching vault
-transfer, already used the nonce and moved nothing, so the operator reconciles
-it directly with no replacement. In both cases a mined transaction already used
-the nonce, and that is what lets later sends proceed. The release is
-bookkeeping: it drops the bot's hold on the used nonce and does not rewind nonce
-allocation onto it. A prepared transaction discarded before broadcast (a
-persist-failure rollback) is different: its nonce is unused, so allocation is
-rewound to refill it.
+reservation for its signed withdrawal, and one reconciled from a signed
+`SendPending` for its send to the issuer. `Reconciled` retains that
+transaction's hash (`withdrawal_nonce_hash` or `issuer_send_nonce_hash`; a
+legacy `SendPending` holds no nonce), and the running bot releases the
+reservation by hash without a restart: the redemption's resume job releases it
+when it loads `Reconciled`, in `perform` and in its terminal attempt, and the
+timeout sweep enqueues a resume job for a reconcile it observes (a failed
+enqueue is kept and retried on later sweep ticks). The release is
+ownership-checked and idempotent. It does not cancel the signed transaction. The
+operator reconciles a `SendPending` only after verifying onchain that its send
+to the issuer can never land (another transaction from the bot wallet mined at
+its nonce, or the send itself mined and reverted). Reconcile of a redemption
+holding a signed withdrawal is refused unless the chain proves the withdrawal
+can never land. A signed withdrawal stuck below the market fee will not confirm
+at that fee but can still mine when fees drop. If the withdrawal mined and
+reverted, the operator waits for its required confirmations, settles the equity
+by hand and reconciles with no `--superseding-tx`. If it has no receipt, the
+operator first cancels it: a higher fee 0-value self-transfer from the bot
+wallet at its nonce, mined. Only then does the operator settle the equity by
+hand and reconcile, naming the cancel (`--superseding-tx`, the API's
+`supersedingTx`). The bot reads the chain of the redemption, through that
+chain's raindex and bot wallet, and accepts only one of two proofs, each with
+that chain's required confirmations. Either the withdrawal itself mined and
+reverted, which used its nonce and moved nothing, so no replacement is named. Or
+the withdrawal has no receipt and the named tx is a different tx from the bot
+wallet at its nonce that moved nothing: it either reverted, or is a plain
+cancel, a 0-value transfer with no calldata from the bot wallet to itself that
+is not EIP-7702 and whose receipt holds no logs. A vault withdrawal always logs
+(the inventory's withdraw event and the token transfer), and a reverted frame
+drops its logs, so a successful tx with none moved nothing, even if code ran at
+the wallet through an EIP-7702 delegation; the check reads only the receipt, so
+it needs no historical state. Any other successful tx (a fee bumped copy of the
+withdrawal, a call through another contract, a contract creation, or one that
+emitted logs) may have withdrawn the vault and is refused. Either way nothing
+moved, so the manual equity settlement is the same. A withdrawal that mined
+successfully went through and is refused: its withdraw4 settles atomically, so a
+success moved tokens even when its logs do not match what the bot expected. The
+withdrawal must be signed by the chain's configured bot wallet, since nonces are
+per sender. Only a tx the node shows mined in the canonical chain counts, so a
+lagging node refuses rather than proves. The check runs before the pure
+`Reconcile` command in both the CLI and the bot's reconcile route (`409` with
+the reason, `502` on a failed chain read, `503` before the bot is ready); a
+`supersedingTx` on a mint, or on a redemption with no signed withdrawal, is
+refused. The command carries the hash of the withdrawal it proved (none when the
+redemption held none) and refuses if the redemption now holds a different one,
+such as a withdrawal the live job signed while the check ran. In both cases a
+mined transaction already used the nonce, and that is what lets later sends
+proceed. The release is bookkeeping: it drops the bot's hold on the used nonce
+and does not rewind nonce allocation onto it. A prepared transaction discarded
+before broadcast (a persist-failure rollback) is different: its nonce is unused,
+so allocation is rewound to refill it.
+
+A tx that took the signed withdrawal's nonce but is not a plain cancel may have
+moved the equity, so reconcile refuses it; when it did the withdrawal itself (a
+wallet "speed up" that sent the same `withdraw4` again at a higher fee), the
+redemption adopts it instead. The
+`AdoptWithdrawalReplacement { replacement_tx,
+replaced_withdrawal, reason }`
+command is valid only while the redemption still holds the signed withdrawal the
+caller checked (`VaultWithdrawSubmitting`, or a `VaultWithdrawSubmitted` that
+retains its signed bytes), refuses the withdrawal itself as its own replacement,
+and requires a reason. It emits `VaultWithdrawReplacementAdopted`, which leaves
+the redemption in `VaultWithdrawSubmitted` with the adopted hash, no signed
+bytes and the original submitted time, so the reconciliation deadline keeps
+running. The command is pure: the bot's route
+`POST
+/liquidity-write/transfers/equity_redemption/{id}/adopt-withdrawal`
+(client: `debug adopt-withdrawal`; `stox` has no adopt verb) first checks on the
+redemption's chain, through that chain's raindex and bot wallet, that the tx is
+mined in the canonical chain from the bot wallet, at the withdrawal's nonce, is
+not the withdrawal itself, has the chain's required confirmations, succeeded,
+and is a `withdraw4` to the contract the withdrawal calls, from the same token
+and vault, for at most the signed withdrawal's amount, whose receipt shows a
+transfer of that token to the bot wallet, which `withdraw4` pays as its caller,
+and is not already another redemption's recorded vault withdrawal (`409` naming
+the failed check, `502` on a failed chain read, `503` before the bot is ready,
+`400` for a redemption with no signed withdrawal). The route holds the recovery
+lock and sends the command through the conductor owned store, so the live
+transfer reactor sees the adoption. The redemption's redrive then resumes from
+`VaultWithdrawSubmitted` as for any hash only submission: it restores the
+adopted hash at its nonce, `ConfirmWithdraw` confirms it and records the vault
+transfer its receipt shows (refusing a receipt that paid the withdrawal's token
+nowhere the bot expects), and confirming it releases the whole nonce entry,
+including the signed withdrawal's reservation. Nothing is rebroadcast, since the
+nonce is used. A restart restores the same hash only reservation, so the release
+does not depend on the process that adopted it.
+
+An adopted redemption is never reconciled: `Reconcile` refuses a
+`VaultWithdrawSubmitted` whose `adopted_from` is set, whatever a node shows for
+the adopted tx, since the bot proved it moved the equity. A legacy redemption
+holding only a withdrawal hash (from before the signed bytes were kept) has no
+nonce to prove unused, so it reconciles on the operator's word, except once that
+hash mined and succeeded: then the equity left the vault, and reconcile refuses
+it as it does a signed withdrawal that went through (both the CLI and the bot's
+route read the hash first, the route `503` before the bot is ready).
+
+Rollback floor for withdrawal adoption: a build before it cannot replay
+`VaultWithdrawReplacementAdopted`. The pre deploy `verify-migrations` gate
+replays every persisted aggregate, completed ones included, so once any
+redemption has an adoption event a build before adoption fails that gate and
+cannot be deployed. The first release with adoption is therefore a permanent
+rollback floor from the first adoption on, whether or not the adopted redemption
+has finished.
 
 The `Reconciled` state retains the identifying fields (symbol, quantity,
 original failure reason, request/redemption identifiers) so the dashboard
@@ -6309,10 +7173,11 @@ effect rather than a generic intent:
   caveat is the bot concurrently driving the same on-chain mint); or the running
   bot (REST). `fail`, `recheck`, `transfer resume --kind equity`, and
   `transfer resume --kind usdc` require the bot. `cctp complete-mint`,
-  `process-tx`, and `view rebuild` also have running bot routes under the
-  IAP-verified `/liquidity-write/` prefix (client: `st0x-liquidity-client`),
-  which remove the stop the bot precondition of their direct paths; their
-  contracts are the next three bullets and the `process-tx` bullet below.
+  `process-tx`, `view rebuild`, and the capital verbs also have running bot
+  routes under the IAP-verified `/liquidity-write/` prefix (client:
+  `st0x-liquidity-client`), which remove the stop the bot precondition of their
+  direct paths; their contracts are the next four bullets and the `process-tx`
+  bullet below.
 - **`cctp complete-mint` through the running bot is two phase and never waits on
   Circle.** `POST /liquidity-write/cctp/complete-mint` fetches the burn's
   attestation with a single request, holding no lock: a burn Circle has not
@@ -6354,6 +7219,165 @@ effect rather than a generic intent:
   `stox view
   rebuild` CLI runs the same rebuild direct-DB and must run only
   while the bot is stopped.
+- **The capital verbs through the running bot sign with the bot's own wallets
+  and never wait on settlement.** `st0x-liquidity-client capital` posts to
+  `POST /liquidity-write/capital/{verb}` for `transfer-usdc`, `vault-deposit`,
+  `vault-withdraw`, `vault-withdraw-usdc`, `cctp-bridge` and `reset-allowance`,
+  the network counterparts of the `st0x-cli` verbs of the same names, and for
+  `cctp-burn-supersede`, which settles a `cctp-bridge` burn and has no
+  `st0x-cli` counterpart. The routes sign with the wallets the conductor uses,
+  so they share its nonce manager instead of running a second one. The ops load
+  balancer times a request out after 60 seconds, so no route waits on CCTP
+  attestation, USDC settlement, or the confirmations of the transaction it
+  answers with; only a prerequisite approve, when an allowance is short, is
+  awaited before that broadcast. `transfer-usdc` starts a fresh transfer on the
+  bot's own transfer worker, the path the rebalancer uses, and returns its new
+  id at once. It runs on the served corridor its optional `chain` names, picked
+  by the same rule as `st0x-cli transfer-usdc --chain`: `chain` may be left out
+  while the build serves one corridor, and a missing or ambiguous choice is
+  refused with `422`. An amount that is not positive or is finer than USDC's six
+  decimals is refused with `400` before anything else, then it refuses with
+  `503` until startup completes, then it takes the recovery lock (`409`),
+  quiesces the USDC rebalancing driver (`503`), then applies the single flight
+  gates of `transfer resume --kind usdc` in order: an every corridor latch, a
+  live USDC job row, or a durable guard holder refuses with `409`; then, like
+  the trigger before every fresh transfer, it refuses with `409` while a cash
+  snapshot divergence is engaged or the cash balance is restart tainted (the
+  transfer would mark the cash venue busy and keep the poller from resolving
+  either), and with `503` while the Base or Ethereum signing wallet cannot be
+  shown to pay gas; last, a corridor guard held in memory refuses the claim with
+  `409`. A retried request can therefore not start a second transfer while the
+  first is in flight. Everything after the startup gate runs on a tracked
+  detached task, so a dropped request cannot release the corridor claim after
+  the job is queued. `cctp-bridge` only burns: it applies the same corridor gas
+  check (`503`) as `transfer-usdc`, since the burn and the mint that completes
+  it spend both wallets' gas, then holds the recovery lock and the driver pause
+  around the burn like `cctp complete-mint` does around the mint, and returns
+  the burn tx as soon as the burn is broadcast, not when it confirms: an approve
+  plus the burn's confirmations can outlast the 60 second load balancer cut, and
+  a request that timed out after the broadcast would leave the operator without
+  the burn tx. Every request carries the client's operation id (a UUID, which
+  `st0x-liquidity-client` generates per run and prints before sending), and an
+  id holds at most one burn: the `CctpBurnOperation` aggregate (ADR 0023). After
+  the lock, the pause and the amount, the route signs the burn without
+  broadcasting it, records the signed bytes under the id (`Prepared`), and only
+  then broadcasts them, so the burn is on record before it can exist onchain. A
+  request whose id already holds a burn never signs or burns again, and its
+  `from` and amount (or `all`) must match the recorded burn's, else `409`. A
+  settled burn, or a pending one a node already holds (mined or in its mempool),
+  is answered before the gas check and the locks, since nothing is sent: the
+  recorded burn tx and the status its own receipt proves. A pending burn no node
+  holds (a restart before its broadcast, or a drop) is sent again from its
+  recorded bytes under the lock and the pause, like a new burn, since sending
+  spends the wallet's USDC. After every broadcast attempt, accepted or not and
+  on either path, the route reloads the operation, which the supersede route may
+  have settled meanwhile: a settled burn releases its nonce again and reports
+  its outcome, and a failed attempt also reports what the burn's own receipt
+  proves. A failed reload never drops the lock or the pause. Under the lock the
+  route looks the id up again, so two concurrent requests with one id burn once,
+  and the aggregate refuses a second `Prepare` for an id. A failed record
+  releases the signature's nonce when a reload shows nothing recorded (`500`,
+  nothing broadcast), adopts the burn another request recorded, and keeps the
+  nonce reserved when the reload fails too (`500`, rerun only after a restart,
+  since until then a rerun could sign behind the reserved nonce). A failed
+  broadcast of a recorded burn answers `502` only while its receipt does not
+  prove the outcome; a rerun with the same id broadcasts the same bytes. A burn
+  signed by another address than the source wallet (a rotated key) is never
+  broadcast or restored through this wallet, whose nonce bookkeeping is per
+  address. The response carries the operation id, the burn tx, both chains, the
+  raw amount and a `status`: `pending`, `confirmed`, `reverted`, `superseded` or
+  `replaced`. The detached task then awaits the receipt, still holding the lock
+  and the pause, until the burn has the source chain's required confirmations or
+  the wait gives up (up to 5 minutes for inclusion plus 30 minutes for the
+  confirmations), and records the outcome its own canonical receipt proves at
+  those confirmations: `Confirmed`, only with the CCTP `MessageSent` event that
+  `cctp complete-mint` needs (a successful receipt without it pages and stays
+  pending), or `Reverted` (which burned nothing). A receipt timeout, a drop
+  report, an RPC error or a shallower receipt proves nothing, so the burn stays
+  pending and a rerun with its id reports it and broadcasts it again. Meanwhile
+  every route that takes the recovery lock answers `409`, and
+  `cctp complete-mint` answers `502` until Circle attests the burn and `409`
+  once it has, since it fetches the attestation before it tries the lock. The
+  operator finishes with `cctp complete-mint`. A reverted burn is final: a rerun
+  with its id reports `reverted` and burns nothing, and burning again takes a
+  new id. A signed burn is never resigned or fee bumped. At startup, next to the
+  signed deposit sends and before any startup approval or revoke, the bot
+  records the outcome of every pending burn whose receipt now decides, and
+  reserves the nonce of every other one signed by the source wallet and
+  rebroadcasts its exact bytes (except one the node shows mined, a shallow
+  receipt or one without `MessageSent`, which keeps the reservation only; one
+  signed by another wallet is skipped and gates its chain); a chain with such a
+  burn not mined yet skips its startup approvals and revokes, as for a deposit
+  send. A pending burn that will not mine at its fee keeps its nonce on the
+  source wallet, and later sends from that wallet queue behind it, until it
+  mines or the operator cancels it with a plain 0 value transfer to the wallet
+  itself, with no calldata and a higher fee, at the burn's nonce, then settles
+  it with `POST /liquidity-write/capital/cctp-burn-supersede` (`operationId`,
+  `supersedingTx`). The named tx must be mined from the burn's signer at the
+  burn's nonce with the source chain's required confirmations, and the burn
+  itself unmined. The signer is read from the burn's signed bytes, so a burn
+  signed by a rotated key can be settled too; its nonce is then not released,
+  since this wallet never booked it. A reverted tx or a plain cancel records
+  `Superseded`. A fee bumped copy of the burn (a wallet's speed up: the burn's
+  exact calldata to the same TokenMessenger, no value, with `MessageSent` in its
+  receipt) records `Replaced`, and the copy becomes the operation's burn tx for
+  `complete-mint`. Either way the route releases the wallet's hold on the nonce,
+  again on every later call, since a stale rebroadcast can book it again. Any
+  other successful tx is refused with `409`, since it may have moved funds; a
+  failed chain read answers `502`, and an unknown id `404`. A burn whose outcome
+  is recorded or whose own receipt now decides reports that status instead. The
+  vault verbs and `reset-allowance` take neither the lock nor the pause, like
+  the `st0x-cli` verbs: pausing the driver would refuse every vault operation
+  for the length of each USDC transfer. `vault-deposit` does take its own lock
+  (`409` while another `vault-deposit` request runs): the deposit reads the
+  allowance and approves exactly the amount when it is short, so two concurrent
+  requests for a token without the startup MAX grant could overwrite each
+  other's approval. The lock covers these requests only: without the MAX grant,
+  a request can still use up the exact approval of a USDC transfer worker's
+  deposit, which then reverts and needs a redrive. `vault-withdraw` and
+  `vault-withdraw-usdc` share a withdraw lock of their own (`409` while either
+  runs), held until the outcome of the tx it answered with is known, for the
+  rerun reason below; it does not cover the bot's own transfer withdrawals.
+  Every capital route refuses with `503` until startup completes, like
+  `process-tx`, since the startup preflights (each chain's id, the inventory
+  `OPERATOR_ROLE`) have not passed before then. Each route that sends a
+  transaction runs it on a tracked detached task, like `process-tx`, so a client
+  or load balancer timeout cannot drop a transaction between its broadcast and
+  its receipt, graceful shutdown waits for it, and the task logs its own
+  outcome. The vault verbs and `reset-allowance` answer at the broadcast like
+  `cctp-bridge`, with the same response bodies, since the tx hash, the raw
+  amount and the decimals are all known before the send: the 12 confirmations
+  production requires on Ethereum take about two and a half minutes, longer than
+  the load balancer cut. These verbs refuse a chain without a
+  `[chains.<name>.trading]` table with `400`, and Ethereum has none in staging
+  or prod today, so that cost applies once Ethereum gets one. The task then
+  awaits the confirmation and logs the outcome with the tx hash, so a tx that
+  reverts after the answer shows only in the bot logs. The answer does not wait
+  for the onchain effect, so the vault balance may not have moved yet when it
+  arrives (or may have, if the tx was included quickly). The vault verbs hold
+  their lock until their tx's fate is proven: its own canonical receipt at the
+  chain's required confirmations shows it succeeded or failed, or the wallet
+  decoded its revert. After a confirmation error the task reads that receipt, so
+  a failed tx whose revert replay decodes nothing (no revert data, or pruned
+  state) still frees the lock. Any other confirmation error (a receipt timeout,
+  a drop report, a transport failure, a JSON-RPC error reply) proves nothing: a
+  lagging or load balanced RPC can report a tx dropped while another node still
+  holds it pending. So the task keeps the lock and waits for the receipt again
+  30 seconds later; each wait can itself take up to 5 minutes for inclusion plus
+  30 minutes for the confirmations, so the lock can stay held for hours. A panic
+  while confirming leaves the fate unknown, so the task keeps the lock until a
+  restart. A failed send frees the lock and answers `500`, like `st0x-cli`: its
+  error cannot tell whether the tx went out, so the operator checks onchain
+  before a rerun. Until the lock is freed a rerun of `vault-deposit`,
+  `vault-withdraw`, or `vault-withdraw-usdc` answers `409` instead of sending a
+  second tx. The locks live in memory, so a restart frees them. A rerun of
+  `reset-allowance` still sends a redundant `approve(0)`, which moves no funds.
+  When the allowance is short `vault-deposit` still awaits the approve's
+  confirmation before it broadcasts the deposit, so only a deposit of a token
+  without the startup MAX grant can still outlast the cut. The tokenization and
+  issuer verbs (`transfer-equity`, `wrap-equity`, `unwrap-equity`,
+  `donate-equity`, `dividend-bump`) have no route: they touch tokenization and
+  the issuer wallet, not liquidity capital.
 - **`transfer resume --kind usdc` routes through the running bot.** The CLI
   posts to `POST /transfers/usdc/resume/{direction}/{id}`. The endpoint
   validates server-side (unknown id refuses -- a mistyped id must never start a
@@ -6368,10 +7392,11 @@ effect rather than a generic intent:
   aggregate's persisted amount. Routing through the bot closes the CLI-vs-server
   race: the CLI process never drives an aggregate the bot's worker may also
   drive. The manual `transfer-usdc` command still starts a fresh transfer
-  directly, but hands off to this endpoint at the FIRST bot-resumable wait
-  (attestation timeout, settlement lag, inconclusive poll); when the bot is
-  unreachable, the transfer is durable -- a bot restart re-arms it
-  automatically. Like the whole `server_port` recovery surface
+  directly, on the served corridor `--chain` names (optional while the build
+  serves one corridor), but hands off to this endpoint at the FIRST
+  bot-resumable wait (attestation timeout, settlement lag, inconclusive poll);
+  when the bot is unreachable, the transfer is durable -- a bot restart re-arms
+  it automatically. Like the whole `server_port` recovery surface
   (`/transfers/resume`, `/transfers/recheck`, `/transfers/fail`), its bare path
   is restricted to loopback callers for the in-container CLI. Network operators
   use the IAP-verified `/liquidity-write/transfers/*` mounts.
@@ -7051,11 +8076,14 @@ multiple broker-specific contexts.
    environment.
 
    `Position.last_price` remains the last fill-derived observation used by the
-   trading domain and historical accounting. Dashboard pricing is a separate,
-   process-local read model streamed in the initial WebSocket state and in live
-   price updates; it does not mutate a Position or the event store. Pricing
-   transport failures are retried and degrade only dashboard USD values, not
-   hedging or rebalancing.
+   trading domain. Dashboard pricing is a separate, process-local read model
+   streamed in the initial WebSocket state and in live price updates; it does
+   not mutate a Position or the event store. The same store also supplies the
+   rebalancer's minimum-operation-size price for a never-filled symbol and the
+   daily portfolio snapshot's newer-than-fill mark (see "USD marks"). Pricing
+   transport failures are retried. They never affect hedging; they can delay a
+   never-filled symbol's rebalancing, and a snapshot taken before any mark
+   arrives falls back to the last fill.
 
 3. **Spreads**: Last realized spreads per asset (buy/sell prices and spread bps)
    and per-symbol price charts over time.
@@ -7345,20 +8373,93 @@ transport-only. Automatic funding from another wallet is not part of this
 behavior; prolonged low balances continue to use the monitor's repeated
 operational alerts.
 
+### Hedge-stall monitoring
+
+The dead-letter and worker-failure alerts cover hedges that fail loudly. The
+hedge-stall monitor covers counter-trading that stops quietly: an idle hedge
+worker, a position sweep that no longer reschedules, or a broker order that
+never completes. It runs only when `[alerts.hedge_stall]` is configured, reads
+the `Position` projection and an in-memory record of the last completed full
+position sweep, and never changes hedging.
+
+**Conditions.** Every `poll_interval` seconds the monitor observes the position
+sweep and each symbol, each with a progress marker. A stall alerts when it has
+been observed on every poll for `stall_after` seconds with an unchanged marker.
+The sweep's marker is its last completion, and it is observed in every session.
+A failed broker session read is also observed in every session, on each poll
+whose read fails, and a successful read ends it. A symbol's marker is its net
+shares minus onchain fills, which moves only when a hedge fills or an operator
+adjusts the position. A symbol is observed while one of these conditions holds,
+and the alert names the one that holds at the time:
+
+| Condition            | Observed when                                                       |
+| -------------------- | ------------------------------------------------------------------- |
+| order not completing | position has a pending offchain order, whatever its net             |
+| anchored too long    | position blocked by a failed-order anchor, whatever its net         |
+| exposure not placed  | position ready to hedge, not held by the last sweep, no dead-letter |
+
+One clock covers all three conditions, so a symbol that alternates between them
+(an order rejected and re-placed, a limit order repriced repeatedly) still
+alerts when nothing fills.
+
+"Ready to hedge" is `Position::is_ready_for_execution` with the operational
+limit of the hedged chain that sizes the sweep's hedge; symbols no hedged chain
+enables are ignored. The last sweep holds a symbol on purpose for an active
+equity transfer, a policy preflight skip (hedge floor, broker minimums), a
+reference-price failure that already paged, or a dry run with no reference
+source. A transient failure such as a broker 5xx or 429 is not a hold, and
+neither is a funding shortfall (buying power or inventory), which nothing else
+pages on. A symbol with a placement dead-letter is left to that alert; a
+residual-after-close alert does not suppress it.
+
+**Quiet guard.** The three per-symbol conditions count only while the market
+session can hedge the symbol (regular hours, or extended hours when enabled for
+it); "exposure not placed" and "anchored too long" also need the trading
+schedule to admit a new order. Outside that, the condition is not observed and
+its clock resets, so a closed market or a flat book never alerts and an alert
+comes no sooner than `stall_after` after the open. If the session read fails,
+the last known session stands for these conditions until its own close time,
+then counts as closed. Pre-market reads as extended hours with the 20:00 ET
+close, so a stale session can hide the regular open; "market session unreadable"
+covers that. It and "scan not running" apply in every session.
+
+**De-duplication and recovery.** Same as the gas monitor: alert on the
+transition into the stalled state, re-alert at most once per `realert_interval`,
+and log recovery at `info!` (target `hedge`) without notifying. State is in
+memory; after a restart no condition can alert before `stall_after` has passed,
+so a restart during a stall stops the alert lines and Grafana reports it
+resolved until the monitor alerts again.
+
+**Alert text.** The downstream classifier matches on the message, so these
+phrases are a contract:
+
+- `Hedge stalled: scan not running for <minutes>m`
+- `Hedge stalled: market session unreadable for <minutes>m`
+- `Hedge stalled: exposure not placed for <SYMBOL>, net <n> shares, <minutes>m (session <session>)`
+- `Hedge stalled: order not completing for <SYMBOL>, net <n> shares, <minutes>m (session <session>)`
+- `Hedge stalled: anchored too long for <SYMBOL>, net <n> shares, <minutes>m (session <session>)`
+
+**Config.** `[alerts.hedge_stall]` takes `poll_interval`, `stall_after` and
+`realert_interval` in seconds, all required and non-zero. `stall_after` must be
+at least three `position_check_interval_secs` intervals, plus
+`[broker] extended_hours_reprice_timeout_secs` when that is set, so a late scan
+or a resting extended-hours limit order waiting for its reprice and replacement
+does not alert.
+
 ### Structured log channel
 
 Alerts are emitted as structured ERROR logs: target `operational_alert`, an
 `alert = true` marker field, and the human-readable alert text in the `message`
 field. Delivery to humans happens downstream in the log pipeline (Cloud Logging
--> Grafana alert rules, maintained in t0.devops), so the bot holds no delivery
+-> Grafana alert rules, maintained in t0.grafana), so the bot holds no delivery
 credentials and in-process delivery cannot fail. The non-secret `[alerts]`
-config supplies only the gas-monitor thresholds and intervals; the encrypted
-secrets carry nothing for alerting. (Migration note: the retired Telegram fields
-are accepted and ignored with a deprecation warning for one release, then
-rejected -- `chat_id`/`message_thread_id` in the `[alerts]` config section, and
-a leftover `[alerts]` table (`bot_token`) in the secrets file. Deployed config
-versions still carry the former, deployed secret versions the latter, and the
-previous build required them.)
+config supplies only the gas-monitor and hedge-stall-monitor thresholds and
+intervals; the encrypted secrets carry nothing for alerting. (Migration note:
+the retired Telegram fields are accepted and ignored with a deprecation warning
+for one release, then rejected -- `chat_id`/`message_thread_id` in the
+`[alerts]` config section, and a leftover `[alerts]` table (`bot_token`) in the
+secrets file. Deployed config versions still carry the former, deployed secret
+versions the latter, and the previous build required them.)
 
 ### BaseToAlpaca deposit send
 

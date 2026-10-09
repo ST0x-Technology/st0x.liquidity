@@ -13,8 +13,8 @@ use std::process::ExitCode;
 
 use crate::auth::{AuthError, StaticToken, TokenSource};
 use crate::cli::{
-    Cctp, CctpSourceChain, Cli, Command, Debug, EquityTransferKind, PortfolioSnapshot, Position,
-    Read, RebuildableView, RecheckTransferType, UsdcDirection, View,
+    Capital, Cctp, Cli, Command, Debug, HedgedChain, PortfolioSnapshot, Position, Read,
+    RebuildableView, RecheckTransferType, UsdcDirection, VaultArgs, View,
 };
 use crate::output::OutputError;
 use crate::target::Auth;
@@ -172,12 +172,25 @@ async fn dispatch<A: TokenSource + Sync>(
             );
             client.get(&path, &args.params).await?
         }
-        Command::Debug(Debug::Resume) => client.post("/transfers/resume", &[]).await?,
-        Command::Debug(Debug::Recheck {
+        Command::Debug(debug) => send_debug(client, debug).await?,
+        Command::Capital(capital) => dispatch_capital(client, capital).await?,
+    };
+    output::print(&value).map_err(ApiError::from)
+}
+
+/// Sends one operator write through the write prefix and returns the bot's
+/// response for `dispatch` to print.
+async fn send_debug<A: TokenSource + Sync>(
+    client: &Client<A>,
+    debug: Debug,
+) -> Result<serde_json::Value, TransportError> {
+    let value = match debug {
+        Debug::Resume => client.post("/transfers/resume", &[]).await?,
+        Debug::Recheck {
             kind,
             id,
             deposit_tx,
-        }) => {
+        } => {
             let kind = match kind {
                 RecheckTransferType::Mint => "equity_mint",
                 RecheckTransferType::Redemption => "equity_redemption",
@@ -189,7 +202,7 @@ async fn dispatch<A: TokenSource + Sync>(
                 .post(&format!("/transfers/recheck/{kind}/{id}"), &params)
                 .await?
         }
-        Command::Debug(Debug::ResumeUsdc { direction, id }) => {
+        Debug::ResumeUsdc { direction, id } => {
             let direction = match direction {
                 UsdcDirection::AlpacaToBase => "alpaca_to_base",
                 UsdcDirection::BaseToAlpaca => "base_to_alpaca",
@@ -199,11 +212,11 @@ async fn dispatch<A: TokenSource + Sync>(
                 .post(&format!("/transfers/usdc/resume/{direction}/{id}"), &[])
                 .await?
         }
-        Command::Debug(Debug::ReconcileUsdc {
+        Debug::ReconcileUsdc {
             id,
             reason,
             superseding_tx,
-        }) => {
+        } => {
             let id = encode_segment(&id);
             client
                 .post_json(
@@ -215,20 +228,41 @@ async fn dispatch<A: TokenSource + Sync>(
                 )
                 .await?
         }
-        Command::Debug(Debug::ReconcileEquity { kind, id, reason }) => {
-            let kind = match kind {
-                EquityTransferKind::Mint => "equity_mint",
-                EquityTransferKind::Redemption => "equity_redemption",
-            };
+        Debug::ReconcileEquity {
+            kind,
+            id,
+            reason,
+            superseding_tx,
+        } => {
+            let kind = kind.route_segment();
             let id = encode_segment(&id);
             client
                 .post_json(
                     &format!("/transfers/{kind}/{id}/reconcile"),
-                    &wire::ReconcileEquityRequest { reason },
+                    &wire::ReconcileEquityRequest {
+                        reason,
+                        superseding_tx,
+                    },
                 )
                 .await?
         }
-        Command::Debug(Debug::ClearPendingBurn { id, reason }) => {
+        Debug::AdoptWithdrawal {
+            id,
+            replacement_tx,
+            reason,
+        } => {
+            let id = encode_segment(&id);
+            client
+                .post_json(
+                    &format!("/transfers/equity_redemption/{id}/adopt-withdrawal"),
+                    &wire::AdoptWithdrawalRequest {
+                        reason,
+                        replacement_tx,
+                    },
+                )
+                .await?
+        }
+        Debug::ClearPendingBurn { id, reason } => {
             let id = encode_segment(&id);
             client
                 .post_json(
@@ -237,7 +271,7 @@ async fn dispatch<A: TokenSource + Sync>(
                 )
                 .await?
         }
-        Command::Debug(Debug::FailUsdcTransfer { id, reason }) => {
+        Debug::FailUsdcTransfer { id, reason } => {
             let id = encode_segment(&id);
             client
                 .post_json(
@@ -246,11 +280,8 @@ async fn dispatch<A: TokenSource + Sync>(
                 )
                 .await?
         }
-        Command::Debug(Debug::FailEquityTransfer { kind, id, reason }) => {
-            let kind = match kind {
-                EquityTransferKind::Mint => "equity_mint",
-                EquityTransferKind::Redemption => "equity_redemption",
-            };
+        Debug::FailEquityTransfer { kind, id, reason } => {
+            let kind = kind.route_segment();
             let id = encode_segment(&id);
             client
                 .post_json(
@@ -259,7 +290,7 @@ async fn dispatch<A: TokenSource + Sync>(
                 )
                 .await?
         }
-        Command::Debug(Debug::Position(Position::Set(args))) => {
+        Debug::Position(Position::Set(args)) => {
             let symbol = encode_segment(&args.symbol);
             client
                 .post_json(
@@ -272,7 +303,7 @@ async fn dispatch<A: TokenSource + Sync>(
                 )
                 .await?
         }
-        Command::Debug(Debug::Position(Position::ReleaseHedge(args))) => {
+        Debug::Position(Position::ReleaseHedge(args)) => {
             let symbol = encode_segment(&args.symbol);
             client
                 .post_json(
@@ -284,7 +315,7 @@ async fn dispatch<A: TokenSource + Sync>(
                 )
                 .await?
         }
-        Command::Debug(Debug::PortfolioSnapshot(PortfolioSnapshot::SetMark(args))) => {
+        Debug::PortfolioSnapshot(PortfolioSnapshot::SetMark(args)) => {
             client
                 .post_json(
                     "/portfolio-snapshot/marks",
@@ -299,14 +330,14 @@ async fn dispatch<A: TokenSource + Sync>(
                 )
                 .await?
         }
-        Command::Debug(Debug::ProcessTx { tx_hash, chain }) => {
+        Debug::ProcessTx { tx_hash, chain } => {
             let tx_hash = encode_segment(&tx_hash);
             let params = optional_query("chain", chain.map(|chain| chain.wire_name().to_owned()));
             client
                 .post(&format!("/transactions/{tx_hash}/process"), &params)
                 .await?
         }
-        Command::Debug(Debug::View(View::Rebuild(args))) => {
+        Debug::View(View::Rebuild(args)) => {
             let view = match args.view {
                 RebuildableView::Position => "position",
                 RebuildableView::OffchainOrder => "offchain-order",
@@ -326,26 +357,153 @@ async fn dispatch<A: TokenSource + Sync>(
                 )
                 .await?
         }
-        Command::Debug(Debug::Cctp(Cctp::CompleteMint {
+        Debug::Cctp(Cctp::CompleteMint {
             burn_tx,
             source_chain,
-        })) => {
-            let source_chain = match source_chain {
-                CctpSourceChain::Ethereum => "ethereum",
-                CctpSourceChain::Base => "base",
-            };
+        }) => {
             client
                 .post_json(
                     "/cctp/complete-mint",
                     &wire::CompleteCctpMintRequest {
                         burn_tx,
-                        source_chain,
+                        source_chain: source_chain.wire_name(),
                     },
                 )
                 .await?
         }
     };
-    output::print(&value).map_err(ApiError::from)
+    Ok(value)
+}
+
+/// Sends one `capital` verb through the write prefix and returns the bot's
+/// response for `dispatch` to print, like `send_debug` for the debug verbs.
+async fn dispatch_capital<A: TokenSource + Sync>(
+    client: &Client<A>,
+    capital: Capital,
+) -> Result<serde_json::Value, TransportError> {
+    match capital {
+        Capital::TransferUsdc {
+            direction,
+            amount,
+            chain,
+        } => {
+            client
+                .post_json(
+                    "/capital/transfer-usdc",
+                    &wire::TransferUsdcRequest {
+                        direction,
+                        amount,
+                        chain: chain.map(HedgedChain::wire_name),
+                    },
+                )
+                .await
+        }
+        Capital::VaultDeposit(args) => {
+            client
+                .post_json("/capital/vault-deposit", &vault_request(args))
+                .await
+        }
+        Capital::VaultWithdraw(args) => {
+            client
+                .post_json("/capital/vault-withdraw", &vault_request(args))
+                .await
+        }
+        Capital::VaultWithdrawUsdc { amount, network } => {
+            client
+                .post_json(
+                    "/capital/vault-withdraw-usdc",
+                    &wire::VaultWithdrawUsdcRequest {
+                        chain: network.wire_name(),
+                        amount,
+                    },
+                )
+                .await
+        }
+        Capital::CctpBridge {
+            amount,
+            all,
+            from,
+            operation_id,
+        } => {
+            let operation_id = operation_id.unwrap_or_else(uuid::Uuid::new_v4);
+            // Printed before the request, so it survives a timeout or an
+            // interrupted run: the id is what makes the rerun safe.
+            eprintln!(
+                "operation id {operation_id}: after a failure or a timeout, rerun with \
+                 --operation-id {operation_id} to report this burn instead of burning again \
+                 (only against a bot that records operation ids, see below)"
+            );
+            let answer = client
+                .post_json(
+                    "/capital/cctp-bridge",
+                    &wire::CctpBridgeRequest {
+                        operation_id,
+                        from: from.wire_name(),
+                        amount,
+                        all,
+                    },
+                )
+                .await?;
+            if !records_operation(&answer, operation_id) {
+                eprintln!(
+                    "WARNING: the bot did not answer with operation id {operation_id} and a \
+                     status, so it predates operation ids and did not record this burn. A \
+                     rerun, even with --operation-id, burns again: do not rerun, finish this \
+                     burn with debug cctp complete-mint"
+                );
+            }
+            Ok(answer)
+        }
+        Capital::CctpBurnSupersede {
+            operation_id,
+            superseding_tx,
+        } => {
+            client
+                .post_json(
+                    "/capital/cctp-burn-supersede",
+                    &wire::CctpBurnSupersedeRequest {
+                        operation_id,
+                        superseding_tx,
+                    },
+                )
+                .await
+        }
+        Capital::ResetAllowance { network } => {
+            client
+                .post_json(
+                    "/capital/reset-allowance",
+                    &wire::ResetAllowanceRequest {
+                        chain: network.wire_name(),
+                    },
+                )
+                .await
+        }
+    }
+}
+
+/// Whether a `cctp-bridge` answer comes from a bot that records operation
+/// ids: it echoes this run's id and a status. An older bot ignores the id and
+/// burns on every call, so a rerun with the same id is only safe when this
+/// holds.
+fn records_operation(answer: &serde_json::Value, operation_id: uuid::Uuid) -> bool {
+    let echoed = answer
+        .get("operationId")
+        .and_then(serde_json::Value::as_str)
+        == Some(operation_id.to_string().as_str());
+    echoed
+        && answer
+            .get("status")
+            .is_some_and(serde_json::Value::is_string)
+}
+
+/// The body `vault-deposit` and `vault-withdraw` share.
+fn vault_request(args: VaultArgs) -> wire::VaultTransferRequest {
+    wire::VaultTransferRequest {
+        chain: args.network.wire_name(),
+        token: args.token,
+        vault_id: args.vault_id,
+        amount: args.amount,
+    }
 }
 
 #[cfg(test)]
@@ -356,17 +514,17 @@ mod tests {
     use std::sync::mpsc::{Receiver, channel};
     use std::time::Duration;
 
-    use super::{ApiError, dispatch};
+    use super::{ApiError, dispatch, records_operation};
     use crate::auth::{AuthError, StaticToken};
     use crate::cli::{
-        Cctp, CctpSourceChain, Command, Debug, EquityTransferKind, HedgedChain, PortfolioSnapshot,
-        Position, Read, ReadResource, RebuildViewArgs, RebuildableView, RecheckTransferType,
-        ReleaseHedgeArgs, ResourceArgs, SetMarkArgs, SetPositionArgs, TradeEventsArgs,
-        TransferEventsArgs, UsdcDirection, View,
+        Capital, Cctp, CctpSourceChain, Command, Debug, EquityTransferKind, HedgedChain,
+        PortfolioSnapshot, Position, Read, ReadResource, RebuildViewArgs, RebuildableView,
+        RecheckTransferType, ReleaseHedgeArgs, ResourceArgs, SetMarkArgs, SetPositionArgs,
+        TradeEventsArgs, TransferEventsArgs, UsdcDirection, VaultArgs, View,
     };
     use crate::output::OutputError;
     use crate::transport::{Client, TransportError};
-    use crate::wire::ReconcileUsdcReason;
+    use crate::wire::{ReconcileUsdcReason, TransferUsdcDirection};
 
     /// Accepts one connection, captures the raw request bytes, and replies with
     /// an empty JSON object.
@@ -607,6 +765,7 @@ mod tests {
             kind: EquityTransferKind::Redemption,
             id: "abc".to_owned(),
             reason: "settled by hand".to_owned(),
+            superseding_tx: None,
         }))
         .await?;
         assert_eq!(
@@ -616,6 +775,53 @@ mod tests {
         assert_eq!(
             request_body(&request),
             serde_json::json!({ "reason": "settled by hand" })
+        );
+        Ok(())
+    }
+
+    /// A redemption's superseding tx travels as the camelCase `supersedingTx`
+    /// the bot's equity reconcile body reads.
+    #[tokio::test]
+    async fn reconcile_equity_sends_the_superseding_tx_when_given()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Debug(Debug::ReconcileEquity {
+            kind: EquityTransferKind::Redemption,
+            id: "abc".to_owned(),
+            reason: "cancelled at its nonce".to_owned(),
+            superseding_tx: Some("0xcancel".to_owned()),
+        }))
+        .await?;
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({
+                "reason": "cancelled at its nonce",
+                "supersedingTx": "0xcancel",
+            })
+        );
+        Ok(())
+    }
+
+    /// The adopt route takes the redemption id in the path and the replacement
+    /// as the camelCase `replacementTx` the bot's body reads.
+    #[tokio::test]
+    async fn adopt_withdrawal_posts_the_replacement_and_reason()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Debug(Debug::AdoptWithdrawal {
+            id: "abc".to_owned(),
+            replacement_tx: "0xspeedup".to_owned(),
+            reason: "wallet sped up the withdrawal".to_owned(),
+        }))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/transfers/equity_redemption/abc/adopt-withdrawal HTTP/1.1"
+        );
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({
+                "reason": "wallet sped up the withdrawal",
+                "replacementTx": "0xspeedup",
+            })
         );
         Ok(())
     }
@@ -860,6 +1066,203 @@ mod tests {
             "POST /liquidity-write/views/rebalance-timing/rebuild HTTP/1.1"
         );
         assert_eq!(request_body(&request), serde_json::json!({ "all": true }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transfer_usdc_posts_the_direction_and_amount() -> Result<(), Box<dyn std::error::Error>>
+    {
+        for (direction, spelling) in [
+            (TransferUsdcDirection::ToRaindex, "to-raindex"),
+            (TransferUsdcDirection::ToAlpaca, "to-alpaca"),
+        ] {
+            let request = request_for(Command::Capital(Capital::TransferUsdc {
+                direction,
+                amount: "250.5".parse()?,
+                chain: None,
+            }))
+            .await?;
+            assert_eq!(
+                request_line(&request),
+                "POST /liquidity-write/capital/transfer-usdc HTTP/1.1"
+            );
+            assert_eq!(
+                request_body(&request),
+                serde_json::json!({ "direction": spelling, "amount": "250.5" })
+            );
+        }
+        let request = request_for(Command::Capital(Capital::TransferUsdc {
+            direction: TransferUsdcDirection::ToRaindex,
+            amount: "250.5".parse()?,
+            chain: Some(HedgedChain::Robinhood),
+        }))
+        .await?;
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({ "direction": "to-raindex", "amount": "250.5", "chain": "robinhood" })
+        );
+        Ok(())
+    }
+
+    /// Both vault verbs send the same camelCase body, each to its own route.
+    #[tokio::test]
+    async fn vault_verbs_post_the_chain_token_vault_and_amount()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let token = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+        let vault_id = "0x00000000000000000000000000000000000000000000000000000000000000a1";
+        let args = VaultArgs {
+            amount: "1.5".parse()?,
+            token: token.parse()?,
+            vault_id: vault_id.parse()?,
+            network: HedgedChain::Ethereum,
+        };
+        for (command, route) in [
+            (Capital::VaultDeposit(args.clone()), "vault-deposit"),
+            (Capital::VaultWithdraw(args), "vault-withdraw"),
+        ] {
+            let request = request_for(Command::Capital(command)).await?;
+            assert_eq!(
+                request_line(&request),
+                format!("POST /liquidity-write/capital/{route} HTTP/1.1")
+            );
+            assert_eq!(
+                request_body(&request),
+                serde_json::json!({
+                    "chain": "ethereum",
+                    "token": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                    "vaultId": "0x00000000000000000000000000000000000000000000000000000000000000a1",
+                    "amount": "1.5",
+                })
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn vault_withdraw_usdc_posts_the_chain_and_amount()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Capital(Capital::VaultWithdrawUsdc {
+            amount: "100".parse()?,
+            network: HedgedChain::Base,
+        }))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/capital/vault-withdraw-usdc HTTP/1.1"
+        );
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({ "chain": "base", "amount": "100" })
+        );
+        Ok(())
+    }
+
+    /// The body carries the operation id and either `amount` or `all: true`,
+    /// never both keys and never `all: false`. A run without
+    /// `--operation-id` sends a fresh id; one with it sends that id.
+    #[tokio::test]
+    async fn cctp_bridge_posts_either_an_amount_or_all() -> Result<(), Box<dyn std::error::Error>> {
+        let amount = request_for(Command::Capital(Capital::CctpBridge {
+            amount: Some("100".parse()?),
+            all: false,
+            from: CctpSourceChain::Ethereum,
+            operation_id: None,
+        }))
+        .await?;
+        assert_eq!(
+            request_line(&amount),
+            "POST /liquidity-write/capital/cctp-bridge HTTP/1.1"
+        );
+        let mut body = request_body(&amount);
+        let generated = body
+            .as_object_mut()
+            .and_then(|body| body.remove("operationId"))
+            .and_then(|id| id.as_str().map(str::parse::<uuid::Uuid>))
+            .transpose()?;
+        assert!(generated.is_some_and(|id| id.get_version_num() == 4));
+        assert_eq!(
+            body,
+            serde_json::json!({ "from": "ethereum", "amount": "100" })
+        );
+
+        let id: uuid::Uuid = "6f1c2a1e-6c39-4a77-9a8e-1f0b7d6e8c11".parse()?;
+        let all = request_for(Command::Capital(Capital::CctpBridge {
+            amount: None,
+            all: true,
+            from: CctpSourceChain::Base,
+            operation_id: Some(id),
+        }))
+        .await?;
+        assert_eq!(
+            request_body(&all),
+            serde_json::json!({ "operationId": id.to_string(), "from": "base", "all": true })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cctp_burn_supersede_posts_the_operation_and_the_superseding_tx()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let id: uuid::Uuid = "6f1c2a1e-6c39-4a77-9a8e-1f0b7d6e8c11".parse()?;
+        let request = request_for(Command::Capital(Capital::CctpBurnSupersede {
+            operation_id: id,
+            superseding_tx: "0xabc".to_owned(),
+        }))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/capital/cctp-burn-supersede HTTP/1.1"
+        );
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({ "operationId": id.to_string(), "supersedingTx": "0xabc" })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reset_allowance_posts_the_chain() -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Capital(Capital::ResetAllowance {
+            network: HedgedChain::Hyperevm,
+        }))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/capital/reset-allowance HTTP/1.1"
+        );
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({ "chain": "hyperevm" })
+        );
+        Ok(())
+    }
+
+    /// Only an answer that echoes this run's operation id and a status comes
+    /// from a bot that records the burn; an older bot's answer, or one for
+    /// another id, must trigger the do not rerun warning.
+    #[test]
+    fn only_an_answer_echoing_the_operation_id_and_a_status_is_recorded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let id: uuid::Uuid = "6f1c2a1e-6c39-4a77-9a8e-1f0b7d6e8c11".parse()?;
+        let recorded = serde_json::json!({
+            "operationId": id.to_string(),
+            "burnTx": "0x01",
+            "status": "pending",
+        });
+        let old_bot = serde_json::json!({
+            "burnTx": "0x01",
+            "sourceChain": "base",
+            "destinationChain": "ethereum",
+            "amountRaw": "1000000",
+        });
+        let other_id = serde_json::json!({
+            "operationId": uuid::Uuid::new_v4().to_string(),
+            "status": "pending",
+        });
+
+        assert!(records_operation(&recorded, id));
+        assert!(!records_operation(&old_bot, id));
+        assert!(!records_operation(&other_id, id));
         Ok(())
     }
 

@@ -192,7 +192,8 @@ pub mod equity_redemption {
 
     #[cfg(feature = "test-support")]
     pub use crate::equity_redemption::{
-        DetectionFailure, EquityRedemptionError, redemption_aggregate_id,
+        DetectionFailure, EquityRedemptionError, prepared_withdrawal_for_test,
+        redemption_aggregate_id,
     };
 }
 
@@ -265,8 +266,22 @@ pub mod equity_transfer {
         RedemptionAlreadyReconciled(RedemptionAggregateId),
         #[error(
             "redemption {0} has an unresolved vault withdrawal submission; force-fail is \
-             refused because the withdrawal may already have landed -- verify it on-chain, \
-             then reconcile it (`stox transfer reconcile --kind redemption`) to resolve it"
+             refused because the withdrawal can still mine. Check its receipt on chain. If it \
+             mined successfully, do not reconcile; the redrive confirms it (if no job remains, \
+             run `stox transfer resume --kind equity` or restart the bot). If it mined and \
+             reverted, it moved nothing: once it has the required confirmations, settle the \
+             equity by hand and reconcile without --superseding-tx \
+             (`stox transfer reconcile --kind redemption --id {0} --reason <reason>`). If it \
+             has no receipt but another tx from the bot wallet already mined at its nonce and \
+             did the withdrawal (for example a wallet speed up of the same withdraw4), do not \
+             settle by hand: adopt that tx (`st0x-liquidity-client --env <env> debug \
+             adopt-withdrawal {0} --replacement-tx <tx> --reason <reason>`). If nothing mined \
+             at its nonce, cancel it with a 0-value self-transfer with no calldata (not \
+             EIP-7702) from the bot wallet at its nonce with fees above the withdrawal's, \
+             wait for the required \
+             confirmations, then settle the equity by hand and reconcile \
+             (`stox transfer reconcile --kind redemption --id {0} --reason <reason> \
+             --superseding-tx <cancel tx>`)"
         )]
         RedemptionSubmissionUnresolved(RedemptionAggregateId),
         #[error("mint store operation failed")]
@@ -3233,7 +3248,7 @@ pub mod process_tx {
 
         use st0x_config::{
             ChainAssets, Ctx, ExecutionThreshold, HedgedChain, HedgingAssets, PricingCtx,
-            TradingScheduleConfig, TradingScheduleMode,
+            TradingScheduleConfig, TradingScheduleMode, UsdcCorridors,
         };
         use st0x_event_sorcery::{AggregateError, SendError, StoreBuilder};
         use st0x_evm::{Chain, ReadOnlyEvm};
@@ -8352,8 +8367,9 @@ pub mod process_tx {
                     cash_reserved: None,
                     hedge_floor: st0x_execution::HedgeFloor::default(),
                     allocation: st0x_config::AllocationCtx::base_test(),
-                    usdc: None,
+                    usdc: UsdcCorridors::base_cctp_disabled(),
                     transfer_timeout: std::time::Duration::from_secs(60),
+                    recovery_hold_alert_after: std::time::Duration::from_secs(60 * 60),
                     chains: std::collections::BTreeMap::from([(
                         Chain::Base,
                         ChainRebalancingConfig::for_test(ChainAssets {
@@ -8361,7 +8377,6 @@ pub mod process_tx {
                             cash: None,
                         }),
                     )]),
-                    served_usdc_corridor: st0x_bridge::corridor::UsdcCorridor::BASE_CCTP,
                 },
                 vault_registry,
                 std::collections::BTreeMap::from([(
@@ -8500,6 +8515,9 @@ pub mod rebalancing {
     pub mod equity {
         pub use crate::rebalancing::equity::{
             ChainEquityServices, CrossVenueEquityTransfer, EquityTransferServices,
+            SignedRedemptionTx, SignedTxNotSuperseded, WithdrawalNotSuperseded,
+            verify_hash_only_withdrawal_not_through, verify_signed_redemption_txs_superseded,
+            withdrawal_required_confirmations,
         };
     }
 

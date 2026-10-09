@@ -30,7 +30,8 @@ use st0x_dto::{
     TradingVenue,
 };
 use st0x_event_sorcery::{
-    AggregateError, EventSourced, SendError, Store, StoreBuilder, load_entity, send_command,
+    AggregateError, EventSourced, LifecycleError, SendError, Store, StoreBuilder, load_entity,
+    send_command,
 };
 use st0x_evm::Chain;
 use st0x_execution::alpaca_broker_api::AccountActivitiesQuery;
@@ -41,6 +42,7 @@ use st0x_registry::SymbolCache;
 use st0x_tokenization::IssuerRequestId;
 
 use crate::AppState;
+use crate::cctp_burn::{CctpBurnOperation, CctpSourceChain};
 use crate::dashboard::pnl::{
     PnlError, PnlQuery, PnlResponse, acquire_pnl_report_permit, build_pnl_report_with_permit,
     validate_pnl_snapshot_rowid,
@@ -73,7 +75,9 @@ use crate::performance::reliability::{
 };
 use crate::performance::{ReportRange, hedge_latency_report, load_hedge_performance};
 use crate::rebalancing::equity::{
-    CrossVenueEquityTransfer, EquityTransferServices, RecheckError, RecheckOutcome,
+    CrossVenueEquityTransfer, EquityTransferServices, MintError, RecheckError, RecheckOutcome,
+    ReplacementNotAdoptable, SignedTxNotSuperseded, WithdrawalNotSuperseded,
+    withdrawal_required_confirmations,
 };
 use crate::rebalancing::usdc::{
     CctpMintRecoveryError, DepositSendNotSuperseded, DriverNotQuiesced, RecheckUsdcDeposit,
@@ -82,7 +86,8 @@ use crate::rebalancing::usdc::{
 };
 use crate::rebalancing::{RebalancingService, UsdcResumeError};
 use crate::tokenized_equity_mint::{
-    TokenizedEquityMint, TokenizedEquityMintCommand, TokenizedEquityMintEvent,
+    TokenizedEquityMint, TokenizedEquityMintCommand, TokenizedEquityMintError,
+    TokenizedEquityMintEvent,
 };
 use crate::usdc_rebalance::{
     PreBurnFailEligibility, RebalanceDirection, ReconcileReason, UsdcRebalance,
@@ -92,6 +97,8 @@ use crate::view_rebuild::{
     RebuildScope, RebuildableView, ViewRebuildError, execute_rebuild_view, parse_rebuild_scope,
     validate_rebuild_scope,
 };
+
+mod capital;
 
 /// Comma-separated filter for transfer kinds in query parameters.
 ///
@@ -1135,7 +1142,10 @@ fn stuck_redemption_info(rows: &[(String, String, i64)]) -> Option<StuckTransfer
             | UnwrapPending { .. }
             | UnwrapSubmitted { .. }
             | SendPending { .. }
-            | Detected { .. } => {}
+            | SendPrepared { .. }
+            | SendReplaced { .. }
+            | Detected { .. }
+            | VaultWithdrawReplacementAdopted { .. } => {}
         }
     }
 
@@ -1315,6 +1325,10 @@ struct ErrorResponse {
     error: String,
 }
 
+/// The status and body every ops route returns on failure. Named because
+/// clippy's `type_complexity` refuses it nested inside another generic type.
+type OpsError = (StatusCode, Json<ErrorResponse>);
+
 /// Shared handle for operating on tokenization transfers at runtime, set by
 /// the conductor after startup completes.
 pub(crate) struct RecoveryHandle {
@@ -1345,6 +1359,10 @@ pub(crate) struct RecoveryHandle {
     /// to the durable outcome. A standalone store would bypass the reactor and
     /// leave the running bot latched with `guardHeld: false` reported.
     pub(crate) usdc_store: Arc<Store<UsdcRebalance>>,
+    /// The conductor-built `CctpBurnOperation` store: the capital
+    /// `cctp-bridge` route records each signed burn under its operation id
+    /// before broadcasting it, and the startup restore reads the same store.
+    pub(crate) cctp_burn_store: Arc<Store<CctpBurnOperation>>,
 }
 
 /// Shared handle backing the in-bot process-tx route: the broker order placer
@@ -1367,8 +1385,10 @@ pub(crate) struct ProcessTxHandle {
 }
 
 /// Serializes operator transfer-recovery requests so they cannot race through
-/// duplicate or conflicting mint/redemption flows.
-pub(crate) struct ResumeLock(pub(crate) Mutex<()>);
+/// duplicate or conflicting mint/redemption flows. The mutex sits behind an
+/// `Arc` so a detached task can own its guard past the request:
+/// `capital cctp-bridge` holds it until its burn confirms.
+pub(crate) struct ResumeLock(pub(crate) Arc<Mutex<()>>);
 
 /// The operator request asking to pause the USDC driver, logged when the pause
 /// is refused so the refusal is traceable to that request.
@@ -1384,6 +1404,10 @@ enum UsdcDriverPauseRequest<'a> {
         burn_tx: TxHash,
         direction: BridgeDirection,
     },
+    /// `capital transfer-usdc`, which starts a transfer that has no id yet.
+    ManualTransfer { direction: RebalanceDirection },
+    /// `capital cctp-bridge`, which burns the rebalancing wallet's USDC.
+    CctpBurn { direction: BridgeDirection },
 }
 
 /// Quiesces the USDC rebalancing driver for the caller's mutation window:
@@ -1405,6 +1429,14 @@ async fn quiesce_usdc_driver(
                 %burn_tx,
                 ?direction,
                 "USDC driver did not quiesce for a CCTP mint recovery; refusing"
+            ),
+            UsdcDriverPauseRequest::ManualTransfer { direction } => warn!(
+                ?direction,
+                "USDC driver did not quiesce for a manual USDC transfer; refusing"
+            ),
+            UsdcDriverPauseRequest::CctpBurn { direction } => warn!(
+                ?direction,
+                "USDC driver did not quiesce for a CCTP burn; refusing"
             ),
         }
         (
@@ -1874,10 +1906,35 @@ fn recheck_error_response(error: &RecheckError) -> (StatusCode, String) {
             StatusCode::BAD_GATEWAY,
             "Tokenization provider unavailable; retry later".to_string(),
         ),
-        ChainServicesMissing(_) | Mint(_) | Redemption(_) | Rebalancing(_) | Database(_) => (
+        Mint(mint_error) => replay_refusal(mint_error).map_or_else(
+            || {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to recheck transfer".to_string(),
+                )
+            },
+            |refusal| (StatusCode::UNPROCESSABLE_ENTITY, refusal.to_string()),
+        ),
+        ChainServicesMissing(_) | Redemption(_) | Rebalancing(_) | Database(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to recheck transfer".to_string(),
         ),
+    }
+}
+
+/// The provider still has no record of a `MintRequested` mint on a listing
+/// that cannot start operations. This is the operator's state to act on, not
+/// a bot fault, so `recheck_error_response` answers 422 with its message.
+fn replay_refusal(error: &MintError) -> Option<&TokenizedEquityMintError> {
+    let MintError::Aggregate(send_error) = error else {
+        return None;
+    };
+
+    match send_error.as_ref() {
+        AggregateError::UserError(LifecycleError::Apply(
+            refusal @ TokenizedEquityMintError::ReplayRefused { .. },
+        )) => Some(refusal),
+        _ => None,
     }
 }
 
@@ -2032,22 +2089,26 @@ async fn resume_usdc_transfer(
 /// stay generic (the full error is logged at the call site).
 fn usdc_resume_error_response(error: &UsdcResumeError) -> (StatusCode, String) {
     use UsdcResumeError::{
-        Aggregate, AlreadyInFlight, AlreadyTerminal, ApalisDatabase, CorridorNotServed, Database,
-        DirectionMismatch, EveryCorridorLatched, GuardHeldElsewhere, NotFound, NotReady, Queue,
+        Aggregate, AlreadyInFlight, AlreadyTerminal, ApalisDatabase, CashDivergenceEngaged,
+        CashRestartTainted, CorridorChoice, CorridorNotServed, Database, DirectionMismatch,
+        EveryCorridorLatched, GasNotReady, GuardHeldElsewhere, NotFound, NotReady, Queue,
     };
 
     match error {
         NotFound(_) => (StatusCode::NOT_FOUND, error.to_string()),
-        DirectionMismatch { .. } | AlreadyTerminal { .. } | CorridorNotServed { .. } => {
-            (StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
-        }
-        AlreadyInFlight { .. } | GuardHeldElsewhere | EveryCorridorLatched => {
-            (StatusCode::CONFLICT, error.to_string())
-        }
-        NotReady => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+        DirectionMismatch { .. }
+        | AlreadyTerminal { .. }
+        | CorridorNotServed { .. }
+        | CorridorChoice(_) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
+        AlreadyInFlight { .. }
+        | GuardHeldElsewhere
+        | EveryCorridorLatched
+        | CashDivergenceEngaged
+        | CashRestartTainted => (StatusCode::CONFLICT, error.to_string()),
+        NotReady | GasNotReady(_) => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
         Aggregate(_) | Database(_) | ApalisDatabase(_) | Queue(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to enqueue USDC resume".to_string(),
+            "Failed to enqueue the USDC transfer job".to_string(),
         ),
     }
 }
@@ -2579,6 +2640,9 @@ async fn clear_pending_usdc_burn(
     }))
 }
 
+/// `outcome` of a BaseToAlpaca transfer failed at `WithdrawalSubmitting`.
+const FAILED_WITHDRAWAL_NEVER_SENT: &str = "failed_withdrawal_never_sent";
+
 /// Wire contract for the fail-usdc-transfer route.
 #[derive(Deserialize)]
 struct FailUsdcTransferRequest {
@@ -2593,9 +2657,10 @@ struct FailUsdcTransferResponse {
     transfer_id: String,
     outcome: &'static str,
     /// Whether the rebalancing guard is still held after the failure, read
-    /// from the durable state. The route only fails AlpacaToBase transfers,
-    /// whose withdrawal already moved the funds off Alpaca, so the guard stays
-    /// held until `reconcile-usdc` settles them.
+    /// from the durable state. A pre-burn AlpacaToBase failure keeps it: the
+    /// withdrawal already moved the funds off Alpaca, so the guard stays held
+    /// until `reconcile-usdc` settles them. A BaseToAlpaca withdrawal that
+    /// never reached the chain clears it.
     guard_held: bool,
 }
 
@@ -2605,9 +2670,18 @@ struct FailUsdcTransferResponse {
 /// accepts post-burn `Bridging` / `Attested` and would emit a guard-holding
 /// failure, so [`UsdcRebalance::pre_burn_fail_eligibility`] is the
 /// authoritative gate, shared with `stox fail-usdc-transfer`. Also refuses
-/// every BaseToAlpaca transfer: its vault withdrawal already moved the USDC to
-/// the market maker wallet, and the live reactor would credit it back to the
-/// vault, so those stay with the offline CLI.
+/// every other BaseToAlpaca transfer: its vault withdrawal already moved the
+/// USDC to the market maker wallet, and the live reactor would credit it back
+/// to the vault, so those stay with the offline CLI.
+///
+/// A BaseToAlpaca transfer at `WithdrawalSubmitting` is accepted and failed
+/// with `RejectWithdrawal`: its withdrawal was never initiated, so the reactor
+/// credits nothing and clears the guard. The route cannot prove the withdraw
+/// never landed, so the operator first confirms on chain that the bot wallet
+/// made no `OperatorWithdraw` after the transfer's `from_block`; a withdrawal
+/// that did land must be adopted with resume-usdc instead. The route kills
+/// the transfer's queued job rows, which would otherwise count as an
+/// in-flight transfer, and the failure starts the corridor's withdraw cooldown.
 ///
 /// Runs in the bot process under the resume lock and with the USDC driver
 /// quiesced: a worker execution, including the burn broadcast it spawns,
@@ -2667,6 +2741,23 @@ async fn fail_usdc_transfer(
     .await?;
 
     let response = fail_pre_burn_usdc_transfer(&handle.usdc_store, &id, reason).await?;
+    // An operator acting on a USDC transfer re-arms the under-funded page.
+    handle.rebalancing_service.underfunded_alerts().reset_all();
+    if response.outcome == FAILED_WITHDRAWAL_NEVER_SENT {
+        match handle
+            .rebalancing_service
+            .kill_queued_usdc_hedging_jobs(&id)
+            .await
+        {
+            Ok(killed) => info!(%id, killed, "Killed the failed transfer's queued job rows"),
+            Err(error) => warn!(
+                %id,
+                ?error,
+                "Failed to kill the failed transfer's queued job rows; USDC planning on the \
+                 corridor resumes once the row next runs"
+            ),
+        }
+    }
     Ok(Json(response))
 }
 
@@ -2695,6 +2786,15 @@ async fn fail_pre_burn_usdc_transfer(
             }),
         ));
     };
+
+    if let UsdcRebalance::WithdrawalSubmitting {
+        direction: RebalanceDirection::BaseToAlpaca,
+        from_block,
+        ..
+    } = &rebalance
+    {
+        return reject_unsent_usdc_withdrawal(store, id, reason, *from_block).await;
+    }
 
     let eligibility = rebalance.pre_burn_fail_eligibility();
     let direction = rebalance.direction();
@@ -2728,8 +2828,9 @@ async fn fail_pre_burn_usdc_transfer(
              is already in its cleared state and will not re-arm on restart."
         )),
         PreBurnFailEligibility::NotAtBridgeBoundary => Some(format!(
-            "fail-usdc-transfer is only valid from WithdrawalComplete or BridgingSubmitting \
-             with no recorded burn; transfer {id} is in {}.",
+            "fail-usdc-transfer is only valid from WithdrawalComplete, BridgingSubmitting \
+             with no recorded burn, or a BaseToAlpaca WithdrawalSubmitting; transfer {id} is \
+             in {}.",
             rebalance.state_name()
         )),
     };
@@ -2774,6 +2875,47 @@ async fn fail_pre_burn_usdc_transfer(
     Ok(FailUsdcTransferResponse {
         transfer_id: id.to_string(),
         outcome: "failed_pre_burn",
+        guard_held,
+    })
+}
+
+/// Fails a BaseToAlpaca transfer at `WithdrawalSubmitting` whose withdraw the
+/// operator verified never landed (see [`fail_usdc_transfer`]). Goes through
+/// the wired store so the live reactor clears the guard.
+async fn reject_unsent_usdc_withdrawal(
+    store: &Store<UsdcRebalance>,
+    id: &UsdcRebalanceId,
+    reason: String,
+    from_block: u64,
+) -> Result<FailUsdcTransferResponse, (StatusCode, Json<ErrorResponse>)> {
+    store
+        .send(
+            id,
+            UsdcRebalanceCommand::RejectWithdrawal {
+                reason: reason.clone(),
+            },
+        )
+        .await
+        .map_err(ops_command_error)?;
+
+    let Some(failed) = store.load(id).await.map_err(ops_store_error)? else {
+        error!(%id, "USDC transfer could not be reloaded after RejectWithdrawal was recorded");
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!(
+                    "USDC transfer {id} was failed but could not be reloaded to report its \
+                     guard state"
+                ),
+            }),
+        ));
+    };
+    let guard_held = failed.holds_rebalance_guard();
+
+    info!(%id, %reason, from_block, guard_held, "USDC transfer whose withdrawal never reached the chain failed via API");
+    Ok(FailUsdcTransferResponse {
+        transfer_id: id.to_string(),
+        outcome: FAILED_WITHDRAWAL_NEVER_SENT,
         guard_held,
     })
 }
@@ -2909,24 +3051,6 @@ struct CompleteCctpMintRequest {
     burn_tx: String,
     /// Chain the burn happened on; the mint lands on the other one.
     source_chain: CctpSourceChain,
-}
-
-/// The burn's chain, kebab-cased on the wire (`ethereum`, `base`), matching
-/// the CLI's `--source-chain` value.
-#[derive(Deserialize, Clone, Copy, Debug)]
-#[serde(rename_all = "kebab-case")]
-enum CctpSourceChain {
-    Ethereum,
-    Base,
-}
-
-impl CctpSourceChain {
-    const fn bridge_direction(self) -> BridgeDirection {
-        match self {
-            Self::Ethereum => BridgeDirection::EthereumToBase,
-            Self::Base => BridgeDirection::BaseToEthereum,
-        }
-    }
 }
 
 #[derive(Serialize)]
@@ -3098,9 +3222,11 @@ async fn complete_cctp_mint_recovery(
 /// transport hiccup) is a 502 with the typed message. A hard failure (a complete
 /// but malformed attestation, a deterministic mint failure, an amount decode, or
 /// a gas-ledger enqueue) is a 500 whose detail is logged at the call site rather
-/// than returned.
+/// than returned. No service serving the CCTP corridor is a 409 naming it.
 fn cctp_mint_recovery_error_response(error: &CctpMintRecoveryError) -> (StatusCode, String) {
-    if error.is_mint_inconclusive() {
+    if let CctpMintRecoveryError::CorridorNotServed { .. } = error {
+        (StatusCode::CONFLICT, error.to_string())
+    } else if error.is_mint_inconclusive() {
         (
             StatusCode::BAD_GATEWAY,
             "CCTP mint recovery is inconclusive: the destination mint may already \
@@ -3121,9 +3247,14 @@ fn cctp_mint_recovery_error_response(error: &CctpMintRecoveryError) -> (StatusCo
 
 /// Wire contract for the equity reconcile route (mint or redemption).
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ReconcileEquityRequest {
     /// Free-text operator audit reason (required; persisted on the event).
     reason: String,
+    /// For a redemption with a signed vault withdrawal or send to the issuer, the tx
+    /// that took that signed tx's nonce.
+    #[serde(default)]
+    superseding_tx: Option<TxHash>,
 }
 
 /// Reconciles an equity mint or redemption stuck in the `Failed` terminal to
@@ -3131,6 +3262,13 @@ struct ReconcileEquityRequest {
 /// loads the aggregate and sends `Reconcile`, dispatching no reactor effect and
 /// no inventory update, so it is safe against the live bot (a `Failed` terminal
 /// has no active driver).
+///
+/// A redemption with a signed vault withdrawal or send to the issuer reconciles only
+/// once the bot proves on the redemption's chain that it can never land (`409`
+/// until it does, `503` before the bot is ready): see
+/// [`verify_withdrawal_superseded`](crate::rebalancing::equity::verify_withdrawal_superseded).
+/// A `supersedingTx` on a mint, or on a redemption with no signed withdrawal,
+/// is a `400`.
 ///
 /// Mirrors `stox transfer reconcile --kind mint|redemption`.
 async fn reconcile_equity_transfer(
@@ -3159,6 +3297,16 @@ async fn reconcile_equity_transfer(
     })?;
     match transfer_kind {
         TransferKind::EquityMint => {
+            if request.superseding_tx.is_some() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "supersedingTx applies only to a redemption with a signed vault \
+                                withdrawal"
+                            .to_string(),
+                    }),
+                ));
+            }
             let mint_id: IssuerRequestId = id.parse().map_err(|error| {
                 (
                     StatusCode::BAD_REQUEST,
@@ -3226,15 +3374,26 @@ async fn reconcile_equity_transfer(
                     Json(ErrorResponse {
                         error: format!(
                             "Redemption {id} is not reconcilable; reconcile resolves a \
-                             Failed terminal or an unresolved vault-withdrawal submission."
+                             Failed terminal, an unresolved vault-withdrawal submission, or a \
+                             pending send to the issuer."
                         ),
                     }),
                 ));
             }
+            let proven_withdrawal = check_signed_withdrawal_superseded(
+                &state,
+                &redemption_id,
+                &entity,
+                request.superseding_tx,
+            )
+            .await?;
             send_command::<EquityRedemption>(
                 &state.pool,
                 &redemption_id,
-                EquityRedemptionCommand::Reconcile { reason },
+                EquityRedemptionCommand::Reconcile {
+                    reason,
+                    proven_withdrawal,
+                },
                 services,
             )
             .await
@@ -3257,6 +3416,310 @@ async fn reconcile_equity_transfer(
         transfer_id: id,
         outcome: "reconciled",
     }))
+}
+
+/// The redemption command is pure, so the chain proof that a signed vault
+/// withdrawal (or signed send to the issuer, checked the same way) can never land is
+/// read before it, through the bot's equity
+/// transfer on the redemption's own chain. Returns the proven withdrawal's
+/// hash (`None` when there is none), which the command checks is still the
+/// redemption's, so a withdrawal signed during the check is never reconciled
+/// unproven. A `supersedingTx` on a redemption with no signed withdrawal is a
+/// `400`. A legacy redemption holding only a withdrawal hash is refused once
+/// that hash mined and succeeded; an adopted one is left for the command to
+/// refuse, with no chain read.
+async fn check_signed_withdrawal_superseded(
+    state: &AppState,
+    id: &RedemptionAggregateId,
+    redemption: &EquityRedemption,
+    superseding_tx: Option<TxHash>,
+) -> Result<Option<TxHash>, (StatusCode, Json<ErrorResponse>)> {
+    let prepared = redemption.reconcilable_signed_tx();
+    let (kind, signed) = redemption.reconcilable_signed_txs();
+    if prepared.is_none() && superseding_tx.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!(
+                    "Redemption {id} has no signed vault withdrawal or send to the issuer; \
+                     supersedingTx applies only to one that has"
+                ),
+            }),
+        ));
+    }
+    let hash_only = redemption.hash_only_withdrawal();
+    if prepared.is_none() && hash_only.is_none() {
+        return Ok(None);
+    }
+
+    let handle = state.recovery.get().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Recovery not ready yet (conductor still starting)".to_string(),
+            }),
+        )
+    })?;
+
+    let chain = redemption.chain();
+    let verified = match (prepared, hash_only) {
+        (Some(prepared), _) => match withdrawal_required_confirmations(&state.ctx.chains, chain) {
+            Ok(required_confirmations) => handle
+                .transfer
+                .verify_signed_txs_superseded(
+                    chain,
+                    kind,
+                    &signed,
+                    superseding_tx,
+                    required_confirmations,
+                )
+                .await
+                .map(|()| Some(prepared.tx_hash())),
+            Err(refusal) => Err(SignedTxNotSuperseded { kind, refusal }),
+        },
+        (None, Some(tx)) => handle
+            .transfer
+            .verify_hash_only_withdrawal_not_through(chain, tx)
+            .await
+            .map(|()| None)
+            .map_err(|refusal| SignedTxNotSuperseded { kind, refusal }),
+        (None, None) => Ok(None),
+    };
+
+    verified.map_err(|error| {
+        // `Display`, not `Debug`: a read error's `Debug` names the RPC URL,
+        // whose path carries the key.
+        warn!(%error, %id, "Refused to reconcile a redemption with an unresolved vault withdrawal");
+        let (status, message) = withdrawal_not_superseded_response(id, &error);
+        (status, Json(ErrorResponse { error: message }))
+    })
+}
+
+/// Maps a refused vault withdrawal chain check to an HTTP status: an unproven
+/// withdrawal is a `409` naming why; a failed chain read is a transient `502`.
+fn withdrawal_not_superseded_response(
+    id: &RedemptionAggregateId,
+    error: &SignedTxNotSuperseded,
+) -> (StatusCode, String) {
+    match &error.refusal {
+        WithdrawalNotSuperseded::UnreadableWithdrawal { .. }
+        | WithdrawalNotSuperseded::WithdrawalSignedByAnotherWallet { .. }
+        | WithdrawalNotSuperseded::WithdrawalWentThrough { .. }
+        | WithdrawalNotSuperseded::WithdrawalRevertUnconfirmed { .. }
+        | WithdrawalNotSuperseded::NoSupersedingTx { .. }
+        | WithdrawalNotSuperseded::SupersedingTxIsTheWithdrawal { .. }
+        | WithdrawalNotSuperseded::SupersedingTxNotMined { .. }
+        | WithdrawalNotSuperseded::SupersedingTxFromAnotherSender { .. }
+        | WithdrawalNotSuperseded::SupersedingTxAtAnotherNonce { .. }
+        | WithdrawalNotSuperseded::SupersedingTxUnconfirmed { .. }
+        | WithdrawalNotSuperseded::SupersedingTxNotAPlainCancel { .. }
+        | WithdrawalNotSuperseded::NoConfirmationDepth { .. }
+        | WithdrawalNotSuperseded::ChainServicesMissing(_) => (
+            StatusCode::CONFLICT,
+            format!("Redemption {id}: refusing to reconcile: {error}"),
+        ),
+        WithdrawalNotSuperseded::Read { .. } => (
+            StatusCode::BAD_GATEWAY,
+            "Chain RPC unavailable; retry later".to_string(),
+        ),
+    }
+}
+
+/// Wire contract for adopting a mined replacement of a redemption's signed
+/// vault withdrawal.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdoptWithdrawalReplacementRequest {
+    /// Operator audit reason, free text (required; persisted on the event).
+    reason: String,
+    /// The mined tx that took the signed withdrawal's nonce and did the
+    /// withdrawal itself.
+    replacement_tx: TxHash,
+}
+
+/// Adopts `replacementTx` as a redemption's vault withdrawal in place of its
+/// signed one, so the redemption finishes instead of waiting on a withdrawal
+/// that can never mine. For a tx that took the withdrawal's nonce but is not a
+/// plain cancel, e.g. a wallet "speed up" that sent the same `withdraw4` again
+/// at a higher fee: reconcile refuses it, because it may have moved the equity.
+///
+/// The bot first checks on the redemption's chain that the tx did what the
+/// withdrawal would have done (see
+/// [`verify_withdrawal_replacement`](crate::rebalancing::equity::verify_withdrawal_replacement)):
+/// `409` naming the failed check, `502` on a failed chain read, `503` before
+/// the bot is ready, `400` for a redemption holding no signed withdrawal. The
+/// command goes through the conductor owned store, as `fail_transfer` does, so
+/// the live transfer reactor sees the adoption and the write queues behind any
+/// command the redemption's job is sending. The redemption's redrive then
+/// confirms the adopted tx, records the vault transfer from its receipt and
+/// continues with the unwrap and send. Confirming it releases the withdrawal's
+/// nonce hold.
+async fn adopt_withdrawal_replacement(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<AdoptWithdrawalReplacementRequest>,
+) -> Result<Json<TransferOpResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let reason = request.reason.trim().to_owned();
+    if reason.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "reason is required".to_string(),
+            }),
+        ));
+    }
+    let redemption_id: RedemptionAggregateId = id.parse().map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("Invalid redemption id: {error}"),
+            }),
+        )
+    })?;
+
+    // Admit the projection write before taking the recovery lock, as
+    // `fail_transfer` does.
+    let _projection_write = state.projection_maintenance.enter().await;
+    let _guard = state.resume_lock.0.try_lock().map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "A transfer recovery operation is already in progress".to_string(),
+            }),
+        )
+    })?;
+    let handle = state.recovery.get().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Recovery not ready yet (conductor still starting)".to_string(),
+            }),
+        )
+    })?;
+
+    let entity = handle
+        .redemption_store
+        .load(&redemption_id)
+        .await
+        .map_err(ops_store_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("Redemption aggregate not found: {id}"),
+                }),
+            )
+        })?;
+    let Some(prepared) = entity.prepared_withdrawal() else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!(
+                    "Redemption {id} holds no signed vault withdrawal to replace; adopt applies \
+                     only to VaultWithdrawSubmitting or VaultWithdrawSubmitted with a signed \
+                     withdrawal"
+                ),
+            }),
+        ));
+    };
+
+    let chain = entity.chain();
+    let verified = match state.ctx.chains.required_confirmations(chain) {
+        Some(required_confirmations) => {
+            handle
+                .transfer
+                .verify_withdrawal_replacement(
+                    chain,
+                    prepared,
+                    request.replacement_tx,
+                    required_confirmations,
+                )
+                .await
+        }
+        None => Err(ReplacementNotAdoptable::NoConfirmationDepth { chain }),
+    };
+    let verified = match verified {
+        Ok(()) => match crate::equity_redemption::redemption_recording_withdrawal(
+            &state.pool,
+            request.replacement_tx,
+            &redemption_id,
+        )
+        .await
+        .map_err(ops_store_error)?
+        {
+            Some(redemption) => Err(
+                ReplacementNotAdoptable::ReplacementIsAnotherRedemptionsWithdrawal {
+                    replacement: request.replacement_tx,
+                    redemption,
+                },
+            ),
+            None => Ok(()),
+        },
+        Err(error) => Err(error),
+    };
+    verified.map_err(|error| {
+        // `Display`, not `Debug`: a read error's `Debug` names the RPC URL, whose
+        // path carries the key.
+        warn!(%error, %id, "Refused to adopt a vault withdrawal replacement");
+        let (status, message) = replacement_not_adoptable_response(&redemption_id, &error);
+        (status, Json(ErrorResponse { error: message }))
+    })?;
+
+    handle
+        .redemption_store
+        .send(
+            &redemption_id,
+            EquityRedemptionCommand::AdoptWithdrawalReplacement {
+                replacement_tx: request.replacement_tx,
+                replaced_withdrawal: prepared.tx_hash(),
+                reason,
+            },
+        )
+        .await
+        .map_err(ops_command_error)?;
+
+    info!(
+        %id, replacement_tx = %request.replacement_tx,
+        "Vault withdrawal replacement adopted via API"
+    );
+    Ok(Json(TransferOpResponse {
+        transfer_id: id,
+        outcome: "withdrawal_replacement_adopted",
+    }))
+}
+
+/// Maps a refused replacement check to an HTTP status: an unadoptable tx is a
+/// `409` naming why; a failed chain read is a transient `502`.
+fn replacement_not_adoptable_response(
+    id: &RedemptionAggregateId,
+    error: &ReplacementNotAdoptable,
+) -> (StatusCode, String) {
+    match error {
+        ReplacementNotAdoptable::UnreadableWithdrawal { .. }
+        | ReplacementNotAdoptable::WithdrawalSignedByAnotherWallet { .. }
+        | ReplacementNotAdoptable::ReplacementIsTheWithdrawal { .. }
+        | ReplacementNotAdoptable::ReplacementNotMined { .. }
+        | ReplacementNotAdoptable::ReplacementFromAnotherSender { .. }
+        | ReplacementNotAdoptable::ReplacementAtAnotherNonce { .. }
+        | ReplacementNotAdoptable::ReplacementUnconfirmed { .. }
+        | ReplacementNotAdoptable::ReplacementReverted { .. }
+        | ReplacementNotAdoptable::ReplacementCallsAnotherContract { .. }
+        | ReplacementNotAdoptable::ReplacementNotAWithdrawal { .. }
+        | ReplacementNotAdoptable::ReplacementWithdrawsAnotherVault { .. }
+        | ReplacementNotAdoptable::ReplacementWithdrewNothing { .. }
+        | ReplacementNotAdoptable::ReplacementReceiptUnreadable { .. }
+        | ReplacementNotAdoptable::ReplacementWithdrawsMore { .. }
+        | ReplacementNotAdoptable::ReplacementIsAnotherRedemptionsWithdrawal { .. }
+        | ReplacementNotAdoptable::NoConfirmationDepth { .. }
+        | ReplacementNotAdoptable::ChainServicesMissing(_) => (
+            StatusCode::CONFLICT,
+            format!("Redemption {id}: refusing to adopt the replacement: {error}"),
+        ),
+        ReplacementNotAdoptable::Read { .. } => (
+            StatusCode::BAD_GATEWAY,
+            "Chain RPC unavailable; retry later".to_string(),
+        ),
+    }
 }
 
 /// Maps a request parse failure to a `400` with the operator-facing reason. The
@@ -3610,16 +4073,133 @@ struct DetachedProcessTx<'a> {
     projection_write: crate::conductor::projection_pause::ProjectionWrite,
 }
 
-/// Runs the process-tx workload on a detached `tokio` task and awaits its
-/// result, mapping a task-join failure and the operator error to HTTP
-/// responses.
+/// Spawns `work` on a detached `tokio` task tracked by `detached_tasks` and
+/// returns the future that joins it, refusing with 503 once the shutdown
+/// drain closed the tracker and mapping a task join failure to 500.
+/// `operation` names the route in both messages; `subject` names what the
+/// work acted on (a tx hash, a chain, a token) in the join failure log, since
+/// a panicked task leaves no outcome log of its own.
 ///
-/// The workload is spawned (not awaited inline) so that dropping the request
-/// future -- a client disconnect or cancellation -- detaches the in-flight
-/// broker placement instead of cancelling it: a hedge that has already reached
-/// the broker must run through to its `Submitted` event even when nobody is
-/// waiting on the response. Awaiting `process_tx` inline here would
-/// reintroduce that cancellation bug.
+/// The work is spawned (not awaited inline) so that dropping the request
+/// future (a client disconnect or cancellation) detaches the work instead of
+/// cancelling it midway: a hedge that has reached the broker, or a
+/// transaction that has been broadcast, must run through to its outcome even
+/// when nobody is waiting on the response. The work must therefore log its
+/// own outcome. Awaiting the work inline here would reintroduce that
+/// cancellation bug. The spawn happens before this returns, so the caller's
+/// future only ever holds the join handle, never the work itself.
+///
+/// The join future does not borrow `detached_tasks` (`use<..>` leaves its
+/// lifetime out), so a caller that answers before the work ends can hand
+/// the join to a tracked task of its own and keep the failure log.
+fn spawn_detached<Output, Subject, Work>(
+    detached_tasks: &TaskTracker,
+    operation: &'static str,
+    subject: Subject,
+    work: Work,
+) -> Result<impl Future<Output = Result<Output, OpsError>> + use<Output, Subject, Work>, OpsError>
+where
+    Output: Send + 'static,
+    Subject: std::fmt::Display + Send + 'static,
+    Work: Future<Output = Output> + Send + 'static,
+{
+    // Tracked so graceful shutdown waits for work already under way instead
+    // of dropping it with the runtime. The token is taken before the closed
+    // check: the drain closes the tracker and then checks it is empty, so
+    // either the drain sees this request as running or the request sees the
+    // tracker closed and refuses. Spawning into a drained tracker would let
+    // the task be dropped at exit.
+    let admission = detached_tasks.token();
+    if detached_tasks.is_closed() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: format!("{operation} is unavailable while the bot shuts down"),
+            }),
+        ));
+    }
+    let task = detached_tasks.spawn(work);
+    drop(admission);
+    Ok(async move {
+        task.await.map_err(|error| {
+            error!(%error, %subject, "{} worker task failed", operation);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("{operation} worker task failed: {error}"),
+                }),
+            )
+        })
+    })
+}
+
+/// Runs a route's work through [`spawn_detached`] in two phases, for a route
+/// that answers at a broadcast rather than at the outcome. `broadcast` runs
+/// up to the transaction's broadcast and returns the answer together with
+/// the confirmation to run next; this helper sends that answer to the request
+/// at once, then awaits the confirmation on the same task. A refusal from
+/// `broadcast` is the answer instead, and nothing runs after it. So a
+/// confirmation slower than the 60 second load balancer cut still reaches the
+/// operator with the tx hash, and every path through the task answers.
+/// Whatever the confirmation future owns (a lock guard, a driver pause) stays
+/// held until it completes.
+///
+/// The request cannot be the one to join the task, since it returns before
+/// the task ends, so a tracked watcher joins it: a panic in either phase still
+/// reaches the join failure log of [`spawn_detached`], after the answer or a
+/// dropped request alike.
+async fn answer_from_detached<Answer, Subject, Broadcast, Confirm>(
+    detached_tasks: &TaskTracker,
+    operation: &'static str,
+    subject: Subject,
+    broadcast: Broadcast,
+) -> Result<Answer, OpsError>
+where
+    Answer: Send + 'static,
+    Subject: std::fmt::Display + Send + 'static,
+    Broadcast: Future<Output = Result<(Answer, Confirm), OpsError>> + Send + 'static,
+    Confirm: Future<Output = ()> + Send + 'static,
+{
+    let (answer, answered) = tokio::sync::oneshot::channel();
+    // Held until the watcher is spawned too, as `spawn_detached` holds its own
+    // across its spawn: otherwise a worker that ends at once could leave the
+    // tracker empty for a shutdown drain to return before the watcher exists,
+    // and a panic's join failure log would be lost.
+    let admission = detached_tasks.token();
+    let worker = spawn_detached(detached_tasks, operation, subject, async move {
+        // A dropped request has no receiver left, so a failed send is fine.
+        match broadcast.await {
+            Ok((reply, confirm)) => {
+                let _ = answer.send(Ok(reply));
+                confirm.await;
+            }
+            Err(refusal) => {
+                let _ = answer.send(Err(refusal));
+            }
+        }
+    })?;
+    detached_tasks.spawn(async move {
+        let _joined = worker.await;
+    });
+    drop(admission);
+
+    match answered.await {
+        Ok(answer) => answer,
+        // Every path through the task answers, so a dropped sender means the
+        // broadcast phase panicked; the watcher logs the join failure.
+        Err(_panicked) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("{operation} worker task failed"),
+            }),
+        )),
+    }
+}
+
+/// Runs the process-tx workload through [`spawn_detached`], mapping
+/// the operator error to an HTTP response. The detached task keeps the
+/// in flight broker placement alive after a client disconnect, and the
+/// request's projection claim moves into it.
 async fn spawn_and_join_process_tx<ChainProvider: alloy::providers::Provider + Clone + 'static>(
     tx_hash: TxHash,
     ctx: Ctx,
@@ -3639,22 +4219,7 @@ async fn spawn_and_join_process_tx<ChainProvider: alloy::providers::Provider + C
     let counter_trade_submission_lock = Arc::clone(&handle.counter_trade_submission_lock);
     let poll_status_queue = handle.poll_status_queue.clone();
     let poll_interval = handle.poll_interval;
-    // Tracked so graceful shutdown waits for a placement already under way
-    // instead of dropping it with the runtime. The token is taken before the
-    // closed check: the drain closes the tracker and then checks it is empty,
-    // so either the drain sees this request as running or the request sees the
-    // tracker closed and refuses. Spawning into a drained tracker would let the
-    // task be dropped at exit.
-    let admission = detached_tasks.token();
-    if detached_tasks.is_closed() {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "process-tx is unavailable while the bot shuts down".to_string(),
-            }),
-        ));
-    }
-    let task = detached_tasks.spawn(async move {
+    spawn_detached(detached_tasks, "process-tx", tx_hash, async move {
         let _projection_write = projection_write;
         let result = process_tx::process_tx(
             tx_hash,
@@ -3678,21 +4243,11 @@ async fn spawn_and_join_process_tx<ChainProvider: alloy::providers::Provider + C
             Err(error) => error!(%tx_hash, %error, "process-tx failed"),
         }
         result
-    });
-    drop(admission);
-    task.await
-        .map_err(|error| {
-            error!(%tx_hash, %error, "process-tx worker task failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("process-tx worker task failed: {error}"),
-                }),
-            )
-        })?
-        // The detached task above already logged the failure, so render it
-        // without logging it a second time.
-        .map_err(operator_error_response)
+    })?
+    .await?
+    // The detached task above already logged the failure, so render it
+    // without logging it a second time.
+    .map_err(operator_error_response)
 }
 
 /// Accounts a missed on-chain fill and places the opposite hedge inside the
@@ -3967,6 +4522,10 @@ fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
             post(reconcile_equity_transfer),
         )
         .route(
+            "/liquidity-write/transfers/equity_redemption/{id}/adopt-withdrawal",
+            post(adopt_withdrawal_replacement),
+        )
+        .route(
             "/liquidity-write/positions/{symbol}/release-hedge",
             post(release_position_hedge),
         )
@@ -3989,6 +4548,34 @@ fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
         .route(
             "/liquidity-write/cctp/complete-mint",
             post(complete_cctp_mint),
+        )
+        .route(
+            "/liquidity-write/capital/transfer-usdc",
+            post(capital::transfer_usdc),
+        )
+        .route(
+            "/liquidity-write/capital/vault-deposit",
+            post(capital::vault_deposit),
+        )
+        .route(
+            "/liquidity-write/capital/vault-withdraw",
+            post(capital::vault_withdraw),
+        )
+        .route(
+            "/liquidity-write/capital/vault-withdraw-usdc",
+            post(capital::vault_withdraw_usdc),
+        )
+        .route(
+            "/liquidity-write/capital/cctp-bridge",
+            post(capital::cctp_bridge),
+        )
+        .route(
+            "/liquidity-write/capital/cctp-burn-supersede",
+            post(capital::cctp_burn_supersede),
+        )
+        .route(
+            "/liquidity-write/capital/reset-allowance",
+            post(capital::reset_allowance),
         )
         .layer(axum::middleware::from_fn(move |request, next| {
             let verifier = Arc::clone(&write_verifier);
@@ -4082,13 +4669,21 @@ pub(crate) fn routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use alloy::primitives::{Address, Bytes, IntoLogData, TxHash, address, fixed_bytes, uint};
+    use alloy::consensus::{SignableTransaction as _, TxEip1559, TxEnvelope};
+    use alloy::eips::eip2718::{EIP1559_TX_TYPE_ID, Encodable2718 as _};
+    use alloy::eips::eip2930::AccessList;
+    use alloy::primitives::{
+        Address, B256, Bytes, IntoLogData, TxHash, TxKind, address, fixed_bytes, uint,
+    };
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::rpc::types::Log;
+    use alloy::signers::SignerSync as _;
+    use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::SolCall;
     use async_trait::async_trait;
     use axum::body::{Body, to_bytes};
@@ -4105,12 +4700,13 @@ mod tests {
     use st0x_bridge::cctp::CctpError;
     use st0x_bridge::corridor::{HopKind, UsdcCorridor};
     use st0x_config::{
-        BrokerCtx, Ctx, ExecutionThreshold, FileLogging, HedgedChain, LogLevel, RestApiCtx,
+        BrokerCtx, ChainCashAsset, Ctx, ExecutionThreshold, FileLogging, HedgedChain, LogLevel,
+        OperationMode, RebalancingMode, RestApiCtx, UsdcCorridors,
         create_test_ctx_with_order_owner,
     };
     use st0x_dto::{Trade, TradeOutcome, TradingVenue};
     use st0x_event_sorcery::{ReactorHarness, StoreBuilder};
-    use st0x_evm::Chain;
+    use st0x_evm::{Chain, MinedTx, PreparedTransaction};
     use st0x_execution::alpaca_broker_api::AlpacaBrokerMock;
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaWalletError,
@@ -4134,6 +4730,7 @@ mod tests {
     use crate::offchain::order::{
         OffchainOrder, OffchainOrderEvent, OffchainOrderId, OrderPlacementResult,
     };
+    use crate::onchain::mock::MockRaindex;
     use crate::onchain_trade::{
         InventoryVenue, OnChainTrade, OnChainTradeCommand, OnChainTradeId, OnChainTradeSource,
     };
@@ -4145,13 +4742,14 @@ mod tests {
         PortfolioSnapshotId, PortfolioSnapshotProjection, et_day,
     };
     use crate::position::{NormalizedOnChainFillCommand, Position, PositionCommand, TradeId};
-    use crate::rebalancing::equity::ChainServicesMissing;
+    use crate::rebalancing::equity::{ChainServicesMissing, SignedRedemptionTx};
     use crate::rebalancing::usdc::{
         RecoveredCctpMint, UsdcDriverGate, u256_to_usdc, usdc_driver_pause,
     };
     use crate::rebalancing::{RebalancingSchedulers, RebalancingServiceConfig};
     use crate::test_utils::{
-        TEST_POLL_INTERVAL, get_test_order, reserving_counter_trade_preflight,
+        AnvilRaindexChain, HeldReceiptWallet, ReceiptGate, TEST_POLL_INTERVAL, erc20_allowance,
+        erc20_balance, get_test_order, mined_receipt, reserving_counter_trade_preflight,
         seed_get_test_order_token_symbols, setup_test_pools,
     };
     use crate::tokenized_equity_mint::TokenizedEquityMint;
@@ -4178,7 +4776,9 @@ mod tests {
             ),
             recovery: Arc::new(tokio::sync::OnceCell::new()),
             process_tx: Arc::new(tokio::sync::OnceCell::new()),
-            resume_lock: Arc::new(ResumeLock(Mutex::new(()))),
+            resume_lock: Arc::new(ResumeLock(Arc::new(Mutex::new(())))),
+            vault_deposit_lock: Arc::new(Mutex::new(())),
+            vault_withdraw_lock: Arc::new(Mutex::new(())),
             projection_maintenance: Arc::new(
                 crate::conductor::projection_pause::ProjectionMaintenance::for_test(),
             ),
@@ -7149,12 +7749,23 @@ mod tests {
                 "POST",
                 "/liquidity-write/transfers/equity_redemption/x/reconcile",
             ),
+            (
+                "POST",
+                "/liquidity-write/transfers/equity_redemption/x/adopt-withdrawal",
+            ),
             ("POST", "/liquidity-write/positions/x/release-hedge"),
             ("POST", "/liquidity-write/positions/x/set"),
             ("POST", "/liquidity-write/portfolio-snapshot/marks"),
             ("POST", "/liquidity-write/transactions/x/process"),
             ("POST", "/liquidity-write/views/position/rebuild"),
             ("POST", "/liquidity-write/cctp/complete-mint"),
+            ("POST", "/liquidity-write/capital/transfer-usdc"),
+            ("POST", "/liquidity-write/capital/vault-deposit"),
+            ("POST", "/liquidity-write/capital/vault-withdraw"),
+            ("POST", "/liquidity-write/capital/vault-withdraw-usdc"),
+            ("POST", "/liquidity-write/capital/cctp-bridge"),
+            ("POST", "/liquidity-write/capital/cctp-burn-supersede"),
+            ("POST", "/liquidity-write/capital/reset-allowance"),
         ] {
             let response = app
                 .clone()
@@ -7201,12 +7812,23 @@ mod tests {
                 "POST",
                 "/liquidity-write/transfers/equity_redemption/x/reconcile",
             ),
+            (
+                "POST",
+                "/liquidity-write/transfers/equity_redemption/x/adopt-withdrawal",
+            ),
             ("POST", "/liquidity-write/positions/x/release-hedge"),
             ("POST", "/liquidity-write/positions/x/set"),
             ("POST", "/liquidity-write/portfolio-snapshot/marks"),
             ("POST", "/liquidity-write/transactions/x/process"),
             ("POST", "/liquidity-write/views/position/rebuild"),
             ("POST", "/liquidity-write/cctp/complete-mint"),
+            ("POST", "/liquidity-write/capital/transfer-usdc"),
+            ("POST", "/liquidity-write/capital/vault-deposit"),
+            ("POST", "/liquidity-write/capital/vault-withdraw"),
+            ("POST", "/liquidity-write/capital/vault-withdraw-usdc"),
+            ("POST", "/liquidity-write/capital/cctp-bridge"),
+            ("POST", "/liquidity-write/capital/cctp-burn-supersede"),
+            ("POST", "/liquidity-write/capital/reset-allowance"),
         ] {
             let response = app
                 .clone()
@@ -7295,6 +7917,21 @@ mod tests {
             }));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(message, "Failed to recheck transfer");
+
+        // The provider still has no record of a mint on a stopped listing:
+        // the operator's state to act on -> 422 carrying the refusal.
+        let refusal = TokenizedEquityMintError::ReplayRefused {
+            issuer_request_id: issuer_request_id("mint-2"),
+            chain: Chain::Base,
+            symbol: Symbol::new("AAPL").unwrap(),
+            mode: RebalancingMode::Paused,
+        };
+        let (status, message) =
+            recheck_error_response(&RecheckError::Mint(MintError::Aggregate(Box::new(
+                AggregateError::UserError(LifecycleError::Apply(refusal.clone())),
+            ))));
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(message, refusal.to_string());
     }
 
     #[test]
@@ -7425,30 +8062,25 @@ mod tests {
         }
     }
 
-    /// Builds an `AppState` with a published recovery handle whose USDC driver
-    /// pause is returned alongside its gate, so a test can hold an execution
-    /// in flight and drive the two operator routes through their real quiesce
-    /// call. The heavy handle dependencies are never touched on the 503 path
-    /// (the route refuses at the pause), but must exist to construct the handle.
-    async fn recovery_state_with_driver_pause() -> (AppState, UsdcDriverGate) {
-        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        let state = empty_app_state(ctx).await;
+    /// Builds an `AppState` with a published recovery handle whose equity
+    /// transfer runs on `services` and whose USDC driver pause is returned
+    /// alongside its gate, so a test can hold an execution in flight and drive
+    /// the two operator routes through their real quiesce call. The heavy
+    /// handle dependencies are never touched on the 503 path (the route
+    /// refuses at the pause), but must exist to construct the handle.
+    async fn recovery_state_with_driver_pause(
+        services: EquityTransferServices,
+    ) -> (AppState, UsdcDriverGate) {
+        recovery_state_for_ctx(create_test_ctx_with_order_owner(Address::ZERO), services).await
+    }
 
-        let services = EquityTransferServices::panicking();
-        let (mint_store, _) = StoreBuilder::<TokenizedEquityMint>::new(state.pool.clone())
-            .build(services.clone())
-            .await
-            .unwrap();
-        let (redemption_store, _) =
-            StoreBuilder::<crate::equity_redemption::EquityRedemption>::new(state.pool.clone())
-                .build(services.clone())
-                .await
-                .unwrap();
-        let transfer = Arc::new(CrossVenueEquityTransfer::new(
-            services,
-            mint_store.clone(),
-            redemption_store.clone(),
-        ));
+    /// [`recovery_state_with_driver_pause`] over a caller supplied `ctx`, for
+    /// the capital routes that need a configured wallet.
+    async fn recovery_state_for_ctx(
+        ctx: Ctx,
+        services: EquityTransferServices,
+    ) -> (AppState, UsdcDriverGate) {
+        let state = empty_app_state(ctx).await;
 
         let (event_sender, _) = broadcast::channel(16);
         let rebalancing_inventory = Arc::new(BroadcastingInventory::new(
@@ -7464,8 +8096,9 @@ mod tests {
                 poll_freshness: crate::inventory::PollFreshness::always_fresh(),
                 inventory_staleness_bound: std::time::Duration::from_secs(300),
                 allocation: st0x_config::AllocationCtx::base_test(),
-                usdc: None,
+                usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: std::time::Duration::from_secs(60),
+                recovery_hold_alert_after: std::time::Duration::from_secs(60 * 60),
                 chains: std::collections::BTreeMap::from([(
                     Chain::Base,
                     crate::rebalancing::ChainRebalancingConfig::for_test(
@@ -7477,7 +8110,6 @@ mod tests {
                 )]),
                 cash_reserved: None,
                 hedge_floor: st0x_execution::HedgeFloor::default(),
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
             },
             vault_registry,
             std::collections::BTreeMap::from([(
@@ -7497,6 +8129,35 @@ mod tests {
             Arc::new(crate::alerts::LogNotifier),
         ));
 
+        let usdc_store = standalone_usdc_store(&state.pool).await;
+        let gate = publish_recovery_handle(&state, rebalancing_service, usdc_store, services).await;
+        (state, gate)
+    }
+
+    /// Publishes a recovery handle over `rebalancing_service` and `usdc_store`,
+    /// with its equity transfer on `services`, and returns the gate of its
+    /// USDC driver pause.
+    async fn publish_recovery_handle(
+        state: &AppState,
+        rebalancing_service: Arc<RebalancingService>,
+        usdc_store: Arc<Store<UsdcRebalance>>,
+        services: EquityTransferServices,
+    ) -> UsdcDriverGate {
+        let (mint_store, _) = StoreBuilder::<TokenizedEquityMint>::new(state.pool.clone())
+            .build(services.clone())
+            .await
+            .unwrap();
+        let (redemption_store, _) =
+            StoreBuilder::<crate::equity_redemption::EquityRedemption>::new(state.pool.clone())
+                .build(services.clone())
+                .await
+                .unwrap();
+        let transfer = Arc::new(CrossVenueEquityTransfer::new(
+            services,
+            mint_store.clone(),
+            redemption_store.clone(),
+        ));
+
         let (pause, gate) = usdc_driver_pause();
 
         state
@@ -7511,12 +8172,13 @@ mod tests {
                 // CCTP mint recovery, so any double fills the slot.
                 cctp_mint_recovery: Arc::new(InconclusiveMint),
                 usdc_driver_pause: Arc::new(pause),
-                usdc_store: standalone_usdc_store(&state.pool).await,
+                usdc_store,
+                cctp_burn_store: Arc::new(st0x_event_sorcery::test_store(state.pool.clone(), ())),
             })
             .ok()
             .expect("recovery cell must start empty");
 
-        (state, gate)
+        gate
     }
 
     /// Production integration for the resume route's driver-pause call: with a
@@ -7526,7 +8188,8 @@ mod tests {
     /// unknown id, failing this 503 assertion.
     #[tokio::test]
     async fn resume_usdc_route_returns_503_when_driver_cannot_quiesce() {
-        let (state, gate) = recovery_state_with_driver_pause().await;
+        let (state, gate) =
+            recovery_state_with_driver_pause(EquityTransferServices::panicking()).await;
         let _executing = gate.enter().await;
         // Pause the clock only after the DB pools are built, so the quiesce
         // window's 5-second timer auto-advances without a real wait while the
@@ -7555,7 +8218,8 @@ mod tests {
     /// `left_unchanged`), failing this 503 assertion.
     #[tokio::test]
     async fn recheck_usdc_route_returns_503_when_driver_cannot_quiesce() {
-        let (state, gate) = recovery_state_with_driver_pause().await;
+        let (state, gate) =
+            recovery_state_with_driver_pause(EquityTransferServices::panicking()).await;
         let _executing = gate.enter().await;
         tokio::time::pause();
         let id = uuid::Uuid::new_v4();
@@ -7575,6 +8239,1892 @@ mod tests {
             body.error,
             "A USDC transfer is executing; retry once it is not in flight"
         );
+    }
+
+    fn capital_request<Request: serde::de::DeserializeOwned>(
+        body: serde_json::Value,
+    ) -> Json<Request> {
+        Json(serde_json::from_value(body).unwrap())
+    }
+
+    const TEST_OPERATION_ID: &str = "6f1c2a1e-6c39-4a77-9a8e-1f0b7d6e8c11";
+
+    /// A zero, negative, or off-grid amount is refused as input before the
+    /// resume lock is even tried: with the lock held, a 409 here would mean
+    /// the amount was not checked first. `1.0000001` is positive but
+    /// finer than USDC's six decimals, so the worker would refuse it only
+    /// after the enqueue had claimed the corridor.
+    #[tokio::test]
+    async fn transfer_usdc_refuses_an_invalid_amount_before_the_resume_lock() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let resume_lock = Arc::clone(&state.resume_lock);
+        let _held = resume_lock.0.try_lock().unwrap();
+
+        for amount in ["0", "-5", "1.0000001"] {
+            let Err((status, Json(body))) = capital::transfer_usdc(
+                State(state.clone()),
+                capital_request(serde_json::json!({"direction": "to-raindex", "amount": amount})),
+            )
+            .await
+            else {
+                panic!("amount {amount} must be refused");
+            };
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{amount}: {}", body.error);
+        }
+    }
+
+    /// Like the resume route, the manual transfer takes the resume lock
+    /// before it needs the recovery handle, so a held lock is a 409 even
+    /// before the recovery handle is published.
+    #[tokio::test]
+    async fn transfer_usdc_returns_409_while_the_resume_lock_is_held() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        state.health.set_ready();
+        let resume_lock = Arc::clone(&state.resume_lock);
+        let _held = resume_lock.0.try_lock().unwrap();
+
+        let Err((status, Json(body))) = capital::transfer_usdc(
+            State(state.clone()),
+            capital_request(serde_json::json!({"direction": "to-alpaca", "amount": "10"})),
+        )
+        .await
+        else {
+            panic!("a held resume lock must refuse the transfer");
+        };
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body.error,
+            "A resume or recheck operation is already in progress"
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_usdc_returns_503_before_the_recovery_handle_is_ready() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        state.health.set_ready();
+
+        let Err((status, Json(body))) = capital::transfer_usdc(
+            State(state),
+            capital_request(serde_json::json!({"direction": "to-raindex", "amount": "10"})),
+        )
+        .await
+        else {
+            panic!("the transfer must wait for the recovery handle");
+        };
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body.error,
+            "Recovery not ready yet (conductor still starting)"
+        );
+    }
+
+    /// With a worker execution in flight the manual transfer refuses at the
+    /// driver pause. Without the pause call it would reach the unwired
+    /// fixture service, whose `NotReady` 503 carries a different message.
+    #[tokio::test]
+    async fn transfer_usdc_route_returns_503_when_driver_cannot_quiesce() {
+        let (state, gate) =
+            recovery_state_with_driver_pause(EquityTransferServices::panicking()).await;
+        state.health.set_ready();
+        let _executing = gate.enter().await;
+        tokio::time::pause();
+
+        let Err((status, Json(body))) = capital::transfer_usdc(
+            State(state),
+            capital_request(serde_json::json!({"direction": "to-raindex", "amount": "10"})),
+        )
+        .await
+        else {
+            panic!("the transfer must refuse while another transfer is executing");
+        };
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body.error,
+            "A USDC transfer is executing; retry once it is not in flight"
+        );
+    }
+
+    /// End to end through the handler and the conductor wired service: the
+    /// response carries a fresh id, echoes the wire direction and amount, and
+    /// exactly one job of the direction's type sits on the bot's own queue
+    /// under that id.
+    #[tokio::test]
+    async fn transfer_usdc_enqueues_a_job_under_the_returned_id() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        state.health.set_ready();
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let (service, store) =
+            crate::rebalancing::trigger::wire_usdc_reactor_store(&state.pool, &apalis_pool).await;
+        let _gate =
+            publish_recovery_handle(&state, service, store, EquityTransferServices::panicking())
+                .await;
+
+        let Ok(Json(body)) = capital::transfer_usdc(
+            State(state.clone()),
+            capital_request(serde_json::json!({"direction": "to-raindex", "amount": "250.5"})),
+        )
+        .await
+        else {
+            panic!("the transfer must be enqueued");
+        };
+
+        let body = serde_json::to_value(&body).unwrap();
+        assert_eq!(body["direction"], "to-raindex");
+        assert_eq!(body["amount"], "250.5");
+        assert_eq!(body["outcome"], "enqueued");
+        let transfer_id = body["transferId"].as_str().unwrap().to_string();
+        transfer_id
+            .parse::<UsdcRebalanceId>()
+            .expect("the transfer id must be a rebalance id");
+
+        let rows: Vec<(String, Vec<u8>)> = sqlx_apalis::query_as(
+            "SELECT job_type, job FROM Jobs WHERE json_extract(job, '$.id') = ?",
+        )
+        .bind(&transfer_id)
+        .fetch_all(&apalis_pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1, "exactly one job row under the returned id");
+        assert_eq!(
+            rows[0].0,
+            std::any::type_name::<crate::rebalancing::usdc::TransferUsdcToMarketMaking>(),
+            "to-raindex must enqueue the Alpaca to Base job"
+        );
+    }
+
+    /// Every route that acts on one chain's trading table refuses a chain
+    /// without one as input. No `[wallet]` is configured, so the 400 also
+    /// proves the table is checked before the wallet is required.
+    #[tokio::test]
+    async fn capital_chain_routes_refuse_a_chain_without_a_trading_table() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let vault = serde_json::json!({
+            "chain": "ethereum",
+            "token": "0x0000000000000000000000000000000000000001",
+            "vaultId": "0x0000000000000000000000000000000000000000000000000000000000000002",
+            "amount": "1",
+        });
+
+        let deposit =
+            capital::vault_deposit(State(state.clone()), capital_request(vault.clone())).await;
+        let withdraw = capital::vault_withdraw(State(state.clone()), capital_request(vault)).await;
+        let withdraw_usdc = capital::vault_withdraw_usdc(
+            State(state.clone()),
+            capital_request(serde_json::json!({"chain": "ethereum", "amount": "1"})),
+        )
+        .await;
+        let reset = capital::reset_allowance(
+            State(state),
+            capital_request(serde_json::json!({"chain": "ethereum"})),
+        )
+        .await;
+
+        for (route, result) in [
+            ("vault-deposit", deposit.err()),
+            ("vault-withdraw", withdraw.err()),
+            ("vault-withdraw-usdc", withdraw_usdc.err()),
+            ("reset-allowance", reset.err()),
+        ] {
+            let (status, Json(body)) = result.unwrap_or_else(|| panic!("{route} must refuse"));
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{route}: {}", body.error);
+            assert!(
+                body.error.contains("[chains.ethereum.trading]"),
+                "{route}: {}",
+                body.error
+            );
+        }
+    }
+
+    /// A zero or negative vault amount is input, refused before the chain or
+    /// the wallet is resolved.
+    #[tokio::test]
+    async fn vault_deposit_refuses_a_non_positive_amount() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+
+        for amount in ["0", "-1"] {
+            let Err((status, Json(body))) = capital::vault_deposit(
+                State(state.clone()),
+                capital_request(serde_json::json!({
+                    "chain": "base",
+                    "token": "0x0000000000000000000000000000000000000001",
+                    "vaultId": "0x0000000000000000000000000000000000000000000000000000000000000002",
+                    "amount": amount,
+                })),
+            )
+            .await
+            else {
+                panic!("amount {amount} must be refused");
+            };
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{amount}: {}", body.error);
+        }
+    }
+
+    /// A missing `[wallet]` on a chain with a trading table is the bot's own
+    /// fault: a generic 500, never a 400 that blames the request.
+    #[tokio::test]
+    async fn capital_chain_routes_without_a_wallet_return_500() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+
+        let Err((status, Json(body))) = capital::reset_allowance(
+            State(state),
+            capital_request(serde_json::json!({"chain": "base"})),
+        )
+        .await
+        else {
+            panic!("a bot without a wallet must refuse");
+        };
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.error, "The bot has no signing wallet configured");
+    }
+
+    /// Both or neither of `amount` and `all` is input, refused before the
+    /// recovery handle is needed.
+    #[tokio::test]
+    async fn cctp_bridge_refuses_both_or_neither_of_amount_and_all() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+
+        for body in [
+            serde_json::json!({"operationId": TEST_OPERATION_ID, "from": "base", "amount": "100", "all": true}),
+            serde_json::json!({"operationId": TEST_OPERATION_ID, "from": "base"}),
+        ] {
+            let Err((status, Json(error))) =
+                capital::cctp_bridge(State(state.clone()), capital_request(body.clone())).await
+            else {
+                panic!("{body} must be refused");
+            };
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {}", error.error);
+        }
+    }
+
+    /// The burn spends the rebalancing wallet's USDC, so like the CCTP mint
+    /// recovery it refuses while another operator write holds the resume
+    /// lock, from inside the detached task that owns the burn.
+    #[tokio::test]
+    async fn cctp_bridge_returns_409_while_the_resume_lock_is_held() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.wallet = Some(st0x_config::OnchainWalletCtx::stub());
+        let (state, _gate) = recovery_state_for_ctx(ctx, EquityTransferServices::panicking()).await;
+        state.health.set_ready();
+        let resume_lock = Arc::clone(&state.resume_lock);
+        let _held = resume_lock.0.try_lock().unwrap();
+
+        let Err((status, Json(body))) = capital::cctp_bridge(
+            State(state.clone()),
+            capital_request(serde_json::json!({"operationId": TEST_OPERATION_ID, "from": "base", "amount": "100"})),
+        )
+        .await
+        else {
+            panic!("a held resume lock must refuse the burn");
+        };
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body.error,
+            "A resume or recheck operation is already in progress"
+        );
+    }
+
+    /// Like every other corridor move, the burn refuses while the corridor's
+    /// signing wallets are below their gas thresholds, before it takes the
+    /// resume lock or touches the chain. The lock is held here, so a gate
+    /// placed behind it would answer the 409 of
+    /// `cctp_bridge_returns_409_while_the_resume_lock_is_held` instead.
+    #[tokio::test]
+    async fn cctp_bridge_returns_503_while_the_corridor_wallets_are_not_gas_ready() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.wallet = Some(st0x_config::OnchainWalletCtx::stub());
+        let (state, _gate) = recovery_state_for_ctx(ctx, EquityTransferServices::panicking()).await;
+        state.health.set_ready();
+        state
+            .recovery
+            .get()
+            .unwrap()
+            .rebalancing_service
+            .set_usdc_gas_readiness(std::collections::BTreeMap::from([(
+                st0x_bridge::corridor::UsdcCorridor::BASE_CCTP.chain(),
+                crate::native_gas::ConfiguredGasReadiness::Wired(
+                    crate::native_gas::GasReadiness::for_test(
+                        U256::MAX,
+                        U256::from(1_u64),
+                        U256::ZERO,
+                        U256::from(1_u64),
+                    ),
+                ),
+            )]))
+            .await;
+        let resume_lock = Arc::clone(&state.resume_lock);
+        let _held = resume_lock.0.try_lock().unwrap();
+
+        let Err((status, Json(body))) = capital::cctp_bridge(
+            State(state),
+            capital_request(serde_json::json!({"operationId": TEST_OPERATION_ID, "from": "base", "amount": "100"})),
+        )
+        .await
+        else {
+            panic!("a corridor wallet below its gas threshold must refuse the burn");
+        };
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            body.error.contains("signing wallets are not gas ready"),
+            "{}",
+            body.error
+        );
+    }
+
+    /// Two concurrent `capital vault-deposit` requests for a token without the
+    /// startup MAX grant could overwrite each other's approval, so a request
+    /// refuses with 409 while another one holds the deposit lock, before any
+    /// chain call.
+    #[tokio::test]
+    async fn vault_deposit_returns_409_while_another_deposit_holds_the_lock() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.wallet = Some(st0x_config::OnchainWalletCtx::stub());
+        let (state, _gate) = recovery_state_for_ctx(ctx, EquityTransferServices::panicking()).await;
+        state.health.set_ready();
+        let deposit_lock = Arc::clone(&state.vault_deposit_lock);
+        let _held = deposit_lock.try_lock().unwrap();
+
+        let Err((status, Json(body))) = capital::vault_deposit(
+            State(state),
+            capital_request(serde_json::json!({
+                "chain": "base",
+                "token": "0x0000000000000000000000000000000000000001",
+                "vaultId": "0x0000000000000000000000000000000000000000000000000000000000000002",
+                "amount": "1",
+            })),
+        )
+        .await
+        else {
+            panic!("a held deposit lock must refuse the deposit");
+        };
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body.error,
+            "Another vault deposit is in progress or its outcome is unknown; check the bot \
+             logs for it before retrying"
+        );
+    }
+
+    /// `vault-withdraw-usdc` shares the withdraw lock with `vault-withdraw`:
+    /// while either holds it, a request refuses with 409 before any chain call.
+    #[tokio::test]
+    async fn vault_withdraw_usdc_returns_409_while_another_withdrawal_holds_the_lock() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.wallet = Some(st0x_config::OnchainWalletCtx::stub());
+        ctx.chains.primary_mut().assets.cash = Some(ChainCashAsset {
+            vault_ids: vec![B256::with_last_byte(7)],
+            rebalancing: OperationMode::Disabled,
+            operational_limit: None,
+        });
+        let (state, _gate) = recovery_state_for_ctx(ctx, EquityTransferServices::panicking()).await;
+        state.health.set_ready();
+        let withdraw_lock = Arc::clone(&state.vault_withdraw_lock);
+        let _held = withdraw_lock.try_lock().unwrap();
+
+        let Err((status, Json(body))) = capital::vault_withdraw_usdc(
+            State(state),
+            capital_request(serde_json::json!({"chain": "base", "amount": "1"})),
+        )
+        .await
+        else {
+            panic!("a held withdraw lock must refuse the withdrawal");
+        };
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body.error,
+            "Another vault withdrawal is in progress or its outcome is unknown; check the bot \
+             logs for it before retrying"
+        );
+    }
+
+    /// Every capital route refuses with 503 until startup completes, as
+    /// process-tx does: the recovery handle and the wallets exist before the
+    /// chain id and `OPERATOR_ROLE` preflights have passed, and the job
+    /// `transfer-usdc` enqueues signs with those same wallets. The request is
+    /// otherwise valid for each route, so a 503 proves the gate fires before
+    /// any onchain call or enqueue.
+    #[tokio::test]
+    async fn capital_routes_return_503_until_startup_completes() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.wallet = Some(st0x_config::OnchainWalletCtx::stub());
+        ctx.chains.primary_mut().assets.cash = Some(ChainCashAsset {
+            vault_ids: vec![B256::with_last_byte(7)],
+            rebalancing: OperationMode::Disabled,
+            operational_limit: None,
+        });
+        let (state, _gate) = recovery_state_for_ctx(ctx, EquityTransferServices::panicking()).await;
+        let vault = serde_json::json!({
+            "chain": "base",
+            "token": "0x0000000000000000000000000000000000000001",
+            "vaultId": "0x0000000000000000000000000000000000000000000000000000000000000002",
+            "amount": "1",
+        });
+
+        let transfer = capital::transfer_usdc(
+            State(state.clone()),
+            capital_request(serde_json::json!({"direction": "to-raindex", "amount": "1"})),
+        )
+        .await;
+        let deposit =
+            capital::vault_deposit(State(state.clone()), capital_request(vault.clone())).await;
+        let withdraw = capital::vault_withdraw(State(state.clone()), capital_request(vault)).await;
+        let withdraw_usdc = capital::vault_withdraw_usdc(
+            State(state.clone()),
+            capital_request(serde_json::json!({"chain": "base", "amount": "1"})),
+        )
+        .await;
+        let bridge = capital::cctp_bridge(
+            State(state.clone()),
+            capital_request(serde_json::json!({"operationId": TEST_OPERATION_ID, "from": "base", "amount": "1"})),
+        )
+        .await;
+        let supersede = capital::cctp_burn_supersede(
+            State(state.clone()),
+            capital_request(serde_json::json!({
+                "operationId": TEST_OPERATION_ID,
+                "supersedingTx": TxHash::ZERO,
+            })),
+        )
+        .await;
+        let reset = capital::reset_allowance(
+            State(state),
+            capital_request(serde_json::json!({"chain": "base"})),
+        )
+        .await;
+
+        for (route, result) in [
+            ("transfer-usdc", transfer.err()),
+            ("vault-deposit", deposit.err()),
+            ("vault-withdraw", withdraw.err()),
+            ("vault-withdraw-usdc", withdraw_usdc.err()),
+            ("cctp-bridge", bridge.err()),
+            ("cctp-burn-supersede", supersede.err()),
+            ("reset-allowance", reset.err()),
+        ] {
+            let (status, Json(body)) = result.unwrap_or_else(|| panic!("{route} must refuse"));
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{route}: {}",
+                body.error
+            );
+            assert_eq!(
+                body.error,
+                format!("{route} is unavailable until startup completes")
+            );
+        }
+    }
+
+    /// The 200 body of a capital route as JSON; a refusal panics with its
+    /// status and message, so a failing route reports why.
+    fn capital_success<Response: Serialize>(
+        route: &str,
+        result: Result<Json<Response>, (StatusCode, Json<ErrorResponse>)>,
+    ) -> serde_json::Value {
+        match result {
+            Ok(Json(body)) => serde_json::to_value(body).unwrap(),
+            Err((status, Json(error))) => {
+                panic!("{route} refused with {status}: {}", error.error)
+            }
+        }
+    }
+
+    fn vault_request(token: Address, vault_id: B256, amount: &str) -> serde_json::Value {
+        serde_json::json!({
+            "chain": "base",
+            "token": token,
+            "vaultId": vault_id,
+            "amount": amount,
+        })
+    }
+
+    /// A ctx whose Base trading table is `chain`'s orderbook in Legacy mode,
+    /// where the bot's own vaults live, with every signer the bot's wallet on
+    /// that node behind a [`HeldReceiptWallet`]: each route's confirmation
+    /// waits until the returned gate moves, so the tests can observe a route
+    /// that answered at the broadcast while its confirmation is still pending.
+    fn capital_ctx_on(chain: &AnvilRaindexChain) -> (Ctx, tokio::sync::watch::Sender<ReceiptGate>) {
+        let (wallet, gate) = HeldReceiptWallet::wrap(Arc::clone(&chain.bot_wallet));
+        let mut ctx = create_test_ctx_with_order_owner(chain.bot);
+        let primary = ctx.chains.primary_mut();
+        primary.rpc_url = chain.endpoint.clone();
+        primary.orderbook = chain.orderbook;
+        ctx.wallet = Some(st0x_config::OnchainWalletCtx::from_wallets(
+            Arc::clone(&wallet),
+            Arc::clone(&wallet),
+            Arc::clone(&wallet),
+            wallet,
+        ));
+        (ctx, gate)
+    }
+
+    /// Checks that the capital route that just answered is still awaiting its
+    /// held confirmation, then releases it and waits until every capital task
+    /// has finished, leaving the gate held again for the next route.
+    async fn confirm_after_the_answer(
+        state: &AppState,
+        gate: &tokio::sync::watch::Sender<ReceiptGate>,
+    ) {
+        state.detached_tasks.close();
+        let Err(_still_confirming) =
+            tokio::time::timeout(Duration::from_millis(200), state.detached_tasks.wait()).await
+        else {
+            panic!("the route's task must keep running until its confirmation");
+        };
+        gate.send_replace(ReceiptGate::Released);
+        state.detached_tasks.wait().await;
+        state.detached_tasks.reopen();
+        gate.send_replace(ReceiptGate::Held);
+    }
+
+    /// End to end through the handler against a deployed orderbook: the
+    /// amount is scaled by the decimals read onchain, the response reports the
+    /// deposit tx at its broadcast while the deposit lock stays held until the
+    /// deposit confirms, and exactly the reported raw amount moves from the
+    /// bot's wallet into its vault.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn vault_deposit_moves_the_scaled_amount_into_the_bots_vault() {
+        let chain = AnvilRaindexChain::deploy().await;
+        let supply = U256::from(1_000_u64) * U256::from(10_u64).pow(U256::from(18_u64));
+        let token = chain.deploy_bot_token(18, supply).await;
+        let vault_id = B256::with_last_byte(3);
+        let (ctx, gate) = capital_ctx_on(&chain);
+        let state = empty_app_state(ctx).await;
+        state.health.set_ready();
+
+        let body = capital_success(
+            "vault-deposit",
+            capital::vault_deposit(
+                State(state.clone()),
+                capital_request(vault_request(token, vault_id, "1.5")),
+            )
+            .await,
+        );
+        let Err(_) = state.vault_deposit_lock.try_lock() else {
+            panic!("the deposit must hold the deposit lock until it confirms");
+        };
+        confirm_after_the_answer(&state, &gate).await;
+        let Ok(_released) = state.vault_deposit_lock.try_lock() else {
+            panic!("the confirmed deposit must release the deposit lock");
+        };
+        assert!(logs_contain("Vault operation confirmed via API"));
+
+        let deposit_tx: TxHash = serde_json::from_value(body["depositTx"].clone()).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "chain": "base",
+                "token": token,
+                "vaultId": vault_id,
+                "amount": "1.5",
+                "amountRaw": "1500000000000000000",
+                "decimals": 18,
+                "depositTx": deposit_tx,
+            })
+        );
+        let receipt = mined_receipt(&chain.bot_wallet, deposit_tx).await;
+        assert_eq!(receipt.to, Some(chain.orderbook));
+
+        let deposited = U256::from(1_500_000_000_000_000_000_u64);
+        assert_eq!(chain.vault_balance(token, vault_id, 18).await, deposited);
+        assert_eq!(
+            erc20_balance(&chain.bot_wallet, token, chain.bot).await,
+            supply - deposited
+        );
+    }
+
+    /// After a deposit, a partial withdraw answers with its tx at the
+    /// broadcast, a rerun of it refuses with 409 while the bot still waits for
+    /// that withdraw's receipt (the gate holds the wait; Anvil has already
+    /// mined it), and exactly the reported raw amount returns from the vault
+    /// to the bot's wallet, once.
+    #[tokio::test]
+    async fn vault_withdraw_moves_the_scaled_amount_back_to_the_bots_wallet() {
+        let chain = AnvilRaindexChain::deploy().await;
+        let supply = U256::from(1_000_u64) * U256::from(10_u64).pow(U256::from(18_u64));
+        let token = chain.deploy_bot_token(18, supply).await;
+        let vault_id = B256::with_last_byte(4);
+        let (ctx, gate) = capital_ctx_on(&chain);
+        let state = empty_app_state(ctx).await;
+        state.health.set_ready();
+        capital_success(
+            "vault-deposit",
+            capital::vault_deposit(
+                State(state.clone()),
+                capital_request(vault_request(token, vault_id, "1.5")),
+            )
+            .await,
+        );
+        confirm_after_the_answer(&state, &gate).await;
+
+        let body = capital_success(
+            "vault-withdraw",
+            capital::vault_withdraw(
+                State(state.clone()),
+                capital_request(vault_request(token, vault_id, "0.25")),
+            )
+            .await,
+        );
+        let Err((status, Json(rerun))) = capital::vault_withdraw(
+            State(state.clone()),
+            capital_request(vault_request(token, vault_id, "0.25")),
+        )
+        .await
+        else {
+            panic!("a rerun before the confirmation must not withdraw again");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            rerun.error,
+            "Another vault withdrawal is in progress or its outcome is unknown; check the bot \
+             logs for it before retrying"
+        );
+        confirm_after_the_answer(&state, &gate).await;
+        let Ok(_released) = state.vault_withdraw_lock.try_lock() else {
+            panic!("the confirmed withdraw must release the withdraw lock");
+        };
+
+        let withdraw_tx: TxHash = serde_json::from_value(body["withdrawTx"].clone()).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "chain": "base",
+                "token": token,
+                "vaultId": vault_id,
+                "amount": "0.25",
+                "amountRaw": "250000000000000000",
+                "decimals": 18,
+                "withdrawTx": withdraw_tx,
+            })
+        );
+        let receipt = mined_receipt(&chain.bot_wallet, withdraw_tx).await;
+        assert_eq!(receipt.to, Some(chain.orderbook));
+
+        let deposited = U256::from(1_500_000_000_000_000_000_u64);
+        let withdrawn = U256::from(250_000_000_000_000_000_u64);
+        assert_eq!(
+            chain.vault_balance(token, vault_id, 18).await,
+            deposited - withdrawn
+        );
+        assert_eq!(
+            erc20_balance(&chain.bot_wallet, token, chain.bot).await,
+            supply - deposited + withdrawn
+        );
+    }
+
+    /// The USDC withdraw resolves the chain's settlement stable and the first
+    /// configured cash vault on its own: the response names both and answers
+    /// at the broadcast, the reported raw amount (6 decimals) leaves that vault
+    /// for the bot's wallet, and the second configured cash vault is
+    /// untouched.
+    #[tokio::test]
+    async fn vault_withdraw_usdc_withdraws_the_stable_from_the_first_cash_vault() {
+        let chain = AnvilRaindexChain::deploy().await;
+        let usdc = Chain::Base.settlement_stable().address;
+        chain
+            .etch_bot_stable(usdc, U256::from(100_000_000_u64))
+            .await;
+        let cash_vault = B256::with_last_byte(7);
+        let second_cash_vault = B256::with_last_byte(8);
+        let (mut ctx, gate) = capital_ctx_on(&chain);
+        ctx.chains.primary_mut().assets.cash = Some(ChainCashAsset {
+            vault_ids: vec![cash_vault, second_cash_vault],
+            rebalancing: OperationMode::Disabled,
+            operational_limit: None,
+        });
+        let state = empty_app_state(ctx).await;
+        state.health.set_ready();
+        capital_success(
+            "vault-deposit",
+            capital::vault_deposit(
+                State(state.clone()),
+                capital_request(vault_request(usdc, cash_vault, "10")),
+            )
+            .await,
+        );
+        confirm_after_the_answer(&state, &gate).await;
+
+        let body = capital_success(
+            "vault-withdraw-usdc",
+            capital::vault_withdraw_usdc(
+                State(state.clone()),
+                capital_request(serde_json::json!({"chain": "base", "amount": "2.5"})),
+            )
+            .await,
+        );
+        confirm_after_the_answer(&state, &gate).await;
+
+        let withdraw_tx: TxHash = serde_json::from_value(body["withdrawTx"].clone()).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "chain": "base",
+                "token": usdc,
+                "vaultId": cash_vault,
+                "amount": "2.5",
+                "amountRaw": "2500000",
+                "decimals": 6,
+                "withdrawTx": withdraw_tx,
+            })
+        );
+        let receipt = mined_receipt(&chain.bot_wallet, withdraw_tx).await;
+        assert_eq!(receipt.to, Some(chain.orderbook));
+
+        assert_eq!(
+            chain.vault_balance(usdc, cash_vault, 6).await,
+            U256::from(7_500_000_u64)
+        );
+        assert_eq!(
+            chain.vault_balance(usdc, second_cash_vault, 6).await,
+            U256::ZERO
+        );
+        assert_eq!(
+            erc20_balance(&chain.bot_wallet, usdc, chain.bot).await,
+            U256::from(92_500_000_u64)
+        );
+    }
+
+    /// A standing settlement stable allowance to the orderbook is revoked by
+    /// an approve on the stable, reported with its tx at the broadcast and
+    /// confirmed afterwards; a second reset finds it already zero and sends
+    /// nothing.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn reset_allowance_revokes_a_standing_allowance_then_reports_already_zero() {
+        let chain = AnvilRaindexChain::deploy().await;
+        let usdc = Chain::Base.settlement_stable().address;
+        chain.etch_bot_stable(usdc, U256::ZERO).await;
+        chain
+            .approve_from_bot(usdc, chain.orderbook, U256::from(5_000_000_u64))
+            .await;
+        let (ctx, gate) = capital_ctx_on(&chain);
+        let state = empty_app_state(ctx).await;
+        state.health.set_ready();
+
+        let revoked = capital_success(
+            "reset-allowance",
+            capital::reset_allowance(
+                State(state.clone()),
+                capital_request(serde_json::json!({"chain": "base"})),
+            )
+            .await,
+        );
+        confirm_after_the_answer(&state, &gate).await;
+        assert!(logs_contain("Orderbook allowance reset confirmed via API"));
+
+        let revoke_tx: TxHash = serde_json::from_value(revoked["tx"].clone()).unwrap();
+        assert_eq!(
+            revoked,
+            serde_json::json!({
+                "chain": "base",
+                "token": usdc,
+                "spender": chain.orderbook,
+                "outcome": "revoked",
+                "tx": revoke_tx,
+            })
+        );
+        let receipt = mined_receipt(&chain.bot_wallet, revoke_tx).await;
+        assert_eq!(receipt.to, Some(usdc));
+        assert_eq!(
+            erc20_allowance(&chain.bot_wallet, usdc, chain.bot, chain.orderbook).await,
+            U256::ZERO
+        );
+
+        let already_zero = capital_success(
+            "reset-allowance",
+            capital::reset_allowance(
+                State(state),
+                capital_request(serde_json::json!({"chain": "base"})),
+            )
+            .await,
+        );
+
+        assert_eq!(
+            already_zero,
+            serde_json::json!({
+                "chain": "base",
+                "token": usdc,
+                "spender": chain.orderbook,
+                "outcome": "already_zero",
+                "tx": null,
+            })
+        );
+    }
+
+    /// A route that answered at the broadcast and then panics while awaiting
+    /// the confirmation still reaches the join failure log through the
+    /// tracked watcher, since the request is long gone by then.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_panic_after_the_answer_still_reaches_the_join_failure_log() {
+        let chain = AnvilRaindexChain::deploy().await;
+        let usdc = Chain::Base.settlement_stable().address;
+        chain.etch_bot_stable(usdc, U256::ZERO).await;
+        chain
+            .approve_from_bot(usdc, chain.orderbook, U256::from(5_000_000_u64))
+            .await;
+        let (ctx, gate) = capital_ctx_on(&chain);
+        gate.send_replace(ReceiptGate::Panic);
+        let state = empty_app_state(ctx).await;
+        state.health.set_ready();
+
+        let revoked = capital_success(
+            "reset-allowance",
+            capital::reset_allowance(
+                State(state.clone()),
+                capital_request(serde_json::json!({"chain": "base"})),
+            )
+            .await,
+        );
+        assert_eq!(revoked["outcome"], "revoked");
+
+        state.detached_tasks.close();
+        state.detached_tasks.wait().await;
+        assert!(logs_contain("reset-allowance worker task failed"));
+        assert!(!logs_contain("Orderbook allowance reset confirmed via API"));
+    }
+
+    /// A confirmation that fails after the answer is logged as not confirmed
+    /// with the tx the route answered with, for a vault verb and for
+    /// `reset-allowance` alike, and the failed deposit still releases the
+    /// deposit lock. Anvil does not mine, so the gate's revert is the only
+    /// outcome either route sees.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_failed_confirmation_is_logged_with_the_answered_tx() {
+        let chain = AnvilRaindexChain::deploy().await;
+        let supply = U256::from(1_000_u64) * U256::from(10_u64).pow(U256::from(18_u64));
+        let token = chain.deploy_bot_token(18, supply).await;
+        let usdc = Chain::Base.settlement_stable().address;
+        chain.etch_bot_stable(usdc, U256::ZERO).await;
+        chain
+            .approve_from_bot(usdc, chain.orderbook, U256::from(5_000_000_u64))
+            .await;
+        // Pre-approve the deposit, whose approve would otherwise wait for a
+        // block that never comes.
+        chain
+            .approve_from_bot(token, chain.orderbook, U256::MAX)
+            .await;
+        chain.set_automine(false).await;
+        let (ctx, gate) = capital_ctx_on(&chain);
+        gate.send_replace(ReceiptGate::Fail);
+        let state = empty_app_state(ctx).await;
+        state.health.set_ready();
+
+        let deposit = capital_success(
+            "vault-deposit",
+            capital::vault_deposit(
+                State(state.clone()),
+                capital_request(vault_request(token, B256::with_last_byte(3), "1.5")),
+            )
+            .await,
+        );
+        let reset = capital_success(
+            "reset-allowance",
+            capital::reset_allowance(
+                State(state.clone()),
+                capital_request(serde_json::json!({"chain": "base"})),
+            )
+            .await,
+        );
+        state.detached_tasks.close();
+        state.detached_tasks.wait().await;
+
+        let Ok(_released) = state.vault_deposit_lock.try_lock() else {
+            panic!("a deposit whose confirmation failed must release the deposit lock");
+        };
+        let deposit_tx: TxHash = serde_json::from_value(deposit["depositTx"].clone()).unwrap();
+        let reset_tx: TxHash = serde_json::from_value(reset["tx"].clone()).unwrap();
+        logs_assert(|lines| {
+            for (message, tx) in [
+                (
+                    "Vault operation broadcast via API did not confirm",
+                    deposit_tx,
+                ),
+                (
+                    "Orderbook allowance reset via API did not confirm",
+                    reset_tx,
+                ),
+            ] {
+                let tx_field = format!("tx={tx}");
+                if !lines
+                    .iter()
+                    .any(|line| line.contains(message) && line.contains(&tx_field))
+                {
+                    return Err(format!("no `{message}` line names {tx_field}"));
+                }
+            }
+            Ok(())
+        });
+        assert!(!logs_contain("confirmed via API"));
+    }
+
+    /// Deposits into a vault, stops Anvil from mining so the next tx stays
+    /// pending, then withdraws with the receipt gate set to `gate`, waits until
+    /// `outcome_logged` sees the confirmation's outcome, and returns the chain,
+    /// the state, and the refusal of an immediate rerun of the same withdraw.
+    /// Panics if the rerun is not refused.
+    async fn rerun_after_withdraw_outcome(
+        gate: ReceiptGate,
+        outcome_logged: impl Fn() -> bool + Send + Sync,
+    ) -> (AnvilRaindexChain, AppState, (StatusCode, ErrorResponse)) {
+        let chain = AnvilRaindexChain::deploy().await;
+        let supply = U256::from(1_000_u64) * U256::from(10_u64).pow(U256::from(18_u64));
+        let token = chain.deploy_bot_token(18, supply).await;
+        let vault_id = B256::with_last_byte(4);
+        let (ctx, receipts) = capital_ctx_on(&chain);
+        let state = empty_app_state(ctx).await;
+        state.health.set_ready();
+        capital_success(
+            "vault-deposit",
+            capital::vault_deposit(
+                State(state.clone()),
+                capital_request(vault_request(token, vault_id, "1.5")),
+            )
+            .await,
+        );
+        confirm_after_the_answer(&state, &receipts).await;
+        // The route reads the tx's own receipt when the gate fails the wait,
+        // so the tx must really be unmined for the outcome to be unknown.
+        chain.set_automine(false).await;
+        receipts.send_replace(gate);
+
+        capital_success(
+            "vault-withdraw",
+            capital::vault_withdraw(
+                State(state.clone()),
+                capital_request(vault_request(token, vault_id, "0.25")),
+            )
+            .await,
+        );
+        // Wait until the task has handled the gate's outcome, whichever way,
+        // so the rerun below is what decides the test.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !outcome_logged() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the confirmation must reach an outcome");
+
+        let Err((status, Json(rerun))) = capital::vault_withdraw(
+            State(state.clone()),
+            capital_request(vault_request(token, vault_id, "0.25")),
+        )
+        .await
+        else {
+            panic!("a rerun before the withdraw's fate is proven must not withdraw again");
+        };
+        (chain, state, (status, rerun))
+    }
+
+    fn assert_withdraw_lock_refusal((status, refusal): (StatusCode, ErrorResponse)) {
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            refusal.error,
+            "Another vault withdrawal is in progress or its outcome is unknown; check the bot \
+             logs for it before retrying"
+        );
+    }
+
+    /// A receipt timeout does not prove the withdraw failed: the tx can still
+    /// land. The route keeps the withdraw lock and waits again, so a rerun
+    /// still answers 409 instead of broadcasting a second withdraw.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_withdraw_whose_receipt_times_out_keeps_its_lock() {
+        let (_chain, _state, refusal) = rerun_after_withdraw_outcome(ReceiptGate::TimeOut, || {
+            logs_contain("is not confirmed yet") || logs_contain("did not confirm")
+        })
+        .await;
+
+        assert_withdraw_lock_refusal(refusal);
+        assert!(!logs_contain(
+            "Vault operation broadcast via API did not confirm"
+        ));
+    }
+
+    /// A formal JSON-RPC error reply to the receipt poll proves nothing about
+    /// the tx either, so it keeps the lock like a timeout does.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_withdraw_whose_receipt_poll_errors_keeps_its_lock() {
+        let (_chain, _state, refusal) = rerun_after_withdraw_outcome(ReceiptGate::RpcError, || {
+            logs_contain("is not confirmed yet") || logs_contain("did not confirm")
+        })
+        .await;
+
+        assert_withdraw_lock_refusal(refusal);
+        assert!(!logs_contain(
+            "Vault operation broadcast via API did not confirm"
+        ));
+    }
+
+    /// A panic while confirming leaves the tx's fate unknown, so the lock is
+    /// kept until a restart and the panic still reaches the join failure log.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_withdraw_whose_confirmation_panics_keeps_its_lock() {
+        let (_chain, _state, refusal) = rerun_after_withdraw_outcome(ReceiptGate::Panic, || {
+            logs_contain("vault-withdraw worker task failed")
+        })
+        .await;
+
+        assert_withdraw_lock_refusal(refusal);
+        assert!(logs_contain(
+            "Vault operation confirmation panicked; keeping its lock until a restart"
+        ));
+    }
+
+    /// A drop report does not prove the withdraw can never land: the node the
+    /// wallet asked may just not have it. The lock stays held, a rerun still
+    /// answers 409, and once the tx mines its receipt confirms it and frees
+    /// the lock, though the wallet still reports a drop.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_withdraw_reported_dropped_keeps_its_lock_until_it_mines() {
+        let (chain, state, refusal) = rerun_after_withdraw_outcome(ReceiptGate::Dropped, || {
+            logs_contain("is not confirmed yet") || logs_contain("did not confirm")
+        })
+        .await;
+
+        assert_withdraw_lock_refusal(refusal);
+        assert!(!logs_contain(
+            "Vault operation broadcast via API did not confirm"
+        ));
+
+        chain.mine().await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while state.vault_withdraw_lock.try_lock().is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the mined withdraw must free the withdraw lock");
+        logs_assert(|lines| {
+            let confirmed = lines
+                .iter()
+                .filter(|line| line.contains("Vault operation confirmed via API"))
+                .count();
+            // One for the deposit, one for the withdraw that mined.
+            (confirmed == 2)
+                .then_some(())
+                .ok_or_else(|| format!("expected 2 confirmed lines, got {confirmed}"))
+        });
+    }
+
+    /// A deposit that mines with a status 0 receipt, while the replay that
+    /// would decode its revert fails as it does on a node with pruned state,
+    /// is still a proven failure: its own receipt shows it mined and failed.
+    /// The route logs it as not confirmed and frees the deposit lock instead
+    /// of waiting forever.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_mined_failure_whose_replay_decodes_nothing_frees_its_lock() {
+        let chain = AnvilRaindexChain::deploy().await;
+        let supply = U256::from(1_000_u64) * U256::from(10_u64).pow(U256::from(18_u64));
+        let token = chain.deploy_bot_token(18, supply).await;
+        chain
+            .approve_from_bot(token, chain.orderbook, U256::MAX)
+            .await;
+        chain.set_automine(false).await;
+        let (ctx, gate) = capital_ctx_on(&chain);
+        gate.send_replace(ReceiptGate::Unreplayable);
+        let state = empty_app_state(ctx).await;
+        state.health.set_ready();
+
+        capital_success(
+            "vault-deposit",
+            capital::vault_deposit(
+                State(state.clone()),
+                capital_request(vault_request(token, B256::with_last_byte(5), "1.5")),
+            )
+            .await,
+        );
+        // The pending deposit's token transfer now reverts, so the block
+        // mines it with a status 0 receipt.
+        chain.make_always_revert(token).await;
+        chain.mine().await;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while state.vault_deposit_lock.try_lock().is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the mined failure must free the deposit lock");
+        assert!(logs_contain(
+            "Vault operation broadcast via API did not confirm"
+        ));
+        assert!(logs_contain("missing trie node"));
+        assert!(!logs_contain("confirmed via API"));
+    }
+
+    /// CCTP V2 deployed on two Anvil nodes with `starting_usdc` in the bot's
+    /// Base wallet, reached through the ctx's test overrides, and a Circle API
+    /// that only serves the fast transfer fee: nothing is minted, so no
+    /// attestation is involved.
+    #[cfg(feature = "test-support")]
+    async fn cctp_burn_state(
+        starting_usdc: U256,
+    ) -> (
+        crate::test_utils::AnvilCctpPair,
+        httpmock::MockServer,
+        AppState,
+    ) {
+        let cctp = crate::test_utils::deploy_anvil_cctp_pair(starting_usdc).await;
+        let circle = httpmock::MockServer::start();
+        circle.mock(|when, then| {
+            when.method(GET).path_includes("/v2/burn/USDC/fees/");
+            then.status(200).json_body(serde_json::json!([
+                {"finalityThreshold": 1000, "minimumFee": 1},
+                {"finalityThreshold": 2000, "minimumFee": 0}
+            ]));
+        });
+
+        let mut ctx = create_test_ctx_with_order_owner(cctp.bot);
+        ctx.wallet = Some(st0x_config::OnchainWalletCtx::from_wallets(
+            Arc::clone(&cctp.base_wallet),
+            Arc::clone(&cctp.ethereum_wallet),
+            Arc::clone(&cctp.base_wallet),
+            Arc::clone(&cctp.base_wallet),
+        ));
+        ctx.rebalancing.cctp_corridor =
+            st0x_bridge::cctp::CctpCorridor::with_tokens(cctp.usdc, cctp.usdc);
+        ctx.rebalancing.circle_api_base = circle.base_url();
+        ctx.rebalancing.token_messenger = cctp.token_messenger;
+        ctx.rebalancing.message_transmitter = cctp.message_transmitter;
+        let (state, _gate) = recovery_state_for_ctx(ctx, EquityTransferServices::panicking()).await;
+        state.health.set_ready();
+        (cctp, circle, state)
+    }
+
+    #[cfg(feature = "test-support")]
+    async fn burn_from_base(
+        state: &AppState,
+        operation_id: &str,
+        amount: &str,
+    ) -> Result<Json<capital::CctpBridgeResponse>, (StatusCode, Json<ErrorResponse>)> {
+        capital::cctp_bridge(
+            State(state.clone()),
+            capital_request(serde_json::json!({
+                "operationId": operation_id,
+                "from": "base",
+                "amount": amount,
+            })),
+        )
+        .await
+    }
+
+    /// Signs a burn of `amount` from Base and records it under `operation_id`
+    /// without broadcasting it, as a request that died between the record and
+    /// the broadcast, or a restart in between, leaves it.
+    #[cfg(feature = "test-support")]
+    async fn record_unbroadcast_burn(
+        state: &AppState,
+        operation_id: &str,
+        amount: U256,
+    ) -> st0x_evm::PreparedTransaction {
+        let wallets = state.ctx.wallet().unwrap();
+        let bridge = crate::cctp_burn::bot_cctp_bridge(&state.ctx, wallets).unwrap();
+        let prepared = bridge
+            .prepare_burn(
+                st0x_bridge::BridgeDirection::BaseToEthereum,
+                amount,
+                wallets.ethereum_wallet().address(),
+            )
+            .await
+            .unwrap();
+        state
+            .recovery
+            .get()
+            .unwrap()
+            .cctp_burn_store
+            .send(
+                &operation_id.parse().unwrap(),
+                crate::cctp_burn::CctpBurnOperationCommand::Prepare {
+                    source: CctpSourceChain::Base,
+                    requested: crate::cctp_burn::RequestedBurn::Exact { amount },
+                    amount,
+                    recipient: wallets.ethereum_wallet().address(),
+                    prepared: prepared.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        prepared
+    }
+
+    #[cfg(feature = "test-support")]
+    async fn recorded_burn(state: &AppState, operation_id: &str) -> CctpBurnOperation {
+        state
+            .recovery
+            .get()
+            .unwrap()
+            .cctp_burn_store
+            .load(&operation_id.parse().unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// An exact burn from Base reports the operation id, the route, the raw
+    /// amount and the burn tx at the broadcast as pending, keeps the resume
+    /// lock held until the burn confirms, records the confirmation, and
+    /// exactly that amount leaves the bot's Base wallet.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn cctp_bridge_burns_the_exact_amount_from_the_source_wallet() {
+        let starting_usdc = U256::from(5_000_000_u64);
+        let (cctp, _circle, state) = cctp_burn_state(starting_usdc).await;
+
+        let body = capital_success(
+            "cctp-bridge",
+            burn_from_base(&state, TEST_OPERATION_ID, "1").await,
+        );
+        // The request is answered at the broadcast while the task still awaits
+        // the receipt, so the lock is held here, before anything else awaits.
+        let Err(_) = state.resume_lock.0.try_lock() else {
+            panic!("the burn must hold the resume lock until it confirms");
+        };
+
+        let burn_tx: TxHash = serde_json::from_value(body["burnTx"].clone()).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "operationId": TEST_OPERATION_ID,
+                "burnTx": burn_tx,
+                "sourceChain": "base",
+                "destinationChain": "ethereum",
+                "amountRaw": "1000000",
+                "status": "pending",
+            })
+        );
+        state.detached_tasks.close();
+        state.detached_tasks.wait().await;
+        let Ok(_released) = state.resume_lock.0.try_lock() else {
+            panic!("the confirmed burn must release the resume lock");
+        };
+        let receipt = mined_receipt(&cctp.base_wallet, burn_tx).await;
+        assert_eq!(receipt.to, Some(cctp.token_messenger));
+        assert_eq!(
+            erc20_balance(&cctp.base_wallet, cctp.usdc, cctp.bot).await,
+            starting_usdc - U256::from(1_000_000_u64)
+        );
+        let recorded = recorded_burn(&state, TEST_OPERATION_ID).await;
+        assert_eq!(recorded.burn_tx(), burn_tx);
+        assert!(matches!(
+            recorded.outcome,
+            crate::cctp_burn::CctpBurnOutcome::Confirmed { .. }
+        ));
+    }
+
+    /// A request whose answer was lost after the broadcast, retried with the
+    /// same operation id while the first burn is still confirming, and again
+    /// after, gets the same burn tx each time and burns once. A new id burns
+    /// again.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn a_retry_with_the_same_operation_id_burns_once_and_a_new_id_burns_again() {
+        let starting_usdc = U256::from(5_000_000_u64);
+        let (cctp, _circle, state) = cctp_burn_state(starting_usdc).await;
+        let one_usdc = U256::from(1_000_000_u64);
+
+        let first = capital_success(
+            "cctp-bridge",
+            burn_from_base(&state, TEST_OPERATION_ID, "1").await,
+        );
+        let while_confirming = capital_success(
+            "cctp-bridge",
+            burn_from_base(&state, TEST_OPERATION_ID, "1").await,
+        );
+        state.detached_tasks.close();
+        state.detached_tasks.wait().await;
+        state.detached_tasks.reopen();
+        let after = capital_success(
+            "cctp-bridge",
+            burn_from_base(&state, TEST_OPERATION_ID, "1").await,
+        );
+
+        assert_eq!(while_confirming["burnTx"], first["burnTx"]);
+        assert_eq!(after["burnTx"], first["burnTx"]);
+        assert_eq!(after["status"], "confirmed");
+        assert_eq!(
+            erc20_balance(&cctp.base_wallet, cctp.usdc, cctp.bot).await,
+            starting_usdc - one_usdc,
+            "the retries must not burn again"
+        );
+
+        let fresh = capital_success(
+            "cctp-bridge",
+            burn_from_base(&state, "0b6c6f47-3f52-4c2f-9f3c-6d1f2e0a9b44", "1").await,
+        );
+        state.detached_tasks.close();
+        state.detached_tasks.wait().await;
+        assert_ne!(fresh["burnTx"], first["burnTx"]);
+        assert_eq!(
+            erc20_balance(&cctp.base_wallet, cctp.usdc, cctp.bot).await,
+            starting_usdc - one_usdc - one_usdc,
+            "a new operation id burns again"
+        );
+    }
+
+    /// A burn recorded but never broadcast (the request died in between, or
+    /// the bot restarted) is adopted by the retry with its operation id: no
+    /// node holds it, so the retry sends the recorded bytes under the lock,
+    /// like a fresh burn. The burn tx is the recorded one, the burn confirms,
+    /// and the wallet burns once.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn a_retry_broadcasts_a_burn_recorded_before_its_broadcast() {
+        let starting_usdc = U256::from(5_000_000_u64);
+        let (cctp, _circle, state) = cctp_burn_state(starting_usdc).await;
+        let one_usdc = U256::from(1_000_000_u64);
+        let prepared = record_unbroadcast_burn(&state, TEST_OPERATION_ID, one_usdc).await;
+        assert_eq!(
+            erc20_balance(&cctp.base_wallet, cctp.usdc, cctp.bot).await,
+            starting_usdc
+        );
+
+        let body = capital_success(
+            "cctp-bridge",
+            burn_from_base(&state, TEST_OPERATION_ID, "1").await,
+        );
+        let Err(_) = state.resume_lock.0.try_lock() else {
+            panic!("sending a recorded burn must hold the resume lock until it confirms");
+        };
+        state.detached_tasks.close();
+        state.detached_tasks.wait().await;
+
+        let burn_tx: TxHash = serde_json::from_value(body["burnTx"].clone()).unwrap();
+        assert_eq!(burn_tx, prepared.tx_hash());
+        assert_eq!(body["status"], "pending");
+        assert!(matches!(
+            recorded_burn(&state, TEST_OPERATION_ID).await.outcome,
+            crate::cctp_burn::CctpBurnOutcome::Confirmed { .. }
+        ));
+        assert_eq!(
+            erc20_balance(&cctp.base_wallet, cctp.usdc, cctp.bot).await,
+            starting_usdc - one_usdc
+        );
+    }
+
+    /// An operation id names one burn, so a request with another amount
+    /// under it is refused instead of reporting a burn it did not ask for.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn a_different_burn_under_a_used_operation_id_is_refused() {
+        let (_cctp, _circle, state) = cctp_burn_state(U256::from(5_000_000_u64)).await;
+        capital_success(
+            "cctp-bridge",
+            burn_from_base(&state, TEST_OPERATION_ID, "1").await,
+        );
+
+        let Err((status, Json(body))) = burn_from_base(&state, TEST_OPERATION_ID, "2").await else {
+            panic!("another amount under a used operation id must be refused");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body.error.contains("use a new operation id"),
+            "{}",
+            body.error
+        );
+    }
+
+    /// A recorded burn whose nonce a plain cancel took can never mine. A
+    /// retry before the burn is settled cannot send it, and answers `502`
+    /// pointing at the supersede route. That route refuses a tx at another
+    /// nonce, settles the burn on the cancel, and a retry with its operation
+    /// id then reports it superseded without burning.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn a_burn_whose_nonce_a_cancel_took_is_settled_superseded() {
+        let starting_usdc = U256::from(5_000_000_u64);
+        let (cctp, _circle, state) = cctp_burn_state(starting_usdc).await;
+        let prepared =
+            record_unbroadcast_burn(&state, TEST_OPERATION_ID, U256::from(1_000_000_u64)).await;
+        // The operator's cancel: a 0 value self transfer with no calldata at
+        // the burn's nonce, which the bot's wallet frees for it here.
+        cctp.base_wallet.discard_prepared(prepared.tx_hash()).await;
+        let cancel = cctp
+            .base_wallet
+            .send(cctp.bot, alloy::primitives::Bytes::new(), "cancel")
+            .await
+            .unwrap();
+        let later = cctp
+            .base_wallet
+            .send(cctp.bot, alloy::primitives::Bytes::new(), "later")
+            .await
+            .unwrap();
+        let Err((status, Json(unsendable))) = burn_from_base(&state, TEST_OPERATION_ID, "1").await
+        else {
+            panic!("a burn whose nonce another tx took must not be reported in flight");
+        };
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(
+            unsendable.error.contains("cctp-burn-supersede"),
+            "{}",
+            unsendable.error
+        );
+        let Err((status, Json(refusal))) = supersede_burn(&state, later.transaction_hash).await
+        else {
+            panic!("a tx at another nonce must not settle the burn");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            refusal.error.contains("not the burn's nonce"),
+            "{}",
+            refusal.error
+        );
+
+        let settled = capital_success(
+            "cctp-burn-supersede",
+            supersede_burn(&state, cancel.transaction_hash).await,
+        );
+        assert_eq!(settled["status"], "superseded");
+
+        let retry = capital_success(
+            "cctp-bridge",
+            burn_from_base(&state, TEST_OPERATION_ID, "1").await,
+        );
+        assert_eq!(retry["status"], "superseded");
+        assert_eq!(
+            erc20_balance(&cctp.base_wallet, cctp.usdc, cctp.bot).await,
+            starting_usdc
+        );
+    }
+
+    /// At startup a pending burn is rebroadcast from its recorded bytes, so a
+    /// burn signed and recorded before a restart still lands once; the next
+    /// start finds it mined and records it instead of restoring it again.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn startup_rebroadcasts_a_pending_burn_then_records_it_once_mined() {
+        let starting_usdc = U256::from(5_000_000_u64);
+        let (cctp, _circle, state) = cctp_burn_state(starting_usdc).await;
+        let one_usdc = U256::from(1_000_000_u64);
+        let prepared = record_unbroadcast_burn(&state, TEST_OPERATION_ID, one_usdc).await;
+        let wallets = state.ctx.wallet().unwrap();
+        let bridge = crate::cctp_burn::bot_cctp_bridge(&state.ctx, wallets).unwrap();
+        let store = &state.recovery.get().unwrap().cctp_burn_store;
+
+        let first_start = crate::cctp_burn::restore_pending_cctp_burns(
+            &state.pool,
+            store,
+            &bridge,
+            &state.ctx.chains,
+        )
+        .await;
+        assert_eq!(first_start.restored, 1);
+        // Whether the receipt is readable right after the rebroadcast depends
+        // on timing; a burn still unmined then gates its chain, as it should.
+        mined_receipt(&cctp.base_wallet, prepared.tx_hash()).await;
+        assert_eq!(
+            erc20_balance(&cctp.base_wallet, cctp.usdc, cctp.bot).await,
+            starting_usdc - one_usdc
+        );
+
+        let second_start = crate::cctp_burn::restore_pending_cctp_burns(
+            &state.pool,
+            store,
+            &bridge,
+            &state.ctx.chains,
+        )
+        .await;
+        assert_eq!((second_start.restored, second_start.settled), (0, 1));
+        assert!(matches!(
+            recorded_burn(&state, TEST_OPERATION_ID).await.outcome,
+            crate::cctp_burn::CctpBurnOutcome::Confirmed { .. }
+        ));
+    }
+
+    #[cfg(feature = "test-support")]
+    async fn supersede_burn(
+        state: &AppState,
+        superseding_tx: TxHash,
+    ) -> Result<Json<capital::CctpBridgeResponse>, (StatusCode, Json<ErrorResponse>)> {
+        capital::cctp_burn_supersede(
+            State(state.clone()),
+            capital_request(serde_json::json!({
+                "operationId": TEST_OPERATION_ID,
+                "supersedingTx": superseding_tx,
+            })),
+        )
+        .await
+    }
+
+    /// A wallet speed up sends the burn's exact calldata again at its nonce
+    /// with a higher fee, and that copy burns in the signed burn's place. The
+    /// supersede route adopts it as the replacement: the operation reports
+    /// `replaced` with the copy as its burn tx, and the wallet burned once.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn a_fee_bumped_copy_of_the_burn_is_adopted_as_its_replacement() {
+        let starting_usdc = U256::from(5_000_000_u64);
+        let (cctp, _circle, state) = cctp_burn_state(starting_usdc).await;
+        let one_usdc = U256::from(1_000_000_u64);
+        let prepared = record_unbroadcast_burn(&state, TEST_OPERATION_ID, one_usdc).await;
+        cctp.base_wallet.discard_prepared(prepared.tx_hash()).await;
+        // A speed up pays a higher fee, so its signed bytes and hash differ.
+        {
+            use alloy::providers::Provider as _;
+            use alloy::providers::ext::AnvilApi as _;
+            let base_fee = cctp.base_wallet.provider().get_gas_price().await.unwrap();
+            cctp.base_wallet
+                .provider()
+                .anvil_set_next_block_base_fee_per_gas(base_fee * 4 + 1_000_000_000)
+                .await
+                .unwrap();
+            cctp.base_wallet
+                .provider()
+                .anvil_mine(Some(1), None)
+                .await
+                .unwrap();
+        }
+        let copy = cctp
+            .base_wallet
+            .send(cctp.token_messenger, prepared.input().unwrap(), "speed up")
+            .await
+            .unwrap();
+        assert_ne!(copy.transaction_hash, prepared.tx_hash());
+
+        let settled = capital_success(
+            "cctp-burn-supersede",
+            supersede_burn(&state, copy.transaction_hash).await,
+        );
+
+        assert_eq!(settled["status"], "replaced");
+        let burn_tx: TxHash = serde_json::from_value(settled["burnTx"].clone()).unwrap();
+        assert_eq!(burn_tx, copy.transaction_hash);
+        let retry = capital_success(
+            "cctp-bridge",
+            burn_from_base(&state, TEST_OPERATION_ID, "1").await,
+        );
+        assert_eq!(retry["status"], "replaced");
+        assert_eq!(retry["burnTx"], settled["burnTx"]);
+        assert_eq!(
+            erc20_balance(&cctp.base_wallet, cctp.usdc, cctp.bot).await,
+            starting_usdc - one_usdc
+        );
+    }
+
+    /// A successful tx at the burn's nonce that is neither a plain cancel nor
+    /// an exact copy of the burn may have moved funds, so it settles nothing
+    /// and the burn stays pending. The closest case: a `depositForBurn` of
+    /// another amount to the same TokenMessenger, which also emits
+    /// `MessageSent` but burned a different amount.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn a_successful_tx_at_the_nonce_that_is_neither_cancel_nor_copy_is_refused() {
+        let (cctp, _circle, state) = cctp_burn_state(U256::from(5_000_000_u64)).await;
+        let prepared =
+            record_unbroadcast_burn(&state, TEST_OPERATION_ID, U256::from(1_000_000_u64)).await;
+        cctp.base_wallet.discard_prepared(prepared.tx_hash()).await;
+        // `depositForBurn`'s first argument is the amount: its last byte sits
+        // at offset 35 of the calldata, after the 4 byte selector.
+        let mut other_amount = prepared.input().unwrap().to_vec();
+        other_amount[35] ^= 1;
+        let other_burn = cctp
+            .base_wallet
+            .send(
+                cctp.token_messenger,
+                alloy::primitives::Bytes::from(other_amount),
+                "another burn",
+            )
+            .await
+            .unwrap();
+
+        let Err((status, Json(refusal))) =
+            supersede_burn(&state, other_burn.transaction_hash).await
+        else {
+            panic!("a burn of another amount must not settle the recorded burn");
+        };
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            refusal.error.contains("neither a plain cancel"),
+            "{}",
+            refusal.error
+        );
+        assert_eq!(
+            recorded_burn(&state, TEST_OPERATION_ID).await.outcome,
+            crate::cctp_burn::CctpBurnOutcome::Pending
+        );
+    }
+
+    /// A recorded burn that mines and reverts burned nothing: the confirmation
+    /// records it `Reverted`, a retry reports `reverted` without burning, and
+    /// the wallet keeps its USDC. A TokenMessenger that always reverts makes
+    /// the burn revert.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn a_reverted_burn_is_recorded_and_never_burns() {
+        use alloy::providers::ext::AnvilApi as _;
+        let starting_usdc = U256::from(5_000_000_u64);
+        let (cctp, _circle, state) = cctp_burn_state(starting_usdc).await;
+        record_unbroadcast_burn(&state, TEST_OPERATION_ID, U256::from(1_000_000_u64)).await;
+        cctp.base_wallet
+            .provider()
+            .anvil_set_code(cctp.token_messenger, alloy::primitives::bytes!("5f5ffd"))
+            .await
+            .unwrap();
+
+        capital_success(
+            "cctp-bridge",
+            burn_from_base(&state, TEST_OPERATION_ID, "1").await,
+        );
+        state.detached_tasks.close();
+        state.detached_tasks.wait().await;
+        state.detached_tasks.reopen();
+
+        assert!(matches!(
+            recorded_burn(&state, TEST_OPERATION_ID).await.outcome,
+            crate::cctp_burn::CctpBurnOutcome::Reverted { .. }
+        ));
+        let retry = capital_success(
+            "cctp-bridge",
+            burn_from_base(&state, TEST_OPERATION_ID, "1").await,
+        );
+        assert_eq!(retry["status"], "reverted");
+        assert_eq!(
+            erc20_balance(&cctp.base_wallet, cctp.usdc, cctp.bot).await,
+            starting_usdc
+        );
+    }
+
+    /// When the record of a signed burn fails to write and the reload shows
+    /// nothing recorded, the route answers `500` with nothing broadcast and
+    /// releases the signature's nonce: a later burn uses that nonce and
+    /// mines, instead of queuing behind a burn nobody will send.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn a_signed_burn_that_fails_to_record_releases_its_nonce() {
+        let starting_usdc = U256::from(5_000_000_u64);
+        let (cctp, _circle, state) = cctp_burn_state(starting_usdc).await;
+        sqlx::query(
+            "CREATE TRIGGER refuse_burn_record BEFORE INSERT ON events \
+             WHEN NEW.event_type = 'CctpBurnOperationEvent::Prepared' \
+             BEGIN SELECT RAISE(ABORT, 'injected write failure'); END",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let Err((status, Json(refusal))) = burn_from_base(&state, TEST_OPERATION_ID, "1").await
+        else {
+            panic!("a burn that cannot be recorded must not be broadcast");
+        };
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            refusal.error.contains("nothing was broadcast"),
+            "{}",
+            refusal.error
+        );
+        assert!(
+            state
+                .recovery
+                .get()
+                .unwrap()
+                .cctp_burn_store
+                .load(&TEST_OPERATION_ID.parse().unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            erc20_balance(&cctp.base_wallet, cctp.usdc, cctp.bot).await,
+            starting_usdc
+        );
+
+        sqlx::query("DROP TRIGGER refuse_burn_record")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let burned = capital_success(
+            "cctp-bridge",
+            burn_from_base(&state, TEST_OPERATION_ID, "1").await,
+        );
+        let burn_tx: TxHash = serde_json::from_value(burned["burnTx"].clone()).unwrap();
+        assert!(mined_receipt(&cctp.base_wallet, burn_tx).await.status());
+        assert_eq!(
+            erc20_balance(&cctp.base_wallet, cctp.usdc, cctp.bot).await,
+            starting_usdc - U256::from(1_000_000_u64)
+        );
+    }
+
+    /// A burn whose receipt succeeded without the CCTP `MessageSent` event
+    /// gave Circle nothing to attest, so it is paged and never recorded
+    /// confirmed. A TokenMessenger that only stops produces such a receipt.
+    #[cfg(feature = "test-support")]
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_burn_that_emitted_no_message_sent_is_never_recorded_confirmed() {
+        use alloy::providers::ext::AnvilApi as _;
+        let (cctp, _circle, state) = cctp_burn_state(U256::from(5_000_000_u64)).await;
+        cctp.base_wallet
+            .provider()
+            .anvil_set_code(cctp.token_messenger, alloy::primitives::bytes!("00"))
+            .await
+            .unwrap();
+
+        let body = capital_success(
+            "cctp-bridge",
+            burn_from_base(&state, TEST_OPERATION_ID, "1").await,
+        );
+        state.detached_tasks.close();
+        state.detached_tasks.wait().await;
+
+        let burn_tx: TxHash = serde_json::from_value(body["burnTx"].clone()).unwrap();
+        assert!(mined_receipt(&cctp.base_wallet, burn_tx).await.status());
+        assert_eq!(
+            recorded_burn(&state, TEST_OPERATION_ID).await.outcome,
+            crate::cctp_burn::CctpBurnOutcome::Pending
+        );
+        assert!(logs_contain("emitted no MessageSent"));
+        assert!(!logs_contain("CCTP burn confirmed via API"));
+    }
+
+    /// The supersede route never settles a burn that mined: its own receipt
+    /// is read before the named tx, so a mined burn whose receipt does not
+    /// decide it (here a success without `MessageSent`) is refused, the
+    /// operation stays pending, and its nonce is not released.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn a_burn_that_mined_is_never_settled_as_superseded() {
+        use alloy::providers::ext::AnvilApi as _;
+        let (cctp, _circle, state) = cctp_burn_state(U256::from(5_000_000_u64)).await;
+        cctp.base_wallet
+            .provider()
+            .anvil_set_code(cctp.token_messenger, alloy::primitives::bytes!("00"))
+            .await
+            .unwrap();
+        capital_success(
+            "cctp-bridge",
+            burn_from_base(&state, TEST_OPERATION_ID, "1").await,
+        );
+        state.detached_tasks.close();
+        state.detached_tasks.wait().await;
+        let other = cctp
+            .base_wallet
+            .send(cctp.bot, alloy::primitives::Bytes::new(), "other")
+            .await
+            .unwrap();
+
+        let Err((status, Json(refusal))) = supersede_burn(&state, other.transaction_hash).await
+        else {
+            panic!("a burn that mined must not be settled as superseded");
+        };
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            refusal.error.contains("itself is mined"),
+            "{}",
+            refusal.error
+        );
+        assert_eq!(
+            recorded_burn(&state, TEST_OPERATION_ID).await.outcome,
+            crate::cctp_burn::CctpBurnOutcome::Pending
+        );
+    }
+
+    /// A recorded burn signed by another key (a rotated wallet) never enters
+    /// this wallet's nonce bookkeeping: startup skips it and gates the chain,
+    /// and a retry answers `502` instead of reporting it in flight.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn a_burn_signed_by_another_wallet_is_neither_restored_nor_rebroadcast() {
+        let (_cctp, _circle, state) = cctp_burn_state(U256::from(5_000_000_u64)).await;
+        let wallets = state.ctx.wallet().unwrap();
+        let one_usdc = U256::from(1_000_000_u64);
+        let store = &state.recovery.get().unwrap().cctp_burn_store;
+        store
+            .send(
+                &TEST_OPERATION_ID.parse().unwrap(),
+                crate::cctp_burn::CctpBurnOperationCommand::Prepare {
+                    source: CctpSourceChain::Base,
+                    requested: crate::cctp_burn::RequestedBurn::Exact { amount: one_usdc },
+                    amount: one_usdc,
+                    recipient: wallets.ethereum_wallet().address(),
+                    prepared: st0x_evm::PreparedTransaction::for_test(TxHash::repeat_byte(7), 0),
+                },
+            )
+            .await
+            .unwrap();
+        let bridge = crate::cctp_burn::bot_cctp_bridge(&state.ctx, wallets).unwrap();
+
+        let restored = crate::cctp_burn::restore_pending_cctp_burns(
+            &state.pool,
+            store,
+            &bridge,
+            &state.ctx.chains,
+        )
+        .await;
+        assert_eq!(restored.restored, 0);
+        assert!(restored.unmined_chains.contains(&Chain::Base));
+
+        let Err((status, Json(refusal))) = burn_from_base(&state, TEST_OPERATION_ID, "1").await
+        else {
+            panic!("a burn this wallet cannot broadcast must not be reported in flight");
+        };
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(
+            refusal.error.contains("was the key rotated"),
+            "{}",
+            refusal.error
+        );
+    }
+
+    /// A pending burn signed by a key the bot no longer uses can still be
+    /// settled: the old key cancels it at its nonce, and the supersede route
+    /// checks the cancel against the burn's own signer, not the bot's current
+    /// wallet.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn a_burn_of_a_rotated_key_is_settled_by_that_keys_cancel() {
+        let (cctp, _circle, state) = cctp_burn_state(U256::from(5_000_000_u64)).await;
+        let rotated = &cctp.rotated_base_wallet;
+        let one_usdc = U256::from(1_000_000_u64);
+        let prepared = rotated
+            .prepare_pending(cctp.bot, alloy::primitives::Bytes::new(), "old burn")
+            .await
+            .unwrap();
+        state
+            .recovery
+            .get()
+            .unwrap()
+            .cctp_burn_store
+            .send(
+                &TEST_OPERATION_ID.parse().unwrap(),
+                crate::cctp_burn::CctpBurnOperationCommand::Prepare {
+                    source: CctpSourceChain::Base,
+                    requested: crate::cctp_burn::RequestedBurn::Exact { amount: one_usdc },
+                    amount: one_usdc,
+                    recipient: cctp.bot,
+                    prepared: prepared.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        rotated.discard_prepared(prepared.tx_hash()).await;
+        let cancel = rotated
+            .send(rotated.address(), alloy::primitives::Bytes::new(), "cancel")
+            .await
+            .unwrap();
+
+        let settled = capital_success(
+            "cctp-burn-supersede",
+            supersede_burn(&state, cancel.transaction_hash).await,
+        );
+
+        assert_eq!(settled["status"], "superseded");
     }
 
     /// `UsdcResumeResponse` is the wire contract the CLI parses, so its
@@ -7621,7 +10171,7 @@ mod tests {
                 chain: Chain::Robinhood,
                 hop: HopKind::Relay,
             },
-            served: UsdcCorridor::BASE_CCTP,
+            served: BTreeSet::from([UsdcCorridor::BASE_CCTP]),
         });
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(
@@ -7641,13 +10191,31 @@ mod tests {
         let (status, _) = usdc_resume_error_response(&UsdcResumeError::EveryCorridorLatched);
         assert_eq!(status, StatusCode::CONFLICT);
 
+        let (status, _) = usdc_resume_error_response(&UsdcResumeError::CashDivergenceEngaged);
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let (status, _) = usdc_resume_error_response(&UsdcResumeError::CashRestartTainted);
+        assert_eq!(status, StatusCode::CONFLICT);
+
         let (status, _) = usdc_resume_error_response(&UsdcResumeError::NotReady);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+        let (status, message) = usdc_resume_error_response(&UsdcResumeError::GasNotReady(
+            crate::native_gas::GasReadinessFailure::below_threshold_for_test(
+                Chain::Base,
+                std::time::Duration::from_secs(60),
+            ),
+        ));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            message.contains("signing wallets are not gas ready"),
+            "the 503 must say the corridor wallets are not gas ready; got: {message}"
+        );
 
         let (status, message) =
             usdc_resume_error_response(&UsdcResumeError::Database(sqlx::Error::RowNotFound));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(message, "Failed to enqueue USDC resume");
+        assert_eq!(message, "Failed to enqueue the USDC transfer job");
     }
 
     /// Mirrors `recheck_error_response_distinguishes_recoverability` for the
@@ -7734,7 +10302,7 @@ mod tests {
             UsdcTransferError::CorridorMismatch {
                 id: id.clone(),
                 recorded: relay,
-                served: UsdcCorridor::BASE_CCTP,
+                served: BTreeSet::from([UsdcCorridor::BASE_CCTP]),
                 holds_guard: true,
             },
         )));
@@ -7748,7 +10316,7 @@ mod tests {
             UsdcTransferError::CorridorNotServed {
                 id,
                 requested: relay,
-                served: UsdcCorridor::BASE_CCTP,
+                served: BTreeSet::from([UsdcCorridor::BASE_CCTP]),
             },
         )));
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -8123,8 +10691,12 @@ mod tests {
     }
 
     /// Seeds an `EquityRedemption` into the non-terminal `VaultWithdrawSubmitting`
-    /// origin (exact withdrawal signed and persisted, not yet broadcast).
-    async fn seed_redemption_submitting(pool: &SqlitePool, id: &RedemptionAggregateId) {
+    /// origin (exact withdrawal `prepared` signed and persisted, not yet broadcast).
+    async fn seed_redemption_submitting(
+        pool: &SqlitePool,
+        id: &RedemptionAggregateId,
+        prepared: PreparedTransaction,
+    ) {
         let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
             .build(EquityTransferServices::panicking())
             .await
@@ -8140,7 +10712,7 @@ mod tests {
                     vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(1000u64),
                     from_block: 0,
-                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                    prepared,
                 },
             )
             .await
@@ -8148,9 +10720,63 @@ mod tests {
     }
 
     /// Seeds an `EquityRedemption` into the non-terminal, non-reconcilable
-    /// `VaultWithdrawSubmitted` state (withdrawal broadcast, awaiting confirmation).
-    async fn seed_redemption_submitted(pool: &SqlitePool, id: &RedemptionAggregateId) {
-        seed_redemption_submitting(pool, id).await;
+    /// `VaultWithdrawSubmitted` state (withdrawal `prepared` broadcast, awaiting
+    /// confirmation).
+    /// Seeds a redemption at `SendPending` holding the signed send to the issuer
+    /// `prepared`.
+    async fn seed_redemption_signed_send(
+        pool: &SqlitePool,
+        id: &RedemptionAggregateId,
+        prepared: PreparedTransaction,
+    ) {
+        use EquityRedemptionCommand::*;
+
+        let token = Address::ZERO;
+        let amount = U256::from(10_000_000_000_000_000_000_u128);
+        let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .build(EquityTransferServices::confirming_withdrawal(token, amount))
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                Redeem {
+                    chain: Chain::Base,
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(10),
+                    token,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
+                    amount,
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                },
+            )
+            .await
+            .unwrap();
+        for command in [
+            RecordWithdrawSubmission {
+                tx_hash: crate::equity_redemption::prepared_withdrawal_for_test().tx_hash(),
+            },
+            ConfirmWithdraw,
+            UnwrapTokens,
+            SubmitUnwrap,
+            ConfirmUnwrap,
+            PrepareSend {
+                prepared,
+                redemption_wallet: Address::repeat_byte(0x77),
+            },
+        ] {
+            store.send(id, command).await.unwrap();
+        }
+    }
+
+    async fn seed_redemption_submitted(
+        pool: &SqlitePool,
+        id: &RedemptionAggregateId,
+        prepared: PreparedTransaction,
+    ) {
+        let tx_hash = prepared.tx_hash();
+        seed_redemption_submitting(pool, id, prepared).await;
         let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
             .build(EquityTransferServices::panicking())
             .await
@@ -8158,12 +10784,87 @@ mod tests {
         store
             .send(
                 id,
-                EquityRedemptionCommand::RecordWithdrawSubmission {
-                    tx_hash: alloy::primitives::TxHash::ZERO,
-                },
+                EquityRedemptionCommand::RecordWithdrawSubmission { tx_hash },
             )
             .await
             .unwrap();
+    }
+
+    /// The bot wallet nonce the ready-path reconcile tests sign the vault
+    /// withdrawal at.
+    const SIGNED_WITHDRAWAL_NONCE: u64 = 12;
+    /// The contract the ready-path reconcile tests' vault withdrawal calls.
+    const SIGNED_WITHDRAWAL_TARGET: Address = Address::repeat_byte(0x1A);
+    /// The token and vault the ready path reconcile tests' vault withdrawal
+    /// withdraws.
+    const SIGNED_WITHDRAWAL_TOKEN: Address = Address::repeat_byte(0x70);
+    const SIGNED_WITHDRAWAL_VAULT: B256 = B256::repeat_byte(0x7A);
+
+    /// `withdraw4` calldata withdrawing `target_amount` of `token` from
+    /// `vault_id`, as the bot signs it.
+    fn withdraw4_calldata(token: Address, vault_id: B256, target_amount: B256) -> Bytes {
+        Bytes::from(
+            crate::bindings::IRaindexInventory::withdraw4Call {
+                token,
+                vaultId: vault_id,
+                targetAmount: target_amount,
+                tasks: Vec::new(),
+            }
+            .abi_encode(),
+        )
+    }
+
+    /// A vault withdrawal on Base genuinely signed by `signer`, so the chain
+    /// check can recover its signer and target.
+    fn sign_vault_withdrawal(signer: &PrivateKeySigner) -> PreparedTransaction {
+        let unsigned = TxEip1559 {
+            chain_id: 8453,
+            nonce: SIGNED_WITHDRAWAL_NONCE,
+            gas_limit: 300_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 1_000_000,
+            to: TxKind::Call(SIGNED_WITHDRAWAL_TARGET),
+            value: U256::ZERO,
+            access_list: AccessList::default(),
+            input: withdraw4_calldata(
+                SIGNED_WITHDRAWAL_TOKEN,
+                SIGNED_WITHDRAWAL_VAULT,
+                float!(10).get_inner(),
+            ),
+        };
+        let signature = signer.sign_hash_sync(&unsigned.signature_hash()).unwrap();
+        let envelope = TxEnvelope::from(unsigned.into_signed(signature));
+        PreparedTransaction::from_raw(Bytes::from(envelope.encoded_2718())).unwrap()
+    }
+
+    /// A ready bot whose Base equity services sign as `bot_wallet` and read the
+    /// chain through `raindex`, holding redemption `id` in
+    /// `VaultWithdrawSubmitted` with the signed withdrawal `prepared`. The test
+    /// ctx gives Base `required_confirmations = 1`.
+    async fn signed_withdrawal_reconcile_state(
+        bot_wallet: Address,
+        raindex: MockRaindex,
+        id: &RedemptionAggregateId,
+        prepared: PreparedTransaction,
+    ) -> AppState {
+        let state = Box::pin(signed_withdrawal_ready_state(bot_wallet, raindex)).await;
+        seed_redemption_submitted(&state.pool, id, prepared).await;
+        state
+    }
+
+    /// A ready bot whose Base equity services sign as `bot_wallet` and read the
+    /// chain through `raindex`, holding no redemption yet.
+    async fn signed_withdrawal_ready_state(bot_wallet: Address, raindex: MockRaindex) -> AppState {
+        let mut services = EquityTransferServices::panicking();
+        let base = services
+            .chains
+            .get_mut(&Chain::Base)
+            .expect("panicking services wire every chain");
+        base.wallet = bot_wallet;
+        base.raindex = Arc::new(raindex);
+
+        let (state, _gate) = recovery_state_with_driver_pause(services).await;
+        state
     }
 
     #[tokio::test]
@@ -8452,7 +11153,8 @@ mod tests {
     /// leave the aggregate as it was.
     #[tokio::test]
     async fn reconcile_usdc_transfer_route_returns_409_while_the_resume_lock_is_held() {
-        let (state, _gate) = recovery_state_with_driver_pause().await;
+        let (state, _gate) =
+            recovery_state_with_driver_pause(EquityTransferServices::panicking()).await;
         let id = UsdcRebalanceId(uuid::Uuid::new_v4());
         seed_usdc_bridging_failed(&state.pool, &id).await;
         let resume_lock = Arc::clone(&state.resume_lock);
@@ -8484,7 +11186,8 @@ mod tests {
     /// `RecoverBridging` is not rejected against `Reconciled`.
     #[tokio::test]
     async fn reconcile_usdc_transfer_route_returns_503_while_a_transfer_is_executing() {
-        let (state, gate) = recovery_state_with_driver_pause().await;
+        let (state, gate) =
+            recovery_state_with_driver_pause(EquityTransferServices::panicking()).await;
         let id = UsdcRebalanceId(uuid::Uuid::new_v4());
         seed_usdc_bridging_failed(&state.pool, &id).await;
         let executing = gate.enter().await;
@@ -8701,7 +11404,8 @@ mod tests {
     /// lock lets the failure through, failing both assertions.
     #[tokio::test]
     async fn fail_usdc_transfer_route_returns_409_while_the_resume_lock_is_held() {
-        let (state, _gate) = recovery_state_with_driver_pause().await;
+        let (state, _gate) =
+            recovery_state_with_driver_pause(EquityTransferServices::panicking()).await;
         let id = UsdcRebalanceId(uuid::Uuid::new_v4());
         seed_usdc_bridging_submitting(&state.pool, &id, false).await;
         let resume_lock = Arc::clone(&state.resume_lock);
@@ -8733,7 +11437,8 @@ mod tests {
     /// failure through, failing both assertions.
     #[tokio::test]
     async fn fail_usdc_transfer_route_returns_503_while_a_transfer_is_executing() {
-        let (state, gate) = recovery_state_with_driver_pause().await;
+        let (state, gate) =
+            recovery_state_with_driver_pause(EquityTransferServices::panicking()).await;
         let id = UsdcRebalanceId(uuid::Uuid::new_v4());
         seed_usdc_bridging_submitting(&state.pool, &id, false).await;
         let executing = gate.enter().await;
@@ -8771,7 +11476,8 @@ mod tests {
     /// resumes and the resume lock is free for the next operator request.
     #[tokio::test]
     async fn fail_usdc_transfer_route_releases_the_driver_and_the_lock_after_success() {
-        let (state, gate) = recovery_state_with_driver_pause().await;
+        let (state, gate) =
+            recovery_state_with_driver_pause(EquityTransferServices::panicking()).await;
         let id = UsdcRebalanceId(uuid::Uuid::new_v4());
         seed_usdc_alpaca_to_base_withdrawal_complete(&state.pool, &id).await;
 
@@ -8904,6 +11610,43 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(error.error.contains("reconcile-usdc"), "{}", error.error);
         assert!(!error.error.contains("cleared state"), "{}", error.error);
+    }
+
+    /// A BaseToAlpaca transfer latched at `WithdrawalSubmitting` (the
+    /// operator verified no withdraw landed) fails with no withdrawal recorded
+    /// and clears the guard.
+    #[tokio::test]
+    async fn fail_pre_burn_usdc_transfer_fails_a_base_to_alpaca_withdrawal_submitting() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        let store = standalone_usdc_store(&pool).await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::BeginWithdrawal {
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc::new(float!(1971.318665)),
+                    from_block: 52_027_377,
+                },
+            )
+            .await
+            .unwrap();
+
+        let body = fail_pre_burn_usdc_transfer(&store, &id, "no withdraw landed".to_string())
+            .await
+            .unwrap_or_else(|(status, Json(error))| panic!("{status}: {}", error.error));
+
+        assert_eq!(body.outcome, "failed_withdrawal_never_sent");
+        assert!(!body.guard_held);
+        assert!(matches!(
+            load_usdc_rebalance(&pool, &id).await,
+            UsdcRebalance::WithdrawalFailed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                withdrawal_ref: None,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -9388,7 +12131,7 @@ mod tests {
     /// unpaused, and only the (never reached) mint submission would take them.
     #[tokio::test]
     async fn complete_cctp_mint_poll_does_not_park_usdc_work_while_unattested() {
-        let resume_lock = Arc::new(ResumeLock(Mutex::new(())));
+        let resume_lock = Arc::new(ResumeLock(Arc::new(Mutex::new(()))));
         let (pause, gate) = usdc_driver_pause();
         let lock_free = Arc::new(AtomicBool::new(false));
         let driver_free = Arc::new(AtomicBool::new(false));
@@ -9476,6 +12219,15 @@ mod tests {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(message, "CCTP mint recovery failed");
 
+        // No service carries the CCTP corridor in this build: a 409 naming it.
+        let unserved = CctpMintRecoveryError::CorridorNotServed {
+            corridor: UsdcCorridor::BASE_CCTP,
+        };
+        let (status, message) = cctp_mint_recovery_error_response(&unserved);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(message, unserved.to_string());
+        assert!(message.contains("base via cctp"), "{message}");
+
         let mint = CctpMintRecoveryError::Mint {
             burn_tx,
             source: st0x_bridge::cctp::CctpError::MintAndWithdrawEventNotFound,
@@ -9527,7 +12279,7 @@ mod tests {
     /// mint failure.
     #[tokio::test]
     async fn complete_cctp_mint_reports_an_inconclusive_mint_as_retryable() {
-        let resume_lock = Arc::new(ResumeLock(Mutex::new(())));
+        let resume_lock = Arc::new(ResumeLock(Arc::new(Mutex::new(()))));
         let (pause, _gate) = usdc_driver_pause();
 
         let resp = complete_cctp_mint_recovery(
@@ -9589,7 +12341,7 @@ mod tests {
     /// reports the raw values and the conversion error rather than nulls.
     #[tokio::test]
     async fn complete_cctp_mint_reports_undecodable_amounts_with_the_error() {
-        let resume_lock = Arc::new(ResumeLock(Mutex::new(())));
+        let resume_lock = Arc::new(ResumeLock(Arc::new(Mutex::new(()))));
         let (pause, _gate) = usdc_driver_pause();
 
         let Ok(Json(body)) = complete_cctp_mint_recovery(
@@ -9628,6 +12380,7 @@ mod tests {
             Path(("equity_mint".to_string(), id.to_string())),
             Json(ReconcileEquityRequest {
                 reason: "handled out-of-band".to_string(),
+                superseding_tx: None,
             }),
         )
         .await;
@@ -9661,6 +12414,7 @@ mod tests {
             Path(("equity_redemption".to_string(), id.to_string())),
             Json(ReconcileEquityRequest {
                 reason: "handled out-of-band".to_string(),
+                superseding_tx: None,
             }),
         )
         .await;
@@ -9694,6 +12448,7 @@ mod tests {
             Path(("equity_mint".to_string(), id.to_string())),
             Json(ReconcileEquityRequest {
                 reason: "handled out-of-band".to_string(),
+                superseding_tx: None,
             }),
         )
         .await;
@@ -9705,26 +12460,163 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_equity_transfer_reconciles_a_submitting_redemption() {
-        // The one in-flight state with no automatic exit: an operator who
-        // verified the withdrawal's on-chain fate reconciles it out-of-band.
+    async fn reconcile_equity_transfer_does_not_reconcile_a_signed_withdrawal_on_the_operators_word()
+     {
+        // A signed withdrawal stuck below the market fee can still mine when
+        // fees drop, so reconcile needs the bot's chain proof; before the bot
+        // is ready there is none, and the redemption stays unresolved.
         let ctx = create_test_ctx_with_order_owner(Address::ZERO);
         let state = empty_app_state(ctx).await;
-        let id = redemption_aggregate_id("api-redemption-submitting");
-        seed_redemption_submitting(&state.pool, &id).await;
+        let id = redemption_aggregate_id("api-redemption-submitted-reconcile");
+        seed_redemption_submitted(
+            &state.pool,
+            &id,
+            crate::equity_redemption::prepared_withdrawal_for_test(),
+        )
+        .await;
 
         let resp = reconcile_equity_transfer(
             State(state.clone()),
             Path(("equity_redemption".to_string(), id.to_string())),
             Json(ReconcileEquityRequest {
-                reason: "withdrawal never broadcast; verified on-chain".to_string(),
+                reason: "withdrawal outrun by fees; verified dead onchain".to_string(),
+                superseding_tx: None,
             }),
         )
         .await;
 
-        let Ok(Json(_)) = resp else {
-            panic!("a stuck submitting redemption must reconcile");
+        let Err((status, _)) = resp else {
+            panic!("a signed withdrawal must not reconcile without the chain proof");
         };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let entity = load_entity::<EquityRedemption>(&state.pool, &id)
+            .await
+            .unwrap()
+            .expect("redemption aggregate must exist");
+        assert!(
+            matches!(entity, EquityRedemption::VaultWithdrawSubmitted { .. }),
+            "the redemption must stay unresolved, got {entity:?}",
+        );
+    }
+
+    /// A signed send to the issuer can still mine until its nonce is proven taken, so
+    /// reconcile needs the bot's chain proof; before the bot is ready there is
+    /// none, and the send stays unresolved.
+    #[tokio::test]
+    async fn reconcile_equity_transfer_does_not_reconcile_a_signed_send_on_the_operators_word() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let id = redemption_aggregate_id("api-redemption-signed-send-reconcile");
+        seed_redemption_signed_send(
+            &state.pool,
+            &id,
+            PreparedTransaction::for_test(TxHash::repeat_byte(0x5e), 7),
+        )
+        .await;
+
+        let resp = reconcile_equity_transfer(
+            State(state.clone()),
+            Path(("equity_redemption".to_string(), id.to_string())),
+            Json(ReconcileEquityRequest {
+                reason: "send outrun by fees; verified dead onchain".to_string(),
+                superseding_tx: Some(TxHash::repeat_byte(0xCA)),
+            }),
+        )
+        .await;
+
+        let Err((status, _)) = resp else {
+            panic!("a signed send must not reconcile without the chain proof");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let entity = load_entity::<EquityRedemption>(&state.pool, &id)
+            .await
+            .unwrap()
+            .expect("redemption aggregate must exist");
+        assert!(
+            matches!(
+                entity,
+                EquityRedemption::SendPending {
+                    prepared_send: Some(_),
+                    ..
+                }
+            ),
+            "the send must stay unresolved, got {entity:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_equity_transfer_refuses_a_superseding_tx_without_a_signed_withdrawal() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let id = redemption_aggregate_id("api-redemption-failed-superseding");
+        seed_redemption_failed(&state.pool, &id).await;
+
+        let resp = reconcile_equity_transfer(
+            State(state.clone()),
+            Path(("equity_redemption".to_string(), id.to_string())),
+            Json(ReconcileEquityRequest {
+                reason: "handled out-of-band".to_string(),
+                superseding_tx: Some(TxHash::repeat_byte(0xCA)),
+            }),
+        )
+        .await;
+
+        let Err((status, _)) = resp else {
+            panic!("a superseding tx on a redemption with no signed withdrawal must be refused");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let entity = load_entity::<EquityRedemption>(&state.pool, &id)
+            .await
+            .unwrap()
+            .expect("redemption aggregate must exist");
+        assert!(
+            matches!(entity, EquityRedemption::Failed { .. }),
+            "a refused request must not reconcile, got {entity:?}",
+        );
+    }
+
+    /// A confirmed 0-value self-transfer from the bot wallet at the withdrawal's
+    /// nonce proves the withdrawal can never land, so the redemption reconciles.
+    #[tokio::test]
+    async fn reconcile_equity_transfer_reconciles_a_signed_withdrawal_after_a_confirmed_cancel() {
+        let signer = PrivateKeySigner::random();
+        let bot_wallet = signer.address();
+        let prepared = sign_vault_withdrawal(&signer);
+        let cancel = TxHash::repeat_byte(0xCA);
+        let raindex = MockRaindex::new().with_mined_tx(
+            cancel,
+            MinedTx {
+                from: bot_wallet,
+                to: Some(bot_wallet),
+                nonce: SIGNED_WITHDRAWAL_NONCE,
+                value: U256::ZERO,
+                input: Bytes::new(),
+                tx_type: EIP1559_TX_TYPE_ID,
+                succeeded: true,
+                emitted_logs: false,
+                confirmations: 1,
+            },
+        );
+        let id = redemption_aggregate_id("api-redemption-signed-cancelled");
+        let state = signed_withdrawal_reconcile_state(bot_wallet, raindex, &id, prepared).await;
+
+        let resp = reconcile_equity_transfer(
+            State(state.clone()),
+            Path(("equity_redemption".to_string(), id.to_string())),
+            Json(ReconcileEquityRequest {
+                reason: "withdrawal cancelled at its nonce".to_string(),
+                superseding_tx: Some(cancel),
+            }),
+        )
+        .await;
+
+        let Ok(Json(body)) = resp else {
+            panic!("a confirmed cancel must reconcile the redemption");
+        };
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::json!({ "transferId": id.to_string(), "outcome": "reconciled" }),
+        );
         let entity = load_entity::<EquityRedemption>(&state.pool, &id)
             .await
             .unwrap()
@@ -9735,28 +12627,51 @@ mod tests {
         );
     }
 
+    /// A confirmed revert used the withdrawal's nonce and moved nothing, so it
+    /// proves itself with no superseding tx.
     #[tokio::test]
-    async fn reconcile_equity_transfer_reconciles_a_submitted_redemption() {
-        // A broadcast withdrawal (`VaultWithdrawSubmitted`) may still be live
-        // onchain and is never failed automatically, so an operator who verified
-        // it will never land reconciles it out of band, like the submitting origin.
-        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        let state = empty_app_state(ctx).await;
-        let id = redemption_aggregate_id("api-redemption-submitted-reconcile");
-        seed_redemption_submitted(&state.pool, &id).await;
+    async fn reconcile_equity_transfer_reconciles_a_confirmed_reverted_withdrawal() {
+        let signer = PrivateKeySigner::random();
+        let bot_wallet = signer.address();
+        let prepared = sign_vault_withdrawal(&signer);
+        let raindex = MockRaindex::new().with_mined_tx(
+            prepared.tx_hash(),
+            MinedTx {
+                from: bot_wallet,
+                to: Some(SIGNED_WITHDRAWAL_TARGET),
+                nonce: SIGNED_WITHDRAWAL_NONCE,
+                value: U256::ZERO,
+                input: withdraw4_calldata(
+                    SIGNED_WITHDRAWAL_TOKEN,
+                    SIGNED_WITHDRAWAL_VAULT,
+                    float!(10).get_inner(),
+                ),
+                tx_type: EIP1559_TX_TYPE_ID,
+                succeeded: false,
+                emitted_logs: false,
+                confirmations: 1,
+            },
+        );
+        let id = redemption_aggregate_id("api-redemption-signed-reverted");
+        let state = signed_withdrawal_reconcile_state(bot_wallet, raindex, &id, prepared).await;
 
         let resp = reconcile_equity_transfer(
             State(state.clone()),
             Path(("equity_redemption".to_string(), id.to_string())),
             Json(ReconcileEquityRequest {
-                reason: "withdrawal outrun by fees; verified dead onchain".to_string(),
+                reason: "withdrawal reverted onchain".to_string(),
+                superseding_tx: None,
             }),
         )
         .await;
 
-        let Ok(Json(_)) = resp else {
-            panic!("a stuck submitted redemption must reconcile");
+        let Ok(Json(body)) = resp else {
+            panic!("a confirmed reverted withdrawal must reconcile the redemption");
         };
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::json!({ "transferId": id.to_string(), "outcome": "reconciled" }),
+        );
         let entity = load_entity::<EquityRedemption>(&state.pool, &id)
             .await
             .unwrap()
@@ -9765,6 +12680,632 @@ mod tests {
             matches!(entity, EquityRedemption::Reconciled { .. }),
             "the redemption must land in the Reconciled terminal, got {entity:?}",
         );
+    }
+
+    /// A signed withdrawal with no receipt can still mine when fees drop, so
+    /// with no superseding tx the route refuses with a 409 naming the nonce.
+    #[tokio::test]
+    async fn reconcile_equity_transfer_refuses_an_unmined_withdrawal_without_a_superseding_tx() {
+        let signer = PrivateKeySigner::random();
+        let bot_wallet = signer.address();
+        let prepared = sign_vault_withdrawal(&signer);
+        let tx = prepared.tx_hash();
+        let id = redemption_aggregate_id("api-redemption-signed-unmined");
+        let state =
+            signed_withdrawal_reconcile_state(bot_wallet, MockRaindex::new(), &id, prepared).await;
+
+        let resp = reconcile_equity_transfer(
+            State(state.clone()),
+            Path(("equity_redemption".to_string(), id.to_string())),
+            Json(ReconcileEquityRequest {
+                reason: "withdrawal outrun by fees".to_string(),
+                superseding_tx: None,
+            }),
+        )
+        .await;
+
+        let Err((status, Json(body))) = resp else {
+            panic!("an unmined signed withdrawal must not reconcile without a superseding tx");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        let refused = WithdrawalNotSuperseded::NoSupersedingTx {
+            tx,
+            nonce: SIGNED_WITHDRAWAL_NONCE,
+        };
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::json!({
+                "error": format!("Redemption {id}: refusing to reconcile: {refused}")
+            }),
+        );
+        let entity = load_entity::<EquityRedemption>(&state.pool, &id)
+            .await
+            .unwrap()
+            .expect("redemption aggregate must exist");
+        assert!(
+            matches!(entity, EquityRedemption::VaultWithdrawSubmitted { .. }),
+            "a refused reconcile must leave the redemption unresolved, got {entity:?}",
+        );
+    }
+
+    /// A failed chain read proves nothing, so the route answers a transient 502
+    /// and leaves the redemption unresolved.
+    #[tokio::test]
+    async fn reconcile_equity_transfer_returns_502_when_the_chain_read_fails() {
+        let signer = PrivateKeySigner::random();
+        let bot_wallet = signer.address();
+        let prepared = sign_vault_withdrawal(&signer);
+        let raindex = MockRaindex::new().with_mined_tx_read_error(prepared.tx_hash());
+        let id = redemption_aggregate_id("api-redemption-signed-read-error");
+        let state = signed_withdrawal_reconcile_state(bot_wallet, raindex, &id, prepared).await;
+
+        let resp = reconcile_equity_transfer(
+            State(state.clone()),
+            Path(("equity_redemption".to_string(), id.to_string())),
+            Json(ReconcileEquityRequest {
+                reason: "withdrawal cancelled at its nonce".to_string(),
+                superseding_tx: Some(TxHash::repeat_byte(0xCA)),
+            }),
+        )
+        .await;
+
+        let Err((status, Json(body))) = resp else {
+            panic!("a failed chain read must not reconcile the redemption");
+        };
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::json!({ "error": "Chain RPC unavailable; retry later" }),
+        );
+        let entity = load_entity::<EquityRedemption>(&state.pool, &id)
+            .await
+            .unwrap()
+            .expect("redemption aggregate must exist");
+        assert!(
+            matches!(entity, EquityRedemption::VaultWithdrawSubmitted { .. }),
+            "a failed chain read must leave the redemption unresolved, got {entity:?}",
+        );
+    }
+
+    /// A `withdraw4` of the signed withdrawal's token and vault at its nonce,
+    /// for `target_amount`, as the chain reports it.
+    fn mined_at_withdrawal_nonce(from: Address, to: Address, target_amount: B256) -> MinedTx {
+        MinedTx {
+            from,
+            to: Some(to),
+            nonce: SIGNED_WITHDRAWAL_NONCE,
+            value: U256::ZERO,
+            input: withdraw4_calldata(
+                SIGNED_WITHDRAWAL_TOKEN,
+                SIGNED_WITHDRAWAL_VAULT,
+                target_amount,
+            ),
+            tx_type: EIP1559_TX_TYPE_ID,
+            succeeded: true,
+            emitted_logs: true,
+            confirmations: 1,
+        }
+    }
+
+    /// A chain showing `speed_up` as a confirmed `withdraw4` of the signed
+    /// withdrawal's token and vault at its nonce, whose receipt pays the bot
+    /// wallet.
+    fn adoptable_speed_up(bot_wallet: Address, speed_up: TxHash) -> MockRaindex {
+        MockRaindex::new()
+            .with_mined_tx(
+                speed_up,
+                mined_at_withdrawal_nonce(
+                    bot_wallet,
+                    SIGNED_WITHDRAWAL_TARGET,
+                    float!(5).get_inner(),
+                ),
+            )
+            .with_transfer_receipt(speed_up, SIGNED_WITHDRAWAL_TOKEN, bot_wallet, U256::from(7))
+    }
+
+    async fn adopt(
+        state: &AppState,
+        id: &RedemptionAggregateId,
+        replacement_tx: TxHash,
+    ) -> Result<Json<TransferOpResponse>, (StatusCode, Json<ErrorResponse>)> {
+        adopt_withdrawal_replacement(
+            State(state.clone()),
+            Path(id.to_string()),
+            Json(AdoptWithdrawalReplacementRequest {
+                reason: "wallet sped up the withdrawal".to_string(),
+                replacement_tx,
+            }),
+        )
+        .await
+    }
+
+    /// A successful `withdraw4` at the withdrawal's nonce to the contract it
+    /// calls, from the same token and vault, e.g. a wallet "speed up" of the
+    /// withdrawal, becomes the redemption's withdrawal, with no signed bytes
+    /// left. A different amount is adopted too: the receipt records what moved.
+    #[tokio::test]
+    async fn adopt_withdrawal_replacement_adopts_a_confirmed_call_to_the_withdrawal_target() {
+        let signer = PrivateKeySigner::random();
+        let bot_wallet = signer.address();
+        let prepared = sign_vault_withdrawal(&signer);
+        let speed_up = TxHash::repeat_byte(0x5E);
+        let raindex = adoptable_speed_up(bot_wallet, speed_up);
+        let id = redemption_aggregate_id("api-redemption-adopt");
+        let state = signed_withdrawal_reconcile_state(bot_wallet, raindex, &id, prepared).await;
+
+        let Ok(Json(body)) = adopt(&state, &id, speed_up).await else {
+            panic!("a confirmed call to the withdrawal target must be adopted");
+        };
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::json!({
+                "transferId": id.to_string(),
+                "outcome": "withdrawal_replacement_adopted",
+            }),
+        );
+        let entity = load_entity::<EquityRedemption>(&state.pool, &id)
+            .await
+            .unwrap()
+            .expect("redemption aggregate must exist");
+        assert!(
+            matches!(
+                entity,
+                EquityRedemption::VaultWithdrawSubmitted {
+                    tx_hash,
+                    prepared: None,
+                    ..
+                } if tx_hash == speed_up
+            ),
+            "the adopted tx must become the redemption's withdrawal, got {entity:?}",
+        );
+    }
+
+    /// The adoption goes through the conductor's store, so the redemption view
+    /// folds it: one adopted from `VaultWithdrawSubmitting` shows as submitted
+    /// with the adopted hash, which the next `ConfirmWithdraw` can follow.
+    #[tokio::test]
+    async fn adopting_from_submitting_updates_the_redemption_view() {
+        let signer = PrivateKeySigner::random();
+        let bot_wallet = signer.address();
+        let prepared = sign_vault_withdrawal(&signer);
+        let replaced = prepared.tx_hash();
+        let speed_up = TxHash::repeat_byte(0x5E);
+        let raindex = adoptable_speed_up(bot_wallet, speed_up);
+        let state = signed_withdrawal_ready_state(bot_wallet, raindex).await;
+        let id = redemption_aggregate_id("api-redemption-adopt-view");
+        seed_redemption_submitting(&state.pool, &id, prepared).await;
+        let (_store, view) = StoreBuilder::<EquityRedemption>::new(state.pool.clone())
+            .build(EquityTransferServices::panicking())
+            .await
+            .unwrap();
+        assert!(matches!(
+            view.load(&id).await.unwrap(),
+            Some(EquityRedemption::VaultWithdrawSubmitting { .. })
+        ));
+
+        let Ok(_) = adopt(&state, &id, speed_up).await else {
+            panic!("a confirmed call to the withdrawal target must be adopted");
+        };
+
+        let viewed = view.load(&id).await.unwrap();
+        assert!(
+            matches!(
+                viewed,
+                Some(EquityRedemption::VaultWithdrawSubmitted {
+                    tx_hash,
+                    prepared: None,
+                    adopted_from: Some(adopted_from),
+                    ..
+                }) if tx_hash == speed_up && adopted_from == replaced
+            ),
+            "the view must fold the adoption, got {viewed:?}"
+        );
+    }
+
+    /// An adopted replacement moved the equity, so reconcile refuses it as
+    /// adopted, without treating it as a legacy hash to read: the redrive
+    /// confirms it.
+    #[tokio::test]
+    async fn reconcile_refuses_an_adopted_replacement() {
+        let signer = PrivateKeySigner::random();
+        let bot_wallet = signer.address();
+        let speed_up = TxHash::repeat_byte(0x5E);
+        let raindex = adoptable_speed_up(bot_wallet, speed_up);
+        let id = redemption_aggregate_id("api-redemption-adopt-then-reconcile");
+        let state = signed_withdrawal_reconcile_state(
+            bot_wallet,
+            raindex,
+            &id,
+            sign_vault_withdrawal(&signer),
+        )
+        .await;
+        let Ok(_) = adopt(&state, &id, speed_up).await else {
+            panic!("a confirmed call to the withdrawal target must be adopted");
+        };
+
+        let Err((status, Json(body))) = reconcile_equity_transfer(
+            State(state.clone()),
+            Path(("equity_redemption".to_string(), id.to_string())),
+            Json(ReconcileEquityRequest {
+                reason: "settled by hand".to_string(),
+                superseding_tx: None,
+            }),
+        )
+        .await
+        else {
+            panic!("an adopted replacement must not be reconciled");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body.error
+                .contains("is an adopted replacement that moved the equity"),
+            "{}",
+            body.error
+        );
+        assert!(matches!(
+            load_entity::<EquityRedemption>(&state.pool, &id)
+                .await
+                .unwrap(),
+            Some(EquityRedemption::VaultWithdrawSubmitted { .. })
+        ));
+    }
+
+    /// Each chain check refuses with its reason and leaves the signed
+    /// withdrawal in place.
+    #[tokio::test]
+    async fn adopt_withdrawal_replacement_refuses_each_unadoptable_tx() {
+        let signer = PrivateKeySigner::random();
+        let bot_wallet = signer.address();
+        let other = Address::repeat_byte(0x0E);
+        let candidate = TxHash::repeat_byte(0x5E);
+        let valid =
+            mined_at_withdrawal_nonce(bot_wallet, SIGNED_WITHDRAWAL_TARGET, float!(10).get_inner());
+        let cases: [(&str, Option<MinedTx>, &str); 10] = [
+            (
+                "another sender",
+                Some(MinedTx {
+                    from: other,
+                    ..valid.clone()
+                }),
+                "was sent by",
+            ),
+            (
+                "another nonce",
+                Some(MinedTx {
+                    nonce: SIGNED_WITHDRAWAL_NONCE + 1,
+                    ..valid.clone()
+                }),
+                "is at nonce",
+            ),
+            (
+                "unconfirmed",
+                Some(MinedTx {
+                    confirmations: 0,
+                    ..valid.clone()
+                }),
+                "required confirmations",
+            ),
+            (
+                "reverted",
+                Some(MinedTx {
+                    succeeded: false,
+                    ..valid.clone()
+                }),
+                "reverted, so it withdrew nothing",
+            ),
+            (
+                "another target",
+                Some(MinedTx {
+                    to: Some(other),
+                    ..valid.clone()
+                }),
+                "so it did not do the withdrawal",
+            ),
+            (
+                "not a withdraw4",
+                Some(MinedTx {
+                    input: Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]),
+                    ..valid.clone()
+                }),
+                "is not a withdraw4 call",
+            ),
+            (
+                "another token",
+                Some(MinedTx {
+                    input: withdraw4_calldata(
+                        other,
+                        SIGNED_WITHDRAWAL_VAULT,
+                        float!(10).get_inner(),
+                    ),
+                    ..valid.clone()
+                }),
+                "not token",
+            ),
+            (
+                "another vault",
+                Some(MinedTx {
+                    input: withdraw4_calldata(
+                        SIGNED_WITHDRAWAL_TOKEN,
+                        B256::repeat_byte(0x0E),
+                        float!(10).get_inner(),
+                    ),
+                    ..valid.clone()
+                }),
+                "from vault 0x0e0e0e0e",
+            ),
+            (
+                "a larger amount",
+                Some(MinedTx {
+                    input: withdraw4_calldata(
+                        SIGNED_WITHDRAWAL_TOKEN,
+                        SIGNED_WITHDRAWAL_VAULT,
+                        float!(20).get_inner(),
+                    ),
+                    ..valid
+                }),
+                "more than the 10 the vault withdrawal booked",
+            ),
+            ("not mined", None, "is not mined"),
+        ];
+
+        for (case, mined, reason) in cases {
+            let prepared = sign_vault_withdrawal(&signer);
+            let raindex = mined.map_or_else(MockRaindex::new, |mined| {
+                MockRaindex::new().with_mined_tx(candidate, mined)
+            });
+            let id = redemption_aggregate_id(&format!("api-redemption-adopt-{case}"));
+            let state = signed_withdrawal_reconcile_state(bot_wallet, raindex, &id, prepared).await;
+
+            let Err((status, Json(body))) = adopt(&state, &id, candidate).await else {
+                panic!("{case}: an unadoptable tx must be refused");
+            };
+            assert_eq!(status, StatusCode::CONFLICT, "{case}");
+            assert!(body.error.contains(reason), "{case}: {}", body.error);
+            let entity = load_entity::<EquityRedemption>(&state.pool, &id)
+                .await
+                .unwrap()
+                .expect("redemption aggregate must exist");
+            assert!(
+                matches!(
+                    entity,
+                    EquityRedemption::VaultWithdrawSubmitted {
+                        prepared: Some(_),
+                        ..
+                    }
+                ),
+                "{case}: a refusal must keep the signed withdrawal, got {entity:?}",
+            );
+        }
+
+        let prepared = sign_vault_withdrawal(&signer);
+        let itself = prepared.tx_hash();
+        let id = redemption_aggregate_id("api-redemption-adopt-itself");
+        let state =
+            signed_withdrawal_reconcile_state(bot_wallet, MockRaindex::new(), &id, prepared).await;
+        let Err((status, Json(body))) = adopt(&state, &id, itself).await else {
+            panic!("the withdrawal itself must not be adopted as its replacement");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body.error.contains("is the vault withdrawal itself"),
+            "{}",
+            body.error
+        );
+
+        // A successful withdraw4 that paid the bot wallet nothing, e.g. one of
+        // zero, would leave ConfirmWithdraw no transfer to record.
+        let paid_elsewhere = TxHash::repeat_byte(0x6E);
+        let raindex = MockRaindex::new()
+            .with_mined_tx(
+                paid_elsewhere,
+                mined_at_withdrawal_nonce(
+                    bot_wallet,
+                    SIGNED_WITHDRAWAL_TARGET,
+                    float!(5).get_inner(),
+                ),
+            )
+            .with_transfer_receipt(
+                paid_elsewhere,
+                SIGNED_WITHDRAWAL_TOKEN,
+                other,
+                U256::from(7),
+            );
+        let id = redemption_aggregate_id("api-redemption-adopt-paid-nothing");
+        let state = signed_withdrawal_reconcile_state(
+            bot_wallet,
+            raindex,
+            &id,
+            sign_vault_withdrawal(&signer),
+        )
+        .await;
+        let Err((status, Json(body))) = adopt(&state, &id, paid_elsewhere).await else {
+            panic!("a replacement that paid the bot wallet nothing must not be adopted");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body.error.contains("so it did not do the withdrawal")
+                && body.error.contains("paid the bot wallet"),
+            "{}",
+            body.error
+        );
+    }
+
+    /// After a nonce is reused (a lagging RPC served a stale pending nonce),
+    /// the tx at it can be an earlier redemption's withdrawal. It passes every
+    /// chain check, but that redemption already records its vault transfer.
+    #[tokio::test]
+    async fn adopt_withdrawal_replacement_refuses_another_redemptions_withdrawal() {
+        let signer = PrivateKeySigner::random();
+        let bot_wallet = signer.address();
+        let earlier_withdrawal = TxHash::repeat_byte(0x5E);
+        let id = redemption_aggregate_id("api-redemption-adopt-reused-nonce");
+        let state = signed_withdrawal_reconcile_state(
+            bot_wallet,
+            adoptable_speed_up(bot_wallet, earlier_withdrawal),
+            &id,
+            sign_vault_withdrawal(&signer),
+        )
+        .await;
+        let earlier = redemption_aggregate_id("api-redemption-earlier-at-the-nonce");
+        seed_redemption_submitted(
+            &state.pool,
+            &earlier,
+            PreparedTransaction::for_test(earlier_withdrawal, SIGNED_WITHDRAWAL_NONCE),
+        )
+        .await;
+
+        let Err((status, Json(body))) = adopt(&state, &id, earlier_withdrawal).await else {
+            panic!("another redemption's withdrawal must not be adopted");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body.error.contains(&format!(
+                "is already the vault withdrawal of redemption {earlier}"
+            )),
+            "{}",
+            body.error
+        );
+        assert!(matches!(
+            load_entity::<EquityRedemption>(&state.pool, &id)
+                .await
+                .unwrap(),
+            Some(EquityRedemption::VaultWithdrawSubmitted {
+                prepared: Some(_),
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn adopt_withdrawal_replacement_returns_502_when_the_chain_read_fails() {
+        let signer = PrivateKeySigner::random();
+        let bot_wallet = signer.address();
+        let prepared = sign_vault_withdrawal(&signer);
+        let candidate = TxHash::repeat_byte(0x5E);
+        let raindex = MockRaindex::new().with_mined_tx_read_error(candidate);
+        let id = redemption_aggregate_id("api-redemption-adopt-read-error");
+        let state = signed_withdrawal_reconcile_state(bot_wallet, raindex, &id, prepared).await;
+
+        let Err((status, _)) = adopt(&state, &id, candidate).await else {
+            panic!("a failed chain read must not adopt the replacement");
+        };
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
+
+    /// Before the bot is ready there is no chain check, so nothing is adopted;
+    /// and a redemption holding no signed withdrawal has nothing to replace.
+    #[tokio::test]
+    async fn adopt_withdrawal_replacement_needs_a_ready_bot_and_a_signed_withdrawal() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let submitted = redemption_aggregate_id("api-redemption-adopt-not-ready");
+        seed_redemption_submitted(
+            &state.pool,
+            &submitted,
+            crate::equity_redemption::prepared_withdrawal_for_test(),
+        )
+        .await;
+        let Err((status, _)) = adopt(&state, &submitted, TxHash::repeat_byte(0x5E)).await else {
+            panic!("nothing is adopted before the bot is ready");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+        let (ready, _gate) =
+            recovery_state_with_driver_pause(EquityTransferServices::panicking()).await;
+        let failed = redemption_aggregate_id("api-redemption-adopt-failed");
+        seed_redemption_failed(&ready.pool, &failed).await;
+        let Err((status, Json(body))) = adopt(&ready, &failed, TxHash::repeat_byte(0x5E)).await
+        else {
+            panic!("a redemption with no signed withdrawal has nothing to replace");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body.error.contains("holds no signed vault withdrawal"),
+            "{}",
+            body.error
+        );
+    }
+
+    /// A mint has no vault withdrawal, so a superseding tx on it is a 400.
+    #[tokio::test]
+    async fn reconcile_equity_transfer_refuses_a_superseding_tx_on_a_mint() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let id = issuer_request_id("api-mint-failed-superseding");
+        seed_mint_failed(&state.pool, &id).await;
+
+        let resp = reconcile_equity_transfer(
+            State(state.clone()),
+            Path(("equity_mint".to_string(), id.to_string())),
+            Json(ReconcileEquityRequest {
+                reason: "handled out-of-band".to_string(),
+                superseding_tx: Some(TxHash::repeat_byte(0xCA)),
+            }),
+        )
+        .await;
+
+        let Err((status, Json(body))) = resp else {
+            panic!("a superseding tx on a mint must be refused");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::json!({
+                "error": "supersedingTx applies only to a redemption with a signed vault withdrawal"
+            }),
+        );
+        let entity = load_entity::<TokenizedEquityMint>(&state.pool, &id)
+            .await
+            .unwrap()
+            .expect("mint aggregate must exist");
+        assert!(
+            matches!(entity, TokenizedEquityMint::Failed { .. }),
+            "a refused request must not reconcile, got {entity:?}",
+        );
+    }
+
+    #[test]
+    fn reconcile_equity_request_decodes_an_optional_superseding_tx() {
+        let request: ReconcileEquityRequest = serde_json::from_value(serde_json::json!({
+            "reason": "x",
+            "supersedingTx": "0xcacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacaca",
+        }))
+        .unwrap();
+        assert_eq!(request.reason, "x");
+        assert_eq!(request.superseding_tx, Some(TxHash::repeat_byte(0xCA)));
+
+        let request: ReconcileEquityRequest =
+            serde_json::from_value(serde_json::json!({ "reason": "x" })).unwrap();
+        assert_eq!(request.superseding_tx, None);
+    }
+
+    #[test]
+    fn withdrawal_not_superseded_response_names_why_or_asks_to_retry() {
+        let id = redemption_aggregate_id("api-withdrawal-response");
+        let tx = TxHash::repeat_byte(0x66);
+
+        let refused = SignedTxNotSuperseded {
+            kind: SignedRedemptionTx::VaultWithdrawal,
+            refusal: WithdrawalNotSuperseded::NoSupersedingTx { tx, nonce: 7 },
+        };
+        assert_eq!(
+            withdrawal_not_superseded_response(&id, &refused),
+            (
+                StatusCode::CONFLICT,
+                format!("Redemption {id}: refusing to reconcile: {refused}")
+            )
+        );
+        let (status, _) = withdrawal_not_superseded_response(
+            &id,
+            &SignedTxNotSuperseded {
+                kind: SignedRedemptionTx::VaultWithdrawal,
+                refusal: WithdrawalNotSuperseded::Read {
+                    tx,
+                    source: Box::new(st0x_raindex::RaindexError::ZeroAmount),
+                },
+            },
+        );
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
@@ -9778,6 +13319,7 @@ mod tests {
             Path(("equity_mint".to_string(), id.to_string())),
             Json(ReconcileEquityRequest {
                 reason: "handled out-of-band".to_string(),
+                superseding_tx: None,
             }),
         )
         .await;
@@ -9800,6 +13342,7 @@ mod tests {
             Path(("equity_mint".to_string(), id.to_string())),
             Json(ReconcileEquityRequest {
                 reason: "   ".to_string(),
+                superseding_tx: None,
             }),
         )
         .await;
@@ -9821,6 +13364,7 @@ mod tests {
             Path(("bogus".to_string(), id.to_string())),
             Json(ReconcileEquityRequest {
                 reason: "handled out-of-band".to_string(),
+                superseding_tx: None,
             }),
         )
         .await;
@@ -9842,6 +13386,7 @@ mod tests {
             Path(("usdc_bridge".to_string(), id.to_string())),
             Json(ReconcileEquityRequest {
                 reason: "handled out-of-band".to_string(),
+                superseding_tx: None,
             }),
         )
         .await;
@@ -10167,7 +13712,8 @@ mod tests {
     #[tokio::test]
     async fn recovery_routes_wait_for_a_rebuild_without_holding_the_resume_lock() {
         for route in ["resume", "fail", "recheck", "fail-usdc", "reconcile-usdc"] {
-            let (state, _gate) = recovery_state_with_driver_pause().await;
+            let (state, _gate) =
+                recovery_state_with_driver_pause(EquityTransferServices::panicking()).await;
             let rebuild = state.projection_maintenance.pause().await.unwrap();
 
             let mut request = tokio::spawn(run_recovery_route(state.clone(), route));

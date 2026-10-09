@@ -28,7 +28,7 @@ use std::sync::Arc;
 use tracing::info;
 use uuid::Uuid;
 
-use st0x_config::{Ctx, Env};
+use st0x_config::{Ctx, Env, TokenSource};
 use st0x_evm::{Chain, OpenChainErrorRegistry, PreparedTransaction};
 use st0x_execution::alpaca_broker_api::AlpacaLimitPrice;
 use st0x_execution::{AlpacaAccountId, Direction, FractionalShares, Positive, Symbol, TimeInForce};
@@ -514,7 +514,7 @@ pub enum Commands {
     /// Transfer USDC between trading venues (Raindex <-> Alpaca)
     ///
     /// Requires Alpaca broker and rebalancing environment variables.
-    /// Uses Ethereum mainnet and Base mainnet.
+    /// Runs on a served cash corridor through the Ethereum hub.
     TransferUsdc {
         /// Direction of transfer
         #[arg(short = 'd', long = "direction")]
@@ -522,6 +522,10 @@ pub enum Commands {
         /// Amount of USDC to transfer
         #[arg(short = 'a', long = "amount")]
         amount: Usdc,
+        /// Chain of the served cash corridor to run on; may be left out only
+        /// while the build serves one corridor
+        #[arg(long = "chain", value_enum)]
+        chain: Option<TokenizationNetwork>,
     },
 
     /// Mark a pre-burn USDC rebalance as failed, clearing the in-progress guard.
@@ -703,19 +707,20 @@ pub enum Commands {
         network: TokenizationNetwork,
     },
 
-    /// Withdraw USDC from the configured Raindex cash vault
+    /// Withdraw the chain's settlement stable (USDC, or USDG on Robinhood) from
+    /// the configured Raindex cash vault
     ///
-    /// This preserves the existing USDC-specific operator flow by resolving
+    /// This preserves the existing cash vault operator flow by resolving
     /// `vault_ids` from `[chains.<name>.trading.assets.cash]` in config and forwarding into the generic
     /// vault withdrawal implementation.
     VaultWithdrawUsdc {
-        /// Amount of USDC to withdraw
+        /// Amount of the settlement stable to withdraw
         #[arg(short = 'a', long = "amount")]
         amount: Usdc,
 
-        /// Chain of the cash vault: its canonical USDC and its
-        /// `[chains.<name>.trading.assets.cash]` vault; a chain with no pinned
-        /// USDC is refused
+        /// Chain of the cash vault: its settlement stable and its first
+        /// `[chains.<name>.trading.assets.cash]` vault; a chain with no cash
+        /// vault configured is refused
         #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
         network: TokenizationNetwork,
     },
@@ -735,12 +740,13 @@ pub enum Commands {
         from: CctpChain,
     },
 
-    /// Reset USDC allowance for the orderbook to zero.
+    /// Reset the settlement stable allowance (USDC, or USDG on Robinhood) for
+    /// the orderbook to zero.
     ///
     /// Use this to investigate approval behavior or when switching orderbook addresses.
     ResetAllowance {
-        /// Chain whose USDC allowance to reset: its wallet, canonical USDC
-        /// and `[chains.<name>.trading]` orderbook
+        /// Chain whose allowance to reset: its wallet, its settlement stable
+        /// and its `[chains.<name>.trading]` orderbook
         #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
         network: TokenizationNetwork,
     },
@@ -938,12 +944,18 @@ pub enum TransferCommand {
         /// `deposit-credited-offline`; for `mint`/`redemption` it is free text.
         #[arg(short = 'r', long = "reason")]
         reason: AuditReason,
-        /// usdc only, required for a transfer with a signed deposit send and
-        /// refused for any other: the tx that took the send's nonce (the
-        /// 0-value self-transfer cancel). The bot checks that it is from the
-        /// bot's Ethereum wallet, at the send's nonce, not the send itself, has
-        /// the required confirmations, and paid the deposit address no USDC
-        /// unless another transfer recorded it as its own deposit send.
+        /// usdc and redemption only. Required for a USDC transfer with a signed
+        /// deposit send, and for a redemption whose signed vault withdrawal or
+        /// send to the issuer has no canonical receipt (a confirmed reverted one
+        /// reconciles without it); refused for a mint and for a USDC transfer
+        /// or redemption with no signed tx. It is the tx that took that signed tx's nonce (the
+        /// 0-value self-transfer cancel). The bot checks that it is from the bot
+        /// wallet on that chain, at the nonce, not the signed tx itself, has the
+        /// required confirmations, and did not do what the signed tx does: for
+        /// usdc, pay the deposit address USDC (unless another transfer recorded
+        /// it as its own deposit send); for a redemption, it must have reverted
+        /// or be a plain cancel (0 value, no calldata, to the bot wallet itself,
+        /// not EIP-7702, with no logs in its receipt).
         #[arg(long = "superseding-tx")]
         superseding_tx: Option<TxHash>,
     },
@@ -1058,12 +1070,11 @@ impl CliEnv {
 
     /// Load config and secrets from the file paths parsed from CLI arguments.
     pub(crate) async fn load(self) -> anyhow::Result<(Ctx, Commands)> {
-        let ctx = Ctx::load_files(
-            &self.env.config,
-            &self.env.secrets,
-            self.env.registry_file.as_deref(),
-        )
-        .await?;
+        let source = TokenSource::Running {
+            registry_file: self.env.registry_file.as_deref(),
+            registry_state: self.env.registry_state.as_deref(),
+        };
+        let ctx = Ctx::load_files(&self.env.config, &self.env.secrets, source).await?;
         Ok((ctx, self.command))
     }
 }
@@ -1230,6 +1241,7 @@ enum TransferRecoveryCommand {
         transfer_type: TransferType,
         id: String,
         reason: AuditReason,
+        superseding_tx: Option<TxHash>,
     },
     ClearPendingBurn {
         id: Uuid,
@@ -1258,6 +1270,7 @@ enum ProviderCommand {
     TransferUsdc {
         direction: TransferDirection,
         amount: Usdc,
+        chain: Option<Chain>,
     },
     ResumeUsdcTransfer {
         id: Uuid,
@@ -1483,9 +1496,15 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
         Commands::ProcessTx { tx_hash, network } => {
             CommandRoute::Provider(ProviderCommand::ProcessTx { tx_hash, network })
         }
-        Commands::TransferUsdc { direction, amount } => {
-            CommandRoute::Provider(ProviderCommand::TransferUsdc { direction, amount })
-        }
+        Commands::TransferUsdc {
+            direction,
+            amount,
+            chain,
+        } => CommandRoute::Provider(ProviderCommand::TransferUsdc {
+            direction,
+            amount,
+            chain: chain.map(Chain::from),
+        }),
         Commands::VaultDeposit {
             amount,
             token,
@@ -1613,9 +1632,10 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
                         },
                     })
                 }
-                ReconcileKind::Mint | ReconcileKind::Redemption if superseding_tx.is_some() => {
+                ReconcileKind::Mint if superseding_tx.is_some() => {
                     anyhow::bail!(
-                        "transfer reconcile: --superseding-tx applies only to --kind usdc"
+                        "transfer reconcile: --superseding-tx applies only to --kind usdc and \
+                         --kind redemption"
                     )
                 }
                 ReconcileKind::Mint => CommandRoute::Simple(SimpleCommand::Transfer {
@@ -1623,6 +1643,7 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
                         transfer_type: TransferType::Mint,
                         id,
                         reason,
+                        superseding_tx: None,
                     },
                 }),
                 ReconcileKind::Redemption => CommandRoute::Simple(SimpleCommand::Transfer {
@@ -1630,6 +1651,7 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
                         transfer_type: TransferType::Redemption,
                         id,
                         reason,
+                        superseding_tx,
                     },
                 }),
             },
@@ -1925,13 +1947,18 @@ async fn run_transfer_command<W: Write>(
             transfer_type,
             id,
             reason,
+            superseding_tx,
         } => {
             let result = rebalancing::reconcile_equity_transfer_command(
                 stdout,
                 transfer_type,
                 &id,
                 reason,
+                superseding_tx,
                 pool,
+                async |chain, check: rebalancing::WithdrawalCheck<'_>| {
+                    rebalancing::verify_withdrawal_on_chain(ctx, chain, check).await
+                },
             )
             .await;
             finish_with_log_query_url(stdout, ctx, &id, result)
@@ -2116,9 +2143,11 @@ async fn run_provider_command<W: Write + Send>(
             )
             .await
         }
-        ProviderCommand::TransferUsdc { direction, amount } => {
-            rebalancing::transfer_usdc_command(stdout, direction, amount, ctx, pool).await
-        }
+        ProviderCommand::TransferUsdc {
+            direction,
+            amount,
+            chain,
+        } => rebalancing::transfer_usdc_command(stdout, direction, amount, chain, ctx, pool).await,
         ProviderCommand::ResumeUsdcTransfer { id, direction } => {
             rebalancing::resume_usdc_transfer_command(stdout, id, direction, ctx).await
         }
@@ -3887,6 +3916,7 @@ mod tests {
                         transfer_type,
                         id,
                         reason,
+                        superseding_tx: None,
                     },
             }) => {
                 assert!(matches!(transfer_type, TransferType::Mint));
@@ -3915,11 +3945,11 @@ mod tests {
         .unwrap();
 
         let Err(error) = classify_command(cli.command) else {
-            panic!("a superseding tx on an equity reconcile must be refused");
+            panic!("a superseding tx on a mint reconcile must be refused");
         };
-        assert_eq!(
-            error.to_string(),
-            "transfer reconcile: --superseding-tx applies only to --kind usdc"
+        assert!(
+            error.to_string().contains("--superseding-tx"),
+            "the refusal names the flag, got: {error}"
         );
     }
 
@@ -3935,6 +3965,8 @@ mod tests {
             "RED-001",
             "--reason",
             "deposited manually",
+            "--superseding-tx",
+            &TxHash::repeat_byte(0xcc).to_string(),
         ])
         .unwrap();
 
@@ -3945,11 +3977,13 @@ mod tests {
                         transfer_type,
                         id,
                         reason,
+                        superseding_tx,
                     },
             }) => {
                 assert!(matches!(transfer_type, TransferType::Redemption));
                 assert_eq!(id, "RED-001");
                 assert_eq!(reason.as_ref(), "deposited manually");
+                assert_eq!(superseding_tx, Some(TxHash::repeat_byte(0xcc)));
             }
             _ => panic!("expected reconcile equity (redemption) simple command"),
         }
@@ -4623,6 +4657,7 @@ mod tests {
 
                 [rebalancing]
                 transfer_timeout_secs = 1800
+                recovery_hold_alert_after_secs = 3600
                 inventory_staleness_bound_secs = 300
                 transfer_attempt_timeout_secs = 3600
                 attestation_retry_deadline_secs = 86400

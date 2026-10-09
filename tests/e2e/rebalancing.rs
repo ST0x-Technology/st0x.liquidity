@@ -1601,7 +1601,7 @@ async fn redemption_rejected_releases_inflight_and_preserves_failed_transfer() -
             "EquityRedemptionEvent::UnwrapPending",
             "EquityRedemptionEvent::UnwrapSubmitted",
             "EquityRedemptionEvent::TokensUnwrapped",
-            "EquityRedemptionEvent::SendPending",
+            "EquityRedemptionEvent::SendPrepared",
             "EquityRedemptionEvent::TokensSent",
             "EquityRedemptionEvent::Detected",
             "EquityRedemptionEvent::RedemptionRejected",
@@ -2286,7 +2286,7 @@ async fn interrupted_redemption_resumes_after_restart() -> anyhow::Result<()> {
             "EquityRedemptionEvent::UnwrapPending",
             "EquityRedemptionEvent::UnwrapSubmitted",
             "EquityRedemptionEvent::TokensUnwrapped",
-            "EquityRedemptionEvent::SendPending",
+            "EquityRedemptionEvent::SendPrepared",
             "EquityRedemptionEvent::TokensSent",
             "EquityRedemptionEvent::Detected",
             "EquityRedemptionEvent::Completed",
@@ -3210,7 +3210,11 @@ async fn interrupted_usdc_base_to_alpaca_resumes_after_restart() -> anyhow::Resu
         .await?;
     let _deposit_watcher = infra
         .broker_service
-        .start_deposit_watcher(eth_deposit_provider, USDC_ETHEREUM, infra.base_chain.owner)
+        .start_deposit_watcher(
+            eth_deposit_provider.clone(),
+            USDC_ETHEREUM,
+            infra.base_chain.owner,
+        )
         .await?;
 
     let current_block = infra.base_chain.provider.get_block_number().await?;
@@ -3261,6 +3265,16 @@ async fn interrupted_usdc_base_to_alpaca_resumes_after_restart() -> anyhow::Resu
     bot1.abort();
     let _ = bot1.await;
     tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Ethereum automines transactions but not empty blocks. The first bot may
+    // already have minted before cancellation; resume then needs an authoritative
+    // empty deposit scan at least two blocks past that mint before sending.
+    let ethereum_head = eth_deposit_provider.get_block_number().await?;
+    eth_deposit_provider.anvil_mine(Some(2), None).await?;
+    assert!(
+        eth_deposit_provider.get_block_number().await? >= ethereum_head + 2,
+        "the restart fixture must advance Ethereum past the deposit-scan finality margin",
+    );
 
     let ctx2 = build_usdc_rebalancing_ctx()
         .base_chain(&infra.base_chain)

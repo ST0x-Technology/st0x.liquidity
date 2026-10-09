@@ -125,7 +125,7 @@ impl StoredOperation {
                     StoredStageOutcome::Succeeded,
                 );
             }
-            SendPending { pending_at } => {
+            SendPending { pending_at } | SendPrepared { pending_at, .. } => {
                 self.open_once(RedemptionSend, *pending_at);
             }
             // Terminal failures: whichever stage is currently open (varies by
@@ -271,6 +271,10 @@ impl StoredOperation {
                 self.completed_at = Some(*reconciled_at);
                 self.operator_reconciled = true;
             }
+            // The withdraw stage stays open through an adoption: the adopted tx
+            // is what `WithdrawnFromRaindex` later closes it on. A fee
+            // replacement likewise continues the open send stage.
+            VaultWithdrawReplacementAdopted { .. } | SendReplaced { .. } => {}
         }
     }
 
@@ -316,6 +320,10 @@ pub(super) fn redemption_observed_at(event: &EquityRedemptionEvent) -> DateTime<
             unwrapped_at: at, ..
         }
         | SendPending { pending_at: at }
+        | SendPrepared { pending_at: at, .. }
+        | SendReplaced {
+            replaced_at: at, ..
+        }
         | TransferFailed { failed_at: at, .. }
         | TokensSent { sent_at: at, .. }
         | DetectionFailed { failed_at: at, .. }
@@ -331,7 +339,8 @@ pub(super) fn redemption_observed_at(event: &EquityRedemptionEvent) -> DateTime<
         }
         | OperatorReconciled {
             reconciled_at: at, ..
-        } => *at,
+        }
+        | VaultWithdrawReplacementAdopted { adopted_at: at, .. } => *at,
     }
 }
 

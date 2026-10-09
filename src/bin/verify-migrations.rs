@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use st0x_config::{
-    DeploymentSymbolPolicy, TokenFile, fetch_token_file, load_deployment_symbol_policy,
+    DeploymentSymbolPolicy, TokenFile, fetch_gate_token_files, load_deployment_symbol_policy,
 };
 use st0x_hedge::migration_verification::verify_migrations;
 
@@ -43,6 +43,9 @@ struct Args {
     /// read instead of the bucket.
     #[arg(long)]
     registry_file: Option<PathBuf>,
+    /// Check the persisted pending and fallback copies, or the running copy.
+    #[arg(long, conflicts_with = "registry_file")]
+    registry_state: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -51,34 +54,48 @@ async fn main() -> std::process::ExitCode {
         db,
         config,
         registry_file,
+        registry_state,
     } = Args::parse();
 
-    let tokens = match fetch_token_file(&config, registry_file.as_deref()).await {
-        Ok(tokens) => tokens,
-        Err(error) => {
-            eprintln!("Failed to read the token file: {error}");
-            print_error_sources(&error);
+    let files =
+        match fetch_gate_token_files(&config, registry_file.as_deref(), registry_state.as_deref())
+            .await
+        {
+            Ok(files) => files,
+            Err(error) => {
+                eprintln!("Failed to read the token file: {error}");
+                print_error_sources(&error);
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+    for bytes in &files {
+        let tokens = bytes
+            .as_deref()
+            .map_or(TokenFile::Skipped, TokenFile::Bytes);
+        let policy = match load_deployment_symbol_policy(&config, tokens) {
+            Ok(policy) => policy,
+            Err(error) => {
+                eprintln!("Failed to load deployment symbol policy: {error}");
+                print_error_sources(&error);
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+        if verify(&policy, db.as_deref()).await == std::process::ExitCode::FAILURE {
             return std::process::ExitCode::FAILURE;
         }
-    };
-    let tokens = tokens
-        .as_deref()
-        .map_or(TokenFile::Skipped, TokenFile::Bytes);
+    }
+    std::process::ExitCode::SUCCESS
+}
 
-    let symbol_policy = match load_deployment_symbol_policy(&config, tokens) {
-        Ok(policy) => policy,
-        Err(error) => {
-            eprintln!("Failed to load deployment symbol policy: {error}");
-            print_error_sources(&error);
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-
+async fn verify(
+    symbol_policy: &DeploymentSymbolPolicy,
+    db: Option<&std::path::Path>,
+) -> std::process::ExitCode {
     let Some(db) = db else {
-        return verify_first_deploy(&symbol_policy);
+        return verify_first_deploy(symbol_policy);
     };
 
-    match verify_migrations(&db, &symbol_policy).await {
+    match verify_migrations(db, symbol_policy).await {
         Ok(report) => {
             print!("{report}");
             if report.has_failures() {

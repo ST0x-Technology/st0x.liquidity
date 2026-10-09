@@ -29,16 +29,19 @@ Signs locally with a raw private key. Wraps an alloy provider with an embedded
 
 Cargo features on the main crate (`wallet-turnkey` / `wallet-private-key`) gate
 which backends are compiled into the binary. The active backend is then chosen
-from `[rebalancing.wallet]` in `RebalancingConfig` / `RebalancingSecrets`; only
-switching to a backend that was not compiled in requires a rebuild.
+from the top-level `[wallet]` config and secrets sections; only switching to a
+backend that was not compiled in requires a rebuild.
 
 ### Turnkey (`wallet-turnkey`)
 
-| Field             | Location | Description                       |
-| ----------------- | -------- | --------------------------------- |
-| `address`         | config   | Wallet address on both chains     |
-| `organization_id` | config   | Turnkey organization identifier   |
-| `api_private_key` | secrets  | Hex-encoded P-256 API private key |
+| Field             | Location | Description                                                           |
+| ----------------- | -------- | --------------------------------------------------------------------- |
+| `address`         | config   | Signing wallet address                                                |
+| `organization_id` | config   | Turnkey organization UUID                                             |
+| `api_private_key` | secrets  | 64 hex characters encoding a valid P-256 scalar; optional `0x` prefix |
+
+See [Turnkey configuration](../../docs/turnkey.md) for validation and rollout
+requirements.
 
 ### Raw private key (`wallet-private-key`)
 

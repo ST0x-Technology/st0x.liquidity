@@ -1,6 +1,7 @@
 //! USDC-specific trigger types and logic.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use rain_math_float::{Float, FloatError};
@@ -14,8 +15,8 @@ use st0x_finance::{Usd, Usdc};
 use super::{RebalancingService, RebalancingServiceError};
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::inventory::{
-    BroadcastingInventory, Imbalance, ImbalanceThreshold, Inventory, InventoryError,
-    InventoryViewError, TransferOp, Venue,
+    ActiveUsdcRebalance, BroadcastingInventory, Imbalance, ImbalanceThreshold, Inventory,
+    InventoryError, InventoryViewError, TransferOp, Venue,
 };
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceEvent, UsdcRebalanceId};
 
@@ -167,6 +168,39 @@ pub(super) enum UsdcTerminalAction {
     PreservePostBurn,
 }
 
+/// How long a vault withdraw that failed without starting holds Base->Alpaca
+/// planning on its chain. The plan came from an inventory balance the vault
+/// could not cover, and a fresh vault read need not fix that, so the read
+/// alone cannot lift the hold. This bounds a persistent cause to one rejected
+/// withdraw per chain per period, matching the scan redrive cadence. Startup
+/// restores it from durable state (`restore_withdrawal_rejection_cooldowns`).
+pub(crate) const USDC_WITHDRAW_REJECTION_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+
+/// Slack after the cooldown before the delayed check runs, so it does not
+/// land a moment before the cooldown ends.
+const COOLDOWN_EXPIRY_CHECK_MARGIN: Duration = Duration::from_secs(5);
+
+/// What is left at `now` of a `cooldown` that started at `started_at`, or
+/// `None` once it has run out. A start after `now` (clock skew, or a stamp
+/// taken after `now` was read) leaves the time to `started_at + cooldown`,
+/// so a check queued for the end does not run while the hold is still on.
+fn cooldown_remaining(
+    started_at: DateTime<Utc>,
+    cooldown: Duration,
+    now: DateTime<Utc>,
+) -> Option<Duration> {
+    now.signed_duration_since(started_at).to_std().map_or_else(
+        |_| {
+            let ahead = started_at
+                .signed_duration_since(now)
+                .to_std()
+                .unwrap_or_default();
+            Some(cooldown.saturating_add(ahead))
+        },
+        |age| cooldown.checked_sub(age).filter(|left| !left.is_zero()),
+    )
+}
+
 /// Whether a terminal USDC settlement event reconciled the in-memory
 /// inventory ledger. `DeferredToSnapshot` means the settlement was accepted
 /// as authoritative (the durable event proves funds arrived) but the
@@ -174,10 +208,12 @@ pub(super) enum UsdcTerminalAction {
 /// *success* arrived with no tracking context to reconcile against (a
 /// post-restart resume where the transfer already settled), or because
 /// reconciliation underflowed (the resume desync that fails to reconstruct
-/// inflight). The no-tracking clause is terminal-success-only: a pre-burn
-/// terminal *failure* with no tracking context reconciles as `Reconciled`
-/// instead, because nothing moved, so an immediate imbalance check reads data
-/// as fresh as a post-snapshot one (see `cancel_tracked_usdc_rebalance`). In
+/// inflight), or because a `WithdrawalFailed` arrived with no tracking (see
+/// `defer_untracked_withdrawal_failure`, which also requests a forced onchain
+/// cash reconcile). Any other pre-burn terminal
+/// *failure* with no tracking context reconciles as `Reconciled`, because
+/// nothing moved, so an immediate imbalance check reads data as fresh as a
+/// post-snapshot one (see `cancel_tracked_usdc_rebalance`). In
 /// the underflow case, the source venue's residual inflight is zeroed so
 /// `has_inflight()` can clear and future snapshots resume healing; the
 /// available balances on both sides are left for the snapshot poll to
@@ -187,6 +223,27 @@ pub(super) enum UsdcTerminalAction {
 pub(super) enum UsdcSettlementOutcome {
     Reconciled,
     DeferredToSnapshot,
+    /// A `WithdrawalFailed` with no tracking: deferred like
+    /// `DeferredToSnapshot`, and a withdraw cooldown started.
+    HeldByWithdrawCooldown,
+}
+
+/// Whether a terminal event (USDC, mint or redemption) left the in-memory
+/// cash ledger reconciled, or stale until the next snapshot poll heals it.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum CashLedgerState {
+    Reconciled,
+    AwaitingSnapshot,
+}
+
+impl From<UsdcSettlementOutcome> for CashLedgerState {
+    fn from(outcome: UsdcSettlementOutcome) -> Self {
+        match outcome {
+            UsdcSettlementOutcome::Reconciled => Self::Reconciled,
+            UsdcSettlementOutcome::DeferredToSnapshot
+            | UsdcSettlementOutcome::HeldByWithdrawCooldown => Self::AwaitingSnapshot,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -592,27 +649,20 @@ impl RebalancingService {
         }
 
         let terminal_action = self.usdc_terminal_action(&id, &event).await;
-        // The inventory addresses only the primary chain: a transfer on
-        // another corridor never takes or clears its active marker.
-        let on_primary = match self.transfer_chain(&id).await {
-            Some(chain) => chain == self.inventory.read().await.primary_chain(),
-            None => true,
-        };
         let settlement_outcome = self
             .apply_usdc_rebalance_event(&id, &event, terminal_action)
             .await?;
 
         let is_clearable_terminal = terminal_action == UsdcTerminalAction::Clear;
-        {
+        if is_clearable_terminal {
             let mut inventory = self.inventory.write().await;
-            if is_clearable_terminal {
-                let chain = inventory.primary_chain();
-                if on_primary && inventory.owns_usdc_rebalance_slot(&id, chain) {
-                    *inventory = inventory.clone().clear_active_usdc_rebalance();
-                }
-            } else if on_primary {
-                *inventory = inventory.clone().set_active_usdc_rebalance(id.clone());
-            }
+            *inventory = inventory.clone().clear_active_usdc_rebalance(&id);
+        } else {
+            let active = self.active_usdc_rebalance(&id).await;
+            let mut inventory = self.inventory.write().await;
+            *inventory = inventory
+                .clone()
+                .set_active_usdc_rebalance(id.clone(), active);
         }
         if is_clearable_terminal {
             self.usdc_tracking.write().await.remove(&id);
@@ -636,7 +686,8 @@ impl RebalancingService {
         // the post-rebalance inventory.
         if is_clearable_terminal {
             self.equity_scheduler.cancel_pending().await;
-            self.usdc_scheduler.cancel_pending().await;
+            self.cancel_pending_usdc_checks(settlement_outcome.into())
+                .await;
             match settlement_outcome {
                 UsdcSettlementOutcome::Reconciled => {
                     self.usdc_scheduler.enqueue_check().await;
@@ -653,6 +704,16 @@ impl RebalancingService {
                         id = %id,
                         "Deferring fresh USDC imbalance check to next snapshot poll: \
                          in-memory inventory was not reconciled by this terminal event"
+                    );
+                }
+                UsdcSettlementOutcome::HeldByWithdrawCooldown => {
+                    // Deferred as above, and planning is held until the
+                    // withdraw cooldown ends: the hold queued the check for
+                    // then, and the cancel above kept it.
+                    debug!(
+                        target: "rebalance",
+                        id = %id,
+                        "Deferring the fresh USDC imbalance check to the withdraw cooldown's end"
                     );
                 }
             }
@@ -749,8 +810,10 @@ impl RebalancingService {
     /// Retries the load of every transfer blocking all corridors: a loaded
     /// one holds its own corridor when its state holds a guard, a missing
     /// one latches every corridor until a restart, and a failed load waits
-    /// for the next sweep.
+    /// for the next sweep. A loaded one also resolves its inventory marker:
+    /// it names the corridor while the guard holds, and is dropped otherwise.
     pub(super) async fn read_unread_corridors(&self) {
+        let _event_sync_guard = self.usdc_event_sync.lock().await;
         for id in self.usdc_guards.unread_ids() {
             match self.durable_corridor(&id).await {
                 DurableCorridor::Unread => {}
@@ -763,8 +826,19 @@ impl RebalancingService {
                     direction,
                     holds_guard,
                 } => {
-                    self.usdc_guards
-                        .resolve_unread(&id, holds_guard.then_some((corridor.chain(), direction)));
+                    let holder = holds_guard.then_some((corridor.chain(), direction));
+                    self.usdc_guards.resolve_unread(&id, holder);
+                    let mut inventory = self.inventory.write().await;
+                    if inventory.active_usdc_rebalance_entry(&id).is_none() {
+                        continue;
+                    }
+                    *inventory = match holder {
+                        Some((chain, direction)) => inventory.clone().set_active_usdc_rebalance(
+                            id,
+                            ActiveUsdcRebalance::Known { chain, direction },
+                        ),
+                        None => inventory.clone().clear_active_usdc_rebalance(&id),
+                    };
                 }
             }
         }
@@ -1000,13 +1074,18 @@ impl RebalancingService {
                     id,
                     UsdcTrackingEvent::ConversionConfirmed,
                     conversion.received_amount,
+                    None,
                 )
                 .await?
             }
             DepositConfirmed {
                 direction: RebalanceDirection::AlpacaToBase,
+                vault_deposit_block,
                 ..
-            } => self.complete_alpaca_to_base_deposit(id).await?,
+            } => {
+                self.complete_alpaca_to_base_deposit(id, *vault_deposit_block)
+                    .await?
+            }
             // Transient intent markers persisted before the on-chain withdraw /
             // burn. Detailed stage tracking starts at the subsequent Initiated /
             // BridgingInitiated; the inventory's active-rebalance claim is set by
@@ -1025,11 +1104,39 @@ impl RebalancingService {
             | DepositSendAttached { .. }
             | AttestationTimedOut { .. } => UsdcSettlementOutcome::Reconciled,
             // Withdrawal failure is always pre-burn -> reconcile to source.
-            WithdrawalFailed { .. } => self.cancel_tracked_usdc_rebalance(id).await?,
+            WithdrawalFailed { .. } if self.usdc_tracking.read().await.contains_key(id) => {
+                self.cancel_tracked_usdc_rebalance(id).await?
+            }
+            WithdrawalFailed { .. } => self.defer_untracked_withdrawal_failure(id).await,
+            // A cleared ConversionFailed is AlpacaToBase's pre-withdrawal leg
+            // (BaseToAlpaca's conversion is post-deposit, so the classifier
+            // preserves it): nothing left Alpaca, but the cause may persist,
+            // so the conversion cooldown holds Alpaca->Base planning. The
+            // fresh check still runs, for the other direction and corridors.
+            ConversionFailed { reason, failed_at }
+                if terminal_action != UsdcTerminalAction::PreservePostBurn =>
+            {
+                let outcome = self.cancel_tracked_usdc_rebalance(id).await?;
+                self.hold_after_conversion_failure(*failed_at).await;
+                let cooldown = self.config.usdc.conversion_failure_cooldown();
+                self.enqueue_cooldown_expiry_check(*failed_at, cooldown)
+                    .await;
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    %reason,
+                    %failed_at,
+                    cooldown_secs = cooldown.as_secs(),
+                    "USD->USDC conversion failed before the Alpaca withdrawal; holding \
+                     Alpaca->Base planning on every corridor for the cooldown"
+                );
+                outcome
+            }
             // These failures may be pre- or post-burn (BridgingFailed by burn
-            // stage; ConversionFailed by direction -- BaseToAlpaca's conversion
-            // is post-deposit; DepositFailed is always post-mint). The classifier
-            // decides: preserve post-burn, otherwise reconcile to source.
+            // stage; DepositFailed is always post-mint). The classifier
+            // decides: preserve post-burn, otherwise reconcile to source. A
+            // ConversionFailed reaches this arm only when preserved (the
+            // cleared one is handled above).
             BridgingFailed { .. } | DepositFailed { .. } | ConversionFailed { .. } => {
                 if terminal_action == UsdcTerminalAction::PreservePostBurn {
                     // Preservation is achieved by NOT cancelling: the tracking
@@ -1073,44 +1180,69 @@ impl RebalancingService {
     /// file to apply the inflight side-effect when the live reactor processes
     /// the event.
     ///
-    /// Only a transfer that owns the primary chain's slot (see
-    /// `InventoryView::owns_usdc_rebalance_slot`) touches the inflight.
-    ///
-    /// The timeout sweep in `mod.rs` does NOT call this function: it inlines
-    /// `clear_usdc_inflight + clear_active_usdc_rebalance` in a single lock
-    /// acquisition to avoid a transient state where inflight is zeroed but the
-    /// active rebalance is still set.
+    /// Only an active transfer touches the inflight, in the slot of its
+    /// corridor chain from tracking, else from its active entry. One of
+    /// unknown corridor reserved nothing this process can name, so it
+    /// releases nothing.
     async fn reconcile_operator_resolved(
         &self,
         id: &UsdcRebalanceId,
         direction: &RebalanceDirection,
         now: DateTime<Utc>,
     ) -> Result<(), RebalancingServiceError> {
-        let chain = match self.usdc_tracking.read().await.get(id) {
-            Some(tracking) => tracking.corridor.chain(),
-            None => self.inventory.read().await.primary_chain(),
-        };
+        let tracked_chain = self
+            .usdc_tracking
+            .read()
+            .await
+            .get(id)
+            .map(|tracking| tracking.corridor.chain());
         let mut inventory = self.inventory.write().await;
-        if inventory.owns_usdc_rebalance_slot(id, chain) {
-            *inventory = inventory
+        let chain = match (
+            tracked_chain,
+            inventory.active_usdc_rebalance_entry(id).copied(),
+        ) {
+            (Some(chain), Some(_)) | (None, Some(ActiveUsdcRebalance::Known { chain, .. })) => {
+                chain
+            }
+            (_, None) | (None, Some(ActiveUsdcRebalance::Unknown)) => {
+                debug!(
+                    target: "rebalance",
+                    %id,
+                    "Operator reconcile of a transfer with no known corridor slot; \
+                     no USDC inflight to release"
+                );
+                return Ok(());
+            }
+        };
+        *inventory =
+            inventory
                 .clone()
-                .clear_usdc_inflight(source_venue(*direction), now)?;
-        }
+                .clear_usdc_inflight_at(chain, source_venue(*direction), now)?;
         drop(inventory);
 
         Ok(())
     }
 
-    /// The chain of `id`'s corridor: from tracking, else from the store;
-    /// `None` when neither knows it.
-    async fn transfer_chain(&self, id: &UsdcRebalanceId) -> Option<Chain> {
+    /// The corridor chain and direction of `id`: from tracking, else from the
+    /// store; `Unknown` when neither knows it.
+    async fn active_usdc_rebalance(&self, id: &UsdcRebalanceId) -> ActiveUsdcRebalance {
         if let Some(tracking) = self.usdc_tracking.read().await.get(id) {
-            return Some(tracking.corridor.chain());
+            return ActiveUsdcRebalance::Known {
+                chain: tracking.corridor.chain(),
+                direction: tracking.direction,
+            };
         }
 
         match self.durable_corridor(id).await {
-            DurableCorridor::Found { corridor, .. } => Some(corridor.chain()),
-            DurableCorridor::Missing | DurableCorridor::Unread => None,
+            DurableCorridor::Found {
+                corridor,
+                direction,
+                ..
+            } => ActiveUsdcRebalance::Known {
+                chain: corridor.chain(),
+                direction,
+            },
+            DurableCorridor::Missing | DurableCorridor::Unread => ActiveUsdcRebalance::Unknown,
         }
     }
 
@@ -1169,7 +1301,9 @@ impl RebalancingService {
                 Inventory::transfer(tracking_entry.source_venue(), TransferOp::Start, amount);
 
             let mut inventory = self.inventory.write().await;
-            *inventory = inventory.clone().update_usdc(update, Utc::now())?;
+            *inventory = inventory
+                .clone()
+                .update_usdc_at(corridor.chain(), update, Utc::now())?;
             drop(inventory);
 
             self.usdc_tracking
@@ -1193,7 +1327,9 @@ impl RebalancingService {
         let update = Inventory::transfer(tracking_entry.source_venue(), TransferOp::Start, amount);
 
         let mut inventory = self.inventory.write().await;
-        *inventory = inventory.clone().update_usdc(update, Utc::now())?;
+        *inventory = inventory
+            .clone()
+            .update_usdc_at(corridor.chain(), update, Utc::now())?;
         drop(inventory);
 
         self.usdc_tracking
@@ -1282,6 +1418,7 @@ impl RebalancingService {
     async fn complete_alpaca_to_base_deposit(
         &self,
         id: &UsdcRebalanceId,
+        vault_deposit_block: Option<u64>,
     ) -> Result<UsdcSettlementOutcome, RebalancingServiceError> {
         let Some(tracking) = self.usdc_tracking.read().await.get(id).cloned() else {
             // Resumed after a restart with no rebuilt tracking: the transfer
@@ -1301,8 +1438,13 @@ impl RebalancingService {
             return Err(RebalancingServiceError::MissingUsdcBridgedAmount { id: id.clone() });
         };
 
-        self.complete_usdc_rebalance(id, UsdcTrackingEvent::DepositConfirmed, amount_received)
-            .await
+        self.complete_usdc_rebalance(
+            id,
+            UsdcTrackingEvent::DepositConfirmed,
+            amount_received,
+            vault_deposit_block,
+        )
+        .await
     }
 
     async fn cancel_tracked_usdc_rebalance(
@@ -1322,6 +1464,7 @@ impl RebalancingService {
             return Ok(UsdcSettlementOutcome::Reconciled);
         }
 
+        let chain = tracking.corridor.chain();
         let source_venue = tracking.source_venue();
         let initiated_amount = tracking.initiated_amount;
         let now = Utc::now();
@@ -1334,7 +1477,7 @@ impl RebalancingService {
         });
 
         let mut inventory = self.inventory.write().await;
-        let outcome = match inventory.clone().update_usdc(update, now) {
+        let outcome = match inventory.clone().update_usdc_at(chain, update, now) {
             Ok(updated) => {
                 *inventory = updated;
                 UsdcSettlementOutcome::Reconciled
@@ -1364,7 +1507,9 @@ impl RebalancingService {
                      source inflight so snapshots can heal, and skipping in-memory \
                      available reconciliation (heals on next snapshot poll)."
                 );
-                *inventory = inventory.clone().clear_usdc_inflight(source_venue, now)?;
+                *inventory = inventory
+                    .clone()
+                    .clear_usdc_inflight_at(chain, source_venue, now)?;
                 UsdcSettlementOutcome::DeferredToSnapshot
             }
             Err(error) => return Err(error.into()),
@@ -1374,11 +1519,183 @@ impl RebalancingService {
         Ok(outcome)
     }
 
+    /// A `WithdrawalFailed` with no tracking never reached `Initiated`: the
+    /// withdraw was rejected before broadcast (`RejectWithdrawal`), or this is
+    /// a replay after a restart. Nothing moved, so there is no inflight to
+    /// cancel. But the transfer was planned from a vault balance the vault did
+    /// not have, and every later check (each snapshot, each fill) would plan
+    /// the same withdraw again. Two gates stop that:
+    ///
+    /// - a forced onchain cash reconcile for the chain, which holds USDC
+    ///   dispatch until the poller admits a fresh vault read, emitted even
+    ///   when the balance is unchanged;
+    /// - the chain's withdraw cooldown, which holds Base->Alpaca planning on
+    ///   it for [`USDC_WITHDRAW_REJECTION_COOLDOWN`], so a cause a fresh read
+    ///   does not fix rejects at most once per period.
+    ///
+    /// See [`Self::hold_after_withdraw_rejection`]. When the chain is
+    /// unknown, the cooldown holds every chain.
+    async fn defer_untracked_withdrawal_failure(
+        &self,
+        id: &UsdcRebalanceId,
+    ) -> UsdcSettlementOutcome {
+        let chain = match self.usdc_guards.held_chain(id) {
+            Some(chain) => Some(chain),
+            None => match self.durable_corridor(id).await {
+                DurableCorridor::Found { corridor, .. } => Some(corridor.chain()),
+                DurableCorridor::Missing | DurableCorridor::Unread => None,
+            },
+        };
+
+        warn!(target: "rebalance", %id, ?chain, "Untracked failed withdrawal: holding Base->Alpaca planning for the cooldown (every chain when the chain is unknown)");
+        let rejected_at = Utc::now();
+        self.hold_after_withdraw_rejection(chain, rejected_at).await;
+        self.enqueue_cooldown_expiry_check(rejected_at, USDC_WITHDRAW_REJECTION_COOLDOWN)
+            .await;
+
+        UsdcSettlementOutcome::HeldByWithdrawCooldown
+    }
+
+    /// Installs the gates of a withdraw rejected at `rejected_at` on `chain`
+    /// (every chain when `None`):
+    ///
+    /// - the withdraw cooldown, keeping the later of two rejection times;
+    /// - a forced onchain cash reconcile for a chain a served corridor polls,
+    ///   floored at the view's applied USDC block so a lagging read cannot
+    ///   clear it (no poller would ever answer it for any other chain, and
+    ///   the cash gate holds dispatch on every corridor);
+    ///
+    /// The caller queues the delayed check for the cooldown's end
+    /// ([`Self::enqueue_cooldown_expiry_check`]); a later terminal event keeps
+    /// it ([`Self::cancel_pending_usdc_checks`]).
+    pub(super) async fn hold_after_withdraw_rejection(
+        &self,
+        chain: Option<Chain>,
+        rejected_at: DateTime<Utc>,
+    ) {
+        self.usdc_withdraw_rejections
+            .write()
+            .await
+            .entry(chain)
+            .and_modify(|held_from| *held_from = (*held_from).max(rejected_at))
+            .or_insert(rejected_at);
+
+        if let Some(chain) = chain {
+            if self
+                .config
+                .usdc
+                .served()
+                .iter()
+                .any(|corridor| corridor.chain() == chain)
+            {
+                let floor = self
+                    .inventory
+                    .read()
+                    .await
+                    .onchain_usdc_block_watermark(chain);
+                self.divergence_gate
+                    .request_onchain_cash_reconcile(chain, floor)
+                    .await;
+            } else {
+                warn!(target: "rebalance", %chain, "No served corridor polls this chain's cash vault; not requesting a forced vault read");
+            }
+        }
+    }
+
+    /// Queues a USDC check for the end of a `cooldown` that started at
+    /// `started_at`: a quiet market queues no other check then, and planning
+    /// would otherwise wait for the next fill or balance change.
+    pub(super) async fn enqueue_cooldown_expiry_check(
+        &self,
+        started_at: DateTime<Utc>,
+        cooldown: Duration,
+    ) {
+        let remaining = cooldown_remaining(started_at, cooldown, Utc::now()).unwrap_or_default();
+        self.usdc_scheduler
+            .enqueue_check_after(remaining.saturating_add(COOLDOWN_EXPIRY_CHECK_MARGIN))
+            .await;
+    }
+
+    /// Drops the pending USDC checks a terminal event made stale, and keeps
+    /// the delayed ones, such as each cooldown's check for its end. The
+    /// caller queues the fresh check it needs.
+    ///
+    /// With a reconciled `ledger`, the checks already due are dropped: the
+    /// caller's fresh check replaces them. While the `ledger` awaits a
+    /// snapshot, no pending check runs sooner than the inventory staleness
+    /// bound: by then the check either reads an onchain USDC poll taken after
+    /// the terminal event or skips the stale chain. Broker cash freshness is
+    /// not checked here.
+    pub(super) async fn cancel_pending_usdc_checks(&self, ledger: CashLedgerState) {
+        match ledger {
+            CashLedgerState::Reconciled => self.usdc_scheduler.cancel_due().await,
+            CashLedgerState::AwaitingSnapshot => {
+                // The margin covers the whole-second rounding of `run_at`.
+                self.usdc_scheduler
+                    .defer_pending(
+                        self.config
+                            .inventory_staleness_bound
+                            .saturating_add(COOLDOWN_EXPIRY_CHECK_MARGIN),
+                    )
+                    .await;
+            }
+        }
+    }
+
+    /// Holds Alpaca->Base planning on every corridor for the conversion
+    /// cooldown, from `failed_at` of a USD->USDC conversion that failed
+    /// before its Alpaca withdrawal, keeping the later of two failure times.
+    /// The delayed check for the cooldown's end is queued apart, as for
+    /// [`Self::hold_after_withdraw_rejection`].
+    pub(super) async fn hold_after_conversion_failure(&self, failed_at: DateTime<Utc>) {
+        let mut held_from = self.usdc_conversion_failed_at.write().await;
+        *held_from = Some(held_from.map_or(failed_at, |held| held.max(failed_at)));
+    }
+
+    /// Whether Alpaca->Base planning is held because a USD->USDC conversion
+    /// failed before its withdrawal less than the conversion cooldown ago. An
+    /// expired failure is dropped.
+    pub(super) async fn usdc_conversion_cooling_down(&self, now: DateTime<Utc>) -> bool {
+        let cooldown = self.config.usdc.conversion_failure_cooldown();
+        let mut failed_at = self.usdc_conversion_failed_at.write().await;
+        // A failure stamped after `now` (taken before this lock) is still
+        // cooling down.
+        if failed_at.is_some_and(|at| cooldown_remaining(at, cooldown, now).is_none()) {
+            *failed_at = None;
+        }
+
+        failed_at.is_some()
+    }
+
+    /// Whether Base->Alpaca planning on `chain` is held because a vault
+    /// withdraw there failed without starting less than
+    /// [`USDC_WITHDRAW_REJECTION_COOLDOWN`] ago. Expired entries are dropped.
+    pub(super) async fn usdc_withdraw_cooling_down(
+        &self,
+        chain: Chain,
+        now: DateTime<Utc>,
+    ) -> bool {
+        let mut rejections = self.usdc_withdraw_rejections.write().await;
+        // A rejection stamped after `now` (taken before this lock) is still
+        // cooling down.
+        rejections.retain(|_, rejected_at| {
+            now.signed_duration_since(*rejected_at)
+                .to_std()
+                .map_or(true, |age| age < USDC_WITHDRAW_REJECTION_COOLDOWN)
+        });
+
+        rejections.contains_key(&Some(chain)) || rejections.contains_key(&None)
+    }
+
+    /// Settles a tracked transfer into inventory. `vault_deposit_block` is
+    /// the block of the vault deposit that credits the corridor chain's
+    /// MarketMaking USDC, `None` when the transfer credits Alpaca.
     async fn complete_usdc_rebalance(
         &self,
         id: &UsdcRebalanceId,
         event: UsdcTrackingEvent,
         settled_amount: Usdc,
+        vault_deposit_block: Option<u64>,
     ) -> Result<UsdcSettlementOutcome, RebalancingServiceError> {
         let Some(tracking) = self.usdc_tracking.read().await.get(id).cloned() else {
             // Resumed after a restart with no rebuilt tracking: the transfer
@@ -1389,6 +1706,7 @@ impl RebalancingService {
             return Ok(UsdcSettlementOutcome::DeferredToSnapshot);
         };
 
+        let chain = tracking.corridor.chain();
         let source_venue = tracking.source_venue();
         let initiated_amount = tracking.initiated_amount;
 
@@ -1418,9 +1736,39 @@ impl RebalancingService {
             Inventory::with_last_rebalancing(now)(settled, chain)
         });
 
+        // A completed transfer re-arms the chain's under-funded page.
+        self.underfunded_alerts.reset(chain);
+
+        // A vault credit requests a pinned read in the same inventory write
+        // as the credit. The gate's dispatch lock is taken first (lock
+        // order: dispatch, then inventory), so inventory writers never wait
+        // on a running USDC dispatch.
+        let cash_engagement = match vault_deposit_block {
+            Some(_) => Some(self.divergence_gate.lock_cash_engagement().await),
+            None => None,
+        };
         let mut inventory = self.inventory.write().await;
-        let outcome = match inventory.clone().update_usdc(update, now) {
+        let outcome = match inventory.clone().update_usdc_at(chain, update, now) {
             Ok(updated) => {
+                // A fill in the deposit's block or earlier may already have
+                // spent the credit onchain while the order fill reader, which
+                // trails the chain tip, has not delivered it. Hold every USDC
+                // check until a vault read pinned at or past the deposit
+                // block replaces the balance (ADR 0024). A read already
+                // applied past that block (a forced read while the transfer
+                // was inflight) contains the deposit, so the credit counts it
+                // twice: the request then needs a read at or past that read,
+                // since the view rejects anything older. The request is made
+                // under the same write as the credit, so no check reads the
+                // credit without it.
+                if let (Some(block_number), Some(cash_engagement)) =
+                    (vault_deposit_block, &cash_engagement)
+                {
+                    let minimum_block = updated
+                        .onchain_usdc_block_watermark(chain)
+                        .map_or(block_number, |watermark| watermark.max(block_number));
+                    cash_engagement.request_onchain_cash_reconcile(chain, Some(minimum_block));
+                }
                 *inventory = updated;
                 UsdcSettlementOutcome::Reconciled
             }
@@ -1459,12 +1807,15 @@ impl RebalancingService {
                      and skipping in-memory available reconciliation (heals \
                      on next snapshot poll)."
                 );
-                *inventory = inventory.clone().clear_usdc_inflight(source_venue, now)?;
+                *inventory = inventory
+                    .clone()
+                    .clear_usdc_inflight_at(chain, source_venue, now)?;
                 UsdcSettlementOutcome::DeferredToSnapshot
             }
             Err(error) => return Err(error.into()),
         };
         drop(inventory);
+        drop(cash_engagement);
 
         Ok(outcome)
     }
@@ -1549,8 +1900,23 @@ impl UsdcRebalancingCheckScheduler {
         }
     }
 
-    pub(super) async fn cancel_pending(&self) {
-        self.queue.cancel_all_pending().await;
+    /// Queues a check to run after `delay`.
+    pub(super) async fn enqueue_check_after(&self, delay: Duration) {
+        let mut queue = self.queue.clone();
+        if let Err(QueuePushError(error)) = queue.push_with_delay(UsdcRebalancingCheck, delay).await
+        {
+            warn!(target: "rebalance", %error, "Failed to enqueue a delayed UsdcRebalancingCheck job");
+        }
+    }
+
+    /// Drops the checks already due and keeps the delayed ones.
+    pub(super) async fn cancel_due(&self) {
+        self.queue.cancel_due_pending().await;
+    }
+
+    /// Moves every pending check to run no sooner than `not_before`.
+    pub(super) async fn defer_pending(&self, not_before: Duration) {
+        self.queue.defer_pending(not_before).await;
     }
 }
 
@@ -1632,6 +1998,33 @@ mod tests {
                 .await;
 
         assert_eq!(result, Err(UsdcTriggerSkip::NoImbalance));
+    }
+
+    #[test]
+    fn cooldown_started_in_the_future_lasts_until_its_end() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 5, 15, 0, 0).unwrap();
+        let cooldown = Duration::from_secs(300);
+        let started_at = now + chrono::Duration::seconds(60);
+
+        assert_eq!(
+            cooldown_remaining(started_at, cooldown, now),
+            Some(Duration::from_secs(360))
+        );
+    }
+
+    #[test]
+    fn cooldown_started_in_the_past_counts_down() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 5, 15, 0, 0).unwrap();
+        let cooldown = Duration::from_secs(300);
+
+        assert_eq!(
+            cooldown_remaining(now - chrono::Duration::seconds(60), cooldown, now),
+            Some(Duration::from_secs(240))
+        );
+        assert_eq!(
+            cooldown_remaining(now - chrono::Duration::seconds(300), cooldown, now),
+            None
+        );
     }
 
     /// The floor exists to keep a transfer from converting into a balance
@@ -2587,6 +2980,7 @@ mod tests {
         UsdcRebalanceEvent::DepositConfirmed {
             direction,
             deposit_confirmed_at: ts(108),
+            vault_deposit_block: None,
         }
     }
 
@@ -3031,6 +3425,21 @@ mod tests {
         .expect("count pending usdc-check jobs")
     }
 
+    async fn count_usdc_checks_delayed_at_least(
+        apalis_pool: &apalis_sqlite::SqlitePool,
+        secs: i64,
+    ) -> i64 {
+        sqlx_apalis::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ? \
+             AND run_at >= strftime('%s', 'now') + ?",
+        )
+        .bind(std::any::type_name::<UsdcRebalancingCheck>())
+        .bind(secs)
+        .fetch_one(apalis_pool)
+        .await
+        .expect("count delayed usdc-check jobs")
+    }
+
     #[tokio::test]
     async fn usdc_scheduler_enqueue_check_inserts_pending_row() {
         let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
@@ -3042,7 +3451,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn usdc_scheduler_cancel_pending_marks_pending_rows_done() {
+    async fn usdc_scheduler_cancel_due_marks_due_rows_done() {
         let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
         let scheduler = UsdcRebalancingCheckScheduler::new(&apalis_pool);
 
@@ -3050,12 +3459,57 @@ mod tests {
         scheduler.enqueue_check().await;
         assert_eq!(count_pending_usdc_check_jobs(&apalis_pool).await, 2);
 
-        scheduler.cancel_pending().await;
+        scheduler.cancel_due().await;
 
         assert_eq!(
             count_pending_usdc_check_jobs(&apalis_pool).await,
             0,
-            "cancel_pending must drain all pending rows"
+            "cancel_due must drain every pending row that is due"
+        );
+    }
+
+    #[tokio::test]
+    async fn usdc_scheduler_cancel_due_keeps_delayed_rows() {
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let scheduler = UsdcRebalancingCheckScheduler::new(&apalis_pool);
+
+        scheduler.enqueue_check().await;
+        scheduler
+            .enqueue_check_after(Duration::from_secs(300))
+            .await;
+
+        scheduler.cancel_due().await;
+
+        assert_eq!(
+            (
+                count_pending_usdc_check_jobs(&apalis_pool).await,
+                count_usdc_checks_delayed_at_least(&apalis_pool, 290).await,
+            ),
+            (1, 1),
+            "only the delayed row is left"
+        );
+    }
+
+    #[tokio::test]
+    async fn usdc_scheduler_defer_pending_moves_rows_due_sooner_only() {
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let scheduler = UsdcRebalancingCheckScheduler::new(&apalis_pool);
+
+        scheduler.enqueue_check().await;
+        scheduler
+            .enqueue_check_after(Duration::from_secs(1000))
+            .await;
+
+        scheduler.defer_pending(Duration::from_secs(300)).await;
+
+        assert_eq!(
+            (
+                count_pending_usdc_check_jobs(&apalis_pool).await,
+                count_usdc_checks_delayed_at_least(&apalis_pool, 295).await,
+                count_usdc_checks_delayed_at_least(&apalis_pool, 990).await,
+            ),
+            (2, 2, 1),
+            "the due row moves to the deferral, the later row keeps its time"
         );
     }
 
@@ -3065,7 +3519,7 @@ mod tests {
         let scheduler = UsdcRebalancingCheckScheduler::new(&apalis_pool);
 
         scheduler.enqueue_check().await;
-        scheduler.cancel_pending().await;
+        scheduler.cancel_due().await;
         scheduler.enqueue_check().await;
 
         assert_eq!(count_pending_usdc_check_jobs(&apalis_pool).await, 1);

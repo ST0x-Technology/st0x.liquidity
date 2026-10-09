@@ -9,10 +9,11 @@ use alloy::primitives::Address;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use thiserror::Error;
+use tracing::error;
 
 use super::{BroadcastingInventory, divergence::ReconciliationGeneration};
 
@@ -151,13 +152,37 @@ pub(crate) struct InventorySnapshot {
     pub(crate) base_wallet_unwrapped_equity: BTreeMap<Symbol, FractionalShares>,
     /// Latest Base wallet wrapped equity token balances
     pub(crate) base_wallet_wrapped_equity: BTreeMap<Symbol, FractionalShares>,
-    /// Equity currently in-flight via mints (shares leaving Alpaca for issuer)
+    /// Latest wallet unwrapped equity token balances of every other chain.
+    /// Base stays in `base_wallet_unwrapped_equity`, so a binary that
+    /// predates these maps still reads Base's wallet.
+    #[serde(default)]
+    pub(crate) wallet_unwrapped_equity: BTreeMap<Chain, BTreeMap<Symbol, FractionalShares>>,
+    /// Latest wallet wrapped equity token balances of every chain but Base.
+    #[serde(default)]
+    pub(crate) wallet_wrapped_equity: BTreeMap<Chain, BTreeMap<Symbol, FractionalShares>>,
+    /// Equity currently in-flight via mints on every chain (shares leaving
+    /// Alpaca for issuer)
     pub(crate) inflight_mints: BTreeMap<Symbol, FractionalShares>,
-    /// Equity currently in-flight via redemptions (tokens sent to Alpaca)
+    /// Equity currently in-flight via redemptions on Base (tokens sent to
+    /// Alpaca)
     pub(crate) inflight_redemptions: BTreeMap<Symbol, FractionalShares>,
     /// Time the current inflight equity provider snapshot was fetched.
     #[serde(default)]
     pub(crate) inflight_equity_fetched_at: Option<DateTime<Utc>>,
+    /// Whether Base redemption totals were fetched with chain-scoped ownership.
+    #[serde(default)]
+    pub(crate) base_redemptions_chain_scoped: bool,
+    /// Equity in-flight via redemptions on every chain but Base. Base stays
+    /// in `inflight_redemptions`, so a binary that predates this map still
+    /// reads Base's. That binary ignores this map through serde defaults, so
+    /// once compaction erases the `ChainInflightRedemptions` events it starts
+    /// normally and puts other chains' redemptions back on Base: rolling
+    /// back below the release that added this map is unsupported.
+    #[serde(default)]
+    pub(crate) chain_inflight_redemptions: BTreeMap<Chain, BTreeMap<Symbol, FractionalShares>>,
+    /// Time each chain's entry in `chain_inflight_redemptions` was fetched.
+    #[serde(default)]
+    pub(crate) chain_inflight_redemptions_fetched_at: BTreeMap<Chain, DateTime<Utc>>,
     /// When this snapshot was last updated
     pub(crate) last_updated: DateTime<Utc>,
 }
@@ -203,8 +228,13 @@ impl EventSourced for InventorySnapshot {
             inflight_mints: BTreeMap::new(),
             inflight_redemptions: BTreeMap::new(),
             inflight_equity_fetched_at: None,
+            base_redemptions_chain_scoped: false,
+            chain_inflight_redemptions: BTreeMap::new(),
+            chain_inflight_redemptions_fetched_at: BTreeMap::new(),
             base_wallet_unwrapped_equity: BTreeMap::new(),
             base_wallet_wrapped_equity: BTreeMap::new(),
+            wallet_unwrapped_equity: BTreeMap::new(),
+            wallet_wrapped_equity: BTreeMap::new(),
             last_updated: event.timestamp(),
         };
         snapshot.apply_event(event);
@@ -223,7 +253,7 @@ impl EventSourced for InventorySnapshot {
     ) -> Result<Vec<Self::Event>, Self::Error> {
         use InventorySnapshotCommand::*;
         let now = Utc::now();
-        Ok(vec![match command {
+        let event = match command {
             OnchainEquity {
                 chain,
                 balances,
@@ -348,20 +378,28 @@ impl EventSourced for InventorySnapshot {
                 mints,
                 redemptions,
                 fetched_at,
+                base_redemptions_chain_scoped: true,
             },
-            BaseWalletUnwrappedEquity { balances } => {
-                InventorySnapshotEvent::BaseWalletUnwrappedEquity {
-                    balances,
-                    fetched_at: now,
-                }
+            ChainWalletUnwrappedEquity { chain, balances } => {
+                InventorySnapshotEvent::wallet_unwrapped_equity(chain, balances, now)
             }
-            BaseWalletWrappedEquity { balances } => {
-                InventorySnapshotEvent::BaseWalletWrappedEquity {
-                    balances,
-                    fetched_at: now,
-                }
+            ChainWalletWrappedEquity { chain, balances } => {
+                InventorySnapshotEvent::wallet_wrapped_equity(chain, balances, now)
             }
-        }])
+            ChainInflightRedemptions {
+                redemptions,
+                fetched_at,
+            } => {
+                return Ok(chain_inflight_redemption_events(
+                    &BTreeMap::new(),
+                    &BTreeMap::new(),
+                    redemptions,
+                    fetched_at,
+                ));
+            }
+        };
+
+        Ok(vec![event])
     }
 
     async fn transition(
@@ -545,35 +583,103 @@ impl EventSourced for InventorySnapshot {
                     .inflight_equity_fetched_at
                     .is_some_and(|current| fetched_at <= current);
 
-                if maps_unchanged && (nothing_inflight || fetch_not_newer) {
+                if self.base_redemptions_chain_scoped
+                    && maps_unchanged
+                    && (nothing_inflight || fetch_not_newer)
+                {
                     return Ok(vec![]);
                 }
                 Ok(vec![InventorySnapshotEvent::InflightEquity {
                     mints,
                     redemptions,
                     fetched_at,
+                    base_redemptions_chain_scoped: true,
                 }])
             }
-            BaseWalletUnwrappedEquity { balances } => {
-                if self.base_wallet_unwrapped_equity == balances {
-                    return Ok(vec![]);
-                }
-                Ok(vec![InventorySnapshotEvent::BaseWalletUnwrappedEquity {
-                    balances,
-                    fetched_at: now,
-                }])
+            ChainWalletUnwrappedEquity { chain, balances } => {
+                Ok(self.wallet_unwrapped_equity_events(chain, balances, now))
             }
-            BaseWalletWrappedEquity { balances } => {
-                if self.base_wallet_wrapped_equity == balances {
-                    return Ok(vec![]);
-                }
-                Ok(vec![InventorySnapshotEvent::BaseWalletWrappedEquity {
-                    balances,
-                    fetched_at: now,
-                }])
+            ChainWalletWrappedEquity { chain, balances } => {
+                Ok(self.wallet_wrapped_equity_events(chain, balances, now))
             }
+            ChainInflightRedemptions {
+                redemptions,
+                fetched_at,
+            } => Ok(chain_inflight_redemption_events(
+                &self.chain_inflight_redemptions,
+                &self.chain_inflight_redemptions_fetched_at,
+                redemptions,
+                fetched_at,
+            )),
         }
     }
+}
+
+/// One `ChainInflightRedemptions` event per chain whose pending redemptions
+/// changed, including a chain whose last pending redemption disappeared.
+/// Mirrors the `InflightEquity` dedupe per chain: an unchanged chain emits
+/// only when something is still pending there and the fetch is newer.
+fn chain_inflight_redemption_events(
+    stored: &BTreeMap<Chain, BTreeMap<Symbol, FractionalShares>>,
+    stored_fetched_at: &BTreeMap<Chain, DateTime<Utc>>,
+    mut redemptions: BTreeMap<Chain, BTreeMap<Symbol, FractionalShares>>,
+    fetched_at: DateTime<Utc>,
+) -> Vec<InventorySnapshotEvent> {
+    if let Some(base) = redemptions.remove(&Chain::Base) {
+        error!(
+            target: "inventory",
+            ?base,
+            "Ignoring Base redemptions sent as another chain's; Base records InflightEquity"
+        );
+    }
+
+    let chains: BTreeSet<Chain> = redemptions
+        .keys()
+        .chain(stored.keys())
+        .copied()
+        .filter(|chain| *chain != Chain::Base)
+        .collect();
+
+    chains
+        .into_iter()
+        .filter_map(|chain| {
+            let current = redemptions.remove(&chain).unwrap_or_default();
+            let unchanged = stored
+                .get(&chain)
+                .map_or(current.is_empty(), |previous| *previous == current);
+            let fetch_not_newer = stored_fetched_at
+                .get(&chain)
+                .is_some_and(|previous| fetched_at <= *previous);
+
+            if unchanged && (current.is_empty() || fetch_not_newer) {
+                return None;
+            }
+
+            Some(InventorySnapshotEvent::ChainInflightRedemptions {
+                chain,
+                redemptions: current,
+                fetched_at,
+            })
+        })
+        .collect()
+}
+
+/// Whether a wallet read on `chain` equals the stored balances. Each chain
+/// compares against its own wallet only; a never-polled chain equals an
+/// empty read.
+fn wallet_equity_unchanged(
+    chain: Chain,
+    base: &BTreeMap<Symbol, FractionalShares>,
+    other_chains: &BTreeMap<Chain, BTreeMap<Symbol, FractionalShares>>,
+    balances: &BTreeMap<Symbol, FractionalShares>,
+) -> bool {
+    if chain == Chain::Base {
+        return base == balances;
+    }
+
+    other_chains
+        .get(&chain)
+        .map_or(balances.is_empty(), |current| current == balances)
 }
 
 impl InventorySnapshot {
@@ -601,6 +707,46 @@ impl InventorySnapshot {
             fetched_at,
             block_number,
         }]
+    }
+
+    fn wallet_unwrapped_equity_events(
+        &self,
+        chain: Chain,
+        balances: BTreeMap<Symbol, FractionalShares>,
+        fetched_at: DateTime<Utc>,
+    ) -> Vec<InventorySnapshotEvent> {
+        if wallet_equity_unchanged(
+            chain,
+            &self.base_wallet_unwrapped_equity,
+            &self.wallet_unwrapped_equity,
+            &balances,
+        ) {
+            return vec![];
+        }
+
+        vec![InventorySnapshotEvent::wallet_unwrapped_equity(
+            chain, balances, fetched_at,
+        )]
+    }
+
+    fn wallet_wrapped_equity_events(
+        &self,
+        chain: Chain,
+        balances: BTreeMap<Symbol, FractionalShares>,
+        fetched_at: DateTime<Utc>,
+    ) -> Vec<InventorySnapshotEvent> {
+        if wallet_equity_unchanged(
+            chain,
+            &self.base_wallet_wrapped_equity,
+            &self.wallet_wrapped_equity,
+            &balances,
+        ) {
+            return vec![];
+        }
+
+        vec![InventorySnapshotEvent::wallet_wrapped_equity(
+            chain, balances, fetched_at,
+        )]
     }
 
     fn onchain_usdc_events(
@@ -631,10 +777,15 @@ impl InventorySnapshot {
         let now = Utc::now();
         let mut view = inventory.write().await;
         let mut event_count = 0usize;
+        let legacy_redemptions = !self.base_redemptions_chain_scoped;
 
         self.each_hydration_event(|event| {
             event_count += 1;
-            if let Ok(updated) = view.clone().apply_snapshot_event(&event, now) {
+            if let Ok(updated) = view.clone().apply_snapshot_hydration_event_with_format(
+                &event,
+                now,
+                legacy_redemptions,
+            ) {
                 *view = updated;
             }
         });
@@ -748,6 +899,26 @@ impl InventorySnapshot {
             });
         }
 
+        for (chain, balances) in &self.wallet_unwrapped_equity {
+            if !balances.is_empty() {
+                emit(InventorySnapshotEvent::ChainWalletUnwrappedEquity {
+                    chain: *chain,
+                    balances: balances.clone(),
+                    fetched_at,
+                });
+            }
+        }
+
+        for (chain, balances) in &self.wallet_wrapped_equity {
+            if !balances.is_empty() {
+                emit(InventorySnapshotEvent::ChainWalletWrappedEquity {
+                    chain: *chain,
+                    balances: balances.clone(),
+                    fetched_at,
+                });
+            }
+        }
+
         if let Some(fetched_at) = self.inflight_equity_fetched_at
             && (!self.inflight_mints.is_empty() || !self.inflight_redemptions.is_empty())
         {
@@ -755,7 +926,20 @@ impl InventorySnapshot {
                 mints: self.inflight_mints.clone(),
                 redemptions: self.inflight_redemptions.clone(),
                 fetched_at,
+                base_redemptions_chain_scoped: self.base_redemptions_chain_scoped,
             });
+        }
+
+        for (chain, redemptions) in &self.chain_inflight_redemptions {
+            if let Some(fetched_at) = self.chain_inflight_redemptions_fetched_at.get(chain)
+                && !redemptions.is_empty()
+            {
+                emit(InventorySnapshotEvent::ChainInflightRedemptions {
+                    chain: *chain,
+                    redemptions: redemptions.clone(),
+                    fetched_at: *fetched_at,
+                });
+            }
         }
     }
 
@@ -900,16 +1084,43 @@ impl InventorySnapshot {
                 mints,
                 redemptions,
                 fetched_at,
+                base_redemptions_chain_scoped,
             } => {
                 self.inflight_mints = mints.clone();
                 self.inflight_redemptions = redemptions.clone();
                 self.inflight_equity_fetched_at = Some(*fetched_at);
+                self.base_redemptions_chain_scoped = *base_redemptions_chain_scoped;
             }
             InventorySnapshotEvent::BaseWalletUnwrappedEquity { balances, .. } => {
                 self.base_wallet_unwrapped_equity = balances.clone();
             }
             InventorySnapshotEvent::BaseWalletWrappedEquity { balances, .. } => {
                 self.base_wallet_wrapped_equity = balances.clone();
+            }
+            InventorySnapshotEvent::ChainWalletUnwrappedEquity {
+                chain, balances, ..
+            } => {
+                self.wallet_unwrapped_equity
+                    .insert(*chain, balances.clone());
+            }
+            InventorySnapshotEvent::ChainWalletWrappedEquity {
+                chain, balances, ..
+            } => {
+                self.wallet_wrapped_equity.insert(*chain, balances.clone());
+            }
+            InventorySnapshotEvent::ChainInflightRedemptions {
+                chain,
+                redemptions,
+                fetched_at,
+            } => {
+                if redemptions.is_empty() {
+                    self.chain_inflight_redemptions.remove(chain);
+                } else {
+                    self.chain_inflight_redemptions
+                        .insert(*chain, redemptions.clone());
+                }
+                self.chain_inflight_redemptions_fetched_at
+                    .insert(*chain, *fetched_at);
             }
         }
     }
@@ -1031,20 +1242,33 @@ pub(crate) enum InventorySnapshotCommand {
     BaseWalletUsdc {
         usdc_balance: Usdc,
     },
-    BaseWalletUnwrappedEquity {
+    /// Unwrapped equity token balances of the bot wallet on `chain`. Base's
+    /// read records the `BaseWalletUnwrappedEquity` event.
+    ChainWalletUnwrappedEquity {
+        chain: Chain,
         balances: BTreeMap<Symbol, FractionalShares>,
     },
-    BaseWalletWrappedEquity {
+    /// Wrapped equity token balances of the bot wallet on `chain`. Base's
+    /// read records the `BaseWalletWrappedEquity` event.
+    ChainWalletWrappedEquity {
+        chain: Chain,
         balances: BTreeMap<Symbol, FractionalShares>,
     },
     /// Equity currently in-flight through Alpaca's tokenization pipeline.
     /// Fetched by polling Alpaca's `list_requests` endpoint for pending requests.
     InflightEquity {
-        /// Pending mints by symbol (shares leaving Alpaca for issuer).
+        /// Pending mints by symbol on every chain (shares leaving Alpaca for
+        /// issuer).
         mints: BTreeMap<Symbol, FractionalShares>,
-        /// Pending redemptions by symbol (tokens sent to Alpaca).
+        /// Pending redemptions on Base by symbol (tokens sent to Alpaca).
         redemptions: BTreeMap<Symbol, FractionalShares>,
         /// Time the provider pending-request response was observed.
+        fetched_at: DateTime<Utc>,
+    },
+    /// Pending redemptions on every chain but Base, from the same provider
+    /// poll as `InflightEquity`. A chain absent from the map has none.
+    ChainInflightRedemptions {
+        redemptions: BTreeMap<Chain, BTreeMap<Symbol, FractionalShares>>,
         fetched_at: DateTime<Utc>,
     },
 }
@@ -1160,9 +1384,22 @@ pub(crate) enum InventorySnapshotEvent {
         fetched_at: DateTime<Utc>,
     },
     /// Equity currently in-flight through Alpaca's tokenization pipeline,
-    /// fetched by polling Alpaca's `list_requests` endpoint.
+    /// fetched by polling Alpaca's `list_requests` endpoint: mints on every
+    /// chain, redemptions on Base.
     InflightEquity {
         mints: BTreeMap<Symbol, FractionalShares>,
+        redemptions: BTreeMap<Symbol, FractionalShares>,
+        #[serde(default)]
+        base_redemptions_chain_scoped: bool,
+        fetched_at: DateTime<Utc>,
+    },
+    /// Redemptions in-flight on a chain other than Base. A separate variant
+    /// for the same reason as `ChainWalletUnwrappedEquity`: an older binary
+    /// fails on it instead of replaying the chain's redemptions onto Base.
+    /// That guard lasts only until compaction erases the event (see
+    /// `InventorySnapshot::chain_inflight_redemptions`).
+    ChainInflightRedemptions {
+        chain: Chain,
         redemptions: BTreeMap<Symbol, FractionalShares>,
         fetched_at: DateTime<Utc>,
     },
@@ -1174,9 +1411,67 @@ pub(crate) enum InventorySnapshotEvent {
         balances: BTreeMap<Symbol, FractionalShares>,
         fetched_at: DateTime<Utc>,
     },
+    /// Unwrapped equity in the bot wallet on a chain other than Base. A
+    /// separate variant rather than a `chain` field on
+    /// `BaseWalletUnwrappedEquity`: a binary that ignores the unknown field
+    /// would replay another chain's wallet onto Base, while an unknown
+    /// variant fails loudly.
+    ChainWalletUnwrappedEquity {
+        chain: Chain,
+        balances: BTreeMap<Symbol, FractionalShares>,
+        fetched_at: DateTime<Utc>,
+    },
+    /// Wrapped equity in the bot wallet on a chain other than Base.
+    ChainWalletWrappedEquity {
+        chain: Chain,
+        balances: BTreeMap<Symbol, FractionalShares>,
+        fetched_at: DateTime<Utc>,
+    },
 }
 
 impl InventorySnapshotEvent {
+    /// The unwrapped wallet event for `chain`: Base keeps its original
+    /// variant, every other chain names itself.
+    pub(crate) fn wallet_unwrapped_equity(
+        chain: Chain,
+        balances: BTreeMap<Symbol, FractionalShares>,
+        fetched_at: DateTime<Utc>,
+    ) -> Self {
+        if chain == Chain::Base {
+            Self::BaseWalletUnwrappedEquity {
+                balances,
+                fetched_at,
+            }
+        } else {
+            Self::ChainWalletUnwrappedEquity {
+                chain,
+                balances,
+                fetched_at,
+            }
+        }
+    }
+
+    /// The wrapped wallet event for `chain`, as for
+    /// [`Self::wallet_unwrapped_equity`].
+    pub(crate) fn wallet_wrapped_equity(
+        chain: Chain,
+        balances: BTreeMap<Symbol, FractionalShares>,
+        fetched_at: DateTime<Utc>,
+    ) -> Self {
+        if chain == Chain::Base {
+            Self::BaseWalletWrappedEquity {
+                balances,
+                fetched_at,
+            }
+        } else {
+            Self::ChainWalletWrappedEquity {
+                chain,
+                balances,
+                fetched_at,
+            }
+        }
+    }
+
     pub(crate) fn timestamp(&self) -> DateTime<Utc> {
         match self {
             Self::OnchainEquity { fetched_at, .. }
@@ -1194,7 +1489,10 @@ impl InventorySnapshotEvent {
             | Self::BaseWalletUsdc { fetched_at, .. }
             | Self::BaseWalletUnwrappedEquity { fetched_at, .. }
             | Self::BaseWalletWrappedEquity { fetched_at, .. }
-            | Self::InflightEquity { fetched_at, .. } => *fetched_at,
+            | Self::ChainWalletUnwrappedEquity { fetched_at, .. }
+            | Self::ChainWalletWrappedEquity { fetched_at, .. }
+            | Self::InflightEquity { fetched_at, .. }
+            | Self::ChainInflightRedemptions { fetched_at, .. } => *fetched_at,
         }
     }
 }
@@ -1233,7 +1531,16 @@ impl DomainEvent for InventorySnapshotEvent {
             Self::BaseWalletWrappedEquity { .. } => {
                 "InventorySnapshotEvent::BaseWalletWrappedEquity".to_string()
             }
+            Self::ChainWalletUnwrappedEquity { .. } => {
+                "InventorySnapshotEvent::ChainWalletUnwrappedEquity".to_string()
+            }
+            Self::ChainWalletWrappedEquity { .. } => {
+                "InventorySnapshotEvent::ChainWalletWrappedEquity".to_string()
+            }
             Self::InflightEquity { .. } => "InventorySnapshotEvent::InflightEquity".to_string(),
+            Self::ChainInflightRedemptions { .. } => {
+                "InventorySnapshotEvent::ChainInflightRedemptions".to_string()
+            }
         }
     }
 
@@ -2049,7 +2356,8 @@ mod tests {
 
         let events = TestHarness::<InventorySnapshot>::with(())
             .given_no_previous_events()
-            .when(InventorySnapshotCommand::BaseWalletUnwrappedEquity {
+            .when(InventorySnapshotCommand::ChainWalletUnwrappedEquity {
+                chain: Chain::Base,
                 balances: balances.clone(),
             })
             .await
@@ -2082,7 +2390,8 @@ mod tests {
                 balances: old_balances,
                 fetched_at: Utc::now(),
             }])
-            .when(InventorySnapshotCommand::BaseWalletUnwrappedEquity {
+            .when(InventorySnapshotCommand::ChainWalletUnwrappedEquity {
+                chain: Chain::Base,
                 balances: new_balances.clone(),
             })
             .await
@@ -2112,7 +2421,10 @@ mod tests {
                 balances: balances.clone(),
                 fetched_at: Utc::now(),
             }])
-            .when(InventorySnapshotCommand::BaseWalletUnwrappedEquity { balances })
+            .when(InventorySnapshotCommand::ChainWalletUnwrappedEquity {
+                chain: Chain::Base,
+                balances,
+            })
             .await
             .events();
 
@@ -2142,7 +2454,8 @@ mod tests {
 
         let events = TestHarness::<InventorySnapshot>::with(())
             .given_no_previous_events()
-            .when(InventorySnapshotCommand::BaseWalletWrappedEquity {
+            .when(InventorySnapshotCommand::ChainWalletWrappedEquity {
+                chain: Chain::Base,
                 balances: balances.clone(),
             })
             .await
@@ -2175,7 +2488,8 @@ mod tests {
                 balances: old_balances,
                 fetched_at: Utc::now(),
             }])
-            .when(InventorySnapshotCommand::BaseWalletWrappedEquity {
+            .when(InventorySnapshotCommand::ChainWalletWrappedEquity {
+                chain: Chain::Base,
                 balances: new_balances.clone(),
             })
             .await
@@ -2205,7 +2519,10 @@ mod tests {
                 balances: balances.clone(),
                 fetched_at: Utc::now(),
             }])
-            .when(InventorySnapshotCommand::BaseWalletWrappedEquity { balances })
+            .when(InventorySnapshotCommand::ChainWalletWrappedEquity {
+                chain: Chain::Base,
+                balances,
+            })
             .await
             .events();
 
@@ -2225,7 +2542,8 @@ mod tests {
                 balances: old_balances,
                 fetched_at: Utc::now(),
             }])
-            .when(InventorySnapshotCommand::BaseWalletWrappedEquity {
+            .when(InventorySnapshotCommand::ChainWalletWrappedEquity {
+                chain: Chain::Base,
                 balances: new_balances.clone(),
             })
             .await
@@ -2243,6 +2561,232 @@ mod tests {
             );
         };
         assert_eq!(*event_balances, new_balances);
+    }
+
+    #[tokio::test]
+    async fn another_chains_wallet_read_records_its_own_event_and_leaves_base_unchanged() {
+        let base_balances = BTreeMap::from([(test_symbol("AAPL"), test_shares(5))]);
+        let robinhood_balances = BTreeMap::from([(test_symbol("AAPL"), test_shares(7))]);
+
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![InventorySnapshotEvent::BaseWalletUnwrappedEquity {
+                balances: base_balances.clone(),
+                fetched_at: Utc::now(),
+            }])
+            .when(InventorySnapshotCommand::ChainWalletUnwrappedEquity {
+                chain: Chain::Robinhood,
+                balances: robinhood_balances.clone(),
+            })
+            .await
+            .events();
+
+        let [
+            InventorySnapshotEvent::ChainWalletUnwrappedEquity {
+                chain: Chain::Robinhood,
+                balances,
+                ..
+            },
+        ] = events.as_slice()
+        else {
+            panic!("expected one Robinhood wallet event, got {events:?}");
+        };
+        assert_eq!(*balances, robinhood_balances);
+
+        let snapshot = replay::<InventorySnapshot>(vec![
+            InventorySnapshotEvent::BaseWalletUnwrappedEquity {
+                balances: base_balances.clone(),
+                fetched_at: Utc::now(),
+            },
+            events[0].clone(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(snapshot.base_wallet_unwrapped_equity, base_balances);
+        assert_eq!(
+            snapshot.wallet_unwrapped_equity,
+            BTreeMap::from([(Chain::Robinhood, robinhood_balances)])
+        );
+    }
+
+    #[tokio::test]
+    async fn base_wallet_read_still_dedupes_after_another_chains_wallet_event() {
+        let base_balances = BTreeMap::from([(test_symbol("AAPL"), test_shares(5))]);
+
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![
+                InventorySnapshotEvent::BaseWalletWrappedEquity {
+                    balances: base_balances.clone(),
+                    fetched_at: Utc::now(),
+                },
+                InventorySnapshotEvent::ChainWalletWrappedEquity {
+                    chain: Chain::Robinhood,
+                    balances: BTreeMap::from([(test_symbol("AAPL"), test_shares(9))]),
+                    fetched_at: Utc::now(),
+                },
+            ])
+            .when(InventorySnapshotCommand::ChainWalletWrappedEquity {
+                chain: Chain::Base,
+                balances: base_balances,
+            })
+            .await
+            .events();
+
+        assert!(events.is_empty(), "unchanged Base read emitted {events:?}");
+    }
+
+    #[tokio::test]
+    async fn another_chains_unchanged_wallet_read_emits_nothing() {
+        let balances = BTreeMap::from([(test_symbol("AAPL"), test_shares(3))]);
+
+        let unchanged = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![InventorySnapshotEvent::ChainWalletWrappedEquity {
+                chain: Chain::Robinhood,
+                balances: balances.clone(),
+                fetched_at: Utc::now(),
+            }])
+            .when(InventorySnapshotCommand::ChainWalletWrappedEquity {
+                chain: Chain::Robinhood,
+                balances: balances.clone(),
+            })
+            .await
+            .events();
+        assert!(unchanged.is_empty(), "unchanged read emitted {unchanged:?}");
+
+        let never_polled_empty = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![InventorySnapshotEvent::BaseWalletWrappedEquity {
+                balances,
+                fetched_at: Utc::now(),
+            }])
+            .when(InventorySnapshotCommand::ChainWalletWrappedEquity {
+                chain: Chain::Robinhood,
+                balances: BTreeMap::new(),
+            })
+            .await
+            .events();
+        assert!(
+            never_polled_empty.is_empty(),
+            "an empty first read emitted {never_polled_empty:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chain_wallet_read_on_base_records_the_base_event() {
+        let balances = BTreeMap::from([(test_symbol("AAPL"), test_shares(2))]);
+
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given_no_previous_events()
+            .when(InventorySnapshotCommand::ChainWalletUnwrappedEquity {
+                chain: Chain::Base,
+                balances: balances.clone(),
+            })
+            .await
+            .events();
+
+        assert_eq!(
+            events,
+            vec![InventorySnapshotEvent::BaseWalletUnwrappedEquity {
+                balances,
+                fetched_at: events[0].timestamp(),
+            }]
+        );
+    }
+
+    /// A stored snapshot written before other chains' wallets were tracked
+    /// has no per-chain wallet maps; it must load with them empty.
+    #[test]
+    fn snapshot_stored_before_per_chain_wallets_still_deserializes() {
+        let stored = json!({
+            "onchain_equity": {},
+            "onchain_usdc": {},
+            "offchain_equity": {},
+            "offchain_usd_cents": null,
+            "offchain_cash_buying_power_cents": null,
+            "ethereum_usdc": null,
+            "base_wallet_usdc": null,
+            "base_wallet_unwrapped_equity": {"AAPL": test_shares(4)},
+            "base_wallet_wrapped_equity": {},
+            "inflight_mints": {},
+            "inflight_redemptions": {},
+            "last_updated": "2026-01-01T00:00:00Z"
+        });
+
+        let snapshot: InventorySnapshot = serde_json::from_value(stored).unwrap();
+
+        assert_eq!(
+            snapshot.base_wallet_unwrapped_equity,
+            BTreeMap::from([(test_symbol("AAPL"), test_shares(4))])
+        );
+        assert!(snapshot.wallet_unwrapped_equity.is_empty());
+        assert!(snapshot.wallet_wrapped_equity.is_empty());
+    }
+
+    /// A snapshot holding Base and another chain's wallet keeps Base in the
+    /// fields an older binary reads, and hydrates each chain's wallet with
+    /// that chain's event.
+    #[test]
+    fn snapshot_with_another_chains_wallet_keeps_base_fields_and_hydrates_each_chain() {
+        let base_balances = BTreeMap::from([(test_symbol("AAPL"), test_shares(1))]);
+        let robinhood_unwrapped = BTreeMap::from([(test_symbol("AAPL"), test_shares(2))]);
+        let robinhood_wrapped = BTreeMap::from([(test_symbol("TSLA"), test_shares(3))]);
+
+        let snapshot = replay::<InventorySnapshot>(vec![
+            InventorySnapshotEvent::BaseWalletUnwrappedEquity {
+                balances: base_balances.clone(),
+                fetched_at: Utc::now(),
+            },
+            InventorySnapshotEvent::ChainWalletUnwrappedEquity {
+                chain: Chain::Robinhood,
+                balances: robinhood_unwrapped.clone(),
+                fetched_at: Utc::now(),
+            },
+            InventorySnapshotEvent::ChainWalletWrappedEquity {
+                chain: Chain::Robinhood,
+                balances: robinhood_wrapped.clone(),
+                fetched_at: Utc::now(),
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        let stored = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(
+            stored["base_wallet_unwrapped_equity"],
+            serde_json::to_value(&base_balances).unwrap()
+        );
+
+        let events = snapshot.hydration_events();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            InventorySnapshotEvent::BaseWalletUnwrappedEquity { balances, .. }
+                if *balances == base_balances
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            InventorySnapshotEvent::ChainWalletUnwrappedEquity {
+                chain: Chain::Robinhood,
+                balances,
+                ..
+            } if *balances == robinhood_unwrapped
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            InventorySnapshotEvent::ChainWalletWrappedEquity {
+                chain: Chain::Robinhood,
+                balances,
+                ..
+            } if *balances == robinhood_wrapped
+        )));
+
+        let rebuilt = replay::<InventorySnapshot>(events).unwrap().unwrap();
+        assert_eq!(rebuilt.base_wallet_unwrapped_equity, base_balances);
+        assert_eq!(
+            rebuilt.wallet_unwrapped_equity,
+            snapshot.wallet_unwrapped_equity
+        );
+        assert_eq!(
+            rebuilt.wallet_wrapped_equity,
+            snapshot.wallet_wrapped_equity
+        );
     }
 
     #[test]
@@ -2307,6 +2851,7 @@ mod tests {
                 mints: mints.clone(),
                 redemptions: initial_redemptions,
                 fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
             }])
             .when(InventorySnapshotCommand::InflightEquity {
                 mints: mints.clone(),
@@ -2338,6 +2883,7 @@ mod tests {
                 mints: mints.clone(),
                 redemptions: BTreeMap::new(),
                 fetched_at,
+                base_redemptions_chain_scoped: true,
             }])
             .when(InventorySnapshotCommand::InflightEquity {
                 mints,
@@ -2365,6 +2911,7 @@ mod tests {
                 mints: mints.clone(),
                 redemptions: BTreeMap::new(),
                 fetched_at: first_fetched_at,
+                base_redemptions_chain_scoped: true,
             }])
             .when(InventorySnapshotCommand::InflightEquity {
                 mints,
@@ -2391,6 +2938,7 @@ mod tests {
                 mints: BTreeMap::new(),
                 redemptions: BTreeMap::new(),
                 fetched_at: first_fetched_at,
+                base_redemptions_chain_scoped: true,
             }])
             .when(InventorySnapshotCommand::InflightEquity {
                 mints: BTreeMap::new(),
@@ -2418,6 +2966,7 @@ mod tests {
                 mints: mints.clone(),
                 redemptions: BTreeMap::new(),
                 fetched_at: current_fetched_at,
+                base_redemptions_chain_scoped: true,
             }])
             .when(InventorySnapshotCommand::InflightEquity {
                 mints,
@@ -2449,6 +2998,7 @@ mod tests {
                 mints: initial_mints,
                 redemptions: BTreeMap::new(),
                 fetched_at: current_fetched_at,
+                base_redemptions_chain_scoped: true,
             }])
             .when(InventorySnapshotCommand::InflightEquity {
                 mints: updated_mints.clone(),
@@ -2484,6 +3034,7 @@ mod tests {
                 mints: initial_mints,
                 redemptions: BTreeMap::new(),
                 fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
             }])
             .when(InventorySnapshotCommand::InflightEquity {
                 mints: updated_mints.clone(),
@@ -2515,6 +3066,7 @@ mod tests {
             mints: mints.clone(),
             redemptions: redemptions.clone(),
             fetched_at: Utc::now(),
+            base_redemptions_chain_scoped: true,
         }])
         .unwrap()
         .unwrap();
@@ -2596,11 +3148,13 @@ mod tests {
                 mints: first_mints,
                 redemptions: BTreeMap::new(),
                 fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
             },
             InventorySnapshotEvent::InflightEquity {
                 mints: second_mints.clone(),
                 redemptions: BTreeMap::new(),
                 fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
             },
         ])
         .unwrap()
@@ -2611,6 +3165,160 @@ mod tests {
             !snapshot.inflight_mints.contains_key(&test_symbol("AAPL")),
             "Previous inflight mints should be fully replaced"
         );
+    }
+
+    #[tokio::test]
+    async fn chain_inflight_redemptions_emit_disappearance_without_touching_base() {
+        let now = Utc::now();
+        let symbol = test_symbol("AAPL");
+        let secondary = BTreeMap::from([(symbol.clone(), test_shares(7))]);
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![
+                InventorySnapshotEvent::InflightEquity {
+                    mints: BTreeMap::new(),
+                    redemptions: BTreeMap::from([(symbol, test_shares(3))]),
+                    fetched_at: now,
+                    base_redemptions_chain_scoped: true,
+                },
+                InventorySnapshotEvent::ChainInflightRedemptions {
+                    chain: Chain::Robinhood,
+                    redemptions: secondary,
+                    fetched_at: now,
+                },
+            ])
+            .when(InventorySnapshotCommand::ChainInflightRedemptions {
+                redemptions: BTreeMap::new(),
+                fetched_at: now + chrono::Duration::seconds(1),
+            })
+            .await
+            .events();
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(&events[0], InventorySnapshotEvent::ChainInflightRedemptions {
+            chain: Chain::Robinhood, redemptions, ..
+        } if redemptions.is_empty())
+        );
+    }
+
+    #[test]
+    fn chain_inflight_snapshot_hydrates_only_on_its_chain_and_reads_legacy() {
+        let now = Utc::now();
+        let symbol = test_symbol("AAPL");
+        let snapshot = replay::<InventorySnapshot>(vec![
+            InventorySnapshotEvent::InflightEquity {
+                mints: BTreeMap::new(),
+                redemptions: BTreeMap::from([(symbol.clone(), test_shares(3))]),
+                fetched_at: now,
+                base_redemptions_chain_scoped: true,
+            },
+            InventorySnapshotEvent::ChainInflightRedemptions {
+                chain: Chain::Robinhood,
+                redemptions: BTreeMap::from([(symbol.clone(), test_shares(7))]),
+                fetched_at: now,
+            },
+        ])
+        .unwrap()
+        .unwrap();
+        let reconstructed = replay::<InventorySnapshot>(snapshot.hydration_events())
+            .unwrap()
+            .unwrap();
+        assert_eq!(reconstructed.inflight_redemptions[&symbol], test_shares(3));
+        assert_eq!(
+            reconstructed.chain_inflight_redemptions[&Chain::Robinhood][&symbol],
+            test_shares(7)
+        );
+        let mut legacy = serde_json::to_value(&snapshot).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("chain_inflight_redemptions");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("chain_inflight_redemptions_fetched_at");
+        let restored: InventorySnapshot = serde_json::from_value(legacy).unwrap();
+        assert!(restored.chain_inflight_redemptions.is_empty());
+        assert_eq!(restored.inflight_redemptions[&symbol], test_shares(3));
+    }
+
+    #[tokio::test]
+    async fn base_only_snapshot_restores_redemption_inflight_after_compaction() {
+        let symbol = test_symbol("AAPL");
+        let snapshot = replay::<InventorySnapshot>(vec![InventorySnapshotEvent::InflightEquity {
+            mints: BTreeMap::new(),
+            redemptions: BTreeMap::from([(symbol.clone(), test_shares(3))]),
+            fetched_at: Utc::now(),
+            base_redemptions_chain_scoped: true,
+        }])
+        .unwrap()
+        .unwrap();
+        assert!(snapshot.chain_inflight_redemptions_fetched_at.is_empty());
+        let stored = serde_json::to_value(&snapshot).unwrap();
+        let restored: InventorySnapshot = serde_json::from_value(stored.clone()).unwrap();
+        let (sender, _) = tokio::sync::broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            crate::inventory::InventoryView::default(),
+            sender,
+        ));
+        restored.hydrate_inventory(&inventory).await;
+        assert_eq!(
+            inventory.read().await.equity_inflight_at(
+                &symbol,
+                crate::inventory::Venue::MarketMaking,
+                Chain::Base
+            ),
+            Some(test_shares(3))
+        );
+
+        let mut legacy = stored;
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("base_redemptions_chain_scoped");
+        let legacy: InventorySnapshot = serde_json::from_value(legacy).unwrap();
+        let (sender, _) = tokio::sync::broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            crate::inventory::InventoryView::default(),
+            sender,
+        ));
+        legacy.hydrate_inventory(&inventory).await;
+        assert_eq!(
+            inventory.read().await.equity_inflight_at(
+                &symbol,
+                crate::inventory::Venue::MarketMaking,
+                Chain::Base
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn first_chain_scoped_poll_persists_the_format_even_when_empty() {
+        let now = Utc::now();
+        let event = InventorySnapshotEvent::InflightEquity {
+            mints: BTreeMap::new(),
+            redemptions: BTreeMap::new(),
+            fetched_at: now,
+            base_redemptions_chain_scoped: false,
+        };
+        let mut json = serde_json::to_value(&event).unwrap();
+        json["InflightEquity"]
+            .as_object_mut()
+            .unwrap()
+            .remove("base_redemptions_chain_scoped");
+        let legacy: InventorySnapshotEvent = serde_json::from_value(json).unwrap();
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![legacy])
+            .when(InventorySnapshotCommand::InflightEquity {
+                mints: BTreeMap::new(),
+                redemptions: BTreeMap::new(),
+                fetched_at: now,
+            })
+            .await
+            .events();
+        assert_eq!(events.len(), 1);
+        let snapshot = replay::<InventorySnapshot>(events).unwrap().unwrap();
+        assert!(snapshot.base_redemptions_chain_scoped);
     }
 
     #[test]
@@ -2634,9 +3342,14 @@ mod tests {
             base_wallet_usdc: None,
             base_wallet_unwrapped_equity: BTreeMap::new(),
             base_wallet_wrapped_equity: BTreeMap::new(),
+            wallet_unwrapped_equity: BTreeMap::new(),
+            wallet_wrapped_equity: BTreeMap::new(),
             inflight_mints: BTreeMap::new(),
             inflight_redemptions: BTreeMap::new(),
+            chain_inflight_redemptions: BTreeMap::new(),
+            chain_inflight_redemptions_fetched_at: BTreeMap::new(),
             inflight_equity_fetched_at: None,
+            base_redemptions_chain_scoped: false,
             last_updated: Utc::now(),
         };
 
@@ -2670,9 +3383,14 @@ mod tests {
             base_wallet_usdc: None,
             base_wallet_unwrapped_equity: BTreeMap::new(),
             base_wallet_wrapped_equity: BTreeMap::new(),
+            wallet_unwrapped_equity: BTreeMap::new(),
+            wallet_wrapped_equity: BTreeMap::new(),
             inflight_mints: inflight_mints.clone(),
             inflight_redemptions: BTreeMap::new(),
+            chain_inflight_redemptions: BTreeMap::new(),
+            chain_inflight_redemptions_fetched_at: BTreeMap::new(),
             inflight_equity_fetched_at: Some(now),
+            base_redemptions_chain_scoped: true,
             last_updated: now,
         };
 
@@ -2903,6 +3621,7 @@ mod tests {
                 mints: BTreeMap::from([(test_symbol("AAPL"), test_shares(10))]),
                 redemptions: BTreeMap::new(),
                 fetched_at: inflight_fetched_at,
+                base_redemptions_chain_scoped: true,
             }])
             .unwrap()
             .unwrap();

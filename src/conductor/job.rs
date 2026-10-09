@@ -454,6 +454,20 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
         Ok(TaskSink::push_task(&mut self.0, scheduled).await?)
     }
 
+    /// Schedules one delayed successor for a stable domain identity.
+    pub(crate) async fn push_idempotent_with_delay(
+        &mut self,
+        idempotency_key: &str,
+        task: Task,
+        delay: Duration,
+    ) -> Result<(), QueuePushError> {
+        let scheduled = TaskBuilder::<Task, SqliteContext, _>::new(task)
+            .with_idempotency_key(idempotency_key)
+            .run_after(delay)
+            .build();
+        Ok(TaskSink::push_task(&mut self.0, scheduled).await?)
+    }
+
     pub(crate) fn into_storage(self) -> Storage<Task> {
         self.0
     }
@@ -482,6 +496,60 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
                 %error,
                 job_type,
                 "Failed to cancel pending rows for job type",
+            );
+        }
+    }
+
+    /// Mark this queue's pending rows that are already due as `Done`, and keep
+    /// the ones scheduled for later. Used after a terminal domain event makes
+    /// the due work stale while delayed work stays valid.
+    pub(crate) async fn cancel_due_pending(&self) {
+        let job_type = self.queue_key();
+        if let Err(error) = sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Done' \
+             WHERE status = 'Pending' AND job_type = ? \
+             AND run_at <= strftime('%s', 'now')",
+        )
+        .bind(job_type)
+        .execute(self.pool())
+        .await
+        {
+            warn!(
+                target: "rebalance",
+                %error,
+                job_type,
+                "Failed to cancel due pending rows for job type",
+            );
+        }
+    }
+
+    /// Move this queue's pending rows so none runs sooner than `not_before`
+    /// from now. A row already scheduled later keeps its time.
+    pub(crate) async fn defer_pending(&self, not_before: Duration) {
+        let job_type = self.queue_key();
+        let Ok(not_before_secs) = i64::try_from(not_before.as_secs()) else {
+            warn!(
+                target: "rebalance",
+                ?not_before,
+                job_type,
+                "Deferral too long to schedule; leaving pending rows unchanged",
+            );
+            return;
+        };
+        if let Err(error) = sqlx_apalis::query(
+            "UPDATE Jobs SET run_at = MAX(run_at, strftime('%s', 'now') + ?) \
+             WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(not_before_secs)
+        .bind(job_type)
+        .execute(self.pool())
+        .await
+        {
+            warn!(
+                target: "rebalance",
+                %error,
+                job_type,
+                "Failed to defer pending rows for job type",
             );
         }
     }
@@ -899,6 +967,41 @@ impl fmt::Display for TaskIdentity {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
     }
+}
+
+/// Whether another job row of `JobPayload`'s type, other than
+/// `task_identity`, can still run for the same owner. A terminal attempt
+/// calls this before releasing what its job owns: a live sibling row still
+/// drives that owner, so the release would let a second transfer start beside
+/// it. A `Failed` row with attempts left is live; one that exhausted its
+/// budget is a dead letter.
+pub(crate) async fn has_live_sibling_job<JobPayload>(
+    pool: &SqlitePool,
+    task_identity: &TaskIdentity,
+    same_owner: impl Fn(&JobPayload) -> bool,
+) -> Result<bool, BoxDynError>
+where
+    JobPayload: DeserializeOwned,
+{
+    let payloads: Vec<Vec<u8>> = sqlx_apalis::query_scalar(
+        "SELECT job FROM Jobs \
+         WHERE id <> ? AND job_type = ? \
+         AND (status IN ('Pending', 'Queued', 'Running') \
+              OR (status = 'Failed' AND attempts < max_attempts))",
+    )
+    .bind(task_identity.as_str())
+    .bind(std::any::type_name::<JobPayload>())
+    .fetch_all(pool)
+    .await?;
+
+    for payload in payloads {
+        let sibling: JobPayload = serde_json::from_slice(&payload)?;
+        if same_owner(&sibling) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 /// Allows e2e tests to force the next job of a specific kind to

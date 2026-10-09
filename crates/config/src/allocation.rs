@@ -13,7 +13,7 @@ use st0x_finance::Usdc;
 use st0x_float_macro::float;
 use st0x_float_serde::{deserialize_float_from_number_or_string, format_float_with_fallback};
 
-use crate::{ChainConfig, ChainLifecycle, OperationMode, TradingConfig};
+use crate::{ChainConfig, ChainLifecycle, TradingConfig};
 
 static EXACT_ONE: LazyLock<Float> = LazyLock::new(|| float!(1));
 
@@ -105,9 +105,8 @@ impl AllocationConfig {
     /// Checks the targets against the chain tables: a target may name only a
     /// hedged chain, every rebalanced listing needs an effective target that is
     /// zero or above the deviation band, and per symbol those targets plus the
-    /// floor must not exceed 1. A listing
-    /// with rebalancing disabled is never planned, so it needs no target and
-    /// does not count.
+    /// floor must not exceed 1. Enabled and paused listings both need an
+    /// effective target. Disabled listings need no target and do not count.
     ///
     /// # Errors
     ///
@@ -137,7 +136,7 @@ impl AllocationConfig {
                 .equities
                 .symbols
                 .iter()
-                .filter(|(_, equity)| equity.rebalancing == OperationMode::Enabled)
+                .filter(|(_, equity)| equity.rebalancing.keeps_services())
                 .collect();
             listings.sort_by_key(|(symbol, _)| *symbol);
 

@@ -12,18 +12,21 @@ pub(crate) mod view;
 pub(crate) use st0x_config::ImbalanceThreshold;
 
 pub(crate) use broadcasting::BroadcastingInventory;
-pub(crate) use divergence::{InventoryDivergenceGate, InventoryDivergenceRecoveryCtx};
+pub(crate) use divergence::{
+    CashAdmission, InventoryDivergenceGate, InventoryDivergenceRecoveryCtx,
+};
 pub(crate) use freshness::PollFreshness;
 #[cfg(test)]
 pub(crate) use polling::PollerError;
 pub(crate) use polling::{
-    ChainVaultPolling, HedgeOrderGateReconciliationCtx, InventoryPollingService,
-    PendingRequestOwnership, PendingRequestOwnershipSnapshot, Poller, WalletPollingCtx,
+    ChainVaultPolling, EquityWalletPolling, HedgeOrderGateReconciliationCtx,
+    InventoryPollingService, PendingRequestOwnership, PendingRequestOwnershipSnapshot, Poller,
+    WalletPollingCtx,
 };
 pub(crate) use snapshot::{InventorySnapshot, InventorySnapshotId};
 pub(crate) use venue_balance::{InventoryError, VenueBalance};
 pub(crate) use view::{
-    EquityVenuesError, Imbalance, Inventory, InventoryScope, InventoryView, InventoryViewError,
-    Operator, TransferOp, Venue,
+    ActiveUsdcRebalance, EquityVenuesError, Imbalance, Inventory, InventoryScope, InventoryView,
+    InventoryViewError, Operator, TransferOp, Venue,
 };
 pub use view::{PortfolioAsset, PortfolioBalanceRow, PortfolioLocation};

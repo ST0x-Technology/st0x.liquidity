@@ -17,18 +17,22 @@ mod order_poller;
 mod pricing;
 mod rebalancing;
 pub mod registry;
+pub mod registry_state;
 mod telemetry;
 mod threshold;
 mod trading_schedule;
 mod wallet;
 
-pub use alerts::{AlertsAssemblyError, AlertsConfig, AlertsCtx, LEGACY_GAS_MONITORED_CHAINS};
+pub use alerts::{
+    AlertsAssemblyError, AlertsConfig, AlertsCtx, HedgeStallConfig, HedgeStallCtx,
+    LEGACY_GAS_MONITORED_CHAINS,
+};
 pub use allocation::{
     AllocationConfig, AllocationConfigError, AllocationCtx, DeviationBand, TargetShare,
 };
 pub use assets::{
     CashHedgePolicy, ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset,
-    EquityHedgePolicy, HedgedEquities, HedgingAssets, OperationMode,
+    EquityHedgePolicy, HedgedEquities, HedgingAssets, OperationMode, RebalancingMode,
 };
 pub use bot_gas_valuation::BotGasValuationConfig;
 pub use chain::{
@@ -46,8 +50,9 @@ pub use orchestrator::{OrchestratorAddresses, OrchestratorConfig, OrchestratorEr
 pub use order_poller::OrderPollerCtx;
 pub use pricing::{PricingApiKey, PricingAuth, PricingConfig, PricingCtx, PricingCtxError};
 pub use rebalancing::{
-    ALPACA_MINIMUM_WITHDRAWAL, ALPACA_TO_BASE_MINIMUM_TRANSFER, RebalancingConfig, RebalancingCtx,
-    RebalancingCtxError, UsdcCorridorConfig, UsdcCorridorCtx, UsdcRebalancing,
+    ALPACA_MINIMUM_WITHDRAWAL, ALPACA_TO_BASE_MINIMUM_TRANSFER, ManualCorridorError,
+    RebalancingConfig, RebalancingCtx, RebalancingCtxError, UsdcCorridorConfig, UsdcCorridorCtx,
+    UsdcCorridors, UsdcRebalancing, manual_transfer_corridor,
 };
 pub use registry::{RegistryLive, RegistrySource, TokenFile};
 pub use telemetry::{

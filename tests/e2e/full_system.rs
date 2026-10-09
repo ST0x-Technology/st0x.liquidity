@@ -35,7 +35,7 @@ use st0x_float_macro::float;
 use tokio::sync::broadcast;
 use tracing::{debug, info};
 
-use st0x_config::{BrokerCtx, Ctx, FileLogging, LogLevel, configure_sqlite_pool};
+use st0x_config::{BrokerCtx, ChainCtx, Ctx, FileLogging, LogLevel, configure_sqlite_pool};
 use st0x_config::{CashHedgePolicy, EquityHedgePolicy, HedgedEquities, HedgingAssets};
 use st0x_dto::Statement;
 use st0x_event_sorcery::Projection;
@@ -54,7 +54,7 @@ use st0x_hedge::mock_api::{
 };
 use st0x_hedge::{
     AllocationCtx, ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset,
-    ImbalanceThreshold, OperationMode, Position, RebalancingCtx,
+    ImbalanceThreshold, OperationMode, Position, RebalancingCtx, RebalancingMode,
     seed_simulated_equity_redemption_history, seed_simulated_hedge_latency_history,
     seed_simulated_mint_history, seed_simulated_usdc_rebalance_history,
 };
@@ -113,7 +113,7 @@ pub(crate) fn build_full_system_ctx<P: Provider + Clone>(
                     tokenized_equity_derivative: *wrapped,
                     vault_ids: equity_vault_ids.get(symbol).copied().into_iter().collect(),
                     trading: OperationMode::Enabled,
-                    rebalancing: OperationMode::Enabled,
+                    rebalancing: RebalancingMode::Enabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
                     target_share: None,
@@ -152,7 +152,7 @@ pub(crate) fn build_full_system_ctx<P: Provider + Clone>(
         ethereum_wallet,
     );
 
-    Ctx::for_test()
+    let mut ctx = Ctx::for_test()
         .database_url(db_path.display().to_string())
         .rpc_url(chain.endpoint().parse()?)
         .orderbook(chain.orderbook)
@@ -202,8 +202,15 @@ pub(crate) fn build_full_system_ctx<P: Provider + Clone>(
             chainlink_feed: chain.mock_chainlink_feed,
         })
         .alerts(test_alerts())
-        .call()
-        .map_err(Into::into)
+        .call()?;
+    // The USDC withdrawal tx lands on Ethereum and is checked at its depth.
+    ctx.chains.insert_transport(ChainCtx {
+        chain: Chain::Ethereum,
+        rpc_url: ethereum_endpoint.parse()?,
+        required_confirmations: 0,
+    });
+
+    Ok(ctx)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -601,6 +608,7 @@ realert_interval = 1
 
 [rebalancing]
 transfer_timeout_secs = 1800
+recovery_hold_alert_after_secs = 3600
 inventory_staleness_bound_secs = 300
 transfer_attempt_timeout_secs = 3600
 attestation_retry_deadline_secs = 86400
