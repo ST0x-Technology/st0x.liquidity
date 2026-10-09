@@ -15,15 +15,17 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::num::ParseFloatError;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use metrics_exporter_prometheus::formatting::{write_help_line, write_type_line};
 use rain_math_float::{Float, FloatError};
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use st0x_float_serde::format_float;
 
+pub(crate) mod inventory;
 pub(crate) mod settings;
 
 /// The process-wide store `/metrics` renders, like the recorder it sits next
@@ -49,6 +51,26 @@ pub(crate) enum LiqMetric {
     AssetCounterTrading,
     AssetExtendedHours,
     AssetRebalancing,
+    EquityOnchainAvailable,
+    EquityOffchainAvailable,
+    EquityInflightTotal,
+    EquityTotal,
+    EquityUnwrapped,
+    EquityWrapped,
+    EquityRatio,
+    UsdcOnchainAvailable,
+    UsdcOnchainInflight,
+    UsdcOffchainAvailable,
+    UsdcOffchainGross,
+    UsdcOffchainInflight,
+    UsdcAlpacaUsdc,
+    UsdcAlpacaTotal,
+    UsdcInflightTotal,
+    UsdcInflightEthereumWallet,
+    UsdcInflightBaseWallet,
+    UsdcTotal,
+    UsdcRatio,
+    UsdcRebalanceable,
     CollectorLastSuccessTsSeconds,
 }
 
@@ -56,7 +78,7 @@ impl LiqMetric {
     /// Every variant, for the catalog tests. A new variant needs an entry
     /// here and its name in the catalog test.
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 16] = [
+    pub(crate) const ALL: [Self; 36] = [
         Self::BotInfo,
         Self::BotStartTimestampSeconds,
         Self::SettingsInfo,
@@ -72,6 +94,26 @@ impl LiqMetric {
         Self::AssetCounterTrading,
         Self::AssetExtendedHours,
         Self::AssetRebalancing,
+        Self::EquityOnchainAvailable,
+        Self::EquityOffchainAvailable,
+        Self::EquityInflightTotal,
+        Self::EquityTotal,
+        Self::EquityUnwrapped,
+        Self::EquityWrapped,
+        Self::EquityRatio,
+        Self::UsdcOnchainAvailable,
+        Self::UsdcOnchainInflight,
+        Self::UsdcOffchainAvailable,
+        Self::UsdcOffchainGross,
+        Self::UsdcOffchainInflight,
+        Self::UsdcAlpacaUsdc,
+        Self::UsdcAlpacaTotal,
+        Self::UsdcInflightTotal,
+        Self::UsdcInflightEthereumWallet,
+        Self::UsdcInflightBaseWallet,
+        Self::UsdcTotal,
+        Self::UsdcRatio,
+        Self::UsdcRebalanceable,
         Self::CollectorLastSuccessTsSeconds,
     ];
 
@@ -92,6 +134,26 @@ impl LiqMetric {
             Self::AssetCounterTrading => "liq_asset_counter_trading",
             Self::AssetExtendedHours => "liq_asset_extended_hours",
             Self::AssetRebalancing => "liq_asset_rebalancing",
+            Self::EquityOnchainAvailable => "liq_equity_onchain_available",
+            Self::EquityOffchainAvailable => "liq_equity_offchain_available",
+            Self::EquityInflightTotal => "liq_equity_inflight_total",
+            Self::EquityTotal => "liq_equity_total",
+            Self::EquityUnwrapped => "liq_equity_unwrapped",
+            Self::EquityWrapped => "liq_equity_wrapped",
+            Self::EquityRatio => "liq_equity_ratio",
+            Self::UsdcOnchainAvailable => "liq_usdc_onchain_available",
+            Self::UsdcOnchainInflight => "liq_usdc_onchain_inflight",
+            Self::UsdcOffchainAvailable => "liq_usdc_offchain_available",
+            Self::UsdcOffchainGross => "liq_usdc_offchain_gross",
+            Self::UsdcOffchainInflight => "liq_usdc_offchain_inflight",
+            Self::UsdcAlpacaUsdc => "liq_usdc_alpaca_usdc",
+            Self::UsdcAlpacaTotal => "liq_usdc_alpaca_total",
+            Self::UsdcInflightTotal => "liq_usdc_inflight_total",
+            Self::UsdcInflightEthereumWallet => "liq_usdc_inflight_ethereum_wallet",
+            Self::UsdcInflightBaseWallet => "liq_usdc_inflight_base_wallet",
+            Self::UsdcTotal => "liq_usdc_total",
+            Self::UsdcRatio => "liq_usdc_ratio",
+            Self::UsdcRebalanceable => "liq_usdc_rebalanceable",
             Self::CollectorLastSuccessTsSeconds => "liq_collector_last_success_ts_seconds",
         }
     }
@@ -127,6 +189,39 @@ impl LiqMetric {
                  trading is disabled"
             }
             Self::AssetRebalancing => "1 when the symbol starts new rebalancing operations, else 0",
+            Self::EquityOnchainAvailable => "Primary chain vault shares available",
+            Self::EquityOffchainAvailable => "Broker shares available",
+            Self::EquityInflightTotal => "Primary chain vault plus broker shares in flight",
+            Self::EquityTotal => {
+                "Primary chain vault plus broker shares, available and in flight; excludes \
+                 wallet tokens and other chains"
+            }
+            Self::EquityUnwrapped => "Unwrapped tokens held in the Base wallet",
+            Self::EquityWrapped => "Wrapped tokens held in the Base wallet",
+            Self::EquityRatio => {
+                "Primary chain vault share of available shares; 0 when nothing is available"
+            }
+            Self::UsdcOnchainAvailable => "Primary chain vault settlement stable available",
+            Self::UsdcOnchainInflight => "Primary chain vault settlement stable in flight",
+            Self::UsdcOffchainAvailable => "Broker cash available after the reserve",
+            Self::UsdcOffchainGross => "Broker cash before the reserve; absent until read",
+            Self::UsdcOffchainInflight => "Broker cash in flight",
+            Self::UsdcAlpacaUsdc => "USDC held as a token in the broker account; absent until read",
+            Self::UsdcAlpacaTotal => {
+                "Broker cash before the reserve, or after it until the gross is read"
+            }
+            Self::UsdcInflightTotal => "Primary chain vault plus broker cash in flight",
+            Self::UsdcInflightEthereumWallet => {
+                "USDC held in the Ethereum wallet; absent until read"
+            }
+            Self::UsdcInflightBaseWallet => "USDC held in the Base wallet; absent until read",
+            Self::UsdcTotal => "Primary chain vault cash plus broker total plus cash in flight",
+            Self::UsdcRatio => {
+                "Primary chain vault share of vault plus broker cash; 0 when both are 0"
+            }
+            Self::UsdcRebalanceable => {
+                "Withdrawable broker cash above the reserve; absent until withdrawable is read"
+            }
             Self::CollectorLastSuccessTsSeconds => {
                 "Unix time each liq_ collector last published its family"
             }
@@ -147,9 +242,16 @@ impl LiqMetric {
                 "wallet_address",
                 "wallet_kind",
             ],
-            Self::AssetCounterTrading | Self::AssetExtendedHours | Self::AssetRebalancing => {
-                &["symbol"]
-            }
+            Self::AssetCounterTrading
+            | Self::AssetExtendedHours
+            | Self::AssetRebalancing
+            | Self::EquityOnchainAvailable
+            | Self::EquityOffchainAvailable
+            | Self::EquityInflightTotal
+            | Self::EquityTotal
+            | Self::EquityUnwrapped
+            | Self::EquityWrapped
+            | Self::EquityRatio => &["symbol"],
             Self::CollectorLastSuccessTsSeconds => &["collector"],
             Self::BotStartTimestampSeconds
             | Self::SettingsEquityTarget
@@ -160,7 +262,20 @@ impl LiqMetric {
             | Self::SettingsExecutionThresholdUsd
             | Self::SettingsOrderPollingSeconds
             | Self::SettingsInventoryPollSeconds
-            | Self::SettingsDeploymentBlock => &[],
+            | Self::SettingsDeploymentBlock
+            | Self::UsdcOnchainAvailable
+            | Self::UsdcOnchainInflight
+            | Self::UsdcOffchainAvailable
+            | Self::UsdcOffchainGross
+            | Self::UsdcOffchainInflight
+            | Self::UsdcAlpacaUsdc
+            | Self::UsdcAlpacaTotal
+            | Self::UsdcInflightTotal
+            | Self::UsdcInflightEthereumWallet
+            | Self::UsdcInflightBaseWallet
+            | Self::UsdcTotal
+            | Self::UsdcRatio
+            | Self::UsdcRebalanceable => &[],
         }
     }
 
@@ -182,6 +297,26 @@ impl LiqMetric {
             | Self::AssetCounterTrading
             | Self::AssetExtendedHours
             | Self::AssetRebalancing => Some(LiqFamily::Settings),
+            Self::EquityOnchainAvailable
+            | Self::EquityOffchainAvailable
+            | Self::EquityInflightTotal
+            | Self::EquityTotal
+            | Self::EquityUnwrapped
+            | Self::EquityWrapped
+            | Self::EquityRatio
+            | Self::UsdcOnchainAvailable
+            | Self::UsdcOnchainInflight
+            | Self::UsdcOffchainAvailable
+            | Self::UsdcOffchainGross
+            | Self::UsdcOffchainInflight
+            | Self::UsdcAlpacaUsdc
+            | Self::UsdcAlpacaTotal
+            | Self::UsdcInflightTotal
+            | Self::UsdcInflightEthereumWallet
+            | Self::UsdcInflightBaseWallet
+            | Self::UsdcTotal
+            | Self::UsdcRatio
+            | Self::UsdcRebalanceable => Some(LiqFamily::Inventory),
             Self::CollectorLastSuccessTsSeconds => None,
         }
     }
@@ -192,6 +327,7 @@ impl LiqMetric {
 pub(crate) enum LiqFamily {
     Health,
     Settings,
+    Inventory,
 }
 
 impl LiqFamily {
@@ -200,6 +336,7 @@ impl LiqFamily {
         match self {
             Self::Health => "health",
             Self::Settings => "settings",
+            Self::Inventory => "inventory",
         }
     }
 }
@@ -257,6 +394,7 @@ struct LabelSet(Vec<(&'static str, String)>);
 #[derive(Default)]
 pub(crate) struct LiqFamilies {
     families: Mutex<BTreeMap<LiqFamily, FamilyEntry>>,
+    generations: AtomicU64,
 }
 
 /// Samples are shared, so a render copies the `Arc`s under the lock and
@@ -264,39 +402,17 @@ pub(crate) struct LiqFamilies {
 struct FamilyEntry {
     samples: Arc<[LiqSample]>,
     last_success: SystemTime,
+    /// Set by [`LiqFamilies::replace_at_generation`], so a publisher that
+    /// read its source before another cannot overwrite the newer samples.
+    generation: Option<u64>,
 }
 
 impl LiqFamilies {
     /// Replaces every sample of `family` and records `at` as its last
-    /// success. A sample whose metric belongs to another family, or that
-    /// repeats an earlier `(name, labels)`, is dropped and logged: each name
-    /// has one writer, and the text format allows one value per series.
+    /// success. Samples the family may not publish are dropped and logged
+    /// (see [`owned_unique_samples`]).
     pub(crate) fn replace(&self, family: LiqFamily, samples: Vec<LiqSample>, at: SystemTime) {
-        let mut seen = HashSet::new();
-        let samples: Arc<[LiqSample]> = samples
-            .into_iter()
-            .filter(|sample| {
-                if sample.metric.family() != Some(family) {
-                    error!(
-                        metric = sample.metric.name(),
-                        ?family,
-                        "Dropped a liq_ sample published by a family that does not own its name"
-                    );
-                    return false;
-                }
-
-                if !seen.insert((sample.metric, sample.labels.clone())) {
-                    error!(
-                        metric = sample.metric.name(),
-                        labels = ?sample.labels,
-                        "Dropped a duplicate liq_ sample; the first one is kept"
-                    );
-                    return false;
-                }
-
-                true
-            })
-            .collect();
+        let samples = owned_unique_samples(family, samples);
 
         self.families
             .lock()
@@ -306,8 +422,52 @@ impl LiqFamilies {
                 FamilyEntry {
                     samples,
                     last_success: at,
+                    generation: None,
                 },
             );
+    }
+
+    /// Numbers a source read for [`Self::replace_at_generation`]. One
+    /// sequence per store, so a publisher created later (a new bot session
+    /// in the same process) never starts below a stored generation.
+    pub(crate) fn next_generation(&self) -> u64 {
+        self.generations.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Like [`Self::replace`], for a family several publishers write: each
+    /// read its source at `generation`, numbered in source order. A replace
+    /// whose generation is older than the stored one is ignored and returns
+    /// false, so a publisher that pauses after its read cannot put older
+    /// values back.
+    pub(crate) fn replace_at_generation(
+        &self,
+        family: LiqFamily,
+        generation: u64,
+        samples: Vec<LiqSample>,
+        at: SystemTime,
+    ) -> bool {
+        let samples = owned_unique_samples(family, samples);
+        let mut families = self.families.lock().unwrap_or_else(PoisonError::into_inner);
+
+        if let Some(stored) = families.get(&family).and_then(|entry| entry.generation)
+            && generation < stored
+        {
+            debug!(
+                ?family,
+                generation, stored, "Ignored a liq_ family read before the stored one"
+            );
+            return false;
+        }
+
+        families.insert(
+            family,
+            FamilyEntry {
+                samples,
+                last_success: at,
+                generation: Some(generation),
+            },
+        );
+        true
     }
 
     /// Appends the `liq_*` exposition to `body`, which already holds the
@@ -325,6 +485,61 @@ impl LiqFamilies {
             .iter()
             .map(|(family, entry)| (*family, Arc::clone(&entry.samples), entry.last_success))
             .collect()
+    }
+}
+
+/// The samples a family may publish, shared for rendering. A sample whose
+/// metric belongs to another family, or that repeats an earlier
+/// `(name, labels)`, is dropped and logged: each name has one writer, and the
+/// text format allows one value per series.
+fn owned_unique_samples(family: LiqFamily, samples: Vec<LiqSample>) -> Arc<[LiqSample]> {
+    let mut seen = HashSet::new();
+
+    samples
+        .into_iter()
+        .filter(|sample| {
+            if sample.metric.family() != Some(family) {
+                error!(
+                    metric = sample.metric.name(),
+                    ?family,
+                    "Dropped a liq_ sample published by a family that does not own its name"
+                );
+                return false;
+            }
+
+            if !seen.insert((sample.metric, sample.labels.clone())) {
+                error!(
+                    metric = sample.metric.name(),
+                    labels = ?sample.labels,
+                    "Dropped a duplicate liq_ sample; the first one is kept"
+                );
+                return false;
+            }
+
+            true
+        })
+        .collect()
+}
+
+/// Adds one sample, or logs and skips it. A value that does not convert is
+/// left absent, as the exporter left a value it could not parse.
+pub(crate) fn push_sample(
+    samples: &mut Vec<LiqSample>,
+    metric: LiqMetric,
+    labels: Vec<(&'static str, String)>,
+    value: Result<f64, LiqValueError>,
+) {
+    let value = match value {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(metric = metric.name(), ?labels, %error, "Skipped a liq_ sample");
+            return;
+        }
+    };
+
+    match LiqSample::new(metric, labels, value) {
+        Ok(sample) => samples.push(sample),
+        Err(error) => error!(metric = metric.name(), %error, "Built an invalid liq_ sample"),
     }
 }
 
@@ -634,12 +849,33 @@ pub(crate) mod tests {
                 "liq_asset_counter_trading",
                 "liq_asset_extended_hours",
                 "liq_asset_rebalancing",
+                "liq_equity_onchain_available",
+                "liq_equity_offchain_available",
+                "liq_equity_inflight_total",
+                "liq_equity_total",
+                "liq_equity_unwrapped",
+                "liq_equity_wrapped",
+                "liq_equity_ratio",
+                "liq_usdc_onchain_available",
+                "liq_usdc_onchain_inflight",
+                "liq_usdc_offchain_available",
+                "liq_usdc_offchain_gross",
+                "liq_usdc_offchain_inflight",
+                "liq_usdc_alpaca_usdc",
+                "liq_usdc_alpaca_total",
+                "liq_usdc_inflight_total",
+                "liq_usdc_inflight_ethereum_wallet",
+                "liq_usdc_inflight_base_wallet",
+                "liq_usdc_total",
+                "liq_usdc_ratio",
+                "liq_usdc_rebalanceable",
                 "liq_collector_last_success_ts_seconds",
             ]
         );
         assert_eq!(
-            [LiqFamily::Health, LiqFamily::Settings].map(LiqFamily::collector),
-            ["health", "settings"]
+            [LiqFamily::Health, LiqFamily::Settings, LiqFamily::Inventory]
+                .map(LiqFamily::collector),
+            ["health", "settings", "inventory"]
         );
     }
 
@@ -813,6 +1049,59 @@ pub(crate) mod tests {
                 30.0
             )])
         );
+    }
+
+    fn onchain(symbol: &str, value: f64) -> LiqSample {
+        LiqSample::new(
+            LiqMetric::EquityOnchainAvailable,
+            vec![("symbol", symbol.to_string())],
+            value,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn replace_at_generation_ignores_a_read_older_than_the_stored_one() {
+        let families = LiqFamilies::default();
+        let key = series("liq_equity_onchain_available", &[("symbol", "AAPL")]);
+        let freshness = series(
+            "liq_collector_last_success_ts_seconds",
+            &[("collector", "inventory")],
+        );
+
+        assert!(families.replace_at_generation(
+            LiqFamily::Inventory,
+            5,
+            vec![onchain("AAPL", 5.0)],
+            at(50),
+        ));
+        assert!(!families.replace_at_generation(
+            LiqFamily::Inventory,
+            4,
+            vec![onchain("AAPL", 4.0)],
+            at(60),
+        ));
+
+        let rendered = parse_exposition(&render(&families));
+        assert_eq!(rendered.get(&key), Some(&5.0));
+        assert_eq!(rendered.get(&freshness), Some(&50.0));
+
+        assert!(families.replace_at_generation(
+            LiqFamily::Inventory,
+            5,
+            vec![onchain("AAPL", 5.5)],
+            at(70),
+        ));
+        assert!(families.replace_at_generation(
+            LiqFamily::Inventory,
+            6,
+            vec![onchain("AAPL", 6.0)],
+            at(80),
+        ));
+
+        let rendered = parse_exposition(&render(&families));
+        assert_eq!(rendered.get(&key), Some(&6.0));
+        assert_eq!(rendered.get(&freshness), Some(&80.0));
     }
 
     #[test]

@@ -308,10 +308,16 @@ async fn run_bot_session_inner(
 
     let metrics_handle = metrics::setup().context("failed to install Prometheus recorder")?;
 
-    let inventory = Arc::new(inventory::BroadcastingInventory::new(
-        inventory::InventoryView::for_primary_chain(ctx.chains.primary().chain),
-        event_sender.clone(),
-    ));
+    let inventory = Arc::new(
+        inventory::BroadcastingInventory::new(
+            inventory::InventoryView::for_primary_chain(ctx.chains.primary().chain),
+            event_sender.clone(),
+        )
+        .publishing_liq_metrics(metrics::liquidity::inventory::InventoryPublisher::new(
+            &ctx,
+            &metrics::liquidity::LIQ_FAMILIES,
+        )),
+    );
     let equity_prices = dashboard::equity_price::EquityPriceStore::new(
         ctx.chains.hedged().map(|hedged| &hedged.assets),
     );

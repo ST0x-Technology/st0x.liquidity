@@ -9,13 +9,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use alloy::primitives::Address;
 use itertools::Itertools;
 use rain_math_float::Float;
-use tracing::{error, warn};
+use tracing::warn;
 
 use st0x_config::{BrokerCtx, Ctx, ExecutionThreshold, OperationMode};
 use st0x_finance::{Positive, Symbol};
 
 use super::{
-    LiqFamilies, LiqFamily, LiqMetric, LiqSample, LiqValueError, float_value, integer_value,
+    LiqFamilies, LiqFamily, LiqMetric, LiqSample, float_value, integer_value, push_sample,
     strip_prefix,
 };
 
@@ -138,11 +138,7 @@ impl SettingsInput {
             equity_deviation: rebalancing.allocation.deviation.inner(),
             usdc_target: usdc_band.map(|band| band.target),
             usdc_deviation: usdc_band.map(|band| band.deviation),
-            cash_reserved: ctx
-                .assets
-                .cash
-                .as_ref()
-                .map(|cash| Positive::inner(cash.reserved).inner()),
+            cash_reserved: cash_reserved(ctx),
             execution_threshold_usd,
             assets,
             wallet: ctx.wallet_meta.as_ref().map(|meta| WalletInput {
@@ -159,6 +155,14 @@ impl SettingsInput {
             inventory_poll_seconds: ctx.inventory_poll_interval_secs,
         }
     }
+}
+
+/// The USD the broker account holds back, when configured.
+pub(crate) fn cash_reserved(ctx: &Ctx) -> Option<Float> {
+    ctx.assets
+        .cash
+        .as_ref()
+        .map(|cash| Positive::inner(cash.reserved).inner())
 }
 
 /// `liq_bot_info` and `liq_bot_start_timestamp_seconds`.
@@ -299,28 +303,6 @@ fn asset_samples(samples: &mut Vec<LiqSample>, asset: &AssetInput) {
         vec![("symbol", symbol)],
         flag(asset.rebalancing),
     );
-}
-
-/// Adds one sample, or logs and skips it. A value that does not convert is
-/// left absent, as the exporter left a value it could not parse.
-fn push_sample(
-    samples: &mut Vec<LiqSample>,
-    metric: LiqMetric,
-    labels: Vec<(&'static str, String)>,
-    value: Result<f64, LiqValueError>,
-) {
-    let value = match value {
-        Ok(value) => value,
-        Err(error) => {
-            warn!(metric = metric.name(), ?labels, %error, "Skipped a liq_ sample");
-            return;
-        }
-    };
-
-    match LiqSample::new(metric, labels, value) {
-        Ok(sample) => samples.push(sample),
-        Err(error) => error!(metric = metric.name(), %error, "Built an invalid liq_ sample"),
-    }
 }
 
 #[cfg(test)]
