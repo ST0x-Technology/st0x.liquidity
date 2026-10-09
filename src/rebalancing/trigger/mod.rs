@@ -37457,6 +37457,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_poll_after_other_chain_recovery_leaves_the_active_mint_inflight() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory =
+            InventoryView::default().with_equity(symbol.clone(), shares(20), shares(80));
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = issuer_request_id("mint-across-other-chain-recovery");
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+
+        for event in [
+            make_mint_requested(&symbol, float!(30)),
+            make_mint_accepted(),
+        ] {
+            harness
+                .receive::<TokenizedEquityMint>(id.clone(), event)
+                .await
+                .unwrap();
+        }
+
+        apply_and_dispatch_snapshot(
+            reactor.clone(),
+            snapshot_id.clone(),
+            InventorySnapshotEvent::InflightEquity {
+                mints: BTreeMap::from([(symbol.clone(), shares(30))]),
+                redemptions: BTreeMap::new(),
+                fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        trigger
+            .on_snapshot_recovery(
+                RebalancingServiceError::Inventory(InventoryViewError::Equity(
+                    InventoryError::NegativeInflight {
+                        value: FractionalShares::new(float!(-1)),
+                    },
+                )),
+                InventorySnapshotEvent::ChainInflightRedemptions {
+                    chain: Chain::Robinhood,
+                    redemptions: BTreeMap::new(),
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // The provider drops the request from its pending list before the
+        // bot processes `TokensReceived`.
+        apply_and_dispatch_snapshot(
+            reactor,
+            snapshot_id,
+            InventorySnapshotEvent::InflightEquity {
+                mints: BTreeMap::new(),
+                redemptions: BTreeMap::new(),
+                fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(30)),
+            "An empty poll after another chain's recovery must leave the active mint's \
+             Hedging inflight to the mint"
+        );
+
+        harness
+            .receive::<TokenizedEquityMint>(id.clone(), make_tokens_received())
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(0)),
+            "TokensReceived must release the mint's Hedging inflight"
+        );
+        assert_eq!(
+            inventory.onchain_equity_available_at(&symbol, Chain::Base),
+            Some(shares(30)),
+            "TokensReceived must credit the minted shares to MarketMaking"
+        );
+        drop(inventory);
+        assert_eq!(
+            trigger.divergence_gate.pending_offchain_equity_reconciles(),
+            Vec::<Symbol>::new(),
+            "A settled mint must not defer to a forced reconcile"
+        );
+    }
+
+    #[tokio::test]
     async fn recovery_path_expires_timed_out_mints_before_reapplying_inflight() {
         let symbol = Symbol::new("AAPL").unwrap();
         let fetched_at = Utc::now();
