@@ -40,6 +40,9 @@ use st0x_tokenization::IssuerRequestId;
 
 use crate::AppState;
 use crate::cctp_burn::{CctpBurnOperation, CctpSourceChain};
+use crate::dashboard::order_loader::{
+    PendingOrderResponse, RaindexOrders, fetch_raindex_orders, load_pending_orders,
+};
 use crate::dashboard::pnl::{
     PnlError, PnlQuery, PnlReportDeps, PnlReportError, PnlResponse, run_pnl_report,
 };
@@ -109,8 +112,6 @@ fn parse_transfer_kind_filter(value: &str) -> Result<Vec<TransferKind>, InvalidT
         .collect()
 }
 
-const DEFAULT_RAINDEX_ORDERS_PAGE_SIZE: u32 = 50;
-const MAX_RAINDEX_ORDERS_PAGE_SIZE: u32 = 100;
 /// Bounds the rows SQLite may need to sort and skip for one history request.
 const MAX_TRANSFER_HISTORY_OFFSET: usize = 10_000;
 
@@ -137,21 +138,6 @@ struct LogResponse {
     entries: Vec<serde_json::Value>,
     total: usize,
     has_more: bool,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PendingOrderResponse {
-    view_id: String,
-    status: String,
-    symbol: String,
-    direction: String,
-    shares: String,
-    executor: String,
-    placed_at: String,
-    submitted_at: Option<String>,
-    shares_filled: Option<String>,
-    avg_price: Option<String>,
 }
 
 /// Where the stranded equity physically sits for a failed transfer.
@@ -723,51 +709,7 @@ fn extract_log_file_date(entry: &std::fs::DirEntry) -> Option<chrono::NaiveDate>
 
 /// Returns non-terminal offchain orders (Pending, Submitted, PartiallyFilled, Cancelling).
 async fn pending_orders(State(state): State<AppState>) -> Json<Vec<PendingOrderResponse>> {
-    let rows: Vec<(String, String, String)> = match sqlx::query_as(
-        "SELECT view_id, status, payload FROM offchain_order_view \
-         WHERE status IN ('Pending', 'Submitted', 'PartiallyFilled', 'Cancelling') \
-         ORDER BY rowid DESC LIMIT 100",
-    )
-    .fetch_all(&state.pool)
-    .await
-    {
-        Ok(rows) => rows,
-        Err(error) => {
-            tracing::warn!(target: "dashboard", %error, "Failed to load pending orders");
-            return Json(Vec::new());
-        }
-    };
-
-    let orders = rows
-        .into_iter()
-        .filter_map(|(view_id, status, payload_str)| {
-            parse_pending_order(view_id, status, &payload_str)
-        })
-        .collect();
-
-    Json(orders)
-}
-
-fn parse_pending_order(
-    view_id: String,
-    status: String,
-    payload_str: &str,
-) -> Option<PendingOrderResponse> {
-    let payload: serde_json::Value = serde_json::from_str(payload_str).ok()?;
-    let inner = payload.get("Live")?.get(&status)?;
-
-    Some(PendingOrderResponse {
-        view_id,
-        symbol: inner["symbol"].as_str()?.to_string(),
-        direction: inner["direction"].as_str()?.to_string(),
-        shares: inner["shares"].as_str().unwrap_or("0").to_string(),
-        executor: inner["executor"].as_str().unwrap_or("unknown").to_string(),
-        placed_at: inner["placed_at"].as_str().unwrap_or("").to_string(),
-        submitted_at: inner["submitted_at"].as_str().map(String::from),
-        shares_filled: inner["shares_filled"].as_str().map(String::from),
-        avg_price: inner["avg_price"].as_str().map(String::from),
-        status,
-    })
+    Json(load_pending_orders(&state.pool).await)
 }
 
 #[derive(Deserialize, Default)]
@@ -1320,63 +1262,15 @@ struct RaindexOrdersQuery {
 /// Proxies the bot's active Raindex orders from the st0x REST API.
 /// When `[rest_api]` is not configured, returns an unavailable indicator
 /// so the dashboard can show a friendly message instead of an error.
-#[allow(clippy::cognitive_complexity)]
 async fn raindex_orders(
     State(state): State<AppState>,
     Query(query): Query<RaindexOrdersQuery>,
 ) -> Json<serde_json::Value> {
     let RaindexOrdersQuery { page, page_size } = query;
-    let Some(rest_api) = &state.ctx.rest_api else {
-        return unavailable_json("REST API not configured (simulate mode)");
-    };
 
-    let owner = state.ctx.vault_owner();
-    let url = format!(
-        "{}/v1/orders/owner/{:#x}",
-        rest_api.url.trim_end_matches('/'),
-        owner
-    );
-
-    let page = page.unwrap_or(1).max(1);
-    let page_size = page_size
-        .unwrap_or(DEFAULT_RAINDEX_ORDERS_PAGE_SIZE)
-        .clamp(1, MAX_RAINDEX_ORDERS_PAGE_SIZE);
-
-    let mut request = rest_api
-        .http_client
-        .get(&url)
-        .query(&[("page", page), ("pageSize", page_size)]);
-
-    if let (Some(key_id), Some(key_secret)) = (&rest_api.key_id, &rest_api.key_secret) {
-        request = request.basic_auth(key_id, Some(key_secret));
-    }
-
-    let response = match request.send().await {
-        Ok(response) => response,
-        Err(error) => {
-            tracing::warn!(target: "dashboard", %error, %url, "Failed to reach st0x REST API");
-            return unavailable_json("REST API unreachable");
-        }
-    };
-
-    if !response.status().is_success() {
-        let status = response.status();
-        tracing::warn!(target: "dashboard", %status, %url, "st0x REST API returned error");
-        return unavailable_json("REST API returned an error");
-    }
-
-    match response.text().await {
-        Ok(body) => match serde_json::from_str(&body) {
-            Ok(value) => Json(value),
-            Err(error) => {
-                tracing::warn!(target: "dashboard", %error, "st0x REST API returned non-JSON body");
-                unavailable_json("REST API returned non-JSON")
-            }
-        },
-        Err(error) => {
-            tracing::warn!(target: "dashboard", %error, "Failed to read st0x REST API response body");
-            unavailable_json("Failed to read REST API response")
-        }
+    match fetch_raindex_orders(&state.ctx, page, page_size).await {
+        RaindexOrders::Available(body) => Json(body),
+        RaindexOrders::Unavailable { reason } => unavailable_json(reason),
     }
 }
 
@@ -4960,28 +4854,6 @@ mod tests {
         assert_eq!(stuck.amount, "12.5");
         assert_eq!(stuck.location, StuckLocation::Issuer);
         assert_eq!(stuck.reason, StuckReason::MintAcceptanceFailed);
-    }
-
-    #[test]
-    fn parse_pending_order_handles_cancelling_status() {
-        // The cancel-and-replace flow introduced the non-terminal `Cancelling`
-        // state; the /orders/pending endpoint must surface it like any other
-        // live order rather than dropping it on the floor.
-        let payload = r#"{"Live":{"Cancelling":{"symbol":"AAPL","direction":"Sell","shares":"1.5","executor":"DryRun","placed_at":"2026-01-01T00:00:00Z","submitted_at":"2026-01-01T00:00:01Z","shares_filled":"0.5","avg_price":"195.25"}}}"#;
-
-        let parsed = parse_pending_order("order-1".to_string(), "Cancelling".to_string(), payload)
-            .expect("Cancelling order should parse");
-
-        assert_eq!(parsed.view_id, "order-1");
-        assert_eq!(parsed.status, "Cancelling");
-        assert_eq!(parsed.symbol, "AAPL");
-        assert_eq!(parsed.direction, "Sell");
-        assert_eq!(parsed.shares, "1.5");
-        assert_eq!(parsed.executor, "DryRun");
-        assert_eq!(parsed.placed_at, "2026-01-01T00:00:00Z");
-        assert_eq!(parsed.submitted_at.as_deref(), Some("2026-01-01T00:00:01Z"));
-        assert_eq!(parsed.shares_filled.as_deref(), Some("0.5"));
-        assert_eq!(parsed.avg_price.as_deref(), Some("195.25"));
     }
 
     #[test]
