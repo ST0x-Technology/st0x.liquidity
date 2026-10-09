@@ -5330,8 +5330,8 @@ impl RebalancingService {
                 Some(Self::start_equity_transfer_update(Venue::Hedging, quantity))
             }
             // Cancel only the Hedging inflight this mint's own `Start` moved.
-            // A pre-acceptance operator force-fail (RAI-999) started nothing, so
-            // a Cancel there would be unmatched; SPEC's "no balance change for a
+            // A pre-acceptance operator force-fail started nothing, so a Cancel
+            // there would be unmatched; SPEC's "no balance change for a
             // pre-acceptance force-fail" holds by construction. A `Start` that
             // failed also moved nothing: any inflight on the symbol was written
             // by a poll before the mint became active, and crediting it would
@@ -8770,8 +8770,8 @@ impl RebalancingService {
                         tokenization_request_id,
                         stage,
                         last_progress_at,
-                        // An accepted mint's inflight is restored below as its
-                        // own, so a later failure cancels it.
+                        // Only an accepted mint can still fail, and its inflight
+                        // is restored below as its own, so the failure cancels it.
                         hedging_start: match stage {
                             MintTrackingStage::Requested => HedgingStart::NotStarted,
                             MintTrackingStage::Accepted
@@ -8876,7 +8876,9 @@ impl RebalancingService {
         //   tombstoned the aggregate (so the reactor ignores late events), so we
         //   drop the tombstone and re-set the in-flight (available stays debited);
         // - an explicit MintAcceptanceFailed cancelled the in-flight back to
-        //   available, so we move it back into the in-flight with a Start.
+        //   available, so we move it back into the in-flight with a Start. A
+        //   mint whose own `Start` failed had nothing to cancel, so this Start
+        //   debits available again (or is refused) until a broker snapshot heals.
         // Peek (don't yet remove) the timeout markers so a failure in the
         // fallible inventory update below leaves them intact -- a failed rebuild
         // does not run the caller's rollback, so consuming them up front would
@@ -10161,7 +10163,7 @@ mod tests {
 
     #[test]
     fn mint_inventory_update_skips_cancel_for_unstarted_mint() {
-        // A pre-acceptance force-fail (RAI-999) or a failed `Start` moved no
+        // A pre-acceptance force-fail or a failed `Start` moved no
         // shares into Hedging inflight, so a Cancel there would be unmatched or
         // would credit poll inflight as broker shares.
         let event = TokenizedEquityMintEvent::MintAcceptanceFailed {
@@ -10183,7 +10185,8 @@ mod tests {
         // Once `MintAccepted` started a Hedging inflight, a later
         // `MintAcceptanceFailed` MUST cancel it. This pins the cancel arm: the
         // unstarted skip test alone would still pass if it collapsed to `None`.
-        // The end-to-end cancel effect lives in `recover_mint_clears_hedging_inflight`.
+        // The end-to-end effect lives in
+        // `mint_failing_after_inflight_snapshot_reset_restores_only_its_own_shares`.
         let event = TokenizedEquityMintEvent::MintAcceptanceFailed {
             reason: "operator force-fail".to_string(),
             failed_at: Utc::now(),
@@ -10906,6 +10909,7 @@ mod tests {
             Some(tokenization_request_id("TOK-1"))
         );
         assert_eq!(tracking.stage, MintTrackingStage::Accepted);
+        assert_eq!(tracking.hedging_start, HedgingStart::Started);
         assert_eq!(tracking.last_progress_at, accepted_at);
 
         let ownership = trigger.pending_request_ownership().await;
