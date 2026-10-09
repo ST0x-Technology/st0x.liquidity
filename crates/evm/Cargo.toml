@@ -13,6 +13,7 @@ turnkey = [
   "dep:turnkey_client",
   "dep:turnkey_api_key_stamper",
   "dep:mime",
+  "dep:uuid",
   # KMS-stamped (keyless) Turnkey authentication: base64/sha2 for the
   # AsymmetricSign round-trip, p256 to parse/compress the public key and
   # verify KMS signatures before use.
@@ -42,6 +43,7 @@ tracing.workspace = true
 turnkey_api_key_stamper = { version = "0.4.0", optional = true }
 turnkey_client = { version = "0.4.0", optional = true }
 url = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
 httpmock.workspace = true

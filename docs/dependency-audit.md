@@ -9,7 +9,8 @@ database fetch.
 Vulnerabilities, unmaintained crates, and unsound crates fail the audit except
 for the documented advisory IDs in `.cargo/audit.toml`. Since cargo-audit
 ignores an advisory across the entire lockfile, `scripts/audit-rust.sh` checks
-the exact affected package versions and immediate dependents using all features,
+every locked version of each excepted crate, including packages unused by the
+workspace, and the affected versions’ immediate dependents using all features,
 all targets, and normal, build, and development edges. A changed path requires
 reassessment of the exception. The lockfile must already be current; auditing
 does not regenerate it.
@@ -22,3 +23,11 @@ rejected without fetching dependencies or advisories.
 
 When updating a vulnerable dependency, check every workspace binary's declared
 Rust minimum. The patched `ruint 1.20.0` requires Rust 1.90, including the CLI.
+
+When a new advisory fails CI, reproduce it with the command above and inspect
+its affected versions and dependency paths. Prefer a patched release, then run
+the full local checks. If upstream has no fix, document why an exception is
+necessary and constrain its locked versions and paths; add a regression case
+before changing the policy. Never weaken the audit to work around a database or
+registry outage. The audit runs last in the hooks job so unrelated hook results
+remain available when its fetch or policy check fails.

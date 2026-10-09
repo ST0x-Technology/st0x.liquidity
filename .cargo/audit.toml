@@ -17,7 +17,8 @@
 # alloy currently constrains lru below the patched 0.18 line.
 # RUSTSEC-2026-0205: scc 2.4.0 is selected only by the serial_test 3.4.0
 # development dependency; the affected panic path is not production code.
-# scripts/audit-rust.sh rejects any change to these exact dependency paths.
+# scripts/audit-rust.sh guards every locked version and these exact dependency paths.
+# h2 0.4.20 is patched; the exception is needed only for the 0.3.27 path.
 ignore = [
   "RUSTSEC-2023-0071",
   "RUSTSEC-2024-0388",

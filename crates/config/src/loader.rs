@@ -1844,6 +1844,18 @@ fn validate_config(
     tokens: TokenFile<'_>,
     startup_notices: &mut Vec<StartupNotice>,
 ) -> Result<ValidatedConfigParts, CtxError> {
+    #[cfg(feature = "wallet-turnkey")]
+    if let Some(wallet) = &config.wallet
+        && wallet.get("kind").and_then(toml::Value::as_str) == Some("turnkey")
+    {
+        st0x_evm::turnkey::TurnkeySettings::deserialize(wallet.clone()).map_err(|source| {
+            CtxError::ConfigToml {
+                path: config_path.to_path_buf(),
+                source,
+            }
+        })?;
+    }
+
     if let (Some(registry), TokenFile::Bytes(_)) = (&config.registry, tokens) {
         startup_notices.push(StartupNotice::info(format!(
             "per-symbol tables read from {} ({})",
@@ -2414,6 +2426,16 @@ fn parse_and_validate_with(
     let chains = ChainRegistry::new(&config.chains, secrets.chains)?;
     let (wallet_inputs, wallet_meta) =
         validate_wallet_inputs(config.wallet, secrets.wallet, &chains, config_path)?;
+
+    #[cfg(feature = "wallet-turnkey")]
+    if wallet_meta.kind == "turnkey" {
+        st0x_evm::turnkey::TurnkeyCredentials::deserialize(wallet_inputs.secrets.clone()).map_err(
+            |source| CtxError::SecretsToml {
+                path: secrets_path.to_path_buf(),
+                source,
+            },
+        )?;
+    }
 
     let Some(rebalancing_config) = config.rebalancing else {
         return Err(CtxError::MissingRebalancing);
@@ -8104,7 +8126,7 @@ mod tests {
             [wallet]
             kind = "turnkey"
             address = "0x0000000000000000000000000000000000000001"
-            organization_id = "org-test"
+            organization_id = "00000000-0000-4000-8000-000000000001"
             kms_api_key = "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1"
         "#,
         );
@@ -12166,6 +12188,65 @@ mod tests {
 
     #[cfg(feature = "wallet-turnkey")]
     #[test]
+    fn validate_config_file_rejects_malformed_turnkey_organization_id() {
+        let config = toml_file(
+            &String::from_utf8_lossy(minimal_config_toml_bytes()).replace(
+                "kind = \"private-key\"",
+                "kind = \"turnkey\"\norganization_id = \"not-a-uuid\"",
+            ),
+        );
+
+        let error = Ctx::validate_config_file(config.path(), TokenFile::Skipped).unwrap_err();
+        let CtxError::ConfigToml { path, source } = error else {
+            panic!("expected config parse error, got {error:?}");
+        };
+        assert_eq!(path, config.path());
+        assert!(
+            source
+                .to_string()
+                .contains("Turnkey organization ID must be a UUID")
+        );
+    }
+
+    #[cfg(feature = "wallet-turnkey")]
+    #[test]
+    fn validate_files_rejects_malformed_turnkey_private_keys_without_network() {
+        let config = toml_file(
+            &String::from_utf8_lossy(minimal_config_toml_bytes()).replace(
+                "kind = \"private-key\"",
+                "kind = \"turnkey\"\norganization_id = \"00000000-0000-4000-8000-000000000001\"",
+            ),
+        );
+        let valid_secrets = alpaca_secrets_toml();
+        let secrets_text = std::fs::read_to_string(valid_secrets.path()).unwrap();
+        for (key, expected) in [
+            ("not-hex".to_string(), "valid hexadecimal"),
+            ("deadbeef".to_string(), "32 bytes, got 4"),
+            ("00".repeat(32), "valid P-256 private key"),
+        ] {
+            let secrets = toml_file(&secrets_text.replace(
+                "private_key = \"0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"",
+                &format!("api_private_key = \"{key}\""),
+            ));
+            let error =
+                Ctx::validate_files(config.path(), secrets.path(), TokenFile::Skipped).unwrap_err();
+            let CtxError::SecretsToml { path, source } = error else {
+                panic!("expected secrets parse error, got {error:?}");
+            };
+            assert_eq!(path, secrets.path());
+            assert!(
+                source.to_string().contains(expected),
+                "unexpected error: {source}"
+            );
+            assert!(
+                !source.to_string().contains(&key),
+                "private key leaked: {source}"
+            );
+        }
+    }
+
+    #[cfg(feature = "wallet-turnkey")]
+    #[test]
     fn load_turnkey_approval_policy_inputs_extracts_validated_deploy_inputs() {
         let config = toml_file(
             r#"
@@ -12224,7 +12305,7 @@ mod tests {
             [wallet]
             kind = "turnkey"
             address = "0x6666666666666666666666666666666666666666"
-            organization_id = "org-test"
+            organization_id = "00000000-0000-4000-8000-000000000001"
 
             [broker]
             counter_trade_slippage_bps = 100
@@ -12295,7 +12376,7 @@ mod tests {
             account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
 
             [wallet]
-            api_private_key = "secret-p256-key"
+            api_private_key = "0000000000000000000000000000000000000000000000000000000000000001"
 
             [issuance]
             base_url = "http://issuance.test:8000"
@@ -12314,7 +12395,10 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(inputs.organization_id.as_str(), "org-test");
+        assert_eq!(
+            inputs.organization_id.as_str(),
+            "00000000-0000-4000-8000-000000000001"
+        );
         assert_eq!(
             inputs.wallet_address,
             address!("0x6666666666666666666666666666666666666666")
@@ -12331,8 +12415,11 @@ mod tests {
                 .is_trading_enabled(&Symbol::new("AAPL").unwrap())
         );
         assert!(inputs.kms_api_key.is_none());
-        assert!(inputs.api_private_key.is_some());
-        assert!(!format!("{inputs:?}").contains("secret-p256-key"));
+        assert_eq!(format!("{:?}", inputs.api_private_key), "Some([REDACTED])");
+        assert!(
+            !format!("{inputs:?}")
+                .contains("0000000000000000000000000000000000000000000000000000000000000001")
+        );
     }
 
     /// The deploy gate proves coverage for every chain startup grants
@@ -12461,10 +12548,11 @@ mod tests {
             [wallet]
             kind = "turnkey"
             address = "0x6666666666666666666666666666666666666666"
-            organization_id = "org-test"
+            organization_id = "00000000-0000-4000-8000-000000000001"
             "#,
         );
-        let secrets = toml_file(
+        let api_private_key = format!("{:064x}", 1);
+        let secrets = toml_file(&format!(
             r#"
             [chains.base]
             rpc_url = "http://localhost:8545"
@@ -12485,7 +12573,7 @@ mod tests {
             account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
 
             [wallet]
-            api_private_key = "secret-p256-key"
+            api_private_key = "{api_private_key}"
 
             [issuance]
             base_url = "http://issuance.test:8000"
@@ -12494,7 +12582,7 @@ mod tests {
             [pricing]
             api_key = "pricing-oracle-test-key"
             "#,
-        );
+        ));
 
         let inputs = Ctx::load_turnkey_approval_policy_inputs(
             config.path(),
@@ -12504,6 +12592,10 @@ mod tests {
         .unwrap()
         .unwrap();
 
+        assert_eq!(
+            inputs.organization_id.as_str(),
+            "00000000-0000-4000-8000-000000000001"
+        );
         assert_eq!(
             inputs
                 .hedged
@@ -12538,6 +12630,9 @@ mod tests {
                 .map(|equity| equity.tokenized_equity),
             Some(address!("0x7777777777777777777777777777777777777777"))
         );
+        assert!(inputs.kms_api_key.is_none());
+        assert_eq!(format!("{:?}", inputs.api_private_key), "Some([REDACTED])");
+        assert!(!format!("{inputs:?}").contains(&api_private_key));
     }
 
     #[cfg(feature = "wallet-turnkey")]

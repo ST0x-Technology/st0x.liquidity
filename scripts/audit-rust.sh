@@ -73,6 +73,33 @@ assert_tree() {
   fi
 }
 
+# Advisory ignores cover every version, including lock-only packages.
+locked_packages="$(taplo get --file-path Cargo.lock --output-format json package)"
+assert_versions() {
+  local name="$1"
+  shift
+
+  local actual expected
+  actual="$(printf '%s' "$locked_packages" | jq -r --arg name "$name" '.[] | select(.name == $name) | .version' | sort -u)"
+  expected="$(printf '%s\n' "$@" | sort -u)"
+  if [[ "$actual" != "$expected" ]]; then
+    printf 'Unexpected locked versions for %s\nExpected:\n%s\nActual:\n%s\n' \
+      "$name" "$expected" "$actual" >&2
+    exit 1
+  fi
+}
+
+assert_versions rsa 0.9.10
+assert_versions tracing-subscriber 0.2.25 0.3.23
+assert_versions derivative 2.2.0
+assert_versions h2 0.3.27 0.4.20
+assert_versions paste 1.0.15
+assert_versions proc-macro-error2 2.0.1
+assert_versions rustls-pemfile 1.0.4
+assert_versions lru 0.16.4
+assert_versions scc 2.4.0
+assert_versions spin 0.9.8
+
 assert_tree "rsa@0.9.10"
 assert_tree "tracing-subscriber@0.2.25"
 assert_tree "derivative@2.2.0"

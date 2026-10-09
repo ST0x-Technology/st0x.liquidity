@@ -701,6 +701,7 @@ CI will fail if `bun.nix` is out of sync with `bun.lock`.
 ## Documentation
 
 - **[SPEC.md](SPEC.md)** - Complete technical specification and architecture
+- **[docs/turnkey.md](docs/turnkey.md)** - Turnkey configuration validation
 - **[docs/domain.md](docs/domain.md)** - Domain model, terminology, and naming
   conventions
 - **[AGENTS.md](AGENTS.md)** - Development guidelines for AI-assisted coding

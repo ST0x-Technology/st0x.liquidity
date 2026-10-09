@@ -8,6 +8,8 @@ trap 'rm -rf "$fixture"' EXIT
 mkdir -p "$fixture/.cargo" "$fixture/bin" "$fixture/float"
 cp "$repo_root/.cargo/audit.toml" "$fixture/.cargo/audit.toml"
 
+cp "$repo_root/Cargo.lock" "$fixture/Cargo.lock"
+
 cat > "$fixture/bin/cargo" <<'CARGO'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -103,6 +105,15 @@ assert_rejected new_parent 'Unexpected dependency paths for h2@0.3.27'
 assert_rejected tree_failure 'Unable to inspect dependency paths for rsa@0.9.10'
 assert_rejected audit_failure '"found": true'
 assert_rejected new_yank 'another-crate 1.0.0'
+
+cat >> "$fixture/Cargo.lock" <<'LOCK'
+
+[[package]]
+name = "rsa"
+version = "0.8.0"
+LOCK
+assert_rejected baseline 'Unexpected locked versions for rsa'
+cp "$repo_root/Cargo.lock" "$fixture/Cargo.lock"
 
 sed '/^ignore = \[/a\
   "RUSTSEC-2099-9999",' "$fixture/.cargo/audit.toml" > "$fixture/changed-policy"
