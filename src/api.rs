@@ -40,6 +40,7 @@ use st0x_tokenization::IssuerRequestId;
 
 use crate::AppState;
 use crate::cctp_burn::{CctpBurnOperation, CctpSourceChain};
+use crate::dashboard::event_lines::{event_step, variant_fields};
 use crate::dashboard::order_loader::{
     PendingOrderResponse, RaindexOrders, fetch_raindex_orders, load_pending_orders,
 };
@@ -952,16 +953,9 @@ async fn transfer_events(
     })))
 }
 
-fn event_step(event_type: &str) -> &str {
-    event_type.split("::").last().unwrap_or("Unknown")
-}
-
 fn event_payload_inner(step: &str, payload: &str, sequence: i64) -> serde_json::Value {
     match serde_json::from_str::<serde_json::Value>(payload) {
-        Ok(parsed) => parsed
-            .as_object()
-            .and_then(|obj| obj.get(step).cloned())
-            .unwrap_or(parsed),
+        Ok(parsed) => variant_fields(step, parsed),
 
         Err(error) => {
             warn!(

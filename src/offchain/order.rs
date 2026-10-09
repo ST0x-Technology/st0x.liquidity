@@ -2074,10 +2074,7 @@ impl OffchainOrder {
         Ok(Trade {
             id: id.to_string(),
             occurred_at,
-            venue: match executor {
-                SupportedExecutor::AlpacaBrokerApi => TradingVenue::Alpaca,
-                SupportedExecutor::DryRun => TradingVenue::DryRun,
-            },
+            venue: executor_venue(executor),
             direction,
             symbol,
             shares,
@@ -3615,6 +3612,14 @@ pub enum OffchainOrderError {
     /// A repair found the order in a broker cancellation the bot is driving.
     #[error("Cannot fail order: a broker cancellation is in progress")]
     CancellationInProgress,
+}
+
+/// The dashboard venue of an order placed through `executor`.
+pub(crate) const fn executor_venue(executor: SupportedExecutor) -> TradingVenue {
+    match executor {
+        SupportedExecutor::AlpacaBrokerApi => TradingVenue::Alpaca,
+        SupportedExecutor::DryRun => TradingVenue::DryRun,
+    }
 }
 
 #[cfg(test)]
