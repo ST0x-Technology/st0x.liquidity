@@ -5507,17 +5507,9 @@ impl RebalancingService {
         };
     }
 
-    /// Zeroes any Hedging inflight left on `symbol` once its mint is terminal.
-    ///
-    /// Only mints put equity inflight at Hedging, and a symbol has at most one
-    /// active mint, so a residual here is phantom: e.g. a Base snapshot-error
-    /// reset on a symbol with an open hedge order keeps its broker balance,
-    /// drops `active_mints` and re-applies a poll that lists this mint's
-    /// request, so `MintAccepted` counts it again. Without the hedge order the
-    /// reset drops the broker balance and `MintAccepted` fails to start
-    /// instead. Left in place a residual blocks the symbol's rebalancing and
-    /// snapshots until restart. A request still pending at the provider is
-    /// restored by its next poll.
+    /// Only mints write a symbol's Hedging inflight, one at a time, so a
+    /// residual after its terminal event is this mint counted twice (a Base
+    /// snapshot-error reset). Zero it and force an offchain reconcile.
     async fn clear_residual_hedging_inflight(
         &self,
         id: &IssuerRequestId,
