@@ -5,8 +5,10 @@ use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, TransactionReceipt};
 use alloy::sol;
 use alloy::sol_types::{SolCall, SolEvent};
+use std::future::Future;
 use std::num::NonZeroU32;
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio::time::{Instant, MissedTickBehavior, interval};
 use tracing::{debug, info, trace, warn};
 
@@ -14,7 +16,7 @@ use tracing::{debug, info, trace, warn};
 use st0x_evm::Evm;
 use st0x_evm::{
     Chain, EvmError, IntoErrorRegistry, MinedTx, NODE_SYNC_MAX_ATTEMPTS, NODE_SYNC_POLL_INTERVAL,
-    PreparedTransaction, Wallet, qualified_absence_head, wait_for_node_sync,
+    PreparedTransaction, TransactionSubmission, Wallet, qualified_absence_head, wait_for_node_sync,
 };
 
 use super::{
@@ -306,6 +308,9 @@ pub(crate) struct CctpEndpoint<W: Wallet> {
     /// [`with_burn_drop_config`](Self::with_burn_drop_config) so the drop grace
     /// resolves immediately instead of after the production 30 s window.
     burn_drop_config: BurnDropConfig,
+    /// Retain evidence, not a verdict or nonce reservation, after a generic wallet drop.
+    /// One slot is bounded; replacing it can only leave an older burn conservatively pending.
+    suspected_drop_submission: Mutex<Option<(TxHash, TransactionSubmission)>>,
     /// Probe cadence for
     /// [`recover_already_minted`](Self::recover_already_minted). Production
     /// uses [`MintRecoveryConfig::defaults`]; tests override it via
@@ -335,6 +340,7 @@ impl<W: Wallet> CctpEndpoint<W> {
             scan_window: ScanWindow::for_chain(chain),
             node_sync_poll_interval: NODE_SYNC_POLL_INTERVAL,
             burn_drop_config: BurnDropConfig::defaults(),
+            suspected_drop_submission: Mutex::new(None),
             mint_recovery_config: MintRecoveryConfig::defaults(),
         }
     }
@@ -637,7 +643,9 @@ impl<W: Wallet> CctpEndpoint<W> {
         tx_hash: TxHash,
         amount: U256,
     ) -> Result<crate::BurnReceipt, CctpError> {
-        let receipt = self.wallet.confirm::<Registry>(tx_hash).await?;
+        let receipt = self
+            .wait_for_burn_receipt(tx_hash, self.wallet.confirm::<Registry>(tx_hash))
+            .await?;
 
         if !receipt
             .inner
@@ -654,13 +662,44 @@ impl<W: Wallet> CctpEndpoint<W> {
         })
     }
 
+    async fn clear_suspected_drop(&self, tx_hash: TxHash) {
+        let mut retained = self.suspected_drop_submission.lock().await;
+        if retained.as_ref().is_some_and(|(hash, _)| *hash == tx_hash) {
+            *retained = None;
+        }
+    }
+
+    async fn wait_for_burn_receipt(
+        &self,
+        tx_hash: TxHash,
+        wait: impl Future<Output = Result<TransactionReceipt, EvmError>> + Send,
+    ) -> Result<TransactionReceipt, EvmError> {
+        let submission = self.wallet.transaction_submission(tx_hash);
+        let result = wait.await;
+        match &result {
+            Ok(_) => self.clear_suspected_drop(tx_hash).await,
+            Err(error) if error.is_transaction_dropped() => {
+                match submission {
+                    Some(submission) if submission.submitted_after_block.is_some() => {
+                        *self.suspected_drop_submission.lock().await = Some((tx_hash, submission));
+                    }
+                    // Failed rebroadcast evidence must not resurrect an older boundary.
+                    Some(_) => self.clear_suspected_drop(tx_hash).await,
+                    None => {}
+                }
+            }
+            Err(error) if error.is_revert() => self.clear_suspected_drop(tx_hash).await,
+            Err(_) => {}
+        }
+        result
+    }
+
     /// Resolves the on-chain status of a broadcast burn tx for crash-safe resume,
     /// using this endpoint's configured drop policy (`burn_drop_config`).
     ///
-    /// `submitted_after_block` is the chain head recorded before the burn was
-    /// broadcast (the same pre-burn head `find_recent_burn` scans from): the
-    /// burn can only have mined strictly after it, so it anchors the
-    /// node-freshness gate on the `Dropped` verdict.
+    /// `submitted_after_block` is the transfer's additional lower bound. It
+    /// cannot replace complete wallet submission evidence: absence qualification
+    /// uses the higher of that bound and the wallet's observed broadcast head.
     pub(super) async fn burn_status(
         &self,
         tx_hash: TxHash,
@@ -729,7 +768,10 @@ impl<W: Wallet> CctpEndpoint<W> {
                 // SUCCESS -- reburning before the revert is confirmation-deep would then
                 // double-burn. Re-fetch through the wallet's confirmation-aware path
                 // (mirroring the success path) before trusting the revert.
-                let confirmed = match self.wallet.await_receipt(tx_hash).await {
+                let confirmed = match self
+                    .wait_for_burn_receipt(tx_hash, self.wallet.await_receipt(tx_hash))
+                    .await
+                {
                     Ok(confirmed) => confirmed,
                     Err(error) if error.is_transaction_dropped() => {
                         return Ok(crate::BurnTxStatus::Dropped);
@@ -752,7 +794,12 @@ impl<W: Wallet> CctpEndpoint<W> {
             // Qualify independent receipt/mempool misses with sender state at
             // the exact canonical head hash. A separate latest nonce read can
             // hit a stale backend and falsely authenticate a hidden mined tx.
-            let Some(mut submission) = self.wallet.transaction_submission(tx_hash) else {
+            let retained = *self.suspected_drop_submission.lock().await;
+            let Some(mut submission) = self.wallet.transaction_submission(tx_hash).or_else(|| {
+                retained
+                    .filter(|(hash, _)| *hash == tx_hash)
+                    .map(|(_, submission)| submission)
+            }) else {
                 warn!(%tx_hash, "No recorded sender nonce for burn; absence remains pending");
                 return Ok(crate::BurnTxStatus::Pending);
             };
@@ -808,31 +855,67 @@ impl<W: Wallet> CctpEndpoint<W> {
         }
     }
 
-    /// Scans for a `DepositForBurn` event from this endpoint's wallet at or
-    /// after `from_block`, returning the transaction hash of the most recent
-    /// match.
+    /// Scans for a `DepositForBurn` event from this endpoint's wallet strictly
+    /// after `from_block`, returning every candidate newest first.
     ///
     /// Crash-safe burn recovery: a transfer records the chain head before the
     /// burn, so on resume this detects an already-submitted burn instead of
-    /// re-burning (which would burn USDC twice with at most one mint). Matches on
-    /// `(depositor, amount, destinationDomain, mintRecipient)` so an adopted burn
-    /// is provably this transfer's -- not merely a same-amount burn from the same
-    /// wallet to a different destination. The head is captured before the burn, so
-    /// this transfer's burn lands strictly after `from_block`; the scan excludes the
-    /// `from_block` block itself so an earlier identical burn is never adopted.
+    /// re-burning (which would burn USDC twice with at most one mint). Matching
+    /// `(depositor, amount, destinationDomain, mintRecipient)` supplies a candidate,
+    /// not ownership proof. A stale initial RPC head can include an earlier
+    /// identical burn even with the exclusive lower bound. The caller must
+    /// reject candidates already recorded by another transfer before adoption.
     ///
-    /// Returns `Ok(None)` ONLY when the queried node is confirmations-deep past
-    /// `from_block` and repeated scans agree the burn is absent; a node that may
-    /// be lagging (the dRPC load-balancing hazard) yields a retryable
-    /// [`CctpError::ScanInconclusive`] instead, so the caller never re-burns off a
-    /// single stale empty `eth_getLogs`.
-    pub(super) async fn find_recent_burn(
+    /// Completes repeated full-range scans and the bounded finality gate even
+    /// when candidates exist: callers may exclude every candidate as foreign.
+    /// A lagging final head yields [`CctpError::ScanInconclusive`], not a partial
+    /// range that could authorize a reburn after ownership filtering.
+    pub(super) async fn find_recent_burns(
         &self,
         amount: U256,
         dest_domain: u32,
         recipient: Address,
         from_block: u64,
-    ) -> Result<Option<TxHash>, CctpError> {
+    ) -> Result<Vec<TxHash>, CctpError> {
+        self.scan_burn(amount, dest_domain, recipient, from_block, None)
+            .await
+    }
+
+    pub(super) async fn find_recorded_burn(
+        &self,
+        amount: U256,
+        dest_domain: u32,
+        recipient: Address,
+        from_block: u64,
+        burn_tx: TxHash,
+    ) -> Result<crate::RecordedBurnScan, CctpError> {
+        if !self
+            .scan_burn(amount, dest_domain, recipient, from_block, Some(burn_tx))
+            .await?
+            .is_empty()
+        {
+            return Ok(crate::RecordedBurnScan::Found);
+        }
+
+        // A separate numeric head cannot establish the log backend's coverage.
+        // Requalify the exact submission's canonical unused nonce after the scan.
+        // This is a point-in-time suspected absence, not a future mining guarantee.
+        Ok(match self.burn_status(burn_tx, from_block).await? {
+            crate::BurnTxStatus::Dropped => crate::RecordedBurnScan::Absent,
+            crate::BurnTxStatus::Pending
+            | crate::BurnTxStatus::MinedSuccess
+            | crate::BurnTxStatus::MinedReverted => crate::RecordedBurnScan::Inconclusive,
+        })
+    }
+
+    async fn scan_burn(
+        &self,
+        amount: U256,
+        dest_domain: u32,
+        recipient: Address,
+        from_block: u64,
+        recorded_hash: Option<TxHash>,
+    ) -> Result<Vec<TxHash>, CctpError> {
         let depositor = self.wallet.address();
         let mint_recipient = FixedBytes::<32>::left_padding_from(recipient.as_slice());
         let filter = Filter::new()
@@ -840,10 +923,14 @@ impl<W: Wallet> CctpEndpoint<W> {
             .address(self.token_messenger_address)
             .event_signature(TokenMessengerV2::DepositForBurn::SIGNATURE_HASH);
 
+        let mut candidates: Vec<(u64, Option<u64>, TxHash)> = Vec::new();
         for attempt in 1..=SCAN_ATTEMPTS {
             let logs = self.wallet.provider().get_logs(&filter).await?;
 
             for log in logs.iter().rev() {
+                if recorded_hash.is_some_and(|expected| log.transaction_hash != Some(expected)) {
+                    continue;
+                }
                 let decoded = log.log_decode::<TokenMessengerV2::DepositForBurn>()?;
                 let event = decoded.data();
 
@@ -851,24 +938,31 @@ impl<W: Wallet> CctpEndpoint<W> {
                     && event.amount == amount
                     && event.destinationDomain == dest_domain
                     && event.mintRecipient == mint_recipient
-                    && log.block_number.is_some_and(|block| block > from_block)
+                    && let Some(block) = log.block_number.filter(|block| *block > from_block)
                     && let Some(tx_hash) = log.transaction_hash
                 {
                     debug!(target: "bridge", %tx_hash, from_block, "Found existing burn during resume");
-                    return Ok(Some(tx_hash));
+                    if recorded_hash.is_some() {
+                        return Ok(vec![tx_hash]);
+                    }
+                    if !candidates.iter().any(|(_, _, hash)| *hash == tx_hash) {
+                        candidates.push((block, log.log_index, tx_hash));
+                    }
                 }
             }
 
-            // A single empty eth_getLogs from a load-balanced node is not
-            // authoritative (dRPC lag). Only conclude a true absence once the head
-            // is confirmations-deep past from_block AND repeated scans agree; else
-            // retry, and if still inconclusive return a retryable error so the
-            // caller never re-burns off a stale empty result.
+            // Finish the bounded range check even with positive candidates:
+            // ownership filtering may later exclude every one. This independent
+            // head is not log-backend affinity proof; exact absence additionally
+            // requires fresh canonical submission qualification in the caller.
             let head = self.wallet.provider().get_block_number().await?;
             let caught_up = head >= from_block.saturating_add(SCAN_FINALITY_MARGIN);
 
             if caught_up && attempt == SCAN_ATTEMPTS {
-                return Ok(None);
+                candidates.sort_unstable_by(|left, right| {
+                    right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1))
+                });
+                return Ok(candidates.into_iter().map(|(_, _, hash)| hash).collect());
             }
 
             if attempt < SCAN_ATTEMPTS {
@@ -889,7 +983,7 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// Used to derive the lower bound for [`find_recent_usdc_transfers`] from the
     /// known mint tx: the deposit send to Alpaca lands at or after the mint's
     /// block, so the mint block bounds the transfer scan exactly the way the
-    /// captured head bounds [`find_recent_burn`]. Confirmation-aware: it polls via
+    /// captured head bounds [`find_recent_burns`]. Confirmation-aware: it polls via
     /// `await_receipt` rather than a single-shot lookup, so a load-balanced node
     /// that has not yet seen the mint does not yield a spurious "block missing".
     pub(super) async fn tx_block(&self, tx_hash: TxHash) -> Result<u64, CctpError> {
@@ -1335,7 +1429,7 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// node's log index lagging behind the state its own `usedNonces()` view
     /// call already reflects -- up to `SCAN_ATTEMPTS` times spaced
     /// `SCAN_RETRY_BACKOFF` apart, the same dRPC-lag tolerance
-    /// [`find_recent_burn`](Self::find_recent_burn) and
+    /// [`find_recent_burns`](Self::find_recent_burns) and
     /// [`find_recent_usdc_transfers`](Self::find_recent_usdc_transfers) already
     /// apply to their own `get_logs` scans. This runs at most once per
     /// `recover_already_minted` call (not once per probe). Each retry's scan
@@ -1981,8 +2075,8 @@ mod tests {
     use httpmock::{Mock, MockServer};
     use serde_json::json;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    use st0x_evm::TransactionSubmission;
     use st0x_evm::local::RawPrivateKeyWallet;
 
     use super::*;
@@ -1992,6 +2086,8 @@ mod tests {
         hash: TxHash,
         submission: TransactionSubmission,
         confirmation: Mutex<Option<Result<TransactionReceipt, EvmError>>>,
+        released: AtomicBool,
+        receipt: Option<TransactionReceipt>,
     }
 
     #[async_trait]
@@ -2010,7 +2106,7 @@ mod tests {
         }
 
         fn transaction_submission(&self, hash: TxHash) -> Option<TransactionSubmission> {
-            (hash == self.hash).then_some(self.submission)
+            (hash == self.hash && !self.released.load(Ordering::SeqCst)).then_some(self.submission)
         }
 
         async fn sign_typed_data(&self, _: String, _: B256) -> Result<Signature, EvmError> {
@@ -2073,11 +2169,26 @@ mod tests {
 
         async fn await_receipt(&self, hash: TxHash) -> Result<TransactionReceipt, EvmError> {
             assert_eq!(hash, self.hash);
-            self.confirmation
-                .lock()
-                .unwrap()
-                .take()
-                .expect("absent receipt fixture must not confirm")
+            let confirmation = self.confirmation.lock().unwrap().take();
+            if let Some(confirmation) = confirmation {
+                if confirmation
+                    .as_ref()
+                    .is_err_and(EvmError::is_transaction_dropped)
+                {
+                    self.released.store(true, Ordering::SeqCst);
+                }
+                return confirmation;
+            }
+            self.released.store(true, Ordering::SeqCst);
+            self.receipt.as_ref().map_or_else(
+                || {
+                    Err(EvmError::TransactionDropped {
+                        tx_hash: hash,
+                        elapsed_secs: 30,
+                    })
+                },
+                |receipt| Ok(receipt.clone()),
+            )
         }
 
         async fn send(
@@ -2103,6 +2214,37 @@ mod tests {
         observations: impl Iterator<Item = (u64, u64)>,
     ) -> BurnProbeWallet {
         let asserter = Asserter::new();
+        push_absent_burn_observations(&asserter, floor, observations);
+        BurnProbeWallet {
+            confirmation: Mutex::new(None),
+            released: AtomicBool::new(false),
+            receipt: None,
+            provider: ProviderBuilder::new()
+                .disable_recommended_fillers()
+                .connect_mocked_client(asserter),
+            hash: TxHash::random(),
+            submission: TransactionSubmission {
+                sender: Address::random(),
+                nonce: 0,
+                submitted_after_block: floor,
+            },
+        }
+    }
+
+    fn push_absent_burn_heads(
+        asserter: &Asserter,
+        floor: Option<u64>,
+        next_nonce: u64,
+        heads: impl Iterator<Item = u64>,
+    ) {
+        push_absent_burn_observations(asserter, floor, heads.map(|head| (head, next_nonce)));
+    }
+
+    fn push_absent_burn_observations(
+        asserter: &Asserter,
+        floor: Option<u64>,
+        observations: impl Iterator<Item = (u64, u64)>,
+    ) {
         for (head, next_nonce) in observations {
             asserter.push_success(&serde_json::Value::Null);
             asserter.push_success(&serde_json::Value::Null);
@@ -2113,18 +2255,6 @@ mod tests {
             if head >= floor.unwrap_or(40) + SCAN_FINALITY_MARGIN {
                 asserter.push_success(&next_nonce);
             }
-        }
-        BurnProbeWallet {
-            confirmation: Mutex::new(None),
-            provider: ProviderBuilder::new()
-                .disable_recommended_fillers()
-                .connect_mocked_client(asserter),
-            hash: TxHash::random(),
-            submission: TransactionSubmission {
-                sender: Address::random(),
-                nonce: 0,
-                submitted_after_block: floor,
-            },
         }
     }
 
@@ -2333,6 +2463,367 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn confirm_drop_retains_identity_for_fresh_burn_status_requalification() {
+        for (next_nonce, advancing, expected) in [
+            (0, true, crate::BurnTxStatus::Dropped),
+            (1, true, crate::BurnTxStatus::Pending),
+            (0, false, crate::BurnTxStatus::Pending),
+        ] {
+            let wallet = burn_probe_wallet(
+                Some(40),
+                next_nonce,
+                (0..200).map(|index| if advancing { 42 + index } else { 42 }),
+            );
+            let hash = wallet.hash;
+            let endpoint = CctpEndpoint::new(
+                Chain::Ethereum,
+                Address::random(),
+                Address::random(),
+                Address::random(),
+                wallet,
+            );
+            let error = endpoint
+                .confirm_burn::<st0x_evm::OpenChainErrorRegistry>(hash, U256::from(1))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, CctpError::Evm(EvmError::TransactionDropped { tx_hash, .. })
+                if tx_hash == hash)
+            );
+            assert_eq!(
+                endpoint.wallet.transaction_submission(hash),
+                None,
+                "generic wallet drops release their submission identity before returning"
+            );
+            assert_eq!(
+                endpoint
+                    .burn_status_with_config(hash, 40, BurnDropConfig::fast())
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn confirm_drop_inconclusive_scan_requalifies_then_proves_exact_absence() {
+        let mut wallet = burn_probe_wallet(Some(40), 0, std::iter::empty());
+        let hash = wallet.hash;
+        let asserter = Asserter::new();
+        for _ in 0..SCAN_ATTEMPTS {
+            asserter.push_success(&Vec::<Log>::new());
+            asserter.push_success(&40u64);
+        }
+        push_absent_burn_heads(&asserter, Some(40), 0, [42, 43, 44].into_iter());
+        for _ in 0..SCAN_ATTEMPTS {
+            asserter.push_success(&Vec::<Log>::new());
+            asserter.push_success(&44u64);
+        }
+        push_absent_burn_heads(&asserter, Some(40), 0, [45, 46, 47].into_iter());
+        wallet.provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_mocked_client(asserter);
+        let endpoint = CctpEndpoint::new(
+            Chain::Ethereum,
+            Address::random(),
+            Address::random(),
+            Address::random(),
+            wallet,
+        )
+        .with_burn_drop_config(BurnDropConfig::fast());
+        let amount = U256::from(100);
+        let recipient = Address::random();
+        let error = endpoint
+            .confirm_burn::<st0x_evm::OpenChainErrorRegistry>(hash, amount)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CctpError::Evm(EvmError::TransactionDropped { .. })
+        ));
+        assert_eq!(endpoint.wallet.transaction_submission(hash), None);
+        assert!(matches!(
+            endpoint
+                .find_recorded_burn(
+                    amount,
+                    BridgeDirection::BaseToEthereum.dest_domain(),
+                    recipient,
+                    40,
+                    hash
+                )
+                .await,
+            Err(CctpError::ScanInconclusive { from_block: 40 })
+        ));
+        assert_eq!(
+            endpoint
+                .burn_status_with_config(hash, 40, BurnDropConfig::fast())
+                .await
+                .unwrap(),
+            crate::BurnTxStatus::Dropped,
+            "a failed scan after wallet release must not lose fresh requalification evidence"
+        );
+        assert_eq!(
+            endpoint
+                .find_recorded_burn(
+                    amount,
+                    BridgeDirection::BaseToEthereum.dest_domain(),
+                    recipient,
+                    40,
+                    hash
+                )
+                .await
+                .unwrap(),
+            crate::RecordedBurnScan::Absent,
+            "only the later qualified drop plus authoritative empty scan may page"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recorded_burn_empty_scan_needs_fresh_canonical_absence_after_wallet_release() {
+        for chain in [Chain::Ethereum, Chain::Base] {
+            for (nonce, advancing, expected) in [
+                (1, true, crate::RecordedBurnScan::Inconclusive),
+                (0, false, crate::RecordedBurnScan::Inconclusive),
+                (0, true, crate::RecordedBurnScan::Absent),
+            ] {
+                let mut wallet = burn_probe_wallet(Some(40), 0, std::iter::empty());
+                let hash = wallet.hash;
+                let asserter = Asserter::new();
+                for _ in 0..SCAN_ATTEMPTS {
+                    asserter.push_success(&Vec::<Log>::new());
+                    asserter.push_success(&44u64);
+                }
+                push_absent_burn_heads(
+                    &asserter,
+                    Some(40),
+                    nonce,
+                    (0..200).map(|index| if advancing { 44 + index } else { 44 }),
+                );
+                wallet.provider = ProviderBuilder::new()
+                    .disable_recommended_fillers()
+                    .connect_mocked_client(asserter);
+                let endpoint = CctpEndpoint::new(
+                    chain,
+                    Address::random(),
+                    Address::random(),
+                    Address::random(),
+                    wallet,
+                )
+                .with_burn_drop_config(BurnDropConfig::fast());
+                let error = endpoint
+                    .confirm_burn::<st0x_evm::OpenChainErrorRegistry>(hash, U256::from(100))
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    error,
+                    CctpError::Evm(EvmError::TransactionDropped { .. })
+                ));
+                assert_eq!(endpoint.wallet.transaction_submission(hash), None);
+                assert_eq!(
+                    endpoint
+                        .find_recorded_burn(U256::from(100), 6, Address::random(), 40, hash)
+                        .await
+                        .unwrap(),
+                    expected,
+                    "stale empty logs and an independent numeric head cannot authenticate current absence"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reverted_receipt_confirmation_drop_uses_the_same_suspected_drop_recovery() {
+        let mut wallet = burn_probe_wallet(Some(40), 0, std::iter::empty());
+        let hash = wallet.hash;
+        let mut shallow_revert = receipt_with_logs(vec![]);
+        shallow_revert.transaction_hash = hash;
+        let ReceiptEnvelope::Eip1559(inner) = &mut shallow_revert.inner else {
+            panic!("receipt fixture must be EIP-1559");
+        };
+        inner.receipt.status = false.into();
+        let asserter = Asserter::new();
+        asserter.push_success(&shallow_revert);
+        push_absent_burn_heads(&asserter, Some(40), 0, (0..200).map(|index| 42 + index));
+        wallet.provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_mocked_client(asserter);
+        let endpoint = CctpEndpoint::new(
+            Chain::Ethereum,
+            Address::random(),
+            Address::random(),
+            Address::random(),
+            wallet,
+        );
+        assert_eq!(
+            endpoint
+                .burn_status_with_config(hash, 40, BurnDropConfig::fast())
+                .await
+                .unwrap(),
+            crate::BurnTxStatus::Dropped,
+            "a reorg during revert confirmation must use the manager's drop cross-check, never reburn"
+        );
+        assert_eq!(endpoint.wallet.transaction_submission(hash), None);
+        assert_eq!(
+            endpoint
+                .burn_status_with_config(hash, 40, BurnDropConfig::fast())
+                .await
+                .unwrap(),
+            crate::BurnTxStatus::Dropped,
+            "later status checks must requalify using retained known identity"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retained_drop_evidence_is_hash_scoped_and_never_masks_incomplete_live_identity() {
+        for scenario in [
+            "unrelated hash",
+            "incomplete live identity",
+            "released incomplete identity",
+            "new endpoint",
+            "missing boundary",
+        ] {
+            let mut wallet = burn_probe_wallet(Some(40), 0, (0..200).map(|index| 42 + index));
+            if scenario == "missing boundary" {
+                wallet.submission.submitted_after_block = None;
+            }
+            let hash = wallet.hash;
+            let mut endpoint = CctpEndpoint::new(
+                Chain::Ethereum,
+                Address::random(),
+                Address::random(),
+                Address::random(),
+                wallet,
+            );
+            let error = endpoint
+                .confirm_burn::<st0x_evm::OpenChainErrorRegistry>(hash, U256::from(1))
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                CctpError::Evm(EvmError::TransactionDropped { .. })
+            ));
+            let requested = match scenario {
+                "unrelated hash" => TxHash::random(),
+                "incomplete live identity" => {
+                    endpoint.wallet.released.store(false, Ordering::SeqCst);
+                    endpoint.wallet.submission.submitted_after_block = None;
+                    hash
+                }
+                "released incomplete identity" => {
+                    endpoint.wallet.released.store(false, Ordering::SeqCst);
+                    endpoint.wallet.submission.submitted_after_block = None;
+                    let error = endpoint
+                        .confirm_burn::<st0x_evm::OpenChainErrorRegistry>(hash, U256::from(1))
+                        .await
+                        .unwrap_err();
+                    assert!(matches!(
+                        error,
+                        CctpError::Evm(EvmError::TransactionDropped { .. })
+                    ));
+                    hash
+                }
+                "new endpoint" => {
+                    endpoint = CctpEndpoint::new(
+                        Chain::Ethereum,
+                        Address::random(),
+                        Address::random(),
+                        Address::random(),
+                        endpoint.wallet,
+                    );
+                    hash
+                }
+                "missing boundary" => hash,
+                other => panic!("unexpected evidence scenario {other}"),
+            };
+            assert_eq!(
+                endpoint
+                    .burn_status_with_config(requested, 40, BurnDropConfig::fast())
+                    .await
+                    .unwrap(),
+                crate::BurnTxStatus::Pending,
+                "{scenario}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_drop_slot_is_bounded_and_matching_confirmation_clears_it() {
+        for success in [true, false] {
+            let wallet = burn_probe_wallet(Some(40), 0, std::iter::empty());
+            let hash = wallet.hash;
+            let submission = wallet.submission;
+            let mut endpoint = CctpEndpoint::new(
+                Chain::Ethereum,
+                Address::random(),
+                Address::random(),
+                Address::random(),
+                wallet,
+            );
+            *endpoint.suspected_drop_submission.lock().await = Some((TxHash::random(), submission));
+            let error = endpoint
+                .confirm_burn::<st0x_evm::OpenChainErrorRegistry>(hash, U256::from(1))
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                CctpError::Evm(EvmError::TransactionDropped { .. })
+            ));
+            assert_eq!(
+                *endpoint.suspected_drop_submission.lock().await,
+                Some((hash, submission))
+            );
+            endpoint.clear_suspected_drop(TxHash::random()).await;
+            assert_eq!(
+                *endpoint.suspected_drop_submission.lock().await,
+                Some((hash, submission))
+            );
+
+            let error = endpoint
+                .wait_for_burn_receipt(hash, async {
+                    Err(EvmError::ReceiptTimeout {
+                        tx_hash: hash,
+                        timeout_secs: 30,
+                    })
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(error, EvmError::ReceiptTimeout { tx_hash, .. } if tx_hash == hash));
+            assert_eq!(
+                *endpoint.suspected_drop_submission.lock().await,
+                Some((hash, submission)),
+                "inconclusive confirmation errors must retain known evidence"
+            );
+
+            let mut receipt = receipt_with_logs(vec![]);
+            receipt.transaction_hash = hash;
+            let ReceiptEnvelope::Eip1559(inner) = &mut receipt.inner else {
+                panic!("receipt fixture must be EIP-1559");
+            };
+            inner.receipt.status = success.into();
+            endpoint.wallet.receipt = Some(receipt);
+            let asserter = Asserter::new();
+            asserter.push_success(&serde_json::Value::Null);
+            endpoint.wallet.provider = ProviderBuilder::new()
+                .disable_recommended_fillers()
+                .connect_mocked_client(asserter);
+            let error = endpoint
+                .confirm_burn::<st0x_evm::OpenChainErrorRegistry>(hash, U256::from(1))
+                .await
+                .unwrap_err();
+            if success {
+                assert!(
+                    matches!(error, CctpError::MessageSentEventNotFound { tx_hash } if tx_hash == hash)
+                );
+            } else {
+                assert!(
+                    matches!(error, CctpError::Evm(EvmError::Reverted { tx_hash }) if tx_hash == hash)
+                );
+            }
+            assert_eq!(*endpoint.suspected_drop_submission.lock().await, None);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn burn_status_caller_floor_cannot_replace_unknown_submission_boundary() {
         let wallet = burn_probe_wallet(None, 0, (0..200).map(|index| 42 + index));
         assert_eq!(probe_burn(wallet, 40).await, crate::BurnTxStatus::Pending);
@@ -2523,6 +3014,106 @@ mod tests {
                 .saturating_mul(config.probes.get().saturating_sub(1)),
             Duration::from_secs(120),
             "the production mint recovery window must stay at the documented two minutes"
+        );
+    }
+
+    fn burn_log(sender: Address, recipient: Address, hash: TxHash, block: u64) -> Log {
+        let event = TokenMessengerV2::DepositForBurn {
+            burnToken: Address::random(),
+            amount: U256::from(100),
+            depositor: sender,
+            mintRecipient: FixedBytes::<32>::left_padding_from(recipient.as_slice()),
+            destinationDomain: 6,
+            destinationTokenMessenger: B256::random(),
+            destinationCaller: B256::ZERO,
+            maxFee: U256::ZERO,
+            minFinalityThreshold: 1000,
+            hookData: Bytes::new(),
+        };
+        Log {
+            inner: PrimitiveLog {
+                address: Address::random(),
+                data: event.encode_log_data(),
+            },
+            block_number: Some(block),
+            transaction_hash: Some(hash),
+            log_index: Some(0),
+            ..Log::default()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn generic_burn_candidates_require_complete_bounded_scan_even_when_nonempty() {
+        for chain in [Chain::Ethereum, Chain::Base] {
+            for head in [40u64, 45] {
+                let mut wallet = burn_probe_wallet(Some(40), 0, std::iter::empty());
+                let recipient = Address::random();
+                let older = TxHash::random();
+                let newer = TxHash::random();
+                let old_log = burn_log(wallet.address(), recipient, older, 41);
+                let new_log = burn_log(wallet.address(), recipient, newer, 43);
+                let asserter = Asserter::new();
+                for attempt in 1..=SCAN_ATTEMPTS {
+                    let logs = if attempt == SCAN_ATTEMPTS {
+                        vec![old_log.clone(), new_log.clone()]
+                    } else {
+                        vec![old_log.clone()]
+                    };
+                    asserter.push_success(&logs);
+                    asserter.push_success(&head);
+                }
+                wallet.provider = ProviderBuilder::new()
+                    .disable_recommended_fillers()
+                    .connect_mocked_client(asserter);
+                let endpoint = CctpEndpoint::new(
+                    chain,
+                    Address::random(),
+                    Address::random(),
+                    Address::random(),
+                    wallet,
+                );
+                let result = endpoint
+                    .find_recent_burns(U256::from(100), 6, recipient, 40)
+                    .await;
+                if head == 40 {
+                    assert!(
+                        matches!(result, Err(CctpError::ScanInconclusive { from_block: 40 })),
+                        "a positive partial range cannot authorize ownership-excluded absence: {result:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        result.unwrap(),
+                        vec![newer, older],
+                        "finish the complete range and order newer candidates before earlier responses"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recorded_burn_positive_log_does_not_need_unused_nonce_qualification() {
+        let mut wallet = burn_probe_wallet(Some(40), 1, std::iter::empty());
+        let hash = wallet.hash;
+        let recipient = Address::random();
+        let asserter = Asserter::new();
+        asserter.push_success(&vec![burn_log(wallet.address(), recipient, hash, 41)]);
+        wallet.provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_mocked_client(asserter);
+        let endpoint = CctpEndpoint::new(
+            Chain::Ethereum,
+            Address::random(),
+            Address::random(),
+            Address::random(),
+            wallet,
+        );
+        assert_eq!(
+            endpoint
+                .find_recorded_burn(U256::from(100), 6, recipient, 40, hash)
+                .await
+                .unwrap(),
+            crate::RecordedBurnScan::Found
         );
     }
 

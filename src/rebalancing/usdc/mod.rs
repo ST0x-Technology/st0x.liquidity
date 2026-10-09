@@ -53,7 +53,9 @@ use st0x_raindex::RaindexError;
 use crate::bot_gas::redrive::BotGasFailureClassifier;
 use crate::inventory::InventoryViewError;
 use crate::native_gas::GasReadinessFailure;
-use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceId};
+use crate::usdc_rebalance::{
+    BurnTxOwnershipLookupError, RebalanceDirection, UsdcRebalance, UsdcRebalanceId,
+};
 
 #[derive(Debug, Error)]
 pub enum UsdcTransferError {
@@ -65,6 +67,27 @@ pub enum UsdcTransferError {
     AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
     #[error("CCTP bridge error: {0}")]
     Cctp(#[from] Box<CctpError>),
+    #[error(
+        "USDC rebalance {id}: burn {tx} is already recorded by rebalance {recorded_by}; not adopting or reburning"
+    )]
+    BurnTxAlreadyRecorded {
+        id: UsdcRebalanceId,
+        tx: TxHash,
+        recorded_by: UsdcRebalanceId,
+    },
+    #[error(
+        "USDC rebalance {id}: ownership history is not wired for burn {tx}; not adopting or reburning"
+    )]
+    BurnTxOwnershipUnchecked { id: UsdcRebalanceId, tx: TxHash },
+    #[error(
+        "USDC rebalance {id}: ownership history could not be read for burn {tx}; not adopting or reburning"
+    )]
+    BurnTxOwnershipLookupFailed {
+        id: UsdcRebalanceId,
+        tx: TxHash,
+        #[source]
+        source: BurnTxOwnershipLookupError,
+    },
     /// Constructed only at the bot-gas enqueue site
     /// (`CrossVenueCashTransfer::enqueue_bot_gas_cost`), deliberately NOT via
     /// `#[from]`: the job layer treats this variant as best-effort bookkeeping
@@ -84,11 +107,14 @@ pub enum UsdcTransferError {
     /// IMPORTANT: The double-burn safety guarantee does NOT come from this
     /// classification. It comes from `resume_bridging_submitting` /
     /// `resume_bridging_submitting_ethereum` scanning for an existing burn (via
-    /// `find_recent_burn`) before attempting a new one, with the scan lower bound
-    /// (`from_block`) durably recorded in the `BeginBridging` / `BridgingSubmitting`
-    /// event before the burn call. This variant identifies errors where the EVM
+    /// `find_recent_burn`) before attempting a new one, rejecting another
+    /// transfer's historical burn claim and confirming a candidate before
+    /// adoption. The recorded hash must be confirmed reverted before an empty
+    /// scan permits reburning; a missing hash still fails closed. The scan's
+    /// durably recorded lower bound can be stale and is not ownership proof.
+    /// This variant identifies errors where the EVM
     /// produced no lasting state change (post-mining reverts, pre-flight rejections).
-    /// The safety guarantee is the scan, not this variant.
+    /// The safety guarantee is the recovery evidence, not this variant.
     #[error("CCTP burn revert (no on-chain state change): {0}")]
     BurnRevert(Box<CctpError>),
     #[error("Vault error: {0}")]
@@ -658,6 +684,9 @@ impl UsdcTransferError {
             Self::AlpacaWallet(_)
             | Self::AlpacaBrokerApi(_)
             | Self::Cctp(_)
+            | Self::BurnTxAlreadyRecorded { .. }
+            | Self::BurnTxOwnershipUnchecked { .. }
+            | Self::BurnTxOwnershipLookupFailed { .. }
             | Self::BurnRevert(_)
             | Self::Vault(_)
             | Self::InsufficientVaultLiquidity { .. }
@@ -724,6 +753,9 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::AlpacaWallet(_)
             | Self::AlpacaBrokerApi(_)
             | Self::Cctp(_)
+            | Self::BurnTxAlreadyRecorded { .. }
+            | Self::BurnTxOwnershipUnchecked { .. }
+            | Self::BurnTxOwnershipLookupFailed { .. }
             | Self::BurnRevert(_)
             | Self::Vault(_)
             | Self::InsufficientVaultLiquidity { .. }
