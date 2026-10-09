@@ -8916,7 +8916,9 @@ impl RebalancingService {
             .transpose()?
             .is_some_and(|is_zero| !is_zero);
 
-        let (update, rollback): (EquityInventoryUpdate, RecoveryRollback) =
+        // Only the `Start` branch debits available, so only it marks the
+        // rebuilt tracking `Started`; the `set_inflight` branches debit nothing.
+        let (update, rollback, debits_available): (EquityInventoryUpdate, RecoveryRollback, bool) =
             if let Some(timed_out_at) = timed_out_at {
                 let suppressed_at = self
                     .suppressed_inflight_symbols
@@ -8931,16 +8933,19 @@ impl RebalancingService {
                         timed_out_at,
                         suppressed_at,
                     },
+                    false,
                 )
             } else if inflight_already_established {
                 (
                     Box::new(Inventory::set_inflight(Venue::Hedging, quantity)),
                     RecoveryRollback::TrackingOnly,
+                    false,
                 )
             } else {
                 (
                     Self::start_equity_transfer_update(Venue::Hedging, quantity),
                     RecoveryRollback::CancelInflight,
+                    true,
                 )
             };
 
@@ -9010,7 +9015,15 @@ impl RebalancingService {
                 .remove(&(symbol.clone(), entity.chain()));
         }
 
-        self.mint_tracking.write().await.insert(
+        let mut mint_tracking = self.mint_tracking.write().await;
+        let hedging_start = if debits_available {
+            HedgingStart::Started
+        } else {
+            mint_tracking
+                .get(id)
+                .map_or(HedgingStart::NotStarted, |tracking| tracking.hedging_start)
+        };
+        mint_tracking.insert(
             id.clone(),
             MintTracking {
                 symbol: symbol.clone(),
@@ -9019,9 +9032,10 @@ impl RebalancingService {
                 tokenization_request_id: Some(tokenization_request_id),
                 stage: MintTrackingStage::Accepted,
                 last_progress_at: Utc::now(),
-                hedging_start: HedgingStart::Started,
+                hedging_start,
             },
         );
+        drop(mint_tracking);
         Ok(match recovery_guard {
             Some(guard) => RecoveryClaim::Guarded { rollback, guard },
             None => RecoveryClaim::Claimed(rollback),
