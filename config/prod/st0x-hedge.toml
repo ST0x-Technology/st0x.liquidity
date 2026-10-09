@@ -1,20 +1,25 @@
 # st0x liquidity bot runtime config for PRODUCTION: the deployed source of
 # truth since 2026-09-07 (moved here from t0.devops terraform/production-
 # liquidity/st0x-hedge.toml; the stack there keeps only the secret and its
-# grants). A merge touching this file is a PRODUCTION CONFIG RELEASE: the
-# release workflow validates it inside the exact bot image it rolls (validate-
-# config), publishes it as a version of the liquidity-runtime-config secret,
-# then rolls the plane only after an approver activates the app-deploy PAM
-# grant in the GCP console (.github/workflows/production-release.yml). A
-# version tag ships this file together with the new binary; a
-# workflow_dispatch on an older tag rolls both back. Non-secret settings only;
-# secrets come from Secret Manager env injection.
+# grants). A merge touching this file deploys nothing. Production rolls only
+# through a manual production-release run (.github/workflows/
+# production-release.yml): version = vX.Y.Z ships this file together with
+# that tag's binary (an older tag rolls both back), and an empty version is a
+# config-only release of this file onto the live images. That release takes
+# the file from the branch the run is started from, so start it from master;
+# any other branch publishes that branch's unreviewed copy. The
+# workflow validates the file inside the exact bot image it will run on
+# (validate-config), publishes it as a version of the liquidity-runtime-config
+# secret, then rolls the plane only after an approver activates the
+# app-deploy PAM grant. Non-secret settings only; secrets come from Secret
+# Manager env injection.
 #
 # The VM (t0.devops terraform/production-liquidity) fetches exactly the
 # CONFIG_VERSION that images.env names, never `latest`; the release
-# workflow writes that line next to the digests it rolls, so image, config
-# and the Terraform-pinned secrets version always roll, and roll back,
-# together. The release validates this file inside the bot image it rolls
+# workflow writes that line next to the digests it rolls. A versioned release
+# rolls, and rolls back, the image, this config, and the Terraform-pinned
+# secrets version together; an empty-version release keeps the live image
+# digests. The release validates this file inside the bot image it will run
 # (the 2026-09-04 crash loop was a field only the newer image knew).
 #
 # HTTP API port for the dashboard and health checks.
@@ -161,8 +166,10 @@ required_confirmations = 1
 # the previous release cannot load. So if the switch-on release does not
 # boot, roll back to the previous release. Once it has moved equity, the
 # stop is a paused generation on this release, or a roll forward. To pause,
-# publish a st0x.registry generation with the listing's Robinhood
-# rebalancing at "paused" and bump [registry].generation here; this file
+# merge the listing's Robinhood rebalancing at "paused" in t0.tokens, publish
+# it to production (a manual publish-t0-tokens run with its PAM grant), bump
+# [registry].generation here to that generation, and roll it with a
+# config-only production-release run. A merge alone pauses nothing. This file
 # cannot set it, since [registry] refuses inline equities tables. "paused"
 # still runs the Robinhood startup preflights (OPERATOR_ROLE, approvals,
 # issuer and wrapper), so it does not fix a release that fails to boot. A
@@ -385,13 +392,13 @@ operational_limit = 25000
 # config-check stays red on this file until that tag exists. Empty on
 # purpose: QSEP is still in the token file (as production runs it). Listing a
 # symbol here drops its rows from the token file at the merge, so retire it
-# here first; its rows in st0x.registry can go afterwards (see
+# here first; its rows in t0.tokens can go afterwards (see
 # docs/how-to-add-new-asset.md, "Retiring an asset").
 [assets.equities]
 retired_symbols = []
 
 # The per-symbol tables ([chains.<c>.trading.assets.equities.<SYM>] and
-# [assets.equities.<SYM>]) come from st0x.registry's token file in the bucket.
+# [assets.equities.<SYM>]) come from t0.tokens' token file in the bucket.
 [registry]
 url = "gs://t0-artifacts-tokens/production/tokens.toml"
 generation = 1791378253362331

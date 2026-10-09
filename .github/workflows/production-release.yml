@@ -6,7 +6,8 @@ name: production-release
 #     version = vX.Y.Z  : images AND config/prod/st0x-hedge.toml from that
 #                         tag (new version, re-deploy or rollback);
 #     version empty     : CONFIG-ONLY release, config/prod/st0x-hedge.toml
-#                         from master on the digests LIVE in production.
+#                         on the digests LIVE in production, taken from the
+#                         branch the run starts from: select master.
 # Nothing fires on its own any more (until 2026-09-08 a merge touching the
 # prod config requested a grant by itself, and release-tag.yml did the same
 # for every tag; RAI-2266). Either way the file is validated inside the
@@ -20,7 +21,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "vX.Y.Z to deploy images and config from that tag; leave empty for a config-only release of config/prod/st0x-hedge.toml from master onto the live images"
+        description: "vX.Y.Z to deploy images and config from that tag; leave empty for a config-only release of config/prod/st0x-hedge.toml onto the live images, taken from the branch selected above (select master)"
         required: false
         default: ""
         type: string

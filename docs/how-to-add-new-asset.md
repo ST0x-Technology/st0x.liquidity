@@ -10,10 +10,11 @@ in a specific order. This guide walks through each step.
 When you add a new asset (e.g. SGOV), you need to:
 
 1. **Get the token contract addresses** (from the registry)
-2. **Register it in the Issuance Bot** (so Alpaca knows about it)
-3. **Whitelist the contract in Fireblocks** (so minting transactions can be
-   signed)
-4. **Add it to the Liquidity Bot config** (so it starts trading/hedging)
+2. **Allow the vault in the issuer's Turnkey policy** and grant `DEPOSIT` and
+   `WITHDRAW` to the issuance bot's signing wallet, not the liquidity bot's
+   wallet (so mints and burns can be signed). Do this before step 3.
+3. **Register it in the Issuance Bot** (so Alpaca knows about it)
+4. **Add it to the Liquidity Bot's token file** (so it starts trading/hedging)
 
 ---
 
@@ -27,51 +28,67 @@ Every tokenized asset has two contract addresses on each chain that lists it
 | **tokenized_equity**            | The base ERC-20 token (e.g. tSGOV). This is also the "vault" address the issuance bot needs. | `0xc941C1506B7555Ba8C506Fb6c9b9CC259902d612` |
 | **tokenized_equity_derivative** | The wrapped/dividend-accruing version (e.g. wtSGOV).                                         | `0x78c31580c97101694c70022c83d570150c11e935` |
 
-**Where to find them:** The `ST0x-Technology/st0x.registry` GitHub repo. If
-they've been removed from the current code, check the git history.
+**Where to find them:** The `ST0x-Technology/st0x.registry` GitHub repo, in
+`token-lists/<chain>.json`. Each entry is the wrapped token (`wtSYM`): its
+`address` is `tokenized_equity_derivative` and its `extensions.unwrappedAddress`
+is `tokenized_equity`. For a token that is not listed yet, the addresses come
+from the deploy run that created it (see the prerequisites in the issuance
+onboarding runbook below).
 
 ---
 
-## Step 2: Register the Asset in the Issuance Bot
+## Step 2: Allow the Vault in the Issuer's Turnkey Policy
 
-The issuance bot runs on a DigitalOcean droplet. You need to SSH into it and
-call the bot's internal API to register the new asset.
+The issuance bot signs its onchain transactions (minting and redemption) with
+Turnkey. Fireblocks is decommissioned (see the st0x.issuance runbook
+`docs/runbooks/fireblocks-decommission.md`), so there is no Fireblocks whitelist
+step any more.
 
-### 2a. SSH into the issuance bot server
+Instead, the issuer's Turnkey policies carry an explicit per-chain list of
+receipt vaults. A vault missing from that list is refused at signing on every
+mint and burn. Get the policy change applied and verified, together with the
+vault's `DEPOSIT` and `WITHDRAW` grants to the issuance bot's signing wallet
+(not the liquidity bot's wallet), **before** you register the asset in step 3.
+Both are prerequisites in the issuance onboarding runbook. A listing that goes
+live before signing works fails its first mint at signing (Turnkey 403), and
+that mint then needs manual recovery.
 
-```bash
-ssh root@<ISSUANCE_BOT_DROPLET_IP>
-```
+If a mint or a burn fails on a missing policy or another transient error, fix
+the cause first. Then recover the mint or the redemption with the admin
+endpoints in the st0x.issuance recovery guide (`docs/ops-recovery-guide.md`),
+called from the issuer host as in step 3.
 
-### 2b. Verify the bot is running
+---
 
-```bash
-docker ps
-```
+## Step 3: Register the Asset in the Issuance Bot
 
-You should see `issuance-bot` with status `Up ...` (not `Restarting`).
+The listing is runtime state in the issuance bot, written by one
+`POST /tokenized-assets` call against the running service. Nothing ships and
+nothing restarts. The authoritative procedure, with the exact pre-check,
+register and verify commands and what each status code means, is the
+`ST0x-Technology/st0x.issuance` runbook
+[`docs/runbooks/tokenized-asset-onboarding.md`](https://github.com/ST0x-Technology/st0x.issuance/blob/main/docs/runbooks/tokenized-asset-onboarding.md).
+Follow it; this section only says where to run it.
 
-### 2c. Check what assets are already registered
+Do this only after step 2: the vault must already be in the issuer's Turnkey
+policy, with its `DEPOSIT` and `WITHDRAW` grants.
 
-```bash
-sqlite3 /mnt/volume_nyc3_02/issuance.db "SELECT payload FROM tokenized_asset_view"
-```
+### 3a. Get onto the issuer host
 
-This shows all currently registered assets. Verify your new asset is NOT already
-there.
+Get onto the issuer host as the `S01-Issuer/s01.devops` access runbook says. The
+admin API is not reachable from outside that host.
 
-### 2d. Add the new asset
+### 3b. Call the admin API from the issuer host
 
-Run this command, replacing the values for your asset:
+`POST /tokenized-assets` uses "internal auth": it needs the `X-API-KEY` header
+**and** a client IP inside the service's internal ranges, so call it on the
+issuer host. Follow the st0x.issuance onboarding runbook for the base URL and
+the API key. Do not assume a fixed port: confirm the port that the service
+listens on, as the st0x.issuance recovery guide does, and use `ISSUER_BASE_URL`
+as the onboarding runbook does. On the wrong port the pre-check `GET` can return
+a `404` that does not come from the issuance bot.
 
-```bash
-read -rsp "Issuance bot internal API key: " INTERNAL_API_KEY; echo
-curl -s -X POST http://localhost:8000/tokenized-assets \
-  -H 'Content-Type: application/json' \
-  -H "X-API-KEY: ${INTERNAL_API_KEY}" \
-  -d '{"underlying":"SGOV","token":"tSGOV","network":"base","vault":"0xc941C1506B7555Ba8C506Fb6c9b9CC259902d612"}'
-unset INTERNAL_API_KEY
-```
+Never print the API key or the secrets env that holds it.
 
 **Important notes:**
 
@@ -80,24 +97,16 @@ unset INTERNAL_API_KEY
 - The `network` field is the chain the asset is listed on, spelled as the bot's
   chain name (`base`, `ethereum`, `hyperevm`, `robinhood`). Register once per
   chain.
-- The `X-API-KEY` is the internal API key stored on the server. Check the `.env`
-  file on the droplet if you don't know it. The `read -rsp` command above
-  prompts for the key without echoing it or saving it to shell history.
-- `POST /tokenized-assets` uses "internal auth" which allows requests from the
-  Docker network. Run it from the droplet host, NOT from outside.
-- The `GET /tokenized-assets` endpoint is locked to Alpaca's IPs, so you can't
-  use it to verify. Use the sqlite3 command from step 2c instead.
-- This is idempotent -- calling it twice with the same data is safe.
+- Pre-check with `GET /tokenized-assets/<underlying>?network=<network>` (also
+  internal auth). Register only when it returns `404`: re-adding an existing
+  asset with a different vault silently repoints the listing.
+- Verify with the same `GET`, which must return `200` with the expected token,
+  network and vault. The list endpoint `GET /tokenized-assets` is for Alpaca and
+  is not the way to verify.
+- `422` means an unconfigured network, an invalid symbol, or a vault that
+  already serves another underlying on that network.
 
-### 2e. Verify it was added
-
-```bash
-sqlite3 /mnt/volume_nyc3_02/issuance.db "SELECT payload FROM tokenized_asset_view"
-```
-
-You should now see your new asset in the list.
-
-### 2f. Wait for Alpaca to pick it up
+### 3c. Wait for Alpaca to pick it up
 
 Alpaca periodically calls `GET /tokenized-assets` on the issuance bot to
 discover available assets. After you add the asset, Alpaca's internal
@@ -109,45 +118,28 @@ discover available assets. After you add the asset, Alpaca's internal
 
 ---
 
-## Step 3: Whitelist the Contract in Fireblocks
-
-The issuance bot uses Fireblocks to sign onchain transactions (minting). If the
-new asset's vault contract isn't whitelisted in Fireblocks, minting will fail
-with: `"contract 0x... is not whitelisted in Fireblocks"`
-
-**Action:** Add the vault contract address (`tokenized_equity`) to the
-Fireblocks workspace's whitelist via the Fireblocks console/UI.
-
-This is done by whoever has admin access to the Fireblocks workspace (likely
-Josh or another team member with Fireblocks access).
-
-If a mint fails before whitelisting, the mint enters `MintingFailed` state.
-After whitelisting, restart the bot (`docker restart issuance-bot`) -- the
-auto-recovery will retry the failed mint on startup.
-
----
-
 ## Step 4: Add the Asset to the Token File
 
 The liquidity bot (this repo) reads its per-symbol tables from the token file
-that `st0x.registry` publishes to `gs://t0-artifacts-tokens/<env>/tokens.toml`
-(`t0/<env>.toml` in that repository). The bot's configs,
+that the private `T0Trade/t0.tokens` repository publishes to
+`gs://t0-artifacts-tokens/<env>/tokens.toml` (`t0/<env>.toml` in that
+repository; it moved there from `st0x.registry`, which now keeps only the
+`token-lists/<chain>.json` address lists). The bot's configs,
 `config/staging/st0x-hedge.toml` and `config/prod/st0x-hedge.toml`, name that
 file under `[registry]` and must not carry a per-symbol table themselves: a
 config that does is refused at startup.
 
 ### 4a. Edit the token file
 
-Edit `t0/staging.toml` (or `t0/production.toml`) in `st0x.registry`. The bot
-takes two tables per asset. The first says where the asset is listed on-chain,
-so it goes under the chain that lists it. The second says how the bot hedges it,
-which is independent of any chain -- there is one broker account and one
-position per symbol. Other services own other keys on the same tables (the
-file's header lists them). The bot takes its own keys and ignores the others;
-which keys may appear, and their spelling, is checked by `st0x.registry`'s CI
-(`t0/check.jq`) before the file is published, not by the bot. Publishing
-`rebalancing = "paused"` needs this order so an older binary never reads a token
-file it cannot load:
+Edit `t0/staging.toml` (or `t0/production.toml`) in `t0.tokens`. The bot takes
+two tables per asset. The first says where the asset is listed on-chain, so it
+goes under the chain that lists it. The second says how the bot hedges it, which
+is independent of any chain -- there is one broker account and one position per
+symbol. Other services own other keys on the same tables (the file's header
+lists them). The bot takes its own keys and ignores the others; which keys may
+appear, and their spelling, is checked by `t0.tokens`' CI (`t0/check.jq`) before
+the file is published, not by the bot. Publishing `rebalancing = "paused"` needs
+this order so an older binary never reads a token file it cannot load:
 
 1. Deploy the bot that reads `paused`.
 2. Merge the `t0/check.jq` validator change that accepts `paused`.
@@ -283,9 +275,11 @@ chain's signing wallet, orderbook, `redemption_wallet` and
 
 ### 4b. Publish and verify adoption
 
-Merge the `st0x.registry` change; its CI publishes the token file. After the
-unpinned reload release, the bot polls every ten seconds and validates each
-observed generation before a graceful restart. No liquidity pin-bump PR or
+Merge the `t0.tokens` change. Its `publish-t0-tokens` workflow uploads the
+staging file on merge. The production file is uploaded only when someone runs
+that workflow by hand on `main`, and the upload waits for an approved PAM grant.
+After the unpinned reload release, the bot polls every ten seconds and validates
+each observed generation before a graceful restart. No liquidity pin-bump PR or
 config-only release is needed. Start with a disabled listing, verify adoption,
 then enable trading in a second publish. Newly configured contracts are probed
 including disabled rows; newly selected tokenization routes and changed startup
@@ -323,7 +317,7 @@ ship in one release, with the Robinhood switch-on
 master without that pin. A tag rollback from that release is safe only before it
 has run any equity operation on any chain: every redemption it runs, on Base
 too, persists `SendPrepared`, which the previous release cannot load. After
-that, pause the Robinhood listing with a new st0x.registry generation plus a pin
+that, pause the Robinhood listing with a new token-file generation plus a pin
 bump, or roll forward; going below R follows SPEC.md.
 
 ### Retiring an asset
@@ -351,15 +345,18 @@ the asset, then enable trading in a follow-up change.
 For adding asset **XYZ**:
 
 - [ ] Get `tokenized_equity` and `tokenized_equity_derivative` addresses from
-      `st0x.registry`
-- [ ] SSH into issuance bot droplet
-- [ ] Run `POST /tokenized-assets` curl command with the vault address
-- [ ] Verify asset appears in the database
-- [ ] Whitelist the vault contract in Fireblocks (ask team member with access)
+      `st0x.registry` (`token-lists/<chain>.json`)
+- [ ] Get the vault into the issuer's Turnkey policy and its `DEPOSIT` and
+      `WITHDRAW` grants to the issuance bot's signing wallet
+- [ ] Get onto the issuer host as the `S01-Issuer/s01.devops` access runbook
+      says
+- [ ] Pre-check, then run `POST /tokenized-assets` with the vault address, as in
+      the st0x.issuance onboarding runbook
+- [ ] Verify with `GET /tokenized-assets/<underlying>?network=<network>`
 - [ ] Wait for Alpaca to refresh their tokencache (or ask them to force it)
 - [ ] Test a mint via the liquidity bot CLI:
       `stox alpaca-tokenize -t <token_addr> -s XYZ -q 1 -r <receiving_wallet>`
-- [ ] Add the asset to `t0/staging.toml` in `st0x.registry` (disabled first)
+- [ ] Add the asset to `t0/staging.toml` in `t0.tokens` (disabled first)
 - [ ] On each hedged chain where the asset is listed: that chain's own
       `tokenized_equity_derivative`, and Turnkey approval policies for that
       chain's id
@@ -371,18 +368,20 @@ For adding asset **XYZ**:
       first orchestrator-mode mint fails at signing without it
 - [ ] Verify staging applied the disabled asset generation
 - [ ] Enable trading in the token file and verify adoption
-- [ ] Repeat for production when staging looks good (during pinned rollout,
-      apply a reviewed generation bump and release)
+- [ ] Repeat for production when staging looks good: run `publish-t0-tokens` on
+      `main` and get its PAM grant approved (during pinned rollout, also apply a
+      reviewed generation bump and release)
 
 ---
 
 ## Troubleshooting
 
-| Problem                                             | Cause                                            | Fix                                                                           |
-| --------------------------------------------------- | ------------------------------------------------ | ----------------------------------------------------------------------------- |
-| `"Token symbol for X not found in tokencache"`      | Alpaca hasn't refreshed their cache              | Wait, or contact Alpaca to force refresh                                      |
-| `"contract 0x... is not whitelisted in Fireblocks"` | Vault contract not in Fireblocks whitelist       | Add it in Fireblocks console, then restart bot                                |
-| Mint stuck in `MintingFailed`                       | Transient error (Fireblocks, network, etc.)      | Fix root cause, then `docker restart issuance-bot` (recovery runs on startup) |
-| `curl` to `GET /tokenized-assets` returns 403       | That endpoint is locked to Alpaca IPs            | Use `sqlite3` to query the DB directly instead                                |
-| Bot shows empty curl response                       | Bot is still backfilling (happens after restart) | Wait for backfill to complete, then retry                                     |
-| `"user balance exceeded"` on RPC                    | dRPC credits depleted                            | Top up dRPC credits (ask Josh)                                                |
+| Problem                                        | Cause                                            | Fix                                                                                                            |
+| ---------------------------------------------- | ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
+| `"Token symbol for X not found in tokencache"` | Alpaca hasn't refreshed their cache              | Wait, or contact Alpaca to force refresh                                                                       |
+| Mint refused at signing (Turnkey 403)          | Vault missing from the issuer's Turnkey policy   | Get the policy change applied (step 2), then recover the mint (recovery guide, "Recovering mints")             |
+| Burn refused at signing (Turnkey 403)          | Vault missing from the issuer's Turnkey policy   | Get the policy change applied (step 2), then recover the redemption (recovery guide, "Recovering redemptions") |
+| Mint stuck in `MintingFailed`                  | Transient error (signing, network, etc.)         | Fix root cause, then recover it with the st0x.issuance recovery guide                                          |
+| `curl` to `GET /tokenized-assets` returns 403  | That endpoint is locked to Alpaca IPs            | Use `GET /tokenized-assets/<underlying>?network=<network>` on the issuer host (step 3b)                        |
+| Bot shows empty curl response                  | Bot is still backfilling (happens after restart) | Wait for backfill to complete, then retry                                                                      |
+| `"user balance exceeded"` on RPC               | dRPC credits depleted                            | Top up dRPC credits (ask Josh)                                                                                 |

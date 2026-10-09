@@ -471,12 +471,16 @@ are no longer seen or recovered. `paused` keeps all of them until you have
 checked that nothing is left. Removing the listing or the chain from config
 while its work is still open refuses startup.
 
-1. In `st0x.registry`, set `rebalancing = "paused"` on
-   `[chains.<chain>.assets.equities.<SYM>]` and publish the token file. The
-   planner and `transfer-equity` start no new mint or redemption for that
-   listing. Transfers already under way, their resume jobs and wallet recovery
-   on that chain run to completion: a paused listing keeps the chain's equity
-   services, so its wallet is still polled.
+1. In `t0.tokens`, set `rebalancing = "paused"` on
+   `[chains.<chain>.assets.equities.<SYM>]` and publish the token file. A merge
+   uploads only staging. In production, run `publish-t0-tokens` on `main` with
+   its PAM grant. While production pins `[registry].generation`, also bump it to
+   the new generation and release it with a config-only `production-release`
+   run. Confirm `registry_applied_generation` shows the new generation before
+   you go to step 2. Then the planner and `transfer-equity` start no new mint or
+   redemption for that listing. Transfers already under way, their resume jobs
+   and wallet recovery on that chain run to completion: a paused listing keeps
+   the chain's equity services, so its wallet is still polled.
 2. Wait until nothing for that symbol and chain is in flight. This lists every
    mint and redemption that has not reached a terminal state:
 
@@ -495,7 +499,8 @@ while its work is still open refuses startup.
    steps in this guide (`transfer recheck`, `transfer resume`, `transfer fail`).
    A mint that the issuer never received stays at `MintRequested` while paused.
    Confirm with the issuer, then use `transfer fail --kind mint`.
-3. Set `rebalancing = "disabled"` and publish again.
+3. Set `rebalancing = "disabled"` and publish again, with the same production
+   steps as step 1.
 
 Pausing does not move the listing's equity off the chain. To move it first, use
 `vault-withdraw`, `unwrap-equity`, then `alpaca-redeem` with the unwrapped

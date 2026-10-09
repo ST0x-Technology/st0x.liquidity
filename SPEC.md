@@ -2022,13 +2022,17 @@ Alternative approaches (Ansible, Kamal) were evaluated and documented in commit
 
 #### Config validation
 
-The GCP production and staging config TOMLs are committed beside their stacks in
-`t0.devops`, published as pinned Secret Manager versions, and mounted at
-`/run/t0-config/st0x-hedge.toml`. The OCI image contains no environment config;
-the compose file selects the mounted file with its `--config` flag. A config
-edit that only the deployed service can judge is a config edit whose first check
-is a bot that will not boot, which is what the `validate-config` binary exists
-to prevent.
+The GCP staging and production config TOMLs are committed in this repository
+(`config/staging/st0x-hedge.toml` and `config/prod/st0x-hedge.toml`). Each
+release validates the file inside the image that will run it, publishes it as a
+pinned `liquidity-runtime-config` Secret Manager version, and the VM mounts it
+at `/run/t0-config/st0x-hedge.toml`. A merge to `master` releases staging
+(`build-oci.yml`); production releases only through a manual
+`production-release.yml` run. The OCI image contains no environment config; the
+compose file selects the mounted file with its `--config` flag. A config edit
+that only the deployed service can judge is a config edit whose first check is a
+bot that will not boot, which is what the `validate-config` binary exists to
+prevent.
 
 `validate-config --config <path> [--secrets <path>] [--registry-file <path>]
 [--registry-state <dir>]`
@@ -2108,7 +2112,7 @@ pinned in code per chain, never configured.
 The per-symbol tables, `[chains.<c>.trading.assets.equities.<SYM>]` (addresses,
 vault ids, `trading` / `rebalancing` / `wrapped_equity_recovery`) and
 `[assets.equities.<SYM>]` (the hedge policy), are not in the bot's config. They
-come from the token file that `st0x.registry` publishes to
+come from the token file that `T0Trade/t0.tokens` publishes to
 `gs://t0-artifacts-tokens/<env>/tokens.toml`, one file per environment shared
 with pricing, the oracle, bebop and the price publisher. The config names it
 under `[registry]` (`url`, and in production `generation`) and must carry no
@@ -2120,7 +2124,7 @@ second budget, 4 MiB cap. A read that fails, a file that does not parse, a slot
 with a malformed switch or a missing address, a chain the config does not
 declare, or an empty universe all fail boot. The bot takes its own keys from
 each slot and ignores the others; which keys may appear is checked by
-`st0x.registry`'s CI before the file is published. The rows are merged into the
+`t0.tokens`' CI before the file is published. The rows are merged into the
 config's TOML table before it is deserialized, so every rule in
 `validate_config` runs on the result unchanged. A symbol listed under
 `retired_symbols` is dropped at the merge, so retiring is one config change and
@@ -5611,7 +5615,7 @@ release, together with the RAI-2780 production switch-on:
 3. A tag rollback from R to the release before it is safe only before R has run
    any equity operation on any chain: every redemption R runs, on Base too,
    persists `SendPrepared`, which older binaries cannot load. After that, stop
-   the Robinhood listing with a paused generation on R (a new st0x.registry
+   the Robinhood listing with a paused generation on R (a new token-file
    generation plus a pin bump, since `[registry]` refuses inline equities
    tables), or roll forward. A binary rollback below R follows the rules below.
 

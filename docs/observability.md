@@ -16,11 +16,15 @@ beside SQLite. Rotation retains seven daily files, which caps file count but not
 bytes. The lower file level reduces within-day growth and disk-exhaustion risk;
 it does not enforce a per-file byte limit or filesystem quota.
 
-The active GCP configs are config-as-data in `T0Trade/t0.devops`, not the baked
-`config/*-gcp` copies in this repository. A logging-schema release must promote
-the matching image and runtime config together. Staging's automatic image roll
-must be paused before merging an incompatible schema change; production already
-pins its image and config in one gated promotion.
+The active GCP configs are `config/staging/st0x-hedge.toml` and
+`config/prod/st0x-hedge.toml` in this repository. Each release validates the
+file inside the image that will run it and publishes it as a
+`liquidity-runtime-config` version together with the image digests. A production
+config-only release (empty `version`) rolls no image: it re-uses the digests
+that are live. A logging-schema release must therefore ship the matching image
+and runtime config together: a merge to master rolls staging with both from the
+same commit (`build-oci.yml`), and production pins both in one gated
+`production-release.yml` run.
 
 ## Tracing targets
 

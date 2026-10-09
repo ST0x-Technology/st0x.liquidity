@@ -477,10 +477,14 @@ nix run .#deployAll   # first deployment
   touches them provisions them into a throwaway Grafana; a merge to `master`
   ships them to the production T0 Grafana. See
   [observability/README.md](observability/README.md).
-- **Production** bot images are promoted from `t0.devops`, not this repo:
-  promote a digest proven in staging into
-  `terraform/production-liquidity/images.yaml` and merge. The apply requires 2
-  of 4 approvers (Juan, Alastair, Kais, Josh).
+- **Production** (`.github/workflows/production-release.yml`): the only way to
+  roll production. A manual run with `version = vX.Y.Z` releases the images and
+  `config/prod/st0x-hedge.toml` from that tag. A run with an empty `version` is
+  a config-only release of `config/prod/st0x-hedge.toml` onto the images that
+  are live. It takes the file from the branch selected in "Use workflow from",
+  not always `master`, so select `master`; any other branch publishes that
+  branch's unreviewed config. Each run waits for an approved `app-deploy` PAM
+  grant in `t0-liquidity`.
 
 Track staging and production deploys in the Grafana deployments dashboard:
 https://grafana.t0trade.com/d/t0-deployments/deployments
