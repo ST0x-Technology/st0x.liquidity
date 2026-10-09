@@ -91,9 +91,11 @@ const READ_PREFIX: &str = "/liquidity-read";
 /// Role prefix the load balancer routes to the write IAP backend.
 const WRITE_PREFIX: &str = "/liquidity-write";
 
-/// Thin HTTP wrapper over the liquidity bot ops API. Holds no domain logic: it
-/// attaches the role's bearer token, builds the request under the role prefix,
-/// sends it, and returns the decoded JSON or a mapped error.
+/// HTTP wrapper over the liquidity bot ops API.
+///
+/// It attaches the role's bearer token, builds the request under the role
+/// prefix, sends it, and returns decoded JSON or a mapped error. It holds no
+/// domain logic.
 ///
 /// Reads go to `/liquidity-read/*` and writes to `/liquidity-write/*`. In the
 /// shipped desktop OAuth flow both roles carry the same token; IAP admits each

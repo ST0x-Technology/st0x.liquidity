@@ -7954,6 +7954,7 @@ dependencies = [
  "st0x-hedge",
  "st0x-issuance-client",
  "st0x-issuance-dto",
+ "st0x-liquidity-client",
  "st0x-pricing-types",
  "st0x-raindex",
  "st0x-registry",
