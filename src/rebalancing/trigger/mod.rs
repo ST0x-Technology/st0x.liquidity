@@ -516,6 +516,10 @@ fn stale_snapshot_age(fetched_at: Option<DateTime<Utc>>, bound: Duration) -> Opt
 enum HedgingStart {
     NotStarted,
     Started,
+    /// Rebuilt on restart: the inflight is restored, but whether the prior
+    /// process's `Start` debited available is unknown, so a failure reconciles
+    /// it like `NotStarted` instead of crediting it.
+    Restored,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5336,9 +5340,10 @@ impl RebalancingService {
             // failed also moved nothing: any inflight on the symbol was written
             // by a poll before the mint became active, and crediting it would
             // invent broker shares. The terminal residual clear zeroes it and
-            // forces a reconcile instead.
+            // forces a reconcile instead. A mint restored on restart cannot
+            // tell whether its `Start` debited, so it reconciles the same way.
             MintAcceptanceFailed { .. } => match hedging_start {
-                HedgingStart::NotStarted => None,
+                HedgingStart::NotStarted | HedgingStart::Restored => None,
                 HedgingStart::Started => Some(Self::cancel_equity_transfer_update(
                     Venue::Hedging,
                     quantity,
@@ -8770,16 +8775,18 @@ impl RebalancingService {
                         tokenization_request_id,
                         stage,
                         last_progress_at,
-                        // An accepted mint's inflight is restored below as its
-                        // own, so a later failure cancels it; a requested mint
-                        // started nothing.
+                        // An accepted mint's inflight is restored below, but the
+                        // prior process's `Start` may have failed without
+                        // debiting, so a later failure reconciles it instead of
+                        // cancelling it into available. A requested mint started
+                        // nothing.
                         hedging_start: match stage {
                             MintTrackingStage::Requested => HedgingStart::NotStarted,
                             MintTrackingStage::Accepted
                             | MintTrackingStage::TokensReceived
                             | MintTrackingStage::WrapSubmitted
                             | MintTrackingStage::TokensWrapped
-                            | MintTrackingStage::VaultDepositSubmitted => HedgingStart::Started,
+                            | MintTrackingStage::VaultDepositSubmitted => HedgingStart::Restored,
                         },
                     },
                 );
@@ -8878,8 +8885,9 @@ impl RebalancingService {
         //   drop the tombstone and re-set the in-flight (available stays debited);
         // - an explicit MintAcceptanceFailed cancelled the in-flight back to
         //   available, so we move it back into the in-flight with a Start. A
-        //   mint whose own `Start` failed had nothing to cancel, so this Start
-        //   debits available again (or is refused) until a broker snapshot heals.
+        //   mint whose own `Start` failed, or one restored on restart, had
+        //   nothing cancelled: its failure zeroed the in-flight and forced a
+        //   broker reconcile, so this Start debits available once.
         // Peek (don't yet remove) the timeout markers so a failure in the
         // fallible inventory update below leaves them intact -- a failed rebuild
         // does not run the caller's rollback, so consuming them up front would
@@ -10910,7 +10918,7 @@ mod tests {
             Some(tokenization_request_id("TOK-1"))
         );
         assert_eq!(tracking.stage, MintTrackingStage::Accepted);
-        assert_eq!(tracking.hedging_start, HedgingStart::Started);
+        assert_eq!(tracking.hedging_start, HedgingStart::Restored);
         assert_eq!(tracking.last_progress_at, accepted_at);
 
         let ownership = trigger.pending_request_ownership().await;
