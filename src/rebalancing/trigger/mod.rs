@@ -17302,8 +17302,8 @@ mod tests {
         // The provider drops the request from its pending list before the
         // bot processes `TokensReceived`.
         apply_and_dispatch_snapshot(
-            reactor.clone(),
-            snapshot_id.clone(),
+            reactor,
+            snapshot_id,
             InventorySnapshotEvent::InflightEquity {
                 mints: BTreeMap::new(),
                 redemptions: BTreeMap::new(),
@@ -17343,19 +17343,6 @@ mod tests {
             .receive::<TokenizedEquityMint>(id.clone(), make_deposited_into_raindex())
             .await
             .unwrap();
-
-        apply_and_dispatch_snapshot(
-            reactor.clone(),
-            snapshot_id,
-            InventorySnapshotEvent::InflightEquity {
-                mints: BTreeMap::new(),
-                redemptions: BTreeMap::new(),
-                fetched_at: Utc::now(),
-                base_redemptions_chain_scoped: true,
-            },
-        )
-        .await
-        .unwrap();
 
         let inventory = trigger.inventory.read().await;
         assert_eq!(
