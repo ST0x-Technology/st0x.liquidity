@@ -8887,7 +8887,10 @@ impl RebalancingService {
         //   available, so we move it back into the in-flight with a Start. A
         //   mint whose own `Start` failed, or one restored on restart, had
         //   nothing cancelled: its failure zeroed the in-flight and forced a
-        //   broker reconcile, so this Start debits available once.
+        //   broker reconcile. Recheck runs only after the provider completed,
+        //   so once a snapshot lands available already excludes the shares
+        //   and this Start debits them again, or fails if available is short.
+        //   That double debit is a known gap.
         // Peek (don't yet remove) the timeout markers so a failure in the
         // fallible inventory update below leaves them intact -- a failed rebuild
         // does not run the caller's rollback, so consuming them up front would
