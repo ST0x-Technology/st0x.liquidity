@@ -95,5 +95,8 @@ age; the watcher ignores holds older than fifteen minutes.
 
 Production remains pinned during the state-seeding rollout. Its watcher does not
 apply updates until the separate unpin release and matching t0.devops gate
-changes land. Alert rules for invalid content, startup failure and fallback are
-owned by the infrastructure follow-up.
+changes land. A refused token file does not alert: whoever publishes it checks
+`registry_invalid` and the "registry candidate refused" log. Fallback, which
+also covers startup failure, alerts through
+`liquidity-token-file-fallback-production` in
+`observability/alerting/liquidity.rules.yml`.

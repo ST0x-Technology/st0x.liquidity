@@ -16,7 +16,9 @@
 # file provisions the rule, so it would be deleted after every restart.
 apiVersion: 1
 
-deleteRules: []
+deleteRules:
+  - orgId: 1
+    uid: t0liqreginvprd
 
 groups:
   # Robinhood Chain Raindex vault inventory, from the capital probe in
@@ -4411,11 +4413,15 @@ groups:
       # /metrics reach Cloud Monitoring through the Ops Agent prometheus
       # receiver, so the names below are the bot's own, with no prefix.
       #
-      # Both rules read gauges, not registry_reloads_total. start_failed and
+      # A refused token file has no rule: the registry and the bot's pinned
+      # config often differ for a while during normal rollouts, so
+      # registry_invalid is not worth a page.
+      #
+      # The rule reads a gauge, not registry_reloads_total. start_failed and
       # fallback are counted once, at the boot that creates the fallback, so
       # each counter is born at 1 in a new process and never moves again.
       # An increase over a window can miss that first sample. The fallback
-      # time is also a gauge that later boots restore from state.json, which
+      # time is a gauge that later boots restore from state.json, which
       # makes it a reliable read. start_failed has no rule of its own: the
       # bot counts it in the same call as fallback, so a second rule would
       # page twice for one event.
@@ -4424,62 +4430,7 @@ groups:
       # whenever there is no fallback. execErrState OK, as for the per-kind
       # rules above: until the bot first exports these names the metric
       # descriptor does not exist and Cloud Monitoring answers with an error.
-      - uid: t0liqreginvprd
-        title: liquidity-token-file-refused-production
-        condition: C
-        data:
-          - refId: A
-            queryType: timeSeriesList
-            relativeTimeRange: {from: 300, to: 0}
-            datasourceUid: cloudmon
-            model:
-              datasource: {type: stackdriver, uid: cloudmon}
-              queryType: timeSeriesList
-              refId: A
-              instant: true
-              intervalMs: 60000
-              timeSeriesList:
-                projectName: t0-liquidity
-                filters:
-                  - "metric.type"
-                  - "="
-                  - "prometheus.googleapis.com/registry_invalid/gauge"
-                alignmentPeriod: 60s
-                perSeriesAligner: ALIGN_MAX
-                crossSeriesReducer: REDUCE_MAX
-                preprocessor: none
-                groupBys: []
-                view: FULL
-          - refId: B
-            queryType: expression
-            relativeTimeRange: {from: 0, to: 0}
-            datasourceUid: __expr__
-            model:
-              datasource: {name: Expression, type: __expr__, uid: __expr__}
-              type: reduce
-              reducer: last
-              expression: A
-              refId: B
-          - refId: C
-            queryType: expression
-            relativeTimeRange: {from: 0, to: 0}
-            datasourceUid: __expr__
-            model:
-              datasource: {name: Expression, type: __expr__, uid: __expr__}
-              type: math
-              expression: "$B > 0.5"
-              refId: C
-        noDataState: OK
-        execErrState: OK
-        # A refused generation stays refused, so this does not flap. The hold
-        # only rides out a short 403 or 404 on the bucket read.
-        for: 3m
-        annotations:
-          summary: >-
-            Production liquidity bot refused the latest token file in the bucket. It keeps running its current tokens. Check the bot's error log for the generation and reason, then fix or revert the file in st0x.registry.
-          description: >-
-            registry_invalid has read 1 for 3 minutes. The latest copy of gs://t0-artifacts-tokens/production/tokens.toml failed the bot's checks, or the bot cannot read it (404, 403 or too large). The desk does not change: the bot keeps the tokens it runs now, but nothing new in the file goes live. The bot does not judge a refused generation again, so waiting does not help. Find the reason: gcloud logging read '"registry candidate refused"' --project t0-liquidity --freshness 1d. That line carries the generation and the reason. A read failure logs as "registry reload poll failed" instead. Then fix t0/production.toml in st0x.registry, or publish the previous file again. This clears when the bot applies a new copy or finds it equal to what it runs, so RESOLVED means fixed.
-        labels: {service: liquidity, severity: critical}
+      #
       # The bot accepted a new token file and restarted onto it, and it did
       # not start twice in a row. The bot then booted the last good tables
       # with the listings that copy added switched off, and it retries the
