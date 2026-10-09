@@ -6286,9 +6286,10 @@ transfer dispatch. It does not calculate cross-venue inventory imbalances.
 - Every terminal mint event (`DepositedIntoRaindex`, `MintRejected`,
   `MintAcceptanceFailed`, `RaindexDepositFailed`, `WrappingFailed`,
   `OperatorReconciled`) also zeroes any Hedging inflight still left on the
-  symbol and forces an offchain equity reconcile. Hedging inflight holds only
-  mint shares, and a symbol has one mint at a time, so a residual there is the
-  finished mint counted twice (e.g. after a Base snapshot-error reset)
+  symbol and, when it zeroes a non-zero amount, forces an offchain equity
+  reconcile. Hedging inflight holds only mint shares, and a symbol has one mint
+  at a time, so a residual there is the finished mint counted twice (e.g. after
+  a Base snapshot-error reset)
 - `EquityRedemptionEvent::WithdrawnFromRaindex` - Moves tokens to inflight
   (leaving Raindex vault)
 - `EquityRedemptionEvent::TokensUnwrapped` - Exact-match unwraps, including
