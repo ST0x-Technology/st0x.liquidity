@@ -103,6 +103,17 @@ impl InventoryPublisher {
         }
     }
 
+    /// Reads the view again without a change, for the periodic republish.
+    /// Call it while a read lock is held: no write can then move the
+    /// generation, so the read carries the generation of the last write.
+    /// `None` before [`Self::start`]: boot has not restored the view yet.
+    pub(crate) fn read_current(&self, view: &InventoryView) -> Option<InventoryRead> {
+        self.started().then(|| InventoryRead {
+            generation: self.families.current_generation(),
+            input: InventoryInput::from_view(view),
+        })
+    }
+
     /// Builds the samples and stores them, unless a newer read was stored
     /// first. Call it after the lock is released.
     pub(crate) fn publish(&self, read: InventoryRead) {
@@ -1038,6 +1049,47 @@ pub(crate) mod tests {
                 &[("symbol", "AAPL")]
             )),
             Some(&9.0)
+        );
+    }
+
+    #[test]
+    fn nothing_is_republished_before_the_start() {
+        let publisher = publisher(leaked_families());
+
+        assert!(
+            publisher
+                .read_current(&view_with("AAPL", float!(1)))
+                .is_none()
+        );
+
+        publisher.publish(publisher.start(&view_with("AAPL", float!(1))));
+        assert!(
+            publisher
+                .read_current(&view_with("AAPL", float!(1)))
+                .is_some()
+        );
+    }
+
+    /// The periodic republish reads at the last write's generation, so a
+    /// write that lands between its read and its publish wins.
+    #[test]
+    fn a_republish_read_before_a_newer_write_is_ignored() {
+        let families = leaked_families();
+        let publisher = publisher(families);
+        publisher.publish(publisher.start(&view_with("AAPL", float!(1))));
+
+        let republish = publisher
+            .read_current(&view_with("AAPL", float!(1)))
+            .unwrap();
+        publisher.publish(publisher.read_changed(&view_with("AAPL", float!(2))));
+        publisher.publish(republish);
+
+        assert_eq!(
+            rendered_store(families).get(&series(
+                "liq_equity_onchain_available",
+                &[("symbol", "AAPL")]
+            )),
+            Some(&2.0)
         );
     }
 

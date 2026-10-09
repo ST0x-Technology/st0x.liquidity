@@ -401,12 +401,15 @@ async fn run_bot_session_inner(
         startup_barrier.token(),
         startup_barrier.token(),
     );
-    let equity_price_supervisor = equity_price_task.map(|task| {
-        non_escalating_supervisor_builder()
-            .with_task("dashboard-equity-prices", task)
-            .build()
-            .run()
-    });
+    let auxiliary_supervisor = spawn_auxiliary_supervisor(
+        equity_price_task,
+        metrics::liquidity::refresh::LiqStateRefresh {
+            inventory: inventory.clone(),
+            equity_prices: equity_prices.clone(),
+            pool: pools.cqrs.clone(),
+            families: &metrics::liquidity::LIQ_FAMILIES,
+        },
+    );
     let mut bot_task = tokio::spawn(Box::pin(run_conductor_session(
         ctx.clone(),
         pools,
@@ -439,7 +442,7 @@ async fn run_bot_session_inner(
     let mut session_guard = SessionTaskGuard {
         conductor: bot_task.abort_handle(),
         server_supervisor: server_supervisor.clone(),
-        equity_price_supervisor: equity_price_supervisor.clone(),
+        auxiliary_supervisor: auxiliary_supervisor.clone(),
         armed: true,
     };
 
@@ -488,7 +491,7 @@ async fn run_bot_session_inner(
             StartupOutcome::Started => {
                 await_shutdown(
                     server_supervisor,
-                    equity_price_supervisor,
+                    auxiliary_supervisor,
                     bot_task,
                     &detached_tasks,
                     shutdown_token,
@@ -498,7 +501,7 @@ async fn run_bot_session_inner(
                 .await
             }
             StartupOutcome::ShutdownSignal => {
-                shutdown_equity_price_supervisor(equity_price_supervisor.as_ref());
+                shutdown_auxiliary_supervisor(&auxiliary_supervisor);
                 drain_for_shutdown_signal(
                     &server_supervisor,
                     bot_task,
@@ -609,7 +612,7 @@ fn transfer_id<Tag>(id: uuid::Uuid) -> st0x_finance::Id<Tag> {
 struct SessionTaskGuard {
     conductor: AbortHandle,
     server_supervisor: SupervisorHandle,
-    equity_price_supervisor: Option<SupervisorHandle>,
+    auxiliary_supervisor: SupervisorHandle,
     armed: bool,
 }
 
@@ -627,7 +630,7 @@ impl Drop for SessionTaskGuard {
 
         self.conductor.abort();
         shutdown_supervisor(&self.server_supervisor);
-        shutdown_equity_price_supervisor(self.equity_price_supervisor.as_ref());
+        shutdown_auxiliary_supervisor(&self.auxiliary_supervisor);
     }
 }
 
@@ -745,13 +748,30 @@ fn spawn_server_supervisor(
         .run()
 }
 
+/// The supervisor for tasks that must never stop trading: the dashboard
+/// price feed (when pricing is configured) and the `liq_*` refresh.
+fn spawn_auxiliary_supervisor(
+    equity_price_task: Option<startup::StartupTask<dashboard::equity_price::EquityPriceMonitor>>,
+    liq_state_refresh: metrics::liquidity::refresh::LiqStateRefresh,
+) -> SupervisorHandle {
+    let builder =
+        non_escalating_supervisor_builder().with_task("liq-state-refresh", liq_state_refresh);
+
+    match equity_price_task {
+        Some(task) => builder.with_task("dashboard-equity-prices", task),
+        None => builder,
+    }
+    .build()
+    .run()
+}
+
 fn non_escalating_supervisor_builder() -> SupervisorBuilder {
     SupervisorBuilder::default().with_unlimited_restarts()
 }
 
 async fn await_shutdown<S>(
     server_supervisor: SupervisorHandle,
-    equity_price_supervisor: Option<SupervisorHandle>,
+    auxiliary_supervisor: SupervisorHandle,
     mut bot_task: JoinHandle<anyhow::Result<()>>,
     detached_tasks: &TaskTracker,
     shutdown_token: CancellationToken,
@@ -768,7 +788,7 @@ where
         result = server_supervisor.wait() => ShutdownTrigger::ServerExit(result),
         result = &mut bot_task => ShutdownTrigger::BotExit(result),
     };
-    shutdown_equity_price_supervisor(equity_price_supervisor.as_ref());
+    shutdown_auxiliary_supervisor(&auxiliary_supervisor);
 
     match trigger {
         ShutdownTrigger::Signal => {
@@ -914,10 +934,8 @@ fn shutdown_supervisor(handle: &SupervisorHandle) {
     shutdown_named_supervisor("server", handle);
 }
 
-fn shutdown_equity_price_supervisor(handle: Option<&SupervisorHandle>) {
-    if let Some(handle) = handle {
-        shutdown_named_supervisor("dashboard-equity-prices", handle);
-    }
+fn shutdown_auxiliary_supervisor(handle: &SupervisorHandle) {
+    shutdown_named_supervisor("auxiliary", handle);
 }
 
 fn shutdown_named_supervisor(name: &'static str, handle: &SupervisorHandle) {
@@ -1297,7 +1315,7 @@ mod tests {
         let mut guard = SessionTaskGuard {
             conductor: conductor_task.abort_handle(),
             server_supervisor: supervisor.clone(),
-            equity_price_supervisor: None,
+            auxiliary_supervisor: pending_test_supervisor(),
             armed: true,
         };
 
@@ -1332,7 +1350,7 @@ mod tests {
         let guard = SessionTaskGuard {
             conductor: conductor_task.abort_handle(),
             server_supervisor: supervisor.clone(),
-            equity_price_supervisor: None,
+            auxiliary_supervisor: pending_test_supervisor(),
             armed: true,
         };
 
@@ -1366,7 +1384,7 @@ mod tests {
             let mut guard = SessionTaskGuard {
                 conductor: conductor_abort,
                 server_supervisor: supervisor,
-                equity_price_supervisor: None,
+                auxiliary_supervisor: pending_test_supervisor(),
                 armed: true,
             };
             let coordinated_shutdown = async move {
@@ -1425,8 +1443,8 @@ mod tests {
 
         let supervisor = SupervisorBuilder::default().build().run();
         let supervisor_handle_for_assert = supervisor.clone();
-        let equity_price_supervisor = pending_test_supervisor();
-        let equity_price_handle_for_assert = equity_price_supervisor.clone();
+        let auxiliary_supervisor = pending_test_supervisor();
+        let auxiliary_handle_for_assert = auxiliary_supervisor.clone();
 
         let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
         let signal_fut = async move {
@@ -1440,7 +1458,7 @@ mod tests {
 
         await_shutdown(
             supervisor,
-            Some(equity_price_supervisor),
+            auxiliary_supervisor,
             bot_task,
             &TaskTracker::new(),
             shutdown_token,
@@ -1461,14 +1479,11 @@ mod tests {
             post_wait.is_ok(),
             "supervisor.wait() should return after signal-triggered shutdown"
         );
-        let equity_price_post_wait = tokio::time::timeout(
-            Duration::from_secs(1),
-            equity_price_handle_for_assert.wait(),
-        )
-        .await;
+        let auxiliary_post_wait =
+            tokio::time::timeout(Duration::from_secs(1), auxiliary_handle_for_assert.wait()).await;
         assert!(
-            equity_price_post_wait.is_ok(),
-            "equity price supervisor should stop during signal-triggered shutdown"
+            auxiliary_post_wait.is_ok(),
+            "auxiliary supervisor should stop during signal-triggered shutdown"
         );
     }
 
@@ -1483,7 +1498,7 @@ mod tests {
 
         await_shutdown(
             supervisor,
-            None,
+            pending_test_supervisor(),
             bot_task,
             &TaskTracker::new(),
             shutdown_token,
@@ -1525,7 +1540,7 @@ mod tests {
 
         await_shutdown(
             supervisor,
-            None,
+            pending_test_supervisor(),
             bot_task,
             &TaskTracker::new(),
             shutdown_token,
@@ -1603,7 +1618,7 @@ mod tests {
                 async move {
                     await_shutdown(
                         supervisor,
-                        None,
+                        pending_test_supervisor(),
                         bot_task,
                         &detached_tasks,
                         shutdown_token,
@@ -1660,7 +1675,7 @@ mod tests {
 
         await_shutdown(
             supervisor,
-            None,
+            pending_test_supervisor(),
             bot_task,
             &TaskTracker::new(),
             shutdown_token,
