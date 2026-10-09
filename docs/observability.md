@@ -123,6 +123,33 @@ their `describe_*` forms.** The recorder never forgets a label set, so a
 departed symbol would keep its last value forever, and the name would get a
 second writer. A test scans `src/` for this.
 
+### Native performance metrics
+
+These typed recorder metrics count at the source, so a later board can use
+`increase()` and `histogram_quantile()` instead of the 24-hour `liq_*`
+snapshots. Duration histograms render with fixed buckets (`_bucket{le}` lines),
+not as summaries. A supervised upkeep task drains the histogram buffers every 5
+seconds, so they stay bounded when nothing scrapes `/metrics`.
+
+`order_fill_poll_cycles_total{outcome}` is `ok`, `error`, or `paused`. A
+`paused` cycle succeeds but ingests nothing, because the cutoff block is unknown
+or behind the checkpoint while a checkpoint exists. An unknown lag keeps
+`order_fill_block_lag_blocks` at its last value, so
+`time() - order_fill_block_lag_sampled_timestamp_seconds` shows how old that
+value is. A cutoff block behind the checkpoint is a known lag of 0 with a fresh
+sample time, so only `outcome="paused"` shows that stall.
+
+| Name                                             | Type      | Labels                               | Recorded                                                 |
+| ------------------------------------------------ | --------- | ------------------------------------ | -------------------------------------------------------- |
+| `dependency_calls_total`                         | counter   | `dependency`, `operation`, `outcome` | every RPC and broker call, before the telemetry channel  |
+| `dependency_call_duration_seconds`               | histogram | `dependency`, `operation`            | same                                                     |
+| `telemetry_samples_dropped_total`                | counter   |                                      | a dependency sample the full or closed channel dropped   |
+| `order_fill_poll_cycles_total`                   | counter   | `chain`, `outcome`                   | each order-fill poll cycle                               |
+| `order_fill_poll_skipped_ticks_total`            | counter   | `chain`                              | poll ticks dropped because the previous cycle overran    |
+| `order_fill_poll_duration_seconds`               | histogram | `chain`                              | each order-fill poll cycle                               |
+| `order_fill_block_lag_blocks`                    | gauge     | `chain`                              | each poll that knows the cutoff block and the checkpoint |
+| `order_fill_block_lag_sampled_timestamp_seconds` | gauge     | `chain`                              | same, set to the poll's sample time                      |
+
 ### Catalog
 
 | Name                                    | Labels                                                                                                                     | Family      | Published                                                                                          |
