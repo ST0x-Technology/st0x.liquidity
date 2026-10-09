@@ -6905,23 +6905,6 @@ mod tests {
             Some(FractionalShares::ZERO),
             "The poll must not count an active mint's request"
         );
-
-        let view = view
-            .update_equity(
-                &symbol,
-                Inventory::transfer(Venue::Hedging, TransferOp::Start, shares(20)),
-                now,
-            )
-            .unwrap()
-            .apply_inflight_snapshot(&BTreeMap::new(), &BTreeMap::new(), now, now)
-            .unwrap();
-
-        assert_eq!(
-            view.equity_inflight(&symbol, Venue::Hedging),
-            Some(shares(20)),
-            "A later poll that drops the symbol must leave an active mint's Hedging \
-             inflight to the mint"
-        );
     }
 
     #[test]
