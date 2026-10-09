@@ -630,6 +630,10 @@ cargo fmt                    # format Rust code
 nix fmt                      # format Nix code (when editing .nix files)
 ```
 
+`nix run .#ci` runs the complete local verification suite, including RustSec
+dependency auditing. For the standalone audit and its regression tests, see
+[Rust dependency auditing](docs/dependency-audit.md).
+
 Debug builds use `debug = "line-tables-only"` (workspace `Cargo.toml`) and the
 Linux dev shells link with mold (`flake.nix`), which keeps the `st0x-hedge` test
 binary well under 1 GB and takes about 20 s of link time off every test cycle.
