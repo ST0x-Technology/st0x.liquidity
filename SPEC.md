@@ -1812,9 +1812,11 @@ loaders as the `/performance/*` endpoints, over the last 24 hours:
   `liq_hedge_latency_ms_samples{stage}`, and per open exposure
   `liq_open_exposure_fill_count{symbol}` and
   `liq_open_exposure_oldest_ts_seconds{symbol}`.
-- `reliability`: `liq_failure_event_count_24h{event_type}` and
-  `liq_job_queue{job_type,state}`. The job queue counts are the queue now, not a
-  window.
+- `reliability`: `liq_reliability_log_count_24h{level}` (`error` and `warning`,
+  both always present), `liq_log_target_count_24h{target,level}` (`ERROR` or
+  `WARN`, only targets with events), `liq_failure_event_count_24h{event_type}`
+  and `liq_job_queue{job_type,state}`. The job queue counts are the queue now,
+  not a window.
 - `infra`: `liq_block_lag_blocks{chain}`,
   `liq_block_lag_sampled_ts_seconds{chain}`,
   `liq_poll_{cycles,errors,skipped_ticks}_24h{chain}`,
@@ -1823,6 +1825,19 @@ loaders as the `/performance/*` endpoints, over the last 24 hours:
   `liq_dependency_latency_ms{dependency,operation,quantile}`. The block-lag and
   poll series carry one `chain` per hedged chain; the exporter's unlabelled
   versions came from a report shape the bot no longer serves.
+
+The log counts cover the events the file log writes, with the file log's filter,
+and are kept only when file logging is configured; without it both level rows
+are 0 and there are no target rows. The bot counts each event as it is logged,
+in one-minute buckets. After a start it adds, once and in the background, the
+entries earlier processes wrote in the previous 24 hours; until that is done the
+two log names are absent. A scan that fails to read the files is retried twice
+on later refreshes, then kept with what it could read. Unlike
+`/performance/reliability`, the counts have no 50,000-entry cap, the first
+minute of the window counts as a whole, and lines another process (an operator's
+`st0x-cli` run) appends to the same files are counted only after the next
+restart. An event the file writer drops (a full queue or a failed write) is
+still counted.
 
 Every fifth cycle the task publishes `rebalances` over the last 30 days:
 `liq_rebalance_stage_ms{kind,stage,quantile}` (`kind` is `usdc` or `equity`) and
