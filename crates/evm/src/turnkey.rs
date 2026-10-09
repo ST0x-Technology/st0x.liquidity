@@ -48,7 +48,9 @@ use crate::submit::{
     prepare_fee_replacement, prepare_with_nonce, release_in_flight_after_wait, restore_prepared,
     restore_transaction, send_with_recovery,
 };
-use crate::{Evm, EvmError, PreparedTransaction, TryIntoWallet, Wallet, WalletCtx};
+use crate::{
+    Evm, EvmError, PreparedTransaction, TransactionSubmission, TryIntoWallet, Wallet, WalletCtx,
+};
 
 /// Turnkey organization identifier (non-secret, lives in plaintext
 /// config).
@@ -396,8 +398,8 @@ pub struct TurnkeyWallet<P: Provider> {
     /// too low" errors without needing to traverse the filler chain.
     nonce_manager: ResettableNonceManager,
     /// This wallet's own record of nonces it has assigned to transactions
-    /// not yet confirmed or proven dropped. Shared across clones, same as
-    /// `nonce_manager`.
+    /// not yet confirmed or released by suspected-drop policy. Shared across
+    /// clones, same as `nonce_manager`.
     in_flight: InFlightNonces,
     /// Serializes sends from this wallet so concurrent callers cannot
     /// build two transactions at the same nonce. Shared across clones so
@@ -1115,6 +1117,10 @@ impl<P> Wallet for TurnkeyWallet<P>
 where
     P: Provider + Clone + Send + Sync + 'static,
 {
+    fn transaction_submission(&self, tx_hash: TxHash) -> Option<TransactionSubmission> {
+        self.in_flight.submission(self.address(), tx_hash)
+    }
+
     fn address(&self) -> Address {
         self.address
     }
@@ -1277,7 +1283,10 @@ where
 
     async fn await_receipt(&self, tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
         let result =
-            crate::wait_for_receipt(&self.provider, tx_hash, self.required_confirmations).await;
+            crate::wait_for_receipt(&self.provider, tx_hash, self.required_confirmations, || {
+                self.transaction_submission(tx_hash)
+            })
+            .await;
 
         release_in_flight_after_wait(
             &self.in_flight,
@@ -1328,9 +1337,13 @@ mod tests {
     use alloy::eips::eip2718::Encodable2718;
     use alloy::eips::eip2930::AccessList;
     use alloy::node_bindings::{Anvil, AnvilInstance};
-    use alloy::primitives::{TxKind, U256};
+    use alloy::primitives::{BlockNumber, TxKind, U64, U256};
     use alloy::providers::ext::AnvilApi;
     use alloy::providers::fillers::NonceManager as _;
+    use alloy::providers::mock::Asserter;
+    use alloy::providers::{DynProvider, ProviderCall, RootProvider};
+    use alloy::rpc::client::NoParams;
+    use alloy::rpc::json_rpc::ErrorPayload;
     use alloy::rpc::types::TransactionRequest;
     use alloy::signers::Signer;
     use alloy::signers::local::PrivateKeySigner;
@@ -1343,9 +1356,182 @@ mod tests {
 
     use super::*;
 
+    /// Keep signing, filling and broadcasting on the real chain while scripting
+    /// only the two freshness observations at the signing provider boundary.
+    #[derive(Clone)]
+    struct ScriptedHeadProvider {
+        chain: DynProvider,
+        heads: DynProvider,
+    }
+
+    impl Provider for ScriptedHeadProvider {
+        fn root(&self) -> &RootProvider {
+            self.chain.root()
+        }
+
+        fn get_block_number(&self) -> ProviderCall<NoParams, U64, BlockNumber> {
+            self.heads.get_block_number()
+        }
+    }
+
     /// Generate a fresh P-256 API key for testing.
     fn test_api_key() -> TurnkeyP256ApiKey {
         TurnkeyP256ApiKey::generate()
+    }
+
+    #[tokio::test]
+    async fn prepared_broadcast_refreshes_delayed_and_restored_submission_floors() {
+        for previous_floor in [None, Some(100), Some(300)] {
+            for post_head in [Some(200), Some(50), None] {
+                let asserter = Asserter::new();
+                asserter.push_success(&U256::from(1));
+                asserter.push_success(&U256::from(150));
+                let prepared = PreparedTransaction::for_test(TxHash::random(), 7);
+                asserter.push_success(&prepared.tx_hash());
+                if let Some(head) = post_head {
+                    asserter.push_success(&U256::from(head));
+                } else {
+                    asserter.push_failure(ErrorPayload {
+                        code: -32000,
+                        message: "post-broadcast head unavailable".into(),
+                        data: None,
+                    });
+                    asserter.push_success(&U256::from(50));
+                    asserter.push_success(&prepared.tx_hash());
+                    asserter.push_success(&U256::from(75));
+                }
+                let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+                let server = MockServer::start();
+                let wallet = TurnkeyWallet::from_client(
+                    mock_client(&server),
+                    TurnkeyOrganizationId::new("org-test".to_string()),
+                    Address::random(),
+                    provider,
+                    1,
+                )
+                .await
+                .unwrap();
+                if let Some(floor) = previous_floor {
+                    wallet.restore_prepared(&prepared).await;
+                    wallet.in_flight.record_submission_block(
+                        wallet.address(),
+                        prepared.tx_hash(),
+                        floor,
+                    );
+                }
+                assert_eq!(
+                    wallet
+                        .broadcast_prepared(&prepared, "delayed broadcast")
+                        .await
+                        .unwrap(),
+                    prepared.tx_hash()
+                );
+                let submission = wallet.transaction_submission(prepared.tx_hash()).unwrap();
+                assert_eq!(
+                    submission.submitted_after_block,
+                    post_head
+                        .map(|head| previous_floor.map_or(150, |floor| floor.max(150)).max(head))
+                );
+                assert_eq!(
+                    wallet.in_flight.ownership(wallet.address(), 7),
+                    NonceOwnership::Ours
+                );
+                if post_head.is_none() {
+                    wallet
+                        .broadcast_prepared(&prepared, "lagging retry")
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        wallet
+                            .transaction_submission(prepared.tx_hash())
+                            .unwrap()
+                            .submitted_after_block,
+                        Some(previous_floor.map_or(150, |floor| floor.max(150)))
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn submission_floor_uses_signing_provider_for_send_and_prepare() {
+        for prepare in [false, true] {
+            for post_head in [Some(200), Some(50), None] {
+                let anvil = Anvil::new().spawn();
+                let chain = ProviderBuilder::new()
+                    .connect_http(anvil.endpoint_url())
+                    .erased();
+                let signer: PrivateKeySigner = anvil.keys()[0].clone().into();
+                let asserter = Asserter::new();
+                asserter.push_success(&U256::from(100));
+                if let Some(head) = post_head {
+                    asserter.push_success(&U256::from(head));
+                } else {
+                    asserter.push_failure(ErrorPayload {
+                        code: -32000,
+                        message: "post-submission head unavailable".into(),
+                        data: None,
+                    });
+                }
+                let provider = ScriptedHeadProvider {
+                    chain,
+                    heads: ProviderBuilder::new()
+                        .connect_mocked_client(asserter.clone())
+                        .erased(),
+                };
+                let server = MockServer::start();
+                let mut wallet = TurnkeyWallet::from_client(
+                    mock_client(&server),
+                    TurnkeyOrganizationId::new("org-test".to_string()),
+                    signer.address(),
+                    provider.clone(),
+                    1,
+                )
+                .await
+                .unwrap();
+                // Keep the actual Turnkey entrypoints and nonce tracker, but isolate
+                // boundary sampling from the separately covered HTTP signing seam.
+                wallet.signing_provider = ProviderBuilder::new()
+                    .disable_recommended_fillers()
+                    .filler(GasFiller)
+                    .filler(BlobGasFiller::default())
+                    .with_nonce_management(wallet.nonce_manager.clone())
+                    .filler(ChainIdFiller::default())
+                    .wallet(EthereumWallet::from(signer))
+                    .connect_provider(provider);
+                let hash = if prepare {
+                    wallet
+                        .prepare_pending(wallet.address(), Bytes::new(), "floor regression")
+                        .await
+                        .unwrap()
+                        .tx_hash()
+                } else {
+                    wallet
+                        .send_pending(wallet.address(), Bytes::new(), "floor regression")
+                        .await
+                        .unwrap()
+                };
+                let submission = wallet
+                    .transaction_submission(hash)
+                    .expect("successful operation retains identity");
+                let expected_floor = post_head.map(|head| head.max(100));
+                assert_eq!(
+                    submission.submitted_after_block, expected_floor,
+                    "prepare={prepare}, post_head={post_head:?}"
+                );
+                assert!(
+                    asserter.read_q().is_empty(),
+                    "both signing-boundary heads must be consumed"
+                );
+                assert_eq!(submission.nonce, 0);
+                assert_eq!(
+                    wallet
+                        .in_flight
+                        .ownership(wallet.address(), submission.nonce),
+                    NonceOwnership::Ours
+                );
+            }
+        }
     }
 
     /// Build a Turnkey client that sends requests to the mock server.
@@ -2580,7 +2766,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_hash_only_drop_releases_nonce_for_reuse() {
+    async fn known_submission_drop_releases_nonce_for_reuse() {
+        assert_generic_absence_updates_ownership(true).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_hash_only_unknown_submission_retains_nonce_after_timeout() {
+        assert_generic_absence_updates_ownership(false).await;
+    }
+
+    async fn assert_generic_absence_updates_ownership(known_submission: bool) {
         let anvil = Anvil::new().spawn();
         let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
         let address = anvil.addresses()[0];
@@ -2615,26 +2810,46 @@ mod tests {
         wallet.restore_transaction(tx_hash).await.unwrap();
         provider.anvil_revert(snapshot_id).await.unwrap();
 
+        if known_submission {
+            let floor = wallet.provider().get_block_number().await.unwrap();
+            wallet
+                .in_flight
+                .record_submission_block(address, tx_hash, floor);
+            wallet.provider().anvil_mine(Some(3), None).await.unwrap();
+        }
+
         let result = wait_for_receipt_with_config(
             wallet.provider(),
             tx_hash,
             1,
             ReceiptWaitConfig {
+                submission: wallet.transaction_submission(tx_hash),
                 poll_interval: Duration::from_millis(1),
                 inclusion_timeout: Duration::from_millis(100),
                 confirmation_timeout: Duration::from_millis(100),
                 dropped_grace: Duration::ZERO,
                 dropped_consecutive_misses: 1,
+                dropped_head_advance: 0,
             },
         )
         .await;
-        assert!(matches!(
-            &result,
-            Err(EvmError::TransactionDropped {
-                tx_hash: dropped_hash,
-                ..
-            }) if *dropped_hash == tx_hash
-        ));
+        match (&result, known_submission) {
+            (
+                Err(EvmError::TransactionDropped {
+                    tx_hash: actual, ..
+                }),
+                true,
+            )
+            | (
+                Err(EvmError::ReceiptTimeout {
+                    tx_hash: actual, ..
+                }),
+                false,
+            ) => assert_eq!(*actual, tx_hash),
+            _ => panic!(
+                "unexpected absence verdict with known evidence {known_submission}: {result:?}"
+            ),
+        }
         release_in_flight_after_wait(
             &wallet.in_flight,
             &wallet.send_lock,
@@ -2649,11 +2864,27 @@ mod tests {
             .get_next_nonce(wallet.provider(), address)
             .await
             .unwrap();
-        assert_eq!(next_nonce, submitted_nonce);
+        assert_eq!(
+            next_nonce,
+            if known_submission {
+                submitted_nonce
+            } else {
+                submitted_nonce + 1
+            }
+        );
     }
 
     #[tokio::test]
-    async fn restored_prepared_drop_retains_nonce_for_exact_rebroadcast() {
+    async fn known_prepared_drop_retains_nonce_for_exact_rebroadcast() {
+        assert_prepared_absence_preserves_ownership(true).await;
+    }
+
+    #[tokio::test]
+    async fn restored_prepared_unknown_submission_retains_nonce_for_exact_rebroadcast() {
+        assert_prepared_absence_preserves_ownership(false).await;
+    }
+
+    async fn assert_prepared_absence_preserves_ownership(known_submission: bool) {
         let anvil = Anvil::new().spawn();
         let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
         let signer: PrivateKeySigner = anvil.keys()[0].clone().into();
@@ -2709,26 +2940,46 @@ mod tests {
         restarted_wallet.restore_prepared(&prepared).await;
         provider.anvil_revert(snapshot_id).await.unwrap();
 
+        if known_submission {
+            let floor = restarted_wallet
+                .provider()
+                .get_block_number()
+                .await
+                .unwrap();
+            restarted_wallet
+                .in_flight
+                .record_submission_block(address, prepared.tx_hash(), floor);
+            restarted_wallet
+                .provider()
+                .anvil_mine(Some(3), None)
+                .await
+                .unwrap();
+        }
+
         let result = wait_for_receipt_with_config(
             restarted_wallet.provider(),
             prepared.tx_hash(),
             1,
             ReceiptWaitConfig {
+                submission: restarted_wallet.transaction_submission(prepared.tx_hash()),
                 poll_interval: Duration::from_millis(1),
                 inclusion_timeout: Duration::from_millis(100),
                 confirmation_timeout: Duration::from_millis(100),
                 dropped_grace: Duration::ZERO,
                 dropped_consecutive_misses: 1,
+                dropped_head_advance: 0,
             },
         )
         .await;
-        assert!(matches!(
-            &result,
-            Err(EvmError::TransactionDropped {
-                tx_hash: dropped_hash,
-                ..
-            }) if *dropped_hash == prepared.tx_hash()
-        ));
+        match (&result, known_submission) {
+            (Err(EvmError::TransactionDropped { tx_hash, .. }), true)
+            | (Err(EvmError::ReceiptTimeout { tx_hash, .. }), false) => {
+                assert_eq!(*tx_hash, prepared.tx_hash());
+            }
+            _ => panic!(
+                "unexpected absence verdict with known evidence {known_submission}: {result:?}"
+            ),
+        }
         release_in_flight_after_wait(
             &restarted_wallet.in_flight,
             &restarted_wallet.send_lock,

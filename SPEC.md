@@ -5135,6 +5135,29 @@ in the `BridgingSubmitting` aggregate event before the burn call. Even a
 misclassified error cannot cause a double-burn because the scan adopts any
 existing burn.
 
+Generic sends observe their submission boundary under the wallet's send lock,
+immediately around each attempted broadcast, including nonce and fee recovery
+retries. Waiting for that lock cannot leave a queued send with an old boundary.
+Gas estimation, filling, and signing finish before the pre-broadcast head read;
+signing latency cannot leave the accepted send with a pre-signing boundary.
+Prepared transactions refresh their submission boundary at every broadcast,
+including exact rebroadcast after restart. An unfinished or failed observation
+cannot reuse a stale preparation boundary to qualify absence; it stays unknown
+without releasing nonce ownership. Completed observations retain the highest
+boundary seen across preparation and broadcasts.
+
+Preparation keeps the send lock through signing and its boundary observations.
+Until the signed transaction is returned to its caller, cancellation or failure
+releases only that fresh, unused preparation's reservation and invalidates its
+cached allocation; earlier occupied nonces remain held. Optional post-operation
+head reads are bounded by the existing wallet receipt-poll interval. A failed or
+timed-out post-read returns the accepted hash or signed preparation with unknown
+freshness and retained ownership, rather than delaying durable burn-hash
+recording indefinitely. Receipt waits read live submission evidence at each drop
+check and again after canonical-state lookups. Changed or unfinished rebroadcast
+evidence resets accumulated absence and head progress; an old copied boundary
+cannot qualify a new suspected drop.
+
 A per-attempt wall-clock timeout is similarly reclassified: the hung attempt is
 aborted and the job re-enqueues with a 30 s delay. The scan alone is
 mempool-blind -- it adopts only a MINED burn, not one that was broadcast but not
@@ -5161,8 +5184,23 @@ hash is durably recorded, an ambiguous "dropped" classification pages the
 operator (a terminal `BurnTxDropped` error) for manual on-chain verification,
 because a load-balanced RPC could misreport a still-pending burn as dropped and
 a reburn there would double-burn. `burn_status` mirrors the wallet's
-`wait_for_receipt` drop policy (a grace window plus consecutive mempool-absence
-misses) so a still-pending tx is never misclassified as dropped.
+`wait_for_receipt` drop policy (a grace window plus consecutive qualified
+mempool-absence misses). Its head-progress reference starts after grace;
+progress before grace followed by a frozen head does not qualify. Consecutive
+misses count only once the head has advanced by the required margin beyond that
+post-grace reference. A bounded further observation window allows fresh progress
+before a frozen head returns Pending. An inconclusive lagging-head or
+consumed-nonce poll resets absence progress but does not end that observation
+window or restart grace; later polls must qualify against a new reference.
+Absence only qualifies with the submitted transaction's known sender and nonce,
+a head beyond the pre-submission block, and an unused nonce read at that exact
+canonical block hash. A consumed nonce can mean a mined transaction hidden by a
+lagging receipt backend, so it stays pending. Unknown submission evidence,
+unavailable canonical state, or a frozen/lagging head cannot produce a dropped
+verdict; wallet waits time out without releasing nonce ownership and burn
+recovery redrives. Head advancement alone does not prove global mempool absence,
+so the verdict remains suspected drop and never authorizes automatically
+reburning a recorded burn.
 
 **Bound**: Both revert and timeout redrives count against a shared
 `max_burn_revert_redrives` counter persisted in the job payload (durable across

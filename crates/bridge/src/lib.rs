@@ -135,12 +135,16 @@ pub trait Bridge: Send + Sync + 'static {
     /// receipt consults the mempool: a tx still known to the node is
     /// [`BurnTxStatus::Pending`], and a tx absent from the mempool is only
     /// reported [`BurnTxStatus::Dropped`] after a grace window plus consecutive
-    /// misses (mirroring the wallet's `wait_for_receipt` drop policy), so a
-    /// still-pending tx is never re-burned.
+    /// qualified misses (mirroring the wallet's `wait_for_receipt` policy).
+    /// Qualification requires the known sender/nonce, an advancing head beyond
+    /// `submitted_after_block`, and an unused nonce at that exact canonical
+    /// block hash. Missing evidence or a consumed nonce stays `Pending`.
+    /// `Dropped` remains a suspected verdict, never authorization to reburn.
     async fn burn_status(
         &self,
         direction: BridgeDirection,
         tx_hash: TxHash,
+        submitted_after_block: u64,
     ) -> Result<BurnTxStatus, Self::Error>;
 
     /// Polls for an attestation confirming the burn.
