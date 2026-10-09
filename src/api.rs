@@ -9,11 +9,11 @@ use std::time::Duration;
 use alloy::primitives::{TxHash, U256};
 use axum::Json;
 use axum::Router;
-use axum::extract::{ConnectInfo, Path, Query, Request, State};
+use axum::extract::{ConnectInfo, MatchedPath, Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::http::header::{CACHE_CONTROL, HeaderName};
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use chrono::{DateTime, NaiveDate, Utc};
 use rain_math_float::Float;
@@ -56,6 +56,9 @@ use crate::equity_redemption::{
 };
 use crate::iap_auth::{IapVerifier, require_iap};
 use crate::offchain::order::{OffchainOrderId, OrderPlacer, PollOrderStatusJobQueue};
+use crate::operations_audit::{
+    audit_request, capture_request_body, record_principal, set_audit_route_template,
+};
 use crate::operator::OperatorError;
 use crate::operator::equity_transfer::{
     EquityTransferKind, FailTransferError, validate_failure_reason,
@@ -4401,6 +4404,55 @@ async fn set_portfolio_snapshot_mark(
     }))
 }
 
+async fn unknown_operator_mutation() -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "unknown operator mutation route".to_string(),
+        }),
+    )
+}
+
+async fn audit_write_mutation(mut request: Request, next: Next) -> Response {
+    if request.method() == axum::http::Method::POST
+        && matches!(
+            request.uri().path(),
+            "/liquidity-write" | "/liquidity-write/"
+        )
+    {
+        set_audit_route_template(&mut request, "/liquidity-write/{*path}");
+    }
+    audit_request("write", request, next).await
+}
+
+fn is_loopback_mutation(request: &Request) -> bool {
+    request.method() == axum::http::Method::POST
+        && (request.uri().path() == "/transfers" || request.uri().path().starts_with("/transfers/"))
+}
+
+fn is_known_loopback_mutation_route(request: &Request) -> bool {
+    request
+        .extensions()
+        .get::<MatchedPath>()
+        .is_some_and(|path| {
+            matches!(
+                path.as_str(),
+                "/transfers/fail/{kind}/{id}"
+                    | "/transfers/resume"
+                    | "/transfers/usdc/resume/{direction}/{id}"
+                    | "/transfers/recheck/{kind}/{id}"
+            )
+        })
+}
+
+async fn api_fallback(request: Request) -> Response {
+    if is_loopback_mutation(&request) {
+        unknown_operator_mutation().await.into_response()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
+    }
+}
+
 /// The role-gated ops API: the same handlers the dashboard routes use, mounted
 /// under a prefix the load balancer routes to a role-specific IAP backend.
 ///
@@ -4577,10 +4629,15 @@ fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
             "/liquidity-write/capital/reset-allowance",
             post(capital::reset_allowance),
         )
+        .route("/liquidity-write", post(unknown_operator_mutation))
+        .route("/liquidity-write/", post(unknown_operator_mutation))
+        .route("/liquidity-write/{*path}", post(unknown_operator_mutation))
+        .layer(axum::middleware::from_fn(capture_request_body))
         .layer(axum::middleware::from_fn(move |request, next| {
             let verifier = Arc::clone(&write_verifier);
             async move { require_iap(verifier, request, next).await }
-        }));
+        }))
+        .layer(axum::middleware::from_fn(audit_write_mutation));
 
     read.merge(write)
 }
@@ -4624,7 +4681,38 @@ async fn require_loopback(
         ));
     }
 
+    record_principal(&request, "local-loopback");
+
     Ok(next.run(request).await)
+}
+
+async fn capture_loopback_mutation_body(request: Request, next: Next) -> Response {
+    if is_loopback_mutation(&request) {
+        capture_request_body(request, next).await
+    } else {
+        next.run(request).await
+    }
+}
+
+async fn require_loopback_mutation(request: Request, next: Next) -> Response {
+    if !is_loopback_mutation(&request) {
+        return next.run(request).await;
+    }
+
+    require_loopback(request, next)
+        .await
+        .unwrap_or_else(IntoResponse::into_response)
+}
+
+async fn audit_loopback_mutation(mut request: Request, next: Next) -> Response {
+    if !is_loopback_mutation(&request) {
+        return next.run(request).await;
+    }
+
+    if !is_known_loopback_mutation_route(&request) {
+        set_audit_route_template(&mut request, "/transfers/{*path}");
+    }
+    audit_request("local", request, next).await
 }
 
 pub(crate) fn routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
@@ -4638,8 +4726,7 @@ pub(crate) fn routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
             "/transfers/usdc/resume/{direction}/{id}",
             post(resume_usdc_transfer),
         )
-        .route("/transfers/recheck/{kind}/{id}", post(recheck_transfer))
-        .route_layer(axum::middleware::from_fn(require_loopback));
+        .route("/transfers/recheck/{kind}/{id}", post(recheck_transfer));
 
     Router::new()
         .merge(ops_api_routes(ops_api))
@@ -4658,13 +4745,23 @@ pub(crate) fn routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
         .route("/orders/pending", get(pending_orders))
         .route("/trades", get(trades))
         .route("/trades/{venue}/{aggregate_id}/events", get(trade_events))
-        .route("/transfers", get(transfers_endpoint))
+        .route(
+            "/transfers",
+            get(transfers_endpoint).post(unknown_operator_mutation),
+        )
         .route(
             "/transfers/{kind}/{aggregate_id}/events",
-            get(transfer_events),
+            get(transfer_events).post(unknown_operator_mutation),
         )
         .route("/orders/raindex", get(raindex_orders))
-        .route("/transfers/interrupted", get(interrupted_transfers))
+        .route(
+            "/transfers/interrupted",
+            get(interrupted_transfers).post(unknown_operator_mutation),
+        )
+        .fallback(api_fallback)
+        .layer(axum::middleware::from_fn(capture_loopback_mutation_body))
+        .layer(axum::middleware::from_fn(require_loopback_mutation))
+        .layer(axum::middleware::from_fn(audit_loopback_mutation))
 }
 
 #[cfg(test)]
@@ -4695,6 +4792,7 @@ mod tests {
     use sqlx::SqlitePool;
     use tokio::sync::{Notify, broadcast};
     use tower::ServiceExt;
+    use tracing_test::traced_test;
     use uuid::uuid;
 
     use st0x_bridge::cctp::CctpError;
@@ -7698,6 +7796,104 @@ mod tests {
         }
     }
 
+    #[traced_test]
+    #[tokio::test]
+    async fn unknown_loopback_mutation_is_guarded_and_returns_stable_not_found() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
+
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transfers/not-a-command")
+                    .extension(ConnectInfo(SocketAddr::from(([172, 18, 0, 1], 9))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        for uri in ["/transfers", "/transfers/interrupted"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9))))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+            let body = body_to_string(response).await;
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                body,
+                serde_json::json!({ "error": "unknown operator mutation route" }),
+                "{uri}"
+            );
+        }
+
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let not_found = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transfers/not-a-command")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let request_id: uuid::Uuid = not_found.headers()["x-request-id"]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(request_id.get_version_num(), 4);
+        assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+        let body = body_to_string(not_found).await;
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({ "error": "unknown operator mutation route" })
+        );
+
+        let public_get = app
+            .oneshot(
+                Request::builder()
+                    .uri("/transfers/interrupted")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(public_get.status(), StatusCode::OK);
+        assert_eq!(public_get.headers().get("x-request-id"), None);
+
+        logs_assert(|lines| {
+            lines
+                .iter()
+                .any(|line| {
+                    line.contains("operations_audit: Operations audit event")
+                        && line.contains(&request_id.to_string())
+                        && line.contains("principal=local-loopback")
+                        && line.contains("role=\"local\"")
+                        && line.contains("route=/transfers/{*path}")
+                        && line.contains("target_id=not_identified")
+                        && line.contains("outcome=\"validation_failure\"")
+                })
+                .then_some(())
+                .ok_or_else(|| format!("missing stable unknown-route audit: {lines:?}"))
+        });
+    }
+
     /// Pins the production serve wiring: `serve_with_peer_info` must record
     /// the TCP peer, or the loopback gate fails closed and the in-container
     /// CLI's recovery verbs 403 in production while every hand-injected
@@ -7766,6 +7962,8 @@ mod tests {
             ("POST", "/liquidity-write/capital/cctp-bridge"),
             ("POST", "/liquidity-write/capital/cctp-burn-supersede"),
             ("POST", "/liquidity-write/capital/reset-allowance"),
+            ("POST", "/liquidity-write/not-a-command"),
+            ("POST", "/liquidity-write/"),
         ] {
             let response = app
                 .clone()
@@ -7829,6 +8027,8 @@ mod tests {
             ("POST", "/liquidity-write/capital/cctp-bridge"),
             ("POST", "/liquidity-write/capital/cctp-burn-supersede"),
             ("POST", "/liquidity-write/capital/reset-allowance"),
+            ("POST", "/liquidity-write/not-a-command"),
+            ("POST", "/liquidity-write/"),
         ] {
             let response = app
                 .clone()
@@ -7847,6 +8047,54 @@ mod tests {
                 "{method} {uri}"
             );
         }
+    }
+    #[traced_test]
+    #[tokio::test]
+    async fn exact_write_catchalls_use_the_stable_wildcard_audit_route() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let ops_api = st0x_config::OpsApiConfig {
+            read_audience: "/projects/1/global/backendServices/11".to_string(),
+            write_audience: "/projects/1/global/backendServices/22".to_string(),
+        };
+        let app = routes(Some(&ops_api)).with_state(empty_app_state(ctx).await);
+
+        for (uri, request_id) in [
+            ("/liquidity-write", "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"),
+            ("/liquidity-write/", "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("x-request-id", request_id)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
+
+        logs_assert(|lines| {
+            for request_id in [
+                "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+                "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2",
+            ] {
+                if !lines.iter().any(|line| {
+                    line.contains("operations_audit: Operations audit event")
+                        && line.contains(request_id)
+                        && line.contains("route=/liquidity-write/{*path}")
+                        && line.contains("outcome=\"denied\"")
+                }) {
+                    return Err(format!(
+                        "missing stable-route denial audit for {request_id}: {lines:?}"
+                    ));
+                }
+            }
+            Ok(())
+        });
     }
 
     /// The recheck endpoints' wire envelope is `{"outcome":"<snake_case>"}`.

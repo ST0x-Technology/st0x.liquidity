@@ -65,6 +65,7 @@ mod native_gas;
 mod offchain;
 mod onchain;
 mod onchain_trade;
+mod operations_audit;
 pub mod operator;
 mod performance;
 mod portfolio_snapshot;

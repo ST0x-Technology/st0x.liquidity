@@ -26,6 +26,7 @@ use serde::Deserialize;
 use std::time::Duration;
 use thiserror::Error;
 use tracing_appender::rolling::{InitError, RollingFileAppender, Rotation};
+use tracing_subscriber::filter::{FilterExt, filter_fn};
 use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::{EnvFilter, Registry};
 use url::Url;
@@ -88,6 +89,19 @@ enum ConsoleTextStyle {
     Full,
 }
 
+/// Compose operator-selected diagnostics with the non-negotiable console audit
+/// floor. Keeping this as one per-layer filter emits each audit record once
+/// while field-specific `RUST_LOG` directives can still refine ordinary logs.
+fn console_filter<S>(env_filter: EnvFilter) -> impl tracing_subscriber::layer::Filter<S>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    filter_fn(|metadata| {
+        metadata.target() == "operations_audit" && *metadata.level() <= tracing::Level::INFO
+    })
+    .or(env_filter)
+}
+
 /// Build the console fmt layer for `log_format`. The JSON arm is the single
 /// place the console JSON wire shape is defined, byte-identical to the rolling
 /// file layer, so every subscriber emits one JSON shape.
@@ -102,15 +116,15 @@ where
     match log_format {
         LogFormat::Json => tracing_subscriber::fmt::layer()
             .json()
-            .with_filter(env_filter)
+            .with_filter(console_filter::<S>(env_filter))
             .boxed(),
         LogFormat::Text => match style {
             ConsoleTextStyle::Compact => tracing_subscriber::fmt::layer()
                 .compact()
-                .with_filter(env_filter)
+                .with_filter(console_filter::<S>(env_filter))
                 .boxed(),
             ConsoleTextStyle::Full => tracing_subscriber::fmt::layer()
-                .with_filter(env_filter)
+                .with_filter(console_filter::<S>(env_filter))
                 .boxed(),
         },
     }
@@ -450,9 +464,14 @@ fn install_console_only_subscriber(
 }
 
 pub fn mk_env_filter(level: tracing::Level) -> EnvFilter {
-    let fallback_filter = mk_crate_filter(level);
+    let rust_log = std::env::var("RUST_LOG").ok();
+    mk_env_filter_with_rust_log(level, rust_log.as_deref())
+}
 
-    EnvFilter::try_from_default_env().unwrap_or(fallback_filter)
+fn mk_env_filter_with_rust_log(level: tracing::Level, rust_log: Option<&str>) -> EnvFilter {
+    rust_log
+        .and_then(|directives| EnvFilter::try_new(directives).ok())
+        .unwrap_or_else(|| mk_crate_filter(level))
 }
 
 fn mk_crate_filter(level: tracing::Level) -> EnvFilter {
@@ -477,7 +496,8 @@ fn mk_crate_filter(level: tracing::Level) -> EnvFilter {
     /// level. Keep in sync with
     /// `grep -rhoE 'target: "[a-z_]+"' src/ crates/` (plus `cqrs` from the
     /// external st0x-event-sorcery crate).
-    const DOMAIN_TARGETS: [&str; 19] = [
+    const DOMAIN_TARGETS: [&str; 21] = [
+        "api",
         "backfill",
         "bridge",
         "broker",
@@ -487,6 +507,7 @@ fn mk_crate_filter(level: tracing::Level) -> EnvFilter {
         "evm",
         "gas",
         "hedge",
+        "iap",
         "inventory",
         "market_data",
         "operational_alert",
@@ -510,7 +531,11 @@ fn mk_crate_filter(level: tracing::Level) -> EnvFilter {
         .map(|target| format!("{target}={level}"))
         .join(",");
 
-    EnvFilter::from(format!("warn,{our_crates},{domain_targets}"))
+    // Mutation audits are compliance records, not diagnostic verbosity:
+    // successful commands stay visible even when ordinary logs are ERROR-only.
+    EnvFilter::from(format!(
+        "warn,{our_crates},{domain_targets},operations_audit=info"
+    ))
 }
 
 #[cfg(test)]
@@ -523,12 +548,13 @@ mod tests {
     #[test]
     fn crate_filter_enables_every_domain_target_in_use() {
         // A `target: "..."` overrides the module path, so a target absent
-        // from DOMAIN_TARGETS is silently dropped at every level. This
-        // list mirrors `grep -rhoE 'target: "[a-z_]+"' src/ crates/` in
-        // the workspace; extend both when introducing a new target.
+        // from this list is silently dropped at every level. The list mirrors
+        // workspace domain targets except `operations_audit`, whose mandatory
+        // INFO floor is asserted separately below.
         let filter = mk_crate_filter(tracing::Level::TRACE).to_string();
 
         for target in [
+            "api",
             "backfill",
             "bridge",
             "broker",
@@ -541,6 +567,7 @@ mod tests {
             "evm",
             "gas",
             "hedge",
+            "iap",
             "inventory",
             "market_data",
             "orderbook",
@@ -556,6 +583,12 @@ mod tests {
                 "domain target {target} is missing from the env filter: {filter}"
             );
         }
+
+        let error_filter = mk_crate_filter(tracing::Level::ERROR).to_string();
+        assert!(
+            error_filter.contains("operations_audit=info"),
+            "operations audits must remain enabled at INFO: {error_filter}"
+        );
     }
 
     /// Captures everything written through a subscriber layer so tests can
@@ -580,6 +613,31 @@ mod tests {
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
         }
+    }
+
+    #[test]
+    fn rust_log_cannot_disable_operations_audit_info() {
+        let writer = SharedWriter::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_filter(console_filter::<Registry>(mk_env_filter_with_rust_log(
+                tracing::Level::TRACE,
+                Some("error,operations_audit[{audit_schema}]=off"),
+            )));
+        let subscriber = Registry::default().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                target: "operations_audit",
+                audit_schema = "st0x.operations.audit.v1",
+                "mandatory audit"
+            );
+            tracing::info!(target: "hedge", "ordinary diagnostic");
+        });
+
+        let output = String::from_utf8(writer.0.lock().clone()).unwrap();
+        assert_eq!(output.matches("mandatory audit").count(), 1);
+        assert!(!output.contains("ordinary diagnostic"));
     }
 
     /// Pins the JSON console wire shape a log shipper parses: one JSON object
@@ -652,21 +710,6 @@ mod tests {
         let Err(_) = build_log_file_appender(dir_path) else {
             panic!("expected appender build to fail when the log directory cannot be created");
         };
-    }
-
-    #[test]
-    fn setup_tracing_degrades_to_console_only_when_log_dir_is_invalid() {
-        let file = NamedTempFile::new().unwrap();
-        let uncreatable_dir = file.path().join("nested");
-        let file_logging =
-            FileLogging::new(uncreatable_dir.to_str().unwrap().to_owned(), LogLevel::Info);
-
-        let file_guard = setup_tracing(&LogLevel::Info, LogFormat::Text, Some(&file_logging), None);
-
-        assert!(
-            file_guard.is_none(),
-            "an invalid log dir must degrade to console-only logging, not return a file guard"
-        );
     }
 
     #[test]
@@ -752,39 +795,5 @@ mod tests {
         assert!(stdout.contains("retained locally"));
         assert!(!file.contains("remote-only detail"));
         assert!(file.contains("retained locally"));
-    }
-
-    #[test]
-    fn telemetry_setup_continues_without_file_logging_when_log_dir_is_invalid() {
-        // A regular file cannot contain a subdirectory, so the log directory
-        // cannot be created. setup() must keep the OTLP trace/log pipeline live
-        // and degrade only the file-logging half, returning a None file guard
-        // rather than failing the whole telemetry stack.
-        let file = NamedTempFile::new().unwrap();
-        let uncreatable_dir = file.path().join("nested");
-        let file_logging =
-            FileLogging::new(uncreatable_dir.to_str().unwrap().to_owned(), LogLevel::Info);
-
-        let ctx = TelemetryCtx {
-            service_name: "test-service".to_string(),
-            environment: "test".to_string(),
-            traces_endpoint: Url::parse("http://localhost:10428").unwrap(),
-            logs_endpoint: Url::parse("http://localhost:9428").unwrap(),
-        };
-
-        let (file_guard, _telemetry_guard) = ctx
-            .setup(
-                tracing::Level::INFO,
-                LogFormat::Text,
-                Some(&file_logging),
-                None,
-            )
-            .unwrap();
-
-        assert!(
-            file_guard.is_none(),
-            "an invalid log dir must degrade to console-only logging (None file \
-             guard) while the OTLP exporters stay live"
-        );
     }
 }

@@ -50,6 +50,16 @@ has no CCTP domain.
   directional exposure from onchain fills
 - **Operator Vault Controls**: CLI supports generic ERC20 deposits to and
   withdrawals from Raindex vaults, with a USDC-specific withdrawal shortcut
+- **Shared Operations Audit**: Every operator mutation request that reaches the
+  service emits `st0x.operations.audit.v1` with stable principal, role, matched
+  route template, request UUID, bounded target/reason fields, outcome, and
+  timestamp. Authentication precedes body capture, so in-service denials use
+  `not_identified`/`not_provided`; Cloud IAP edge rejections never reach the
+  application. Docker's `gcplogs` driver forwards each JSON stdout record to
+  Cloud Logging as a serialized line; field parsing depends on the ingestion
+  configuration. VictoriaLogs receives the compatible event only when
+  `[telemetry]` configures the OTLP log exporter. Responses echo the UUID in
+  `x-request-id`.
 - **Public Incident Messaging**: The
   [`scripts/turnkey-message`](scripts/turnkey-message/README.md) utility
   prepares, signs, verifies, sends, and reads zero-value Base messages from an
@@ -477,14 +487,12 @@ nix run .#deployAll   # first deployment
   touches them provisions them into a throwaway Grafana; a merge to `master`
   ships them to the production T0 Grafana. See
   [observability/README.md](observability/README.md).
-- **Production** (`.github/workflows/production-release.yml`): the only way to
-  roll production. A manual run with `version = vX.Y.Z` releases the images and
-  `config/prod/st0x-hedge.toml` from that tag. A run with an empty `version` is
-  a config-only release of `config/prod/st0x-hedge.toml` onto the images that
-  are live. It takes the file from the branch selected in "Use workflow from",
-  not always `master`, so select `master`; any other branch publishes that
-  branch's unreviewed config. Each run waits for an approved `app-deploy` PAM
-  grant in `t0-liquidity`.
+- **Production** (`.github/workflows/production-release.yml`) is a manual
+  `workflow_dispatch`. From `master`, leaving `version` empty releases the
+  current master config onto the image digests already live in production.
+  Supplying `vX.Y.Z` releases that tag's images and config. Both paths validate
+  the config against the image and require app-deploy PAM approval before the
+  production VM rolls.
 
 Track staging and production deploys in the Grafana deployments dashboard:
 https://grafana.t0trade.com/d/t0-deployments/deployments

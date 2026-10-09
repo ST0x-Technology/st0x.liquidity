@@ -279,6 +279,9 @@ tempfile.workspace = true
 ciborium = "0.2.2"
 st0x-pricing-types = { git = "https://github.com/ST0x-Technology/st0x.pricing-types", tag = "v0.8.0" }
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
+parking_lot.workspace = true
+http-body-util = "0.1.5"
+percent-encoding = "2.3.2"
 
 [dev-dependencies]
 approx.workspace = true
