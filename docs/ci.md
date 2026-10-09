@@ -69,10 +69,13 @@ Use a pull request event for merge-blocking validation. Reserve
 `workflow_dispatch` for manual runs whose result does not need to become a pull
 request status check.
 
-## Board check
+## Board and parity checks
 
-The `backend build` job also runs
-`python3 observability/gen-t0-liquidity.py --check` in the `ci-backend` shell,
-and `nix run .#ci` runs it too. It fails when the committed liquidity board JSON
-differs from the generator output, or when a `liq_` selector is not pinned to
-the exporter job.
+The `backend build` job also runs two Python checks in the `ci-backend` shell,
+and `nix run .#ci` runs them too:
+
+- `python3 observability/gen-t0-liquidity.py --check` fails when the committed
+  liquidity board JSON differs from the generator output, or when a `liq_`
+  selector is not pinned to the exporter job.
+- `python3 scripts/liq-parity/test_compare.py` tests the staging parity tool
+  against a checked-in snapshot pair.
