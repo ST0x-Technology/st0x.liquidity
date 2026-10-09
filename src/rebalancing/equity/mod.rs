@@ -2265,6 +2265,9 @@ fn alpaca_resume_failure_kind(error: &AlpacaTokenizationError) -> ResumeFailureK
         AlpacaTokenizationError::Reqwest(_)
         | AlpacaTokenizationError::Auth(_)
         | AlpacaTokenizationError::PollTimeout { .. } => Retryable,
+        AlpacaTokenizationError::Gateway(hop) if hop.retryable || hop.retryable_with_same_key => {
+            Retryable
+        }
         AlpacaTokenizationError::ApiError { .. }
         | AlpacaTokenizationError::PrivateKeyJwtUnsupported
         | AlpacaTokenizationError::JsonParse(_)
@@ -2276,7 +2279,9 @@ fn alpaca_resume_failure_kind(error: &AlpacaTokenizationError) -> ResumeFailureK
         | AlpacaTokenizationError::DuplicateMintIssuerRequestId { .. }
         | AlpacaTokenizationError::InvalidBaseUrl(_)
         | AlpacaTokenizationError::WrongNetwork { .. }
-        | AlpacaTokenizationError::NetworkMissing { .. } => Permanent,
+        | AlpacaTokenizationError::NetworkMissing { .. }
+        | AlpacaTokenizationError::Gateway(_)
+        | AlpacaTokenizationError::NotSent(_) => Permanent,
     }
 }
 

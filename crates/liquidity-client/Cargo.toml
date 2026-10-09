@@ -7,18 +7,30 @@ homepage.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+alloy-primitives.workspace = true
 base64.workspace = true
+chrono.workspace = true
 clap.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
+st0x-alpaca = { workspace = true, features = [
+  "corporate-actions",
+  "issuer",
+  "tokenization",
+] }
+st0x-alpaca-gateway-api = { git = "https://github.com/ST0x-Technology/st0x.alpaca", rev = "0ca02fd33e4ba4ba3aa0fb86c1a59ed11b822c50", features = [
+  "client",
+] }
+thiserror.workspace = true
 tokio.workspace = true
 url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+httpmock.workspace = true
 serial_test.workspace = true
 temp-env.workspace = true
 

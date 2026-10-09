@@ -582,60 +582,49 @@ before any signing. An orchestrator-mode mint reaching the signing step without
 its chain's entry fails there. A missing MintAuth policy is invisible at
 startup: the first orchestrator-mode mint on that chain fails at signing.
 
-## Alpaca Crypto Wallet Management
+## Alpaca Account Operations
 
-### USDC Deposits and Withdrawals
+Use `st0x-liquidity-client --env <staging|production> alpaca` for direct access
+to the T0 Alpaca account through its account bound gateway. The client never
+accepts an Alpaca account identifier and never reads the bot account
+credentials.
 
-```
-stox alpaca-deposit -a 500           # Deposit USDC from Ethereum to Alpaca
-stox alpaca-withdraw -a 500          # Withdraw USDC from Alpaca
-stox alpaca-withdraw -a 500 -t 0x... # Withdraw to a specific address
-```
+The selected environment reads `T0_ALPACA_{STAGING,PROD}_URL`, `_CLIENT_ID`,
+`_CLIENT_SECRET`, `_CONNECT_TIMEOUT_SECS`, and `_REQUEST_TIMEOUT_SECS`. The
+first interactive request opens Google sign in for the T0 operator account.
+Every successful response is one compact JSON object.
 
-### USD/USDC Conversion
+Read commands include account information, cash, positions, market data, orders,
+wallet transfers, conversions, and tokenization requests:
 
-```
-stox alpaca-convert -d to-usd -a 1000    # USDC -> USD (for buying shares)
-stox alpaca-convert -d to-usdc -a 1000   # USD -> USDC (for withdrawals)
-```
-
-### Address Whitelisting
-
-Addresses must be whitelisted before Alpaca will send withdrawals to them:
-
-```
-stox alpaca-whitelist -a 0x...              # Whitelist an address
-stox alpaca-whitelist-list                  # List whitelisted addresses
-stox alpaca-unwhitelist -a 0x...            # Remove an address
-stox alpaca-whitelist-patch-travel-rule     # Patch travel rule info on all whitelisted addresses
+```bash
+st0x-liquidity-client --env staging alpaca account
+st0x-liquidity-client --env staging alpaca positions
+st0x-liquidity-client --env staging alpaca quote --symbol COIN
+st0x-liquidity-client --env staging alpaca transfers --pending
+st0x-liquidity-client --env staging alpaca tokenization-requests --network base
 ```
 
-`alpaca-whitelist-patch-travel-rule` updates every whitelisted address with the
-beneficiary identity from `[broker.travel_rule]` in the config. Required for
-addresses whitelisted before the travel rule deadline took effect.
+Mutations require a nonblank `--reason`. The client generates an idempotency key
+when one is not supplied and includes that key in the JSON response or error so
+an uncertain outcome can be checked before retrying:
 
-### Transfer History
-
-```
-stox alpaca-transfers                # All transfers
-stox alpaca-transfers --pending      # Only pending transfers
-```
-
-### Tokenization Request History
-
-```
-stox alpaca-tokenization-requests
+```bash
+st0x-liquidity-client --env staging alpaca buy --symbol COIN --quantity 10 --reason "operator purchase"
+st0x-liquidity-client --env staging alpaca convert --direction to-usd --amount 1000 --reason "fund purchase"
+st0x-liquidity-client --env staging alpaca withdraw --amount 500 --address 0x... --reason "treasury transfer"
+st0x-liquidity-client --env staging alpaca whitelist --address 0x... --reason "approve treasury wallet"
+st0x-liquidity-client --env staging alpaca whitelist-patch-travel-rule --reason "refresh beneficiary details"
+st0x-liquidity-client --env staging alpaca unwhitelist --address 0x... --reason "remove retired wallet"
+st0x-liquidity-client --env staging alpaca journal --counterparty issuance --symbol COIN --quantity 10 --reason "fund issuer"
+st0x-liquidity-client --env staging alpaca tokenize --symbol COIN --quantity 10 --recipient 0x... --network base --reason "mint inventory"
 ```
 
-### Equity Journaling Between Accounts
-
-Use `alpaca-journal` to transfer equity shares from the configured Alpaca
-account to another account under the same broker firm via a security journal
-(JNLS):
-
-```
-stox alpaca-journal --to <destination-account-id> -s COIN -q 10
-```
+`alpaca deposit --network <network>` returns the account deposit address only.
+It does not send funds. `alpaca redeem <tx-hash> --network <network>` finds the
+provider request created by a separate token transfer only. Chain signing,
+wrapping, vault operations, transfer reconciliation, and bot recovery remain
+outside this client.
 
 ### Rechecking Failed Equity Transfers
 

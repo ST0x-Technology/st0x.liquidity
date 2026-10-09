@@ -1,6 +1,7 @@
 //! Binary entrypoint: resolves the target environment, builds the auth-backed
 //! transport, dispatches the parsed command, and maps failures to exit codes.
 
+mod alpaca;
 mod auth;
 mod cli;
 mod output;
@@ -53,6 +54,7 @@ enum ApiError {
     Transport(TransportError),
     Output(OutputError),
     Auth(AuthError),
+    Alpaca(alpaca::Failure),
 }
 
 impl ApiError {
@@ -64,6 +66,7 @@ impl ApiError {
                 | TransportError::Forbidden(_)
                 | TransportError::Auth(_),
             ) => 77,
+            Self::Alpaca(error) if error.is_access_denied() => 77,
             _ => 1,
         }
     }
@@ -87,12 +90,19 @@ impl From<AuthError> for ApiError {
     }
 }
 
+impl From<alpaca::Failure> for ApiError {
+    fn from(error: alpaca::Failure) -> Self {
+        Self::Alpaca(error)
+    }
+}
+
 impl std::fmt::Display for ApiError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Transport(error) => write!(formatter, "{error}"),
             Self::Output(error) => write!(formatter, "{error}"),
             Self::Auth(error) => write!(formatter, "{error}"),
+            Self::Alpaca(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -103,19 +113,31 @@ impl std::error::Error for ApiError {
             Self::Transport(error) => Some(error),
             Self::Output(error) => Some(error),
             Self::Auth(error) => Some(error),
+            Self::Alpaca(error) => Some(error),
         }
     }
 }
 
 async fn execute(cli: Cli) -> Result<(), Failure> {
-    let target = target::resolve(cli.env).map_err(Failure::Setup)?;
+    let alpaca_command = matches!(&cli.command, Command::Alpaca(_));
+    let target = if alpaca_command {
+        target::resolve_alpaca(cli.env)
+    } else {
+        target::resolve(cli.env)
+    }
+    .map_err(Failure::Setup)?;
     let logging_url = target.logging_url;
     let Auth::OauthDesktop {
         client_id,
         client_secret,
     } = target.auth;
+    let cache_slug = if alpaca_command {
+        cli.env.alpaca_cache_slug()
+    } else {
+        cli.env.cache_slug()
+    };
     let token = auth::desktop_id_token(
-        cli.env.cache_slug(),
+        cache_slug,
         &client_id,
         &client_secret,
         target.request_timeout,
@@ -126,6 +148,20 @@ async fn execute(cli: Cli) -> Result<(), Failure> {
         error: error.into(),
         logging_url: logging_url.clone(),
     })?;
+
+    if let Command::Alpaca(command) = cli.command {
+        let value = alpaca::execute(&target.base_url, token, command)
+            .await
+            .map_err(|error| Failure::Api {
+                error: error.into(),
+                logging_url: logging_url.clone(),
+            })?;
+        return output::print(&value).map_err(|error| Failure::Api {
+            error: error.into(),
+            logging_url,
+        });
+    }
+
     let client = Client::new(
         target.base_url,
         StaticToken(token.clone()),
@@ -174,6 +210,9 @@ async fn dispatch<A: TokenSource + Sync>(
         }
         Command::Debug(debug) => send_debug(client, debug).await?,
         Command::Capital(capital) => dispatch_capital(client, capital).await?,
+        Command::Alpaca(_) => {
+            unreachable!("Alpaca commands are dispatched before the bot client is built")
+        }
     };
     output::print(&value).map_err(ApiError::from)
 }

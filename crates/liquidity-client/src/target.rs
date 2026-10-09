@@ -21,12 +21,27 @@ impl Env {
         }
     }
 
+    fn alpaca_prefix(self) -> &'static str {
+        match self {
+            Self::Staging => "T0_ALPACA_STAGING",
+            Self::Production => "T0_ALPACA_PROD",
+        }
+    }
+
     /// Lowercase environment name that keys the refresh-token cache file, so
     /// each environment's OAuth client keeps its own cached token.
     pub(crate) fn cache_slug(self) -> &'static str {
         match self {
             Self::Staging => "staging",
             Self::Production => "production",
+        }
+    }
+
+    /// Cache key for the T0 Alpaca gateway OAuth client.
+    pub(crate) fn alpaca_cache_slug(self) -> &'static str {
+        match self {
+            Self::Staging => "alpaca-staging",
+            Self::Production => "alpaca-production",
         }
     }
 }
@@ -95,12 +110,31 @@ fn required_timeout(prefix: &str, suffix: &str, hint: &str) -> Result<Duration> 
 }
 
 pub fn resolve(env: Env) -> Result<Target> {
-    let prefix = env.prefix();
-    let raw_url = required(
-        &format!("{prefix}_URL"),
+    resolve_with_prefix(
+        env.prefix(),
         "to the IAP-fronted liquidity API base URL for this environment",
-    )?;
+        false,
+    )
+}
+
+/// Resolves the T0 Alpaca gateway target without consulting liquidity target
+/// variables.
+pub fn resolve_alpaca(env: Env) -> Result<Target> {
+    resolve_with_prefix(
+        env.alpaca_prefix(),
+        "to the IAP-fronted T0 Alpaca gateway origin for this environment",
+        true,
+    )
+}
+
+fn resolve_with_prefix(prefix: &str, url_hint: &str, origin_only: bool) -> Result<Target> {
+    let raw_url = required(&format!("{prefix}_URL"), url_hint)?;
     let base_url = parse_base_url(prefix, &raw_url)?;
+    if origin_only
+        && (base_url.path() != "/" || base_url.query().is_some() || base_url.fragment().is_some())
+    {
+        anyhow::bail!("{prefix}_URL must be a bare https origin, got: {raw_url}");
+    }
     let auth = Auth::OauthDesktop {
         client_id: required(
             &format!("{prefix}_CLIENT_ID"),
@@ -136,7 +170,7 @@ mod tests {
     //! Tests for URL and timeout validation and target resolution.
     use serial_test::serial;
 
-    use super::{Env, parse_base_url, parse_timeout_secs, resolve};
+    use super::{Env, parse_base_url, parse_timeout_secs, resolve, resolve_alpaca};
 
     #[test]
     fn accepts_https_url_with_host() {
@@ -281,6 +315,30 @@ mod tests {
                         .to_string()
                         .contains("T0_LIQUIDITY_PROD_CONNECT_TIMEOUT_SECS")
                 }));
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn alpaca_target_uses_only_t0_alpaca_variables_and_cache() {
+        temp_env::with_vars(
+            [
+                (
+                    "T0_LIQUIDITY_STAGING_URL",
+                    Some("https://liquidity.example.com"),
+                ),
+                ("T0_ALPACA_STAGING_URL", Some("https://alpaca.example.com")),
+                ("T0_ALPACA_STAGING_CLIENT_ID", Some("alpaca-client")),
+                ("T0_ALPACA_STAGING_CLIENT_SECRET", Some("alpaca-secret")),
+                ("T0_ALPACA_STAGING_REQUEST_TIMEOUT_SECS", Some("30")),
+                ("T0_ALPACA_STAGING_CONNECT_TIMEOUT_SECS", Some("10")),
+            ],
+            || {
+                let target = resolve_alpaca(Env::Staging).unwrap();
+                assert_eq!(target.base_url.as_str(), "https://alpaca.example.com/");
+                assert_eq!(Env::Staging.alpaca_cache_slug(), "alpaca-staging");
+                assert_ne!(Env::Staging.alpaca_cache_slug(), Env::Staging.cache_slug());
             },
         );
     }

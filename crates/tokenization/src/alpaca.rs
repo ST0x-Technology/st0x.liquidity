@@ -5,6 +5,8 @@ use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::sol_types::{SolCall, SolEvent};
 use async_trait::async_trait;
+use std::time::Duration;
+use tokio::time::{Instant, MissedTickBehavior};
 use tracing::info;
 
 use st0x_alpaca::core::Network as AlpacaChain;
@@ -31,6 +33,8 @@ pub struct AlpacaTokenizationService<W: Wallet> {
     client: SharedService,
     wallet: W,
     redemption_wallet: Option<Address>,
+    poll_interval: Duration,
+    poll_timeout: Duration,
 }
 
 impl<W: Wallet> AlpacaTokenizationService<W> {
@@ -49,18 +53,70 @@ impl<W: Wallet> AlpacaTokenizationService<W> {
             Chain::HyperEvm => AlpacaChain::HyperEvm,
             Chain::Robinhood => AlpacaChain::Robinhood,
         };
-        let client = SharedService::new(base_url, account_id, auth, network)?;
+        let polling_config = PollingConfig::default();
+        let poll_interval = polling_config.interval;
+        let poll_timeout = polling_config.timeout;
+        let client = SharedService::new(base_url, account_id, auth, network)?
+            .with_polling_config(polling_config);
         Ok(Self {
             client,
             wallet,
             redemption_wallet,
+            poll_interval,
+            poll_timeout,
         })
     }
 
     #[must_use]
     pub fn with_polling_config(mut self, polling_config: PollingConfig) -> Self {
+        self.poll_interval = polling_config.interval;
+        self.poll_timeout = polling_config.timeout;
         self.client = self.client.with_polling_config(polling_config);
         self
+    }
+
+    async fn poll_request_until_terminal(
+        &self,
+        id: &TokenizationRequestId,
+    ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
+        let start = Instant::now();
+        let mut interval = tokio::time::interval(self.poll_interval);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if start.elapsed() >= self.poll_timeout {
+                return Err(AlpacaTokenizationError::PollTimeout {
+                    elapsed: start.elapsed(),
+                });
+            }
+            let request = self.client.get_request(id).await?;
+            if matches!(
+                request.status,
+                TokenizationRequestStatus::Completed | TokenizationRequestStatus::Rejected
+            ) {
+                return Ok(request);
+            }
+        }
+    }
+
+    async fn poll_for_redemption_detection(
+        &self,
+        tx_hash: &TxHash,
+    ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
+        let start = Instant::now();
+        let mut interval = tokio::time::interval(self.poll_interval);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if start.elapsed() >= self.poll_timeout {
+                return Err(AlpacaTokenizationError::PollTimeout {
+                    elapsed: start.elapsed(),
+                });
+            }
+            if let Some(request) = self.client.find_redemption_by_tx(tx_hash).await? {
+                return Ok(request);
+            }
+        }
     }
 
     pub(crate) async fn send_for_redemption<Registry: IntoErrorRegistry>(
@@ -172,7 +228,7 @@ impl<W: Wallet> Tokenizer for AlpacaTokenizationService<W> {
         &self,
         id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, TokenizerError> {
-        Ok(self.client.poll_mint_until_complete(id).await?)
+        Ok(self.poll_request_until_terminal(id).await?)
     }
 
     async fn find_mint_by_issuer_request_id(
@@ -295,7 +351,7 @@ impl<W: Wallet> Tokenizer for AlpacaTokenizationService<W> {
         &self,
         tx_hash: &TxHash,
     ) -> Result<TokenizationRequest, TokenizerError> {
-        Ok(self.client.poll_for_redemption(tx_hash).await?)
+        Ok(self.poll_for_redemption_detection(tx_hash).await?)
     }
 
     async fn find_redemption_by_tx(
@@ -309,7 +365,7 @@ impl<W: Wallet> Tokenizer for AlpacaTokenizationService<W> {
         &self,
         id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, TokenizerError> {
-        Ok(self.client.poll_redemption_until_complete(id).await?)
+        Ok(self.poll_request_until_terminal(id).await?)
     }
 
     async fn verify_mint_tx(

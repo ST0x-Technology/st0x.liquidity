@@ -50,6 +50,8 @@ pub use alpaca_wallet::AlpacaWalletClient;
 pub use alpaca_wallet::{
     AlpacaTransferId, AlpacaWalletError, AlpacaWalletService, Network, PollingConfig, TokenSymbol,
     Transfer, TransferStatus, TravelRuleInfo, WhitelistEntry, WhitelistStatus,
+    immediate_error_polling_config, poll_deposit_by_tx_hash_with,
+    poll_transfer_until_complete_with,
 };
 
 pub use st0x_finance::{

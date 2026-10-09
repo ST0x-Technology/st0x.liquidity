@@ -7069,6 +7069,54 @@ enum Resolution {
 This would provide complete audit trail for all manual interventions and allow
 proper tracking of asset movements that required manual resolution.
 
+### Alpaca gateway operator client
+
+T0 operators call the account bound Alpaca gateway through
+`st0x-liquidity-client --env <staging|production> alpaca <verb>`. The
+environment is mandatory and selects only `T0_ALPACA_{STAGING,PROD}_*`; the
+client has no URL override, account identifier, Alpaca credential, secret file
+input, or fallback to the direct Broker API. Browser authentication uses the
+Desktop OAuth client for the selected T0 gateway environment, caches that sign
+in separately from the liquidity bot client, and sends the resulting Google ID
+token to the selected gateway load balancer.
+
+The `alpaca` group is a thin adapter over `st0x-alpaca-gateway-api`. Reads use
+the gateway read tier and mutations use its write tier. Each invocation sends
+one gateway operation, prints one compact JSON value on stdout, and sends
+diagnostics only to stderr. Mutation arguments include a nonblank audit reason
+and expose the gateway key that makes a safe retry possible. Errors retain the
+gateway classification for authentication, authorization, timeout, rate limit,
+unknown outcome, and same key retry decisions.
+
+The read surface is `account`, `cash`, `positions`, `position-mark`,
+`activities`, `market-status`, `latest-trade`, `quote`, `asset`, `order-status`,
+`order-find`, `deposit`, `transfer`, `transfers`, `find-deposit`,
+`conversion-status`, `conversion-find`, `tokenization-request`, `mint-status`,
+`redeem`, and `tokenization-requests`. `deposit` only returns the account bound
+deposit address. `redeem` only finds the Alpaca redemption created by a
+separately submitted chain transaction. Neither command signs or submits a chain
+transaction.
+
+The mutation surface is `buy`, `sell`, `cancel`, `withdraw`, `whitelist`,
+`whitelist-patch-travel-rule`, `unwhitelist`, `convert`, `journal`, and
+`tokenize`; `whitelist-list` is the corresponding read. Market and exact limit
+orders use caller visible client order IDs. Withdrawals, whitelist changes,
+journals, and tokenization requests use caller visible operation or issuer
+request IDs. `journal` accepts only a configured counterparty name, never an
+Alpaca account identifier. The gateway deployment supplies the bound Alpaca
+account, approved destinations, Travel Rule beneficiary, journal counterparties,
+and tokenization recipients.
+
+This surface replaces the direct Alpaca portion of the legacy `st0x-cli` verbs
+`buy`, `sell`, `cancel`, `order-status`, `alpaca-deposit`, `alpaca-withdraw`,
+`alpaca-whitelist`, `alpaca-whitelist-list`,
+`alpaca-whitelist-patch-travel-rule`, `alpaca-unwhitelist`, `alpaca-transfers`,
+`alpaca-convert`, `alpaca-journal`, `alpaca-tokenize`, `alpaca-redeem`, and
+`alpaca-tokenization-requests`. Bot recovery, CQRS decisions, retry loops,
+Raindex operations, and chain signing remain outside the client. In particular,
+the chain send performed by legacy `alpaca-deposit` and `alpaca-redeem` is not
+moved into the gateway client.
+
 ### Operator Recovery Surface
 
 The CLI exposes operator commands for recovering stuck or failed operations.

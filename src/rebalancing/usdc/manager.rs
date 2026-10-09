@@ -34,7 +34,8 @@ use st0x_execution::alpaca_broker_api::CryptoOrderResponse;
 use st0x_execution::{
     AlpacaAmount, AlpacaBrokerApiError, AlpacaTransferId, AlpacaWalletError, AlpacaWalletService,
     ClientOrderId, ConversionDirection, ConversionOrder, CryptoOrderOutcome, Network, Positive,
-    TokenSymbol, Transfer, TransferStatus,
+    TokenSymbol, Transfer, TransferStatus, immediate_error_polling_config,
+    poll_deposit_by_tx_hash_with, poll_transfer_until_complete_with,
 };
 use st0x_finance::{HasZero, Usd, Usdc};
 use st0x_float_macro::float;
@@ -3105,10 +3106,13 @@ impl<
         transfer_id: &AlpacaTransferId,
         initiated_at: DateTime<Utc>,
     ) -> Result<TxHash, UsdcTransferError> {
-        let transfer = match self
-            .alpaca_wallet
-            .poll_transfer_until_complete(transfer_id)
-            .await
+        let polling = immediate_error_polling_config();
+        let transfer = match poll_transfer_until_complete_with(
+            self.alpaca_wallet.as_ref(),
+            transfer_id,
+            &polling,
+        )
+        .await
         {
             Ok(transfer) => transfer,
             Err(error) => {
@@ -6551,40 +6555,44 @@ impl<
     ) -> Result<(), UsdcTransferError> {
         info!(target: "rebalance", %send_tx, "Polling Alpaca for deposit detection");
 
-        let transfer = match self.alpaca_wallet.poll_deposit_by_tx_hash(&send_tx).await {
-            Ok(transfer) => transfer,
-            Err(error) => {
-                // Classify BEFORE emitting FailDeposit (RAI-1494): a broker
-                // rate-limit (429) is not a determinate "deposit failed"
-                // signal, only a transient throttle on the polling request
-                // itself. Leave the aggregate in DepositInitiated so the
-                // job's backpressure reschedule can re-poll the same send_tx
-                // once the delay elapses, mirroring
-                // `poll_and_confirm_withdrawal`'s conservative fail-closed
-                // pattern for indeterminate poll errors.
-                if error.backpressure().is_some() {
-                    warn!(
-                        target: "rebalance",
-                        %error,
-                        "Alpaca deposit polling hit broker rate-limiting; keeping \
-                         DepositInitiated state for delayed reschedule (will re-poll \
-                         the same send_tx)"
-                    );
+        let polling = immediate_error_polling_config();
+        let transfer =
+            match poll_deposit_by_tx_hash_with(self.alpaca_wallet.as_ref(), &send_tx, &polling)
+                .await
+            {
+                Ok(transfer) => transfer,
+                Err(error) => {
+                    // Classify BEFORE emitting FailDeposit (RAI-1494): a broker
+                    // rate-limit (429) is not a determinate "deposit failed"
+                    // signal, only a transient throttle on the polling request
+                    // itself. Leave the aggregate in DepositInitiated so the
+                    // job's backpressure reschedule can re-poll the same send_tx
+                    // once the delay elapses, mirroring
+                    // `poll_and_confirm_withdrawal`'s conservative fail-closed
+                    // pattern for indeterminate poll errors.
+                    if error.backpressure().is_some() {
+                        warn!(
+                            target: "rebalance",
+                            %error,
+                            "Alpaca deposit polling hit broker rate-limiting; keeping \
+                             DepositInitiated state for delayed reschedule (will re-poll \
+                             the same send_tx)"
+                        );
+                        return Err(UsdcTransferError::AlpacaWallet(error));
+                    }
+
+                    warn!(target: "rebalance", "Alpaca deposit polling failed: {error}");
+                    self.cqrs
+                        .send(
+                            id,
+                            UsdcRebalanceCommand::FailDeposit {
+                                reason: format!("Deposit polling failed: {error}"),
+                            },
+                        )
+                        .await?;
                     return Err(UsdcTransferError::AlpacaWallet(error));
                 }
-
-                warn!(target: "rebalance", "Alpaca deposit polling failed: {error}");
-                self.cqrs
-                    .send(
-                        id,
-                        UsdcRebalanceCommand::FailDeposit {
-                            reason: format!("Deposit polling failed: {error}"),
-                        },
-                    )
-                    .await?;
-                return Err(UsdcTransferError::AlpacaWallet(error));
-            }
-        };
+            };
 
         if transfer.status != TransferStatus::Complete {
             let status = format!("{:?}", transfer.status);

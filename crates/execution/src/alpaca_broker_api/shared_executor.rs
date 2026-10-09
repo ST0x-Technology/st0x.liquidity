@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use std::fmt;
+use std::sync::Mutex;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -18,6 +19,69 @@ use crate::{
     Positive, PostCloseGap, RecoveredOrderPlacement, SupportedExecutor, Symbol, TryIntoExecutor,
     Usd, resolve_buy_preflight,
 };
+
+struct ImmediateConversionReadErrors<'a> {
+    inner: &'a shared::AlpacaBrokerApi,
+    read_error: Mutex<Option<shared::AlpacaBrokerApiError>>,
+}
+
+impl<'a> ImmediateConversionReadErrors<'a> {
+    fn new(inner: &'a shared::AlpacaBrokerApi) -> Self {
+        Self {
+            inner,
+            read_error: Mutex::new(None),
+        }
+    }
+
+    fn take_read_error(&self) -> Option<shared::AlpacaBrokerApiError> {
+        self.read_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
+impl shared::ConversionOrders for ImmediateConversionReadErrors<'_> {
+    async fn submit_conversion(
+        &self,
+        conversion: shared::ConversionOrder,
+        client_order_id: &shared::ClientOrderId,
+    ) -> Result<shared::CryptoOrderResponse, shared::AlpacaBrokerApiError> {
+        self.inner
+            .submit_conversion(conversion, client_order_id)
+            .await
+    }
+
+    async fn get_conversion_order(
+        &self,
+        order_id: Uuid,
+    ) -> Result<shared::CryptoOrderResponse, shared::AlpacaBrokerApiError> {
+        match self.inner.get_conversion_order(order_id).await {
+            Ok(order) => Ok(order),
+            Err(error) => {
+                *self
+                    .read_error
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+                Err(shared::AlpacaBrokerApiError::ConversionOrderNotFound { order_id })
+            }
+        }
+    }
+
+    async fn find_conversion_order(
+        &self,
+        client_order_id: &shared::ClientOrderId,
+    ) -> Result<Option<shared::CryptoOrderResponse>, shared::AlpacaBrokerApiError> {
+        self.inner.find_conversion_order(client_order_id).await
+    }
+
+    async fn cancel_order(
+        &self,
+        order_id: &str,
+    ) -> Result<shared::CancellationOutcome, shared::AlpacaBrokerApiError> {
+        self.inner.cancel_order(order_id).await
+    }
+}
 
 pub struct AlpacaBrokerApi {
     inner: shared::AlpacaBrokerApi,
@@ -526,7 +590,21 @@ impl AlpacaBrokerApi {
         &self,
         order_id: Uuid,
     ) -> Result<shared::CryptoOrderResponse, AlpacaBrokerApiError> {
-        Ok(self.inner.poll_conversion_to_terminal(order_id).await?)
+        // This service already gives transient read failures to the job scheduler,
+        // so preserve that ownership while reusing the shared deadline and cancel loop.
+        let orders = ImmediateConversionReadErrors::new(&self.inner);
+        let result = shared::poll_conversion_to_terminal_with(
+            &orders,
+            order_id,
+            shared::CONVERSION_POLL_INTERVAL,
+        )
+        .await;
+
+        if let Some(error) = orders.take_read_error() {
+            return Err(error.into());
+        }
+
+        Ok(result?)
     }
 
     pub async fn create_journal(

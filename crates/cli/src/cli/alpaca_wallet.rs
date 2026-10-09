@@ -10,7 +10,8 @@ use st0x_evm::{Evm, IERC20, IntoErrorRegistry, USDC_ETHEREUM, USDC_ETHEREUM_SEPO
 use st0x_execution::{
     AlpacaAccountId, AlpacaBrokerApi, AlpacaWalletService, ClientOrderId, ConversionOrder,
     Executor, FractionalShares, Network, Positive, Symbol, TokenSymbol, TransferStatus,
-    TravelRuleInfo, WhitelistEntry, WhitelistStatus,
+    TravelRuleInfo, WhitelistEntry, WhitelistStatus, immediate_error_polling_config,
+    poll_deposit_by_tx_hash_with, poll_transfer_until_complete_with,
 };
 use st0x_finance::{Usd, Usdc};
 use st0x_float_serde::format_float_with_fallback;
@@ -91,7 +92,8 @@ pub(super) async fn alpaca_deposit_command<Registry: IntoErrorRegistry, W: Write
     writeln!(stdout, "   Transaction hash: {tx_hash}")?;
     writeln!(stdout, "   Waiting for Alpaca to detect deposit...")?;
 
-    let transfer = alpaca_wallet.poll_deposit_by_tx_hash(&tx_hash).await?;
+    let polling = immediate_error_polling_config();
+    let transfer = poll_deposit_by_tx_hash_with(&alpaca_wallet, &tx_hash, &polling).await?;
 
     match transfer.status {
         TransferStatus::Complete => {
@@ -271,9 +273,9 @@ pub(super) async fn alpaca_withdraw_command<Registry: IntoErrorRegistry, W: Writ
     writeln!(stdout, "   Status: {:?}", transfer.status)?;
     writeln!(stdout, "   Waiting for withdrawal to complete...")?;
 
-    let final_transfer = alpaca_wallet
-        .poll_transfer_until_complete(&transfer.id)
-        .await?;
+    let polling = immediate_error_polling_config();
+    let final_transfer =
+        poll_transfer_until_complete_with(&alpaca_wallet, &transfer.id, &polling).await?;
 
     match final_transfer.status {
         TransferStatus::Complete => {

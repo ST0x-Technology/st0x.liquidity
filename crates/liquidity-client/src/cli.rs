@@ -44,6 +44,9 @@ pub(crate) enum Command {
     /// tier, the same IAP group as debug).
     #[command(subcommand)]
     Capital(Capital),
+    /// Direct account operations through the T0 Alpaca gateway.
+    #[command(subcommand)]
+    Alpaca(crate::alpaca::Command),
 }
 
 #[derive(Subcommand)]
@@ -646,7 +649,9 @@ mod tests {
             .chain(args.iter().copied());
         Cli::try_parse_from(full).map(|cli| match cli.command {
             Command::Debug(debug) => debug,
-            Command::Read(_) | Command::Capital(_) => panic!("expected a debug command"),
+            Command::Read(_) | Command::Capital(_) | Command::Alpaca(_) => {
+                panic!("expected a debug command")
+            }
         })
     }
 
@@ -969,7 +974,9 @@ mod tests {
             .chain(args.iter().copied());
         Cli::try_parse_from(full).map(|cli| match cli.command {
             Command::Capital(capital) => capital,
-            Command::Read(_) | Command::Debug(_) => panic!("expected a capital command"),
+            Command::Read(_) | Command::Debug(_) | Command::Alpaca(_) => {
+                panic!("expected a capital command")
+            }
         })
     }
 

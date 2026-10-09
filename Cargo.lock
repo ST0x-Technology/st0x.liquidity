@@ -7638,11 +7638,12 @@ dependencies = [
 [[package]]
 name = "st0x-alpaca"
 version = "0.2.1"
-source = "git+https://github.com/ST0x-Technology/st0x.alpaca?tag=v0.2.1#ba660046fa5aad3155bc49ccb334d1f0d6d8d2b6"
+source = "git+https://github.com/ST0x-Technology/st0x.alpaca?rev=0ca02fd33e4ba4ba3aa0fb86c1a59ed11b822c50#0ca02fd33e4ba4ba3aa0fb86c1a59ed11b822c50"
 dependencies = [
  "alloy",
  "alloy-primitives",
  "anyhow",
+ "async-trait",
  "backon",
  "base64 0.22.1",
  "bon",
@@ -7663,6 +7664,25 @@ dependencies = [
  "tracing",
  "url",
  "urlencoding",
+ "uuid",
+]
+
+[[package]]
+name = "st0x-alpaca-gateway-api"
+version = "0.1.0"
+source = "git+https://github.com/ST0x-Technology/st0x.alpaca?rev=0ca02fd33e4ba4ba3aa0fb86c1a59ed11b822c50#0ca02fd33e4ba4ba3aa0fb86c1a59ed11b822c50"
+dependencies = [
+ "alloy-primitives",
+ "chrono",
+ "rain-math-float",
+ "reqwest 0.13.5",
+ "serde",
+ "serde_json",
+ "st0x-alpaca",
+ "st0x-float-serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "url",
  "uuid",
 ]
 
@@ -8007,16 +8027,22 @@ dependencies = [
 name = "st0x-liquidity-client"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
  "anyhow",
  "base64 0.22.1",
+ "chrono",
  "clap",
+ "httpmock",
  "rand 0.8.6",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "serial_test",
  "sha2 0.10.9",
+ "st0x-alpaca",
+ "st0x-alpaca-gateway-api",
  "temp-env",
+ "thiserror 2.0.18",
  "tokio",
  "url",
  "uuid",
