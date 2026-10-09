@@ -27,6 +27,14 @@ The Liquidity bot board and its four tab boards are generated: edit
 Do not edit those files by hand or replace them with a Grafana export; the next
 run of the generator overwrites them.
 
+The liquidity boards read `liq_*` from one source at a time, picked by the
+`Source` variable: the exporter sidecar (`job="t0-liquidity-exporter"`, the
+default) or the bot's own `/metrics` (`t0-liquidity` in production,
+`t0-liquidity-staging` in staging). The generator writes `job=~"$source"` into
+every `liq_` selector and fails on one without it, because an unpinned selector
+adds both sources together. Stage 4 of the migration makes `bot` the default
+(`SOURCE_VAR` in the generator). See `docs/observability.md`, "Board source".
+
 `alerting/liquidity.rules.yml` is the alert rules, in the `Alerts` folder. Each
 rule's `uid` is permanent and must be unique across every repo's file. Removing
 a rule from the file does not remove it from Grafana: add its `uid` to

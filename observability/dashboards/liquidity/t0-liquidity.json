@@ -44,6 +44,33 @@
             "value": "t0-liquidity-staging"
           }
         ]
+      },
+      {
+        "name": "source",
+        "type": "custom",
+        "label": "Source",
+        "description": "Which process serves the liq_* metrics: the exporter sidecar (the default for now) or the bot's own /metrics. Pick bot to compare the two.",
+        "query": "exporter : t0-liquidity-exporter, bot : t0-liquidity|t0-liquidity-staging",
+        "includeAll": false,
+        "multi": false,
+        "hide": 0,
+        "current": {
+          "selected": true,
+          "text": "exporter",
+          "value": "t0-liquidity-exporter"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "exporter",
+            "value": "t0-liquidity-exporter"
+          },
+          {
+            "selected": false,
+            "text": "bot",
+            "value": "t0-liquidity|t0-liquidity-staging"
+          }
+        ]
       }
     ]
   },
@@ -127,7 +154,7 @@
       "id": 1,
       "type": "stat",
       "title": "",
-      "description": "The SPA header's connection light: is the bot process up and answering /health? '\u2014' means the exporter itself is not reporting.",
+      "description": "The SPA header's connection light: is the bot process up and answering? The exporter source reads liq_up, which is 0 when the exporter cannot reach the bot's /health. The bot never emits liq_up, so the bot source reads the scrape's own up. '\u2014' means the source is not reporting.",
       "datasource": {
         "type": "stackdriver",
         "uid": "cloudmon"
@@ -142,7 +169,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_up{job=\"t0-liquidity-exporter\"})",
+            "expr": "max(liq_up{job=~\"$source\"}) or max(up{job=~\"$source\",job!=\"t0-liquidity-exporter\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -244,7 +271,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max by (git_commit) (topk(1, label_replace(timestamp(liq_bot_info{job=\"t0-liquidity-exporter\"}), \"git_commit\", \"$1\", \"git_commit\", \"(.{7}).*\")))",
+            "expr": "max by (git_commit) (topk(1, label_replace(timestamp(liq_bot_info{job=~\"$source\"}), \"git_commit\", \"$1\", \"git_commit\", \"(.{7}).*\")))",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -331,7 +358,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "time() - max(liq_bot_start_timestamp_seconds{job=\"t0-liquidity-exporter\"})",
+            "expr": "time() - max(liq_bot_start_timestamp_seconds{job=~\"$source\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -419,7 +446,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "sum by (broker) (liq_settings_info{job=\"t0-liquidity-exporter\"})",
+            "expr": "sum by (broker) (liq_settings_info{job=~\"$source\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -506,7 +533,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_settings_equity_target{job=\"t0-liquidity-exporter\"})",
+            "expr": "max(liq_settings_equity_target{job=~\"$source\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -594,7 +621,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_settings_usdc_target{job=\"t0-liquidity-exporter\"})",
+            "expr": "max(liq_settings_usdc_target{job=~\"$source\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -682,7 +709,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_settings_execution_threshold_usd{job=\"t0-liquidity-exporter\"})",
+            "expr": "max(liq_settings_execution_threshold_usd{job=~\"$source\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -770,7 +797,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "sum by (row, col) (label_replace(label_replace(liq_usdc_onchain_available{job=\"t0-liquidity-exporter\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Raindex\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_inflight_total{job=\"t0-liquidity-exporter\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Inflight\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_alpaca_total{job=\"t0-liquidity-exporter\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Alpaca Total\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_total{job=\"t0-liquidity-exporter\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Total\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_ratio{job=\"t0-liquidity-exporter\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Ratio\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_ratio_deviation{job=\"t0-liquidity-exporter\"} and liq_usdc_total{job=\"t0-liquidity-exporter\"} > 0, \"row\", \"USDC\", \"\", \"\"), \"col\", \"\u0394\", \"\", \"\"))",
+            "expr": "sum by (row, col) (label_replace(label_replace(liq_usdc_onchain_available{job=~\"$source\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Raindex\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_inflight_total{job=~\"$source\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Inflight\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_alpaca_total{job=~\"$source\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Alpaca Total\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_total{job=~\"$source\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Total\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_ratio{job=~\"$source\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Ratio\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_ratio_deviation{job=~\"$source\"} and liq_usdc_total{job=~\"$source\"} > 0, \"row\", \"USDC\", \"\", \"\"), \"col\", \"\u0394\", \"\", \"\"))",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1084,7 +1111,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "sum by (row, col) (label_replace(label_replace(liq_usdc_alpaca_usdc{job=\"t0-liquidity-exporter\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"USDC\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_rebalanceable{job=\"t0-liquidity-exporter\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Rebalanceable\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_alpaca_total{job=\"t0-liquidity-exporter\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Counter-tradeable\", \"\", \"\"))",
+            "expr": "sum by (row, col) (label_replace(label_replace(liq_usdc_alpaca_usdc{job=~\"$source\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"USDC\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_rebalanceable{job=~\"$source\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Rebalanceable\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_alpaca_total{job=~\"$source\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Counter-tradeable\", \"\", \"\"))",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1267,7 +1294,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "sum by (row, col) (label_replace(label_replace(liq_usdc_inflight_ethereum_wallet{job=\"t0-liquidity-exporter\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Eth\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_inflight_base_wallet{job=\"t0-liquidity-exporter\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Base\", \"\", \"\"))",
+            "expr": "sum by (row, col) (label_replace(label_replace(liq_usdc_inflight_ethereum_wallet{job=~\"$source\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Eth\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_inflight_base_wallet{job=~\"$source\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Base\", \"\", \"\"))",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1429,7 +1456,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "sum by (symbol, col) (label_replace(liq_asset_counter_trading{job=\"t0-liquidity-exporter\"}, \"col\", \"CT\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_asset_rebalancing{job=\"t0-liquidity-exporter\"}, \"col\", \"Rebal\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_asset_extended_hours{job=\"t0-liquidity-exporter\"}, \"col\", \"Ext\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_onchain_available{job=\"t0-liquidity-exporter\"}, \"col\", \"Raindex\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_inflight_total{job=\"t0-liquidity-exporter\"}, \"col\", \"Inflight\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_offchain_available{job=\"t0-liquidity-exporter\"}, \"col\", \"Alpaca\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_total{job=\"t0-liquidity-exporter\"}, \"col\", \"Total\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_ratio{job=\"t0-liquidity-exporter\"}, \"col\", \"Ratio\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_ratio_deviation{job=\"t0-liquidity-exporter\"} and liq_equity_total{job=\"t0-liquidity-exporter\"} > 0, \"col\", \"\u0394\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_exposure_usd{job=\"t0-liquidity-exporter\"} or (liq_equity_total{job=\"t0-liquidity-exporter\"} * NaN), \"col\", \"Exposure\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_unwrapped{job=\"t0-liquidity-exporter\"}, \"col\", \"Unwrapped\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_wrapped{job=\"t0-liquidity-exporter\"}, \"col\", \"Wrapped\", \"\", \"\"))",
+            "expr": "sum by (symbol, col) (label_replace(liq_asset_counter_trading{job=~\"$source\"}, \"col\", \"CT\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_asset_rebalancing{job=~\"$source\"}, \"col\", \"Rebal\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_asset_extended_hours{job=~\"$source\"}, \"col\", \"Ext\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_onchain_available{job=~\"$source\"}, \"col\", \"Raindex\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_inflight_total{job=~\"$source\"}, \"col\", \"Inflight\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_offchain_available{job=~\"$source\"}, \"col\", \"Alpaca\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_total{job=~\"$source\"}, \"col\", \"Total\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_ratio{job=~\"$source\"}, \"col\", \"Ratio\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_ratio_deviation{job=~\"$source\"} and liq_equity_total{job=~\"$source\"} > 0, \"col\", \"\u0394\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_exposure_usd{job=~\"$source\"} or (liq_equity_total{job=~\"$source\"} * NaN), \"col\", \"Exposure\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_unwrapped{job=~\"$source\"}, \"col\", \"Unwrapped\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_wrapped{job=~\"$source\"}, \"col\", \"Wrapped\", \"\", \"\"))",
             "step": "60s"
           },
           "timeSeriesList": {
