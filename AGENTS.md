@@ -247,18 +247,19 @@ Only use `cargo build` when you actually need the build artifacts (e.g., final
 verification before a release, or when the user explicitly asks to run the
 binary).
 
-- `cargo run --bin server` - Run the main arbitrage bot
-- `cargo run -p st0x-cli -- buy -s AAPL -q 1` - Submit a manual buy order via
-  the configured broker
-- `cargo run -p st0x-cli` - Run the command-line interface for manual operations
+- `cargo run --bin server` - Start the server
+- `cargo run -p st0x-cli -- buy -s AAPL -q 1` - Buy one AAPL share through the
+  broker
+- `cargo run -p st0x-cli` - Start the operator CLI
 
 ### Testing
 
-- `cargo nextest run --workspace --all-features` - Run all tests
-- `cargo nextest run --workspace --all-features --lib` - Run library tests only
-- `cargo nextest run --workspace --all-features -E 'package(st0x-hedge)'` - Run
-  one crate's tests only
-- `cargo nextest run --workspace --all-features <test_name>` - Run specific test
+- `cargo nextest run --workspace --all-features` - All tests
+- `cargo nextest run --workspace --all-features --lib` - Library tests
+- `cargo nextest run --workspace --all-features -E 'package(st0x-hedge)'` - One
+  crate's tests
+- `cargo nextest run --workspace --all-features -E 'package(<crate>) & test(<test_name>)'` -
+  One test in one crate
 
 ### Database Management
 
