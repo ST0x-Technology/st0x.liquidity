@@ -3824,8 +3824,8 @@ impl RebalancingService {
             }
         };
 
-        // The recovery reset below drops the active mints/redemptions and
-        // inflight state that the reconcile arms revalidate, so a forced
+        // The recovery reset below drops inflight state that the reconcile
+        // arms revalidate, so a forced
         // retry would pass vacuously against empty state. Drop the event
         // instead: the poller's read-back keeps the gate and counter, and
         // the next quiet poll re-escalates with a fresh reading.
@@ -3915,7 +3915,8 @@ impl RebalancingService {
         // path below skips gated symbols, a wiped gated balance would have
         // no writer left to restore it. A provider inflight event also keeps
         // the inflight the other provider events own, since only it is
-        // reapplied below.
+        // reapplied below. Active mints and redemptions survive too, with
+        // each active mint's Hedging balance: their aggregates own them.
         *inventory = match &event {
             InflightEquity { .. } => {
                 inventory.reset_carrying_other_provider_inflight(Chain::Base, now)
@@ -5508,8 +5509,10 @@ impl RebalancingService {
     }
 
     /// Hedging inflight holds only mint shares, and a symbol has one mint at a
-    /// time, so a residual after its terminal event is this mint counted twice
-    /// (a Base snapshot-error reset). Zero it and force an offchain reconcile.
+    /// time, so a residual after its terminal event is this mint counted twice.
+    /// The poll skips an active mint's symbol and a snapshot-error reset keeps
+    /// the active mint and its Hedging balance, so this is a guard: zero the
+    /// residual and force an offchain reconcile.
     async fn clear_residual_hedging_inflight(
         &self,
         id: &IssuerRequestId,
@@ -17390,8 +17393,8 @@ mod tests {
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = issuer_request_id("failed-mint-with-residual-inflight");
 
-        // A poll applied while the symbol has no active mint stands in for the
-        // Base snapshot-error reset: either way `MintAccepted` counts the
+        // A poll applied while the symbol has no active mint plants the
+        // residual the terminal guard exists for: `MintAccepted` counts the
         // request a second time.
         apply_and_dispatch_snapshot(
             reactor.clone(),
@@ -17440,7 +17443,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inflight_snapshot_reset_during_mint_fails_start_on_the_dropped_broker_balance() {
+    async fn inflight_snapshot_reset_during_mint_keeps_the_broker_balance_it_debits() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory =
             InventoryView::default().with_equity(symbol.clone(), shares(20), shares(80));
@@ -17454,8 +17457,8 @@ mod tests {
             .await
             .unwrap();
 
-        // The reset drops `active_mints` and the broker balance, and the
-        // re-applied poll's inflight keeps broker snapshots off the symbol.
+        // The reset keeps the active mint and its broker balance, so the
+        // re-applied poll leaves the symbol to the mint.
         trigger
             .on_snapshot_recovery(
                 RebalancingServiceError::Inventory(InventoryViewError::Equity(
@@ -17473,20 +17476,11 @@ mod tests {
             .await
             .unwrap();
 
-        let accepted = harness
-            .receive::<TokenizedEquityMint>(id.clone(), make_mint_accepted())
-            .await;
-        assert!(
-            matches!(
-                accepted,
-                Err(RebalancingServiceError::Inventory(InventoryViewError::Equity(
-                    InventoryError::InsufficientAvailable { requested, available },
-                ))) if requested == shares(30) && available == shares(0)
-            ),
-            "MintAccepted must fail to start against the dropped broker balance, got {accepted:?}"
-        );
-
-        for event in [make_tokens_received(), make_deposited_into_raindex()] {
+        for event in [
+            make_mint_accepted(),
+            make_tokens_received(),
+            make_deposited_into_raindex(),
+        ] {
             harness
                 .receive::<TokenizedEquityMint>(id.clone(), event)
                 .await
@@ -17497,12 +17491,12 @@ mod tests {
         assert_eq!(
             inventory.equity_inflight(&symbol, Venue::Hedging),
             Some(shares(0)),
-            "TokensReceived must release the poll's Hedging inflight"
+            "TokensReceived must release the mint's Hedging inflight"
         );
         assert_eq!(
             inventory.equity_available(&symbol, Venue::Hedging),
-            Some(shares(0)),
-            "Hedging available stays at the reset's zero until a broker snapshot lands"
+            Some(shares(50)),
+            "MintAccepted must debit the broker balance the reset kept"
         );
         drop(inventory);
         assert_eq!(
@@ -17513,7 +17507,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inflight_snapshot_reset_during_hedged_mint_clears_the_double_count() {
+    async fn inflight_snapshot_reset_during_hedged_mint_counts_the_request_once() {
         let symbol = Symbol::new("AAPL").unwrap();
         let mut inventory =
             InventoryView::default().with_equity(symbol.clone(), shares(20), shares(80));
@@ -17529,8 +17523,8 @@ mod tests {
             .await
             .unwrap();
 
-        // An open hedge order keeps the broker balance across the reset, so
-        // the re-applied poll and `MintAccepted` both count the request.
+        // The reset keeps the active mint, so the re-applied poll does not
+        // count the request on top of `MintAccepted`.
         trigger
             .on_snapshot_recovery(
                 RebalancingServiceError::Inventory(InventoryViewError::Equity(
@@ -17553,6 +17547,16 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(30)),
+            "MintAccepted must count the request once"
+        );
+
         for event in [make_tokens_received(), make_deposited_into_raindex()] {
             harness
                 .receive::<TokenizedEquityMint>(id.clone(), event)
@@ -17564,7 +17568,7 @@ mod tests {
         assert_eq!(
             inventory.equity_inflight(&symbol, Venue::Hedging),
             Some(shares(0)),
-            "The terminal mint must zero the double-counted Hedging inflight"
+            "TokensReceived must release the mint's Hedging inflight"
         );
         assert_eq!(
             inventory.equity_available(&symbol, Venue::Hedging),
@@ -17574,8 +17578,83 @@ mod tests {
         drop(inventory);
         assert_eq!(
             trigger.divergence_gate.pending_offchain_equity_reconciles(),
-            vec![symbol.clone()],
-            "Clearing the double count must force the next broker snapshot through"
+            Vec::<Symbol>::new(),
+            "Without a double count there is no residual to reconcile"
+        );
+    }
+
+    #[tokio::test]
+    async fn inflight_snapshot_reset_after_mint_accepted_keeps_the_mint_inflight() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mut inventory =
+            InventoryView::default().with_equity(symbol.clone(), shares(20), shares(80));
+        inventory
+            .set_pending_offchain_orders(HashMap::from([(symbol.clone(), OffchainOrderId::new())]));
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = issuer_request_id("accepted-mint-across-inflight-reset");
+
+        for event in [
+            make_mint_requested(&symbol, float!(30)),
+            make_mint_accepted(),
+        ] {
+            harness
+                .receive::<TokenizedEquityMint>(id.clone(), event)
+                .await
+                .unwrap();
+        }
+
+        // The open hedge order alone would carry only the broker available;
+        // the active mint keeps its Hedging inflight too.
+        trigger
+            .on_snapshot_recovery(
+                RebalancingServiceError::Inventory(InventoryViewError::Equity(
+                    InventoryError::NegativeInflight {
+                        value: FractionalShares::new(float!(-1)),
+                    },
+                )),
+                InventorySnapshotEvent::InflightEquity {
+                    mints: BTreeMap::new(),
+                    redemptions: BTreeMap::new(),
+                    fetched_at: Utc::now(),
+                    base_redemptions_chain_scoped: true,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(30)),
+            "The reset must keep the active mint's Hedging inflight"
+        );
+
+        harness
+            .receive::<TokenizedEquityMint>(id.clone(), make_tokens_received())
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(0)),
+            "TokensReceived must release the mint's Hedging inflight"
+        );
+        assert_eq!(
+            inventory.onchain_equity_available_at(&symbol, Chain::Base),
+            Some(shares(30)),
+            "TokensReceived must credit the minted shares to MarketMaking"
+        );
+        drop(inventory);
+        assert_eq!(
+            trigger.divergence_gate.pending_offchain_equity_reconciles(),
+            Vec::<Symbol>::new(),
+            "A settled mint must not defer to a forced reconcile"
         );
     }
 

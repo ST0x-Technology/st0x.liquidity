@@ -779,14 +779,14 @@ pub(crate) struct InventoryView {
     /// deposits into.
     ///
     /// Populated when a non-terminal mint event is processed, cleared on
-    /// terminal mint events.
+    /// terminal mint events. Kept across snapshot-error resets.
     #[serde(default)]
     active_mints: HashMap<Symbol, ActiveEquityTransfer<IssuerRequestId>>,
     /// In-flight equity redemptions, keyed by symbol, with the chain each
     /// redemption withdraws from.
     ///
     /// Populated when a non-terminal redemption event is processed, cleared
-    /// on terminal redemption events.
+    /// on terminal redemption events. Kept across snapshot-error resets.
     #[serde(default)]
     active_redemptions: HashMap<Symbol, ActiveEquityTransfer<RedemptionAggregateId>>,
     /// Equity tokens observed at intermediate wallet locations between
@@ -2155,8 +2155,8 @@ impl InventoryView {
         corrections
     }
 
-    /// A fresh default view retaining stranded redemption exposure and the
-    /// offchain-order guard state
+    /// A fresh default view retaining stranded redemption exposure, the
+    /// active mints and redemptions, the offchain-order guard state
     /// (pending orders and applied-fill times) and, for each gated symbol,
     /// the Hedging available balance that state guards.
     ///
@@ -2174,7 +2174,13 @@ impl InventoryView {
     /// watermarks, so a delayed older fill or read cannot be counted again on
     /// top of the kept balance; other onchain venues are left
     /// uninitialized (they are not delta-owned and nothing blocks their
-    /// repopulation). Every other field is intentionally
+    /// repopulation). The active mints and redemptions come from their
+    /// aggregates' events, not from snapshots, so they survive like the guard
+    /// state. An active mint is the only writer of its symbol's Hedging
+    /// inflight and debits Hedging available on `MintAccepted`, so that
+    /// symbol keeps its whole Hedging balance and watermark: no poll restores
+    /// the inflight, and a dropped balance would fail the mint's own `Start`.
+    /// Every other field is intentionally
     /// defaulted, which is why this uses functional-update syntax rather than
     /// an exhaustive literal: a future field should default here unless it is
     /// guard state.
@@ -2262,8 +2268,23 @@ impl InventoryView {
             }
         }
 
+        for symbol in self.active_mints.keys() {
+            if let Some(balance) = self
+                .equities
+                .get(symbol)
+                .and_then(|inventory| inventory.offchain)
+            {
+                equities.entry(symbol.clone()).or_default().offchain = Some(balance);
+            }
+            if let Some(watermark) = self.offchain_equity_snapshot_watermarks.get(symbol) {
+                offchain_equity_snapshot_watermarks.insert(symbol.clone(), *watermark);
+            }
+        }
+
         Self {
             equities,
+            active_mints: self.active_mints.clone(),
+            active_redemptions: self.active_redemptions.clone(),
             startup_stranded_redemptions: self.startup_stranded_redemptions.clone(),
             previous_inflight_redemptions,
             onchain_equity_snapshot_watermarks,
