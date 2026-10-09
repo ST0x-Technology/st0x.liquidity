@@ -251,6 +251,7 @@ async fn setup_apalis_queues(
     apalis_pool: &apalis_sqlite::SqlitePool,
     event_sender: broadcast::Sender<Statement>,
     chains: &st0x_config::ChainRegistry,
+    equity_prices: EquityPriceStore,
 ) -> anyhow::Result<(
     DexTradeAccountingJobQueue,
     BackfillQueues,
@@ -273,7 +274,7 @@ async fn setup_apalis_queues(
     Ok((
         DexTradeAccountingJobQueue::new(apalis_pool),
         BackfillQueues::new(apalis_pool, chains),
-        DashboardTradeDelivery::new(apalis_pool, pool, event_sender),
+        DashboardTradeDelivery::new(apalis_pool, pool, event_sender, equity_prices),
         RebalancingSchedulers::new(apalis_pool),
     ))
 }
@@ -1110,8 +1111,14 @@ impl Conductor {
         // serializes its broker submission against live hedging (ADR 0014).
         let counter_trade_submission_lock = Arc::new(Mutex::new(()));
 
-        let (job_queue, backfill_queues, dashboard_delivery, schedulers) =
-            setup_apalis_queues(&pool, &apalis_pool, event_sender, &ctx.chains).await?;
+        let (job_queue, backfill_queues, dashboard_delivery, schedulers) = setup_apalis_queues(
+            &pool,
+            &apalis_pool,
+            event_sender,
+            &ctx.chains,
+            equity_prices.clone(),
+        )
+        .await?;
 
         let onchain_trade =
             setup_onchain_trade_store(&pool, dashboard_delivery.broadcaster.clone()).await?;
@@ -9166,7 +9173,8 @@ mod tests {
         Arc<DashboardTradeDeliveryCtx>,
     ) {
         let (sender, receiver) = broadcast::channel(16);
-        let delivery = DashboardTradeDelivery::new(apalis_pool, pool, sender);
+        let delivery =
+            DashboardTradeDelivery::new(apalis_pool, pool, sender, EquityPriceStore::new([]));
         (delivery.broadcaster, receiver, delivery.queue, delivery.ctx)
     }
 

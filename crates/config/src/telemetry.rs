@@ -554,7 +554,7 @@ fn mk_crate_filter(level: tracing::Level) -> EnvFilter {
     /// level. Keep in sync with
     /// `grep -rhoE 'target: "[a-z_]+"' src/ crates/` (plus `cqrs` from the
     /// external st0x-event-sorcery crate).
-    const DOMAIN_TARGETS: [&str; 19] = [
+    const DOMAIN_TARGETS: [&str; 22] = [
         "backfill",
         "bridge",
         "broker",
@@ -565,6 +565,9 @@ fn mk_crate_filter(level: tracing::Level) -> EnvFilter {
         "gas",
         "hedge",
         "inventory",
+        "liq_event",
+        "liq_trade",
+        "liq_transfer",
         "market_data",
         "operational_alert",
         "orderbook",
@@ -619,6 +622,9 @@ mod tests {
             "gas",
             "hedge",
             "inventory",
+            "liq_event",
+            "liq_trade",
+            "liq_transfer",
             "market_data",
             "orderbook",
             "rebalance",

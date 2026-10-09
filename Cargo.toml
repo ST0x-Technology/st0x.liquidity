@@ -142,16 +142,19 @@ uuid = { version = "1.11", features = ["serde", "v4", "v5"] }
 # newer crates require >=0.2.122).
 wasm-bindgen = "=0.2.122"
 
+# TEMPORARY: pinned to the unreleased event-sorcery branch that adds
+# `Reactor::react_committed`. Switch both pins back to the release tag that
+# ships it before this merges.
 [workspace.dependencies.st0x-event-sorcery]
 git = "https://github.com/ST0x-Technology/event-sorcery.git"
-tag = "v0.3.1"
+rev = "915875fdfd20229f19fe51dc0c6c8be31a3a613d"
 package = "event-sorcery"
 
-# Same repository and tag as st0x-event-sorcery: tests compare this crate's
+# Same repository and revision as st0x-event-sorcery: tests compare this crate's
 # event store schema against the one sqlite-es's migrations create.
 [workspace.dependencies.sqlite-es]
 git = "https://github.com/ST0x-Technology/event-sorcery.git"
-tag = "v0.3.1"
+rev = "915875fdfd20229f19fe51dc0c6c8be31a3a613d"
 
 [patch."https://github.com/rainlanguage/rain.math.float"]
 # Keep this path checkout at st0x-finance v0.3.0's pinned revision:
