@@ -17808,6 +17808,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restored_accepted_mint_failure_reconciles_instead_of_crediting_restored_inflight() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory =
+            InventoryView::default().with_equity(symbol.clone(), shares(20), shares(10));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let id = issuer_request_id("restored-accepted-mint");
+
+        // The prior process persisted MintAccepted but its `Start` may never
+        // have debited available, so the restart cannot treat the restored
+        // inflight as the mint's own.
+        trigger
+            .recover_mint_state(
+                &id,
+                &TokenizedEquityMint::MintAccepted {
+                    chain: Chain::Base,
+                    symbol: symbol.clone(),
+                    quantity: float!(10),
+                    wallet: Address::ZERO,
+                    issuer_request_id: id.clone(),
+                    tokenization_request_id: tokenization_request_id("TOK-RESTORED"),
+                    requested_at: Utc::now(),
+                    accepted_at: Utc::now(),
+                    authorization: crate::tokenized_equity_mint::MintAuthorizationProgress::default(
+                    ),
+                },
+            )
+            .await
+            .unwrap();
+
+        trigger
+            .on_mint(id, make_mint_acceptance_failed())
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(0)),
+            "The failed mint must zero its restored Hedging inflight"
+        );
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::Hedging),
+            Some(shares(10)),
+            "A restored mint must not credit inflight its unknown `Start` may never have debited"
+        );
+        drop(inventory);
+        assert_eq!(
+            trigger.divergence_gate.pending_offchain_equity_reconciles(),
+            vec![symbol.clone()],
+            "Zeroing the restored inflight must force the next broker snapshot through"
+        );
+    }
+
+    #[tokio::test]
     async fn mint_acceptance_failed_via_reactor_restores_imbalance() {
         let symbol = Symbol::new("AAPL").unwrap();
         // 20 onchain, 80 offchain = imbalanced
