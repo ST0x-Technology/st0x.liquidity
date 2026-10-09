@@ -6283,6 +6283,12 @@ transfer dispatch. It does not calculate cross-venue inventory imbalances.
   `MintAccepted`, reconciles the started inflight back to Alpaca available. When
   emitted by an operator force-fail from `MintRequested` (pre-acceptance), no
   inflight was ever started, so there is no balance change
+- Every terminal mint event (`DepositedIntoRaindex`, `MintRejected`,
+  `MintAcceptanceFailed`, `RaindexDepositFailed`, `WrappingFailed`,
+  `OperatorReconciled`) also zeroes any Hedging inflight still left on the
+  symbol and forces an offchain equity reconcile. Hedging inflight holds only
+  mint shares, and a symbol has one mint at a time, so a residual there is the
+  finished mint counted twice (e.g. after a Base snapshot-error reset)
 - `EquityRedemptionEvent::WithdrawnFromRaindex` - Moves tokens to inflight
   (leaving Raindex vault)
 - `EquityRedemptionEvent::TokensUnwrapped` - Exact-match unwraps, including
@@ -6378,6 +6384,10 @@ transfer dispatch. It does not calculate cross-venue inventory imbalances.
 - `InventorySnapshotEvent::InflightEquity` - Bot-owned pending tokenization
   requests polled from Alpaca; sets inflight at Hedging for mints on every chain
   and at Base's MarketMaking slot for Base redemptions only
+  - **Active mints**: from `MintRequested` until its terminal event, a mint owns
+    its symbol's Hedging inflight, so the poll neither sets nor zeroes that
+    inflight. The poll still records the symbol, so recovering another chain's
+    failed provider snapshot carries its broker balance
   - **Ownership**: determined by active rebalancing aggregate IDs --
     `issuer_request_id` / `tokenization_request_id` for mints,
     `tokenization_request_id` / `redemption_tx` for redemptions -- not by
