@@ -1,0 +1,46 @@
+{
+  "equityTarget": 0.5,
+  "equityDeviation": 0.2,
+  "usdcTarget": 0.4,
+  "usdcDeviation": null,
+  "cashReserved": "1000.25",
+  "executionThreshold": "$2.5",
+  "assets": [
+    {
+      "symbol": "tAAPL",
+      "counterTrading": { "status": "enabled", "extendedHours": true },
+      "rebalancing": true,
+      "operationalLimit": null
+    },
+    {
+      "symbol": "wtTSLA",
+      "counterTrading": { "status": "enabled", "extendedHours": false },
+      "rebalancing": false,
+      "operationalLimit": "100"
+    },
+    {
+      "symbol": "tSPYM",
+      "counterTrading": { "status": "disabled" },
+      "rebalancing": true,
+      "operationalLimit": null
+    },
+    {
+      "symbol": "RKLB",
+      "counterTrading": { "status": "enabled", "extendedHours": false },
+      "rebalancing": false,
+      "operationalLimit": null
+    }
+  ],
+  "wallet": {
+    "kind": "turnkey",
+    "address": "0x0000000000000000000000000000000000000001",
+    "organizationId": "00000000-0000-0000-0000-000000000001"
+  },
+  "logLevel": "Debug",
+  "serverPort": 8080,
+  "orderbook": "0x0000000000000000000000000000000000000002",
+  "deploymentBlock": 12345678,
+  "broker": "alpaca",
+  "orderPollingInterval": 5,
+  "inventoryPollInterval": 15
+}

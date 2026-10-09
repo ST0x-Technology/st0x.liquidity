@@ -1715,6 +1715,61 @@ each with its own current lag and its own cycle, error and skipped-tick counts:
 two chains never merge into one series, even when their orderbooks share an
 address.
 
+### Prometheus metrics (`liq_*` contract)
+
+`/metrics` serves two kinds of series. The `metrics` recorder renders the bot's
+native operational metrics (`hedge_*`, `registry_*` and others). After them, the
+bot renders the `liq_*` contract: the series that external consumers (the
+capital probe, the shareholder TVL report and the liquidity board) read. The
+contract was first published by an exporter sidecar that polled the bot's API.
+The bot now publishes the same names itself, so those consumers can stop
+depending on the sidecar.
+
+- **Same meaning as the exporter.** Each ported name keeps the exporter's
+  labels, label values, units and sentinels, including the `wt`/`t` prefix rule
+  for `symbol` labels (a prefix is removed only before an uppercase letter). A
+  defect in an existing name is never fixed in place: the fix gets a new name,
+  and consumers move to it explicitly.
+- **Families replace as one unit.** Each source of `liq_*` series (health,
+  settings, and later inventory, prices, performance, orders and P&L windows) is
+  one family. A refresh replaces every sample of its family, so a symbol, chain
+  or day that leaves the source leaves `/metrics` on the next scrape instead of
+  keeping its last value. A family whose refresh fails keeps its last published
+  samples.
+- **One writer per name.** Every `liq_*` name belongs to exactly one family, and
+  no `liq_*` name goes through the `metrics` macros. If the recorder ever
+  renders a `liq_` name, the contract skips its own block for that name and logs
+  an error, so the body stays valid.
+- **Freshness.** `liq_collector_last_success_ts_seconds{collector}` gives the
+  Unix time each family was last published, with `collector` from a closed set
+  (`health`, `settings`, ...).
+- **Typed gauges.** Every `liq_*` block carries a `# HELP` line and a
+  `# TYPE <name> gauge` line. Every name is a gauge: snapshots, rolling `_24h`
+  windows, `*_total` names that mean a count now, and precomputed quantile
+  values. The exporter's series are untyped, so Managed Prometheus keeps them
+  apart from the bot's: a query by name with no `job` selector has a gap at the
+  cutover, and while both run, one name exists under both jobs. Consumers select
+  by `job`, so nothing counts twice. Label values escape backslash, double quote
+  and newline.
+- **Values.** Every value is a finite `f64`. Builders compute in exact types and
+  convert once at the end; a value that does not convert is absent and logged,
+  never replaced by a default. Integer settings beyond 2^53 are absent rather
+  than rounded.
+
+Settings and build identity are published once at boot: `liq_bot_info`
+(`git_commit`, first 12 characters), `liq_bot_start_timestamp_seconds` (process
+start, captured before the config loads; `/health` uptime counts from the same
+instant), `liq_settings_*` and `liq_asset_*` for every symbol the primary chain
+lists. An optional setting that is not configured has no series.
+`liq_asset_extended_hours` is absent while counter trading is disabled.
+`liq_settings_info{trading_mode}` is always empty, as it was in the exporter.
+
+**Exception to financial-integrity rules.** Some ported series reproduce the
+exporter's published sentinels: a ratio with a zero denominator is published as
+0, and a missing balance component counts as 0. These follow the exporter's
+published meaning so that existing consumers read the same numbers. They are for
+observation only and never feed a trading or rebalancing decision.
+
 ### Portfolio Capital and Return Tracking
 
 The `/pnl` report's realized-PnL figures say nothing about the capital deployed

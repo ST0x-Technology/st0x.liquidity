@@ -356,6 +356,12 @@ async fn run_bot_session_inner(
     let health = startup::HealthGate::default();
     let detached_tasks = TaskTracker::new();
     let (reload_sender, reload_receiver) = tokio::sync::mpsc::channel(1);
+    metrics::liquidity::settings::publish_boot_families(
+        &ctx,
+        api::GIT_COMMIT,
+        *PROCESS_START,
+        &metrics::liquidity::LIQ_FAMILIES,
+    );
     let state = AppState {
         ctx: ctx.clone(),
         pool: pools.cqrs.clone(),

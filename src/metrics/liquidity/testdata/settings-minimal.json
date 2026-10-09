@@ -1,0 +1,17 @@
+{
+  "equityTarget": null,
+  "equityDeviation": 0.1,
+  "usdcTarget": null,
+  "usdcDeviation": null,
+  "cashReserved": null,
+  "executionThreshold": "10 shares",
+  "assets": [],
+  "wallet": null,
+  "logLevel": "Info",
+  "serverPort": 0,
+  "orderbook": "0x0000000000000000000000000000000000000002",
+  "deploymentBlock": 0,
+  "broker": "alpaca",
+  "orderPollingInterval": 1,
+  "inventoryPollInterval": 1
+}

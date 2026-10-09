@@ -79,3 +79,8 @@ and `nix run .#ci` runs them too:
   selector is not pinned to the exporter job.
 - `python3 scripts/liq-parity/test_compare.py` tests the staging parity tool
   against a checked-in snapshot pair.
+
+The `liq_*` golden files under `src/metrics/liquidity/testdata/` are committed.
+CI does not regenerate them, because the exporter source is not in this
+repository; `scripts/liq-parity/golden.py` regenerates them from a local
+exporter checkout.
