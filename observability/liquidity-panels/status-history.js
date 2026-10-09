@@ -23,11 +23,25 @@ const stage = (entry) => {
   return index >= 0 ? index : null;
 };
 
-// The row at its latest status, with its status history oldest first: by
-// time (ties keep Cloud Logging's newest-first order reversed), then each
-// pair of neighbouring in-flight bridge entries put in lifecycle order.
+// The event store's sequence in a bot line's `event_id`
+// (`<aggregate>:<id>:<sequence>`), or null for an exporter entry.
+const sequenceOf = (entry) => {
+  const match = /:(\d+)$/.exec(entry.event_id || '');
+  return match ? Number(match[1]) : null;
+};
+
+// The row at its latest status, with its status history oldest first. The
+// bot's lines carry the commit order, so they sort by sequence. Exporter
+// entries sort by time (ties keep Cloud Logging's newest-first order
+// reversed), then each pair of neighbouring in-flight bridge entries is put
+// in lifecycle order.
 const latest = (entries) => {
   if (entries.length === 0) return null;
+  if (entries.every((entry) => sequenceOf(entry) !== null)) {
+    const history = [...entries].sort((left, right) => sequenceOf(left) - sequenceOf(right));
+    const last = history[history.length - 1];
+    return { ...last, first: Math.min(...entries.map((entry) => entry.time)), history };
+  }
   const history = [...entries].reverse().sort((left, right) => left.time - right.time);
   for (let swapped = true; swapped; ) {
     swapped = false;

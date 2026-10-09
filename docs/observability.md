@@ -410,8 +410,42 @@ red, because the exporter's own `up` says nothing about the bot.
 
 Pick `bot` to compare the two side by side. Stage 4 of the migration flips the
 default to `bot` in `SOURCE_VAR`, a one-line change; a later stage removes the
-variable with the exporter. The log tables (Trades, Rebalances, Logs) read the
-exporter's log names on either source until the bot writes its own.
+variable with the exporter.
+
+The log panels follow `Source` too. A Cloud Logging query cannot pick its log by
+a variable, so each one queries both logs, and its first transformation keeps
+the frame of the source picked (`filterByRefId` on `${source:text}-<name>`):
+
+| Panel                | `exporter`                          | `bot` (log `liquidity-bot`)                    |
+| -------------------- | ----------------------------------- | ---------------------------------------------- |
+| Trades               | `liquidity-trades`                  | `jsonPayload.target="liq_trade"`               |
+| Rebalances           | `liquidity-transfers`               | `jsonPayload.target="liq_transfer"`            |
+| Detail dialog events | none (status history)               | `jsonPayload.target="liq_event"`               |
+| Logs                 | `liquidity-botlogs`                 | the bot's own lines, same level/target filters |
+| Orders               | `liquidity-orders` on either source | the bot writes no order lines                  |
+
+The bot's lines use the exporter's field names, so the columns are the same. The
+bot source adds a USD column to Trades and Rebalances (the lines' `usd`) and the
+detail dialog's event timeline, and the dialog drops a line whose `event_id` it
+already has. Every row carries its project (`resource.labels.project_id`), so
+the dialog never shows another environment's row. The generator fails on a log
+panel without both queries and the transformation.
+
+On the bot source, Trades' "Last updated" is when the bot logged the terminal
+status. For an onchain fill the bot caught up on, that is later than the fill
+(the exporter stamps the fill time); the dialog's "Occurred At" is the fill
+time.
+
+The hidden source's queries still run. On the exporter source, each refresh also
+scans the bot's log for Trades, Rebalances and the dialog's events (about 10
+seconds each over 30 days while the log is empty), and the Logs tab for its log
+lines: one more Cloud Logging list call per panel against the project's read
+quota. The plugin shows a throttled call as missing rows, not as an error. The
+bot source holds rows only once the bot logs JSON (`log_format = "json"`) and
+its stdout reaches Cloud Logging as `liquidity-bot`; until then it shows empty
+log panels. Stage 4 flips them with the metrics, in the same `SOURCE_VAR`
+change, after staging shows rows on the bot source, and a later stage removes
+the exporter's queries.
 
 `observability/gen-t0-liquidity.py` adds the matcher and fails if any `liq_`
 selector is left without exactly `job=~"$source"`.

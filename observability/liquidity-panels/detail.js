@@ -4,17 +4,20 @@
 // ⓘ was clicked in the Trades or Rebalances table.
 //
 // The click sets the hidden `detail` variable to the row's id. A and B are
-// the Trades and Rebalances tables' own results (the newest 500 status
-// entries of each log, through the Dashboard datasource), and the script
-// picks the id's entries out of them. C, the bot's event timeline, has no
-// query until the bot logs its events, so the dialog shows the status
-// history. Closing the dialog clears the variable.
+// the Trades and Rebalances tables' own results through the Dashboard
+// datasource: each table's two frames, the exporter's and the bot's (the
+// newest 500 status entries of each log), and the script reads the frames
+// of the `source` picked. On the bot source, bot-events is the bot's event
+// timeline (the newest 500 liq_event lines); the exporter has no event
+// log, so there the dialog shows the status history. Closing the dialog
+// clears the variable.
 //
 // The panel is one empty column of the header row; only the dialog shows.
 //
-// MODE_LABELS, tradeCommands, transferCommands and latest are not defined
-// here: the generator prepends them from recovery-guide.json,
-// recovery-commands.js and status-history.js (see detail_panel()).
+// MODE_LABELS, tradeCommands, transferCommands, latest, lineEntries,
+// eventTimeline, timelineIncomplete and queryState are not defined here: the
+// generator prepends them from recovery-guide.json, recovery-commands.js,
+// status-history.js and log-lines.js (see detail_panel()).
 
 const theme = context.grafana.theme;
 const root = context.element;
@@ -57,42 +60,18 @@ const escapeHtml = (text) =>
 // query's data, still shown while the new one loads.
 const wanted = context.grafana.replaceVariables('${detail}');
 
-// One entry per log line: its time and the exporter's payload. The plugin
-// ships the payload as the JSON body and again as flattened
-// `jsonPayload.<key>` labels; the labels are the fallback.
-const entriesOf = (refId) => {
-  const frame = (context.panelData?.series || []).find((series) => series.refId === refId);
-  if (!frame) return [];
-  const column = (name) => frame.fields.find((field) => field.name === name);
-  const times = column('timestamp');
-  const bodies = column('body');
-  const labels = column('labels');
-  const count = times ? times.values.length : 0;
-  // A JSON object, or null for anything else (no column, bad JSON, a string).
-  const parseObject = (value) => {
-    if (value !== null && typeof value === 'object') return value;
-    try {
-      const parsed = JSON.parse(value);
-      return parsed !== null && typeof parsed === 'object' ? parsed : null;
-    } catch (error) {
-      return null;
-    }
-  };
-  const fromLabels = (index) => {
-    const payload = {};
-    const flat = labels ? parseObject(labels.values[index]) : null;
-    for (const [key, value] of Object.entries(flat || {})) {
-      if (key.startsWith('jsonPayload.')) payload[key.slice('jsonPayload.'.length)] = value;
-    }
-    return payload;
-  };
-  const entries = [];
-  for (let index = 0; index < count; index++) {
-    const payload = (bodies && parseObject(bodies.values[index])) || fromLabels(index);
-    if (payload.id && String(payload.id) === wanted) entries.push({ time: Number(times.values[index]), ...payload });
-  }
-  return entries;
-};
+// The board's environment is its project, and `source` names the frames.
+const env = context.grafana.replaceVariables('${env}');
+const SOURCE = context.grafana.replaceVariables('${source:text}') === 'bot' ? 'bot' : 'exporter';
+
+// The wanted id's entries in one frame, from the board's project only (see
+// lineEntries).
+const entriesOf = (refId) =>
+  lineEntries(
+    (context.panelData?.series || []).find((series) => series.refId === refId),
+    wanted,
+    env
+  );
 
 // The SPA's formatUtc: "Oct 6, 12:24:39 UTC".
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -188,10 +167,22 @@ const txLink = (hash, chain) =>
     ? `<a href="${EXPLORERS[chain]}/tx/${escapeHtml(hash)}" target="_blank" rel="noopener noreferrer">${shortHash(hash)} ↗</a>`
     : `<span class="det-mono" title="${escapeHtml(hash)}">${shortHash(hash)}</span>`;
 
-// The bot's event timeline, once the panel queries it as C: each step with
-// its time and fields, like the SPA's dialog.
-// Without it, the exporter's status log: one step per status change.
-const events = entriesOf('C').sort((left, right) => (left.sequence ?? 0) - (right.sequence ?? 0));
+// The bot's event timeline: each step with its time and fields, like the
+// SPA's dialog. On the exporter source, the status history instead: one
+// step per status change.
+const eventLines = SOURCE === 'bot' ? entriesOf('bot-events') : [];
+// Only an error of a query this source reads fails the dialog (see
+// queryState). An Error state that lists no error fails it too, and one that
+// lists only other errors marks the row as possibly out of date.
+const queries = queryState(context.panelData, SOURCE);
+const eventsFailed = queries.eventsFailed;
+const listedError = (errors) => errors.map((error) => error.message).filter(Boolean).join('; ') || 'unknown error';
+// Grafana can drop a failed table query's error when another query also
+// failed, so a row shown after a failed refresh says it can be out of date.
+const staleNotice = () =>
+  queries.unsure
+    ? `<p class="det-red">A query failed on the last refresh (${escapeHtml(listedError(queries.listed))}). Grafana may not list every query that failed, so this row and its CLI commands can be out of date. Refresh the board and check the row again before you run a command.</p>`
+    : '';
 const humanize = (step) => String(step || '').replace(/([a-z0-9])([A-Z])/g, '$1 $2');
 const isTxHash = (value) => typeof value === 'string' && /^0x[0-9a-fA-F]{64}$/.test(value);
 const eventValue = (key, value, chain) => {
@@ -211,18 +202,14 @@ const eventFields = (payload, rowChain) => {
     .join('');
 };
 
-// The board loads the newest 500 events of all rows, so an older row can have
-// only its later events here. Then the timeline starts after the row's first
-// status entry, and says so.
-const timelineIncomplete = (history) =>
-  history.length > 0 &&
-  Math.min(...events.map((event) => event.time)) > Math.min(...history.map((entry) => entry.time)) + 120000;
-
-const timeline = (history, chain) =>
+// The events scan and the table scans run at different moments, so a row's
+// newest status can also be ahead of its events until the next refresh.
+const timeline = (events, history, chain, rowEventId) =>
   events.length > 0
     ? `
   <div class="det-section-title">Event timeline</div>
-  ${timelineIncomplete(history) ? '<p class="det-muted">Older events of this row are outside the newest 500 the board loads; the full timeline is in the SPA at liquidity.t0trade.com.</p>' : ''}
+  ${eventsFailed ? '<p class="det-red">The event query failed, so this timeline can be out of date.</p>' : ''}
+  ${timelineIncomplete(events, rowEventId) ? '<p class="det-muted">Some events of this row are not here: they are not loaded yet (refresh), outside the newest 500 event lines the board loads, or the bot missed a line. The full timeline is in the SPA at liquidity.t0trade.com.</p>' : ''}
   <div class="det-timeline">${events
     .map(
       (event) => `
@@ -247,7 +234,7 @@ const timeline = (history, chain) =>
     </div>`
     )
     .join('')}</div>
-  <p class="det-muted">From the exporter's status log. The full event timeline is in the SPA at liquidity.t0trade.com.</p>`;
+  <p class="det-muted">${SOURCE === 'exporter' ? "From the exporter's status log." : eventsFailed ? "From the bot's status lines: the event query failed." : "From the bot's status lines; its event lines for this row are not in the newest 500."} The full event timeline is in the SPA at liquidity.t0trade.com.</p>`;
 
 // valueHtml is trusted HTML: a caller escapes any data it puts in it.
 const field = (name, valueHtml) => `<div class="det-field"><span class="det-muted">${escapeHtml(name)}</span><span class="det-break">${valueHtml}</span></div>`;
@@ -274,12 +261,13 @@ const tradeDialog = (trade) => {
     <button class="det-close" data-close aria-label="Close">&times;</button>
   </div>
   <div class="det-dialog-body">
+    ${staleNotice()}
     <div class="det-fields det-mono">
       ${field('ID', idCell)}
-      ${field('Occurred At', utc(trade.first))}
+      ${field('Occurred At', utc(trade.occurred_at || trade.first))}
       ${field('Status', `<span class="${statusClass(trade.status)}">${escapeHtml(statusLabel(trade.status))}</span>${trade.error ? `<div class="det-red">${escapeHtml(trade.error)}</div>` : ''}`)}
     </div>
-    ${timeline(trade.history, onchain ? chain : null)}
+    ${timeline(eventTimeline(eventLines, 'trade'), trade.history, onchain ? chain : null, trade.event_id)}
     ${commandBlock(tradeCommands(CLIENT, trade.symbol))}
   </div>`;
 };
@@ -296,13 +284,14 @@ const transferDialog = (transfer) => {
     <button class="det-close" data-close aria-label="Close">&times;</button>
   </div>
   <div class="det-dialog-body">
+    ${staleNotice()}
     <div class="det-fields det-mono">
       ${field('ID', `<span class="det-muted">${escapeHtml(transfer.id)}</span>`)}
       ${field('Started', utc(transfer.started_at || transfer.first))}
       ${field('Updated', utc(transfer.time))}
       ${field('Status', `<span class="${statusClass(transfer.status)}">${escapeHtml(statusLabel(transfer.status))}</span>`)}
     </div>
-    ${timeline(transfer.history, null)}
+    ${timeline(eventTimeline(eventLines, 'transfer', transfer.kind), transfer.history, null, transfer.event_id)}
     ${commandBlock(
       transferCommands(CLIENT, transfer),
       usdcFailed
@@ -332,15 +321,15 @@ if (state.dismissed !== null && state.dismissed !== wanted) state.dismissed = nu
 // copies the old ones, and keeps them on an error. A Cloud Logging query
 // takes over a second, so the Loading state shows; if it does not, or shows
 // only on the switch render, the dialog says Loading… until the next
-// refresh, which fails safe. Known
-// limit: a query cancelled from the refresh picker after the switch also
-// ends Done with the old rows, and that releases the hold. The memory
-// lives on the window, not the element, so a remount (tab switch, view mode)
-// keeps it. The first render after the page loads is not held back: its rows
-// are for the environment it opened on.
-const env = context.grafana.replaceVariables('${env}');
+// refresh, which fails safe. A query cancelled from the refresh picker
+// after the switch also ends Done with the old rows and releases the hold,
+// but each row carries its project (lineEntries), so a row of the other
+// project still does not show. The memory lives on the window, not the
+// element, so a remount (tab switch, view mode) keeps it. The first render
+// after the page loads is not held back: its rows are for the environment
+// it opened on.
 const loading = context.panelData?.state === 'Loading';
-const failed = context.panelData?.state === 'Error';
+const failed = queries.failed;
 const envState = window.__liqDetailEnv || (window.__liqDetailEnv = { env: undefined, held: false, sawLoading: false });
 const switched = envState.env !== undefined && envState.env !== env;
 envState.env = env;
@@ -358,17 +347,14 @@ if (switched) {
 
 // A failed refresh can keep the old frames, so it shows the error, not a
 // row and its commands that may be out of date.
-const trade = envState.held || failed ? null : latest(entriesOf('A'));
-const transfer = trade || envState.held || failed ? null : latest(entriesOf('B'));
+const trade = envState.held || failed ? null : latest(entriesOf(`${SOURCE}-trades`));
+const transfer = trade || envState.held || failed ? null : latest(entriesOf(`${SOURCE}-transfers`));
 // The dialog opens on the click, before the query returns, and says so when
 // the id has no entries in the panel's window.
 const message = (text) => `
   <div class="det-dialog-head"><span class="det-title-line det-mono">${escapeHtml(wanted)}</span><button class="det-close" data-close aria-label="Close">&times;</button></div>
   <div class="det-dialog-body"><p class="det-muted">${escapeHtml(text)}</p></div>`;
-const queryError = () => {
-  const errors = context.panelData?.errors || (context.panelData?.error ? [context.panelData.error] : []);
-  return errors.map((error) => error.message).filter(Boolean).join('; ') || 'unknown error';
-};
+const queryError = () => listedError(queries.blocking);
 const html = trade
   ? tradeDialog(trade)
   : transfer
