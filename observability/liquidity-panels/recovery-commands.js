@@ -25,6 +25,29 @@ const tradeCommands = (client, symbol) => [
   },
 ];
 
+// USDC_RECONCILE_BASE_TO_ALPACA in transfer.ts. The board offers no USDC
+// reconcile row (the exporter does not log postBurn), so the dialog shows it
+// in usdcFailedNote.
+const USDC_RECONCILE_BASE_TO_ALPACA =
+  ' Base to Alpaca after its burn (not a deposit or conversion failure): unless the mint ' +
+  'was reported unresolvable or funds were already moved by hand, keep the bot running ' +
+  'and run resume-usdc base-to-alpaca, which re-polls Circle, then mints and sends. ' +
+  'Otherwise do not mint, send or reconcile it with the bot running: the bot re-runs its ' +
+  'recovery at every start and can send the USDC to Alpaca itself, with no check for an ' +
+  'earlier send. Follow docs/cli-ops.md, "Settling a post-burn Base to Alpaca failure by hand".';
+
+// The detail dialog's note for a failed USDC bridge. The Base to Alpaca
+// stop-first rule is left out of an Alpaca to Base bridge, as in the SPA; a
+// bridge with no direction gets it.
+const usdcFailedNote = (direction) =>
+  'Reconcile applies only when the funds left their source venue, which the logs do not ' +
+  'show. Check the transfer in the SPA before you reconcile it.' +
+  (direction === 'alpaca_to_base' ? '' : USDC_RECONCILE_BASE_TO_ALPACA);
+
+const EQUITY_RECONCILE_INFLIGHT =
+  ' If the bot started after this redemption failed at detection or was rejected, its ' +
+  'amount stays in flight until the next restart.';
+
 const USDC_FAIL_ALPACA_TO_BASE =
   'Alpaca to Base: the bot accepts this only before the burn, from a completed ' +
   'withdrawal or a burn submission with no recorded burn, and it does not check the ' +
@@ -177,11 +200,13 @@ const transferCommands = (client, transfer) => {
   if (failed) {
     commands.push({
       command: `${client} debug reconcile-equity ${kind} ${id} --reason "<reason>"`,
-      description: 'Mark a Failed transfer as Reconciled once its residue was handled out-of-band (bookkeeping).',
+      description:
+        'Mark a Failed transfer as Reconciled once its residue was handled out-of-band (bookkeeping).' +
+        (kind === 'redemption' ? EQUITY_RECONCILE_INFLIGHT : ''),
       mode: 'requires-bot',
     });
   }
   return commands;
 };
 
-export { tradeCommands, transferCommands };
+export { tradeCommands, transferCommands, usdcFailedNote, USDC_RECONCILE_BASE_TO_ALPACA };

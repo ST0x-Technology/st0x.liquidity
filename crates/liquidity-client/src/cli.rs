@@ -115,7 +115,10 @@ pub(crate) enum Debug {
         /// USDC rebalance id.
         id: String,
     },
-    /// Reconcile a stuck USDC rebalance to OperatorReconciled.
+    /// Reconcile a stuck USDC rebalance to OperatorReconciled. The bot
+    /// re-runs a post-burn BaseToAlpaca BridgingFailed at every start, so do
+    /// not mint, send or reconcile that one with the bot running: follow
+    /// docs/cli-ops.md, "Settling a post-burn Base to Alpaca failure by hand".
     ReconcileUsdc {
         /// USDC rebalance id.
         id: String,
@@ -168,10 +171,19 @@ pub(crate) enum Debug {
         #[arg(long, value_parser = nonblank_reason)]
         reason: String,
     },
-    /// Mark an AlpacaToBase USDC rebalance failed before its burn; the guard
-    /// stays held until reconcile-usdc settles the withdrawn funds. Refuses
-    /// states after the burn and BaseToAlpaca transfers; verify onchain that
-    /// no burn landed first.
+    /// Mark a USDC rebalance failed before its burn. Accepts an AlpacaToBase
+    /// rebalance at WithdrawalComplete or BridgingSubmitting with no recorded
+    /// burn (the guard stays held until reconcile-usdc settles the withdrawn
+    /// funds; at BridgingSubmitting, stop the bot and close the wallet's nonce
+    /// first, then use the offline stox fail-usdc-transfer before you start the
+    /// bot again), and a BaseToAlpaca rebalance whose vault withdrawal was never
+    /// recorded (WithdrawalSubmitting; the guard clears). A BaseToAlpaca
+    /// rebalance at WithdrawalComplete or BridgingSubmitting with no recorded
+    /// burn needs the offline stox fail-usdc-transfer, and its withdrawn USDC
+    /// goes back to the vault by hand. Both refuse every other state. It does
+    /// not check the chain: first verify, for BaseToAlpaca, that no withdrawal
+    /// landed or is pending, and for AlpacaToBase, that no burn landed or is
+    /// pending (see docs/cli-ops.md).
     FailUsdcTransfer {
         /// USDC rebalance id.
         id: String,
@@ -280,8 +292,10 @@ pub(crate) enum Cctp {
     /// Complete the destination mint of a CCTP burn whose mint never landed.
     /// A burn Circle has not attested yet fails at once as retryable; rerun it
     /// later. Rerunning is always safe: a mint that already landed is adopted.
-    /// Afterwards bring the stuck rebalance back in sync with resume-usdc or
-    /// reconcile-usdc.
+    /// Afterwards run resume-usdc while the rebalance is not terminal.
+    /// reconcile-usdc only once a terminal failure's funds leg is done and
+    /// verified. For a post-burn BaseToAlpaca bridge, follow docs/cli-ops.md,
+    /// "Settling a post-burn Base to Alpaca failure by hand", instead.
     CompleteMint {
         /// Transaction hash of the burn on the source chain.
         #[arg(long)]
@@ -1297,6 +1311,196 @@ mod tests {
                 panic!("{bad:?} must be refused");
             };
             assert!(message.contains("EVM address"), "{message}");
+        }
+    }
+
+    /// Every client command the SPA and the board show, written by
+    /// `dashboard/src/lib/transfer-board.test.ts`.
+    const SHOWN_COMMANDS: &str = include_str!("../testdata/shown-commands.txt");
+
+    /// A value for each `<name>` placeholder in a shown command. A new
+    /// placeholder fails the test until it gets a value here.
+    fn placeholder_value(name: &str) -> &'static str {
+        match name {
+            "id" => "abc",
+            "reason" => "operator note",
+            "symbol" => "AAPL",
+            "order-id" => "ord-1",
+            "hash" => "0xabc",
+            "N" => "-5",
+            "USDC_PER_SHARE" => "1.5",
+            other => panic!("no test value for the placeholder <{other}>"),
+        }
+    }
+
+    /// Splits a shown command into words like a shell: double quotes group
+    /// words and are dropped.
+    fn shown_words(line: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut current = String::new();
+        let mut quoted = false;
+        let mut in_word = false;
+        for character in line.chars() {
+            match character {
+                '"' => {
+                    quoted = !quoted;
+                    in_word = true;
+                }
+                ' ' if !quoted => {
+                    if in_word {
+                        words.push(std::mem::take(&mut current));
+                        in_word = false;
+                    }
+                }
+                other => {
+                    current.push(other);
+                    in_word = true;
+                }
+            }
+        }
+        assert!(!quoted, "unmatched quote in {line}");
+        if in_word {
+            words.push(current);
+        }
+        words
+    }
+
+    /// Every way to fill one word's `<...>` placeholders: `<a|b>` gives each
+    /// alternative, `<name>` its test value.
+    fn fill_word(word: &str) -> Vec<String> {
+        let Some(open) = word.find('<') else {
+            return vec![word.to_owned()];
+        };
+        let close = open + word[open..].find('>').expect("unclosed <");
+        let inner = &word[open + 1..close];
+        let choices: Vec<&str> = if inner.contains('|') {
+            inner.split('|').collect()
+        } else {
+            vec![placeholder_value(inner)]
+        };
+        fill_word(&word[close + 1..])
+            .into_iter()
+            .flat_map(|rest| {
+                choices
+                    .iter()
+                    .map(move |choice| format!("{}{choice}{rest}", &word[..open]))
+            })
+            .collect()
+    }
+
+    /// The words of a `[...]` or `(...)` group that starts at the first word,
+    /// without its brackets, and the words after it.
+    fn split_group(words: &[String], open: char, close: char) -> (Vec<String>, &[String]) {
+        let end = words
+            .iter()
+            .position(|word| word.ends_with(close))
+            .unwrap_or_else(|| panic!("unclosed {open} in {words:?}"));
+        let mut group = words[..=end].to_vec();
+        group[0] = group[0].trim_start_matches(open).to_owned();
+        group[end] = group[end].trim_end_matches(close).to_owned();
+        group.retain(|word| !word.is_empty());
+        (group, &words[end + 1..])
+    }
+
+    fn join_each(heads: &[Vec<String>], tails: &[Vec<String>]) -> Vec<Vec<String>> {
+        heads
+            .iter()
+            .flat_map(|head| {
+                tails
+                    .iter()
+                    .map(move |tail| [head.clone(), tail.clone()].concat())
+            })
+            .collect()
+    }
+
+    /// Every argument list a shown command stands for: each optional `[...]`
+    /// with and without, each `(a | b)` alternative, and each placeholder.
+    fn expand_shown(words: &[String]) -> Vec<Vec<String>> {
+        let Some(first) = words.first() else {
+            return vec![Vec::new()];
+        };
+
+        if first.starts_with('[') {
+            let (group, rest) = split_group(words, '[', ']');
+            let tails = expand_shown(rest);
+            let mut both = tails.clone();
+            both.extend(join_each(&expand_shown(&group), &tails));
+            return both;
+        }
+
+        if first.starts_with('(') {
+            let (group, rest) = split_group(words, '(', ')');
+            let heads: Vec<Vec<String>> = group
+                .split(|word| word == "|")
+                .flat_map(expand_shown)
+                .collect();
+            return join_each(&heads, &expand_shown(rest));
+        }
+
+        let heads: Vec<Vec<String>> = fill_word(first)
+            .into_iter()
+            .map(|word| vec![word])
+            .collect();
+        join_each(&heads, &expand_shown(&words[1..]))
+    }
+
+    #[test]
+    fn shown_commands_expand_every_choice() {
+        let words = shown_words(
+            r#"debug view rebuild <position|offchain-order> (--id <id> | --all) [--x "<reason>"]"#,
+        );
+        let expanded: Vec<String> = expand_shown(&words)
+            .into_iter()
+            .map(|argv| argv.join(" "))
+            .collect();
+        assert_eq!(
+            expanded,
+            [
+                "debug view rebuild position --id abc",
+                "debug view rebuild position --id abc --x operator note",
+                "debug view rebuild position --all",
+                "debug view rebuild position --all --x operator note",
+                "debug view rebuild offchain-order --id abc",
+                "debug view rebuild offchain-order --id abc --x operator note",
+                "debug view rebuild offchain-order --all",
+                "debug view rebuild offchain-order --all --x operator note",
+            ]
+        );
+    }
+
+    /// The SPA and the board show recovery commands as text. A command whose
+    /// verb, flag, or value this client no longer accepts fails here, in both
+    /// environments.
+    #[test]
+    fn every_shown_recovery_command_parses() {
+        let lines: Vec<&str> = SHOWN_COMMANDS
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+            .collect();
+        assert!(lines.len() > 20, "only {} shown commands", lines.len());
+
+        for line in lines {
+            // Clap never checks the program name, so a renamed binary would
+            // still parse here and fail for the operator.
+            assert_eq!(
+                shown_words(line).first().map(String::as_str),
+                Some(env!("CARGO_BIN_NAME")),
+                "{line}"
+            );
+            for argv in expand_shown(&shown_words(line)) {
+                for env in ["production", "staging"] {
+                    let argv: Vec<String> = argv
+                        .iter()
+                        .map(|word| match word.as_str() {
+                            "production" => env.to_owned(),
+                            _ => word.clone(),
+                        })
+                        .collect();
+                    if let Err(error) = Cli::try_parse_from(&argv) {
+                        panic!("{line}\nas {argv:?}\ndoes not parse: {error}");
+                    }
+                }
+            }
         }
     }
 
