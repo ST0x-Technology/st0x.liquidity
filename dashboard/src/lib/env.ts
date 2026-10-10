@@ -75,6 +75,22 @@ export const getSimulateSourceId = (): string | null => {
   return val !== undefined && val !== '' ? val : null
 }
 
+/// The operations client environment the recovery commands target. One build
+/// serves both deployments, so the host tells them apart: production is
+/// liquidity.t0trade.com and staging liquidity-staging.t0trade.com. Any other
+/// host (an IAP tunnel to localhost, a dev server) gives null: the commands
+/// then show a placeholder, since guessing could act on production.
+export const getLiquidityClientEnv = (): 'production' | 'staging' | null => {
+  switch (window.location.hostname) {
+    case 'liquidity.t0trade.com':
+      return 'production'
+    case 'liquidity-staging.t0trade.com':
+      return 'staging'
+    default:
+      return null
+  }
+}
+
 export const isDashboardMockMode = (): boolean => {
   const val = env['PUBLIC_DASHBOARD_MOCK_MODE']?.trim().toLowerCase()
   return val === '1' || val === 'true'
