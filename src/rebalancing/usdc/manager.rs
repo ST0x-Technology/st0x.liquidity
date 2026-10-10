@@ -571,9 +571,11 @@ fn alert_unresolvable_mint(id: &UsdcRebalanceId, reason: &str) {
         kind = AlertKind::CctpMintUnresolvable.as_str(),
         %id,
         "USDC transfer {id}: the CCTP mint cannot be resolved automatically ({reason}). \
-         Bridge marked failed; find the mint of the recorded nonce on chain, finish the \
-         funds leg (vault deposit on Base, or send to Alpaca) and verify it, then settle \
-         it with `transfer reconcile --kind usdc`."
+         Bridge marked failed. Base to Alpaca: every restart re-runs this recovery, so do \
+         not mint, send or reconcile with the bot running: stop it and its roll timer and \
+         follow docs/cli-ops.md, \"Settling a post-burn Base to Alpaca failure by hand\". Alpaca to Base: find \
+         the mint of the recorded nonce on chain, deposit it to the vault on Base and \
+         verify it, then settle it with `transfer reconcile --kind usdc`."
     );
 }
 
@@ -15637,10 +15639,8 @@ mod tests {
         assert!(logs_contain("operational_alert"));
         assert!(logs_contain(&format!(
             "USDC transfer {id}: the CCTP mint cannot be resolved automatically \
-             (Circle re-poll failed on a consumed nonce: {}). Bridge marked failed; find \
-             the mint of the recorded nonce on chain, finish the funds leg (vault deposit \
-             on Base, or send to Alpaca) and verify it, then settle it with \
-             `transfer reconcile --kind usdc`.",
+             (Circle re-poll failed on a consumed nonce: {}). Bridge marked failed. Base \
+             to Alpaca: every restart re-runs this recovery",
             CctpError::PlaceholderNonce
         )));
     }
@@ -26186,9 +26186,14 @@ mod tests {
         assert!(logs_contain(&format!(
             "USDC transfer {id}: the CCTP mint cannot be resolved automatically"
         )));
+        // Base to Alpaca: the stop-first rule comes before any funds step.
         assert!(logs_contain(
-            "find the mint of the recorded nonce on chain, finish the funds leg (vault \
-             deposit on Base, or send to Alpaca) and verify it, then settle it with \
+            "Base to Alpaca: every restart re-runs this recovery, so do not mint, send \
+             or reconcile with the bot running"
+        ));
+        assert!(logs_contain(
+            "Alpaca to Base: find the mint of the recorded nonce on chain, deposit it to \
+             the vault on Base and verify it, then settle it with \
              `transfer reconcile --kind usdc`"
         ));
     }
@@ -26599,9 +26604,14 @@ mod tests {
         assert!(logs_contain(&format!(
             "USDC transfer {id}: the CCTP mint cannot be resolved automatically"
         )));
+        // Base to Alpaca: the stop-first rule comes before any funds step.
         assert!(logs_contain(
-            "find the mint of the recorded nonce on chain, finish the funds leg (vault \
-             deposit on Base, or send to Alpaca) and verify it, then settle it with \
+            "Base to Alpaca: every restart re-runs this recovery, so do not mint, send \
+             or reconcile with the bot running"
+        ));
+        assert!(logs_contain(
+            "Alpaca to Base: find the mint of the recorded nonce on chain, deposit it to \
+             the vault on Base and verify it, then settle it with \
              `transfer reconcile --kind usdc`"
         ));
     }

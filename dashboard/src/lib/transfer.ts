@@ -268,10 +268,8 @@ export const LIQUIDITY_CLIENT = 'st0x-liquidity-client --env production'
 /// A client command retargeted at `clientEnv`. The static guide is spelled for
 /// production; a staging deployment shows it with `--env staging`, and an
 /// unknown one with a placeholder the operator must fill in.
-export const forClientEnv = (
-  command: string,
-  clientEnv: 'production' | 'staging' | null
-): string => command.replace('--env production', `--env ${clientEnv ?? '<production|staging>'}`)
+export const forClientEnv = (command: string, clientEnv: 'production' | 'staging' | null): string =>
+  command.replace('--env production', `--env ${clientEnv ?? '<production|staging>'}`)
 
 /// The CLI a deployment's recovery commands run with. `client` is the
 /// operations client; `mock` is the `st0x-cli` mock binary pointed at the
@@ -392,7 +390,10 @@ const equityRecoveryCommands = (
 
   if (!isTerminalStatus(status)) {
     commands.push({
-      ...spell(cli, 'debug resume', { args: 'transfer resume --kind equity', mode: 'requires-bot' }),
+      ...spell(cli, 'debug resume', {
+        args: 'transfer resume --kind equity',
+        mode: 'requires-bot'
+      }),
       label: 'Resume (all equity)',
       description:
         'Re-drive ALL interrupted mints and redemptions via the bot (no id; best-effort per ' +
@@ -418,12 +419,35 @@ const equityRecoveryCommands = (
       }),
       label: 'Reconcile',
       description:
-        'Mark a Failed transfer as Reconciled once its residue was handled out-of-band (bookkeeping).'
+        'Mark a Failed transfer as Reconciled once its residue was handled out-of-band (bookkeeping).' +
+        (kind === 'redemption' ? EQUITY_RECONCILE_INFLIGHT : '')
     })
   }
 
   return commands
 }
+
+/// The offline reconcile for a bridge that may be a post-burn Base to Alpaca
+/// failure: its hand settlement runs with the bot stopped, where the client's
+/// reconcile cannot reach it. The mock CLI's Reconcile is already this form.
+const offlineUsdcReconcile = (
+  cli: RecoveryCli,
+  id: string,
+  direction: UsdcBridgeDirection | null
+): RecoveryCommand[] =>
+  cli.kind === 'client' && direction !== 'alpaca_to_base'
+    ? [
+        {
+          command: `stox transfer reconcile --kind usdc --id ${id} --reason <funds-moved-manually|deposit-credited-offline>`,
+          mode: 'direct-db',
+          label: 'Reconcile (offline)',
+          description:
+            'The same reconcile with the bot and its roll timer stopped, for a Base to Alpaca ' +
+            'bridge that failed after its burn. On GCP, run it as docs/cli-ops.md "Offline ' +
+            'commands on GCP" describes.'
+        }
+      ]
+    : []
 
 /// Maps a `UsdcBridgeDirection` DTO value to the mock CLI's `--direction` flag
 /// vocabulary. The two namespaces deliberately differ: the DTO names the
@@ -454,6 +478,32 @@ const usdcDirectionToClientArg = (direction: UsdcBridgeDirection | null): string
       return null
   }
 }
+
+/// Startup seeds the stranded amount of a redemption that already ended in
+/// `DetectionFailed` or `RedemptionRejected` into inflight, and reconcile
+/// clears that seeding only on the next start. A live failure releases its
+/// inflight at once.
+const EQUITY_RECONCILE_INFLIGHT =
+  ' If the bot started after this redemption failed at detection or was rejected, its ' +
+  'amount stays in flight until the next restart.'
+
+/// The guide entry covers mints too, so it names the redemption case.
+const EQUITY_RECONCILE_INFLIGHT_GUIDE =
+  ' For a redemption that failed at detection or was rejected before the bot started, ' +
+  'its amount stays in flight until the next restart.'
+
+/// The bot re-runs a Base to Alpaca `BridgingFailed` with a burn at every
+/// start, and that recovery can mint and send the USDC to Alpaca on its own. A
+/// restart between a hand settlement and the reconcile can send it twice, so
+/// the settlement runs with the bot stopped. The DTO does not say which failed
+/// state a bridge is in, and an unknown direction gets the note too.
+export const USDC_RECONCILE_BASE_TO_ALPACA =
+  ' Base to Alpaca after its burn (not a deposit or conversion failure): unless the mint ' +
+  'was reported unresolvable or funds were already moved by hand, keep the bot running ' +
+  'and run resume-usdc base-to-alpaca, which re-polls Circle, then mints and sends. ' +
+  'Otherwise do not mint, send or reconcile it with the bot running: the bot re-runs its ' +
+  'recovery at every start and can send the USDC to Alpaca itself, with no check for an ' +
+  'earlier send. Follow docs/cli-ops.md, "Settling a post-burn Base to Alpaca failure by hand".'
 
 const USDC_FAIL_ALPACA_TO_BASE =
   'Alpaca to Base: the bot accepts this only before the burn, from a completed ' +
@@ -543,7 +593,8 @@ const USDC_CONVERTING_ALPACA_TO_BASE =
 /// The extra resume text for a bridge's status and direction.
 const usdcResumeNote = (status: string, direction: UsdcBridgeDirection | null): string => {
   if (direction === 'base_to_alpaca' && status === 'bridging') return USDC_BRIDGING_BASE_TO_ALPACA
-  if (direction !== 'base_to_alpaca' && status === 'converting') return USDC_CONVERTING_ALPACA_TO_BASE
+  if (direction !== 'base_to_alpaca' && status === 'converting')
+    return USDC_CONVERTING_ALPACA_TO_BASE
   return ''
 }
 
@@ -563,7 +614,9 @@ const usdcFailCheck = (status: string, direction: UsdcBridgeDirection | null): s
 }
 
 /// Recovery commands for a USDC bridge, gated by status:
-///   - failed (terminal): `reconcile`, but ONLY for a reconcile-eligible
+///   - failed (terminal): for a post-burn failure that is not Alpaca to
+///     Base, `resume` first (the normal path for a Base to Alpaca failure
+///     after its burn). Then `reconcile`, but ONLY for a reconcile-eligible
 ///     failure. The CLI accepts `transfer reconcile --kind usdc` when the
 ///     funds provably left their source venue (`DepositFailed`, a post-burn
 ///     `BridgingFailed`, any `AlpacaToBase BridgingFailed` -- its withdrawal
@@ -593,7 +646,32 @@ const usdcBridgeRecoveryCommands = (
   if (isFailedStatus(status)) {
     if (postBurn !== true) return []
 
+    // A post-burn Base to Alpaca bridging failure is normally finished by a
+    // resume, so that row comes first. A deposit or conversion failure is
+    // accepted as enqueued but the worker does not move it, so the
+    // description sends those to Reconcile.
+    const resume: RecoveryCommand[] =
+      direction === 'alpaca_to_base'
+        ? []
+        : [
+            {
+              ...spell(cli, `debug resume-usdc base-to-alpaca ${id}`, {
+                args: `transfer resume --kind usdc --id ${id} --direction to-alpaca`,
+                mode: 'requires-bot'
+              }),
+              label: 'Resume',
+              description:
+                'For a Base to Alpaca bridging failure after its burn (not a deposit or ' +
+                'conversion failure: the resume answers enqueued but nothing moves, so use ' +
+                'Reconcile for those): unless the mint was reported ' +
+                'unresolvable or funds were already moved by hand, keep the bot running and ' +
+                'run this. It re-polls Circle, then mints and sends. Otherwise settle it by ' +
+                'hand as the Reconcile row says, with the bot stopped.'
+            }
+          ]
+
     return [
+      ...resume,
       {
         ...spell(
           cli,
@@ -603,8 +681,10 @@ const usdcBridgeRecoveryCommands = (
         label: 'Reconcile',
         description:
           'Mark this failed USDC bridge as Reconciled once its off-venue funds were ' +
-          'settled out-of-band (bookkeeping). Verify where the funds sit first.'
-      }
+          'settled out-of-band (bookkeeping). Verify where the funds sit first.' +
+          (direction === 'alpaca_to_base' ? '' : USDC_RECONCILE_BASE_TO_ALPACA)
+      },
+      ...offlineUsdcReconcile(cli, id, direction)
     ]
   }
 
@@ -782,7 +862,8 @@ export const RECOVERY_GUIDE: GuideGroup[] = [
       {
         command: `${LIQUIDITY_CLIENT} debug reconcile-equity <mint|redemption> <id> --reason "<reason>"`,
         description:
-          'Mark a terminally-failed equity transfer Reconciled after handling residue manually.',
+          'Mark a terminally-failed equity transfer Reconciled after handling residue ' +
+          `manually.${EQUITY_RECONCILE_INFLIGHT_GUIDE}`,
         whenToUse:
           'An equity transfer is in a terminal failure and its residue was settled out-of-band ' +
           '(bookkeeping).',
@@ -791,7 +872,11 @@ export const RECOVERY_GUIDE: GuideGroup[] = [
       },
       {
         command: `${LIQUIDITY_CLIENT} debug reconcile-usdc <id> --reason <funds-moved-manually|deposit-credited-offline>`,
-        description: 'Mark a failed USDC bridge Reconciled after its funds were settled manually.',
+        description:
+          'Mark a failed USDC bridge Reconciled after its funds were settled manually.' +
+          USDC_RECONCILE_BASE_TO_ALPACA +
+          ' The offline form is stox transfer reconcile --kind usdc --id <id> --reason ' +
+          '<funds-moved-manually|deposit-credited-offline>.',
         whenToUse:
           'A USDC bridge failed after its funds left the source venue, and they were settled ' +
           'out-of-band.',
@@ -843,7 +928,11 @@ export const RECOVERY_GUIDE: GuideGroup[] = [
         command: `${LIQUIDITY_CLIENT} debug cctp complete-mint --burn-tx <hash> --source-chain <ethereum|base>`,
         description:
           'Complete the destination-chain mint of a stuck CCTP transfer. A burn Circle has not ' +
-          'attested yet fails at once as retryable; rerun it later.',
+          'attested yet fails at once as retryable; rerun it later. If the burn belongs to a ' +
+          'stuck USDC bridge, run resume-usdc afterwards while the bridge is not terminal. Run ' +
+          'reconcile-usdc only after a terminal failure whose funds leg is done and verified at ' +
+          'the destination. For a Base to Alpaca bridge that failed after its burn, follow ' +
+          'docs/cli-ops.md, "Settling a post-burn Base to Alpaca failure by hand", instead.',
         whenToUse: 'A CCTP burn succeeded but attestation polling was interrupted before the mint.',
         appliesTo: 'CCTP cross-chain USDC transfer',
         mode: 'requires-bot'

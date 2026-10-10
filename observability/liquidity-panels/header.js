@@ -38,9 +38,9 @@ const info = labels.info || {};
 
 const theme = context.grafana.theme;
 const root = context.element;
-// The guide's commands target the environment the board shows: the client
-// takes the selector's text, production or staging.
-const ENV = context.grafana.replaceVariables('${env:text}') === 'staging' ? 'staging' : 'production';
+// The guide's commands target the environment the board shows
+// (client-env.js, prepended).
+const ENV = boardEnv(context.grafana.replaceVariables('${env:text}'));
 // The plugin pads each rendered row by 8px, which makes this one-row panel
 // scroll; the row has no room for it.
 root.style.padding = '0';
@@ -133,7 +133,7 @@ const guideDialog = `
 <dialog class="hdr-dialog hdr-wide" data-dialog="guide">
   <div class="hdr-dialog-head"><span>CLI recovery guide</span><button class="hdr-close" data-close aria-label="Close">&times;</button></div>
   <div class="hdr-dialog-body">
-    <p class="hdr-muted hdr-intro">Every recovery command, grouped by object. They use <span class="hdr-mono">st0x-liquidity-client</span>, which signs in with your Google account and calls the running bot's API, so no SSH is needed and the bot must be running. The one exception is failing a Base to Alpaca USDC bridge after its vault withdrawal confirmed: that needs the offline <span class="hdr-mono">stox fail-usdc-transfer</span> with the bot stopped.</p>
+    <p class="hdr-muted hdr-intro">Every recovery command, grouped by object. They use <span class="hdr-mono">st0x-liquidity-client</span>, which signs in with your Google account and calls the running bot's API, so no SSH is needed and the bot must be running. Some steps need the offline <span class="hdr-mono">stox</span> with the bot stopped instead, for example failing a USDC bridge after its nonce close (<span class="hdr-mono">stox fail-usdc-transfer</span>), and settling a Base to Alpaca bridge by hand after its burn (<span class="hdr-mono">stox transfer reconcile</span>). Each command's description says when.</p>
     ${guide.groups
       .map(
         (group) => `
@@ -143,7 +143,7 @@ const guideDialog = `
           .map(
             (entry) => `
           <div class="hdr-command">
-            <pre class="hdr-mono">${escapeHtml(entry.command.replace('--env production', `--env ${ENV}`))}</pre>
+            <pre class="hdr-mono">${escapeHtml(forClientEnv(entry.command, ENV))}</pre>
             <div class="hdr-grid">
               <span class="hdr-muted">What</span><span>${escapeHtml(entry.description)}</span>
               <span class="hdr-muted">When</span><span>${escapeHtml(entry.whenToUse)}</span>

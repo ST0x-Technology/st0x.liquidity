@@ -48,9 +48,16 @@ loads these panels as "Panel plugin not found" and still passes.
 The recovery commands in the header's guide (`recovery-guide.json`) and in the
 row dialog (`recovery-commands.js`) are copies of the SPA's
 (`dashboard/src/lib/transfer.ts`), in the operations client form for the
-environment the board shows. `dashboard/src/lib/transfer-board.test.ts` fails
-when a copy drifts, so change the SPA and the copies together. It runs in the
-dashboard build of CI.
+environment the board shows (`client-env.js`).
+`dashboard/src/lib/transfer-board.test.ts` fails when a copy drifts, for every
+status the DTOs carry, so change the SPA and the copies together. The same test
+covers the dialog's `status-history.js` and `log-lines.js`, and writes every
+shown client command to `crates/liquidity-client/testdata/shown-commands.txt`,
+which the client's `every_shown_recovery_command_parses` test parses with the
+real CLI, and every shown offline `stox` command to
+`crates/cli/testdata/shown-stox-commands.txt`, which `crates/cli` parses and
+classifies. Run `bunx vitest run -u` in `dashboard/` after a command changes.
+The test runs in the dashboard build of CI.
 
 The Dashboard tab's inventory is three Grafana tables, for their column filters:
 USD at Alpaca, USD on each chain, and Equities. Per-chain rows (USD · Onchain)

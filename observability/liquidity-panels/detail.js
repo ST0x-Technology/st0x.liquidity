@@ -130,9 +130,9 @@ const statusLabel = (status) => {
 // is needed and every command needs the bot.
 // --------------------------------------------------------------------------
 
-// The environment the board shows: the client takes the selector's text.
-const ENV = context.grafana.replaceVariables('${env:text}') === 'staging' ? 'staging' : 'production';
-const CLIENT = `st0x-liquidity-client --env ${ENV}`;
+// The environment the board shows (client-env.js, prepended).
+const ENV = boardEnv(context.grafana.replaceVariables('${env:text}'));
+const CLIENT = clientFor(ENV);
 
 const modeClass = (mode) => (mode === 'requires-bot' ? 'det-amber' : 'det-red');
 const commandBlock = (commands, note) =>
@@ -294,9 +294,7 @@ const transferDialog = (transfer) => {
     ${timeline(eventTimeline(eventLines, 'transfer', transfer.kind), transfer.history, null, transfer.event_id)}
     ${commandBlock(
       transferCommands(CLIENT, transfer),
-      usdcFailed
-        ? 'Reconcile applies only when the funds left their source venue, which the logs do not show. Check the transfer in the SPA before you reconcile it.'
-        : ''
+      usdcFailed ? usdcFailedNote(transfer.direction) : ''
     )}
   </div>`;
 };
