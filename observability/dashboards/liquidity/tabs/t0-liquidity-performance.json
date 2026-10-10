@@ -187,7 +187,7 @@
   ],
   "panels": [
     {
-      "id": 34,
+      "id": 33,
       "type": "marcusolsson-dynamictext-panel",
       "title": "",
       "description": "The SPA header: settings pills, Config, the CLI recovery guide, the deployed commit, uptime, and whether the bot is up: the exporter's liq_up, or the bot scrape's up on the bot source.",
@@ -251,7 +251,7 @@
       "hideTimeOverride": true
     },
     {
-      "id": 35,
+      "id": 34,
       "type": "stat",
       "title": "Detection latency",
       "description": "p95, 24h. Fill on-chain \u2192 bot noticed. good \u226430s, warn \u2264120s.",
@@ -340,7 +340,7 @@
       }
     },
     {
-      "id": 36,
+      "id": 35,
       "type": "stat",
       "title": "Exposure window",
       "description": "p95, 24h. Fill on-chain \u2192 hedge filled: how long capital stays exposed. good \u226460s, warn \u2264300s.",
@@ -429,7 +429,7 @@
       }
     },
     {
-      "id": 37,
+      "id": 36,
       "type": "stat",
       "title": "Errors (24h)",
       "description": "ERROR-level log lines in 24h. good \u22640, warn \u226410. Money-at-risk lifecycle failures are broken out per event type in the 'Errors & warnings by module' table below.",
@@ -518,7 +518,7 @@
       }
     },
     {
-      "id": 38,
+      "id": 37,
       "type": "stat",
       "title": "Oldest unhedged fill",
       "description": "Age of the oldest on-chain fill not yet hedged. good \u22645m, warn \u226430m; '\u2014' = nothing unhedged (the SPA shows 'none').",
@@ -607,7 +607,7 @@
       }
     },
     {
-      "id": 39,
+      "id": 38,
       "type": "stat",
       "title": "Block lag",
       "description": "Chain blocks the fill-detection checkpoint trails by. good \u226430, warn \u2264300.",
@@ -696,7 +696,7 @@
       }
     },
     {
-      "id": 40,
+      "id": 39,
       "type": "stat",
       "title": "",
       "description": "SPA secondary line: p50 detection latency.",
@@ -782,7 +782,7 @@
       }
     },
     {
-      "id": 41,
+      "id": 40,
       "type": "stat",
       "title": "",
       "description": "SPA secondary line: fill sample count backing the detection latency percentiles.",
@@ -868,7 +868,7 @@
       }
     },
     {
-      "id": 42,
+      "id": 41,
       "type": "stat",
       "title": "",
       "description": "SPA secondary line: p50 exposure-window latency.",
@@ -954,7 +954,7 @@
       }
     },
     {
-      "id": 43,
+      "id": 42,
       "type": "stat",
       "title": "",
       "description": "SPA secondary line: hedge sample count backing the exposure-window percentiles.",
@@ -1040,7 +1040,7 @@
       }
     },
     {
-      "id": 44,
+      "id": 43,
       "type": "stat",
       "title": "",
       "description": "SPA secondary line: WARN-level log lines in 24h.",
@@ -1126,7 +1126,7 @@
       }
     },
     {
-      "id": 45,
+      "id": 44,
       "type": "stat",
       "title": "",
       "description": "SPA secondary line: money-at-risk lifecycle failure events in 24h (the 'Errors & warnings by module' table breaks these out by event type).",
@@ -1212,7 +1212,7 @@
       }
     },
     {
-      "id": 46,
+      "id": 45,
       "type": "stat",
       "title": "",
       "description": "SPA secondary line: apalis job queues with a failed or killed job right now (instantaneous, not windowed) \u2014 the SPA folds killed into the same 'queue(s) failed' phrase.",
@@ -1302,7 +1302,7 @@
       }
     },
     {
-      "id": 47,
+      "id": 46,
       "type": "stat",
       "title": "",
       "description": "SPA secondary line: on-chain fills still uncovered by a hedge, summed across symbols.",
@@ -1388,7 +1388,7 @@
       }
     },
     {
-      "id": 48,
+      "id": 47,
       "type": "stat",
       "title": "",
       "description": "SPA secondary line: symbols with an open (unhedged) exposure \u2014 0 is the SPA's 'all fills hedged'.",
@@ -1484,7 +1484,7 @@
       }
     },
     {
-      "id": 49,
+      "id": 48,
       "type": "stat",
       "title": "",
       "description": "SPA secondary line: age of the current block-lag sample.",
@@ -1570,7 +1570,7 @@
       }
     },
     {
-      "id": 50,
+      "id": 49,
       "type": "stat",
       "title": "",
       "description": "SPA secondary line: order-fill monitor poll ticks skipped (overrun) in 24h.",
@@ -1656,7 +1656,7 @@
       }
     },
     {
-      "id": 51,
+      "id": 50,
       "type": "bargauge",
       "title": "Hedge cycle stages (p95, 24h)",
       "description": "The SPA waterfall's aggregate form: p95 per stage. Per-cycle waterfalls live in the SPA.",
@@ -1734,7 +1734,7 @@
       }
     },
     {
-      "id": 52,
+      "id": 51,
       "type": "timeseries",
       "title": "Latency percentiles over time \u2014 $stage",
       "description": "p50/p90/p99 of the selected hedge stage, from the exporter's rolling 24h summary scraped once a minute.",
@@ -1890,7 +1890,7 @@
       }
     },
     {
-      "id": 53,
+      "id": 52,
       "type": "table",
       "title": "Errors & warnings by module (24h)",
       "description": "The SPA's per-target error/warning counts. The Logs tab has the lines themselves. Click a module to jump to the Logs board pre-filtered on it (the SPA's 'logs \u2192' button); sparkline cells are skipped as low-value/fiddly here.",
@@ -2095,7 +2095,7 @@
       }
     },
     {
-      "id": 54,
+      "id": 53,
       "type": "bargauge",
       "title": "USDC rebalance stages (p95, 30d)",
       "description": "Stage timings for USDC rebalances. From the server's stageSummary; per-operation waterfalls live in the SPA.",
@@ -2165,7 +2165,7 @@
       }
     },
     {
-      "id": 55,
+      "id": 54,
       "type": "bargauge",
       "title": "Equity rebalance stages (p95, 30d)",
       "description": "Stage timings for equity mints/redemptions.",
@@ -2235,7 +2235,7 @@
       }
     },
     {
-      "id": 56,
+      "id": 55,
       "type": "table",
       "title": "Dependency health (24h)",
       "description": "Every RPC / broker operation: calls, errors, latency percentiles.",
@@ -2395,7 +2395,7 @@
       }
     },
     {
-      "id": 57,
+      "id": 56,
       "type": "timeseries",
       "title": "CCTP attestation time",
       "description": "Duration of the most recent CCTP attestation per rebalance kind, sampled once per scrape. The SPA can chart the full attestationTrend history for the selected range; this gauge only has 'last value at scrape time', so the line only accrues from whenever this panel started being scraped forward \u2014 a short/flat history here does not mean attestations were fast, it means the metric is young.",
@@ -2516,7 +2516,7 @@
       }
     },
     {
-      "id": 58,
+      "id": 57,
       "type": "timeseries",
       "title": "Block lag over time",
       "description": "The ingestion-health chart: how far fill detection trails the chain.",
@@ -2587,7 +2587,7 @@
       }
     },
     {
-      "id": 59,
+      "id": 58,
       "type": "stat",
       "title": "Poll cycles (24h)",
       "description": "Order-fill monitor poll cycles.",
@@ -2668,7 +2668,7 @@
       }
     },
     {
-      "id": 60,
+      "id": 59,
       "type": "stat",
       "title": "Poll errors (24h)",
       "description": "Failed poll cycles.",
@@ -2753,7 +2753,7 @@
       }
     },
     {
-      "id": 61,
+      "id": 60,
       "type": "stat",
       "title": "Skipped ticks (24h)",
       "description": "Poll ticks skipped (overrun).",
@@ -2838,7 +2838,7 @@
       }
     },
     {
-      "id": 62,
+      "id": 61,
       "type": "bargauge",
       "title": "Poll duration percentiles",
       "description": "The monitor's own cycle duration.",
@@ -2908,7 +2908,7 @@
       }
     },
     {
-      "id": 63,
+      "id": 62,
       "type": "table",
       "title": "Job queues",
       "description": "The bot's apalis job queues (instantaneous whole-table counts, not windowed). killed or failed above zero is the SPA's critical Errors state.",
@@ -3094,7 +3094,7 @@
       }
     },
     {
-      "id": 64,
+      "id": 63,
       "type": "row",
       "title": "Hedge execution quality (native bot metrics)",
       "collapsed": true,
@@ -3106,7 +3106,7 @@
       },
       "panels": [
         {
-          "id": 65,
+          "id": 64,
           "type": "timeseries",
           "title": "Hedge fill latency percentiles",
           "description": "Wall-clock seconds from hedge order placement to confirmed fill. The app builds these as a metrics-rs summary (no explicit buckets), so the quantiles come straight off the {quantile=...} label rather than from histogram_quantile. This is the metrics-side view of the SPA's 'Latency percentiles over time' chart \u2014 that chart's per-stage waterfall (detection / decision / submission / execution) comes from the telemetry tables in SQLite and has no metric behind it.",
@@ -3218,7 +3218,7 @@
           }
         },
         {
-          "id": 66,
+          "id": 65,
           "type": "timeseries",
           "title": "Hedge fill latency by symbol (1h average)",
           "description": "Average seconds between placing a hedge and it filling, per symbol, derived from the summary's _sum / _count. Spikes mean capital sits exposed longer on that name.",
@@ -3293,7 +3293,7 @@
           }
         },
         {
-          "id": 67,
+          "id": 66,
           "type": "timeseries",
           "title": "Broker errors per hour, by kind",
           "description": "Alpaca API failures, split by kind (e.g. place_order_failed) and symbol. Empty is the healthy state.",
@@ -3363,7 +3363,7 @@
           }
         },
         {
-          "id": 68,
+          "id": 67,
           "type": "timeseries",
           "title": "Hedge scans skipped, by reason",
           "description": "Extended-hours buys the position scan dropped before enqueueing a hedge job, because reference-price resolution or crossing failed. Each one is an on-chain fill that did not get hedged on that pass.",
@@ -3433,7 +3433,7 @@
           }
         },
         {
-          "id": 69,
+          "id": 68,
           "type": "timeseries",
           "title": "Hedges dead-lettered, by reason",
           "description": "Hedge attempts the process gave up on: a permanent or retry-budget-exhausted pricing failure, or broker rate-limiting that outlived the reschedule budget. Anything here is an unhedged fill that needs a human.",
@@ -3503,7 +3503,7 @@
           }
         },
         {
-          "id": 70,
+          "id": 69,
           "type": "timeseries",
           "title": "Which reference priced each extended-hours limit",
           "description": "hedge_price_source_total by source (primary_quote / mark / delayed_sip_quote) and path (ordinary_extended / close_flatten). Shows which fallback legs are load-bearing \u2014 a rise in delayed_sip_quote means we are pricing off stale data.",
@@ -3577,7 +3577,7 @@
       ]
     },
     {
-      "id": 71,
+      "id": 70,
       "type": "row",
       "title": "Close-flatten (end-of-session flattening) (native bot metrics)",
       "collapsed": true,
@@ -3589,7 +3589,7 @@
       },
       "panels": [
         {
-          "id": 72,
+          "id": 71,
           "type": "timeseries",
           "title": "Attempts, by post-close gap reason",
           "description": "Close-flatten hedge pricing attempts, by the post-close gap reason that triggered them.",
@@ -3659,7 +3659,7 @@
           }
         },
         {
-          "id": 73,
+          "id": 72,
           "type": "timeseries",
           "title": "Blocked before submission, by reason",
           "description": "Close-flatten attempts stopped before they reached the broker. close_time_unknown carries no symbol label; the rest are per symbol.",
@@ -3729,7 +3729,7 @@
           }
         },
         {
-          "id": 74,
+          "id": 73,
           "type": "timeseries",
           "title": "Placements, by cross applied",
           "description": "Limit orders priced and cleared for submission, bucketed to whole percent of cross. Counts attempts, not orders: a retried or re-driven placement of the same hedge counts again, and an attempt the broker later rejects still counts.",
@@ -3799,7 +3799,7 @@
           }
         },
         {
-          "id": 75,
+          "id": 74,
           "type": "timeseries",
           "title": "Outcomes",
           "description": "Terminal broker-state dispatches for close-flatten placements (filled / cancelled / failed). A placement can be observed again until its follow-up job commits the terminal aggregate transition, so treat these as dispatches rather than a strict order count.",
@@ -3871,7 +3871,7 @@
       ]
     },
     {
-      "id": 76,
+      "id": 75,
       "type": "row",
       "title": "Data integrity & ingestion health (native bot metrics)",
       "collapsed": true,
@@ -3883,7 +3883,7 @@
       },
       "panels": [
         {
-          "id": 77,
+          "id": 76,
           "type": "stat",
           "title": "Ambiguous settlements (24h)",
           "description": "Inventory settlements quarantined because one transaction emitted multiple OperatorDeposits or multiple OperatorWithdraws and the legs could not be safely paired. Each one is a held-back settlement.",
@@ -3973,7 +3973,7 @@
           }
         },
         {
-          "id": 78,
+          "id": 77,
           "type": "stat",
           "title": "Unpaired settlement legs (24h)",
           "description": "OperatorDeposit / OperatorWithdraw legs with no same-transaction counterpart in the batch.",
@@ -4063,7 +4063,7 @@
           }
         },
         {
-          "id": 79,
+          "id": 78,
           "type": "stat",
           "title": "Unusable snapshot marks (24h)",
           "description": "Nonzero equity balances captured with a missing or stale USD mark. These make the portfolio snapshot \u2014 and therefore the PnL replay in the SPA \u2014 incomplete for that interval.",
@@ -4153,7 +4153,7 @@
           }
         },
         {
-          "id": 80,
+          "id": 79,
           "type": "stat",
           "title": "PnL ledger checkpoint lag",
           "description": "How many events the PnL ledger's checkpoint trails the event store by. The PnL numbers themselves are computed by the backend from SQLite and are not exported \u2014 this gauge is the one PnL signal that reaches Grafana, and it answers 'is the PnL panel's input keeping up?'.",
@@ -4247,7 +4247,7 @@
           }
         },
         {
-          "id": 81,
+          "id": 80,
           "type": "timeseries",
           "title": "Scrape health",
           "description": "The Ops Agent's own view of the bot's /metrics endpoint: 1 = scraped successfully, 0 = the endpoint did not answer. Every other panel on this dashboard goes blank while this is 0, so check it first before concluding the bot is idle.",
@@ -4320,7 +4320,7 @@
           }
         },
         {
-          "id": 82,
+          "id": 81,
           "type": "timeseries",
           "title": "Scrape duration and series count",
           "description": "How long the scrape takes and how many series come back. A series count that collapses to near zero while up=1 means the bot restarted and its counters reset.",
@@ -4411,7 +4411,7 @@
           }
         },
         {
-          "id": 83,
+          "id": 82,
           "type": "timeseries",
           "title": "Bot-gas redrives and PnL catch-up failures",
           "description": "bot_gas_redrive_total: receipt-cost enqueue failures redriven instead of failing the triggering job. pnl_ledger_catch_up_failures_total: the PnL ledger failing to catch up to the event store. Both are self-healing retries \u2014 a steady rate means something underneath is not healing.",

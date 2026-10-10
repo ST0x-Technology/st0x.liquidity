@@ -146,7 +146,7 @@
   ],
   "panels": [
     {
-      "id": 8,
+      "id": 7,
       "type": "marcusolsson-dynamictext-panel",
       "title": "",
       "description": "The SPA header: settings pills, Config, the CLI recovery guide, the deployed commit, uptime, and whether the bot is up: the exporter's liq_up, or the bot scrape's up on the bot source.",
@@ -210,7 +210,7 @@
       "hideTimeOverride": true
     },
     {
-      "id": 9,
+      "id": 8,
       "type": "table",
       "title": "Raindex Orders",
       "description": "The SPA's Orders tab, columns in SPA order (Output | Input | Vault Balance | IO Ratio | Order Hash | Created). Shipped by the exporter's collect_orders() as one Cloud Logging row per order per poll cycle (logName liquidity-orders); insertId buckets by poll-hour so a still-active order dedupes to ~1 stored row/hour rather than one per 60s poll \u2014 with a 2h window that means a couple of rows per order is expected, not a bug. Created is the order's own on-chain creation time (jsonPayload.created_at), not the row's ingestion time. The datasource returns at most about the panel's pixel width in entries.",
@@ -495,7 +495,7 @@
       }
     },
     {
-      "id": 10,
+      "id": 9,
       "type": "stat",
       "title": "",
       "description": "In-flight broker orders right now (/orders/pending).",
@@ -577,7 +577,7 @@
       }
     },
     {
-      "id": 11,
+      "id": 10,
       "type": "stat",
       "title": "",
       "description": "Raindex orders owned by the bot (upstream REST API total).",
@@ -659,7 +659,7 @@
       }
     },
     {
-      "id": 12,
+      "id": 11,
       "type": "stat",
       "title": "",
       "description": "1 when the bot's upstream REST API for Raindex orders is unavailable.",

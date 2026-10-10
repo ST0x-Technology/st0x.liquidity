@@ -47,6 +47,28 @@ for the environment the board shows. `dashboard/src/lib/transfer-board.test.ts`
 fails when the copy drifts, so change the SPA and the copy together. It runs in
 the dashboard build of CI.
 
+The Dashboard tab's inventory is three Grafana tables, for their column filters:
+USD at Alpaca, USD on each chain, and Equities. Per-chain rows (USD · Onchain)
+and columns (Equities) come from the bot's `chain`-labelled series
+(`liq_usdc_chain_*`, `liq_usdc_corridor_*`, `liq_equity_chain_available`). The
+exporter does not publish them, so with `Source` on `exporter` the tables show
+the single Base row and column from the unlabelled series. The fallback is per
+source: while the bot publishes per-chain series, a chain without a labelled
+value shows none. The Equities Ratio is coloured only where it is the bot's own
+band verdict (a symbol rebalanced on Base, with a balance, with no vault on
+another chain, while the default Base target is set), so it is grey on the
+`exporter` source, which cannot see the other chains.
+
+Keep the Dashboard tab's panel heights (`TRADES_H`, `TRANSFERS_H` and the
+`native_inventory` heights in the generator) unless you check a new set on a
+preview board: reload it at a few window heights and confirm both columns end
+level and every table shows its rows. The tab link opens the board with
+`autofitpanels`, which scales and rounds every height, keeps the result, and
+fits it again on the next render. Whenever one column rounds a row taller than
+the window, the next pass shrinks everything again and the other column loses a
+row per pass. Most height sets do that on some window size; the current ones do
+not, for windows of 18 to 45 rows.
+
 `alerting/liquidity.rules.yml` is the alert rules, in the `Alerts` folder. Each
 rule's `uid` is permanent and must be unique across every repo's file. Removing
 a rule from the file does not remove it from Grafana: add its `uid` to
