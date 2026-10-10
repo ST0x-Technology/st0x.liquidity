@@ -49,9 +49,17 @@ impl LiqStateRefresh {
         self.refresh_prices().await;
     }
 
+    /// Publishes the prices family and records the run, failed or not, in
+    /// `metrics_refresh_duration_seconds`.
+    async fn refresh_prices(&self) {
+        let started = Instant::now();
+        self.publish_prices().await;
+        record_collector_duration(LiqFamily::Prices.collector(), started.elapsed());
+    }
+
     /// A failed or slow positions load keeps the last published prices, so
     /// exposure never drops to a shorter list.
-    async fn refresh_prices(&self) {
+    async fn publish_prices(&self) {
         let positions = match timeout(POSITION_LOAD_TIMEOUT, load_positions(&self.pool)).await {
             Ok(Ok(positions)) => positions,
             Ok(Err(error)) => {
@@ -98,6 +106,16 @@ const COLLECTOR_TIMEOUT: Duration = Duration::from_secs(30);
 /// A collector slower than this is logged: the loaders replay history and
 /// the exporter runs the same loaders while both publish.
 const SLOW_COLLECTOR: Duration = Duration::from_secs(10);
+
+/// Records one collector run, failed or not, in
+/// `metrics_refresh_duration_seconds`, and logs it when it was slow.
+pub(super) fn record_collector_duration(collector: &'static str, elapsed: Duration) {
+    metrics::histogram!("metrics_refresh_duration_seconds", "collector" => collector)
+        .record(elapsed);
+    if elapsed > SLOW_COLLECTOR {
+        warn!(collector, ?elapsed, "A liq_ collector was slow");
+    }
+}
 
 /// Every 60 seconds: the latencies, reliability and infra families over the
 /// last 24 hours, and every fifth cycle the rebalances over the last 30
@@ -222,13 +240,7 @@ impl LiqPerformanceRefresh {
         let collector = family.collector();
         let started = Instant::now();
         let result = timeout(COLLECTOR_TIMEOUT, build).await;
-        let elapsed = started.elapsed();
-
-        metrics::histogram!("metrics_refresh_duration_seconds", "collector" => collector)
-            .record(elapsed);
-        if elapsed > SLOW_COLLECTOR {
-            warn!(collector, ?elapsed, "A liq_ collector was slow");
-        }
+        record_collector_duration(collector, started.elapsed());
 
         match result {
             Ok(Ok(samples)) => self.families.replace(family, samples, SystemTime::now()),
@@ -589,5 +601,31 @@ mod tests {
             Some(&2.0)
         );
         assert_eq!(collector(families, "prices"), Some(100.0));
+    }
+
+    /// The prices collector records each run in the refresh histogram, like
+    /// the performance and orders collectors, a failed one included.
+    #[tokio::test]
+    async fn each_prices_collector_run_records_its_duration() {
+        let recorder = crate::metrics::local_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let families = leaked_families();
+        let task = refresh(families, EquityPriceStore::new([])).await;
+
+        task.refresh_prices().await;
+        task.pool.close().await;
+        task.refresh_prices().await;
+
+        assert_eq!(
+            parse_exposition(&handle.render())
+                .get(&series(
+                    "metrics_refresh_duration_seconds_count",
+                    &[("collector", "prices")],
+                ))
+                .copied(),
+            Some(2.0)
+        );
+        assert!(collector(families, "prices").is_some());
     }
 }

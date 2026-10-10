@@ -264,8 +264,11 @@ pub struct TelemetrySender {
 
 impl TelemetrySender {
     /// A connected sender plus the receiver to hand to
-    /// [`spawn_dependency_call_writer`].
+    /// [`spawn_dependency_call_writer`]. Registers
+    /// `telemetry_samples_dropped_total` at 0, so the first drop is an
+    /// `increase()` from 0 instead of a new series that starts at 1.
     pub(crate) fn channel() -> (Self, mpsc::Receiver<DependencyCallSample>) {
+        metrics::counter!("telemetry_samples_dropped_total").increment(0);
         let (sender, receiver) = mpsc::channel(DEPENDENCY_CHANNEL_CAPACITY);
         (
             Self {
@@ -938,6 +941,21 @@ mod tests {
         assert_eq!(
             scrub_secrets("https://eth-mainnet.example.com"),
             "https://eth-mainnet.example.com"
+        );
+    }
+
+    #[test]
+    fn a_connected_sender_registers_the_dropped_counter_at_zero() {
+        let recorder = crate::metrics::local_recorder();
+        let handle = recorder.handle();
+
+        let (_sender, _receiver) =
+            metrics::with_local_recorder(&recorder, TelemetrySender::channel);
+
+        let rendered = parse_exposition(&handle.render());
+        assert_eq!(
+            rendered.get(&series("telemetry_samples_dropped_total", &[])),
+            Some(&0.0)
         );
     }
 
