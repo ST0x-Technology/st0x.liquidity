@@ -1775,9 +1775,12 @@ copy of the balances taken while the lock is held. Each copy is numbered in
 write order, and the store ignores a copy older than the one it holds, so a slow
 publisher never puts older balances back. Publishing starts once boot has
 restored the inventory from its snapshots: before that the view is empty, and
-its series would read as zero balances. If boot fails to read a snapshot, the
-inventory series stay unpublished until the next start and an error is logged. A
-task republishes the inventory every 60 seconds, which covers quiet periods.
+its series would read as zero balances. If boot fails to read a snapshot, or one
+of its events fails to apply, the inventory series stay unpublished for that run
+and an error is logged. They return only after a start where every snapshot
+reads and applies; a restart does not help while the failing snapshot is
+unchanged, because boot rebuilds the same event from it. A task republishes the
+inventory every 60 seconds, which covers quiet periods.
 
 Every 60 seconds the same task publishes `liq_position_last_price_usd{symbol}`
 and `liq_equity_exposure_usd{symbol}` (net position times that price) for each
