@@ -4,9 +4,11 @@
     python3 scripts/liq-parity/test_compare.py
 """
 
+import ast
 import io
 import math
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -21,6 +23,29 @@ import compare  # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 BOT = os.path.join(HERE, "testdata", "bot.prom")
 EXPORTER = os.path.join(HERE, "testdata", "exporter.prom")
+CATALOG = os.path.join(HERE, "..", "..", "src", "metrics", "liquidity.rs")
+
+
+def catalog_names():
+    """Every liq_* name the bot publishes: the `LiqMetric::name` arms of the
+    catalog in src/metrics/liquidity.rs."""
+    with open(CATALOG, encoding="utf-8") as f:
+        return catalog_names_in(f.read())
+
+
+def catalog_names_in(source):
+    """The `LiqMetric::name` arms of `source`, on one line or, as rustfmt
+    writes an arm that is too long, with the name inside braces on the next
+    line. Raises when their count is not the N of `ALL: [Self; N]`, so an
+    arm the pattern misses fails every test that reads the catalog."""
+    names = set(re.findall(r'=>\s*\{?\s*"(liq_[a-z0-9_]+)"', source))
+    declared = re.search(r"ALL: \[Self; (\d+)\]", source)
+    if declared is None or len(names) != int(declared.group(1)):
+        raise AssertionError(
+            f"found {len(names)} LiqMetric::name arms, ALL declares "
+            f"{declared.group(1) if declared else 'no count'}"
+        )
+    return names
 
 
 def run(*args):
@@ -473,6 +498,104 @@ class CompareTest(unittest.TestCase):
 
         self.assertEqual(series, {("liq_bot_info", (("git_commit", 'a\\b"c\nd'),)): 1.0})
 
+
+    def test_the_lists_name_exactly_the_names_the_bot_publishes(self):
+        catalog = catalog_names()
+
+        self.assertTrue(catalog)
+        self.assertEqual(compare.PORTED & compare.BOT_ONLY, set())
+        self.assertEqual(compare.PORTED | compare.BOT_ONLY, catalog)
+
+    def test_the_catalog_scan_reads_a_braced_arm_and_checks_the_count(self):
+        source = (
+            "pub(crate) const ALL: [Self; 2] = [Self::Short, Self::Long];\n"
+            'Self::Short => "liq_short",\n'
+            "Self::Long => {\n"
+            '    "liq_a_name_long_enough_that_rustfmt_moves_it_to_its_own_line"\n'
+            "}\n"
+        )
+
+        self.assertEqual(catalog_names_in(source), {
+            "liq_short",
+            "liq_a_name_long_enough_that_rustfmt_moves_it_to_its_own_line",
+        })
+        with self.assertRaises(AssertionError):
+            catalog_names_in(source.replace("[Self; 2]", "[Self; 3]"))
+
+    def test_the_known_diffs_literal_names_each_series_once(self):
+        # A repeated key in a dict literal silently keeps the last rule, and
+        # _add_known_diffs only guards the names added through it.
+        with open(os.path.join(HERE, "compare.py"), encoding="utf-8") as f:
+            module = ast.parse(f.read())
+        literals = [
+            node.value
+            for node in module.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "KNOWN_DIFFS"
+                    for target in node.targets)
+        ]
+
+        self.assertEqual(len(literals), 1)
+        self.assertIsInstance(literals[0], ast.Dict)
+        keys = [ast.literal_eval(key) for key in literals[0].keys]
+        self.assertTrue(keys)
+        self.assertEqual(sorted({key for key in keys if keys.count(key) > 1}), [])
+
+    def test_every_known_diff_names_a_ported_series_with_a_known_rule(self):
+        catalog = catalog_names()
+        rules = {"values", "ignore", "kept_window", "kept_window_bot_absent"}
+
+        for name, rule in compare.KNOWN_DIFFS.items():
+            with self.subTest(name=name):
+                # Only a ported name is compared with the exporter, so a rule
+                # for any other name never applies.
+                self.assertIn(name, compare.PORTED)
+                self.assertIn(name, catalog)
+                self.assertNotIn(name, compare.DROP_LIST)
+                if isinstance(rule, tuple):
+                    self.assertEqual(rule[0], "absolute")
+                    self.assertGreater(rule[1], 0)
+                else:
+                    self.assertIn(rule, rules)
+                # The window rules read the `window` label, which only the
+                # PnL names carry.
+                if rule in {"kept_window", "kept_window_bot_absent"}:
+                    self.assertIn(name, compare.PNL_NAMES)
+
+    def test_a_second_known_diff_for_a_name_is_refused(self):
+        with mock.patch.dict(compare.KNOWN_DIFFS, {"liq_bot_info": "values"}):
+            with self.assertRaisesRegex(ValueError, "liq_bot_info"):
+                compare._add_known_diffs("ignore", {"liq_bot_info"})
+
+            self.assertEqual(compare.KNOWN_DIFFS["liq_bot_info"], "values")
+
+    def test_only_spaces_and_tabs_separate_tokens(self):
+        for body in (
+            "liq_bot_info\u00a01\n",
+            "liq_bot_info\x0c1\n",
+            "liq_bot_info\x0b1\n",
+            "liq_bot_info\u20281\n",
+            "liq_bot_info 1\u00a01700000000000\n",
+            'liq_bot_info{a="1",\x0bb="2"} 1\n',
+            'liq_bot_info{\x0ca="1"} 1\n',
+            'liq_bot_info{a\u00a0="1"} 1\n',
+        ):
+            with self.subTest(body=body):
+                with self.assertRaises(ValueError):
+                    compare.parse_exposition(body)
+
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".prom") as nbsp:
+            nbsp.write("liq_bot_info\u00a01\n")
+            nbsp.flush()
+            err = io.StringIO()
+            with redirect_stderr(err):
+                status, report = run(nbsp.name, EXPORTER)
+
+        self.assertEqual(status, 2)
+        self.assertEqual(report, "")
+        self.assertEqual(err.getvalue(), (
+            "unusable snapshot(s):\n"
+            f"  {nbsp.name}: not a Prometheus text body\n"))
 
 if __name__ == "__main__":
     sys.exit(unittest.main())

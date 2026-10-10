@@ -4,10 +4,13 @@
     python3 scripts/liq-parity/compare.py [--drop-list] [--known-diffs] \\
         BOT.prom EXPORTER.prom [BOT.prom EXPORTER.prom ...]
 
-Each pair is one snapshot of both /metrics bodies taken within the same
-second. With several pairs (for example three, two minutes apart) only
-findings present in every pair are reported: the bot publishes on events and
-the exporter polls, so a one-off difference is timing, not a defect.
+Each pair is one snapshot of both /metrics bodies, read back to back (the
+runbook in docs/observability.md reads both in one SSH command). The tool
+does not check when a body was read. Even bodies read in the same second can
+hold values read from the source at different times: the bot publishes each
+family on its own refresh and the exporter polls on its own cycle. So with
+several pairs (for example three, two minutes apart) only findings present in
+every pair are reported: a one-off difference is timing, not a defect.
 
 Findings, per series `(name, sorted labels)`:
 
@@ -41,8 +44,11 @@ lists below must name everything the bot publishes.
 Exit status: 0 with no findings, 1 with findings, 2 when a snapshot is not
 UTF-8 Prometheus text, holds none of the ported liq_* series (a wrong file,
 an empty body, an HTML or JSON error page, or a degraded target that only
-reports liq_up), or lacks an always-present name another snapshot on its
-side has.
+reports liq_up), or lacks an ALWAYS_PRESENT name another snapshot on its
+side has. That last body is partly filled, for example a target read just
+after a restart, before its first read of every source. Its pair compares
+fewer series, and a series it does not compare gives no finding there, so
+the every-pair rule would drop a real difference the other pairs report.
 
 
 Items that port more names extend PORTED, BOT_ONLY and KNOWN_DIFFS.
@@ -197,9 +203,11 @@ DROP_LIST = {
 
 # Ported names every snapshot holds once its source has been read: both sides
 # publish them unconditionally. A body that lacks one that another body on its
-# side has is partly filled. Names that can be legitimately absent (a value
-# not read yet, a price that expired, a symbol without a position) are not
-# here, so they never make a snapshot unusable.
+# side has is partly filled, and it is unusable: a series its pair does not
+# compare gives no finding in that pair, so the every-pair intersection would
+# drop a real difference that every other pair reports. Names that can be
+# legitimately absent (a value not read yet, a price that expired, a symbol
+# without a position) are not here, so they never make a snapshot unusable.
 ALWAYS_PRESENT = {
     "liq_bot_info",
     "liq_bot_start_timestamp_seconds",
@@ -267,12 +275,17 @@ KNOWN_DIFFS = {
     "liq_reliability_log_count_24h": "values",
     "liq_log_target_count_24h": "ignore",
 }
-# A PnL window whose report failed or did not fit the cycle budget keeps its
-# last value in the bot, with a stalled liq_collector_last_success_ts_seconds
-# {collector="pnl_<window>"}. The exporter drops that window from its pnl
-# family until its next cycle (exporter.py collect_pnl: a failed or skipped
-# window adds no samples before set_family). A deliberate difference.
-KNOWN_DIFFS.update({name: "kept_window" for name in PNL_NAMES})
+
+
+def _add_known_diffs(rule, names):
+    """Gives every name in `names` the rule. A name that already has a rule
+    raises, so a later entry can never silently replace an earlier one."""
+    repeated = sorted(name for name in names if name in KNOWN_DIFFS)
+    if repeated:
+        raise ValueError(f"KNOWN_DIFFS already has a rule for {', '.join(repeated)}")
+    KNOWN_DIFFS.update({name: rule for name in names})
+
+
 # A day component of /pnl that does not parse: the exporter counts it as 0
 # (t0.devops 8dca7be exporter.py pnl_day_samples, `dec(row.get(field)) or
 # Decimal(0)` and `dec(row.get("totalPnlUsd")) or Decimal(0)`), so it still
@@ -287,7 +300,15 @@ PNL_DAY_NAMES = {
     "liq_pnl_day_stream_usd",
     "liq_pnl_day_cum_stream_usd",
 }
-KNOWN_DIFFS.update({name: "kept_window_bot_absent" for name in PNL_DAY_NAMES})
+# A PnL window whose report failed or did not fit the cycle budget keeps its
+# last value in the bot, with a stalled liq_collector_last_success_ts_seconds
+# {collector="pnl_<window>"}. The exporter drops that window from its pnl
+# family until its next cycle (exporter.py collect_pnl: a failed or skipped
+# window adds no samples before set_family). A deliberate difference.
+# "kept_window_bot_absent" includes "kept_window", so the day names take only
+# that rule.
+_add_known_diffs("kept_window", PNL_NAMES - PNL_DAY_NAMES)
+_add_known_diffs("kept_window_bot_absent", PNL_DAY_NAMES)
 
 # (bot type, exporter type) that --known-diffs accepts for every name. The
 # bot publishes every liq_* name as a gauge; the exporter is untyped.
@@ -297,18 +318,20 @@ RELATIVE_TOLERANCE = 1e-9
 
 # The Prometheus text format, one sample line at a time. A line that does not
 # match the whole grammar makes the snapshot unusable rather than being read
-# loosely.
-_LABEL = r'[A-Za-z_][A-Za-z0-9_]*\s*=\s*"(?:[^"\\\n]|\\[\\"n])*"'
-_LABEL_PAIR = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"((?:[^"\\\n]|\\[\\"n])*)"')
+# loosely. Only spaces and tabs separate tokens, as in Prometheus: `\s` would
+# also accept separators such as NBSP or form feed that make it drop a scrape.
+_LABEL = r'[A-Za-z_][A-Za-z0-9_]*[ \t]*=[ \t]*"(?:[^"\\\n]|\\[\\"n])*"'
+_LABEL_PAIR = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*"((?:[^"\\\n]|\\[\\"n])*)"')
 # A decimal float, Inf, Infinity, or NaN (any case, as Go reads them). Python's float() also takes forms such as
 # `1_0` that Prometheus rejects, so the token is checked before conversion.
 _VALUE = (r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
           r"|[+-]?(?i:inf(?:inity)?)|(?i:nan)")
 _SAMPLE_LINE = re.compile(
     r"(?P<name>[A-Za-z_:][A-Za-z0-9_:]*)"
-    r"(?:\{\s*(?:(?P<labels>" + _LABEL + r"(?:\s*,\s*" + _LABEL + r")*)\s*,?\s*)?\})?"
-    r"\s+(?P<value>" + _VALUE + r")"
-    r"(?:\s+(?P<timestamp>-?[0-9]+))?"
+    r"(?:\{[ \t]*(?:(?P<labels>" + _LABEL + r"(?:[ \t]*,[ \t]*" + _LABEL + r")*)"
+    r"[ \t]*,?[ \t]*)?\})?"
+    r"[ \t]+(?P<value>" + _VALUE + r")"
+    r"(?:[ \t]+(?P<timestamp>-?[0-9]+))?"
 )
 _UNESCAPE = {"\\\\": "\\", '\\"': '"', "\\n": "\n"}
 # Like Prometheus, blanks after the `#` are optional: `#TYPE` is a TYPE line.
