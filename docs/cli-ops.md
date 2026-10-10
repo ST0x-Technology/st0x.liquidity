@@ -918,20 +918,48 @@ that no recent CCTP burn was submitted from the market-maker wallet (e.g. via
 A Base->Alpaca transfer at `WithdrawalSubmitting` recorded its vault withdrawal
 intent (with `from_block`), but no withdrawal was initiated. A resume only
 adopts a withdrawal mined after `from_block` and never re-issues one, so if none
-landed it scans forever. First check on Base for an `OperatorWithdraw` by the
-bot wallet on the inventory after `from_block` (the latch alert names the
-block). A withdraw the network accepted but has not mined is not in the logs
-yet, so also wait until the transfer's attempt timeout has passed and confirm
-the bot wallet has no pending transaction to the inventory (no pending
-`withdraw4` in the explorer, or pending nonce equal to latest nonce):
+landed it scans forever. First confirm on Base that the bot wallet made no
+`OperatorWithdraw` on the inventory after the transfer's `from_block` (the latch
+alert names the block), and no `WithdrawV2` on the orderbook either (a
+withdrawal sent before the inventory migration). Only a USDC withdrawal from the
+cash vault counts: the event's `vaultId` must equal `vault_id` under
+`[chains.base.trading.assets.cash]` in the bot config. Withdrawals of other
+tokens or vaults (for example equity rebalancing) do not count. The bot wallet
+must be the `operator` of the `OperatorWithdraw` or the `sender` of the
+`WithdrawV2`. Since the migration, inventory withdrawals also emit a
+`WithdrawV2` with the inventory as `sender` (for example from the Bebop and
+univ4 hooks), and that event does not count. A withdraw the network accepted but
+has not mined is not in the logs yet, so also wait until the transfer's attempt
+timeout has passed and confirm the bot wallet has no pending transaction (no
+pending `withdraw4` in the explorer, and pending nonce equal to latest nonce on
+more than one RPC provider). These checks cannot prove that nothing is pending:
+the bot never records the withdrawal's hash or nonce, and on Base the sequencer
+can hold a transaction that no provider shows.
 
-- **If one landed**: run `transfer resume --kind usdc`; it adopts it.
-- **If none landed**: run `fail-usdc-transfer`. It sends `RejectWithdrawal`, and
-  the transfer ends in `WithdrawalFailed` with no withdrawal recorded. Nothing
-  moved, so the guard clears. The live route (bot running) clears it at once and
-  kills the transfer's queued job rows; the offline command clears it on
-  restart. Base->Alpaca planning on the corridor then waits for the 30-minute
-  withdraw cooldown and a fresh vault read; both survive a restart.
+- **If one landed** (an `OperatorWithdraw` or a `WithdrawV2`), or you are not
+  certain: run `transfer resume --kind usdc`. It adopts a landed withdrawal of
+  the full amount, and the transfer continues. A withdrawal that moved less than
+  the transfer amount (a `WithdrawV2` can fill short) makes the resume end the
+  transfer in `WithdrawalFailed` with the withdrawal recorded; move that USDC
+  from the bot wallet back to the vault by hand. If nothing landed, the resume
+  keeps redriving and the scan stays inconclusive: repeat the checks above, and
+  once they show that no withdrawal landed and none is pending, follow the next
+  step.
+- **If none landed**: close the nonce before you fail the transfer. Stop the bot
+  so that it does not send at that nonce. From the bot wallet on Base, send a
+  0-value transfer with no calldata to the wallet itself at the latest nonce,
+  with `maxFeePerGas` and `maxPriorityFeePerGas` well above the current market
+  fee. Wait until it has the chain's required confirmations, then check the
+  withdrawal logs again. If a withdrawal mined instead, follow the step above.
+  Otherwise run `fail-usdc-transfer` (the offline command, or the live route
+  after a restart). It sends `RejectWithdrawal`, and the transfer ends in
+  `WithdrawalFailed` with no withdrawal recorded. Nothing moved, so the guard
+  clears. The live route (bot running) clears it at once and kills the
+  transfer's queued job rows; the offline command clears it on restart.
+  Base->Alpaca planning on the corridor then waits for the 30-minute withdraw
+  cooldown and a fresh vault read; both survive a restart. If a withdrawal for
+  this transfer mines later anyway, the scan no longer adopts it and its USDC
+  sits in the bot wallet: move that USDC back to the vault by hand.
 
 `transfer reconcile` is the path for persisted terminal failures whose funds
 left the source venue (e.g. `DepositFailed`, `BridgingFailed` with a burn tx
