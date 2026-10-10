@@ -1622,6 +1622,10 @@ migration files in `migrations/`.
   keeps TRACE on stdout for remote log shipping and INFO in local rotated files,
   reducing diagnostic log volume on the SQLite data disk without guaranteeing a
   hard byte bound.
+- Console JSON (`log_format = "json"`) is one flattened object per line: the
+  message and every event field are top-level keys beside `timestamp`, `level`
+  and `target`, so a parsing log shipper exposes them as structured fields. The
+  rotated files keep the nested `fields` shape that the log readers parse.
 - Require both log levels when rotated-file logging is enabled. A missing level
   must fail config validation instead of inheriting another sink's level.
 - API rate limiting and error tracking with metrics collection

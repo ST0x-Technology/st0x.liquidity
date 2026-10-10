@@ -1449,9 +1449,14 @@ pub enum LogLevel {
     Error,
 }
 
-/// Console log output format. `text` is the human readable format; `json`
-/// emits one JSON object per line, the same shape as the rolling file
-/// layer, so a log shipper can parse journald output.
+/// Console log output format.
+///
+/// `text` is the human readable format; `json` emits one flattened JSON
+/// object per line: `timestamp`, `level`, `target`, `message` and every
+/// event field as top-level keys, span context under `span` and `spans`. A
+/// log shipper that parses the line then finds the text at `message`, where
+/// the alert extractors read it. The rolling file layer keeps its own nested
+/// `fields` shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogFormat {

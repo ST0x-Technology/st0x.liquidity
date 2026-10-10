@@ -1282,7 +1282,8 @@ where
             } => {
                 let target = hint.max(pending_nonce);
                 warn!(
-                    target: "wallet", %contract, note, attempt, hint, pending_nonce, target,
+                    target: "wallet", %contract, note, attempt, hint, pending_nonce,
+                    target_nonce = target,
                     "Nonce too low -- seeding the cache with the higher of the node's \
                      reported next nonce and the pending-block count (external nonce \
                      change detected)"
