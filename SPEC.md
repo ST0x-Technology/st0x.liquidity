@@ -8410,11 +8410,15 @@ multiple broker-specific contexts.
    trading domain. Dashboard pricing is a separate, process-local read model
    streamed in the initial WebSocket state and in live price updates; it does
    not mutate a Position or the event store. The same store also supplies the
-   rebalancer's minimum-operation-size price for a never-filled symbol and the
-   daily portfolio snapshot's newer-than-fill mark (see "USD marks"). Pricing
-   transport failures are retried. They never affect hedging; they can delay a
-   never-filled symbol's rebalancing, and a snapshot taken before any mark
-   arrives falls back to the last fill.
+   rebalancer's minimum-operation-size price for a never-filled symbol, the
+   daily portfolio snapshot's newer-than-fill mark (see "USD marks"), and the
+   `liq_*` prices family (`liq_position_last_price_usd` and
+   `liq_equity_exposure_usd`, see "Prometheus metrics (`liq_*` contract)").
+   Pricing transport failures are retried. They never affect hedging; they can
+   delay a never-filled symbol's rebalancing, a snapshot taken before any mark
+   arrives falls back to the last fill, and a symbol with no live price is
+   omitted from the replacement prices family at the next 60-second refresh, so
+   its previous sample is dropped until a later refresh has a live price.
 
 3. **Spreads**: Last realized spreads per asset (buy/sell prices and spread bps)
    and per-symbol price charts over time.

@@ -246,6 +246,37 @@ impl EquityPriceStore {
         }
     }
 
+    /// A store holding exactly `prices`, so a test drives
+    /// [`Self::live_prices`] from a dashboard fixture. An available price
+    /// carries no underlying mark.
+    #[cfg(test)]
+    pub(crate) fn with_prices(prices: &[EquityPrice]) -> Self {
+        let mut seeded = HashMap::new();
+        for price in prices {
+            let available = match price.status {
+                EquityPriceStatus::Available {
+                    price_usd,
+                    observed_at,
+                    expires_at,
+                } => Some(AvailablePrice {
+                    price_usd,
+                    underlying_price_usd: None,
+                    observed_at,
+                    expires_at,
+                }),
+                EquityPriceStatus::Unavailable => None,
+            };
+            let previous = seeded.insert(price.symbol.clone(), available);
+            assert!(previous.is_none(), "{} is listed twice", price.symbol);
+        }
+
+        Self {
+            prices: Arc::new(RwLock::new(seeded)),
+            mark_listener: Arc::default(),
+            last_marks: Arc::default(),
+        }
+    }
+
     /// The symbol's mark if one is live at `now`: the mid price of one
     /// underlying share in the settlement stable. `None` when the live frame
     /// does not carry the underlying rates.
@@ -2089,5 +2120,27 @@ mod tests {
             .await
             .expect_err("must fail");
         assert!(matches!(err, PricingSessionError::IdentityToken(_)));
+    }
+
+    #[test]
+    #[should_panic(expected = "is listed twice")]
+    fn with_prices_rejects_a_symbol_listed_again_after_an_unavailable_entry() {
+        let now = Utc::now();
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        EquityPriceStore::with_prices(&[
+            EquityPrice {
+                symbol: symbol.clone(),
+                status: EquityPriceStatus::Unavailable,
+            },
+            EquityPrice {
+                symbol,
+                status: EquityPriceStatus::Available {
+                    price_usd: float!(187.25),
+                    observed_at: now,
+                    expires_at: now + TimeDelta::seconds(30),
+                },
+            },
+        ]);
     }
 }

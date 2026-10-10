@@ -314,10 +314,13 @@ fn render_body(handle: &PrometheusHandle, families: &liquidity::LiqFamilies) -> 
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::SystemTime;
+
+    use proc_macro2::{Delimiter, Ident, Literal, TokenStream, TokenTree};
 
     use super::*;
     use crate::metrics::liquidity::settings::health_samples;
@@ -459,39 +462,420 @@ mod tests {
     /// would put a second, never-forgetting writer on the contract.
     #[test]
     fn no_metrics_macro_uses_a_liq_name() {
-        let macros = [
-            "counter!(",
-            "gauge!(",
-            "histogram!(",
-            "describe_counter!(",
-            "describe_gauge!(",
-            "describe_histogram!(",
-        ];
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut violations = Vec::new();
-        let mut pending = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+
+        for path in rust_sources(root) {
+            let relative = relative_path(root, &path);
+            let source = std::fs::read_to_string(&path).unwrap();
+            violations.extend(
+                scan_liq_names(&source)
+                    .macro_names
+                    .into_iter()
+                    .map(|name| format!("{relative}: \"{name}\"")),
+            );
+        }
+
+        assert_eq!(violations, Vec::<String>::new());
+    }
+
+    #[test]
+    fn liq_macro_scan_sees_names_however_the_call_is_spaced_and_skips_comments() {
+        let source = concat!(
+            "gauge!(\"liq_plain\").set(1.0);\n",
+            "counter!( r\"liq_raw\").increment(1);\n",
+            "histogram!(r#\"liq_raw_hashed\"#).record(1.0);\n",
+            "gauge!(\"hedge_open_positions\").set(1.0);\n",
+            "info!(\"liq_ state refresh started\");\n",
+            "metrics::gauge! (\"liq_spaced_paren\").set(1.0);\n",
+            "counter ! [\"liq_spaced_bang\"].increment(1);\n",
+            "describe_histogram!{ \"liq_braced\" };\n",
+            "gauge!(\n    \"liq_next_line\",\n    \"symbol\" => \"AAPL\"\n);\n",
+            "gauge!(\"hedge_shares\", \"kind\" => \"liq_label_value\");\n",
+            "// gauge!(\"liq_line_comment\");\n",
+            "/* outer /* gauge!(\"liq_nested_comment\"); */ */\n",
+        );
+
+        assert_eq!(
+            scan_liq_names(source).macro_names,
+            vec![
+                "liq_plain",
+                "liq_raw",
+                "liq_raw_hashed",
+                "liq_spaced_paren",
+                "liq_spaced_bang",
+                "liq_braced",
+                "liq_next_line",
+            ]
+        );
+    }
+
+    /// The catalog that the family store renders. It may hold any `liq_`
+    /// name literal.
+    const LIQ_CATALOG_FILE: &str = "src/metrics/liquidity.rs";
+
+    /// The only `liq_` literals allowed outside the catalog, each with the
+    /// file that holds it: the log targets of the dashboard event lines and
+    /// the same targets in the log filter. A literal anywhere else could
+    /// reach a `metrics` macro through a helper or a const (such as
+    /// `set_shares_gauge` in `position_check`), which
+    /// `no_metrics_macro_uses_a_liq_name` cannot see.
+    const LIQ_LOG_TARGETS: [(&str, &str); 6] = [
+        ("crates/config/src/telemetry.rs", "liq_event"),
+        ("crates/config/src/telemetry.rs", "liq_trade"),
+        ("crates/config/src/telemetry.rs", "liq_transfer"),
+        ("src/dashboard/event_lines.rs", "liq_event"),
+        ("src/dashboard/event_lines.rs", "liq_trade"),
+        ("src/dashboard/event_lines.rs", "liq_transfer"),
+    ];
+
+    #[test]
+    fn only_the_catalog_and_the_log_targets_hold_liq_names_in_production_code() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut violations = Vec::new();
+        let mut catalog_names = 0_usize;
+        let mut log_targets_found = BTreeSet::new();
+
+        for path in rust_sources(root) {
+            let relative = relative_path(root, &path);
+            let source = std::fs::read_to_string(&path).unwrap();
+
+            for name in scan_liq_names(&source).production_names {
+                if relative == LIQ_CATALOG_FILE {
+                    catalog_names += 1;
+                } else if LIQ_LOG_TARGETS
+                    .iter()
+                    .any(|&(file, target)| file == relative && target == name)
+                {
+                    log_targets_found.insert((relative.clone(), name));
+                } else {
+                    violations.push(format!("{relative}: \"{name}\""));
+                }
+            }
+        }
+
+        assert_eq!(
+            violations,
+            Vec::<String>::new(),
+            "liq_ names belong to the catalog in {LIQ_CATALOG_FILE}"
+        );
+        assert!(
+            catalog_names > 0,
+            "the catalog in {LIQ_CATALOG_FILE} must still hold liq_ names"
+        );
+        let allowed: BTreeSet<(String, String)> = LIQ_LOG_TARGETS
+            .iter()
+            .map(|&(file, target)| (file.to_string(), target.to_string()))
+            .collect();
+        assert_eq!(
+            log_targets_found, allowed,
+            "every allowed log target must still be found where it is allowed"
+        );
+    }
+
+    #[test]
+    fn liq_name_scan_sees_names_behind_consts_and_skips_log_text_and_tests() {
+        let source = concat!(
+            "const NAME: &str = \"liq_hidden\";\n",
+            "fn publish() { set_gauge(NAME); }\n",
+            "fn log() { info!(\"liq_ state refresh started\"); }\n",
+            "fn prefix(name: &str) -> bool { name.starts_with(\"liq_\") }\n",
+            "const RAW: &str = r\"liq_raw\";\n",
+            "const RAW_HASHED: &str = r#\"liq_raw_hashed\"#;\n",
+            "fn built(kind: &str) -> String { format!(\"liq_{kind}_shares\") }\n",
+            "const UPPER: &str = \"liq_Unexpected\";\n",
+            "const UNDERSCORE: &str = \"liq__double\";\n",
+            "/// Doc text with liq_doc_comment.\n",
+            "// const COMMENTED: &str = \"liq_commented\";\n",
+            "#[cfg(test)]\n",
+            "mod tests { const IN_TEST: &str = \"liq_test_only\"; }\n",
+        );
+
+        assert_eq!(
+            scan_liq_names(source).production_names,
+            vec![
+                "liq_hidden",
+                "liq_raw",
+                "liq_raw_hashed",
+                "liq_{kind}_shares",
+                "liq_Unexpected",
+                "liq__double",
+            ]
+        );
+    }
+
+    #[test]
+    fn liq_name_scan_skips_each_test_item_and_reads_the_code_after_it() {
+        let source = concat!(
+            "/* #[cfg(test)] mod example { */\n",
+            "const AFTER_COMMENT: &str = \"liq_after_comment\";\n",
+            "const TEXT: &str = \"#[cfg(test)] mod example {\";\n",
+            "const AFTER_STRING: &str = \"liq_after_string\";\n",
+            "#[cfg(test)]\n",
+            "mod integration_tests;\n",
+            "const AFTER_DECLARATION: &str = \"liq_after_declaration\";\n",
+            "#[cfg(test)]\n",
+            "pub(crate) mod tests {\n",
+            "    const BRACE: char = '}';\n",
+            "    const RAW: &str = r#\"}\"#;\n",
+            "    // }\n",
+            "    /* outer /* inner */ { */\n",
+            "    const IN_TEST: &str = \"liq_test_only\";\n",
+            "    fn record() { gauge!(\"liq_in_test\").set(1.0); }\n",
+            "}\n",
+            "#[cfg(test)]\n",
+            "const TEST_CONST: Named = Named { name: \"liq_test_const\" };\n",
+            "#[cfg(test)]\n",
+            "#[allow(dead_code)]\n",
+            "pub(crate) fn test_helper() -> &'static str { \"liq_test_fn\" }\n",
+            "fn publish() {\n",
+            "    #[cfg(test)]\n",
+            "    let name = Named { name: \"liq_test_statement\" };\n",
+            "    set_gauge(\"liq_in_function\");\n",
+            "}\n",
+            "const AFTER_TESTS: &str = \"liq_after_tests\";\n",
+        );
+
+        let scan = scan_liq_names(source);
+
+        assert_eq!(
+            scan.production_names,
+            vec![
+                "liq_after_comment",
+                "liq_after_string",
+                "liq_after_declaration",
+                "liq_in_function",
+                "liq_after_tests",
+            ]
+        );
+        assert_eq!(scan.macro_names, vec!["liq_in_test"]);
+    }
+
+    #[test]
+    fn liq_name_scan_skips_a_file_marked_as_test_only() {
+        let source = concat!(
+            "#![cfg(test)]\n",
+            "const IN_TEST: &str = \"liq_test_only\";\n",
+        );
+
+        assert_eq!(
+            scan_liq_names(source).production_names,
+            Vec::<String>::new()
+        );
+    }
+
+    /// Every `.rs` file under `src/` and `crates/`, sorted.
+    fn rust_sources(root: &Path) -> Vec<PathBuf> {
+        let mut sources = Vec::new();
+        let mut pending = vec![root.join("src"), root.join("crates")];
 
         while let Some(path) = pending.pop() {
             if path.is_dir() {
+                if path.file_name().is_some_and(|name| name == "target") {
+                    continue;
+                }
                 pending.extend(
                     std::fs::read_dir(&path)
                         .unwrap()
                         .map(|entry| entry.unwrap().path()),
                 );
-                continue;
-            }
-            if path.extension().is_none_or(|extension| extension != "rs") {
-                continue;
-            }
-
-            let source = std::fs::read_to_string(&path).unwrap();
-            for (offset, _) in source.match_indices("\"liq_") {
-                let before = source[..offset].trim_end();
-                if macros.iter().any(|call| before.ends_with(call)) {
-                    violations.push(format!("{}:{offset}", path.display()));
-                }
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                sources.push(path);
             }
         }
 
-        assert_eq!(violations, Vec::<String>::new());
+        sources.sort();
+        sources
+    }
+
+    /// `path` relative to `root`, with `/` separators.
+    fn relative_path(root: &Path, path: &Path) -> String {
+        path.strip_prefix(root)
+            .unwrap()
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// What one token walk over a Rust source file finds.
+    #[derive(Debug, Default)]
+    struct LiqScan {
+        /// `liq_` name literals outside `#[cfg(test)]` items, in order.
+        production_names: Vec<String>,
+        /// `liq_` literals passed as the first argument of a `metrics`
+        /// macro, test code included, in order.
+        macro_names: Vec<String>,
+    }
+
+    /// Lexes `source` with `proc-macro2`, so comments (nested ones too) are
+    /// dropped, plain and raw strings are literals, and whitespace between
+    /// a macro name, its `!` and its arguments does not matter.
+    fn scan_liq_names(source: &str) -> LiqScan {
+        let tokens: Vec<TokenTree> = source.parse::<TokenStream>().unwrap().into_iter().collect();
+        let mut scan = LiqScan::default();
+        walk_tokens(&tokens, false, &mut scan);
+        scan
+    }
+
+    /// Records the `liq_` literals of `tokens`, groups included, into
+    /// `scan`. `in_test` marks tokens inside a `#[cfg(test)]` item.
+    fn walk_tokens(tokens: &[TokenTree], in_test: bool, scan: &mut LiqScan) {
+        let mut index = 0;
+
+        while let Some(token) = tokens.get(index) {
+            let is_hash = is_punct(Some(token), '#');
+
+            if is_hash && is_punct(tokens.get(index + 1), '!') && is_cfg_test(tokens.get(index + 2))
+            {
+                walk_tokens(&tokens[index + 3..], true, scan);
+                return;
+            }
+            if is_hash && is_cfg_test(tokens.get(index + 1)) {
+                let end = attributed_item_end(tokens, index + 2);
+                walk_tokens(&tokens[index + 2..end], true, scan);
+                index = end;
+                continue;
+            }
+
+            match token {
+                TokenTree::Group(group) => {
+                    let inner: Vec<TokenTree> = group.stream().into_iter().collect();
+                    walk_tokens(&inner, in_test, scan);
+                }
+                TokenTree::Literal(literal) if !in_test => {
+                    if let Some(value) = string_literal_value(literal)
+                        && is_liq_name(&value)
+                    {
+                        scan.production_names.push(value);
+                    }
+                }
+                TokenTree::Ident(ident) => {
+                    if let Some(value) = metrics_macro_liq_name(ident, &tokens[index + 1..]) {
+                        scan.macro_names.push(value);
+                    }
+                }
+                TokenTree::Literal(_) | TokenTree::Punct(_) => {}
+            }
+            index += 1;
+        }
+    }
+
+    /// The `liq_` literal that `ident` passes as the first argument when
+    /// it names a `metrics` macro and `after` holds its `!` and arguments.
+    /// The `describe_` macros end with the same names, so they match too.
+    fn metrics_macro_liq_name(ident: &Ident, after: &[TokenTree]) -> Option<String> {
+        const MACROS: [&str; 3] = ["counter", "gauge", "histogram"];
+
+        let name = ident.to_string();
+        if !MACROS.iter().any(|call| name.ends_with(call)) || !is_punct(after.first(), '!') {
+            return None;
+        }
+        let Some(TokenTree::Group(arguments)) = after.get(1) else {
+            return None;
+        };
+        let Some(TokenTree::Literal(first)) = arguments.stream().into_iter().next() else {
+            return None;
+        };
+
+        string_literal_value(&first).filter(|value| value.starts_with("liq_"))
+    }
+
+    /// Index just past the item that starts at `start`, the item an outer
+    /// `#[cfg(test)]` applies to. Further outer attributes come first. A
+    /// `const`, `static`, `let`, `use` or `type` ends at its `;`. Another
+    /// item (`fn`, `mod`, `impl` and so on) ends at its `;` or its body.
+    /// A field, variant or statement also ends at a `,`.
+    fn attributed_item_end(tokens: &[TokenTree], start: usize) -> usize {
+        const ITEMS: [&str; 8] = [
+            "fn",
+            "mod",
+            "impl",
+            "struct",
+            "enum",
+            "union",
+            "trait",
+            "macro_rules",
+        ];
+        const DECLARATIONS: [&str; 5] = ["const", "static", "let", "use", "type"];
+
+        let mut item_start = start;
+        while is_punct(tokens.get(item_start), '#')
+            && matches!(
+                tokens.get(item_start + 1),
+                Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Bracket
+            )
+        {
+            item_start += 2;
+        }
+
+        let leading_words: Vec<String> = tokens[item_start..]
+            .iter()
+            .filter(|token| {
+                !matches!(
+                    token,
+                    TokenTree::Group(group) if group.delimiter() == Delimiter::Parenthesis
+                )
+            })
+            .map_while(|token| match token {
+                TokenTree::Ident(ident) => Some(ident.to_string()),
+                _ => None,
+            })
+            .collect();
+        let has_any = |keywords: &[&str]| {
+            leading_words
+                .iter()
+                .any(|word| keywords.contains(&word.as_str()))
+        };
+        let is_item = has_any(ITEMS.as_slice());
+        let is_declaration = !is_item && has_any(DECLARATIONS.as_slice());
+
+        tokens[item_start..]
+            .iter()
+            .position(|token| match token {
+                TokenTree::Punct(punct) => {
+                    punct.as_char() == ';'
+                        || (!is_item && !is_declaration && punct.as_char() == ',')
+                }
+                TokenTree::Group(group) => !is_declaration && group.delimiter() == Delimiter::Brace,
+                TokenTree::Ident(_) | TokenTree::Literal(_) => false,
+            })
+            .map_or(tokens.len(), |offset| item_start + offset + 1)
+    }
+
+    fn is_punct(token: Option<&TokenTree>, character: char) -> bool {
+        matches!(token, Some(TokenTree::Punct(punct)) if punct.as_char() == character)
+    }
+
+    /// Whether `token` is the `[cfg(test)]` part of an attribute.
+    fn is_cfg_test(token: Option<&TokenTree>) -> bool {
+        matches!(
+            token,
+            Some(TokenTree::Group(group))
+                if group.delimiter() == Delimiter::Bracket
+                    && group.stream().to_string().replace(' ', "") == "cfg(test)"
+        )
+    }
+
+    /// The text of a plain or raw string literal, escapes left as written.
+    /// `None` for any other literal.
+    fn string_literal_value(literal: &Literal) -> Option<String> {
+        let text = literal.to_string();
+
+        text.trim_start_matches('r')
+            .trim_matches('#')
+            .strip_prefix('"')?
+            .strip_suffix('"')
+            .map(str::to_string)
+    }
+
+    /// Whether a string literal's text names a `liq_` series: `liq_`
+    /// followed by an ASCII letter, digit or `_`, or by `{` (a name built
+    /// with `format!`). Log text such as `"liq_ state refresh started"` and
+    /// the bare prefix `"liq_"` are not names.
+    fn is_liq_name(text: &str) -> bool {
+        text.strip_prefix("liq_")
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(|next| next.is_ascii_alphanumeric() || next == '_' || next == '{')
     }
 }
