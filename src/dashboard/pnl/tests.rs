@@ -20,7 +20,7 @@ use st0x_execution::alpaca_broker_api::AccountActivity;
 use st0x_finance::{FractionalShares, Positive, Symbol, Usd, Usdc};
 use st0x_float_macro::float;
 
-use super::builder::build_pnl_response_from_rows;
+use super::builder::{build_pnl_response_from_rows, replay_pnl_rows, summarize_pnl_window};
 use super::costs::{
     AccountingBucket, AccountingEffect, CostCategory, CostEntryInternal, validated_cost_magnitude,
 };
@@ -2970,6 +2970,157 @@ fn drops_unsafe_symbols_from_replay_rows_and_position_view() {
             .iter()
             .any(|warning| { warning.contains("Skipped unsafe position event symbol") })
     );
+}
+
+/// One replay summarized for several windows gives each window what a
+/// replay of its own gives, and each window's warnings come in the order a
+/// single replay writes them: the wrapper-ratio warning for the window's
+/// dates, the position view and range warnings, the sample stats, the
+/// replay, then the cost rows and the window's Alpaca activities. The
+/// `SPYM` fill has no wrapper ratio and is inside only some windows, so a
+/// wrapper-ratio warning in the wrong place fails the literal lists.
+#[test]
+fn a_shared_replay_summarizes_each_window_like_its_own_replay() {
+    let unsafe_fill_symbol = "RKLB'); DROP TABLE events; --";
+    let mut legacy_fill = onchain_fill(
+        6,
+        "SPYM",
+        Direction::Sell,
+        "20",
+        "1",
+        "2026-05-18T15:00:00Z",
+    );
+    let PositionLedgerRow::OnchainFill(fill) = &mut legacy_fill else {
+        unreachable!("onchain_fill always returns an onchain fill");
+    };
+    fill.underlying_per_wrapped_fixed18 = None;
+    let events = vec![
+        onchain_fill(
+            1,
+            unsafe_fill_symbol,
+            Direction::Sell,
+            "10",
+            "1",
+            "2026-05-15T14:00:00Z",
+        ),
+        onchain_sell(2, "10", "2026-05-15T14:00:00Z"),
+        offchain_buy(3, "2026-05-15T14:01:00Z", "8", "1"),
+        onchain_sell(4, "12", "2026-05-18T14:00:00Z"),
+        offchain_buy(5, "2026-05-18T14:01:00Z", "9", "1"),
+        legacy_fill,
+        offchain_fill(7, "SPYM", Direction::Buy, "2026-05-18T15:01:00Z", "19", "1"),
+    ];
+    let positions = [
+        position_row("RKLB", "0"),
+        position_row("SPYM", "0"),
+        position_row("BAD';--", "0"),
+    ];
+    let cost_rows = [CostLedgerRow {
+        event_rowid: 8,
+        source: CostSource::TokenizationFee,
+        aggregate_id: "mint-1".to_owned(),
+        symbol: Some("BAD';--".to_owned()),
+        amount_usd: Some("0.5".to_owned()),
+        occurred_at: "2026-05-15T15:00:00Z".to_owned(),
+    }];
+    let activities = [account_activity(
+        "fee-1",
+        "FEE",
+        "-0.25",
+        None,
+        "2026-05-18T16:00:00Z",
+    )];
+    let symbols = BTreeSet::new();
+    let warnings = vec![
+        ATTRIBUTION_WARNING.to_owned(),
+        BASELINE_WARNING.to_owned(),
+        COST_WARNING.to_owned(),
+    ];
+    let replay = replay_pnl_rows(events.clone(), &positions, &symbols).unwrap();
+
+    let wrapper_ratio = "Onchain fills for SPYM in this range were recorded before per-fill \
+                         wrapper ratios and count 1:1 in wrapped shares. That is exact for a \
+                         wrapper whose ratio is 1 and approximate for one above 1, such as SGOV.";
+    let position_view = "Skipped unsafe position_view symbol in backend PnL response: BAD';--";
+    let range = format!(
+        "Skipped unsafe available range symbol in backend PnL response: {unsafe_fill_symbol}"
+    );
+    let sample_stats =
+        format!("Skipped unsafe sample stats symbol in backend PnL response: {unsafe_fill_symbol}");
+    let replayed = format!(
+        "Skipped unsafe position event symbol in backend PnL response: {unsafe_fill_symbol}"
+    );
+    let cost = "Skipped unsafe tokenization cost symbol in backend PnL response: BAD';--";
+    let alpaca = "Cost coverage note: 1 Alpaca account activity rows were fetched from the \
+                  broker API and included as explicit cost/revenue ledger entries.";
+    let with_spym_and_fee: [&str; 10] = [
+        ATTRIBUTION_WARNING,
+        BASELINE_WARNING,
+        COST_WARNING,
+        wrapper_ratio,
+        position_view,
+        &range,
+        &sample_stats,
+        &replayed,
+        cost,
+        alpaca,
+    ];
+    let without: [&str; 8] = [
+        ATTRIBUTION_WARNING,
+        BASELINE_WARNING,
+        COST_WARNING,
+        position_view,
+        &range,
+        &sample_stats,
+        &replayed,
+        cost,
+    ];
+
+    for (from, to, expected_warnings) in [
+        (None, None, with_spym_and_fee.as_slice()),
+        (Some("2026-05-15"), Some("2026-05-15"), without.as_slice()),
+        (
+            Some("2026-05-16"),
+            Some("2026-05-20"),
+            with_spym_and_fee.as_slice(),
+        ),
+        (Some("2026-06-01"), Some("2026-06-30"), without.as_slice()),
+    ] {
+        let window = PnlQuery {
+            from_date: from.map(str::to_owned),
+            to_date: to.map(str::to_owned),
+            ..query()
+        };
+
+        let (own, _own_daily) = build_pnl_response_from_rows(
+            events.clone(),
+            &positions,
+            &cost_rows,
+            &[],
+            &activities,
+            &window,
+            &symbols,
+            warnings.clone(),
+        )
+        .unwrap();
+        let (shared, _shared_daily) = summarize_pnl_window(
+            &replay,
+            &cost_rows,
+            &[],
+            &activities,
+            &window,
+            &symbols,
+            warnings.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(shared.warnings, expected_warnings, "{from:?}..{to:?}");
+        assert_eq!(
+            serde_json::to_string(&shared).unwrap(),
+            serde_json::to_string(&own).unwrap(),
+            "{from:?}..{to:?}"
+        );
+    }
 }
 
 #[test]
