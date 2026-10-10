@@ -92,6 +92,7 @@ use crate::equity_redemption::{
 use crate::inventory::{
     BroadcastingInventory, EquityWalletPolling, InventorySnapshot, PollFreshness,
 };
+use crate::metrics::liquidity::bands::EquityBandPublisher;
 use crate::mint_authorization::{
     ConfiguredMintAuthorizer, MintAuthorizationService, VaultModeReader,
 };
@@ -2684,6 +2685,9 @@ async fn attach_manifest_handles(
             marks: equity_prices,
         }))
         .await;
+    rebalancing_service.publish_equity_bands(EquityBandPublisher::new(
+        &crate::metrics::liquidity::LIQ_FAMILIES,
+    ));
 }
 
 /// Wires the pre-dispatch safety checks used by fresh rebalancing transfers:

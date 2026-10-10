@@ -159,6 +159,8 @@ BOT_ONLY = {
     "liq_usdc_corridor_active",
     "liq_equity_chain_available",
     "liq_equity_chain_inflight",
+    "liq_equity_chain_share",
+    "liq_equity_chain_verdict",
     "liq_usdc_chain_available",
     "liq_usdc_chain_inflight",
     "liq_usdc_chain_ratio",

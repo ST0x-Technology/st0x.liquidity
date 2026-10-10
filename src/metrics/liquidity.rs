@@ -29,6 +29,7 @@ use st0x_float_serde::format_float;
 
 use self::pnl::PnlWindowKey;
 
+pub(crate) mod bands;
 pub(crate) mod inventory;
 pub(crate) mod log_counts;
 pub(crate) mod orders;
@@ -74,6 +75,8 @@ pub(crate) enum LiqMetric {
     EquityRatio,
     EquityChainAvailable,
     EquityChainInflight,
+    EquityChainShare,
+    EquityChainVerdict,
     UsdcOnchainAvailable,
     UsdcOnchainInflight,
     UsdcOffchainAvailable,
@@ -148,7 +151,7 @@ impl LiqMetric {
     /// Every variant, for the catalog tests. A new variant needs an entry
     /// here and its name in the catalog test.
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 95] = [
+    pub(crate) const ALL: [Self; 97] = [
         Self::BotInfo,
         Self::BotStartTimestampSeconds,
         Self::SettingsInfo,
@@ -176,6 +179,8 @@ impl LiqMetric {
         Self::EquityRatio,
         Self::EquityChainAvailable,
         Self::EquityChainInflight,
+        Self::EquityChainShare,
+        Self::EquityChainVerdict,
         Self::UsdcOnchainAvailable,
         Self::UsdcOnchainInflight,
         Self::UsdcOffchainAvailable,
@@ -275,6 +280,8 @@ impl LiqMetric {
             Self::EquityRatio => "liq_equity_ratio",
             Self::EquityChainAvailable => "liq_equity_chain_available",
             Self::EquityChainInflight => "liq_equity_chain_inflight",
+            Self::EquityChainShare => "liq_equity_chain_share",
+            Self::EquityChainVerdict => "liq_equity_chain_verdict",
             Self::UsdcOnchainAvailable => "liq_usdc_onchain_available",
             Self::UsdcOnchainInflight => "liq_usdc_onchain_inflight",
             Self::UsdcOffchainAvailable => "liq_usdc_offchain_available",
@@ -400,6 +407,8 @@ impl LiqMetric {
                 "Wrapped vault shares on each hedged chain a snapshot read; never sum chains"
             }
             Self::EquityChainInflight => "In flight from each hedged chain vault; units in SPEC",
+            Self::EquityChainShare => "Chain's share of the symbol in underlying shares",
+            Self::EquityChainVerdict => "-1 below the chain's band, 0 within, 1 above",
             Self::UsdcOnchainAvailable => "Primary chain vault settlement stable available",
             Self::UsdcOnchainInflight => "Primary chain vault settlement stable in flight",
             Self::UsdcOffchainAvailable => "Broker cash available after the reserve",
@@ -434,59 +443,25 @@ impl LiqMetric {
                 "Live wrapped-token mid price in USD of each symbol with a position"
             }
             Self::EquityExposureUsd => "Net position times its live price, in USD",
-            Self::HedgeLatencyMs => {
-                "Hedge pipeline stage latency over the last 24 hours, by stage and \
-                 nearest-rank quantile (p50, p90, p95, p99, max)"
-            }
-            Self::HedgeLatencyMsSamples => "Samples behind each liq_hedge_latency_ms stage",
-            Self::OpenExposureFillCount => {
-                "Fills observed after the symbol's latest hedge placement"
-            }
-            Self::OpenExposureOldestTsSeconds => {
-                "Block time of the oldest fill not yet covered by a hedge"
-            }
-            Self::ReliabilityLogCount24h => {
-                "Error and warning log events over the last 24 hours, by level (error, warning); \
-                 0 without file logging"
-            }
-            Self::LogTargetCount24h => {
-                "Error and warning log events over the last 24 hours, by target and level (ERROR, \
-                 WARN); only targets with events"
-            }
-            Self::FailureEventCount24h => {
-                "Money-at-risk lifecycle failure events over the last 24 hours, by event type"
-            }
-            Self::JobQueue => "Jobs in each apalis queue now, by job type and state; not windowed",
-            Self::BlockLagBlocks => "Latest sampled order-fill block lag of each hedged chain",
-            Self::BlockLagSampledTsSeconds => {
-                "Unix time of each hedged chain's latest block-lag sample"
-            }
-            Self::PollCycles24h => {
-                "Order-fill poll cycles of each hedged chain over the last 24 hours"
-            }
-            Self::PollErrors24h => {
-                "Failed order-fill poll cycles of each hedged chain over the last 24 hours"
-            }
-            Self::PollSkippedTicks24h => {
-                "Order-fill poll ticks each hedged chain dropped over the last 24 hours"
-            }
-            Self::PollDurationMs => {
-                "Order-fill poll cycle duration over the last 24 hours, by chain and quantile"
-            }
-            Self::DependencyCalls24h => {
-                "External dependency calls over the last 24 hours, by dependency and operation"
-            }
-            Self::DependencyErrors24h => "Failed external dependency calls over the last 24 hours",
-            Self::DependencyLatencyMs => {
-                "External dependency call latency over the last 24 hours, by quantile"
-            }
-            Self::RebalanceStageMs => {
-                "Completed rebalance stage duration over the last 30 days, by kind (usdc, \
-                 equity), stage and quantile"
-            }
-            Self::AttestationLastMs => {
-                "Duration of the latest CCTP attestation in the last 30 days"
-            }
+            Self::HedgeLatencyMs
+            | Self::HedgeLatencyMsSamples
+            | Self::OpenExposureFillCount
+            | Self::OpenExposureOldestTsSeconds
+            | Self::ReliabilityLogCount24h
+            | Self::LogTargetCount24h
+            | Self::FailureEventCount24h
+            | Self::JobQueue
+            | Self::BlockLagBlocks
+            | Self::BlockLagSampledTsSeconds
+            | Self::PollCycles24h
+            | Self::PollErrors24h
+            | Self::PollSkippedTicks24h
+            | Self::PollDurationMs
+            | Self::DependencyCalls24h
+            | Self::DependencyErrors24h
+            | Self::DependencyLatencyMs
+            | Self::RebalanceStageMs
+            | Self::AttestationLastMs => self.operations_help(),
             Self::PnlSummaryUsd => {
                 "Window PnL in USD by stream; absent when the report's decimal does not parse"
             }
@@ -549,6 +524,69 @@ impl LiqMetric {
         }
     }
 
+    /// HELP text of the latency, reliability, infrastructure and rebalance
+    /// names, which `help` routes here.
+    const fn operations_help(self) -> &'static str {
+        match self {
+            Self::HedgeLatencyMs => {
+                "Hedge pipeline stage latency over the last 24 hours, by stage and \
+                 nearest-rank quantile (p50, p90, p95, p99, max)"
+            }
+            Self::HedgeLatencyMsSamples => "Samples behind each liq_hedge_latency_ms stage",
+            Self::OpenExposureFillCount => {
+                "Fills observed after the symbol's latest hedge placement"
+            }
+            Self::OpenExposureOldestTsSeconds => {
+                "Block time of the oldest fill not yet covered by a hedge"
+            }
+            Self::ReliabilityLogCount24h => {
+                "Error and warning log events over the last 24 hours, by level (error, warning); \
+                 0 without file logging"
+            }
+            Self::LogTargetCount24h => {
+                "Error and warning log events over the last 24 hours, by target and level (ERROR, \
+                 WARN); only targets with events"
+            }
+            Self::FailureEventCount24h => {
+                "Money-at-risk lifecycle failure events over the last 24 hours, by event type"
+            }
+            Self::JobQueue => "Jobs in each apalis queue now, by job type and state; not windowed",
+            Self::BlockLagBlocks => "Latest sampled order-fill block lag of each hedged chain",
+            Self::BlockLagSampledTsSeconds => {
+                "Unix time of each hedged chain's latest block-lag sample"
+            }
+            Self::PollCycles24h => {
+                "Order-fill poll cycles of each hedged chain over the last 24 hours"
+            }
+            Self::PollErrors24h => {
+                "Failed order-fill poll cycles of each hedged chain over the last 24 hours"
+            }
+            Self::PollSkippedTicks24h => {
+                "Order-fill poll ticks each hedged chain dropped over the last 24 hours"
+            }
+            Self::PollDurationMs => {
+                "Order-fill poll cycle duration over the last 24 hours, by chain and quantile"
+            }
+            Self::DependencyCalls24h => {
+                "External dependency calls over the last 24 hours, by dependency and operation"
+            }
+            Self::DependencyErrors24h => "Failed external dependency calls over the last 24 hours",
+            Self::DependencyLatencyMs => {
+                "External dependency call latency over the last 24 hours, by quantile"
+            }
+            Self::RebalanceStageMs => {
+                "Completed rebalance stage duration over the last 30 days, by kind (usdc, \
+                 equity), stage and quantile"
+            }
+            Self::AttestationLastMs => {
+                "Duration of the latest CCTP attestation in the last 30 days"
+            }
+            // `help` routes only the names above here; the catalog test
+            // fails on the empty text if one is routed without its own arm.
+            _ => "",
+        }
+    }
+
     /// The label keys every sample of this metric carries, sorted.
     const fn label_keys(self) -> &'static [&'static str] {
         match self {
@@ -577,7 +615,10 @@ impl LiqMetric {
             | Self::EquityExposureUsd
             | Self::OpenExposureFillCount
             | Self::OpenExposureOldestTsSeconds => &["symbol"],
-            Self::EquityChainAvailable | Self::EquityChainInflight => &["chain", "symbol"],
+            Self::EquityChainAvailable
+            | Self::EquityChainInflight
+            | Self::EquityChainShare
+            | Self::EquityChainVerdict => &["chain", "symbol"],
             Self::UsdcCorridorTarget
             | Self::UsdcCorridorDeviation
             | Self::UsdcCorridorActive
@@ -701,6 +742,7 @@ impl LiqMetric {
             | Self::UsdcChainInflight
             | Self::UsdcChainRatio => Some(LiqFamily::Inventory),
             Self::PositionLastPriceUsd | Self::EquityExposureUsd => Some(LiqFamily::Prices),
+            Self::EquityChainShare | Self::EquityChainVerdict => Some(LiqFamily::EquityBands),
             Self::HedgeLatencyMs
             | Self::HedgeLatencyMsSamples
             | Self::OpenExposureFillCount
@@ -766,6 +808,10 @@ pub(crate) enum LiqFamily {
     Settings,
     Inventory,
     Prices,
+    /// The allocation planner's band verdict per chain, replaced each time
+    /// the trigger plans a symbol or refreshes one whose transfer is in
+    /// progress.
+    EquityBands,
     Latencies,
     Reliability,
     Infra,
@@ -785,6 +831,7 @@ impl LiqFamily {
             Self::Settings => "settings",
             Self::Inventory => "inventory",
             Self::Prices => "prices",
+            Self::EquityBands => "equity_bands",
             Self::Latencies => "latencies",
             Self::Reliability => "reliability",
             Self::Infra => "infra",
@@ -807,6 +854,7 @@ impl LiqFamily {
             | Self::Settings
             | Self::Inventory
             | Self::Prices
+            | Self::EquityBands
             | Self::Latencies
             | Self::Reliability
             | Self::Infra
@@ -1403,6 +1451,8 @@ pub(crate) mod tests {
                 "liq_equity_ratio",
                 "liq_equity_chain_available",
                 "liq_equity_chain_inflight",
+                "liq_equity_chain_share",
+                "liq_equity_chain_verdict",
                 "liq_usdc_onchain_available",
                 "liq_usdc_onchain_inflight",
                 "liq_usdc_offchain_available",
@@ -1479,6 +1529,7 @@ pub(crate) mod tests {
                 LiqFamily::Settings,
                 LiqFamily::Inventory,
                 LiqFamily::Prices,
+                LiqFamily::EquityBands,
                 LiqFamily::Latencies,
                 LiqFamily::Reliability,
                 LiqFamily::Infra,
@@ -1492,6 +1543,7 @@ pub(crate) mod tests {
                 "settings",
                 "inventory",
                 "prices",
+                "equity_bands",
                 "latencies",
                 "reliability",
                 "infra",
