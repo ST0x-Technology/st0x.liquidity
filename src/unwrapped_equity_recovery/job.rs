@@ -56,6 +56,7 @@ use super::aggregate::{
     UnwrappedEquityRecovery, UnwrappedEquityRecoveryCommand, UnwrappedEquityRecoveryError,
     UnwrappedEquityRecoveryId,
 };
+use crate::alerts::AlertKind;
 #[cfg(test)]
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::bot_gas::redrive::{BotGasFailureClassifier, redrive_on_bot_gas_failure};
@@ -411,6 +412,7 @@ impl Job<UnwrappedEquityRecoveryCtx> for UnwrappedEquityRecoveryJob {
                 error!(
                     target: "operational_alert",
                     alert = true,
+                    kind = AlertKind::RecoveryActiveTransferOnOtherChain.as_str(),
                     chain = %self.chain,
                     %symbol,
                     recovery_id = %self.recovery_id,
@@ -431,6 +433,7 @@ impl Job<UnwrappedEquityRecoveryCtx> for UnwrappedEquityRecoveryJob {
                 error!(
                     target: "operational_alert",
                     alert = true,
+                    kind = AlertKind::RecoveryChainServicesMissing.as_str(),
                     chain = %self.chain,
                     %symbol,
                     recovery_id = %self.recovery_id,

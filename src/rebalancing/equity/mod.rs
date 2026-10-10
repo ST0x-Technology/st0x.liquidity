@@ -63,7 +63,7 @@ use st0x_wrapper::{
 
 use super::RebalancingService;
 use super::trigger::RecoveryClaim;
-use crate::alerts::Notifier;
+use crate::alerts::{AlertKind, Notifier};
 use crate::bindings::IRaindexInventory::withdraw4Call;
 use crate::bot_gas::redrive::BotGasFailureClassifier;
 use crate::bot_gas::{
@@ -201,7 +201,10 @@ pub(crate) async fn page_underlying_mismatch(
          then end the redemption with `stox transfer fail --kind redemption --id {aggregate_id} \
          --reason <reason>` and handle those tokens by hand."
     );
-    if let Err(alert_error) = notifier.notify(&message).await {
+    if let Err(alert_error) = notifier
+        .notify(AlertKind::RedemptionLegacyUnderlyingMismatch, &message)
+        .await
+    {
         warn!(target: "rebalance", %aggregate_id, %alert_error, "Failed to deliver the underlying mismatch alert");
     }
 }
@@ -277,7 +280,10 @@ pub(crate) async fn withdrawal_reconciliation_redrive_delay(
                  the chain proves the withdrawal can never land, and releases its reservation \
                  and the wallet's hold on its nonce."
             );
-            if let Err(alert_error) = notifier.notify(&message).await {
+            if let Err(alert_error) = notifier
+                .notify(AlertKind::RaindexVaultWithdrawalUnconfirmed, &message)
+                .await
+            {
                 warn!(
                     target: "rebalance",
                     %aggregate_id,

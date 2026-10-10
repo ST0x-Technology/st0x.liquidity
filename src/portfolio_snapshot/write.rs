@@ -69,7 +69,7 @@ use super::read::is_stale_mark;
 use super::{
     PortfolioBalanceRowWithMark, PortfolioSnapshot, PortfolioSnapshotCommand, PortfolioSnapshotId,
 };
-use crate::alerts::{Notifier, NotifierError};
+use crate::alerts::{AlertKind, Notifier, NotifierError};
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::dashboard::equity_price::EquityPriceStore;
 use crate::inventory::{
@@ -540,6 +540,13 @@ impl UnusableMark {
             Self::Stale { .. } => "stale",
         }
     }
+
+    const fn alert_kind(&self) -> AlertKind {
+        match self {
+            Self::Missing => AlertKind::PortfolioSnapshotMarkMissing,
+            Self::Stale { .. } => AlertKind::PortfolioSnapshotMarkStale,
+        }
+    }
 }
 
 impl std::fmt::Display for UnusableMark {
@@ -629,7 +636,7 @@ async fn alert_unusable_marks(
         let message = format!(
             "🚨 Portfolio snapshot mark {reason}\nET day: {target_et_day}\nSymbol: {symbol}\nTotal contributing balance: {formatted_balance}\nRepair: st0x-cli portfolio-snapshot set --day {target_et_day} --symbol {symbol} ..."
         );
-        ctx.notifier.notify(&message).await?;
+        ctx.notifier.notify(reason.alert_kind(), &message).await?;
         ctx.portfolio_snapshot
             .send(
                 id,
@@ -1431,7 +1438,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Notifier for FailOnceNotifier {
-        async fn notify(&self, _message: &str) -> Result<(), NotifierError> {
+        async fn notify(
+            &self,
+            _kind: crate::alerts::AlertKind,
+            _message: &str,
+        ) -> Result<(), NotifierError> {
             if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                 return Err(NotifierError::Simulated);
             }

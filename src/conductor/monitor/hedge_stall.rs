@@ -77,7 +77,7 @@ use st0x_execution::{
     Executor, FractionalShares, MarketSession, MarketSessionStatus, Positive, Symbol,
 };
 
-use crate::alerts::Notifier;
+use crate::alerts::{AlertKind, Notifier};
 use crate::position::{Position, PositionError};
 use crate::position_check::{HedgeScanHeartbeat, backstop_sizing_assets};
 use crate::trading::offchain::close_flatten::CloseFlattenPolicy;
@@ -452,6 +452,19 @@ fn alert_message(
     }
 }
 
+/// The alert kind of [`alert_message`]: its prefix and fixed phrase.
+fn alert_kind(observation: &StallObservation) -> AlertKind {
+    match observation {
+        StallObservation::Scan { .. } => AlertKind::HedgeStalledScanNotRunning,
+        StallObservation::SessionUnreadable => AlertKind::HedgeStalledSessionUnreadable,
+        StallObservation::Symbol { kind, .. } => match kind {
+            StallKind::ExposureNotPlaced => AlertKind::HedgeStalledExposureNotPlaced,
+            StallKind::OrderNotCompleting => AlertKind::HedgeStalledOrderNotCompleting,
+            StallKind::AnchoredTooLong => AlertKind::HedgeStalledAnchoredTooLong,
+        },
+    }
+}
+
 /// Long-running supervised task that raises hedge-stall alerts.
 #[derive(Clone)]
 pub(crate) struct HedgeStallMonitor<E> {
@@ -630,7 +643,7 @@ where
                 // scan check.
                 match tokio::time::timeout(
                     self.timings.poll_interval,
-                    self.notifier.notify(&message),
+                    self.notifier.notify(alert_kind(observation), &message),
                 )
                 .await
                 {
@@ -1272,6 +1285,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn each_alert_kind_is_the_messages_fixed_prefix() {
+        let symbol = |kind| StallObservation::Symbol {
+            symbol: aapl(),
+            kind,
+            net: FractionalShares::new(float!(5)),
+            hedged: FractionalShares::ZERO,
+        };
+        let observations = [
+            StallObservation::Scan {
+                last_completed_at: None,
+            },
+            StallObservation::SessionUnreadable,
+            symbol(StallKind::ExposureNotPlaced),
+            symbol(StallKind::OrderNotCompleting),
+            symbol(StallKind::AnchoredTooLong),
+        ];
+
+        let kinds: Vec<&str> = observations
+            .iter()
+            .map(|observation| {
+                let message =
+                    alert_message(observation, MarketSession::Regular, tick(0), tick(900));
+                let kind = alert_kind(observation).as_str();
+                assert!(
+                    message.starts_with(kind),
+                    "{message:?} does not start with {kind:?}"
+                );
+                kind
+            })
+            .collect();
+
+        assert_eq!(
+            kinds,
+            [
+                "Hedge stalled: scan not running",
+                "Hedge stalled: market session unreadable",
+                "Hedge stalled: exposure not placed",
+                "Hedge stalled: order not completing",
+                "Hedge stalled: anchored too long",
+            ]
+        );
+    }
+
     fn aapl_ctx() -> Ctx {
         let symbol = aapl();
         let mut ctx = Ctx {
@@ -1527,7 +1584,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Notifier for HangingNotifier {
-        async fn notify(&self, _message: &str) -> Result<(), NotifierError> {
+        async fn notify(
+            &self,
+            _kind: crate::alerts::AlertKind,
+            _message: &str,
+        ) -> Result<(), NotifierError> {
             std::future::pending().await
         }
     }

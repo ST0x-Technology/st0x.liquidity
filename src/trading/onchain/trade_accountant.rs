@@ -25,7 +25,7 @@ use st0x_wrapper::RatioError;
 
 use super::inclusion::EmittedOnChain;
 use super::skipped_fill::{SkipReason, record_skipped_fill};
-use crate::alerts::Notifier;
+use crate::alerts::{AlertKind, Notifier};
 use crate::conductor::job::{
     BACKPRESSURE_RESCHEDULE_LIMIT, BackpressureOutcome, BackpressureStreak, Job, JobQueue, Label,
     advance_backpressure, apply_backpressure_step, find_backpressure, find_permanence,
@@ -535,7 +535,10 @@ impl AccountForDexTrade {
             tx = self.trade.tx_hash,
             log_index = trade.log_index,
         );
-        if let Err(error) = notifier.notify(&message).await {
+        if let Err(error) = notifier
+            .notify(AlertKind::FillOnDisabledAsset, &message)
+            .await
+        {
             warn!(target: "hedge", ?error, alert_message = %message, "Disabled-asset alert delivery failed");
         }
     }
@@ -865,6 +868,15 @@ impl DeadLetterReason {
             Self::SymbolScoped(reason) => reason.metric_label(),
             Self::BackpressureExhausted => "backpressure_exhausted",
             Self::ResidualAfterClose => "residual_after_close",
+        }
+    }
+
+    /// The alert kind of this reason's page: an abandoned or skipped hedge
+    /// leaves a standing delta, the residual is its own page.
+    pub(crate) const fn alert_kind(self) -> AlertKind {
+        match self {
+            Self::SymbolScoped(_) | Self::BackpressureExhausted => AlertKind::StandingDelta,
+            Self::ResidualAfterClose => AlertKind::ResidualExposureAfterLatchedClose,
         }
     }
 }

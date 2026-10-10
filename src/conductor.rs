@@ -70,7 +70,7 @@ use st0x_tokenization::AlpacaTokenizationService;
 use st0x_tokenization::Tokenizer;
 use st0x_wrapper::{UnderlyingPerWrapped, Wrapper, WrapperError, WrapperService};
 
-use crate::alerts::{LogNotifier, Notifier};
+use crate::alerts::{AlertKind, LogNotifier, Notifier};
 use crate::bindings::IERC4626;
 use crate::bot_gas::{
     BotGasCostLedger, BotGasReceiptCost, BotGasReceiptCostEnqueuer, RecordBotGasReceiptCostCtx,
@@ -1477,9 +1477,10 @@ impl Conductor {
             MonitorTaskError::TerminalJobFailure {
                 worker,
                 context,
+                kind,
                 source,
             } => {
-                self.alert_terminal_job_failure(worker, context, source)
+                self.alert_terminal_job_failure(worker, context, *kind, source)
                     .await;
             }
             // Not a per-worker failure: the propagated error is the operator
@@ -1499,6 +1500,7 @@ impl Conductor {
         &self,
         worker: &str,
         context: &'static str,
+        kind: AlertKind,
         source: &BoxDynError,
     ) {
         // Deliberately states only what this process controls. The restart
@@ -1507,10 +1509,13 @@ impl Conductor {
         // page an operator with a stale SLA.
         let alert =
             format!("st0x-hedge: {worker}: {context}: {source}; process will exit for restart");
+        // The most specific known cause in the rendered error names the page,
+        // as the log extractor reads it; the job's own kind otherwise.
+        let kind = AlertKind::most_specific_in(&alert).unwrap_or(kind);
 
         match tokio::time::timeout(
             TERMINAL_FAILURE_ALERT_TIMEOUT,
-            self.worker_failure_notifier.notify(&alert),
+            self.worker_failure_notifier.notify(kind, &alert),
         )
         .await
         {
@@ -1634,12 +1639,15 @@ async fn setup_pnl_ledger(
                 "PnL ledger failed to catch up at startup; starting without it"
             );
             if let Err(alert_error) = notifier
-                .notify(&format!(
-                    "PnL ledger failed to catch up at startup ({error}). The bot started \
+                .notify(
+                    AlertKind::PnlLedgerCatchUpFailed,
+                    &format!(
+                        "PnL ledger failed to catch up at startup ({error}). The bot started \
                      without it and keeps hedging; /pnl fails until ingestion recovers. \
                      Watch pnl_ledger_catch_up_failures_total and \
                      pnl_ledger_checkpoint_lag_events."
-                ))
+                    ),
+                )
                 .await
             {
                 warn!(
@@ -3155,7 +3163,7 @@ async fn restore_capital_cctp_burns(
     let bridge = match bot_cctp_bridge(ctx, wallets) {
         Ok(bridge) => bridge,
         Err(error) => {
-            error!(target: "operational_alert", alert = true, ?error, "Could not build the CCTP bridge to restore pending capital CCTP burns; their nonces are not reserved, so startup skips Ethereum and Base token approvals and allowance revokes");
+            error!(target: "operational_alert", alert = true, kind = AlertKind::CapitalCctpBridgeUnavailable.as_str(), ?error, "Could not build the CCTP bridge to restore pending capital CCTP burns; their nonces are not reserved, so startup skips Ethereum and Base token approvals and allowance revokes");
             return BTreeSet::from([Chain::Ethereum, Chain::Base]);
         }
     };
@@ -4500,12 +4508,15 @@ async fn restore_redemption_withdrawal(
                  nonce restore and deferring to the resume job"
             );
             if let Err(alert_error) = notifier
-                .notify(&format!(
-                    "Equity redemption {redemption_id} has a submitted vault withdrawal whose \
+                .notify(
+                    AlertKind::WithdrawalHashUnavailableAtStartup,
+                    &format!(
+                        "Equity redemption {redemption_id} has a submitted vault withdrawal whose \
                      hash the node cannot return at startup ({error}). Monitoring started \
                      without it; the resume job will drive it to the reconciliation deadline. \
                      Verify the withdrawal onchain and reconcile if it will never confirm."
-                ))
+                    ),
+                )
                 .await
             {
                 warn!(
@@ -4592,7 +4603,7 @@ async fn rebroadcast_restored_withdrawal(
         "Could not rebroadcast a restored vault withdrawal at startup"
     );
     if let Err(alert_error) = notifier
-        .notify(&format!(
+        .notify(AlertKind::RebroadcastFailedAtStartup, &format!(
             "Equity redemption {redemption_id} has a signed vault withdrawal (tx {tx_hash}, nonce \
              {nonce}) that could not be rebroadcast at startup ({error}). Its nonce stays \
              reserved, so startup skips token approvals and allowance revokes on {chain}; the \
@@ -4636,6 +4647,7 @@ async fn restore_redemption_send(
         notify_or_warn(
             notifier,
             redemption_id,
+            AlertKind::RedemptionLegacyPendingSend,
             &format!(
                 "Equity redemption {redemption_id} on {chain} has a legacy pending send to the \
                  issuer with no recorded transaction. Recovery refuses to sign again and startup \
@@ -4658,6 +4670,7 @@ async fn restore_redemption_send(
         notify_or_warn(
             notifier,
             redemption_id,
+            AlertKind::RedemptionSendSignedByAnotherWallet,
             &format!(
                 "Equity redemption {redemption_id} on {chain} has a signed send {tx_hash} to the \
                  issuer (nonce {nonce}) signed by {signer}, not the wallet that sends to the \
@@ -4696,6 +4709,7 @@ async fn restore_redemption_send(
     notify_or_warn(
         notifier,
         redemption_id,
+        AlertKind::RedemptionSendUnresolved,
         &format!(
             "Equity redemption {redemption_id} on {chain} has an unresolved signed send {tx_hash} to \
              the issuer; startup approvals on {chain} are paused and recovery will \
@@ -4709,9 +4723,10 @@ async fn restore_redemption_send(
 async fn notify_or_warn(
     notifier: &dyn Notifier,
     redemption_id: &RedemptionAggregateId,
+    kind: AlertKind,
     message: &str,
 ) {
-    if let Err(error) = notifier.notify(message).await {
+    if let Err(error) = notifier.notify(kind, message).await {
         warn!(target: "rebalance", %redemption_id, %error, "Could not deliver a startup alert about a send to the issuer");
     }
 }
@@ -20580,7 +20595,8 @@ mod tests {
             let source: Arc<BoxDynError> = Arc::new("boom".into());
             Err(MonitorTaskError::TerminalJobFailure {
                 worker: "test-worker-0".to_string(),
-                context: "terminal failure",
+                context: "Job failed after retries",
+                kind: AlertKind::JobFailedAfterRetries,
                 source,
             })
         });
@@ -20631,7 +20647,8 @@ mod tests {
             let source: Arc<BoxDynError> = Arc::new("boom".into());
             Err(MonitorTaskError::TerminalJobFailure {
                 worker: "test-worker-0".to_string(),
-                context: "terminal failure",
+                context: "Job failed after retries",
+                kind: AlertKind::JobFailedAfterRetries,
                 source,
             })
         });
@@ -20652,7 +20669,7 @@ mod tests {
 
         let error = conductor.wait_for_completion().await.unwrap_err();
         assert!(
-            error.to_string().contains("terminal failure"),
+            error.to_string().contains("Job failed after retries"),
             "the terminal job failure must still propagate after alerting; got: {error}"
         );
         assert!(
@@ -20734,7 +20751,8 @@ mod tests {
             let source: Arc<BoxDynError> = Arc::new("boom".into());
             Err(MonitorTaskError::TerminalJobFailure {
                 worker: "test-worker-0".to_string(),
-                context: "terminal failure",
+                context: "Job failed after retries",
+                kind: AlertKind::JobFailedAfterRetries,
                 source,
             })
         });
@@ -20756,7 +20774,7 @@ mod tests {
         shutdown_token.cancel();
         let error = conductor.wait_for_completion().await.unwrap_err();
         assert!(
-            error.to_string().contains("terminal failure"),
+            error.to_string().contains("Job failed after retries"),
             "the terminal job failure surfaced during drain must still propagate; got: {error}"
         );
 
@@ -20782,7 +20800,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Notifier for HangingNotifier {
-        async fn notify(&self, _message: &str) -> Result<(), NotifierError> {
+        async fn notify(
+            &self,
+            _kind: crate::alerts::AlertKind,
+            _message: &str,
+        ) -> Result<(), NotifierError> {
             std::future::pending().await
         }
     }
@@ -20794,7 +20816,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Notifier for ErroringNotifier {
-        async fn notify(&self, _message: &str) -> Result<(), NotifierError> {
+        async fn notify(
+            &self,
+            _kind: crate::alerts::AlertKind,
+            _message: &str,
+        ) -> Result<(), NotifierError> {
             Err(NotifierError::Simulated)
         }
     }
@@ -20813,7 +20839,8 @@ mod tests {
             let source: Arc<BoxDynError> = Arc::new("boom".into());
             Err(MonitorTaskError::TerminalJobFailure {
                 worker: "test-worker-0".to_string(),
-                context: "terminal failure",
+                context: "Job failed after retries",
+                kind: AlertKind::JobFailedAfterRetries,
                 source,
             })
         });
@@ -20839,7 +20866,7 @@ mod tests {
             )
             .unwrap_err();
         assert!(
-            error.to_string().contains("terminal failure"),
+            error.to_string().contains("Job failed after retries"),
             "the terminal job failure must still propagate despite a hung notifier; got: {error}"
         );
     }
@@ -20857,7 +20884,8 @@ mod tests {
             let source: Arc<BoxDynError> = Arc::new("boom".into());
             Err(MonitorTaskError::TerminalJobFailure {
                 worker: "test-worker-0".to_string(),
-                context: "terminal failure",
+                context: "Job failed after retries",
+                kind: AlertKind::JobFailedAfterRetries,
                 source,
             })
         });
@@ -20877,7 +20905,7 @@ mod tests {
 
         let error = conductor.wait_for_completion().await.unwrap_err();
         assert!(
-            error.to_string().contains("terminal failure"),
+            error.to_string().contains("Job failed after retries"),
             "the terminal job failure must still propagate even when the notifier itself \
              errors; got: {error}"
         );
@@ -20893,7 +20921,8 @@ mod tests {
         let source: Arc<BoxDynError> = Arc::new("boom".into());
         let error = check_monitor_drain_result(Ok(Err(MonitorTaskError::TerminalJobFailure {
             worker: "test-worker-0".to_string(),
-            context: "terminal failure",
+            context: "Job failed after retries",
+            kind: AlertKind::JobFailedAfterRetries,
             source,
         })))
         .unwrap_err();

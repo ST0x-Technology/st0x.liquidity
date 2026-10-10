@@ -25,6 +25,7 @@ use st0x_event_sorcery::{
 };
 use st0x_finance::{FractionalShares, NotPositive, Positive, Usd};
 
+use crate::alerts::AlertKind;
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::equity_redemption::EquityRedemption;
 use crate::offchain::order::{
@@ -936,6 +937,7 @@ impl Job<DashboardTradeDeliveryCtx> for DeliverDashboardTrade {
         Some(crate::conductor::job::DEFAULT_PERFORM_TIMEOUT);
     const TERMINAL_FAILURE_MSG: &'static str =
         "Dashboard trade delivery failed after retries; terminal update remains undelivered";
+    const TERMINAL_FAILURE_KIND: AlertKind = AlertKind::DashboardTradeDeliveryFailed;
 
     #[cfg(any(test, feature = "test-support"))]
     const JOB_KIND: crate::conductor::job::JobKind =
@@ -1287,6 +1289,16 @@ mod tests {
     };
     use crate::position::{PositionCommand, PositionEvent, TradeId};
     use crate::test_utils::setup_test_pools;
+
+    #[test]
+    fn terminal_failure_message_carries_its_kind() {
+        assert_eq!(
+            AlertKind::most_specific_in(
+                <DeliverDashboardTrade as Job<DashboardTradeDeliveryCtx>>::TERMINAL_FAILURE_MSG
+            ),
+            Some(<DeliverDashboardTrade as Job<DashboardTradeDeliveryCtx>>::TERMINAL_FAILURE_KIND)
+        );
+    }
 
     #[derive(Debug)]
     struct TestDatabaseError {
