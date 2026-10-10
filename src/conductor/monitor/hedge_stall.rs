@@ -1586,9 +1586,10 @@ mod tests {
     impl Notifier for HangingNotifier {
         async fn notify(
             &self,
-            _kind: crate::alerts::AlertKind,
-            _message: &str,
+            kind: crate::alerts::AlertKind,
+            message: &str,
         ) -> Result<(), NotifierError> {
+            crate::alerts::assert_kind_matches_extractor(kind, message);
             std::future::pending().await
         }
     }

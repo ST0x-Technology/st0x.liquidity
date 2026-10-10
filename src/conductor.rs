@@ -80,7 +80,9 @@ use crate::cctp_burn::{
     CctpBurnOperation, RestoredCctpBurns, bot_cctp_bridge, restore_pending_cctp_burns,
 };
 use crate::conductor::exit::{ConductorExit, ConductorExitError, MonitorTaskError};
-use crate::conductor::job::{BACKPRESSURE_RESCHEDULE_LIMIT, BackpressureStreak};
+use crate::conductor::job::{
+    BACKPRESSURE_RESCHEDULE_LIMIT, BackpressureStreak, terminal_failure_kind,
+};
 use crate::conductor::monitor::order_fills::{CutoffProbe, probe_cutoff_block_support};
 use crate::dashboard::equity_price::{EquityPriceStore, MarkListener};
 use crate::dashboard::pnl::{LedgerHead, PnlLedger, PnlLedgerReactor};
@@ -1478,10 +1480,9 @@ impl Conductor {
             MonitorTaskError::TerminalJobFailure {
                 worker,
                 context,
-                kind,
                 source,
             } => {
-                self.alert_terminal_job_failure(worker, context, *kind, source)
+                self.alert_terminal_job_failure(worker, context, source)
                     .await;
             }
             // Not a per-worker failure: the propagated error is the operator
@@ -1501,7 +1502,6 @@ impl Conductor {
         &self,
         worker: &str,
         context: &'static str,
-        kind: AlertKind,
         source: &BoxDynError,
     ) {
         // Deliberately states only what this process controls. The restart
@@ -1510,9 +1510,7 @@ impl Conductor {
         // page an operator with a stale SLA.
         let alert =
             format!("st0x-hedge: {worker}: {context}: {source}; process will exit for restart");
-        // The most specific known cause in the rendered error names the page,
-        // as the log extractor reads it; the job's own kind otherwise.
-        let kind = AlertKind::most_specific_in(&alert).unwrap_or(kind);
+        let kind = terminal_failure_kind(&alert);
 
         match tokio::time::timeout(
             TERMINAL_FAILURE_ALERT_TIMEOUT,
@@ -20752,7 +20750,6 @@ mod tests {
             Err(MonitorTaskError::TerminalJobFailure {
                 worker: "test-worker-0".to_string(),
                 context: "Job failed after retries",
-                kind: AlertKind::JobFailedAfterRetries,
                 source,
             })
         });
@@ -20804,7 +20801,6 @@ mod tests {
             Err(MonitorTaskError::TerminalJobFailure {
                 worker: "test-worker-0".to_string(),
                 context: "Job failed after retries",
-                kind: AlertKind::JobFailedAfterRetries,
                 source,
             })
         });
@@ -20908,7 +20904,6 @@ mod tests {
             Err(MonitorTaskError::TerminalJobFailure {
                 worker: "test-worker-0".to_string(),
                 context: "Job failed after retries",
-                kind: AlertKind::JobFailedAfterRetries,
                 source,
             })
         });
@@ -20958,9 +20953,10 @@ mod tests {
     impl Notifier for HangingNotifier {
         async fn notify(
             &self,
-            _kind: crate::alerts::AlertKind,
-            _message: &str,
+            kind: crate::alerts::AlertKind,
+            message: &str,
         ) -> Result<(), NotifierError> {
+            crate::alerts::assert_kind_matches_extractor(kind, message);
             std::future::pending().await
         }
     }
@@ -20974,9 +20970,10 @@ mod tests {
     impl Notifier for ErroringNotifier {
         async fn notify(
             &self,
-            _kind: crate::alerts::AlertKind,
-            _message: &str,
+            kind: crate::alerts::AlertKind,
+            message: &str,
         ) -> Result<(), NotifierError> {
+            crate::alerts::assert_kind_matches_extractor(kind, message);
             Err(NotifierError::Simulated)
         }
     }
@@ -20996,7 +20993,6 @@ mod tests {
             Err(MonitorTaskError::TerminalJobFailure {
                 worker: "test-worker-0".to_string(),
                 context: "Job failed after retries",
-                kind: AlertKind::JobFailedAfterRetries,
                 source,
             })
         });
@@ -21041,7 +21037,6 @@ mod tests {
             Err(MonitorTaskError::TerminalJobFailure {
                 worker: "test-worker-0".to_string(),
                 context: "Job failed after retries",
-                kind: AlertKind::JobFailedAfterRetries,
                 source,
             })
         });
@@ -21078,7 +21073,6 @@ mod tests {
         let error = check_monitor_drain_result(Ok(Err(MonitorTaskError::TerminalJobFailure {
             worker: "test-worker-0".to_string(),
             context: "Job failed after retries",
-            kind: AlertKind::JobFailedAfterRetries,
             source,
         })))
         .unwrap_err();
