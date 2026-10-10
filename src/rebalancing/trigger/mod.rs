@@ -31736,9 +31736,10 @@ mod tests {
     impl crate::alerts::Notifier for FlakyNotifier {
         async fn notify(
             &self,
-            _kind: crate::alerts::AlertKind,
+            kind: crate::alerts::AlertKind,
             message: &str,
         ) -> Result<(), crate::alerts::NotifierError> {
+            crate::alerts::assert_kind_matches_extractor(kind, message);
             let should_fail = self
                 .remaining_failures
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {

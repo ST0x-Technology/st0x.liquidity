@@ -224,7 +224,10 @@ stays lost, and so does the `liq_trade` line of a hedge release.
 Every `operational_alert` line carries a `kind` field, an `AlertKind` from
 `src/alerts/mod.rs`. Send alerts through `Notifier::notify(kind, message)`. A
 direct `error!(target: "operational_alert", ...)` line must also log
-`kind = AlertKind::...as_str()`; a test fails on one that does not.
+`kind = AlertKind::Variant.as_str()` over a plain string literal message. A test
+scans every direct line: it fails on a line without a kind, and it checks the
+kind against the message literal with the same rules `CapturingNotifier` uses
+(below).
 
 - An existing kind's string is exactly the label the `operational_alerts`
   extractor (t0.devops `observability-consumer`) gives the line once that
@@ -235,9 +238,18 @@ direct `error!(target: "operational_alert", ...)` line must also log
 - A new alert gets a new kind in the `not_extracted` group, whose string is a
   fixed phrase of its message. Teach the extractor that phrase and add a rule;
   then move the kind into the `extracted` group in the extractor's order.
-- `CapturingNotifier` checks every alert a test drives: an extracted kind must
-  be what the extractor reads from the message, and a not-extracted kind must
-  match no extracted phrase.
+- Every kind's string must appear in its message. `CapturingNotifier` checks
+  every alert a test drives: an extracted kind must be what the extractor reads
+  from the message, and the message of a not-extracted kind must hold no
+  extracted phrase.
+- A job's terminal failure page (a dead letter or a supervised worker's terminal
+  failure) takes its kind from its text: the most specific extracted phrase in
+  the rendered alert, else `JobFailedAfterRetries`. The job's
+  `TERMINAL_FAILURE_MSG` decides the kind when the embedded error names nothing
+  more specific, so an override must carry the phrase of its own extracted kind.
+  `build_supervised_worker!` and `build_best_effort_worker!` fail the build on a
+  message with no extracted phrase, and a test checks every
+  `TERMINAL_FAILURE_MSG` in the source.
 
 The phrase extractor is transitional. Once the `operational_alerts` pager reads
 `jsonPayload.kind`, a new alert needs only a new `AlertKind` and a rule in

@@ -10,15 +10,12 @@ use task_supervisor::SupervisorError;
 use tokio::task::JoinError;
 use tracing::{error, info};
 
-use crate::alerts::AlertKind;
-
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum MonitorTaskError {
     #[error("Apalis worker failed after retries: {worker}: {context}")]
     TerminalJobFailure {
         worker: String,
         context: &'static str,
-        kind: AlertKind,
         #[source]
         source: Arc<BoxDynError>,
     },
@@ -146,7 +143,6 @@ mod tests {
             ConductorExit::Monitor(Ok(Err(MonitorTaskError::TerminalJobFailure {
                 worker: "test-worker-0".to_string(),
                 context: "terminal failure",
-                kind: AlertKind::JobFailedAfterRetries,
                 source: Arc::new(source),
             })))
             .handle()

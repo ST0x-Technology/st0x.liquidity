@@ -6095,9 +6095,10 @@ mod tests {
     impl crate::alerts::Notifier for FailingNotifier {
         async fn notify(
             &self,
-            _kind: crate::alerts::AlertKind,
-            _message: &str,
+            kind: crate::alerts::AlertKind,
+            message: &str,
         ) -> Result<(), crate::alerts::NotifierError> {
+            crate::alerts::assert_kind_matches_extractor(kind, message);
             Err(crate::alerts::NotifierError::Simulated)
         }
     }
