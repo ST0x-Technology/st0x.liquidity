@@ -6,7 +6,7 @@ use serde::ser::{Error as _, SerializeStruct};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use ts_rs::TS;
 
-use st0x_finance::{FractionalShares, NonNegative, Positive, Symbol};
+use st0x_finance::{FractionalShares, NonNegative, Positive, Symbol, Usd};
 
 /// Where a trade was executed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -415,6 +415,11 @@ pub struct Trade {
     /// known.
     #[ts(type = "string")]
     pub shares: Positive<FractionalShares>,
+    /// Fill price in USD per share. Absent when the trade has no fill price:
+    /// a failed or cancelled counter-trade, or any trade whose price is not
+    /// known. Only `terminal_outcomes_v3` carries it on the wire.
+    #[ts(type = "string | null")]
+    pub price: Option<Usd>,
     pub outcome: TradeOutcome,
 }
 
@@ -423,7 +428,7 @@ impl Serialize for Trade {
     where
         S: Serializer,
     {
-        serialize_canonical_trade(self, self.venue, serializer)
+        serialize_canonical_trade(self, self.venue, WirePrice::Included, serializer)
     }
 }
 
@@ -438,13 +443,28 @@ impl Serialize for LegacyCompatibleTrade<'_> {
     where
         S: Serializer,
     {
-        serialize_canonical_trade(self.trade, self.trade.venue.legacy_compatible(), serializer)
+        serialize_canonical_trade(
+            self.trade,
+            self.trade.venue.legacy_compatible(),
+            WirePrice::Omitted,
+            serializer,
+        )
     }
+}
+
+/// Whether a trade wire shape carries the fill price. Only
+/// `terminal_outcomes_v3` does; older protocols keep the shape their clients
+/// were built against.
+#[derive(Clone, Copy)]
+enum WirePrice {
+    Included,
+    Omitted,
 }
 
 fn serialize_canonical_trade<S>(
     value: &Trade,
     venue: TradingVenue,
+    price: WirePrice,
     serializer: S,
 ) -> Result<S::Ok, S::Error>
 where
@@ -454,7 +474,14 @@ where
         TradeOutcome::Filled => true,
         TradeOutcome::Failed { .. } | TradeOutcome::Cancelled { .. } => false,
     };
-    let mut trade = serializer.serialize_struct("Trade", 7 + usize::from(is_filled))?;
+    let carries_price = match price {
+        WirePrice::Included => true,
+        WirePrice::Omitted => false,
+    };
+    let mut trade = serializer.serialize_struct(
+        "Trade",
+        7 + usize::from(is_filled) + usize::from(carries_price),
+    )?;
     trade.serialize_field("id", &value.id)?;
     trade.serialize_field("occurredAt", &value.occurred_at)?;
     if is_filled {
@@ -464,6 +491,9 @@ where
     trade.serialize_field("direction", &value.direction)?;
     trade.serialize_field("symbol", &value.symbol)?;
     trade.serialize_field("shares", &value.shares)?;
+    if carries_price {
+        trade.serialize_field("price", &value.price)?;
+    }
     trade.serialize_field("outcome", &value.outcome)?;
     trade.end()
 }
@@ -506,7 +536,12 @@ impl Serialize for TerminalOutcomesV1Trade<'_> {
             ..
         } = &self.trade.outcome
         else {
-            return serialize_canonical_trade(self.trade, self.venue, serializer);
+            return serialize_canonical_trade(
+                self.trade,
+                self.venue,
+                WirePrice::Omitted,
+                serializer,
+            );
         };
 
         // When acceptance provenance is unknown, v1 has no way to express
@@ -734,6 +769,7 @@ mod tests {
             direction: Direction::Sell,
             symbol: Symbol::new("TSLA").unwrap(),
             shares: positive_shares("5.5"),
+            price: None,
             outcome: TradeOutcome::Filled,
         };
         let json = serde_json::to_value(&trade).expect("serialization should succeed");
@@ -748,6 +784,98 @@ mod tests {
     }
 
     #[test]
+    fn canonical_trade_serializes_price_as_a_decimal_string() {
+        let trade = Trade {
+            id: "priced-order-id".to_string(),
+            occurred_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            venue: TradingVenue::Alpaca,
+            direction: Direction::Buy,
+            symbol: Symbol::new("TSLA").unwrap(),
+            shares: positive_shares("5.5"),
+            price: Some(Usd::new(float!(199.5))),
+            outcome: TradeOutcome::Filled,
+        };
+
+        let json = serde_json::to_value(&trade).unwrap();
+
+        assert_eq!(json["price"], json!("199.5"));
+    }
+
+    #[test]
+    fn canonical_trade_serializes_an_absent_price_as_null() {
+        let trade = Trade {
+            id: "unpriced-order-id".to_string(),
+            occurred_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            venue: TradingVenue::Alpaca,
+            direction: Direction::Buy,
+            symbol: Symbol::new("TSLA").unwrap(),
+            shares: positive_shares("5.5"),
+            price: None,
+            outcome: TradeOutcome::Cancelled {
+                accepted_shares: None,
+                filled_shares: None,
+                remaining_shares: None,
+                excess_shares: None,
+            },
+        };
+
+        let json = serde_json::to_value(&trade).unwrap();
+
+        assert_eq!(json.get("price"), Some(&json!(null)));
+    }
+
+    #[test]
+    fn protocols_older_than_v3_keep_their_wire_shape_without_a_price() {
+        let trade = Trade {
+            id: "priced-order-id".to_string(),
+            occurred_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            venue: TradingVenue::Alpaca,
+            direction: Direction::Buy,
+            symbol: Symbol::new("TSLA").unwrap(),
+            shares: positive_shares("5.5"),
+            price: Some(Usd::new(float!(199.5))),
+            outcome: TradeOutcome::Filled,
+        };
+        let failed = Trade {
+            outcome: TradeOutcome::Failed {
+                error: "placement rejected".to_string(),
+                accepted_shares: None,
+                filled_shares: None,
+                remaining_shares: None,
+                excess_shares: None,
+            },
+            ..trade.clone()
+        };
+
+        for wire in [
+            serde_json::to_value(trade.legacy_compatible()).unwrap(),
+            serde_json::to_value(trade.terminal_outcomes_v1()).unwrap(),
+            serde_json::to_value(trade.legacy_terminal_outcomes_v1()).unwrap(),
+            serde_json::to_value(failed.terminal_outcomes_v1()).unwrap(),
+            serde_json::to_value(trade.legacy_fill().unwrap()).unwrap(),
+        ] {
+            assert_eq!(wire.get("price"), None, "unexpected price in {wire}");
+        }
+    }
+
+    #[test]
+    fn trade_deserializes_a_payload_persisted_before_price_existed() {
+        let payload = json!({
+            "id": "order-1",
+            "occurredAt": "2026-07-20T12:00:00Z",
+            "venue": "alpaca",
+            "direction": "buy",
+            "symbol": "AAPL",
+            "shares": "1",
+            "outcome": { "status": "filled" }
+        });
+
+        let trade: Trade = serde_json::from_value(payload).unwrap();
+
+        assert_eq!(trade.price, None);
+    }
+
+    #[test]
     fn trade_roundtrips_through_persistent_job_payload() {
         let trade = Trade {
             id: "durable-order-id".to_string(),
@@ -756,6 +884,7 @@ mod tests {
             direction: Direction::Sell,
             symbol: Symbol::new("TSLA").unwrap(),
             shares: positive_shares("5.5"),
+            price: Some(Usd::new(float!(199.5))),
             outcome: TradeOutcome::Filled,
         };
 
@@ -768,6 +897,7 @@ mod tests {
         assert_eq!(restored.direction, trade.direction);
         assert_eq!(restored.symbol, trade.symbol);
         assert_eq!(restored.shares, trade.shares);
+        assert_eq!(restored.price, Some(Usd::new(float!(199.5))));
         assert_eq!(restored.outcome, trade.outcome);
     }
 
@@ -804,6 +934,7 @@ mod tests {
             direction: Direction::Buy,
             symbol: Symbol::new("SPCX").unwrap(),
             shares: positive_shares("1"),
+            price: None,
             outcome: TradeOutcome::Failed {
                 error: "asset is not tradable".to_string(),
                 accepted_shares: Some(positive_shares("1")),
@@ -881,6 +1012,7 @@ mod tests {
             direction: Direction::Buy,
             symbol: Symbol::new("SPCX").unwrap(),
             shares: positive_shares("1.5"),
+            price: None,
             outcome: TradeOutcome::Cancelled {
                 accepted_shares: Some(positive_shares("1")),
                 filled_shares: Some(NonNegative::new(FractionalShares::ZERO).unwrap()),
@@ -917,6 +1049,7 @@ mod tests {
             direction: Direction::Buy,
             symbol: Symbol::new("SPCX").unwrap(),
             shares: positive_shares("1"),
+            price: None,
             outcome: TradeOutcome::Cancelled {
                 accepted_shares: None,
                 filled_shares: None,
@@ -1141,6 +1274,7 @@ mod tests {
             direction: Direction::Buy,
             symbol: Symbol::new("SPCX").unwrap(),
             shares: positive_shares("2"),
+            price: None,
             outcome: TradeOutcome::Failed {
                 error: "broker failed after overfill".to_string(),
                 accepted_shares: Some(positive_shares("1")),
@@ -1169,6 +1303,7 @@ mod tests {
             direction: Direction::Buy,
             symbol: Symbol::new("SPCX").unwrap(),
             shares: positive_shares("2"),
+            price: None,
             outcome: TradeOutcome::Failed {
                 error: "asset is not tradable".to_string(),
                 accepted_shares: None,
@@ -1200,6 +1335,7 @@ mod tests {
             direction: Direction::Buy,
             symbol: Symbol::new("SPCX").unwrap(),
             shares: positive_shares("1"),
+            price: None,
             outcome: TradeOutcome::Filled,
         };
         let failed = Trade {
@@ -1235,6 +1371,7 @@ mod tests {
             direction: Direction::Buy,
             symbol: Symbol::new("AAPL").unwrap(),
             shares: positive_shares("1"),
+            price: None,
             outcome: TradeOutcome::Filled,
         };
         let tx_hash = "0x0000000000000000000000000000000000000000000000000000000000000000";
@@ -1267,6 +1404,7 @@ mod tests {
             direction: Direction::Buy,
             symbol: Symbol::new("AAPL").unwrap(),
             shares: positive_shares("1"),
+            price: None,
             outcome: TradeOutcome::Filled,
         };
         let mut trades = vec![

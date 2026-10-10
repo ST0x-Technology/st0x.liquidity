@@ -23,7 +23,7 @@ use st0x_dto::{Statement, Trade, TradeOutcome};
 use st0x_event_sorcery::{
     AggregateError, EntityList, Reactor, SendError, deps, is_retryable_sqlite_busy, load_entity,
 };
-use st0x_finance::{FractionalShares, NotPositive, Positive};
+use st0x_finance::{FractionalShares, NotPositive, Positive, Usd};
 
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::equity_redemption::EquityRedemption;
@@ -1166,6 +1166,7 @@ impl Reactor for Broadcaster {
                         symbol,
                         amount,
                         direction,
+                        price_usdc,
                         block_timestamp,
                         ..
                     } => {
@@ -1176,6 +1177,7 @@ impl Reactor for Broadcaster {
                             direction,
                             symbol,
                             shares: Positive::new(FractionalShares::new(amount))?,
+                            price: Some(Usd::new(price_usdc)),
                             outcome: TradeOutcome::Filled,
                         })
                         .await?;
@@ -1373,6 +1375,7 @@ mod tests {
             direction: st0x_execution::Direction::Sell,
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(st0x_float_macro::float!(1))).unwrap(),
+            price: None,
             outcome: TradeOutcome::Filled,
         }
     }
@@ -2376,6 +2379,10 @@ mod tests {
             panic!("expected TradeUpdate message");
         };
         assert_eq!(trade.venue, TradingVenue::Bebop);
+        assert_eq!(
+            trade.price,
+            Some(st0x_finance::Usd::new(st0x_float_macro::float!(150)))
+        );
     }
 
     #[tokio::test]
@@ -2865,6 +2872,10 @@ mod tests {
                 assert!(matches!(trade.venue, TradingVenue::Alpaca));
                 assert!(matches!(trade.direction, st0x_dto::Direction::Sell));
                 assert_eq!(trade.symbol, Symbol::new("TSLA").unwrap());
+                assert_eq!(
+                    trade.price,
+                    Some(st0x_finance::Usd::new(st0x_float_macro::float!(245)))
+                );
             }
             other => panic!("expected TradeUpdate message, got {other:?}"),
         }
@@ -2973,6 +2984,7 @@ mod tests {
                     &trade.outcome, &history[0].outcome,
                     "live and historical failure provenance must be identical"
                 );
+                assert_eq!(trade.price, None);
                 match trade.outcome {
                     st0x_dto::TradeOutcome::Failed {
                         error,
@@ -3119,6 +3131,7 @@ mod tests {
         .unwrap()
         .trades;
         assert_eq!(trade.outcome, history[0].outcome);
+        assert_eq!(trade.price, None);
         assert!(matches!(
             trade.outcome,
             TradeOutcome::Cancelled {

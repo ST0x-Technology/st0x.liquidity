@@ -19,6 +19,7 @@ const staleTrade: Trade = {
   direction: 'buy',
   symbol: 'SPCX',
   shares: '1',
+  price: null,
   outcome: { status: 'filled' }
 }
 
@@ -29,6 +30,7 @@ const failedTrade = (id: string, overrides: Partial<Trade> = {}): Trade => ({
   direction: 'buy',
   symbol: 'SPCX',
   shares: '1',
+  price: null,
   outcome: {
     status: 'failed',
     error: 'broker rejected remainder',
@@ -156,6 +158,7 @@ describe('TradeHistoryPanel', () => {
       direction: 'sell',
       symbol: 'SGOV',
       shares: '2',
+      price: null,
       outcome: { status: 'filled' }
     }
     const hedge: Trade = {
@@ -165,6 +168,7 @@ describe('TradeHistoryPanel', () => {
       direction: 'buy',
       symbol: 'SGOV',
       shares: '2.02',
+      price: null,
       outcome: { status: 'filled' }
     }
     vi.stubGlobal(
@@ -192,6 +196,7 @@ describe('TradeHistoryPanel', () => {
       direction: 'buy',
       symbol: 'COIN',
       shares: '1',
+      price: null,
       outcome: { status: 'filled' }
     }
     const fetchMock = vi.fn((_input: RequestInfo | URL) =>
@@ -237,6 +242,7 @@ describe('TradeHistoryPanel', () => {
       direction: 'buy',
       symbol: 'DOWNGRADED',
       shares: '1',
+      price: null,
       outcome: { status: 'filled' }
     }
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
@@ -317,6 +323,7 @@ describe('TradeHistoryPanel', () => {
       direction: 'buy',
       symbol: 'COIN',
       shares: '1',
+      price: null,
       outcome: { status: 'filled' }
     }
     vi.stubGlobal(

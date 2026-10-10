@@ -278,6 +278,8 @@ export const parseCanonicalTrade = (value: unknown, path = ''): Trade => {
   return {
     ...parseCommonTradeFields(trade, path),
     occurredAt: parseTimestamp(trade['occurredAt'], fieldPath(path, 'occurredAt')),
+    // Absent before terminal_outcomes_v3 carried the fill price.
+    price: parseNullableDecimal(trade['price'] ?? null, fieldPath(path, 'price'), 'positive'),
     outcome: parseOutcome(trade['outcome'], fieldPath(path, 'outcome'))
   }
 }

@@ -83,6 +83,7 @@ const makeTrade = (overrides: Partial<Trade> = {}): Trade => ({
   direction: 'buy',
   symbol: 'AAPL',
   shares: '10',
+  price: null,
   outcome: { status: 'filled' },
   ...overrides
 })
@@ -563,6 +564,7 @@ describe('createWebSocket', () => {
           direction: 'sell',
           symbol: 'TSLA',
           shares: '2',
+          price: null,
           outcome: { status: 'filled' }
         }
       ])
@@ -597,6 +599,7 @@ describe('createWebSocket', () => {
           direction: 'buy',
           symbol: 'AAPL',
           shares: '1',
+          price: null,
           outcome: { status: 'filled' }
         }
       ])
