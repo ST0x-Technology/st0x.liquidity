@@ -40,7 +40,9 @@ second migration with a second history break.
    process-wide store of families. Each refresh replaces all samples of one
    family. `/metrics` renders the recorder output, then the store.
    - Every `liq_*` name is a `LiqMetric` variant that belongs to exactly one
-     family. A sample for a name its family does not own is dropped and logged.
+     family, except the `liq_pnl_*` names: the six P&L window families share
+     them, and each publishes only the series labelled with its own `window`. A
+     sample for a name or window its family does not own is dropped and logged.
      No `liq_` name goes through the `metrics` macros; a test scans the source
      for that.
    - Samples are stored as `Arc<[LiqSample]>`. A render clones the `Arc`s under

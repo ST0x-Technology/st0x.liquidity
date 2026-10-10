@@ -30,8 +30,8 @@ use super::query::{PnlCounterTradingFilter, PnlError, PnlMarketSessionFilter, Pn
 use super::replay::{add_summary, with_direct_symbol_costs};
 use super::response::{PnlResponse, PnlSymbolSummary, PnlWindow, PnlWindowSymbol};
 use super::source::{
-    MAX_CONCURRENT_PNL_REPORTS, acquire_pnl_report_permit, build_pnl_report, pnl_report_admission,
-    run_pnl_replay, run_pnl_replay_with_permit,
+    MAX_CONCURRENT_PNL_REPORTS, PnlReportAdmission, acquire_pnl_report_permit, build_pnl_report,
+    pnl_report_admission, run_pnl_replay, run_pnl_replay_with_permit,
 };
 use super::state::{
     BotGasCostRow, CostLedgerRow, CostSource, Direction, ManualAdjustmentRow, OffchainFillRow,
@@ -3797,6 +3797,58 @@ fn pnl_report_admission_rejects_excess_work_without_queuing() {
 
     drop(permits.pop().unwrap());
     let _replacement = acquire_pnl_report_permit(&admission).unwrap();
+}
+
+#[tokio::test]
+async fn a_queued_pnl_report_admission_waits_for_a_permit_instead_of_failing() {
+    let admission = PnlReportAdmission::queued(1);
+    let held = admission.admit().await.unwrap();
+    let waiting = tokio::spawn({
+        let admission = admission.clone();
+        async move { admission.admit().await.map(drop) }
+    });
+
+    tokio::task::yield_now().await;
+    assert!(!waiting.is_finished());
+
+    drop(held);
+    waiting.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_queued_pnl_report_admission_takes_its_permit_before_the_catch_up() {
+    let admission = PnlReportAdmission::queued(1);
+
+    let early = admission.admit_before_catch_up().await.unwrap();
+
+    assert!(early.is_some());
+    let waiting = tokio::spawn({
+        let admission = admission.clone();
+        async move { admission.admit().await.map(drop) }
+    });
+    tokio::task::yield_now().await;
+    assert!(!waiting.is_finished());
+
+    drop(early);
+    waiting.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_rejecting_pnl_report_admission_takes_no_permit_before_the_catch_up() {
+    let admission = PnlReportAdmission::with_permits(1);
+
+    assert!(admission.admit_before_catch_up().await.unwrap().is_none());
+    let _held = admission.admit().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_rejecting_pnl_report_admission_fails_when_every_permit_is_taken() {
+    let admission = PnlReportAdmission::with_permits(1);
+    let _held = admission.admit().await.unwrap();
+
+    let error = admission.admit().await.unwrap_err();
+
+    assert!(matches!(error, PnlError::ReplayAdmission(_)));
 }
 
 #[tokio::test]

@@ -1748,13 +1748,19 @@ depending on the sidecar.
 - **One writer per name.** Every `liq_*` name belongs to exactly one family, and
   no `liq_*` name goes through the `metrics` macros. If the recorder ever
   renders a `liq_` name, the contract skips its own block for that name and logs
-  an error, so the body stays valid.
+  an error, so the body stays valid. The one exception is the `liq_pnl_*` names:
+  they are exactly the names with a `window` label, and the six P&L window
+  families share them. Each window family publishes only the series whose
+  `window` label is its own window, so every series still has one writer. A
+  sample labelled with another window is dropped and logged, like a sample for a
+  name a family does not own.
 - **Freshness.** `liq_collector_last_success_ts_seconds{collector}` gives the
   Unix time each family was last published, with `collector` from a closed set:
   `health`, `settings`, `inventory`, `prices`, `equity_bands`, `latencies`,
   `reliability`, `infra`, `rebalances`, `pending_orders`, `raindex`, and one per
-  P&L window. `health` and `settings` are published once at boot, so their time
-  stays at the boot time for the life of the process: that is not staleness.
+  P&L window: `pnl_1d`, `pnl_1w`, `pnl_1m`, `pnl_ytd`, `pnl_1y` and `pnl_all`.
+  `health` and `settings` are published once at boot, so their time stays at the
+  boot time for the life of the process: that is not staleness.
 - **Typed gauges.** Every `liq_*` block carries a `# HELP` line and a
   `# TYPE <name> gauge` line. Every name is a gauge: snapshots, rolling `_24h`
   windows, `*_total` names that mean a count now, and precomputed quantile
@@ -1917,14 +1923,28 @@ labelled `window`: `1d`, `1w`, `1m`, `ytd`, `1y` and `all`. Each window is one
 ledger catch-up first. Every window ends on the last day with fills
 (`availableRange.lastDate`); the starts are that day, 6 days, 30 days and 364
 days before it, January 1 of its year, and the first day with fills, and no
-start is before the first day with fills. The windows run one at a time inside a
-120-second budget, `1w` first. The task has its own report admission of one, so
-it never takes one of the two live `/pnl` permits.
+start is before the first day with fills. The task has its own report admission
+of one, so it never takes one of the two live `/pnl` permits; a window's report
+waits for that permit instead of failing, so the replays run one at a time. A
+report takes that permit before its ledger catch-up, so the head it replays to
+is read after its wait.
 
+- The cycle starts the windows in turn inside a 120-second budget and waits up
+  to 30 seconds for each report before it starts the next window. A report that
+  takes longer is not cancelled: it keeps running and publishes its window when
+  it ends. That window starts no new report until then, so one window never has
+  two reports that could publish out of order. No window starts after the
+  budget. The first cycle starts with `1w`, and each later cycle starts one
+  window further along the order `1w`, `1d`, `all`, `1m`, `ytd`, `1y`, so the
+  windows a slow cycle skips change from cycle to cycle.
+- The 30-second wait frees the cycle, not the reports: the reports stay serial
+  behind the one permit, so a slow report delays every report queued behind it,
+  and those windows publish no sooner than in a sequential loop. A window's
+  `metrics_refresh_duration_seconds` includes its wait for the permit.
 - Each window is its own family (`collector="pnl_<window>"`). A window whose
-  report fails, times out, or does not fit the budget keeps its last samples,
-  and its collector time stops advancing. The exporter dropped such a window
-  until its next cycle; this is a deliberate difference.
+  report fails, whose report is still running, or that does not fit the budget
+  keeps its last samples, and its collector time stops advancing. The exporter
+  dropped such a window until its next cycle; this is a deliberate difference.
 - Summary, cost, capital, per-symbol and sample series copy `/pnl`'s fields. A
   decimal that does not parse, and a capital figure that is not computed, leave
   their series absent. Per-symbol rows whose symbols strip to the same label
