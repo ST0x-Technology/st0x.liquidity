@@ -1033,35 +1033,75 @@ impl Broadcaster {
         Ok(())
     }
 
+    /// Enqueues a terminal offchain order's `Trade`, and writes its
+    /// `liq_trade` line when the event committed. The caller loaded the order
+    /// once for both; an order it could not load is queued for reload retry.
     async fn enqueue_offchain_trade(
         &self,
         id: OffchainOrderId,
+        order: Option<OffchainOrder>,
+        event_id: Option<&EventId>,
     ) -> Result<(), DashboardTradeEnqueueError> {
-        match load_entity::<OffchainOrder>(&self.pool, &id).await {
-            Ok(Some(order)) => match order.try_into_trade(&id) {
-                Ok(trade) => return self.enqueue_trade(trade).await,
+        if let Some(order) = order {
+            match order.try_into_trade(&id) {
+                Ok(trade) => {
+                    if let Some(event_id) = event_id {
+                        log_trade(&trade, event_id);
+                    }
+                    return self.enqueue_trade(trade).await;
+                }
                 Err(error) => warn!(
                     target: "dashboard",
-                    %id, %error,
-                    "Failed to convert terminal OffchainOrder; queued for reload retry"
+                    %id,
+                    event_id = event_id.map(tracing::field::display),
+                    %error,
+                    "Failed to convert terminal OffchainOrder; its liq_trade line is not \
+                     written and it is queued for reload retry"
                 ),
-            },
-            Ok(None) => warn!(
-                target: "dashboard",
-                %id,
-                "Terminal OffchainOrder replayed to empty state; queued for reload retry"
-            ),
-            Err(error) => warn!(
-                target: "dashboard",
-                %id, ?error,
-                "Failed to load terminal OffchainOrder; queued for reload retry"
-            ),
+            }
         }
 
         self.handoff_retry_sender
             .send(DashboardTradeHandoff::ReloadOffchainOrder(id))
             .await?;
         Ok(())
+    }
+
+    /// Loads an offchain order once for its log lines and its dashboard
+    /// trade, logging why when it cannot.
+    async fn load_offchain_order(
+        &self,
+        id: &OffchainOrderId,
+        event_id: Option<&EventId>,
+        terminal: bool,
+    ) -> Option<OffchainOrder> {
+        let retry = if terminal {
+            "; it is queued for reload retry"
+        } else {
+            ""
+        };
+        match load_entity::<OffchainOrder>(&self.pool, id).await {
+            Ok(Some(order)) => Some(order),
+            Ok(None) => {
+                warn!(
+                    target: "dashboard",
+                    %id,
+                    event_id = event_id.map(tracing::field::display),
+                    "Offchain order replayed to empty state; its log lines are not written{retry}",
+                );
+                None
+            }
+            Err(error) => {
+                warn!(
+                    target: "dashboard",
+                    %id,
+                    event_id = event_id.map(tracing::field::display),
+                    ?error,
+                    "Failed to load offchain order; its log lines are not written{retry}",
+                );
+                None
+            }
+        }
     }
 
     async fn broadcast_onchain_trade_revision(
@@ -1200,37 +1240,52 @@ impl Broadcaster {
     ) -> Result<(), DashboardTradeEnqueueError> {
         event
             .on(|id, event| async move {
-                if let Some(committed) = committed {
-                    self.log_onchain_trade(&id, &event, committed).await;
-                }
+                let event_id =
+                    committed.map(|committed| EventId::of::<OnChainTrade>(&id, committed));
 
                 match event {
                     OnChainTradeEvent::Filled {
                         source,
-                        symbol,
+                        ref symbol,
                         amount,
                         direction,
                         price_usdc,
                         block_timestamp,
                         ..
                     } => {
-                        self.enqueue_trade(Trade {
+                        // The event carries everything both lines need, so
+                        // the fill is not replayed from the store.
+                        let venue = source.trading_venue();
+                        if let Some(event_id) = &event_id {
+                            log_event::<OnChainTrade>(EventParent::Trade(venue), &event, event_id);
+                        }
+                        let trade = Trade {
                             id: id.to_string(),
                             occurred_at: block_timestamp,
-                            venue: source.trading_venue(),
+                            venue,
                             direction,
-                            symbol,
+                            symbol: symbol.clone(),
                             shares: Positive::new(FractionalShares::new(amount))?,
                             price: Some(Usd::new(price_usdc)),
                             outcome: TradeOutcome::Filled,
-                        })
-                        .await?;
+                        };
+                        if let Some(event_id) = &event_id {
+                            log_trade(&trade, event_id);
+                        }
+                        self.enqueue_trade(trade).await?;
                     }
                     OnChainTradeEvent::SourceAttributed { .. } => {
+                        if let Some(event_id) = &event_id {
+                            self.log_onchain_trade(&id, &event, event_id).await;
+                        }
                         self.broadcast_onchain_trade_revision(id).await?;
                     }
                     OnChainTradeEvent::Enriched { .. }
-                    | OnChainTradeEvent::Acknowledged { .. } => {}
+                    | OnChainTradeEvent::Acknowledged { .. } => {
+                        if let Some(event_id) = &event_id {
+                            self.log_onchain_trade(&id, &event, event_id).await;
+                        }
+                    }
                 }
 
                 Ok(())
@@ -1263,68 +1318,83 @@ impl Broadcaster {
             .on(|id, event| async move {
                 use OffchainOrderEvent::*;
 
-                if let Some(committed) = committed {
-                    self.log_offchain_order(&id, &event, committed).await;
-                }
-
-                match event {
-                    Filled { .. } | Failed { .. } | Cancelled { .. } => {
-                        self.enqueue_offchain_trade(id).await?;
-                    }
+                let terminal = match event {
+                    Filled { .. } | Failed { .. } | Cancelled { .. } => true,
                     Placed { .. }
                     | Submitted { .. }
                     | Accepted { .. }
                     | PartiallyFilled { .. }
-                    | CancelRequested { .. } => {}
+                    | CancelRequested { .. } => false,
+                };
+                let event_id =
+                    committed.map(|committed| EventId::of::<OffchainOrder>(&id, committed));
+                if !terminal && event_id.is_none() {
+                    return Ok(());
+                }
+
+                // One load serves the `liq_event` line, the `liq_trade` line
+                // and the dashboard trade: this runs on the hedge path, before
+                // the command that committed the event returns.
+                let order = self.load_offchain_order(&id, event_id.as_ref(), terminal).await;
+                if let (Some(event_id), Some(order)) = (&event_id, &order) {
+                    log_event::<OffchainOrder>(
+                        EventParent::Trade(executor_venue(order.executor())),
+                        &event,
+                        event_id,
+                    );
+                }
+
+                if terminal {
+                    self.enqueue_offchain_trade(id, order, event_id.as_ref()).await?;
                 }
 
                 Ok(())
             })
 
             .on(|id, event| async move {
+                let event_id = committed.map(|committed| EventId::of::<TokenizedEquityMint>(&id, committed));
                 match load_entity::<TokenizedEquityMint>(&self.pool, &id).await {
                     Ok(Some(entity)) => {
                         let transfer = entity.to_dto(&id);
-                        if let Some(committed) = committed {
-                            self.log_transfer::<TokenizedEquityMint>(&id, &event, &transfer, committed)
-                            .await;
+                        if let Some(event_id) = &event_id {
+                            self.log_transfer::<TokenizedEquityMint>(&event, &transfer, event_id).await;
                         }
                         self.broadcast_transfer(transfer);
                     }
-                    Ok(None) => warn!(target: "dashboard", %id, "Mint entity not found for transfer broadcast"),
-                    Err(error) => warn!(target: "dashboard", %id, ?error, "Failed to load mint for broadcast"),
+                    Ok(None) => warn!(target: "dashboard", %id, event_id = event_id.as_ref().map(tracing::field::display), "Mint entity not found for transfer broadcast"),
+                    Err(error) => warn!(target: "dashboard", %id, event_id = event_id.as_ref().map(tracing::field::display), ?error, "Failed to load mint for broadcast"),
                 }
                 Ok(())
             })
 
             .on(|id, event| async move {
+                let event_id = committed.map(|committed| EventId::of::<EquityRedemption>(&id, committed));
                 match load_entity::<EquityRedemption>(&self.pool, &id).await {
                     Ok(Some(entity)) => {
                         let transfer = entity.to_dto(&id);
-                        if let Some(committed) = committed {
-                            self.log_transfer::<EquityRedemption>(&id, &event, &transfer, committed)
-                            .await;
+                        if let Some(event_id) = &event_id {
+                            self.log_transfer::<EquityRedemption>(&event, &transfer, event_id).await;
                         }
                         self.broadcast_transfer(transfer);
                     }
-                    Ok(None) => warn!(target: "dashboard", %id, "Redemption entity not found for broadcast"),
-                    Err(error) => warn!(target: "dashboard", %id, ?error, "Failed to load redemption for broadcast"),
+                    Ok(None) => warn!(target: "dashboard", %id, event_id = event_id.as_ref().map(tracing::field::display), "Redemption entity not found for broadcast"),
+                    Err(error) => warn!(target: "dashboard", %id, event_id = event_id.as_ref().map(tracing::field::display), ?error, "Failed to load redemption for broadcast"),
                 }
                 Ok(())
             })
 
             .on(|id, event| async move {
+                let event_id = committed.map(|committed| EventId::of::<UsdcRebalance>(&id, committed));
                 match load_entity::<UsdcRebalance>(&self.pool, &id).await {
                     Ok(Some(entity)) => {
                         let transfer = entity.to_dto(&id);
-                        if let Some(committed) = committed {
-                            self.log_transfer::<UsdcRebalance>(&id, &event, &transfer, committed)
-                            .await;
+                        if let Some(event_id) = &event_id {
+                            self.log_transfer::<UsdcRebalance>(&event, &transfer, event_id).await;
                         }
                         self.broadcast_transfer(transfer);
                     }
-                    Ok(None) => warn!(target: "dashboard", %id, "USDC rebalance entity not found for broadcast"),
-                    Err(error) => warn!(target: "dashboard", %id, ?error, "Failed to load rebalance for broadcast"),
+                    Ok(None) => warn!(target: "dashboard", %id, event_id = event_id.as_ref().map(tracing::field::display), "USDC rebalance entity not found for broadcast"),
+                    Err(error) => warn!(target: "dashboard", %id, event_id = event_id.as_ref().map(tracing::field::display), ?error, "Failed to load rebalance for broadcast"),
                 }
                 Ok(())
             })
@@ -1332,18 +1402,16 @@ impl Broadcaster {
             .await
     }
 
-    /// Writes the `liq_event` line of a committed onchain trade event, and
-    /// its `liq_trade` line when the event fills the trade or corrects its
-    /// venue. The venue comes from the stored trade, because only `Filled`
-    /// and `SourceAttributed` carry it.
+    /// Writes the `liq_event` line of a committed onchain trade event other
+    /// than `Filled`, and its `liq_trade` line when the event corrects the
+    /// trade's venue. The venue comes from the stored trade, because
+    /// `Enriched` and `Acknowledged` do not carry it.
     async fn log_onchain_trade(
         &self,
         id: &OnChainTradeId,
         event: &OnChainTradeEvent,
-        committed: Committed,
+        event_id: &EventId,
     ) {
-        let event_id = EventId::of::<OnChainTrade>(id, committed);
-
         let entity = match load_entity::<OnChainTrade>(&self.pool, id).await {
             Ok(Some(entity)) => entity,
             Ok(None) => {
@@ -1368,79 +1436,22 @@ impl Broadcaster {
         log_event::<OnChainTrade>(
             EventParent::Trade(entity.source.trading_venue()),
             event,
-            &event_id,
+            event_id,
         );
 
         match event {
-            OnChainTradeEvent::Filled { .. } | OnChainTradeEvent::SourceAttributed { .. } => {
-                match entity.try_into_trade(id) {
-                    Ok(trade) => log_trade(&trade, &event_id),
-                    Err(error) => warn!(
-                        target: "dashboard",
-                        %event_id,
-                        %error,
-                        "Failed to convert onchain trade; its liq_trade line is not written",
-                    ),
-                }
-            }
-            OnChainTradeEvent::Enriched { .. } | OnChainTradeEvent::Acknowledged { .. } => {}
-        }
-    }
-
-    /// Writes the `liq_event` line of a committed offchain order event, and
-    /// its `liq_trade` line when the event ends the order.
-    async fn log_offchain_order(
-        &self,
-        id: &OffchainOrderId,
-        event: &OffchainOrderEvent,
-        committed: Committed,
-    ) {
-        use OffchainOrderEvent::*;
-
-        let event_id = EventId::of::<OffchainOrder>(id, committed);
-
-        let order = match load_entity::<OffchainOrder>(&self.pool, id).await {
-            Ok(Some(order)) => order,
-            Ok(None) => {
-                warn!(
-                    target: "dashboard",
-                    %event_id,
-                    "Offchain order replayed to empty state; its log lines are not written",
-                );
-                return;
-            }
-            Err(error) => {
-                warn!(
-                    target: "dashboard",
-                    %event_id,
-                    ?error,
-                    "Failed to load offchain order; its log lines are not written",
-                );
-                return;
-            }
-        };
-
-        log_event::<OffchainOrder>(
-            EventParent::Trade(executor_venue(order.executor())),
-            event,
-            &event_id,
-        );
-
-        match event {
-            Filled { .. } | Failed { .. } | Cancelled { .. } => match order.try_into_trade(id) {
-                Ok(trade) => log_trade(&trade, &event_id),
+            OnChainTradeEvent::SourceAttributed { .. } => match entity.try_into_trade(id) {
+                Ok(trade) => log_trade(&trade, event_id),
                 Err(error) => warn!(
                     target: "dashboard",
                     %event_id,
                     %error,
-                    "Failed to convert terminal offchain order; its liq_trade line is not written",
+                    "Failed to convert onchain trade; its liq_trade line is not written",
                 ),
             },
-            Placed { .. }
-            | Submitted { .. }
-            | Accepted { .. }
-            | PartiallyFilled { .. }
-            | CancelRequested { .. } => {}
+            OnChainTradeEvent::Filled { .. }
+            | OnChainTradeEvent::Enriched { .. }
+            | OnChainTradeEvent::Acknowledged { .. } => {}
         }
     }
 
@@ -1448,18 +1459,16 @@ impl Broadcaster {
     /// `liq_transfer` line when the transfer's status changes.
     async fn log_transfer<Entity: EventSourced>(
         &self,
-        id: &Entity::Id,
         event: &Entity::Event,
         transfer: &TransferOperation,
-        committed: Committed,
+        event_id: &EventId,
     ) {
-        let event_id = EventId::of::<Entity>(id, committed);
         log_event::<Entity>(
             EventParent::Transfer(transfer_kind(transfer)),
             event,
-            &event_id,
+            event_id,
         );
-        self.transfer_lines.log(transfer, &event_id).await;
+        self.transfer_lines.log(transfer, event_id).await;
     }
 }
 
@@ -3563,10 +3572,11 @@ mod tests {
         line.keys().map(String::as_str).collect()
     }
 
-    const TRADE_LINE_KEYS: [&str; 12] = [
+    const TRADE_LINE_KEYS: [&str; 13] = [
         "direction",
         "error",
         "event_id",
+        "filled_shares",
         "id",
         "message",
         "occurred_at",
