@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import {
   kindLabel,
@@ -459,7 +460,9 @@ describe('transferRecoveryCommands', () => {
       const text = resumeText(direction)
       expect(text.includes('this resume continues with the Alpaca withdrawal')).toBe(true)
       expect(text.includes('cannot re-drive the USD to USDC conversion')).toBe(true)
-      expect(text.includes('fails the transfer (ConversionFailed) and releases the guard')).toBe(true)
+      expect(text.includes('fails the transfer (ConversionFailed) and releases the guard')).toBe(
+        true
+      )
       // After ConversionCancelNotSettled or ConversionOrderNotFound the order
       // can still fill, and the resume does not ask Alpaca, so check it first.
       const check = text.indexOf('no USD to USDC order for this transfer is still open')
@@ -467,14 +470,22 @@ describe('transferRecoveryCommands', () => {
       expect(check).toBeLessThan(text.indexOf('Do not move USDC by hand before you run the resume'))
       // Settling at Alpaca fits only a ConversionFailed end; a later failure
       // (say an Alpaca to Base BridgingFailed) has funds off Alpaca.
-      expect(text.includes('If it ends in ConversionFailed, settle any converted USDC by hand at Alpaca')).toBe(true)
+      expect(
+        text.includes('If it ends in ConversionFailed, settle any converted USDC by hand at Alpaca')
+      ).toBe(true)
       expect(text.includes('reconcile-usdc does not apply')).toBe(true)
       expect(text.includes('A later failure has its own recovery')).toBe(true)
     }
   })
 
   const bridgeLabels = (status: string, direction: 'alpaca_to_base' | 'base_to_alpaca' | null) =>
-    transferRecoveryCommands({ deployment: PROD, kind: 'usdc_bridge', id: 'BRIDGE001', status, direction })
+    transferRecoveryCommands({
+      deployment: PROD,
+      kind: 'usdc_bridge',
+      id: 'BRIDGE001',
+      status,
+      direction
+    })
 
   it('offers fail-usdc-transfer only where the running bot can accept it', () => {
     // Alpaca to Base: WithdrawalComplete (withdrawing) and a BridgingSubmitting
@@ -500,58 +511,84 @@ describe('transferRecoveryCommands', () => {
     )
     const toBase = failText('withdrawing', 'alpaca_to_base')
     expect(toBase.startsWith('Check the transfer first.')).toBe(true)
-    // The Alpaca to Base burn runs on Ethereum, and a nonce is per chain.
-    // The wallet burned on every earlier transfer too, so the check is anchored.
+    // The checks and the nonce close live in one place, the runbook, so the
+    // dialog gates the fail on them instead of keeping a second copy. The
+    // Alpaca to Base burn runs on Ethereum, and a nonce is per chain.
     expect(
-      toBase.includes('verify on Ethereum that no CCTP burn left the bot wallet after this transfer started')
+      toBase.includes(
+        'do not fail the transfer until you have done every check and the nonce close on Ethereum in docs/cli-ops.md, "Clearing a pre-burn guard latch", with the bot stopped'
+      )
     ).toBe(true)
-    expect(toBase.includes('pending nonce equals latest nonce')).toBe(true)
-    expect(toBase.includes('OperatorWithdraw')).toBe(false)
-
-    // A Base to Alpaca burn comes after the vault withdrawal, so the check is
-    // on the withdrawal, and a landed one is adopted with resume-usdc.
-    const toAlpaca = failText('withdrawing', 'base_to_alpaca')
-    expect(toAlpaca.includes('OperatorWithdraw')).toBe(true)
-    // A withdrawal sent before the inventory migration emits the orderbook's
-    // WithdrawV2, not OperatorWithdraw, so the check names both.
-    expect(toAlpaca.includes('no WithdrawV2 on the orderbook either')).toBe(true)
-    // Only the cash vault's USDC counts, and the hooks' inventory-sent
-    // WithdrawV2 is not the bot's withdrawal.
-    expect(toAlpaca.includes('cash vault_id in the bot config')).toBe(true)
-    expect(toAlpaca.includes('WithdrawV2 with the inventory as sender does not count')).toBe(true)
-    expect(toAlpaca.includes('run resume-usdc instead')).toBe(true)
-    expect(toAlpaca.includes('offline stox fail-usdc-transfer')).toBe(true)
-    // A log scan misses an unmined transaction, so the check also waits out
-    // the attempt and asks for no pending one.
-    expect(toAlpaca.includes('attempt timeout has passed')).toBe(true)
-    expect(toAlpaca.includes('pending nonce equals latest nonce on more than one RPC provider')).toBe(true)
-    // A provider can miss a pending withdraw, so the nonce is closed with a
-    // self-transfer and the logs checked again before the transfer is failed.
-    const cancel = toAlpaca.indexOf('close the nonce before you fail the transfer')
-    expect(cancel).toBeGreaterThan(-1)
-    expect(toAlpaca.includes('0-value transfer with no calldata from the bot wallet to itself')).toBe(true)
-    expect(toAlpaca.indexOf('check the withdrawal logs again')).toBeGreaterThan(cancel)
-    expect(toAlpaca.indexOf('Otherwise run the offline stox fail-usdc-transfer')).toBeGreaterThan(
-      toAlpaca.indexOf('check the withdrawal logs again')
-    )
-    // The bot is stopped at that point, and the client resume needs it running.
     expect(
-      toAlpaca.includes('If a withdrawal mined instead, start the bot and run resume-usdc, and do not fail the transfer')
+      toBase.includes('If a burn landed or you are not certain, run resume-usdc instead')
     ).toBe(true)
-    // Between reading the board and stopping the bot, the bot can broadcast a
-    // burn it does not record, and the offline command does not check the chain.
-    expect(toAlpaca.includes('no CCTP burn left the bot wallet')).toBe(true)
-    // A burn sent just before the stop can still be pending after it.
-    expect(toAlpaca.includes('stop the bot, then confirm')).toBe(true)
-    expect(toAlpaca.includes('the wallet has no pending transaction')).toBe(true)
-    expect(toAlpaca.includes('on Base that no CCTP burn left the bot wallet after this transfer started')).toBe(
+    // A restart sends the burn of a completed withdrawal, so the fail is the
+    // offline command, before the start.
+    expect(
+      toBase.includes(
+        'fail it with the offline stox fail-usdc-transfer before you start the bot again'
+      )
+    ).toBe(true)
+    expect(toBase.includes('the guard stays held until you settle them with reconcile-usdc')).toBe(
       true
     )
-    expect(toAlpaca.includes('on Ethereum')).toBe(false)
+    expect(toBase.includes('OperatorWithdraw')).toBe(false)
+
+    // A Base to Alpaca transfer's checks and nonce close run on Base.
+    const toAlpaca = failText('withdrawing', 'base_to_alpaca')
+    expect(toAlpaca.includes('only while the vault withdrawal is unrecorded')).toBe(true)
+    // The runbook below this stack has no full withdrawal procedure, so the
+    // dialog keeps it: both withdrawal events, the cash vault, the pending and
+    // queued checks, the nonce close and the recheck.
+    expect(toAlpaca.includes('OperatorWithdraw')).toBe(true)
+    expect(toAlpaca.includes('no WithdrawV2 on the orderbook either')).toBe(true)
+    expect(toAlpaca.includes('cash vault_id in the bot config')).toBe(true)
+    expect(
+      toAlpaca.includes('pending nonce equals latest nonce on more than one RPC provider')
+    ).toBe(true)
+    // A queued send waits behind a nonce gap; only empty nonces are filled,
+    // and only after the kept-send check.
+    const fill = toAlpaca.indexOf('fill each empty nonce below it')
+    expect(fill).toBeGreaterThan(-1)
+    expect(toAlpaca.indexOf('signed and keeps holds that nonce')).toBeGreaterThan(fill)
+    const close = toAlpaca.indexOf('close the nonce before you fail the transfer')
+    expect(close).toBeGreaterThan(-1)
+    expect(toAlpaca.indexOf('check the withdrawal logs again')).toBeGreaterThan(close)
+    expect(
+      toAlpaca.includes(
+        'If a withdrawal mined instead, a transaction is pending or queued, or you cannot tell, start the bot and run resume-usdc'
+      )
+    ).toBe(true)
+    // Resume adopts only the full amount; anything else ends in
+    // WithdrawalFailed with the USDC in the wallet.
+    expect(toAlpaca.includes('any other amount ends the transfer in WithdrawalFailed')).toBe(true)
+    // The unrecorded withdrawal can be failed through the live route too.
+    expect(
+      toAlpaca.includes(
+        'Otherwise run the offline stox fail-usdc-transfer, or this command after you restart the bot'
+      )
+    ).toBe(true)
+    // Once recorded, the burn checks apply, with the runbook as the source.
+    expect(toAlpaca.includes('"Clearing a pre-burn guard latch"')).toBe(true)
+    // A late burn is finished with the bot stopped, for the amount the mint
+    // printed.
+    expect(toAlpaca.includes('Keep the bot stopped until that USDC is at Alpaca')).toBe(true)
+    expect(toAlpaca.includes('pending, queued and kept-send checks on Ethereum')).toBe(true)
+    expect(toAlpaca.includes('divided by 1,000,000 (it prints USDC base units)')).toBe(true)
+    // A burn found by the recheck of a confirmed withdrawal is resumed,
+    // never failed.
+    expect(
+      toAlpaca.includes(
+        'If a burn landed, something is pending or queued, or you are not certain, start the bot and run resume-usdc, and do not fail the transfer'
+      )
+    ).toBe(true)
+    // Its withdrawal checks and nonce close run on Base; only a late burn's
+    // mint and deposit are on Ethereum.
+    expect(toAlpaca.includes('to itself on Ethereum')).toBe(false)
 
     const unknown = failText('withdrawing', null)
-    expect(unknown.includes('verify on Ethereum')).toBe(true)
-    expect(unknown.includes('OperatorWithdraw')).toBe(true)
+    expect(unknown.includes('nonce close on Ethereum')).toBe(true)
+    expect(unknown.includes('nonce close on Base')).toBe(true)
     expect(unknown.includes('no reconcile is needed')).toBe(false)
   })
 
@@ -560,10 +597,12 @@ describe('transferRecoveryCommands', () => {
       bridgeLabels(status, direction).find((entry) => entry.label === 'Resume')?.description ?? ''
     // The running bot refuses fail-usdc-transfer once the vault withdrawal
     // confirmed, so the dialog offers no Fail there and the resume says where to go.
-    expect(bridgeLabels('bridging', 'base_to_alpaca').map((entry) => entry.label)).toEqual(['Resume'])
-    expect(resumeText('bridging', 'base_to_alpaca').includes('CLI recovery guide for the offline path')).toBe(
-      true
-    )
+    expect(bridgeLabels('bridging', 'base_to_alpaca').map((entry) => entry.label)).toEqual([
+      'Resume'
+    ])
+    expect(
+      resumeText('bridging', 'base_to_alpaca').includes('CLI recovery guide for the offline path')
+    ).toBe(true)
     for (const [status, direction] of [
       ['withdrawing', 'base_to_alpaca'],
       ['depositing', 'base_to_alpaca'],
@@ -582,7 +621,9 @@ describe('transferRecoveryCommands', () => {
       status: 'bridging',
       direction: 'alpaca_to_base'
     })
-    expect(commandFor(toBase, 'Resume')).toBe(`${CLIENT} debug resume-usdc alpaca-to-base BRIDGE001`)
+    expect(commandFor(toBase, 'Resume')).toBe(
+      `${CLIENT} debug resume-usdc alpaca-to-base BRIDGE001`
+    )
 
     const toAlpaca = transferRecoveryCommands({
       deployment: PROD,
@@ -779,7 +820,9 @@ describe('tradeRecoveryCommands', () => {
     expect(commandFor(commands, 'Set position')).toBe(
       `${CLIENT} debug position set MSTR --target-net <N> [--price-usdc <USDC_PER_SHARE>] --reason "<reason>"`
     )
-    expect(commandFor(commands, 'Rebuild view')).toBe(`${CLIENT} debug view rebuild position --id MSTR`)
+    expect(commandFor(commands, 'Rebuild view')).toBe(
+      `${CLIENT} debug view rebuild position --id MSTR`
+    )
   })
 
   it('uses the mock cli prefix in a simulation build', () => {
@@ -804,7 +847,9 @@ describe('tradeRecoveryCommands', () => {
 describe('forClientEnv', () => {
   it('retargets a guide command at staging and leaves production as is', () => {
     const command = `${CLIENT} debug resume`
-    expect(forClientEnv(command, 'staging')).toBe('st0x-liquidity-client --env staging debug resume')
+    expect(forClientEnv(command, 'staging')).toBe(
+      'st0x-liquidity-client --env staging debug resume'
+    )
     expect(forClientEnv(command, 'production')).toBe(command)
     expect(forClientEnv(command, null)).toBe(
       'st0x-liquidity-client --env <production|staging> debug resume'
@@ -845,7 +890,9 @@ describe('RECOVERY_GUIDE', () => {
     )
     // The bot refuses an Alpaca to Base deposit and one with no onchain deposit
     // transaction, so the guide sends those to manual settlement instead.
-    expect(recheck?.appliesTo.includes('failed Base to Alpaca USDC deposit with an onchain')).toBe(true)
+    expect(recheck?.appliesTo.includes('failed Base to Alpaca USDC deposit with an onchain')).toBe(
+      true
+    )
     expect(recheck?.appliesTo.includes('Alpaca to Base deposit needs manual settlement')).toBe(true)
   })
 
@@ -855,7 +902,9 @@ describe('RECOVERY_GUIDE', () => {
     )
     // The same check as the converting note in the transfer dialog.
     expect(
-      resume?.whenToUse.includes('first confirm at Alpaca that no USD to USDC order for the transfer is still open')
+      resume?.whenToUse.includes(
+        'first confirm at Alpaca that no USD to USDC order for the transfer is still open'
+      )
     ).toBe(true)
   })
 })
@@ -873,5 +922,20 @@ describe('recoveryModeColor', () => {
   it('gives requires-bot amber and direct-db the bot-stop red', () => {
     expect(recoveryModeColor('requires-bot').text).toBe('text-amber-500')
     expect(recoveryModeColor('direct-db').text).toBe('text-destructive')
+  })
+})
+
+describe('runbook headings the recovery text names', () => {
+  it('exist in docs/cli-ops.md', () => {
+    // The fail gates send operators to these sections by name, so a renamed
+    // heading must fail here instead of leaving every gate pointing nowhere.
+    const runbook = readFileSync(new URL('../../../docs/cli-ops.md', import.meta.url), 'utf8')
+    const headings = runbook
+      .split('\n')
+      .filter((line) => line.startsWith('#'))
+      .map((line) => line.replace(/^#+\s*/, ''))
+    for (const heading of ['Clearing a pre-burn guard latch']) {
+      expect(headings).toContain(heading)
+    }
   })
 })
