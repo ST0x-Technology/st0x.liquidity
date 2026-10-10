@@ -456,12 +456,16 @@ const usdcDirectionToClientArg = (direction: UsdcBridgeDirection | null): string
 }
 
 const USDC_FAIL_ALPACA_TO_BASE =
-  'Alpaca to Base: the bot accepts this only before the burn, from a completed withdrawal ' +
-  'or a burn submission with no recorded burn. The burn runs on Ethereum: verify on Ethereum ' +
-  'that no CCTP burn left the bot wallet after this transfer started (its Started time) and ' +
-  'that the wallet has no pending transaction (pending nonce equals latest nonce); if you ' +
-  'are not certain, run resume-usdc instead. The funds left Alpaca, so the guard stays held ' +
-  'until you settle them with reconcile-usdc.'
+  'Alpaca to Base: the bot accepts this only before the burn, from a completed ' +
+  'withdrawal or a burn submission with no recorded burn, and it does not check the ' +
+  'chain. A burn the bot sent but did not record can still land, so do not fail the ' +
+  'transfer until you have done every check and the nonce close on Ethereum in ' +
+  'docs/cli-ops.md, "Clearing a pre-burn guard latch", with the bot stopped. Then fail ' +
+  'it with the offline stox fail-usdc-transfer before you start the bot again: a restart ' +
+  'sends the burn of a completed withdrawal (at a burn submission, this command after a ' +
+  'restart works too). If a burn landed or you are not certain, run resume-usdc instead. ' +
+  'The funds left Alpaca, so the guard stays held until you settle them with ' +
+  'reconcile-usdc.'
 
 const USDC_FAIL_BASE_TO_ALPACA =
   'Base to Alpaca: the bot accepts this only while the vault withdrawal is unrecorded, ' +
@@ -473,25 +477,41 @@ const USDC_FAIL_BASE_TO_ALPACA =
   'sender. A WithdrawV2 with the inventory as sender does not count. A withdraw the ' +
   'network accepted but has not mined is not in the logs yet, so also wait until the ' +
   "transfer's attempt timeout has passed and confirm the wallet has no pending " +
-  'transaction (no pending withdraw4, and pending nonce equals latest nonce on more than ' +
-  'one RPC provider). These checks cannot prove that nothing is pending. If a withdrawal ' +
-  'landed or you are not certain, run resume-usdc instead: it adopts a full withdrawal, ' +
-  'and a short one ends the transfer in WithdrawalFailed, so move that USDC from the bot ' +
-  'wallet back to the vault by hand. If nothing landed, the resume keeps redriving: ' +
-  'repeat the checks, and once they show that no withdrawal landed and none is pending, ' +
-  'take the next step. If none landed, close the nonce before you fail the transfer: ' +
-  'stop the bot, send a 0-value transfer with no calldata from the bot wallet to itself ' +
-  'at the latest nonce, with maxFeePerGas and maxPriorityFeePerGas well above the market ' +
-  'fee, wait for its required confirmations, and check the withdrawal logs again. If a ' +
-  'withdrawal mined instead, start the bot and run resume-usdc, and do not fail the ' +
-  'transfer. Otherwise run the offline stox fail-usdc-transfer, or this command after ' +
-  'you restart the bot. If a withdrawal for this transfer mines later anyway, move its ' +
-  'USDC from the bot wallet back to the vault by hand. While a recorded withdrawal is ' +
-  'still confirming, run resume-usdc. Once it has confirmed the bot refuses: stop the ' +
-  'bot, then confirm the transfer has no recorded burn, and on Base that no CCTP burn ' +
-  'left the bot wallet after this transfer started and the wallet has no pending ' +
-  'transaction. If any of that is not certain, start the bot and run resume-usdc; else ' +
-  'run the offline stox fail-usdc-transfer and move the wallet USDC back by hand.'
+  'transaction (no pending withdraw4, pending nonce equals latest nonce on more than one ' +
+  'RPC provider, and the explorer shows no queued transaction from the wallet). A queued ' +
+  'transaction waits behind a nonce gap: with the bot stopped, fill each empty nonce ' +
+  'below it, in order, with a self-transfer as below, after making sure no send the bot ' +
+  'signed and keeps holds that nonce, then repeat the checks. These checks cannot prove ' +
+  'that nothing is pending. If a withdrawal landed or you are not certain, run ' +
+  'resume-usdc instead: it adopts a withdrawal of the full amount, and any other amount ' +
+  'ends the transfer in WithdrawalFailed, so move that USDC from the bot wallet back to ' +
+  'the cash vault by hand. If nothing landed, the resume keeps redriving: repeat the ' +
+  'checks, and once every check is clean, take the next step. If none landed, close the ' +
+  'nonce before you fail the transfer: stop the bot, check again that the wallet has no ' +
+  'pending or queued transaction, make sure no send the bot signed and keeps holds that ' +
+  'nonce (if one does, start the bot so it rebroadcasts the send instead), send a 0-value ' +
+  'transfer with no calldata from the bot wallet to itself at the latest nonce, with ' +
+  'maxFeePerGas and maxPriorityFeePerGas well above the market fee, wait for its required ' +
+  'confirmations, and check the withdrawal logs again. The self-transfer closes only ' +
+  'that nonce. If a withdrawal mined instead, a transaction is pending or queued, or you ' +
+  'cannot tell, start the bot and run resume-usdc, and do not fail the transfer. ' +
+  'Otherwise run the offline stox fail-usdc-transfer, or this command after you restart ' +
+  'the bot. If a withdrawal for this transfer mines later anyway, move its USDC from the ' +
+  'bot wallet back to the cash vault by hand. While a recorded withdrawal is still ' +
+  'confirming, run resume-usdc. Once it has confirmed the bot refuses: do every check ' +
+  'and the nonce close on Base in docs/cli-ops.md, "Clearing a pre-burn guard latch". If ' +
+  'a burn landed, something is pending or queued, or you are not certain, start the bot ' +
+  'and run resume-usdc, and do not fail the transfer. Otherwise run the offline stox ' +
+  'fail-usdc-transfer and move the wallet USDC back by hand. If ' +
+  'a burn for this transfer mines later anyway, resume and reconcile refuse the failed ' +
+  'transfer. Keep the bot stopped until that USDC is at Alpaca: the offline commands send ' +
+  'from the bot wallet and replace whatever is pending at their nonce. Mint it with stox ' +
+  "cctp complete-mint --burn-tx <burn> --source-chain base (it adopts a relayer's mint; " +
+  'do not mint by hand, since the MessageSent log holds a placeholder nonce). Then send ' +
+  'the amount received that complete-mint printed, divided by 1,000,000 (it prints USDC ' +
+  'base units), to Alpaca with stox alpaca-deposit -a <amount>, and do not move that USDC ' +
+  'back to the vault. Once Alpaca credits it, convert ' +
+  'it with stox alpaca-convert -d to-usd -a <amount>, as the bot would have.'
 
 /// A Base to Alpaca bridge stuck at `bridging` (its vault withdrawal confirmed):
 /// the running bot refuses `fail-usdc-transfer` there, so the resume command
