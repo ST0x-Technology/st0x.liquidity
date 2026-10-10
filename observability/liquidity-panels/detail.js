@@ -12,8 +12,9 @@
 //
 // The panel is one empty column of the header row; only the dialog shows.
 //
-// latest is not defined here: the generator prepends it from
-// status-history.js (see detail_panel()).
+// MODE_LABELS, tradeCommands, transferCommands and latest are not defined
+// here: the generator prepends them from recovery-guide.json,
+// recovery-commands.js and status-history.js (see detail_panel()).
 
 const theme = context.grafana.theme;
 const root = context.element;
@@ -145,6 +146,31 @@ const statusLabel = (status) => {
 };
 
 // --------------------------------------------------------------------------
+// Recovery commands (recovery-commands.js, prepended): the operations client,
+// which signs in with Google and calls the running bot's ops API, so no SSH
+// is needed and every command needs the bot.
+// --------------------------------------------------------------------------
+
+// The environment the board shows: the client takes the selector's text.
+const ENV = context.grafana.replaceVariables('${env:text}') === 'staging' ? 'staging' : 'production';
+const CLIENT = `st0x-liquidity-client --env ${ENV}`;
+
+const modeClass = (mode) => (mode === 'requires-bot' ? 'det-amber' : 'det-red');
+const commandBlock = (commands, note) =>
+  commands.length === 0 && !note
+    ? ''
+    : `<div class="det-cli"><div class="det-cli-title">CLI commands</div>${note ? `<p class="det-muted">${escapeHtml(note)}</p>` : ''}${commands
+        .map(
+          (entry) => `
+        <div class="det-command">
+          <pre>${escapeHtml(entry.command)}</pre>
+          <div>${escapeHtml(entry.description)}</div>
+          <span class="det-mode ${modeClass(entry.mode)}">${escapeHtml(MODE_LABELS[entry.mode] || entry.mode)}</span>
+        </div>`
+        )
+        .join('')}</div>`;
+
+// --------------------------------------------------------------------------
 // The dialog
 // --------------------------------------------------------------------------
 
@@ -254,10 +280,12 @@ const tradeDialog = (trade) => {
       ${field('Status', `<span class="${statusClass(trade.status)}">${escapeHtml(statusLabel(trade.status))}</span>${trade.error ? `<div class="det-red">${escapeHtml(trade.error)}</div>` : ''}`)}
     </div>
     ${timeline(trade.history, onchain ? chain : null)}
+    ${commandBlock(tradeCommands(CLIENT, trade.symbol))}
   </div>`;
 };
 
 const transferDialog = (transfer) => {
+  const usdcFailed = transfer.kind === 'usdc_bridge' && String(transfer.status).toLowerCase() === 'failed';
   return `
   <div class="det-dialog-head">
     <span class="det-title-line">
@@ -275,6 +303,12 @@ const transferDialog = (transfer) => {
       ${field('Status', `<span class="${statusClass(transfer.status)}">${escapeHtml(statusLabel(transfer.status))}</span>`)}
     </div>
     ${timeline(transfer.history, null)}
+    ${commandBlock(
+      transferCommands(CLIENT, transfer),
+      usdcFailed
+        ? 'Reconcile applies only when the funds left their source venue, which the logs do not show. Check the transfer in the SPA before you reconcile it.'
+        : ''
+    )}
   </div>`;
 };
 
