@@ -308,7 +308,7 @@
   ],
   "panels": [
     {
-      "id": 83,
+      "id": 84,
       "type": "marcusolsson-dynamictext-panel",
       "title": "",
       "description": "The SPA header: settings pills, Config, the CLI recovery guide, the deployed commit, uptime, and whether the bot is up: the exporter's liq_up, or the bot scrape's up on the bot source.",
@@ -372,7 +372,7 @@
       "hideTimeOverride": true
     },
     {
-      "id": 84,
+      "id": 85,
       "type": "table",
       "title": "Log History",
       "description": "The bot's structured log lines, re-emitted by the exporter with real severity and target (the raw container stream is all-INFO). Filter with the level/category/target/search variables above. \u26a0\ufe0f Only the newest matching entries, about the panel's pixel width of them. Narrow the filters, or use the SPA for deep digs. DEBUG/TRACE are not shipped.",

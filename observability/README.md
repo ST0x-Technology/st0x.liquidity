@@ -59,6 +59,14 @@ band verdict (a symbol rebalanced on Base, with a balance, with no vault on
 another chain, while the default Base target is set), so it is grey on the
 `exporter` source, which cannot see the other chains.
 
+Trades and Rebalances are Grafana tables too. A row's ⓘ sets the hidden `detail`
+variable to the row's id; the `detail` panel, a second Business Text panel in
+the header row's last column, then opens that row's dialog. It reads the two
+tables' results through the Dashboard datasource (so Rebalances queries as refId
+B) and runs no query of its own, so a click opens the dialog at once. The dialog
+shows the row's status history (`status-history.js`); the bot's event timeline
+joins it once the bot logs its events. Closing the dialog clears the variable.
+
 Keep the Dashboard tab's panel heights (`TRADES_H`, `TRANSFERS_H` and the
 `native_inventory` heights in the generator) unless you check a new set on a
 preview board: reload it at a few window heights and confirm both columns end
