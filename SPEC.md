@@ -1735,23 +1735,26 @@ depending on the sidecar.
   defect in an existing name is never fixed in place: the fix gets a new name,
   and consumers move to it explicitly.
 - **Families replace as one unit.** Each source of `liq_*` series is one family:
-  health, settings, inventory, prices, the four performance families (latencies,
-  reliability, infra, rebalances), pending orders, Raindex orders, and one per
-  P&L window. Inventory is replaced on each inventory write, in write order, and
-  also republished every 60 seconds from the latest copy. A refresh replaces
-  every sample of its family, so a symbol, chain or day that leaves the source
-  leaves `/metrics` on the next scrape instead of keeping its last value. A
-  family whose refresh fails keeps its last published samples.
+  health, settings, inventory, prices, equity bands, the four performance
+  families (latencies, reliability, infra, rebalances), pending orders, Raindex
+  orders, and one per P&L window. Inventory is replaced on each inventory write,
+  in write order, and also republished every 60 seconds from the latest copy.
+  Equity bands are replaced each time the trigger plans a symbol, from the
+  latest bands of every symbol: the planned symbol's samples change and the
+  others keep their last values. A refresh replaces every sample of its family,
+  so a symbol, chain or day that leaves the source leaves `/metrics` on the next
+  scrape instead of keeping its last value. A family whose refresh fails keeps
+  its last published samples.
 - **One writer per name.** Every `liq_*` name belongs to exactly one family, and
   no `liq_*` name goes through the `metrics` macros. If the recorder ever
   renders a `liq_` name, the contract skips its own block for that name and logs
   an error, so the body stays valid.
 - **Freshness.** `liq_collector_last_success_ts_seconds{collector}` gives the
   Unix time each family was last published, with `collector` from a closed set:
-  `health`, `settings`, `inventory`, `prices`, `latencies`, `reliability`,
-  `infra`, `rebalances`, `pending_orders`, `raindex`, and one per P&L window.
-  `health` and `settings` are published once at boot, so their time stays at the
-  boot time for the life of the process: that is not staleness.
+  `health`, `settings`, `inventory`, `prices`, `equity_bands`, `latencies`,
+  `reliability`, `infra`, `rebalances`, `pending_orders`, `raindex`, and one per
+  P&L window. `health` and `settings` are published once at boot, so their time
+  stays at the boot time for the life of the process: that is not staleness.
 - **Typed gauges.** Every `liq_*` block carries a `# HELP` line and a
   `# TYPE <name> gauge` line. Every name is a gauge: snapshots, rolling `_24h`
   windows, `*_total` names that mean a count now, and precomputed quantile
@@ -1825,6 +1828,33 @@ If the positions fail to load, the last published prices stay.
   broker cash is read and while both are 0: it is a bot-only series, so the
   Values rule applies and no exporter sentinel stands in. It is not the
   corridor's trigger ratio, which uses the vault total, in flight included.
+
+Each time the rebalancing trigger plans a symbol, it publishes that symbol's
+`liq_equity_chain_share{chain,symbol}` and
+`liq_equity_chain_verdict{chain,symbol}` from the allocation planner's own
+input: each chain's share of the symbol's total in underlying shares (vaults
+through their wrapper ratio, plus the broker, transfers in flight included), and
+-1, 0 or 1 for below, within or above that chain's own target and band. A chain
+without a target, or whose listing is paused, still counts in the total but has
+no series, because the planner never picks it. The family keeps the latest bands
+of every symbol, so a symbol stays published while others are planned. A symbol
+leaves the family when the planner cannot size it (the broker or a listing chain
+not polled, a stale chain, a total of 0, or a plan input such as a wrapper ratio
+that cannot be read), and while its balance is divergent or restart tainted.
+When a symbol's transfer is in progress the trigger refreshes its bands without
+planning. Shares in flight count at the venue they leave, and venue snapshots
+are not applied while anything is in flight, so the verdict that started a
+transfer stays until the transfer completes; the refresh only picks up fills and
+provider polls of the amount in flight. A frozen asset keeps its last values
+until the next check. The `equity_bands` collector time moves whenever any
+symbol is published, so it does not say how old one symbol's values are. The
+verdict says where the chain sits, not whether the planner acts: it does not act
+while a transfer is in flight. Shares in flight are counted as underlying
+shares, the unit a provider poll and a stranded redemption use. The bot's own
+redemption is in flight in wrapped shares until a provider poll lists it, so
+while the ratio is not 1 the share is off by (ratio - 1) times that amount until
+then. A failed readiness probe of the chain the planner chose keeps the bands it
+recorded.
 
 Every 60 seconds a second task publishes the performance families from the same
 loaders as the `/performance/*` endpoints, over the last 24 hours:
