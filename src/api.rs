@@ -279,10 +279,13 @@ async fn pnl(
 fn pnl_report_error_response(error: PnlReportError) -> (StatusCode, String) {
     match error {
         PnlReportError::Report(error) => pnl_error_response(error),
-        PnlReportError::CatchUpTimeout => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "PnL ledger catch-up timed out".to_string(),
-        ),
+        PnlReportError::CatchUpTimeout => {
+            warn!("PnL ledger catch-up exceeded its request deadline");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "PnL ledger catch-up timed out".to_string(),
+            )
+        }
         PnlReportError::Activities(error) => {
             error!(%error, "Failed to fetch Alpaca account activities for PnL");
             (
@@ -4821,6 +4824,50 @@ mod tests {
         assert_eq!(
             body_to_string(response).await,
             "PnL report capacity exhausted"
+        );
+    }
+
+    #[test]
+    fn pnl_catch_up_timeout_returns_service_unavailable() {
+        let (status, body) = pnl_report_error_response(PnlReportError::CatchUpTimeout);
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, "PnL ledger catch-up timed out");
+    }
+
+    #[test]
+    fn pnl_activities_failure_returns_bad_gateway() {
+        let parse_error = serde_json::from_str::<u64>("not json").unwrap_err();
+        let error = PnlReportError::Activities(Box::new(
+            st0x_execution::AlpacaBrokerApiError::JsonParse(parse_error),
+        ));
+
+        let (status, body) = pnl_report_error_response(error);
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body, "Failed to fetch Alpaca account activities");
+    }
+
+    #[tokio::test]
+    async fn pnl_route_returns_bad_gateway_when_alpaca_activities_are_unreachable() {
+        // A port that was just bound and released, so nothing listens on it
+        // and the activities fetch fails to connect.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.broker = crate::test_utils::mock_alpaca_broker_ctx(format!("http://127.0.0.1:{port}"));
+        let state = empty_app_state(ctx).await;
+
+        let response = build_app(state)
+            .oneshot(Request::builder().uri("/pnl").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            body_to_string(response).await,
+            "Failed to fetch Alpaca account activities"
         );
     }
 
