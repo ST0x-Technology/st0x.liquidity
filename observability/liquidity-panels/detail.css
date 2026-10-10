@@ -129,7 +129,9 @@
 }
 
 .det-command pre {
-  margin: 0 0 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
   padding: 6px 8px;
   border-radius: 4px;
   background: var(--det-card);
@@ -137,6 +139,26 @@
   white-space: pre-wrap;
   word-break: break-all;
 }
+
+.det-command .liq-command-line {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.det-command .liq-copy {
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  border: 1px solid var(--det-border);
+  border-radius: 4px;
+  background: var(--det-card);
+  color: var(--det-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.det-command .liq-copy:hover { color: var(--det-text); }
 
 .det-mode {
   display: inline-block;

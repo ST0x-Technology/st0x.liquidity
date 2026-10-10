@@ -4,20 +4,41 @@
 .hdr {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 8px;
   height: 100%;
   font-size: 13px;
   white-space: nowrap;
 }
 
-.hdr-left,
-.hdr-right {
+/* On a narrow panel only the metric pills and the clock, commit and uptime
+   give way, so the Config button, the guide button and the connection badge
+   stay in view down to about 330px. They are all direct items of .hdr, so
+   no group can shrink below its own controls and push them under the next
+   group. The pills clip; the clock, commit and uptime end in an ellipsis. */
+.hdr-pills {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex: 0 1 auto;
   min-width: 0;
+  overflow: hidden;
 }
+
+.hdr-info {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.hdr-info > * + * { margin-left: 8px; }
+
+.hdr-button,
+.hdr-guide,
+.hdr-badge { flex: 0 0 auto; }
+
+/* Takes the free space, so the guide and what follows sit at the right. */
+.hdr-guide { margin-left: auto; }
 
 .hdr-pill {
   display: inline-flex;
@@ -135,6 +156,8 @@
 }
 
 .hdr-command pre {
+  flex: 1 1 auto;
+  min-width: 0;
   margin: 0;
   padding: 8px;
   border-radius: 4px;
@@ -143,6 +166,25 @@
   white-space: pre-wrap;
   word-break: break-all;
 }
+
+.hdr-command .liq-command-line {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.hdr-command .liq-copy {
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  border: 1px solid var(--hdr-border);
+  border-radius: 4px;
+  background: var(--hdr-card);
+  color: var(--hdr-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.hdr-command .liq-copy:hover { color: var(--hdr-text); }
 
 .hdr-grid {
   display: grid;
