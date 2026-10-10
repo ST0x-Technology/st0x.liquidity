@@ -142,7 +142,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_up)",
+            "expr": "max(liq_up{job=\"t0-liquidity-exporter\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -244,7 +244,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max by (git_commit) (topk(1, label_replace(timestamp(liq_bot_info), \"git_commit\", \"$1\", \"git_commit\", \"(.{7}).*\")))",
+            "expr": "max by (git_commit) (topk(1, label_replace(timestamp(liq_bot_info{job=\"t0-liquidity-exporter\"}), \"git_commit\", \"$1\", \"git_commit\", \"(.{7}).*\")))",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -331,7 +331,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "time() - max(liq_bot_start_timestamp_seconds)",
+            "expr": "time() - max(liq_bot_start_timestamp_seconds{job=\"t0-liquidity-exporter\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -419,7 +419,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "sum by (broker) (liq_settings_info)",
+            "expr": "sum by (broker) (liq_settings_info{job=\"t0-liquidity-exporter\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -506,7 +506,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_settings_equity_target)",
+            "expr": "max(liq_settings_equity_target{job=\"t0-liquidity-exporter\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -594,7 +594,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_settings_usdc_target)",
+            "expr": "max(liq_settings_usdc_target{job=\"t0-liquidity-exporter\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -682,7 +682,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_settings_execution_threshold_usd)",
+            "expr": "max(liq_settings_execution_threshold_usd{job=\"t0-liquidity-exporter\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1055,7 +1055,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_pending_orders_total) or vector(0)",
+            "expr": "max(liq_pending_orders_total{job=\"t0-liquidity-exporter\"}) or vector(0)",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1137,7 +1137,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_raindex_orders_total)",
+            "expr": "max(liq_raindex_orders_total{job=\"t0-liquidity-exporter\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1219,7 +1219,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_raindex_orders_unavailable) or vector(0)",
+            "expr": "max(liq_raindex_orders_unavailable{job=\"t0-liquidity-exporter\"}) or vector(0)",
             "step": "60s"
           },
           "timeSeriesList": {

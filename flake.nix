@@ -425,6 +425,7 @@
                     cargo nextest run --workspace --all-features
                     cargo clippy --workspace --all-targets --all-features
                     cargo fmt -- --check
+                    python3 observability/gen-t0-liquidity.py --check
                   '
 
                   nix develop .#ci-audit -c bash -c './scripts/test-rust-audit.sh && ./scripts/audit-rust.sh'
@@ -848,7 +849,8 @@
             # CI: cargo check/nextest/clippy + sqlx db reset. No terraform, no
             # deploy scripts. abiEnv is needed because build.rs / sol! macros
             # consume ST0X_*_ABI at compile time. foundry is required because
-            # tests spawn anvil for local EVM simulation.
+            # tests spawn anvil for local EVM simulation. python3 runs the
+            # board generator check.
             ci-backend = pkgs.mkShell (
               {
                 buildInputs =
@@ -856,6 +858,7 @@
                   ++ [
                     pkgs.sqlx-cli
                     pkgs.cargo-nextest
+                    pkgs.python3
                     foundryBin
                   ]
                   ++ moldInputs;

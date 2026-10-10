@@ -183,7 +183,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_up)",
+            "expr": "max(liq_up{job=\"t0-liquidity-exporter\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -285,7 +285,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max by (git_commit) (topk(1, label_replace(timestamp(liq_bot_info), \"git_commit\", \"$1\", \"git_commit\", \"(.{7}).*\")))",
+            "expr": "max by (git_commit) (topk(1, label_replace(timestamp(liq_bot_info{job=\"t0-liquidity-exporter\"}), \"git_commit\", \"$1\", \"git_commit\", \"(.{7}).*\")))",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -372,7 +372,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "time() - max(liq_bot_start_timestamp_seconds)",
+            "expr": "time() - max(liq_bot_start_timestamp_seconds{job=\"t0-liquidity-exporter\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -460,7 +460,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "sum by (broker) (liq_settings_info)",
+            "expr": "sum by (broker) (liq_settings_info{job=\"t0-liquidity-exporter\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -547,7 +547,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_settings_equity_target)",
+            "expr": "max(liq_settings_equity_target{job=\"t0-liquidity-exporter\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -635,7 +635,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_settings_usdc_target)",
+            "expr": "max(liq_settings_usdc_target{job=\"t0-liquidity-exporter\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -723,7 +723,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_settings_execution_threshold_usd)",
+            "expr": "max(liq_settings_execution_threshold_usd{job=\"t0-liquidity-exporter\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -811,7 +811,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_hedge_latency_ms{stage=\"detection\",quantile=\"p95\"})",
+            "expr": "max(liq_hedge_latency_ms{job=\"t0-liquidity-exporter\",stage=\"detection\",quantile=\"p95\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -900,7 +900,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_hedge_latency_ms{stage=\"exposure_window\",quantile=\"p95\"})",
+            "expr": "max(liq_hedge_latency_ms{job=\"t0-liquidity-exporter\",stage=\"exposure_window\",quantile=\"p95\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -989,7 +989,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_reliability_log_count_24h{level=\"error\"}) or vector(0)",
+            "expr": "max(liq_reliability_log_count_24h{job=\"t0-liquidity-exporter\",level=\"error\"}) or vector(0)",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1078,7 +1078,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "time() - min(liq_open_exposure_oldest_ts_seconds)",
+            "expr": "time() - min(liq_open_exposure_oldest_ts_seconds{job=\"t0-liquidity-exporter\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1167,7 +1167,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_block_lag_blocks)",
+            "expr": "max(liq_block_lag_blocks{job=\"t0-liquidity-exporter\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1256,7 +1256,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_hedge_latency_ms{stage=\"detection\",quantile=\"p50\"})",
+            "expr": "max(liq_hedge_latency_ms{job=\"t0-liquidity-exporter\",stage=\"detection\",quantile=\"p50\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1342,7 +1342,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_hedge_latency_ms_samples{stage=\"detection\"}) or vector(0)",
+            "expr": "max(liq_hedge_latency_ms_samples{job=\"t0-liquidity-exporter\",stage=\"detection\"}) or vector(0)",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1428,7 +1428,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_hedge_latency_ms{stage=\"exposure_window\",quantile=\"p50\"})",
+            "expr": "max(liq_hedge_latency_ms{job=\"t0-liquidity-exporter\",stage=\"exposure_window\",quantile=\"p50\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1514,7 +1514,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_hedge_latency_ms_samples{stage=\"exposure_window\"}) or vector(0)",
+            "expr": "max(liq_hedge_latency_ms_samples{job=\"t0-liquidity-exporter\",stage=\"exposure_window\"}) or vector(0)",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1600,7 +1600,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_reliability_log_count_24h{level=\"warning\"}) or vector(0)",
+            "expr": "max(liq_reliability_log_count_24h{job=\"t0-liquidity-exporter\",level=\"warning\"}) or vector(0)",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1686,7 +1686,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "sum(liq_failure_event_count_24h) or vector(0)",
+            "expr": "sum(liq_failure_event_count_24h{job=\"t0-liquidity-exporter\"}) or vector(0)",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1772,7 +1772,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "count(sum by (job_type) (liq_job_queue{state=~\"failed|killed\"}) > 0) or vector(0)",
+            "expr": "count(sum by (job_type) (liq_job_queue{job=\"t0-liquidity-exporter\",state=~\"failed|killed\"}) > 0) or vector(0)",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1862,7 +1862,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "sum(liq_open_exposure_fill_count) or vector(0)",
+            "expr": "sum(liq_open_exposure_fill_count{job=\"t0-liquidity-exporter\"}) or vector(0)",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1948,7 +1948,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "count(liq_open_exposure_fill_count > 0) or vector(0)",
+            "expr": "count(liq_open_exposure_fill_count{job=\"t0-liquidity-exporter\"} > 0) or vector(0)",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -2044,7 +2044,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "time() - max(liq_block_lag_sampled_ts_seconds)",
+            "expr": "time() - max(liq_block_lag_sampled_ts_seconds{job=\"t0-liquidity-exporter\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -2130,7 +2130,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_poll_skipped_ticks_24h) or vector(0)",
+            "expr": "max(liq_poll_skipped_ticks_24h{job=\"t0-liquidity-exporter\"}) or vector(0)",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -2216,7 +2216,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max by (stage) (liq_hedge_latency_ms{quantile=\"p95\"})",
+            "expr": "max by (stage) (liq_hedge_latency_ms{job=\"t0-liquidity-exporter\",quantile=\"p95\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -2294,7 +2294,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_hedge_latency_ms{stage=\"$stage\",quantile=\"p50\"})",
+            "expr": "max(liq_hedge_latency_ms{job=\"t0-liquidity-exporter\",stage=\"$stage\",quantile=\"p50\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -2314,7 +2314,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_hedge_latency_ms{stage=\"$stage\",quantile=\"p90\"})",
+            "expr": "max(liq_hedge_latency_ms{job=\"t0-liquidity-exporter\",stage=\"$stage\",quantile=\"p90\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -2334,7 +2334,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_hedge_latency_ms{stage=\"$stage\",quantile=\"p99\"})",
+            "expr": "max(liq_hedge_latency_ms{job=\"t0-liquidity-exporter\",stage=\"$stage\",quantile=\"p99\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -2450,7 +2450,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "label_replace(liq_log_target_count_24h, \"col\", \"$1\", \"level\", \"(.*)\")",
+            "expr": "label_replace(liq_log_target_count_24h{job=\"t0-liquidity-exporter\"}, \"col\", \"$1\", \"level\", \"(.*)\")",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -2655,7 +2655,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max by (stage) (liq_rebalance_stage_ms{kind=\"usdc\",quantile=\"p95\"})",
+            "expr": "max by (stage) (liq_rebalance_stage_ms{job=\"t0-liquidity-exporter\",kind=\"usdc\",quantile=\"p95\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -2725,7 +2725,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max by (stage) (liq_rebalance_stage_ms{kind=\"equity\",quantile=\"p95\"})",
+            "expr": "max by (stage) (liq_rebalance_stage_ms{job=\"t0-liquidity-exporter\",kind=\"equity\",quantile=\"p95\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -2795,7 +2795,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "label_join(label_replace(liq_dependency_calls_24h, \"col\", \"calls\", \"\", \"\"), \"dep\", \" \u00b7 \", \"dependency\", \"operation\") or label_join(label_replace(liq_dependency_errors_24h, \"col\", \"errors\", \"\", \"\"), \"dep\", \" \u00b7 \", \"dependency\", \"operation\") or label_join(label_replace(liq_dependency_latency_ms{quantile=\"p50\"}, \"col\", \"p50 ms\", \"\", \"\"), \"dep\", \" \u00b7 \", \"dependency\", \"operation\") or label_join(label_replace(liq_dependency_latency_ms{quantile=\"p95\"}, \"col\", \"p95 ms\", \"\", \"\"), \"dep\", \" \u00b7 \", \"dependency\", \"operation\") or label_join(label_replace(liq_dependency_latency_ms{quantile=\"max\"}, \"col\", \"max ms\", \"\", \"\"), \"dep\", \" \u00b7 \", \"dependency\", \"operation\")",
+            "expr": "label_join(label_replace(liq_dependency_calls_24h{job=\"t0-liquidity-exporter\"}, \"col\", \"calls\", \"\", \"\"), \"dep\", \" \u00b7 \", \"dependency\", \"operation\") or label_join(label_replace(liq_dependency_errors_24h{job=\"t0-liquidity-exporter\"}, \"col\", \"errors\", \"\", \"\"), \"dep\", \" \u00b7 \", \"dependency\", \"operation\") or label_join(label_replace(liq_dependency_latency_ms{job=\"t0-liquidity-exporter\",quantile=\"p50\"}, \"col\", \"p50 ms\", \"\", \"\"), \"dep\", \" \u00b7 \", \"dependency\", \"operation\") or label_join(label_replace(liq_dependency_latency_ms{job=\"t0-liquidity-exporter\",quantile=\"p95\"}, \"col\", \"p95 ms\", \"\", \"\"), \"dep\", \" \u00b7 \", \"dependency\", \"operation\") or label_join(label_replace(liq_dependency_latency_ms{job=\"t0-liquidity-exporter\",quantile=\"max\"}, \"col\", \"max ms\", \"\", \"\"), \"dep\", \" \u00b7 \", \"dependency\", \"operation\")",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -2955,7 +2955,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_attestation_last_ms{kind=\"usdc\"})",
+            "expr": "max(liq_attestation_last_ms{job=\"t0-liquidity-exporter\",kind=\"usdc\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -2975,7 +2975,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_attestation_last_ms{kind=\"equity\"})",
+            "expr": "max(liq_attestation_last_ms{job=\"t0-liquidity-exporter\",kind=\"equity\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -3076,7 +3076,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_block_lag_blocks)",
+            "expr": "max(liq_block_lag_blocks{job=\"t0-liquidity-exporter\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -3147,7 +3147,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_poll_cycles_24h)",
+            "expr": "max(liq_poll_cycles_24h{job=\"t0-liquidity-exporter\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -3228,7 +3228,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_poll_errors_24h) or vector(0)",
+            "expr": "max(liq_poll_errors_24h{job=\"t0-liquidity-exporter\"}) or vector(0)",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -3313,7 +3313,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_poll_skipped_ticks_24h) or vector(0)",
+            "expr": "max(liq_poll_skipped_ticks_24h{job=\"t0-liquidity-exporter\"}) or vector(0)",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -3398,7 +3398,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max by (quantile) (liq_poll_duration_ms)",
+            "expr": "max by (quantile) (liq_poll_duration_ms{job=\"t0-liquidity-exporter\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -3468,7 +3468,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "label_replace(liq_job_queue, \"col\", \"$1\", \"state\", \"(.*)\")",
+            "expr": "label_replace(liq_job_queue{job=\"t0-liquidity-exporter\"}, \"col\", \"$1\", \"state\", \"(.*)\")",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -3907,7 +3907,7 @@
         {
           "id": 92,
           "type": "timeseries",
-          "title": "Hedge scans skipped, by cause",
+          "title": "Hedge scans skipped, by reason",
           "description": "Extended-hours buys the position scan dropped before enqueueing a hedge job, because reference-price resolution or crossing failed. Each one is an on-chain fill that did not get hedged on that pass.",
           "datasource": {
             "type": "stackdriver",
@@ -3923,9 +3923,9 @@
               "queryType": "promQL",
               "promQLQuery": {
                 "projectName": "$env",
-                "expr": "sum by (cause, symbol) (increase(hedge_scan_skipped_total[1h]))",
+                "expr": "sum by (reason, symbol) (increase(hedge_scan_skipped_total[1h]))",
                 "step": "60s",
-                "legendFormat": "{{cause}} \u00b7 {{symbol}}"
+                "legendFormat": "{{reason}} \u00b7 {{symbol}}"
               },
               "timeSeriesList": {
                 "projectName": "",
