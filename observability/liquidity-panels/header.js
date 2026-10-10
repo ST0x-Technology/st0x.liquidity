@@ -7,34 +7,14 @@
 // commit, info, equity_target, ...) plus the string labels some of them
 // carry (git_commit on commit; broker, wallet_kind, ... on info).
 //
-// RECOVERY_GUIDE is not defined here: the generator prepends it from
-// recovery-guide.json (see pills() in the generator), because the template output is
-// sanitized and cannot carry data into this code.
+// RECOVERY_GUIDE and readHeaderRows are not defined here: the generator
+// prepends them from recovery-guide.json and header-rows.js (see pills() in
+// the generator), because the template output is sanitized and cannot carry
+// data into this code.
 
 const rows = Array.isArray(context.data) ? context.data : [];
-const value = {};
-const labels = {};
-// The stackdriver datasource runs a range query even for an instant target,
-// so each `k` can arrive at several times; keep the newest.
-const seen = {};
-for (const row of rows) {
-  const time = Number(row.Time) || 0;
-  if (row.k !== 'commit') {
-    if (row.k in seen && seen[row.k] > time) continue;
-    seen[row.k] = time;
-  }
-  if (row.k === 'commit') {
-    // A range query keeps the previous commit's series for a few minutes
-    // after a deploy. The commit row's value is its sample timestamp, so the
-    // newest one is the running commit.
-    if (!labels.commit || row.Value > labels.commit.at) labels.commit = { sha: row.git_commit, at: row.Value };
-  } else if (row.k === 'info') {
-    labels.info = row;
-  } else {
-    value[row.k] = row.Value === null || row.Value === undefined || Number.isNaN(Number(row.Value)) ? null : Number(row.Value);
-  }
-}
-const info = labels.info || {};
+// header-rows.js, prepended.
+const { value, commit, info } = readHeaderRows(rows);
 
 const theme = context.grafana.theme;
 const root = context.element;
@@ -174,7 +154,7 @@ root.innerHTML = `
   <div class="hdr-right">
     <button class="hdr-guide" data-open="guide">CLI recovery guide</button>
     <span class="hdr-mono hdr-muted" data-clock>${clock()}</span>
-    ${labels.commit && labels.commit.sha ? `<span class="hdr-mono hdr-muted" title="Deployed commit">${escapeHtml(labels.commit.sha.slice(0, 7))}</span>` : ''}
+    ${commit && commit.sha ? `<span class="hdr-mono hdr-muted" title="Deployed commit">${escapeHtml(commit.sha.slice(0, 7))}</span>` : ''}
     <span class="hdr-muted" title="Bot uptime">${uptime(value.uptime)}</span>
     <span class="hdr-badge ${connection[0]}">${connection[1]}</span>
   </div>

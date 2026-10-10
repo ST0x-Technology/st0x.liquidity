@@ -43,7 +43,9 @@ The header row is a Business Text panel (`marcusolsson-dynamictext-panel`): its
 JavaScript and CSS live in `liquidity-panels/`, and the generator inlines them
 into the board JSON. The plugin is installed on the box by `T0Trade/t0.devops`
 (`GF_INSTALL_PLUGINS`); the PR check's throwaway Grafana does not have it, so it
-loads these panels as "Panel plugin not found" and still passes.
+loads these panels as "Panel plugin not found" and still passes. The header
+reads its query rows through `header-rows.js`, which
+`dashboard/src/lib/board-header.test.ts` tests.
 
 The recovery commands in the header's guide (`recovery-guide.json`) and in the
 row dialog (`recovery-commands.js`) are copies of the SPA's
@@ -70,7 +72,12 @@ publishes per-chain series, a chain without a labelled value shows none. The
 Equities Ratio is coloured only where it is the bot's own band verdict (a symbol
 rebalanced on Base, with a balance, with no vault on another chain, while the
 default Base target is set), so it is grey on the `exporter` source, which
-cannot see the other chains.
+cannot see the other chains. A ratio outside 0 to 100% reads "out of range".
+Counter-trading assets come first, like the SPA, through a hidden sort column.
+The Equities column widths fit the card on a 1934px-wide window with at most two
+chain columns showing (Base and RH). A third, such as HyperEVM, makes the table
+scroll sideways; the generator's `check_equity_widths` holds only that
+two-column budget.
 
 Trades and Rebalances are Grafana tables too. A row's ⓘ sets the hidden `detail`
 variable to the row's id; the `detail` panel, a second Business Text panel in
