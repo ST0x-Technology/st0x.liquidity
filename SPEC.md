@@ -1734,19 +1734,24 @@ depending on the sidecar.
   for `symbol` labels (a prefix is removed only before an uppercase letter). A
   defect in an existing name is never fixed in place: the fix gets a new name,
   and consumers move to it explicitly.
-- **Families replace as one unit.** Each source of `liq_*` series (health,
-  settings, and later inventory, prices, performance, orders and P&L windows) is
-  one family. A refresh replaces every sample of its family, so a symbol, chain
-  or day that leaves the source leaves `/metrics` on the next scrape instead of
-  keeping its last value. A family whose refresh fails keeps its last published
-  samples.
+- **Families replace as one unit.** Each source of `liq_*` series is one family:
+  health, settings, inventory, prices, the four performance families (latencies,
+  reliability, infra, rebalances), pending orders, Raindex orders, and one per
+  P&L window. Inventory is replaced on each inventory write, in write order, and
+  also republished every 60 seconds from the latest copy. A refresh replaces
+  every sample of its family, so a symbol, chain or day that leaves the source
+  leaves `/metrics` on the next scrape instead of keeping its last value. A
+  family whose refresh fails keeps its last published samples.
 - **One writer per name.** Every `liq_*` name belongs to exactly one family, and
   no `liq_*` name goes through the `metrics` macros. If the recorder ever
   renders a `liq_` name, the contract skips its own block for that name and logs
   an error, so the body stays valid.
 - **Freshness.** `liq_collector_last_success_ts_seconds{collector}` gives the
-  Unix time each family was last published, with `collector` from a closed set
-  (`health`, `settings`, ...).
+  Unix time each family was last published, with `collector` from a closed set:
+  `health`, `settings`, `inventory`, `prices`, `latencies`, `reliability`,
+  `infra`, `rebalances`, `pending_orders`, `raindex`, and one per P&L window.
+  `health` and `settings` are published once at boot, so their time stays at the
+  boot time for the life of the process: that is not staleness.
 - **Typed gauges.** Every `liq_*` block carries a `# HELP` line and a
   `# TYPE <name> gauge` line. Every name is a gauge: snapshots, rolling `_24h`
   windows, `*_total` names that mean a count now, and precomputed quantile
@@ -1769,6 +1774,10 @@ lists. An optional setting that is not configured has no series.
 `liq_settings_info{trading_mode}` is always empty, as it was in the exporter.
 `liq_usdc_corridor_target{chain}` and `liq_usdc_corridor_deviation{chain}` give
 the band of every configured USDC corridor, whatever the USDC mode.
+`liq_usdc_corridor_active{chain}` is 1 while the USDC trigger can start
+transfers on that corridor: the USDC mode is enabled and that chain's cash asset
+rebalancing is enabled. It is 0 otherwise, so a consumer can tell a band in use
+from one that is only configured.
 
 Inventory is published each time the inventory write lock is released, from a
 copy of the balances taken while the lock is held. Each copy is numbered in
