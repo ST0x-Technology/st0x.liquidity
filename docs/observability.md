@@ -88,11 +88,13 @@ info!(%symbol, %shares, "Hedging trade");
 
 ### Trade, transfer and event lines
 
-The dashboard `Broadcaster` reactor writes the `liq_trade`, `liq_transfer` and
-`liq_event` lines at INFO from `Reactor::react_committed`
-(`src/dashboard/event_lines.rs`). The store calls that once per commit and never
-when it replays events, so a restart does not write old lines again. Never write
-these lines from `evolve()`: it also runs on every replay.
+The dashboard `Broadcaster` reactor writes the `liq_trade` and `liq_event` lines
+at INFO from `Reactor::react_committed`, and writes a `liq_transfer` line there
+when an event changes a transfer's status (`src/dashboard/event_lines.rs`).
+`TransferLineSweep` also writes `liq_transfer` lines from the transfer
+projections, as described below. The store calls `react_committed` once per
+commit and never when it replays events, so a replay does not write old lines
+again. Never write these lines from `evolve()`: it also runs on every replay.
 
 Every line has an `event_id`, `<aggregate type>:<aggregate id>:<sequence>`, that
 names the committed event behind it. The sequence comes from the event store, so
@@ -100,19 +102,64 @@ the id stays the same across restarts. One commit can write two lines with the
 same `event_id` (a `liq_event` and a `liq_trade` or `liq_transfer`), so a
 consumer drops a duplicate line by target and `event_id` together. A row is not
 a line, though: a trade can get a second `liq_trade` line (a venue correction)
-and a transfer can repeat its status after a restart, each under a new
+and a transfer can repeat its status from the sweep below, each under another
 `event_id`. So a table shows one row per trade `id`, or per transfer `kind` and
 `id`, from its latest line. Each line always has the same fields; a value that
 is not known is an empty string.
 
-The lines are at most once. A crash between the commit and the reactor, or a
-failed reload of the entity in the reactor (logged at WARN on target `dashboard`
-with the `event_id`), loses them, and nothing writes them later. A command sent
-through a store without the `Broadcaster` writes no lines. That covers
-`send_command` and every operator path that builds its own store: the CLI's
-manual transfers, transfer failures and reconciles, `clear-pending-burn`, and
-the hedge release that fails an offchain order. Their events still reach the
-`events` table and the event endpoints, but not these logs.
+The reactor writes each line at most once. A crash between the commit and the
+reactor, or a failed reload of the entity in the reactor (logged at WARN on
+target `dashboard` with the `event_id`), loses it. A command sent through a
+store without the `Broadcaster` writes no lines. That covers `send_command` and
+every operator path that builds its own store: the CLI's manual transfers,
+transfer failures and reconciles, `clear-pending-burn`, and the hedge release
+that fails an offchain order. Their events still reach the `events` table and
+the event endpoints, but not these logs. `TransferLineSweep` heals only the
+`liq_transfer` lines; the `liq_trade` and `liq_event` lines of these paths stay
+missing.
+
+A sweep heals the `liq_transfer` lines (`TransferLineSweep`). A minute after
+start, so the price subscription has sent its marks, and then every 60 seconds,
+it reads every transfer in progress and every transfer that ended in the last 24
+hours. It writes the line of a status this process has not written, under the
+`event_id` of the last event the transfer's projection applied. A read older
+than the last event the reactor saw writes nothing, so a row never goes back to
+an earlier status, and a reactor event older than the last one the sweep read
+writes nothing either. So a lost line, or a status an operator path changed,
+appears within a minute, and a consumer drops the line as a duplicate when that
+last event's own line was already written. The sweep reads the projections, so
+it sees an operator change only when that change runs through a store with the
+projection. Every production command on a transfer does, the equity reconciles
+of the API and the CLI included; a bare `send_command` would not be seen. A
+swept equity line values the transfer at the mark when the sweep runs, not when
+the event committed. When an equity transfer's symbol has no live mark, the
+sweep skips the transfer only while this process has written no line for it and
+the transfer started before this process did (the first pass after a restart,
+when an earlier process can have written its line), and tries again on the next
+pass. Any other line is written at once with an empty `usd`, as the reactor
+does: a status that differs from the one written, and the first line of a
+transfer that started after this process (a mint or redemption an operator ran
+from the offline CLI, say). A mark can stay away longer than the 24 hours the
+sweep keeps an ended transfer (no quote over a weekend, or a symbol with no
+price), so waiting would lose the line. A transfer from before the restart with
+no line whose mark stays away until it leaves that window gets no boot line. The
+status memory is in-process, so after a restart the first pass writes the status
+of every transfer it reads once, and seeds the memory so later events do not
+repeat an unchanged status. When a transfer's last event did not change its
+status (a `RecordPendingBurn` after `BridgingSubmitting`, for example), that
+boot line has a new `event_id` and repeats the status the row already shows. A
+projection row the sweep cannot read is logged at WARN once per version, then at
+DEBUG.
+
+The sweep takes a projection row's `version` as the sequence of the last event
+the projection applied. Each update the projection applies raises `version` by
+one, so the two agree only while the projection loses no update. A lost update
+leaves every later version of that transfer below its true sequence, and a
+healed line then carries the `event_id` of an earlier event, which a consumer
+that already holds that `event_id` drops as a duplicate.
+
+The sweep does not cover `liq_trade` or `liq_event`: a trade line a crash lost
+stays lost, and so does the `liq_trade` line of a hedge release.
 
 | Target         | Fields after `event_id`                                                                          |
 | -------------- | ------------------------------------------------------------------------------------------------ |
@@ -126,10 +173,12 @@ the hedge release that fails an offchain order. Their events still reach the
   A venue correction of an onchain trade (`SourceAttributed`) writes the trade
   again with its new venue.
 - `liq_transfer`: written only when the status differs from the last one this
-  process wrote for the transfer, terminal statuses included. After a restart
-  the first event of a transfer writes its status again. `usd` values an equity
-  transfer at its symbol's mark when the event commits (empty with no live mark)
-  and a USDC bridge at its amount.
+  process wrote for the transfer, terminal statuses included, by the reactor or
+  the sweep. `usd` values a USDC bridge at its amount and an equity transfer at
+  its symbol's mark: the reactor's line uses the mark when it writes, and a
+  swept line uses the mark when the sweep runs. Either is empty with no live
+  mark, except that the sweep writes no first line without one for a transfer
+  that started before this process.
 - `liq_event`: `parent` is `trade` (with `venue`) or `transfer` (with `kind`).
   `step` is the event's variant name and `payload` is the variant's fields as a
   JSON string, with every `signature` and `raw` value replaced by `"redacted"`,

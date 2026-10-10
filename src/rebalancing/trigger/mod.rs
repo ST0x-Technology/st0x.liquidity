@@ -1232,10 +1232,10 @@ enum RedemptionTimeoutCleanup {
         /// The send's newest signed candidate; `None` for a legacy send.
         newest_send: Option<PreparedTransaction>,
     },
-    /// The durable aggregate is `Reconciled`: an operator's `transfer reconcile`
-    /// (a separate-process CLI, or the in-process API via bare `send_command`)
-    /// wrote `OperatorReconciled` to the store, but the live reactor never
-    /// observed it. The sweep applies the reactor's terminal reconcile cleanup
+    /// The durable aggregate is `Reconciled`: an operator's reconcile wrote
+    /// `OperatorReconciled` through a standalone store with no reactor (the
+    /// API reconcile route or the separate-process CLI), so the live reactor
+    /// never observed it. The sweep applies the reactor's terminal reconcile cleanup
     /// so the guard, inflight, and reservation clear without a restart.
     Reconciled {
         tracking: RedemptionTracking,
@@ -2893,9 +2893,10 @@ impl RebalancingService {
         // Withdrawal-submission and send-to-issuer stages are never force-failed
         // on timeout, because their transaction may have landed, but they are
         // checked for a durable `Reconciled` on every tick. An operator's
-        // reconcile writes `OperatorReconciled` through bare `send_command`,
-        // which dispatches no reactor, so the live bot would otherwise never
-        // clear the guard, inflight, and reservation until a restart.
+        // reconcile writes `OperatorReconciled` through a standalone store
+        // with no reactor (the API reconcile route or the separate-process
+        // CLI), so the live bot would otherwise never clear the guard,
+        // inflight, and reservation until a restart.
         let submission_stage = matches!(
             tracking.stage,
             RedemptionTrackingStage::VaultWithdrawPending
