@@ -276,7 +276,7 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
     metrics::describe_counter!(
         "log_events_total",
         "Error and warning events the file log wrote, by level and target; counted only with \
-         file logging, from the recorder's install onwards"
+         file logging, for this process only"
     );
     metrics::describe_histogram!(
         "metrics_refresh_duration_seconds",

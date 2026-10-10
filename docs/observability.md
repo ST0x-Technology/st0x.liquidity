@@ -335,7 +335,9 @@ snapshots. Duration histograms render with fixed buckets (`_bucket{le}` lines),
 not as summaries; `metrics_refresh_duration_seconds` adds buckets from 90 to 300
 seconds, because a P&L refresh can take longer than a minute. A supervised
 upkeep task drains the histogram buffers every 5 seconds, so they stay bounded
-when nothing scrapes `/metrics`. Each fill watcher registers its
+when nothing scrapes `/metrics`. The recorder is installed before the tracing
+subscriber, so `log_events_total` counts every error and warning the file log
+writes, those of the boot included. Each fill watcher registers its
 `order_fill_poll_cycles_total` outcomes and
 `order_fill_poll_skipped_ticks_total` at 0 when it starts, and the telemetry
 channel does the same for `telemetry_samples_dropped_total`, so `increase()`
@@ -417,8 +419,8 @@ sample time, so only `outcome="paused"` shows that stall.
 | `liq_hedge_latency_ms_samples`          | `stage`                                                                                                                    | `latencies`      | samples behind each stage                                                                                                      |
 | `liq_open_exposure_fill_count`          | `symbol`                                                                                                                   | `latencies`      | fills after the symbol's latest hedge placement                                                                                |
 | `liq_open_exposure_oldest_ts_seconds`   | `symbol`                                                                                                                   | `latencies`      | block time of the oldest unhedged fill                                                                                         |
-| `liq_reliability_log_count_24h`         | `level`                                                                                                                    | `reliability`    | errors and warnings in 24 h; both rows once seeded after a start, 0 without file logging                                       |
-| `liq_log_target_count_24h`              | `level`, `target`                                                                                                          | `reliability`    | per target with events in 24 h; one-minute buckets, no entry cap                                                               |
+| `liq_reliability_log_count_24h`         | `level`                                                                                                                    | `logs`           | errors and warnings in 24 h; both rows once seeded after a start, 0 without file logging                                       |
+| `liq_log_target_count_24h`              | `level`, `target`                                                                                                          | `logs`           | per target with events in 24 h; one-minute buckets, no entry cap                                                               |
 | `liq_failure_event_count_24h`           | `event_type`                                                                                                               | `reliability`    | lifecycle failure events in 24 h                                                                                               |
 | `liq_job_queue`                         | `job_type`, `state`                                                                                                        | `reliability`    | queue counts now, not windowed                                                                                                 |
 | `liq_block_lag_blocks`                  | `chain`                                                                                                                    | `infra`          | latest sampled lag of each hedged chain; absent until known                                                                    |

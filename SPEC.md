@@ -1754,16 +1754,16 @@ advancing.
   defect in an existing name is never fixed in place: the fix gets a new name,
   and consumers move to it explicitly.
 - **Families replace as one unit.** Each source of `liq_*` series is one family:
-  health, settings, inventory, prices, equity bands, the four performance
-  families (latencies, reliability, infra, rebalances), pending orders, Raindex
-  orders, and one per P&L window. Inventory is replaced on each inventory write,
-  in write order, and also republished every 60 seconds from the latest copy.
-  Equity bands are replaced each time the trigger plans a symbol, from the
-  latest bands of every symbol: the planned symbol's samples change and the
-  others keep their last values. A refresh replaces every sample of its family,
-  so a symbol, chain or day that leaves the source leaves `/metrics` on the next
-  scrape instead of keeping its last value. A family whose refresh fails keeps
-  its last published samples.
+  health, settings, inventory, prices, equity bands, log counts, the four
+  performance families (latencies, reliability, infra, rebalances), pending
+  orders, Raindex orders, and one per P&L window. Inventory is replaced on each
+  inventory write, in write order, and also republished every 60 seconds from
+  the latest copy. Equity bands are replaced each time the trigger plans a
+  symbol, from the latest bands of every symbol: the planned symbol's samples
+  change and the others keep their last values. A refresh replaces every sample
+  of its family, so a symbol, chain or day that leaves the source leaves
+  `/metrics` on the next scrape instead of keeping its last value. A family
+  whose refresh fails keeps its last published samples.
 - **One writer per name.** Every `liq_*` name belongs to exactly one family, and
   no `liq_*` name goes through the `metrics` macros. If the recorder ever
   renders a `liq_` name, the contract skips its own block for that name and logs
@@ -1775,11 +1775,12 @@ advancing.
   name a family does not own.
 - **Freshness.** `liq_collector_last_success_ts_seconds{collector}` gives the
   Unix time each family was last published, with `collector` from a closed set:
-  `health`, `settings`, `inventory`, `prices`, `equity_bands`, `latencies`,
-  `reliability`, `infra`, `rebalances`, `pending_orders`, `raindex`, and one per
-  P&L window: `pnl_1d`, `pnl_1w`, `pnl_1m`, `pnl_ytd`, `pnl_1y` and `pnl_all`.
-  `health` and `settings` are published once at boot, so their time stays at the
-  boot time for the life of the process: that is not staleness.
+  `health`, `settings`, `inventory`, `prices`, `equity_bands`, `logs`,
+  `latencies`, `reliability`, `infra`, `rebalances`, `pending_orders`,
+  `raindex`, and one per P&L window: `pnl_1d`, `pnl_1w`, `pnl_1m`, `pnl_ytd`,
+  `pnl_1y` and `pnl_all`. `health` and `settings` are published once at boot, so
+  their time stays at the boot time for the life of the process: that is not
+  staleness.
 - **Typed gauges.** Every `liq_*` block carries a `# HELP` line and a
   `# TYPE <name> gauge` line. Every name is a gauge: snapshots, rolling `_24h`
   windows, `*_total` names that mean a count now, and precomputed quantile
@@ -1881,19 +1882,22 @@ while the ratio is not 1 the share is off by (ratio - 1) times that amount until
 then. A failed readiness probe of the chain the planner chose keeps the bands it
 recorded.
 
-Every 60 seconds a second task publishes the performance families from the same
-loaders as the `/performance/*` endpoints, over the last 24 hours:
+Every 60 seconds a second task publishes the log counts and the performance
+families over the last 24 hours. The performance families come from the same
+loaders as the `/performance/*` endpoints; the log counts come from a counter in
+the process (see below):
 
+- `logs`: `liq_reliability_log_count_24h{level}` (`error` and `warning`, both
+  rows once seeded after a start) and `liq_log_target_count_24h{target,level}`
+  (`ERROR` or `WARN`, only targets with events).
 - `latencies`: `liq_hedge_latency_ms{stage,quantile}` (nearest-rank `p50`,
   `p90`, `p95`, `p99` and `max`; a stage with no samples has no series),
   `liq_hedge_latency_ms_samples{stage}`, and per open exposure
   `liq_open_exposure_fill_count{symbol}` and
   `liq_open_exposure_oldest_ts_seconds{symbol}`.
-- `reliability`: `liq_reliability_log_count_24h{level}` (`error` and `warning`,
-  both always present), `liq_log_target_count_24h{target,level}` (`ERROR` or
-  `WARN`, only targets with events), `liq_failure_event_count_24h{event_type}`
-  and `liq_job_queue{job_type,state}`. The job queue counts are the queue now,
-  not a window.
+- `reliability`: `liq_failure_event_count_24h{event_type}` and
+  `liq_job_queue{job_type,state}`. The job queue counts are the queue now, not a
+  window.
 - `infra`: `liq_block_lag_blocks{chain}`,
   `liq_block_lag_sampled_ts_seconds{chain}`,
   `liq_poll_{cycles,errors,skipped_ticks}_24h{chain}`,
@@ -1909,25 +1913,36 @@ loaders as the `/performance/*` endpoints, over the last 24 hours:
 The log counts cover the events the file log writes, with the file log's filter,
 and are kept only when file logging is configured; without it both level rows
 are 0 and there are no target rows. The bot counts each event as it is logged,
-in one-minute buckets. After a start it adds, once and in the background, the
-entries earlier processes wrote in the previous 24 hours; until that is done the
-two log names are absent. A scan that fails to read the files is retried twice
-on later refreshes, then kept with what it could read. Unlike
-`/performance/reliability`, the counts have no 50,000-entry cap, the first
-minute of the window counts as a whole, and lines another process (an operator's
-`st0x-cli` run) appends to the same files are counted only after the next
-restart. An event the file writer drops (a full queue or a failed write) is
-still counted.
+in one-minute buckets. Before it installs the subscriber it records the length
+of every log file. After a start it adds, once and in the background, the
+entries earlier processes wrote in the previous 24 hours, reading each file only
+up to its recorded length. So no entry is counted twice, even when the clock
+steps back after the start. The seed skips entries dated after the start (an
+earlier process whose clock ran ahead), and a minute after the current one is
+not counted until the clock reaches it, as the endpoint's upper bound skips such
+lines. Until that is done the `logs` family is not published. A scan that fails
+to read the files is retried twice on later refreshes, then kept with what it
+could read. A listing that missed files at the start cannot be repeated, since
+the files then also hold this process's lines, so the seed keeps the files it
+listed on its first attempt and logs an error. The `logs` family reads no
+database and runs first in the cycle, so it stays fresh while one `reliability`
+loader fails or times out. A stall of the whole database pool still delays it,
+since the slow cycle skips the next tick. Unlike `/performance/reliability`, the
+counts have no 50,000-entry cap, the first minute of the window counts as a
+whole, and lines another process (an operator's `st0x-cli` run) appends to the
+same files are counted only after the next restart. An event the file writer
+drops (a full queue or a failed write) is still counted.
 
 Every fifth cycle the task publishes `rebalances` over the last 30 days:
 `liq_rebalance_stage_ms{kind,stage,quantile}` (`kind` is `usdc` or `equity`) and
 `liq_attestation_last_ms{kind="usdc"}`, absent with no attestation in the
 window. A collector that fails or takes longer than 30 seconds keeps its last
-family. The four collectors run one after another on purpose: the exporter
-called the same loaders in sequence, and the bot keeps that load shape on the
-SQLite pool the trading paths share. A slow cycle skips the next tick instead of
-overlapping it, and the collector times and `metrics_refresh_duration_seconds`
-show it.
+family. `logs` runs first, from the in-process counter; then `latencies`,
+`reliability`, `infra` and `rebalances` run one after another on purpose: the
+exporter called the same loaders in sequence, and the bot keeps that load shape
+on the SQLite pool the trading paths share. A slow cycle skips the next tick
+instead of overlapping it, and the collector times and
+`metrics_refresh_duration_seconds` show it.
 
 Every 60 seconds a task publishes the order series. `liq_pending_orders_total`
 and `liq_pending_orders{status}` count what `GET /orders/pending` returns, from

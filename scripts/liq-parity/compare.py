@@ -224,8 +224,8 @@ ALWAYS_PRESENT = {
 # exporter has no series of at all is not reported as extra in the bot.
 # "kept_window_bot_absent": as "kept_window", and a series the exporter has
 # and the bot lacks is not reported either, while the bot publishes that name
-# for the same window; values are still compared where both have the series. The item that ports a name adds its entry, with the
-# evidence for it.
+# for the same window; values are still compared where both have the series.
+# The item that ports a name adds its entry, with the evidence for it.
 KNOWN_DIFFS = {
     # The exporter derives the start from integer uptime at poll time.
     "liq_bot_start_timestamp_seconds": ("absolute", 2.0),
@@ -258,11 +258,12 @@ KNOWN_DIFFS = {
     # drops when its queue is full or the disk write fails; the endpoint
     # never sees that line. So the counts differ by the events of the first
     # minute of the window, by every entry past the cap while the endpoint
-    # is truncated, by CLI lines, and by lines the file writer dropped. The two level rows exist on both sides, so their keys are
-    # still compared; the bot leaves them out only until its background seed
-    # finishes, about one refresh after a start, so a comparison right after
-    # a restart reports them missing. A target whose only events are of those kinds has
-    # a row on one side only, so the per-target name is not compared.
+    # is truncated, by CLI lines, and by lines the file writer dropped. The
+    # two level rows exist on both sides, so their keys are still compared;
+    # the bot leaves them out only until its background seed finishes, about
+    # one refresh after a start, so a comparison right after a restart
+    # reports them missing. A target whose only events are of those kinds
+    # has a row on one side only, so the per-target name is not compared.
     "liq_reliability_log_count_24h": "values",
     "liq_log_target_count_24h": "ignore",
 }
