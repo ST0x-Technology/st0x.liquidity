@@ -8420,21 +8420,23 @@ multiple broker-specific contexts.
    `trade_protocol=terminal_outcomes_v3`; legacy, v1, and v2 responses downgrade
    every adapter or unknown-onchain venue to Raindex so an older exhaustive
    dashboard cannot enter a parse/reconnect loop. The v3 trade also carries
-   `price`, the fill price in USD per share: the onchain fill price, or the
-   broker fill price of a filled counter-trade, and `null` for a failed or
-   cancelled counter-trade. Older protocols omit the field. A newer dashboard
-   requests v3 and retries v2, then v1, when an older backend rejects an unknown
-   protocol. Legacy-protocol filter requests likewise collapse selected adapter
-   venues to Raindex so an old backend does not reject the venue query. The
-   dashboard continues to accept v1 responses and reconstructs the complete fill
-   as the legacy filled plus excess quantity. A legacy zero fill remains unknown
-   because v1 synthesized zero when no fill evidence existed. A successful
-   lower-version WebSocket fallback probes v3 again after its next disconnect so
-   a transient restart cannot pin the client to an older protocol. Failed
-   outcomes are sent only through a terminal-outcome protocol. Trade ordering
-   compares the complete RFC 3339 timestamp, including sub-millisecond
-   precision, then uses the same stable trade-ID tie-breaker for initial history
-   and live updates.
+   `price`, the fill price in USD per share of the trade's `shares`: the onchain
+   fill price per wrapped share, or the broker fill price per underlying share
+   of a filled counter-trade, and `null` for a failed or cancelled
+   counter-trade. A broker fill price that is not positive is logged as an error
+   and sent as `null`, since the dashboard rejects a non-positive price. Older
+   protocols omit the field. A newer dashboard requests v3 and retries v2, then
+   v1, when an older backend rejects an unknown protocol. Legacy-protocol filter
+   requests likewise collapse selected adapter venues to Raindex so an old
+   backend does not reject the venue query. The dashboard continues to accept v1
+   responses and reconstructs the complete fill as the legacy filled plus excess
+   quantity. A legacy zero fill remains unknown because v1 synthesized zero when
+   no fill evidence existed. A successful lower-version WebSocket fallback
+   probes v3 again after its next disconnect so a transient restart cannot pin
+   the client to an older protocol. Failed outcomes are sent only through a
+   terminal-outcome protocol. Trade ordering compares the complete RFC 3339
+   timestamp, including sub-millisecond precision, then uses the same stable
+   trade-ID tie-breaker for initial history and live updates.
 
    Every dashboard transport validates trade payloads at runtime before they
    enter client state. Snapshot, live WebSocket, and paginated HTTP paths use

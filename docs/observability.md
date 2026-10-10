@@ -161,16 +161,23 @@ that already holds that `event_id` drops as a duplicate.
 The sweep does not cover `liq_trade` or `liq_event`: a trade line a crash lost
 stays lost, and so does the `liq_trade` line of a hedge release.
 
-| Target         | Fields after `event_id`                                                                          |
-| -------------- | ------------------------------------------------------------------------------------------------ |
-| `liq_trade`    | `id`, `occurred_at`, `venue`, `direction`, `symbol`, `shares`, `status`, `error`, `price`, `usd` |
-| `liq_transfer` | `kind`, `id`, `symbol`, `direction`, `amount`, `status`, `started_at`, `usd`                     |
-| `liq_event`    | `parent`, `venue`, `kind`, `id`, `sequence`, `step`, `payload`                                   |
+| Target         | Fields after `event_id`                                                                                           |
+| -------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `liq_trade`    | `id`, `occurred_at`, `venue`, `direction`, `symbol`, `shares`, `status`, `error`, `filled_shares`, `price`, `usd` |
+| `liq_transfer` | `kind`, `id`, `symbol`, `direction`, `amount`, `status`, `started_at`, `usd`                                      |
+| `liq_event`    | `parent`, `venue`, `kind`, `id`, `sequence`, `step`, `payload`                                                    |
 
 - `liq_trade`: `occurred_at` is when the trade filled or ended, which can be
   well before the line when the bot catches up on onchain fills. `usd` is
   `shares * price`. `price` and `usd` are empty for a failed or cancelled trade.
-  A venue correction of an onchain trade (`SourceAttributed`) writes the trade
+  `shares` is the requested quantity for a failed or cancelled counter-trade,
+  and `filled_shares` is what it filled before it ended (empty for a fill and
+  when the broker did not report it). An onchain trade's `shares` and `price`
+  are in wrapped shares, as Raindex settles them; a counter-trade's are in
+  underlying shares. A broker fill price that is not positive is logged once at
+  ERROR by the offchain order when it records the fill (with symbol, broker
+  order id and price), and the trade is written without `price` and `usd`. A
+  venue correction of an onchain trade (`SourceAttributed`) writes the trade
   again with its new venue.
 - `liq_transfer`: written only when the status differs from the last one this
   process wrote for the transfer, terminal statuses included, by the reactor or
@@ -179,12 +186,15 @@ stays lost, and so does the `liq_trade` line of a hedge release.
   swept line uses the mark when the sweep runs. Either is empty with no live
   mark, except that the sweep writes no first line without one for a transfer
   that started before this process.
-- `liq_event`: `parent` is `trade` (with `venue`) or `transfer` (with `kind`).
-  `step` is the event's variant name and `payload` is the variant's fields as a
-  JSON string, with every `signature` and `raw` value replaced by `"redacted"`,
-  in the same shape `/liquidity-read/trades/{venue}/{id}/events` and
-  `/liquidity-read/transfers/{kind}/{id}/events` return. `Position` events get
-  no line: they belong to no trade or transfer.
+- `liq_event`: `parent` is `trade` (with `venue`) or `transfer` (with `kind`). A
+  trade's `venue` is its venue when the event commits, so an onchain trade's
+  events from before a `SourceAttributed` correction keep the old venue. Join a
+  trade's events on `parent` and `id` only, and a transfer's on `parent`, `kind`
+  and `id`. `step` is the event's variant name and `payload` is the variant's
+  fields as a JSON string, with every `signature` and `raw` value replaced by
+  `"redacted"`, in the same shape `/liquidity-read/trades/{venue}/{id}/events`
+  and `/liquidity-read/transfers/{kind}/{id}/events` return. `Position` events
+  get no line: they belong to no trade or transfer.
 
 ### Operational alert kinds
 

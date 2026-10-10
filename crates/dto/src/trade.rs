@@ -412,12 +412,16 @@ pub struct Trade {
     /// Executed quantity for fills, or requested quantity for a failed or
     /// cancelled counter-trade. Terminal non-fill outcomes carry
     /// broker-accepted and fill provenance separately when those facts are
-    /// known.
+    /// known. Onchain trades count wrapped shares, as Raindex settles them;
+    /// counter-trades count underlying shares.
     #[ts(type = "string")]
     pub shares: Positive<FractionalShares>,
-    /// Fill price in USD per share. Absent when the trade has no fill price:
-    /// a failed or cancelled counter-trade, or any trade whose price is not
-    /// known. Only `terminal_outcomes_v3` carries it on the wire.
+    /// Fill price in USD per share of `shares`: per wrapped share for an
+    /// onchain trade, per underlying share for a counter-trade. Absent when
+    /// the trade has no fill price: a failed or cancelled counter-trade, a
+    /// broker fill whose reported price is not positive, or any trade whose
+    /// price is not known. Only `terminal_outcomes_v3` carries it on the
+    /// wire.
     #[ts(type = "string | null")]
     pub price: Option<Usd>,
     pub outcome: TradeOutcome,

@@ -81,7 +81,10 @@ impl Display for EventId {
 }
 
 /// What a committed event belongs to: a trade at a venue, or a transfer of a
-/// kind. The board's detail view finds a row's events by these.
+/// kind. A trade's `venue` is its venue when the event commits, so the
+/// events of an onchain trade written before a `SourceAttributed` correction
+/// keep the old venue: a reader joins a trade's events on `parent` and `id`
+/// only, and a transfer's on `parent`, `kind` and `id`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EventParent {
     Trade(TradingVenue),
@@ -175,7 +178,9 @@ fn redact_signing_material(value: &mut Value) {
 ///
 /// `occurred_at` is when the trade filled or ended, which can be well before
 /// the line when the bot catches up on onchain fills. `usd` is
-/// `shares * price`, empty when the trade has no price.
+/// `shares * price`, empty when the trade has no price. `filled_shares` is
+/// what a failed or cancelled counter-trade filled before it ended, empty
+/// for a fill (whose `shares` is the fill) and when the broker did not say.
 pub(crate) fn log_trade(trade: &Trade, event_id: &EventId) {
     let Trade {
         id,
@@ -188,10 +193,14 @@ pub(crate) fn log_trade(trade: &Trade, event_id: &EventId) {
         outcome,
     } = trade;
 
-    let (status, error) = match outcome {
-        TradeOutcome::Filled => ("filled", ""),
-        TradeOutcome::Failed { error, .. } => ("failed", error.as_str()),
-        TradeOutcome::Cancelled { .. } => ("cancelled", ""),
+    let (status, error, filled_shares) = match outcome {
+        TradeOutcome::Filled => ("filled", "", None),
+        TradeOutcome::Failed {
+            error,
+            filled_shares,
+            ..
+        } => ("failed", error.as_str(), *filled_shares),
+        TradeOutcome::Cancelled { filled_shares, .. } => ("cancelled", "", *filled_shares),
     };
 
     let usd = (*price)
@@ -210,6 +219,9 @@ pub(crate) fn log_trade(trade: &Trade, event_id: &EventId) {
         %shares,
         status,
         error,
+        filled_shares = filled_shares
+            .map(|filled| filled.to_string())
+            .unwrap_or_default(),
         price = price.map(|price| price.to_string()).unwrap_or_default(),
         usd,
         "Trade reached a terminal status",
@@ -694,7 +706,7 @@ mod tests {
 
     use st0x_dto::{EquityMintOperation, UsdcBridgeOperation};
     use st0x_evm::PreparedTransaction;
-    use st0x_finance::{FractionalShares, Id, Positive, Usdc};
+    use st0x_finance::{FractionalShares, Id, NonNegative, Positive, Usdc};
     use st0x_float_macro::float;
 
     use super::test_support::{CapturedLines, fields};
@@ -1093,6 +1105,7 @@ mod tests {
                     ("shares", "2"),
                     ("status", "filled"),
                     ("error", ""),
+                    ("filled_shares", ""),
                     ("price", "150.5"),
                     ("usd", "301"),
                 ]),
@@ -1133,6 +1146,7 @@ mod tests {
                     ("shares", "2"),
                     ("status", "failed"),
                     ("error", "broker unavailable"),
+                    ("filled_shares", ""),
                     ("price", ""),
                     ("usd", ""),
                 ]),
@@ -1163,6 +1177,48 @@ mod tests {
         assert_eq!(line["error"], "");
         assert_eq!(line["price"], "");
         assert_eq!(line["usd"], "");
+        assert_eq!(line["filled_shares"], "");
+    }
+
+    /// A counter-trade that filled part of its shares and then ended says
+    /// how many filled: `shares` is the requested quantity.
+    #[test]
+    fn a_partly_filled_trade_that_ended_carries_its_filled_shares() {
+        let (captured, _guard) = CapturedLines::install();
+        let shares = |value| NonNegative::new(FractionalShares::new(value)).unwrap();
+
+        log_trade(
+            &trade(
+                None,
+                TradeOutcome::Cancelled {
+                    accepted_shares: Some(Positive::new(FractionalShares::new(float!(2))).unwrap()),
+                    filled_shares: Some(shares(float!(0.5))),
+                    remaining_shares: Some(shares(float!(1.5))),
+                    excess_shares: None,
+                },
+            ),
+            &event_id("OffchainOrder", 5),
+        );
+        log_trade(
+            &trade(
+                None,
+                TradeOutcome::Failed {
+                    error: "rejected after a partial fill".to_string(),
+                    accepted_shares: None,
+                    filled_shares: Some(shares(float!(1.25))),
+                    remaining_shares: None,
+                    excess_shares: None,
+                },
+            ),
+            &event_id("OffchainOrder", 6),
+        );
+
+        let [(_, cancelled), (_, failed)] = captured.take().try_into().unwrap();
+        assert_eq!(cancelled["status"], "cancelled");
+        assert_eq!(cancelled["shares"], "2");
+        assert_eq!(cancelled["filled_shares"], "0.5");
+        assert_eq!(failed["status"], "failed");
+        assert_eq!(failed["filled_shares"], "1.25");
     }
 
     fn usdc_line(event_id: &str, status: &str) -> (String, BTreeMap<String, String>) {
