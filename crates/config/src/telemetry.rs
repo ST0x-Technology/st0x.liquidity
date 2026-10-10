@@ -27,6 +27,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tracing_appender::rolling::{InitError, RollingFileAppender, Rotation};
+use tracing_subscriber::fmt::format::{JsonFields, Writer};
+use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 use tracing_subscriber::{EnvFilter, Registry};
 use url::Url;
@@ -109,8 +111,12 @@ where
 {
     match log_format {
         LogFormat::Json => tracing_subscriber::fmt::layer()
-            .json()
-            .flatten_event(true)
+            .fmt_fields(JsonFields::new())
+            .event_format(JsonWithOtelLines(
+                tracing_subscriber::fmt::format().json().flatten_event(true),
+                OtelLineShape::Flat,
+            ))
+            .with_ansi(false)
             .with_writer(writer)
             .with_filter(env_filter)
             .boxed(),
@@ -125,6 +131,155 @@ where
                 .with_filter(env_filter)
                 .boxed(),
         },
+    }
+}
+
+/// Wraps either JSON shape, the flattened console or the nested rolling file,
+/// and writes OpenTelemetry's internal logs with one `message`.
+///
+/// Before opentelemetry 0.32, `opentelemetry_sdk` and its sibling crates log
+/// through `otel_warn!` and friends, which record a `message` field and then
+/// an empty format string, itself recorded as `message`. Flattened, such a
+/// line has two `message` keys, and a reader keeps one of them: maybe the
+/// empty one. These are the lines that say the OTLP pipeline drops logs or
+/// spans, so they are written by [`write_otel_internal_line`] instead, with
+/// one `message`. The rolling file uses it too, in its nested shape, because
+/// its readers take `fields.message`.
+///
+/// The duplicate-`message` handling is a workaround for those versions:
+/// opentelemetry 0.32 (open-telemetry/opentelemetry-rust#3317) stops adding
+/// the empty format string. After that bump, only the `<name>: <error>`
+/// fallback for export errors, which record no `message`, is still needed.
+struct JsonWithOtelLines<F>(F, OtelLineShape);
+
+/// Where an OpenTelemetry internal line puts its fields: at the top level, as
+/// the flattened console does, or under `fields`, as the rolling file does.
+#[derive(Clone, Copy)]
+enum OtelLineShape {
+    Flat,
+    Nested,
+}
+
+impl<S, N, F> FormatEvent<S, N> for JsonWithOtelLines<F>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+    F: FormatEvent<S, N>,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        writer: Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        if is_otel_internal(event.metadata().target()) {
+            write_otel_internal_line(writer, event, self.1)
+        } else {
+            self.0.format_event(ctx, writer, event)
+        }
+    }
+}
+
+/// Whether `target` is one of OpenTelemetry's crates, which log under their
+/// package name (`opentelemetry`, `opentelemetry_sdk`, `opentelemetry-otlp`,
+/// ...).
+fn is_otel_internal(target: &str) -> bool {
+    target.starts_with("opentelemetry")
+}
+
+/// Writes an OpenTelemetry internal log as one JSON line: `timestamp`,
+/// `level`, `target` and the event fields, with a single `message`. That is
+/// the non-empty one, or for an event with none (an export error records
+/// only `name` and `error`) the event's name, then its error. Span context is
+/// left out on purpose: these lines are about the SDK, not the code that
+/// happened to run.
+fn write_otel_internal_line(
+    mut writer: Writer<'_>,
+    event: &tracing::Event<'_>,
+    shape: OtelLineShape,
+) -> std::fmt::Result {
+    let mut recorded = OtelInternalFields::default();
+    event.record(&mut recorded);
+
+    let metadata = event.metadata();
+    let mut fields = recorded.0;
+    let has_message = fields
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|message| !message.is_empty());
+    if !has_message {
+        let name = fields
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| metadata.name());
+        let message = fields
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .map_or_else(|| name.to_string(), |error| format!("{name}: {error}"));
+        fields.insert("message".to_string(), serde_json::Value::from(message));
+    }
+
+    let mut line = match shape {
+        OtelLineShape::Flat => fields,
+        OtelLineShape::Nested => {
+            serde_json::Map::from_iter([("fields".to_string(), serde_json::Value::Object(fields))])
+        }
+    };
+    line.insert(
+        "timestamp".to_string(),
+        serde_json::Value::from(
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        ),
+    );
+    line.insert(
+        "level".to_string(),
+        serde_json::Value::from(metadata.level().as_str()),
+    );
+    line.insert(
+        "target".to_string(),
+        serde_json::Value::from(metadata.target()),
+    );
+
+    writeln!(writer, "{}", serde_json::Value::Object(line))
+}
+
+/// The fields of an OpenTelemetry internal log. A second `message` replaces
+/// the first only when the first is empty, so the empty format string never
+/// hides the real text.
+#[derive(Default)]
+struct OtelInternalFields(serde_json::Map<String, serde_json::Value>);
+
+impl OtelInternalFields {
+    fn insert(&mut self, field: &tracing::field::Field, value: serde_json::Value) {
+        let name = field.name();
+        let keeps_existing = name == "message"
+            && value.as_str() == Some("")
+            && self.0.get(name).is_some_and(|existing| existing != "");
+        if !keeps_existing {
+            self.0.insert(name.to_string(), value);
+        }
+    }
+}
+
+impl tracing::field::Visit for OtelInternalFields {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.insert(field, serde_json::Value::from(value));
+    }
+
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.insert(field, serde_json::Value::from(value));
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.insert(field, serde_json::Value::from(value));
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.insert(field, serde_json::Value::from(value));
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.insert(field, serde_json::Value::from(format!("{value:?}")));
     }
 }
 
@@ -462,7 +617,12 @@ where
     W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
 {
     tracing_subscriber::fmt::layer()
-        .json()
+        .fmt_fields(JsonFields::new())
+        .event_format(JsonWithOtelLines(
+            tracing_subscriber::fmt::format().json(),
+            OtelLineShape::Nested,
+        ))
+        .with_ansi(false)
         .with_writer(writer)
         .with_filter(mk_crate_filter(level))
         .boxed()
@@ -705,59 +865,153 @@ mod tests {
     /// an alert's `kind` at `jsonPayload.kind`. Span context stays nested. A
     /// tracing-subscriber upgrade that changes this shape must fail here, not
     /// in the shipper.
+    ///
+    /// Both styles are pinned: `TelemetryCtx::setup` passes `Full` and the
+    /// other subscribers `Compact`.
     #[test]
     fn json_console_layer_flattens_the_event_onto_the_line() {
+        for style in [ConsoleTextStyle::Compact, ConsoleTextStyle::Full] {
+            let writer = SharedWriter::default();
+            let layer = console_fmt_layer(
+                LogFormat::Json,
+                mk_crate_filter(tracing::Level::TRACE),
+                style,
+                writer.clone(),
+            );
+
+            let entry = emit_alert_line(layer, &writer);
+
+            assert_eq!(
+                entry,
+                serde_json::json!({
+                    "level": "ERROR",
+                    "target": "operational_alert",
+                    "message": "Low gas: json shape pin",
+                    "alert": true,
+                    "kind": "Low gas",
+                    "span": {"aggregate_id": "abc-123", "name": "recheck"},
+                    "spans": [{"aggregate_id": "abc-123", "name": "recheck"}],
+                })
+            );
+        }
+    }
+
+    /// An OpenTelemetry export error records only `name` and `error`, so its
+    /// line's `message` is built from them instead of left empty.
+    #[test]
+    fn an_opentelemetry_error_without_a_message_gets_one_from_its_name() {
         let writer = SharedWriter::default();
         let layer = console_fmt_layer(
             LogFormat::Json,
             mk_crate_filter(tracing::Level::TRACE),
-            ConsoleTextStyle::Compact,
+            ConsoleTextStyle::Full,
             writer.clone(),
         );
+        let subscriber = Registry::default().with(layer);
 
-        let entry = emit_alert_line(layer, &writer);
+        tracing::subscriber::with_default(subscriber, || {
+            // The shape `otel_error!(name: ..., error = ...)` expands to.
+            tracing::error!(
+                name: "BatchLogProcessor.ExportError",
+                target: "opentelemetry_sdk",
+                name = "BatchLogProcessor.ExportError",
+                error = "connection refused",
+                ""
+            );
+        });
 
+        let bytes = writer.0.lock().clone();
+        let entry: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim_end()).unwrap();
         assert_eq!(
-            entry,
-            serde_json::json!({
-                "level": "ERROR",
-                "target": "operational_alert",
-                "message": "Low gas: json shape pin",
-                "alert": true,
-                "kind": "Low gas",
-                "span": {"aggregate_id": "abc-123", "name": "recheck"},
-                "spans": [{"aggregate_id": "abc-123", "name": "recheck"}],
-            })
+            entry["message"],
+            "BatchLogProcessor.ExportError: connection refused"
         );
     }
 
-    /// Both console styles flatten the same way: the style only selects the
-    /// text renderer.
+    /// Emits the event OpenTelemetry's `otel_warn!(name: ..., message = ...)`
+    /// expands to for `BatchLogProcessor.LogsDropped`: the caller passes the
+    /// fields, `message` among them, and the empty format string. Like
+    /// `otel_warn!`, the caller's `message` field is invisible to the
+    /// workspace scan, which reads the tracing call here and finds no
+    /// reserved name.
+    macro_rules! otel_internal_warn {
+        ($($fields:tt)+) => {
+            tracing::warn!(
+                name: "BatchLogProcessor.LogsDropped",
+                target: "opentelemetry_sdk",
+                name = "BatchLogProcessor.LogsDropped",
+                $($fields)+
+            )
+        };
+    }
+
+    /// The rolling file writes an OpenTelemetry internal log in its nested
+    /// shape, with one `message` under `fields`, which its readers take.
     #[test]
-    fn json_console_layer_ignores_the_text_style() {
-        let compact = SharedWriter::default();
-        let full = SharedWriter::default();
+    fn the_file_layer_writes_an_opentelemetry_log_with_one_nested_message() {
+        let writer = SharedWriter::default();
+        let layer = file_fmt_layer(writer.clone(), tracing::Level::TRACE);
+        let subscriber = Registry::default().with(layer);
 
-        let compact_entry = emit_alert_line(
-            console_fmt_layer(
-                LogFormat::Json,
-                mk_crate_filter(tracing::Level::TRACE),
-                ConsoleTextStyle::Compact,
-                compact.clone(),
-            ),
-            &compact,
-        );
-        let full_entry = emit_alert_line(
-            console_fmt_layer(
-                LogFormat::Json,
-                mk_crate_filter(tracing::Level::TRACE),
-                ConsoleTextStyle::Full,
-                full.clone(),
-            ),
-            &full,
-        );
+        tracing::subscriber::with_default(subscriber, || {
+            otel_internal_warn!(message = "Logs were dropped", "");
+        });
 
-        assert_eq!(compact_entry, full_entry);
+        let bytes = writer.0.lock().clone();
+        let line = std::str::from_utf8(&bytes).unwrap().trim_end();
+        assert_eq!(line.matches("\"message\"").count(), 1, "{line}");
+        let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(entry["fields"]["message"], "Logs were dropped");
+        assert_eq!(entry["level"], "WARN");
+        assert_eq!(entry["target"], "opentelemetry_sdk");
+    }
+
+    /// OpenTelemetry's internal logs record `message` as a field and then an
+    /// empty format string. The console line has one `message` key, with the
+    /// real text, and no span context.
+    #[test]
+    fn an_opentelemetry_internal_log_has_one_message() {
+        let writer = SharedWriter::default();
+        let layer = console_fmt_layer(
+            LogFormat::Json,
+            mk_crate_filter(tracing::Level::TRACE),
+            ConsoleTextStyle::Full,
+            writer.clone(),
+        );
+        let subscriber = Registry::default().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("recheck", aggregate_id = "abc-123");
+            let _entered = span.enter();
+            otel_internal_warn!(
+                dropped_logs_count = 3_u64,
+                message = "Logs were dropped",
+                ""
+            );
+        });
+
+        let bytes = writer.0.lock().clone();
+        let line = std::str::from_utf8(&bytes).unwrap().trim_end();
+        assert_eq!(line.matches("\"message\"").count(), 1, "{line}");
+        let mut entry: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(
+            entry
+                .as_object_mut()
+                .unwrap()
+                .remove("timestamp")
+                .is_some_and(|timestamp| timestamp.is_string())
+        );
+        assert_eq!(
+            entry,
+            serde_json::json!({
+                "level": "WARN",
+                "target": "opentelemetry_sdk",
+                "name": "BatchLogProcessor.LogsDropped",
+                "dropped_logs_count": 3,
+                "message": "Logs were dropped",
+            })
+        );
     }
 
     /// The rolling file keeps the nested shape: the dashboard's log panel and
@@ -1073,14 +1327,19 @@ mod tests {
     /// after its `(`), split at top-level commas, up to the first argument
     /// that is a string literal: that literal is the message, and the fields
     /// come before it. String literals inside an argument are skipped whole,
-    /// so a `)` or `,` in a value does not end or split it.
+    /// so a `)` or `,` in a value does not end or split it, and so are `//`
+    /// comments, up to the end of their line.
     fn macro_fields(source: &str, open: usize) -> Vec<String> {
         let mut fields = Vec::new();
         let mut current = String::new();
         let mut depth = 0_u32;
-        let mut characters = source[open..].chars();
+        let mut characters = source[open..].chars().peekable();
         while let Some(character) = characters.next() {
             match character {
+                '/' if characters.peek() == Some(&'/') => {
+                    characters.by_ref().find(|&inner| inner == '\n');
+                    continue;
+                }
                 '"' if depth == 0 && current.trim().is_empty() => break,
                 '"' => {
                     current.push(character);
@@ -1127,13 +1386,41 @@ mod tests {
         is_identifier.then_some(name)
     }
 
+    /// The tracing event macros the workspace scan reads.
+    const EVENT_MACROS: [&str; 6] = ["trace", "debug", "info", "warn", "error", "event"];
+
+    /// Where the arguments of each tracing event macro call in `source`
+    /// start: just after the `(`, `[` or `{` that follows `warn!` and the
+    /// others, with any whitespace between them. A name preceded by an
+    /// identifier character (`otel_warn!`) is another macro and is skipped.
+    fn event_macro_calls(source: &str) -> Vec<usize> {
+        let mut opens = Vec::new();
+        for name in EVENT_MACROS {
+            let bang = format!("{name}!");
+            for (offset, _) in source.match_indices(&bang) {
+                let preceded_by_identifier = source[..offset]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_');
+                if preceded_by_identifier {
+                    continue;
+                }
+                let after_bang = offset + bang.len();
+                let rest = &source[after_bang..];
+                let delimited = rest.trim_start();
+                if delimited.starts_with(['(', '[', '{']) {
+                    opens.push(after_bang + rest.len() - delimited.len() + 1);
+                }
+            }
+        }
+        opens.sort_unstable();
+        opens
+    }
+
     /// No tracing event in the workspace records a field with a reserved
     /// console key's name (docs/observability.md, "Console format").
     #[test]
     fn no_tracing_event_records_a_reserved_console_key() {
-        let macros = [
-            "trace!(", "debug!(", "info!(", "warn!(", "error!(", "event!(",
-        ];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut pending = vec![root.join("src"), root.join("crates")];
         let mut violations = Vec::new();
@@ -1152,25 +1439,13 @@ mod tests {
             }
 
             let source = std::fs::read_to_string(&path).unwrap();
-            for call in macros {
-                for (offset, _) in source.match_indices(call) {
-                    let preceded_by_identifier =
-                        source[..offset]
-                            .chars()
-                            .next_back()
-                            .is_some_and(|character| {
-                                character.is_ascii_alphanumeric() || character == '_'
-                            });
-                    if preceded_by_identifier {
-                        continue;
-                    }
-                    for argument in macro_fields(&source, offset + call.len()) {
-                        if let Some(name) = field_name(&argument)
-                            && RESERVED_CONSOLE_KEYS.contains(&name)
-                        {
-                            let line = source[..offset].matches('\n').count() + 1;
-                            violations.push(format!("{}:{line}: {name}", path.display()));
-                        }
+            for open in event_macro_calls(&source) {
+                for argument in macro_fields(&source, open) {
+                    if let Some(name) = field_name(&argument)
+                        && RESERVED_CONSOLE_KEYS.contains(&name)
+                    {
+                        let line = source[..open].matches('\n').count() + 1;
+                        violations.push(format!("{}:{line}: {name}", path.display()));
                     }
                 }
             }
@@ -1180,11 +1455,39 @@ mod tests {
     }
 
     #[test]
+    fn the_call_scan_reads_every_delimiter_form_and_skips_other_macros() {
+        // Split so the workspace scan does not read this fixture as calls.
+        let source = concat!(
+            "warn",
+            "!(a)\n",
+            "tracing::info",
+            "! { b }\n",
+            "error",
+            "![c]\n",
+            "debug",
+            "!{d}\n",
+            "otel_warn",
+            "!(e)\n",
+            "info_span",
+            "!(f)\n",
+            "warn",
+            "! is not a call\n",
+        );
+        let found: Vec<_> = event_macro_calls(source)
+            .into_iter()
+            .map(|open| source[open..].trim_start().chars().next().unwrap())
+            .collect();
+
+        assert_eq!(found, ['a', 'b', 'c', 'd']);
+    }
+
+    #[test]
     fn the_field_scan_reads_fields_and_skips_the_target_and_format_arguments() {
         // Split so the workspace scan does not read this fixture as a call.
         let source = concat!(
             "warn",
             r#"!(target: "wallet", %contract, note = "a, b)", target, level = std::u32::MAX, "#,
+            "// a comment ends here: ), spans\n",
             r#"message = %format!("a: {x}"), "text {}", span)"#
         );
         let fields: Vec<_> = macro_fields(source, "warn!(".len())
