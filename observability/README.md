@@ -46,6 +46,9 @@ into the board JSON. The plugin is installed on the box by `T0Trade/t0.devops`
 loads these panels as "Panel plugin not found" and still passes. The header
 reads its query rows through `header-rows.js`, which
 `dashboard/src/lib/board-header.test.ts` tests.
+`dashboard/src/lib/board-header-render.test.ts` and `board-detail.test.ts` run
+the header's and the row dialog's scripts as deployed, from the generated board
+JSON, in happy-dom, so regenerate the boards before you run them.
 
 The recovery commands in the header's guide (`recovery-guide.json`) and in the
 row dialog (`recovery-commands.js`) are copies of the SPA's

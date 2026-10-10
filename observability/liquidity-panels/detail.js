@@ -15,9 +15,10 @@
 // The panel is one empty column of the header row; only the dialog shows.
 //
 // MODE_LABELS, tradeCommands, transferCommands, latest, lineEntries,
-// eventTimeline, timelineIncomplete and queryState are not defined here: the
-// generator prepends them from recovery-guide.json, recovery-commands.js,
-// status-history.js and log-lines.js (see detail_panel()).
+// eventTimeline, timelineIncomplete, queryState, commandLine and
+// wireCopyButtons are not defined here: the generator prepends them from
+// recovery-guide.json, recovery-commands.js, status-history.js, log-lines.js
+// and copy-command.js (see detail_panel()).
 
 const theme = context.grafana.theme;
 const root = context.element;
@@ -105,8 +106,10 @@ const TYPES = {
   equity_redemption: 'Redeem',
   alpaca_to_base: 'Alpaca → Raindex',
   base_to_alpaca: 'Raindex → Alpaca',
+  usdc_bridge: 'USDC Bridge',
 };
-const typeOf = (transfer) => (transfer.kind === 'usdc_bridge' ? transfer.direction : transfer.kind);
+// A USDC bridge is labelled by its direction, or as a bridge when it has none.
+const typeOf = (transfer) => (transfer.kind === 'usdc_bridge' ? transfer.direction || transfer.kind : transfer.kind);
 const typeLabel = (transfer) => TYPES[typeOf(transfer)] || transfer.kind || '—';
 const assetOf = (transfer) => (transfer.kind === 'usdc_bridge' || !transfer.symbol ? 'USDC' : transfer.symbol);
 
@@ -142,7 +145,7 @@ const commandBlock = (commands, note) =>
         .map(
           (entry) => `
         <div class="det-command">
-          <pre>${escapeHtml(entry.command)}</pre>
+          ${commandLine(escapeHtml(entry.command))}
           <div>${escapeHtml(entry.description)}</div>
           <span class="det-mode ${modeClass(entry.mode)}">${escapeHtml(MODE_LABELS[entry.mode] || entry.mode)}</span>
         </div>`
@@ -288,7 +291,7 @@ const transferDialog = (transfer) => {
     <div class="det-fields det-mono">
       ${field('ID', `<span class="det-muted">${escapeHtml(transfer.id)}</span>`)}
       ${field('Started', utc(transfer.started_at || transfer.first))}
-      ${field('Updated', utc(transfer.time))}
+      ${field('Updated', utc(transfer.newest))}
       ${field('Status', `<span class="${statusClass(transfer.status)}">${escapeHtml(statusLabel(transfer.status))}</span>`)}
     </div>
     ${timeline(eventTimeline(eventLines, 'transfer', transfer.kind), transfer.history, null, transfer.event_id)}
@@ -375,8 +378,13 @@ if (!dialog) {
 }
 
 // Property handlers, not listeners: each render replaces them instead of
-// stacking another copy.
-dialog.onclose = () => {
+// stacking another copy. The operator's dismissal is handled when it is
+// asked for: the close button, a backdrop click, or Escape (cancel). The
+// close event is not used: it is queued, so it can run after a later render
+// has reopened a row. A close this script makes, because the variable went
+// empty (browser Back, say), is no dismissal: Forward or a click on the
+// same row opens the row again.
+const recordDismissal = () => {
   state.dismissed = dialog.detId || null;
   dialog.detId = '';
   // An empty value, not null: removing the URL parameter leaves a textbox
@@ -385,13 +393,21 @@ dialog.onclose = () => {
     context.grafana.locationService.partial({ 'var-detail': '' }, true);
   }
 };
+const dismiss = () => {
+  recordDismissal();
+  dialog.close();
+};
+dialog.oncancel = recordDismissal;
 // A click on the backdrop closes it, like the SPA.
 dialog.onclick = (event) => {
-  if (event.target === dialog) dialog.close();
+  if (event.target === dialog) dismiss();
 };
 
 if (html === null || state.dismissed === wanted) {
-  if (dialog.open) dialog.close();
+  if (dialog.open) {
+    dialog.detId = '';
+    dialog.close();
+  }
 } else {
   if (dialog.detHtml !== html) {
     // A refresh that brings a new status keeps the operator's scroll.
@@ -403,6 +419,7 @@ if (html === null || state.dismissed === wanted) {
     if (next) next.scrollTop = scroll;
   }
   dialog.detId = wanted;
-  dialog.querySelector('[data-close]').onclick = () => dialog.close();
+  dialog.querySelector('[data-close]').onclick = dismiss;
+  wireCopyButtons(dialog);
   if (!dialog.open) dialog.showModal();
 }

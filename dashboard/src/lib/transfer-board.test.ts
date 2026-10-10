@@ -79,7 +79,7 @@ type StatusEntry = {
 type StatusHistory = {
   latest: (
     entries: StatusEntry[]
-  ) => (StatusEntry & { first: number; history: StatusEntry[] }) | null
+  ) => (StatusEntry & { first: number; newest: number; history: StatusEntry[] }) | null
 }
 
 // A plain script in the board, an ES module through its export line here.
@@ -322,6 +322,18 @@ describe('board status-history.js', () => {
       first: 100,
       history: ['converting', 'withdrawing', 'bridging']
     })
+  })
+
+  it('gives the newest entry time apart from the time of the latest status', () => {
+    const row = statusHistory.latest([bridge('withdrawing', 200), bridge('bridging', 100)])
+    expect(row).toMatchObject({ status: 'bridging', time: 100, first: 100, newest: 200 })
+    const line = (status: string, time: number, sequence: number): StatusEntry => ({
+      ...bridge(status, time),
+      event_id: `UsdcRebalance:B1:${String(sequence)}`
+    })
+    expect(
+      statusHistory.latest([line('withdrawing', 300, 2), line('bridging', 250, 3)])
+    ).toMatchObject({ status: 'bridging', first: 250, newest: 300 })
   })
 
   it('orders other rows by time, ties newest last as Cloud Logging returned them', () => {

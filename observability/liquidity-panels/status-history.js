@@ -30,6 +30,14 @@ const sequenceOf = (entry) => {
   return match ? Number(match[1]) : null;
 };
 
+// The row at its latest status with its history, the time of its oldest
+// entry (`first`) and of its newest (`newest`). The newest time is not the
+// latest status's: lifecycle order can put an older entry last.
+const withTimes = (last, entries, history) => {
+  const times = entries.map((entry) => entry.time);
+  return { ...last, first: Math.min(...times), newest: Math.max(...times), history };
+};
+
 // The row at its latest status, with its status history oldest first. The
 // bot's lines carry the commit order, so they sort by sequence. Exporter
 // entries sort by time (ties keep Cloud Logging's newest-first order
@@ -40,7 +48,7 @@ const latest = (entries) => {
   if (entries.every((entry) => sequenceOf(entry) !== null)) {
     const history = [...entries].sort((left, right) => sequenceOf(left) - sequenceOf(right));
     const last = history[history.length - 1];
-    return { ...last, first: Math.min(...entries.map((entry) => entry.time)), history };
+    return withTimes(last, entries, history);
   }
   const history = [...entries].reverse().sort((left, right) => left.time - right.time);
   for (let swapped = true; swapped; ) {
@@ -54,7 +62,7 @@ const latest = (entries) => {
     }
   }
   const last = history[history.length - 1];
-  return { ...last, first: Math.min(...entries.map((entry) => entry.time)), history };
+  return withTimes(last, entries, history);
 };
 
 export { latest };
