@@ -1729,6 +1729,25 @@ contract was first published by an exporter sidecar that polled the bot's API.
 The bot now publishes the same names itself, so those consumers can stop
 depending on the sidecar.
 
+The native performance series count at the source. RPC and broker calls give
+`dependency_calls_total{dependency,operation,outcome}`,
+`dependency_call_duration_seconds{dependency,operation}` and
+`telemetry_samples_dropped_total`. Each fill watcher gives
+`order_fill_poll_cycles_total{chain,outcome}`,
+`order_fill_poll_skipped_ticks_total{chain}`,
+`order_fill_poll_duration_seconds{chain}`, `order_fill_block_lag_blocks{chain}`
+and `order_fill_block_lag_sampled_timestamp_seconds{chain}`. Each run of the
+prices, performance, orders and P&L collectors, failed or not, gives
+`metrics_refresh_duration_seconds{collector}`, and the file log gives
+`log_events_total{level,target}`. The duration histograms render with fixed
+buckets; the refresh histogram also has buckets from 90 to 300 seconds, so a run
+longer than 60 seconds is not only in `+Inf`. Each watcher registers its poll
+counters at 0 (every `outcome`, and the skipped ticks) when it starts, and the
+telemetry channel registers its dropped-sample counter at 0, so the first error,
+pause or drop is an increase from 0. An unknown block lag holds
+`order_fill_block_lag_blocks` at its last value, and its sample time stops
+advancing.
+
 - **Same meaning as the exporter.** Each ported name keeps the exporter's
   labels, label values, units and sentinels, including the `wt`/`t` prefix rule
   for `symbol` labels (a prefix is removed only before an uppercase letter). A
@@ -1882,7 +1901,10 @@ loaders as the `/performance/*` endpoints, over the last 24 hours:
   `liq_dependency_{calls_24h,errors_24h}{dependency,operation}` with
   `liq_dependency_latency_ms{dependency,operation,quantile}`. The block-lag and
   poll series carry one `chain` per hedged chain; the exporter's unlabelled
-  versions came from a report shape the bot no longer serves.
+  versions came from a report shape the bot no longer serves. Each block-lag
+  series copies its `/performance/infra` field: a chain whose latest sample has
+  no cutoff block (ingestion paused) has a sample time and no lag, and a chain
+  with no checkpointed sample yet has neither.
 
 The log counts cover the events the file log writes, with the file log's filter,
 and are kept only when file logging is configured; without it both level rows
@@ -1901,7 +1923,11 @@ Every fifth cycle the task publishes `rebalances` over the last 30 days:
 `liq_rebalance_stage_ms{kind,stage,quantile}` (`kind` is `usdc` or `equity`) and
 `liq_attestation_last_ms{kind="usdc"}`, absent with no attestation in the
 window. A collector that fails or takes longer than 30 seconds keeps its last
-family.
+family. The four collectors run one after another on purpose: the exporter
+called the same loaders in sequence, and the bot keeps that load shape on the
+SQLite pool the trading paths share. A slow cycle skips the next tick instead of
+overlapping it, and the collector times and `metrics_refresh_duration_seconds`
+show it.
 
 Every 60 seconds a task publishes the order series. `liq_pending_orders_total`
 and `liq_pending_orders{status}` count what `GET /orders/pending` returns, from
@@ -1915,7 +1941,12 @@ when the count fails. `liq_raindex_orders_total` and
 `liq_raindex_orders_unavailable{reason}` come from the same fetch
 `GET /orders/raindex` proxies (page 1, 50 orders): the upstream
 `pagination.totalOrders` and `{reason=""} 0` while available, and
-`{reason="<why>"} 1` with no total while not.
+`{reason="<why>"} 1` with no total while not. A `totalOrders` that is a number,
+or a string that parses as a finite number, is the total, as the exporter's
+`float()` read it. Any other value keeps the last Raindex family and logs a
+warning: the exporter failed its whole body on it, and a 0 would read as a fresh
+count. Both order collectors record each run in
+`metrics_refresh_duration_seconds`.
 
 Every 5 minutes a task publishes the `liq_pnl_*` series of six windows, each
 labelled `window`: `1d`, `1w`, `1m`, `ytd`, `1y` and `all`. Each window's report

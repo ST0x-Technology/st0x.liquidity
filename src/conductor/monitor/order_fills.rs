@@ -135,6 +135,8 @@ impl<P: Provider + Clone + Send + Sync + 'static> SupervisedTask for OrderFillMo
             "Order fill monitor started (continuous eth_getLogs polling)"
         );
 
+        register_poll_cycle_metrics(self.evm_ctx.chain);
+
         let mut interval = tokio::time::interval(self.poll_interval);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut previous_tick: Option<Instant> = None;
@@ -202,6 +204,8 @@ enum PollCycleOutcome {
 }
 
 impl PollCycleOutcome {
+    const ALL: [Self; 3] = [Self::Ok, Self::Paused, Self::Error];
+
     fn of(result: &Result<PollOutcome, OrderFillMonitorError>) -> Self {
         match result {
             Ok(outcome) if outcome.pauses_ingestion() => Self::Paused,
@@ -217,6 +221,23 @@ impl PollCycleOutcome {
             Self::Error => "error",
         }
     }
+}
+
+/// Registers the chain's poll counters at 0 before the first cycle, so the
+/// first error or paused cycle is an `increase()` from 0 instead of a new
+/// series that starts at 1.
+fn register_poll_cycle_metrics(chain: Chain) {
+    let chain = chain.as_str();
+
+    for outcome in PollCycleOutcome::ALL {
+        metrics::counter!(
+            "order_fill_poll_cycles_total",
+            "chain" => chain,
+            "outcome" => outcome.as_str(),
+        )
+        .increment(0);
+    }
+    metrics::counter!("order_fill_poll_skipped_ticks_total", "chain" => chain).increment(0);
 }
 
 /// The native counterpart of the poll-cycle telemetry row: one cycle, its
@@ -1651,6 +1672,57 @@ mod tests {
         assert_eq!(bucket("base", "0.5"), Some(2.0));
         assert_eq!(bucket("robinhood", "1"), Some(0.0));
         assert_eq!(bucket("robinhood", "2.5"), Some(1.0));
+    }
+
+    /// Every outcome and the skipped ticks exist at 0 before the first
+    /// cycle, and a cycle then counts on top of that 0.
+    #[test]
+    fn poll_counters_are_registered_at_zero_before_the_first_cycle() {
+        let recorder = crate::metrics::local_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || register_poll_cycle_metrics(Chain::Base));
+
+        let before = rendered(&handle);
+        for outcome in ["ok", "paused", "error"] {
+            assert_eq!(
+                before.get(&series(
+                    "order_fill_poll_cycles_total",
+                    &[("chain", "base"), ("outcome", outcome)],
+                )),
+                Some(&0.0),
+                "{outcome}"
+            );
+        }
+        assert_eq!(
+            before.get(&series(
+                "order_fill_poll_skipped_ticks_total",
+                &[("chain", "base")],
+            )),
+            Some(&0.0)
+        );
+
+        metrics::with_local_recorder(&recorder, || {
+            record_poll_cycle_metrics(
+                Chain::Base,
+                &Ok(PollOutcome::CaughtUp),
+                0,
+                Duration::from_millis(40),
+            );
+        });
+
+        let after = rendered(&handle);
+        let cycles = |outcome: &str| {
+            after
+                .get(&series(
+                    "order_fill_poll_cycles_total",
+                    &[("chain", "base"), ("outcome", outcome)],
+                ))
+                .copied()
+        };
+        assert_eq!(cycles("ok"), Some(1.0));
+        assert_eq!(cycles("paused"), Some(0.0));
+        assert_eq!(cycles("error"), Some(0.0));
     }
 
     #[test]

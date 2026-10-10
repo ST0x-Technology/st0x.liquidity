@@ -16,14 +16,15 @@ use std::time::{Duration, SystemTime};
 use serde_json::Value;
 use sqlx::SqlitePool;
 use task_supervisor::{SupervisedTask, TaskResult};
-use tokio::time::{MissedTickBehavior, timeout};
+use tokio::time::{Instant, MissedTickBehavior, timeout};
 use tracing::{error, info, warn};
 
 use st0x_config::Ctx;
 
+use super::refresh::record_collector_duration;
 use super::{
-    LIQ_FAMILIES, LiqFamilies, LiqFamily, LiqMetric, LiqSample, LiqValueError, count_value,
-    push_sample, signed_integer_value,
+    LIQ_FAMILIES, LiqFamilies, LiqFamily, LiqMetric, LiqSample, count_value, push_sample,
+    signed_integer_value,
 };
 use crate::dashboard::order_loader::{
     PendingOrderResponse, RaindexOrders, count_pending_orders, fetch_raindex_orders,
@@ -88,14 +89,18 @@ pub(crate) enum RaindexSamplesError {
     NotAnObject,
     #[error("the Raindex orders pagination is not a JSON object")]
     PaginationNotAnObject,
+    #[error("the Raindex totalOrders {0} is not a finite number")]
+    TotalOrdersNotANumber(Value),
 }
 
 /// `liq_raindex_orders_unavailable{reason}` and, while available,
 /// `liq_raindex_orders_total`. A missing, null or empty `pagination`, or a
-/// missing `totalOrders`, reads as 0 orders, as the exporter read it; a
-/// `totalOrders` that is not a number leaves the total absent. A body whose
-/// shape the exporter could not read is an error, and the caller keeps the
-/// last family.
+/// missing `totalOrders`, reads as 0 orders, as the exporter read it. A
+/// `totalOrders` that is a number, or a string that parses as a finite number
+/// (the exporter's `float()`), is the total. A body whose shape the exporter
+/// could not read, or any other `totalOrders`, is an error, and the caller
+/// keeps the last family: the exporter failed its whole body on such a value,
+/// and a 0 would read as a fresh count.
 pub(crate) fn raindex_samples(
     orders: &RaindexOrders,
 ) -> Result<Vec<LiqSample>, RaindexSamplesError> {
@@ -119,9 +124,9 @@ pub(crate) fn raindex_samples(
     };
 
     let total = match body.get("pagination") {
-        None | Some(Value::Null) => Some(Ok(0.0)),
-        Some(Value::Object(pagination)) => total_orders(pagination.get("totalOrders")),
-        Some(other) if json_falsy(other) => Some(Ok(0.0)),
+        None | Some(Value::Null) => Some(0.0),
+        Some(Value::Object(pagination)) => total_orders(pagination.get("totalOrders"))?,
+        Some(other) if json_falsy(other) => Some(0.0),
         Some(_) => return Err(RaindexSamplesError::PaginationNotAnObject),
     };
     if let Some(total) = total {
@@ -129,7 +134,7 @@ pub(crate) fn raindex_samples(
             &mut samples,
             LiqMetric::RaindexOrdersTotal,
             Vec::new(),
-            total,
+            Ok(total),
         );
     }
 
@@ -143,17 +148,25 @@ pub(crate) fn raindex_samples(
     Ok(samples)
 }
 
-/// `None` when the exporter published no total: a null `totalOrders`.
-fn total_orders(total: Option<&Value>) -> Option<Result<f64, LiqValueError>> {
-    match total {
-        None => Some(Ok(0.0)),
-        Some(Value::Null) => None,
-        Some(Value::Number(number)) => number.as_f64().map(Ok),
-        Some(other) => {
-            warn!(total_orders = %other, "Raindex totalOrders is not a number");
-            None
-        }
-    }
+/// `None` when the exporter published no total: a null `totalOrders`. A
+/// string is trimmed and parsed, as Python's `float()` reads it; one that
+/// does not parse, or parses to infinity or NaN, is an error.
+fn total_orders(total: Option<&Value>) -> Result<Option<f64>, RaindexSamplesError> {
+    let Some(total) = total else {
+        return Ok(Some(0.0));
+    };
+
+    let parsed = match total {
+        Value::Null => return Ok(None),
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.trim().parse::<f64>().ok(),
+        Value::Bool(_) | Value::Array(_) | Value::Object(_) => None,
+    };
+
+    parsed
+        .filter(|value| value.is_finite())
+        .map(Some)
+        .ok_or_else(|| RaindexSamplesError::TotalOrdersNotANumber(total.clone()))
 }
 
 /// Python's falsiness for a JSON value the exporter replaced with `{}`.
@@ -216,10 +229,26 @@ impl LiqOrdersRefresh {
         self.refresh_raindex().await;
     }
 
+    /// Publishes the pending-order family and records the run, failed or
+    /// not, in `metrics_refresh_duration_seconds`.
+    async fn refresh_pending_orders(&self) {
+        let started = Instant::now();
+        self.publish_pending_orders().await;
+        record_collector_duration(LiqFamily::PendingOrders.collector(), started.elapsed());
+    }
+
+    /// Publishes the Raindex family and records the run, failed or not, in
+    /// `metrics_refresh_duration_seconds`.
+    async fn refresh_raindex(&self) {
+        let started = Instant::now();
+        self.publish_raindex().await;
+        record_collector_duration(LiqFamily::Raindex.collector(), started.elapsed());
+    }
+
     /// A read that fails or takes too long keeps the last series, so their
     /// collector time stops advancing; a failed uncapped count leaves only
     /// that series absent.
-    async fn refresh_pending_orders(&self) {
+    async fn publish_pending_orders(&self) {
         let read = read_pending_orders(&self.pool);
         let (orders, uncapped) = match timeout(PENDING_ORDERS_TIMEOUT, read).await {
             Ok(Ok(read)) => read,
@@ -243,7 +272,9 @@ impl LiqOrdersRefresh {
         );
     }
 
-    async fn refresh_raindex(&self) {
+    /// A fetch that takes too long, or a body that cannot be read, keeps the
+    /// last series, so their collector time stops advancing.
+    async fn publish_raindex(&self) {
         let fetch = fetch_raindex_orders(&self.ctx, Some(RAINDEX_PAGE), Some(RAINDEX_PAGE_SIZE));
         let Ok(orders) = timeout(RAINDEX_TIMEOUT, fetch).await else {
             warn!(
@@ -429,13 +460,53 @@ mod tests {
             None
         );
         assert_eq!(
-            raindex_total(json!({"pagination": {"totalOrders": "3"}})),
-            None
-        );
-        assert_eq!(
             raindex_total(json!({"pagination": {"totalOrders": 7}})),
             Some(7.0)
         );
+    }
+
+    /// The exporter's `float()` reads a numeric string, surrounding spaces
+    /// included, so the bot does too.
+    #[test]
+    fn a_numeric_string_total_reads_as_its_number() {
+        assert_eq!(
+            raindex_total(json!({"pagination": {"totalOrders": "12"}})),
+            Some(12.0)
+        );
+        assert_eq!(
+            raindex_total(json!({"pagination": {"totalOrders": " 4 "}})),
+            Some(4.0)
+        );
+        assert_eq!(
+            raindex_total(json!({"pagination": {"totalOrders": "2.5e1"}})),
+            Some(25.0)
+        );
+    }
+
+    /// The exporter failed its whole body on a total `float()` could not
+    /// read. The bot keeps the last family instead, so the collector time
+    /// stops advancing, and never publishes such a total as 0.
+    #[test]
+    fn a_malformed_total_is_an_error_and_never_zero() {
+        for total in [
+            json!("x"),
+            json!(""),
+            json!("NaN"),
+            json!("inf"),
+            json!(true),
+            json!([3]),
+            json!({"count": 3}),
+        ] {
+            assert!(
+                matches!(
+                    raindex_samples(&RaindexOrders::Available(
+                        json!({"pagination": {"totalOrders": total.clone()}})
+                    )),
+                    Err(RaindexSamplesError::TotalOrdersNotANumber(value)) if value == total
+                ),
+                "{total}"
+            );
+        }
     }
 
     #[test]
@@ -572,6 +643,36 @@ mod tests {
         refresh(pool, families).refresh_pending_orders().await;
 
         assert_eq!(pending_series(families), BTreeMap::new());
+    }
+
+    /// Both collectors record each run in the refresh histogram, like the
+    /// performance collectors, a failed one included.
+    #[tokio::test]
+    async fn each_orders_collector_run_records_its_duration() {
+        let recorder = crate::metrics::local_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let pool = setup_test_db().await;
+        let mut task = refresh(pool.clone(), leaked_families());
+        task.ctx.rest_api = Some(RestApiCtx::unauthenticated(
+            "http://127.0.0.1:1".to_string(),
+        ));
+
+        task.refresh_once().await;
+        pool.close().await;
+        task.refresh_pending_orders().await;
+
+        let durations = parse_exposition(&handle.render());
+        let runs = |collector: &str| {
+            durations
+                .get(&series(
+                    "metrics_refresh_duration_seconds_count",
+                    &[("collector", collector)],
+                ))
+                .copied()
+        };
+        assert_eq!(runs("pending_orders"), Some(2.0));
+        assert_eq!(runs("raindex"), Some(1.0));
     }
 
     #[tokio::test]
