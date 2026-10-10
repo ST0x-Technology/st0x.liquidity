@@ -72,6 +72,7 @@ pub(crate) enum LiqMetric {
     EquityWrapped,
     EquityRatio,
     EquityChainAvailable,
+    EquityChainInflight,
     UsdcOnchainAvailable,
     UsdcOnchainInflight,
     UsdcOffchainAvailable,
@@ -146,7 +147,7 @@ impl LiqMetric {
     /// Every variant, for the catalog tests. A new variant needs an entry
     /// here and its name in the catalog test.
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 93] = [
+    pub(crate) const ALL: [Self; 94] = [
         Self::BotInfo,
         Self::BotStartTimestampSeconds,
         Self::SettingsInfo,
@@ -172,6 +173,7 @@ impl LiqMetric {
         Self::EquityWrapped,
         Self::EquityRatio,
         Self::EquityChainAvailable,
+        Self::EquityChainInflight,
         Self::UsdcOnchainAvailable,
         Self::UsdcOnchainInflight,
         Self::UsdcOffchainAvailable,
@@ -269,6 +271,7 @@ impl LiqMetric {
             Self::EquityWrapped => "liq_equity_wrapped",
             Self::EquityRatio => "liq_equity_ratio",
             Self::EquityChainAvailable => "liq_equity_chain_available",
+            Self::EquityChainInflight => "liq_equity_chain_inflight",
             Self::UsdcOnchainAvailable => "liq_usdc_onchain_available",
             Self::UsdcOnchainInflight => "liq_usdc_onchain_inflight",
             Self::UsdcOffchainAvailable => "liq_usdc_offchain_available",
@@ -392,6 +395,7 @@ impl LiqMetric {
             Self::EquityChainAvailable => {
                 "Wrapped vault shares on each hedged chain a snapshot read; never sum chains"
             }
+            Self::EquityChainInflight => "In flight from each hedged chain vault; units in SPEC",
             Self::UsdcOnchainAvailable => "Primary chain vault settlement stable available",
             Self::UsdcOnchainInflight => "Primary chain vault settlement stable in flight",
             Self::UsdcOffchainAvailable => "Broker cash available after the reserve",
@@ -569,7 +573,7 @@ impl LiqMetric {
             | Self::EquityExposureUsd
             | Self::OpenExposureFillCount
             | Self::OpenExposureOldestTsSeconds => &["symbol"],
-            Self::EquityChainAvailable => &["chain", "symbol"],
+            Self::EquityChainAvailable | Self::EquityChainInflight => &["chain", "symbol"],
             Self::UsdcCorridorTarget
             | Self::UsdcCorridorDeviation
             | Self::UsdcChainAvailable
@@ -673,6 +677,7 @@ impl LiqMetric {
             | Self::EquityWrapped
             | Self::EquityRatio
             | Self::EquityChainAvailable
+            | Self::EquityChainInflight
             | Self::UsdcOnchainAvailable
             | Self::UsdcOnchainInflight
             | Self::UsdcOffchainAvailable
@@ -1390,6 +1395,7 @@ pub(crate) mod tests {
                 "liq_equity_wrapped",
                 "liq_equity_ratio",
                 "liq_equity_chain_available",
+                "liq_equity_chain_inflight",
                 "liq_usdc_onchain_available",
                 "liq_usdc_onchain_inflight",
                 "liq_usdc_offchain_available",
