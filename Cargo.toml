@@ -309,6 +309,9 @@ st0x-event-sorcery = { workspace = true, features = ["test-support"] }
 st0x-evm = { workspace = true, features = ["mock", "test-support"] }
 st0x-execution = { workspace = true, features = ["mock", "test-support"] }
 st0x-hedge = { workspace = true, features = ["test-support", "mock"] }
+st0x-liquidity-client = { path = "crates/liquidity-client", features = [
+  "test-support",
+] }
 st0x-tokenization = { workspace = true, features = ["test-support", "mock"] }
 st0x-wrapper = { workspace = true, features = ["mock"] }
 temp-env.workspace = true
