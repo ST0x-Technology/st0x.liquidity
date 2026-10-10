@@ -76,12 +76,66 @@ info!(%symbol, %shares, "Hedging trade");
 | Target              | Subsystem                                                |
 | ------------------- | -------------------------------------------------------- |
 | `hedge`             | Hedging / position management                            |
+| `liq_event`         | One line per committed trade or transfer event           |
+| `liq_trade`         | One line per trade at a terminal status                  |
+| `liq_transfer`      | One line per transfer status change                      |
 | `operational_alert` | Operator alerts (ERROR events the log pipeline pages on) |
 | `orderbook`         | Onchain orderbook interactions                           |
 | `rebalancing`       | Portfolio rebalancing                                    |
 | `startup`           | Application initialization                               |
 | `tokenization`      | Tokenized equity minting                                 |
 | `wallet`            | Alpaca wallet / onchain wallet                           |
+
+### Trade, transfer and event lines
+
+The dashboard `Broadcaster` reactor writes the `liq_trade`, `liq_transfer` and
+`liq_event` lines at INFO from `Reactor::react_committed`
+(`src/dashboard/event_lines.rs`). The store calls that once per commit and never
+when it replays events, so a restart does not write old lines again. Never write
+these lines from `evolve()`: it also runs on every replay.
+
+Every line has an `event_id`, `<aggregate type>:<aggregate id>:<sequence>`, that
+names the committed event behind it. The sequence comes from the event store, so
+the id stays the same across restarts. One commit can write two lines with the
+same `event_id` (a `liq_event` and a `liq_trade` or `liq_transfer`), so a
+consumer drops a duplicate line by target and `event_id` together. A row is not
+a line, though: a trade can get a second `liq_trade` line (a venue correction)
+and a transfer can repeat its status after a restart, each under a new
+`event_id`. So a table shows one row per trade `id`, or per transfer `kind` and
+`id`, from its latest line. Each line always has the same fields; a value that
+is not known is an empty string.
+
+The lines are at most once. A crash between the commit and the reactor, or a
+failed reload of the entity in the reactor (logged at WARN on target `dashboard`
+with the `event_id`), loses them, and nothing writes them later. A command sent
+through a store without the `Broadcaster` writes no lines. That covers
+`send_command` and every operator path that builds its own store: the CLI's
+manual transfers, transfer failures and reconciles, `clear-pending-burn`, and
+the hedge release that fails an offchain order. Their events still reach the
+`events` table and the event endpoints, but not these logs.
+
+| Target         | Fields after `event_id`                                                                          |
+| -------------- | ------------------------------------------------------------------------------------------------ |
+| `liq_trade`    | `id`, `occurred_at`, `venue`, `direction`, `symbol`, `shares`, `status`, `error`, `price`, `usd` |
+| `liq_transfer` | `kind`, `id`, `symbol`, `direction`, `amount`, `status`, `started_at`, `usd`                     |
+| `liq_event`    | `parent`, `venue`, `kind`, `id`, `sequence`, `step`, `payload`                                   |
+
+- `liq_trade`: `occurred_at` is when the trade filled or ended, which can be
+  well before the line when the bot catches up on onchain fills. `usd` is
+  `shares * price`. `price` and `usd` are empty for a failed or cancelled trade.
+  A venue correction of an onchain trade (`SourceAttributed`) writes the trade
+  again with its new venue.
+- `liq_transfer`: written only when the status differs from the last one this
+  process wrote for the transfer, terminal statuses included. After a restart
+  the first event of a transfer writes its status again. `usd` values an equity
+  transfer at its symbol's mark when the event commits (empty with no live mark)
+  and a USDC bridge at its amount.
+- `liq_event`: `parent` is `trade` (with `venue`) or `transfer` (with `kind`).
+  `step` is the event's variant name and `payload` is the variant's fields as a
+  JSON string, with every `signature` and `raw` value replaced by `"redacted"`,
+  in the same shape `/liquidity-read/trades/{venue}/{id}/events` and
+  `/liquidity-read/transfers/{kind}/{id}/events` return. `Position` events get
+  no line: they belong to no trade or transfer.
 
 ### Operational alert kinds
 
