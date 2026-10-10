@@ -8,12 +8,14 @@
 //! and the store ignores an older one, so a publisher that pauses after its
 //! read cannot put older balances back.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use rain_math_float::{Float, FloatError};
 
 use st0x_config::Ctx;
+use st0x_evm::Chain;
 use st0x_finance::Usdc;
 
 use super::settings::cash_reserved;
@@ -34,11 +36,13 @@ pub(crate) struct InventoryInput {
 }
 
 impl InventoryInput {
-    pub(crate) fn from_view(view: &InventoryView) -> Self {
+    /// `hedged` is the chains the config hedges: only their vaults get
+    /// per-chain series.
+    pub(crate) fn from_view(view: &InventoryView, hedged: &BTreeSet<Chain>) -> Self {
         Self {
             symbols: view.symbol_balances(),
             usdc: view.usdc_balances(),
-            by_chain: view.onchain_by_chain(),
+            by_chain: view.onchain_by_chain(hedged),
         }
     }
 }
@@ -48,6 +52,10 @@ impl InventoryInput {
 pub(crate) struct InventoryPublisher {
     families: &'static LiqFamilies,
     cash_reserved: Option<Float>,
+    /// The chains the config hedges. Hydration replays every persisted
+    /// chain, so a chain removed from the config would otherwise keep its
+    /// last per-chain balance.
+    hedged_chains: BTreeSet<Chain>,
     /// Set once boot has restored the view. Before that the view holds no
     /// balances, or only the ones a recovery step seeded, and publishing it
     /// would read as zero balances.
@@ -69,6 +77,7 @@ impl InventoryPublisher {
         Self {
             families,
             cash_reserved: cash_reserved(ctx),
+            hedged_chains: ctx.chains.hedged().map(|hedged| hedged.chain).collect(),
             started: AtomicBool::new(false),
             #[cfg(test)]
             before_publish: None,
@@ -99,7 +108,7 @@ impl InventoryPublisher {
     pub(crate) fn read_changed(&self, view: &InventoryView) -> InventoryRead {
         InventoryRead {
             generation: self.families.next_generation(),
-            input: InventoryInput::from_view(view),
+            input: InventoryInput::from_view(view, &self.hedged_chains),
         }
     }
 
@@ -110,7 +119,7 @@ impl InventoryPublisher {
     pub(crate) fn read_current(&self, view: &InventoryView) -> Option<InventoryRead> {
         self.started().then(|| InventoryRead {
             generation: self.families.current_generation(),
-            input: InventoryInput::from_view(view),
+            input: InventoryInput::from_view(view, &self.hedged_chains),
         })
     }
 
@@ -162,15 +171,17 @@ fn chain_samples(
     broker_gross: Option<Float>,
 ) {
     for balance in &by_chain.equities {
-        push_sample(
-            samples,
-            LiqMetric::EquityChainAvailable,
-            vec![
-                ("chain", balance.chain.as_str().to_string()),
-                ("symbol", strip_prefix(balance.symbol.as_str()).to_string()),
-            ],
-            float_value(balance.available.inner()),
-        );
+        let labels = vec![
+            ("chain", balance.chain.as_str().to_string()),
+            ("symbol", strip_prefix(balance.symbol.as_str()).to_string()),
+        ];
+        let values = [
+            (LiqMetric::EquityChainAvailable, balance.available.inner()),
+            (LiqMetric::EquityChainInflight, balance.inflight.inner()),
+        ];
+        for (metric, value) in values {
+            push_sample(samples, metric, labels.clone(), float_value(value));
+        }
     }
 
     for balance in &by_chain.usdc {
@@ -353,6 +364,7 @@ pub(crate) mod tests {
     use st0x_float_macro::float;
 
     use super::*;
+    use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::inventory::view::{ChainEquityBalance, ChainUsdcBalance};
     use crate::metrics::liquidity::tests::{SeriesKey, parse_exposition, series};
 
@@ -827,11 +839,13 @@ pub(crate) mod tests {
                         symbol: Symbol::new("tAAPL").unwrap(),
                         chain: Chain::Base,
                         available: shares(float!(50)),
+                        inflight: shares(float!(0)),
                     },
                     ChainEquityBalance {
                         symbol: Symbol::new("tAAPL").unwrap(),
                         chain: Chain::Robinhood,
                         available: shares(float!(9)),
+                        inflight: shares(float!(4)),
                     },
                 ],
                 usdc: vec![
@@ -870,6 +884,20 @@ pub(crate) mod tests {
                         &[("chain", "robinhood"), ("symbol", "AAPL")]
                     ),
                     9.0
+                ),
+                (
+                    series(
+                        "liq_equity_chain_inflight",
+                        &[("chain", "base"), ("symbol", "AAPL")]
+                    ),
+                    0.0
+                ),
+                (
+                    series(
+                        "liq_equity_chain_inflight",
+                        &[("chain", "robinhood"), ("symbol", "AAPL")]
+                    ),
+                    4.0
                 ),
                 (
                     series("liq_usdc_chain_available", &[("chain", "base")]),
@@ -954,6 +982,48 @@ pub(crate) mod tests {
         assert_eq!(hyperevm_ratio(&read), Some(0.4));
     }
 
+    /// The publisher takes the hedged chains from the config. Hydration
+    /// replays every persisted chain, so the view can hold a reading for a
+    /// chain the config does not hedge, and that chain gets no series. The
+    /// test config hedges Base only.
+    #[test]
+    fn the_publisher_lists_only_the_chains_the_config_hedges() {
+        let families = leaked_families();
+        let publisher = publisher(families);
+        let now = chrono::Utc::now();
+        let read = |view: InventoryView, chain: Chain, quantity| {
+            view.apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainEquity {
+                    chain,
+                    balances: BTreeMap::from([(Symbol::new("tAAPL").unwrap(), quantity)]),
+                    fetched_at: now,
+                    block_number: Some(1),
+                },
+                now,
+            )
+            .unwrap()
+        };
+        let view = read(
+            read(InventoryView::default(), Chain::Base, shares(float!(50))),
+            Chain::Robinhood,
+            shares(float!(9)),
+        );
+
+        publisher.publish(publisher.start(&view));
+
+        let per_chain: Vec<SeriesKey> = rendered_store(families)
+            .into_keys()
+            .filter(|(name, _)| name == "liq_equity_chain_available")
+            .collect();
+        assert_eq!(
+            per_chain,
+            vec![series(
+                "liq_equity_chain_available",
+                &[("chain", "base"), ("symbol", "AAPL")]
+            )]
+        );
+    }
+
     /// The view read is the same data the dashboard DTO shows, so the
     /// builder sees what the exporter saw.
     #[test]
@@ -968,7 +1038,7 @@ pub(crate) mod tests {
             .with_offchain_gross_usd_cents(150_050)
             .with_withdrawable_cash_cents(80_000);
 
-        let from_view = InventoryInput::from_view(&view);
+        let from_view = InventoryInput::from_view(&view, &BTreeSet::from([Chain::Base]));
         let from_dashboard = input_from_dto(&view.to_dto());
 
         assert_eq!(from_view.symbols, from_dashboard.symbols);
