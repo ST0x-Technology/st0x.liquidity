@@ -758,6 +758,9 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::BurnRecordFailed { .. }
         | UsdcTransferError::BurnSubmitInconclusive { .. }
         | UsdcTransferError::BurnTxDropped { .. }
+        | UsdcTransferError::BurnTxAlreadyRecorded { .. }
+        | UsdcTransferError::BurnTxOwnershipUnchecked { .. }
+        | UsdcTransferError::BurnTxOwnershipLookupFailed { .. }
         | UsdcTransferError::DepositSendUnresolved { .. }
         | UsdcTransferError::DepositSendTaskPanicked { .. }
         | UsdcTransferError::DepositSendLookup { .. }
@@ -2698,6 +2701,32 @@ mod tests {
             "a backpressure-classified poll error stays in the bounded retry \
              budget rather than handing off"
         );
+    }
+
+    #[test]
+    fn burn_ownership_refusals_are_not_bot_resumable_waits() {
+        let id = UsdcRebalanceId(Uuid::from_u128(7));
+        let tx = TxHash::random();
+        let refusals = [
+            UsdcTransferError::BurnTxAlreadyRecorded {
+                id: id.clone(),
+                tx,
+                recorded_by: UsdcRebalanceId(Uuid::from_u128(8)),
+            },
+            UsdcTransferError::BurnTxOwnershipUnchecked { id: id.clone(), tx },
+            UsdcTransferError::BurnTxOwnershipLookupFailed {
+                id,
+                tx,
+                source: sqlx::Error::PoolClosed.into(),
+            },
+        ];
+
+        for refusal in &refusals {
+            assert!(
+                !is_bot_resumable_wait(refusal),
+                "{refusal} needs reconciliation, not automatic wait handoff"
+            );
+        }
     }
 
     /// `transfer resume --kind usdc` posts to the running bot's resume

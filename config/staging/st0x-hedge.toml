@@ -279,6 +279,6 @@ vault_id = "0xfab"
 rebalancing = "disabled"
 
 # The per-symbol tables ([chains.<c>.trading.assets.equities.<SYM>] and
-# [assets.equities.<SYM>]) come from st0x.registry's token file in the bucket.
+# [assets.equities.<SYM>]) come from t0.tokens' token file in the bucket.
 [registry]
 url = "gs://t0-artifacts-tokens/staging/tokens.toml"

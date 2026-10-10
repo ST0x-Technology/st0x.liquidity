@@ -60,14 +60,13 @@ the limit:
 constraints (file size limits apply to entire file). No warnings/errors pass
 through. Work until all tasks complete unless blocked needing user input.
 
-**CRITICAL: If you know you caused a problem and know how to fix it, fix it
-immediately.** Do not restate the request, ask for confirmation, or wait for
-permission to do the obvious corrective work.
+**CRITICAL: Fix a problem you caused immediately when you know the fix.** Do not
+restate the request, ask for confirmation, or wait for permission.
 
 ## Communication
 
-- **Do not run commands to "show" output to the user.** The CLI truncates
-  output. Ask them to look at it instead.
+- **Do not run commands to "show" output to the user.** CLI output is truncated;
+  ask them to look instead.
 - **Never say "standing by" or wait for permission once work has been
   authorized.** Do it -- do not ask "want me to proceed?" or pause between
   subtasks. Stop only when actually blocked on a decision the user must make.
@@ -96,7 +95,7 @@ downstream from the goal.
 
 ### Epic Decomposition for Parallel Execution
 
-Decompose epics to maximize independent parallel execution:
+Decompose epics for independent execution:
 
 1. **Identify coupling boundaries** — disjoint code areas can parallelize.
 2. **Sequence only where necessary** — branch on another only when it needs
@@ -144,10 +143,8 @@ An epic is a Linear project grouping related issues toward a single goal. See
 
 ### Before deciding on an implementation
 
-Before making changes, deeply understand the task: read the relevant repo docs,
-read the relevant source code, form an initial approach, criticize it, and
-improve it until the plan is coherent with the repo architecture. Keep the
-resulting diff as small and reviewable as possible.
+Before changing code, read the relevant docs and source. Critique and refine
+your plan until it fits the architecture; keep the diff small and reviewable.
 
 ### Handling questions and approach changes
 
@@ -158,10 +155,8 @@ don't paraphrase back as a confirmation step.
 ### When issues are pointed out
 
 When the user points out an issue, bug, or problem - fix it immediately. Do not
-ask "Want me to fix this?" or "Should I address this?". The user never sends
-messages just for the sake of it; when they point out issues, they expect action
-(usually a fix, sometimes reproducing, opening a Linear issue, etc. based on
-context).
+ask "Want me to fix this?" or "Should I address this?". A reported issue
+requests action: fix, reproduce, or open a Linear issue as context requires.
 
 **CRITICAL: Re-evaluate all work when a pattern is identified.** When the user
 points out a mistake, immediately: (1) fix it, (2) re-evaluate ALL session work
@@ -633,8 +628,8 @@ reviewing code that uses configuration instead of reading secrets directly.
   `nix run .#ci` enters the right dev shells (`ci-backend`, `ci-dashboard`) and
   runs the full matrix end-to-end -- backend `cargo check` (with and without
   `--all-features`), `cargo nextest run`, `cargo clippy`, `cargo fmt --check`,
-  plus dashboard `bun.nix` freshness check, DTO regeneration, lint,
-  `svelte-check`. Mirrors CI.
+  plus RustSec audit and regressions, dashboard `bun.nix` freshness, DTO
+  generation, lint, `svelte-check`. Mirrors CI.
 
   For iteration (e.g. backend-only), run individual steps in the corresponding
   shell:
@@ -644,7 +639,8 @@ reviewing code that uses configuration instead of reading secrets directly.
      Run via `nix develop .#ci-backend -c cargo nextest run ...`.
   3. `cargo clippy --workspace --all-targets --all-features` - full linting
   4. `cargo fmt` - always run last to ensure clean formatting
-  5. **Diff review** - after all checks pass, review staged changes and revert
+  5. `nix develop .#ci-audit -c bash -c './scripts/test-rust-audit.sh && ./scripts/audit-rust.sh'`
+  6. **Diff review** - after all checks pass, review staged changes and revert
      any chunks without clear justification (see "Before handing over" section)
 - **CRITICAL: ALL workspace checks must pass before work is done** (except
   doc-only changes). Fix every warning/error/failure regardless of origin. CI

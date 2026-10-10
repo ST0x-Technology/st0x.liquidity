@@ -2022,13 +2022,17 @@ Alternative approaches (Ansible, Kamal) were evaluated and documented in commit
 
 #### Config validation
 
-The GCP production and staging config TOMLs are committed beside their stacks in
-`t0.devops`, published as pinned Secret Manager versions, and mounted at
-`/run/t0-config/st0x-hedge.toml`. The OCI image contains no environment config;
-the compose file selects the mounted file with its `--config` flag. A config
-edit that only the deployed service can judge is a config edit whose first check
-is a bot that will not boot, which is what the `validate-config` binary exists
-to prevent.
+The GCP staging and production config TOMLs are committed in this repository
+(`config/staging/st0x-hedge.toml` and `config/prod/st0x-hedge.toml`). Each
+release validates the file inside the image that will run it, publishes it as a
+pinned `liquidity-runtime-config` Secret Manager version, and the VM mounts it
+at `/run/t0-config/st0x-hedge.toml`. A merge to `master` releases staging
+(`build-oci.yml`); production releases only through a manual
+`production-release.yml` run. The OCI image contains no environment config; the
+compose file selects the mounted file with its `--config` flag. A config edit
+that only the deployed service can judge is a config edit whose first check is a
+bot that will not boot, which is what the `validate-config` binary exists to
+prevent.
 
 `validate-config --config <path> [--secrets <path>] [--registry-file <path>]
 [--registry-state <dir>]`
@@ -2108,7 +2112,7 @@ pinned in code per chain, never configured.
 The per-symbol tables, `[chains.<c>.trading.assets.equities.<SYM>]` (addresses,
 vault ids, `trading` / `rebalancing` / `wrapped_equity_recovery`) and
 `[assets.equities.<SYM>]` (the hedge policy), are not in the bot's config. They
-come from the token file that `st0x.registry` publishes to
+come from the token file that `T0Trade/t0.tokens` publishes to
 `gs://t0-artifacts-tokens/<env>/tokens.toml`, one file per environment shared
 with pricing, the oracle, bebop and the price publisher. The config names it
 under `[registry]` (`url`, and in production `generation`) and must carry no
@@ -2120,7 +2124,7 @@ second budget, 4 MiB cap. A read that fails, a file that does not parse, a slot
 with a malformed switch or a missing address, a chain the config does not
 declare, or an empty universe all fail boot. The bot takes its own keys from
 each slot and ignores the others; which keys may appear is checked by
-`st0x.registry`'s CI before the file is published. The rows are merged into the
+`t0.tokens`' CI before the file is published. The rows are merged into the
 config's TOML table before it is deserialized, so every rule in
 `validate_config` runs on the result unchanged. A symbol listed under
 `retired_symbols` is dropped at the merge, so retiring is one config change and
@@ -2277,6 +2281,22 @@ Each profile is independently deployable and rollback-able without affecting
 others. Units use a `/run/st0x/<name>.ready` marker file gated by
 `ConditionPathExists` so they only start after the per-service profile has
 finished activation, never on a bare `nixos-rebuild switch`.
+
+_Migration and replay verification_:
+
+Migration verification checks that every aggregate type persisted in either the
+event store or snapshots, including framework-maintained aggregate types, has a
+replay check under the candidate code. These types are discovered before
+clearing stale snapshots, so a snapshot-only type cannot disappear from the
+coverage check. An uncovered type fails the deploy gate and is named in the
+report. Covered compacted inventory snapshots remain available for
+reconstruction; retained event streams replay without their cached snapshots.
+Verification never mutates the source database.
+
+Removing an aggregate from runtime code does not retire its durable history. An
+uncovered retired type needs compatibility replay support so that its retained
+events and snapshots remain verifiable; the coverage guard is not permission to
+delete retained events or ignore their type.
 
 _Configuration management_:
 
@@ -5129,11 +5149,50 @@ The job returns `Ok` and re-enqueues itself with a 15 s delay, re-entering the
 `resume_bridging_submitting` scan-or-reburn path on the next pickup.
 
 The double-burn safety guarantee is NOT `is_revert()` classification -- it is
-the `resume_bridging_submitting` scan: `find_recent_burn` scans for an existing
-burn before re-attempting, using the `from_block` lower bound durably recorded
-in the `BridgingSubmitting` aggregate event before the burn call. Even a
-misclassified error cannot cause a double-burn because the scan adopts any
-existing burn.
+the combination of scan recovery and fail-closed handling of uncertain
+submission. `find_recent_burn` scans for an existing unclaimed mined burn before
+re-attempting, using the `from_block` lower bound durably recorded in the
+`BridgingSubmitting` aggregate event before the burn call. The scan cannot find
+a still-pending broadcast whose hash was lost; that case must fail closed rather
+than authorize a reburn. Recovery without a recorded hash, including recovery
+after a confirmed revert, must not adopt a burn already recorded by another
+transfer. The scan window can include earlier transfers when its initial RPC
+head was stale; retained transfer history supplies the ownership check. Recovery
+scans return all matching candidates, newest first, after their bounded
+repeated-scan and finality gate. Candidates claimed by another transfer are
+skipped, not adopted and not allowed to hide an older unclaimed candidate. Only
+after the complete candidate set has been checked does the existing empty-result
+rule apply: a confirmed-reverted burn may be retried; a missing recorded hash
+still fails closed. Unavailable ownership evidence fails closed, retaining the
+transfer guard and never authorizing another burn. An unclaimed scan candidate
+is durably recorded as the pending burn before confirmation, replacing any
+confirmed-reverted hash; a failed or cancelled confirmation must not leave that
+old revert authorizing another burn. The candidate must then pass `confirm_burn`
+at the configured confirmation depth with valid `MessageSent` evidence before
+adoption.
+
+Generic sends observe their submission boundary under the wallet's send lock,
+immediately around each attempted broadcast, including nonce and fee recovery
+retries. Waiting for that lock cannot leave a queued send with an old boundary.
+Gas estimation, filling, and signing finish before the pre-broadcast head read;
+signing latency cannot leave the accepted send with a pre-signing boundary.
+Prepared transactions refresh their submission boundary at every broadcast,
+including exact rebroadcast after restart. An unfinished or failed observation
+cannot reuse a stale preparation boundary to qualify absence; it stays unknown
+without releasing nonce ownership. Completed observations retain the highest
+boundary seen across preparation and broadcasts.
+
+Preparation keeps the send lock through signing and its boundary observations.
+Until the signed transaction is returned to its caller, cancellation or failure
+releases only that fresh, unused preparation's reservation and invalidates its
+cached allocation; earlier occupied nonces remain held. Optional post-operation
+head reads are bounded by the existing wallet receipt-poll interval. A failed or
+timed-out post-read returns the accepted hash or signed preparation with unknown
+freshness and retained ownership, rather than delaying durable burn-hash
+recording indefinitely. Receipt waits read live submission evidence at each drop
+check and again after canonical-state lookups. Changed or unfinished rebroadcast
+evidence resets accumulated absence and head progress; an old copied boundary
+cannot qualify a new suspected drop.
 
 A per-attempt wall-clock timeout is similarly reclassified: the hung attempt is
 aborted and the job re-enqueues with a 30 s delay. The scan alone is
@@ -5157,12 +5216,71 @@ reburning a possibly-still-pending burn. On re-pickup,
 `confirm_burn`), a still-pending burn yields a delayed redrive (never a reburn),
 and a reverted burn (which moved no funds) falls through to the scan-or-reburn
 path. A burn classified **dropped** does **not** auto-reburn: once a burn tx
-hash is durably recorded, an ambiguous "dropped" classification pages the
-operator (a terminal `BurnTxDropped` error) for manual on-chain verification,
-because a load-balanced RPC could misreport a still-pending burn as dropped and
-a reburn there would double-burn. `burn_status` mirrors the wallet's
-`wait_for_receipt` drop policy (a grace window plus consecutive mempool-absence
-misses) so a still-pending tx is never misclassified as dropped.
+hash is durably recorded, a suspected drop requires the burn-event cross-check
+below before operator reconciliation. A load-balanced RPC could misreport a
+still-pending burn as dropped, and a reburn there would double-burn.
+`burn_status` mirrors the wallet's `wait_for_receipt` drop policy (a grace
+window plus consecutive qualified mempool-absence misses). Its head-progress
+reference starts after grace; progress before grace followed by a frozen head
+does not qualify. Consecutive misses count only once the head has advanced by
+the required margin beyond that post-grace reference. A bounded further
+observation window allows fresh progress before a frozen head returns Pending.
+An inconclusive lagging-head or consumed-nonce poll resets absence progress but
+does not end that observation window or restart grace; later polls must qualify
+against a new reference. Absence only qualifies with the submitted transaction's
+known sender and nonce, a head beyond the pre-submission block, and an unused
+nonce read at that exact canonical block hash. A consumed nonce can mean a mined
+transaction hidden by a lagging receipt backend, so it stays pending. Unknown
+submission evidence, unavailable canonical state, or a frozen/lagging head
+cannot produce a dropped verdict; wallet waits time out without releasing nonce
+ownership and burn recovery redrives. Head advancement alone does not prove
+global mempool absence, so the verdict remains suspected drop and never
+authorizes automatically reburning a recorded burn.
+
+Before turning a suspected drop into terminal `BurnTxDropped`, both transfer
+directions cross-check `DepositForBurn` logs strictly after the recorded
+pre-burn head, matching depositor, amount, destination domain, recipient and the
+durably recorded transaction hash. Another identical burn is not this transfer's
+evidence; without proof of a same-nonce replacement it cannot be adopted. A drop
+during initial, retry, or adoption confirmation uses the same cross-check as a
+drop found on resume; the confirmation path cannot bypass this evidence. A match
+must pass `confirm_burn` (configured confirmation depth and `MessageSent`
+validation) before it is recorded and adopted. After an empty exact-hash scan,
+the burn must freshly qualify as dropped again using canonical unused-nonce and
+post-grace head-progress evidence. A separately returned fresh numeric head does
+not authenticate a load-balanced log backend's coverage. A receipt, visible
+transaction, consumed nonce, incomplete identity or unavailable fresh evidence
+makes the empty result inconclusive. Positive exact-hash logs remain recoverable
+through confirmation. Only this freshly qualified empty result may page for a
+dropped burn; it is point-in-time evidence, not proof against future mining.
+Inconclusive scans and transient scan or confirmation failures yield
+`SettlementCheckTransient` for delayed retry, retaining the recorded hash and
+transfer guard. Deterministic RPC or validation failures surface for operator
+action, but are not proof of a dropped burn. No scan outcome authorizes
+reburning a suspected drop.
+
+A confirmation-time suspected drop may release the wallet's nonce ownership. The
+source endpoint retains that hash's known submission evidence for automatic
+retry without retaining nonce ownership or a sticky Dropped verdict. This is a
+bounded, process-local slot for the most recently suspected burn, not durable
+history. Every later absence still needs fresh canonical unused-nonce and
+post-grace head-progress qualification. Confirmation clears the matching slot;
+restart or eviction loses the evidence conservatively, leaving an unknown hash
+Pending. A subsequently consumed sender nonce also leaves the burn Pending:
+without the original receipt or exact burn log, consumption cannot distinguish
+the original burn from another transaction. There is no unresolved-burn deadline
+alert in this policy; adding one requires a separate alerting policy, not a
+sticky Dropped verdict.
+
+A pending burn uses the same bounded scan for positive recovery evidence. Only
+the recorded hash can be confirmed and adopted. An empty or inconclusive scan,
+or any scanner failure, preserves Pending and delayed retry with its typed
+source logged; an optional recovery scan cannot exhaust a known pending burn's
+retry budget. Unavailable confirmation RPCs after an exact-hash match also
+retry, including deterministic RPC rejection. Actual invalid burn evidence, such
+as a missing `MessageSent` event, still surfaces for operator action. Pending
+scans never page as dropped and never permit reburning. Unknown identity alone
+still cannot justify a drop.
 
 **Bound**: Both revert and timeout redrives count against a shared
 `max_burn_revert_redrives` counter persisted in the job payload (durable across
@@ -5497,7 +5615,7 @@ release, together with the RAI-2780 production switch-on:
 3. A tag rollback from R to the release before it is safe only before R has run
    any equity operation on any chain: every redemption R runs, on Base too,
    persists `SendPrepared`, which older binaries cannot load. After that, stop
-   the Robinhood listing with a paused generation on R (a new st0x.registry
+   the Robinhood listing with a paused generation on R (a new token-file
    generation plus a pin bump, since `[registry]` refuses inline equities
    tables), or roll forward. A binary rollback below R follows the rules below.
 
@@ -6279,10 +6397,23 @@ transfer dispatch. It does not calculate cross-venue inventory imbalances.
   await retry or manual recovery)
 - `TokenizedEquityMintEvent::MintRejected` - No balance change (rejected before
   shares left Alpaca)
-- `TokenizedEquityMintEvent::MintAcceptanceFailed` - When emitted after
-  `MintAccepted`, reconciles the started inflight back to Alpaca available. When
-  emitted by an operator force-fail from `MintRequested` (pre-acceptance), no
-  inflight was ever started, so there is no balance change
+- `TokenizedEquityMintEvent::MintAcceptanceFailed` - When `MintAccepted` started
+  the mint's inflight in this process, reconciles it back to Alpaca available.
+  When emitted by an operator force-fail from `MintRequested` (pre-acceptance),
+  or when `MintAccepted` failed to start the inflight, the mint moved no shares,
+  so there is no balance change. A mint rebuilt on restart restores its inflight
+  without knowing whether the prior process debited available, so its failure
+  does not credit available either; the terminal clear below zeroes the restored
+  inflight and forces a reconcile
+- Every terminal mint event (`DepositedIntoRaindex`, `MintRejected`,
+  `MintAcceptanceFailed`, `RaindexDepositFailed`, `WrappingFailed`,
+  `OperatorReconciled`) also zeroes any Hedging inflight still left on the
+  symbol and, when it zeroes a non-zero amount, forces an offchain equity
+  reconcile. Hedging inflight holds only mint shares, and a symbol has one mint
+  at a time, so a residual there is inflight a provider poll wrote before the
+  mint became active (a restart replaying a persisted poll, or a provider still
+  listing the previous mint) or a restored mint's inflight, counted on top of
+  the mint's own or never started by it
 - `EquityRedemptionEvent::WithdrawnFromRaindex` - Moves tokens to inflight
   (leaving Raindex vault)
 - `EquityRedemptionEvent::TokensUnwrapped` - Exact-match unwraps, including
@@ -6378,6 +6509,13 @@ transfer dispatch. It does not calculate cross-venue inventory imbalances.
 - `InventorySnapshotEvent::InflightEquity` - Bot-owned pending tokenization
   requests polled from Alpaca; sets inflight at Hedging for mints on every chain
   and at Base's MarketMaking slot for Base redemptions only
+  - **Active mints**: from `MintRequested` until its terminal event, a mint owns
+    its symbol's Hedging inflight, so the poll neither sets nor zeroes that
+    inflight. The poll still records the symbol, so recovering another chain's
+    failed provider snapshot carries its broker balance. A snapshot-error reset
+    keeps the active mints and redemptions and each active mint's whole Hedging
+    balance: they come from aggregate events, and no poll would restore them. A
+    forced broker snapshot applied by that recovery still overwrites the balance
   - **Ownership**: determined by active rebalancing aggregate IDs --
     `issuer_request_id` / `tokenization_request_id` for mints,
     `tokenization_request_id` / `redemption_tx` for redemptions -- not by

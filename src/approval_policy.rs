@@ -997,7 +997,10 @@ mod tests {
     #[tokio::test]
     async fn registry_approval_removals_do_not_query_turnkey() {
         let running = st0x_config::TurnkeyApprovalPolicyInputs {
-            organization_id: st0x_evm::turnkey::TurnkeyOrganizationId::new("offline".into()),
+            organization_id: st0x_evm::turnkey::TurnkeyOrganizationId::try_new(
+                "00000000-0000-4000-8000-000000000001".into(),
+            )
+            .unwrap(),
             kms_api_key: None,
             api_private_key: None,
             wallet_address: Address::ZERO,

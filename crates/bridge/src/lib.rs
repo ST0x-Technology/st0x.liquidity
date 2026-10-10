@@ -57,6 +57,17 @@ pub enum BurnTxStatus {
     Dropped,
 }
 
+/// Evidence from scanning for one durably recorded burn transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordedBurnScan {
+    /// Matching burn logs belong to the exact requested transaction hash.
+    Found,
+    /// A conclusive scan found no matching logs for the requested hash.
+    Absent,
+    /// The scan cannot establish either presence or absence of that hash.
+    Inconclusive,
+}
+
 /// Receipt from minting USDC on the destination chain.
 #[derive(Debug, PartialEq, Eq)]
 pub struct MintReceipt {
@@ -135,12 +146,16 @@ pub trait Bridge: Send + Sync + 'static {
     /// receipt consults the mempool: a tx still known to the node is
     /// [`BurnTxStatus::Pending`], and a tx absent from the mempool is only
     /// reported [`BurnTxStatus::Dropped`] after a grace window plus consecutive
-    /// misses (mirroring the wallet's `wait_for_receipt` drop policy), so a
-    /// still-pending tx is never re-burned.
+    /// qualified misses (mirroring the wallet's `wait_for_receipt` policy).
+    /// Qualification requires the known sender/nonce, an advancing head beyond
+    /// `submitted_after_block`, and an unused nonce at that exact canonical
+    /// block hash. Missing evidence or a consumed nonce stays `Pending`.
+    /// `Dropped` remains a suspected verdict, never authorization to reburn.
     async fn burn_status(
         &self,
         direction: BridgeDirection,
         tx_hash: TxHash,
+        submitted_after_block: u64,
     ) -> Result<BurnTxStatus, Self::Error>;
 
     /// Polls for an attestation confirming the burn.
@@ -178,16 +193,52 @@ pub trait Bridge: Send + Sync + 'static {
         attestation: Vec<u8>,
     ) -> Result<Self::Attestation, Self::Error>;
 
-    /// Scans the burn source chain for an already-submitted burn matching
-    /// `(amount, destinationDomain, recipient)` at or after `from_block`, for
-    /// crash-safe resume.
+    /// Returns the complete matching burn candidate range, newest first.
+    /// Callers must exclude other transfers' recorded hashes before adoption.
+    /// An incomplete range must be an error, never an empty or partial list.
+    async fn find_recent_burns(
+        &self,
+        direction: BridgeDirection,
+        amount: U256,
+        recipient: Address,
+        from_block: u64,
+    ) -> Result<Vec<TxHash>, Self::Error>;
+
+    /// Returns the newest candidate from the complete crash-recovery scan.
     async fn find_recent_burn(
         &self,
         direction: BridgeDirection,
         amount: U256,
         recipient: Address,
         from_block: u64,
-    ) -> Result<Option<TxHash>, Self::Error>;
+    ) -> Result<Option<TxHash>, Self::Error> {
+        Ok(self
+            .find_recent_burns(direction, amount, recipient, from_block)
+            .await?
+            .into_iter()
+            .next())
+    }
+
+    /// Scans for the exact recorded hash as well as this transfer's burn fingerprint.
+    /// The generic adapter supplies positive evidence only. Authoritative absence
+    /// additionally requires fresh canonical qualification of the known submission.
+    async fn find_recorded_burn(
+        &self,
+        direction: BridgeDirection,
+        amount: U256,
+        recipient: Address,
+        from_block: u64,
+        burn_tx: TxHash,
+    ) -> Result<RecordedBurnScan, Self::Error> {
+        let candidates = self
+            .find_recent_burns(direction, amount, recipient, from_block)
+            .await?;
+        Ok(if candidates.contains(&burn_tx) {
+            RecordedBurnScan::Found
+        } else {
+            RecordedBurnScan::Inconclusive
+        })
+    }
 
     /// Returns the mint that consumed `attestation`'s nonce on the destination
     /// chain, or `None` while that nonce is unused, for crash-safe resume. The

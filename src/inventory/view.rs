@@ -779,14 +779,14 @@ pub(crate) struct InventoryView {
     /// deposits into.
     ///
     /// Populated when a non-terminal mint event is processed, cleared on
-    /// terminal mint events.
+    /// terminal mint events. Kept across snapshot-error resets.
     #[serde(default)]
     active_mints: HashMap<Symbol, ActiveEquityTransfer<IssuerRequestId>>,
     /// In-flight equity redemptions, keyed by symbol, with the chain each
     /// redemption withdraws from.
     ///
     /// Populated when a non-terminal redemption event is processed, cleared
-    /// on terminal redemption events.
+    /// on terminal redemption events. Kept across snapshot-error resets.
     #[serde(default)]
     active_redemptions: HashMap<Symbol, ActiveEquityTransfer<RedemptionAggregateId>>,
     /// Equity tokens observed at intermediate wallet locations between
@@ -2155,8 +2155,8 @@ impl InventoryView {
         corrections
     }
 
-    /// A fresh default view retaining stranded redemption exposure and the
-    /// offchain-order guard state
+    /// A fresh default view retaining stranded redemption exposure, the
+    /// active mints and redemptions, the offchain-order guard state
     /// (pending orders and applied-fill times) and, for each gated symbol,
     /// the Hedging available balance that state guards.
     ///
@@ -2174,10 +2174,16 @@ impl InventoryView {
     /// watermarks, so a delayed older fill or read cannot be counted again on
     /// top of the kept balance; other onchain venues are left
     /// uninitialized (they are not delta-owned and nothing blocks their
-    /// repopulation). Every other field is intentionally
-    /// defaulted, which is why this uses functional-update syntax rather than
-    /// an exhaustive literal: a future field should default here unless it is
-    /// guard state.
+    /// repopulation). The active mints and redemptions come from their
+    /// aggregates' events, not from snapshots, so they survive like the guard
+    /// state. The poll never writes an active mint's Hedging inflight, and the
+    /// mint debits Hedging available on `MintAccepted`, so that symbol keeps
+    /// its whole Hedging balance and watermark: no poll restores the
+    /// inflight, and a dropped balance would fail the mint's own `Start`. A
+    /// forced broker snapshot applied after the reset still overwrites it.
+    /// Every other field is intentionally defaulted, which is why this uses
+    /// functional-update syntax rather than an exhaustive literal: a future
+    /// field should default here unless it is guard state.
     pub(crate) fn reset_preserving_offchain_order_state(&self) -> Self {
         let mut equities: HashMap<Symbol, Inventory<FractionalShares>> = self
             .equities
@@ -2262,8 +2268,23 @@ impl InventoryView {
             }
         }
 
+        for symbol in self.active_mints.keys() {
+            if let Some(balance) = self
+                .equities
+                .get(symbol)
+                .and_then(|inventory| inventory.offchain)
+            {
+                equities.entry(symbol.clone()).or_default().offchain = Some(balance);
+            }
+            if let Some(watermark) = self.offchain_equity_snapshot_watermarks.get(symbol) {
+                offchain_equity_snapshot_watermarks.insert(symbol.clone(), *watermark);
+            }
+        }
+
         Self {
             equities,
+            active_mints: self.active_mints.clone(),
+            active_redemptions: self.active_redemptions.clone(),
             startup_stranded_redemptions: self.startup_stranded_redemptions.clone(),
             previous_inflight_redemptions,
             onchain_equity_snapshot_watermarks,
@@ -3265,6 +3286,11 @@ impl InventoryView {
     /// because a stale poll could otherwise re-introduce inflight that was
     /// already cleared by a completed transfer.
     ///
+    /// Skips symbols with an active mint, both when setting and when zeroing:
+    /// the mint reactor owns their Hedging inflight from `MintRequested` on. A
+    /// poll that lists the request before `MintAccepted` lands would otherwise
+    /// count the shares a second time.
+    ///
     /// Mints are inflight at Hedging (shares leaving offchain broker toward
     /// onchain). Redemptions are inflight at MarketMaking (shares leaving
     /// onchain toward offchain broker).
@@ -3281,6 +3307,17 @@ impl InventoryView {
 
         // Set inflight for symbols present in the poll.
         for (symbol, &quantity) in mints {
+            if view.active_mints.contains_key(symbol) {
+                debug!(
+                    target: "inventory",
+                    %symbol,
+                    ?quantity,
+                    "Skipping mint inflight snapshot: an active mint owns \
+                     the symbol's Hedging inflight"
+                );
+                continue;
+            }
+
             if view.is_stale_for_symbol(symbol, fetched_at) {
                 debug!(
                     target: "inventory",
@@ -3301,8 +3338,12 @@ impl InventoryView {
 
         // Zero inflight for symbols that were in the previous poll but
         // disappeared. These are requests that completed or were rejected.
+        // An active mint owns the slot even if an earlier poll recorded it.
         for symbol in &prev_mints {
-            if !mints.contains_key(symbol) && !view.is_stale_for_symbol(symbol, fetched_at) {
+            if !mints.contains_key(symbol)
+                && !view.active_mints.contains_key(symbol)
+                && !view.is_stale_for_symbol(symbol, fetched_at)
+            {
                 view = view.update_equity(
                     symbol,
                     Inventory::set_inflight(Venue::Hedging, FractionalShares::ZERO),
@@ -3543,24 +3584,13 @@ impl InventoryView {
         Ok(view)
     }
 
-    /// Remove a symbol from the previous inflight mint marker set.
-    ///
-    /// Called when a new mint transfer starts (MintAccepted event) to
-    /// prevent the next inflight poll from incorrectly zeroing the new
-    /// inflight. Without this, a poll that fires before Alpaca reflects
-    /// the new pending request would see the symbol in `prev_mints` but
-    /// absent from the current poll, and zero it.
-    pub(crate) fn clear_previous_inflight_mint_marker(mut self, symbol: &Symbol) -> Self {
-        self.previous_inflight_mint_symbols.remove(symbol);
-        self
-    }
-
     /// Remove a symbol from `chain`'s previous inflight redemption markers.
     ///
     /// Called when a new redemption transfer starts
     /// (`VaultWithdrawPending` for legacy aggregates or
-    /// `VaultWithdrawSubmitting` for new aggregates) for the same reason as
-    /// [`Self::clear_previous_inflight_mint_marker`].
+    /// `VaultWithdrawSubmitting` for new aggregates), so a poll that fires
+    /// before the provider reflects the new request does not see the symbol
+    /// in the previous markers but absent from the current poll, and zero it.
     pub(crate) fn clear_previous_inflight_redemption_marker(
         mut self,
         symbol: &Symbol,
@@ -6550,6 +6580,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reset_keeps_active_transfers_and_the_active_mint_hedging_watermark() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let tsla = Symbol::new("TSLA").unwrap();
+        let fetched_at = Utc::now();
+        let mint_id = IssuerRequestId::generate();
+        let redemption_id = RedemptionAggregateId::generate();
+
+        let view = InventoryView::default()
+            .with_equity(aapl.clone(), shares(20), shares(80))
+            .with_equity(tsla.clone(), shares(10), shares(50))
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OffchainEquity {
+                    positions: BTreeMap::from([(aapl.clone(), shares(100))]),
+                    fetched_at,
+                },
+                fetched_at,
+            )
+            .unwrap()
+            .set_active_mint(aapl.clone(), Chain::Base, mint_id.clone())
+            .set_active_redemption(tsla.clone(), Chain::Base, redemption_id.clone());
+
+        let reset = view.reset_preserving_offchain_order_state();
+
+        assert_eq!(reset.active_mint(&aapl), Some(&mint_id));
+        assert_eq!(reset.active_redemption(&tsla), Some(&redemption_id));
+        assert_eq!(
+            reset.equity_available(&aapl, Venue::Hedging),
+            Some(shares(100)),
+            "the active mint's Hedging balance must survive the reset"
+        );
+
+        let stale = reset
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OffchainEquity {
+                    positions: BTreeMap::from([(aapl.clone(), shares(50))]),
+                    fetched_at: fetched_at - Duration::seconds(1),
+                },
+                fetched_at,
+            )
+            .unwrap();
+        assert_eq!(
+            stale.equity_available(&aapl, Venue::Hedging),
+            Some(shares(100)),
+            "a broker snapshot older than the kept watermark must not overwrite \
+             the balance the mint will debit"
+        );
+    }
+
     /// The cash twin of the force-path gate above: while any hedge order is
     /// open, `force_apply_snapshot_event` must not write the venue-level
     /// `OffchainUsd` reading -- the fill delta owns the cash balance and the
@@ -6818,7 +6897,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_previous_mint_marker_prevents_incorrect_zeroing() {
+    fn active_new_mint_keeps_inflight_a_previous_poll_marker_would_zero() {
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
@@ -6850,16 +6929,16 @@ mod tests {
             Some(FractionalShares::ZERO),
         );
 
-        // A new mint starts (MintAccepted sets inflight via
-        // TransferOp::Start) and clears the previous poll marker.
+        // A new mint registers as active (MintRequested), then MintAccepted
+        // sets inflight via TransferOp::Start. The previous poll marker stays.
         let view = view
+            .set_active_mint(symbol.clone(), Chain::Base, IssuerRequestId::generate())
             .update_equity(
                 &symbol,
                 Inventory::transfer(Venue::Hedging, TransferOp::Start, shares(20)),
                 now,
             )
-            .unwrap()
-            .clear_previous_inflight_mint_marker(&symbol);
+            .unwrap();
 
         assert_eq!(
             view.equity_inflight(&symbol, Venue::Hedging),
@@ -6867,7 +6946,6 @@ mod tests {
         );
 
         // Poll 2: Alpaca hasn't reflected the new request yet (empty).
-        // Without the marker clear, this would zero the new inflight.
         let view = view
             .apply_inflight_snapshot(&BTreeMap::new(), &BTreeMap::new(), now, now)
             .unwrap();
@@ -6875,8 +6953,27 @@ mod tests {
         assert_eq!(
             view.equity_inflight(&symbol, Venue::Hedging),
             Some(shares(20)),
-            "New inflight must be preserved when previous poll marker \
-             was cleared by MintAccepted"
+            "An active mint's new inflight must survive a poll that drops \
+             the symbol a previous poll recorded"
+        );
+    }
+
+    #[test]
+    fn inflight_poll_leaves_active_mint_hedging_inflight_to_the_mint() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let pending = BTreeMap::from([(symbol.clone(), shares(20))]);
+
+        let view = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .set_active_mint(symbol.clone(), Chain::Base, IssuerRequestId::generate())
+            .apply_inflight_snapshot(&pending, &BTreeMap::new(), now, now)
+            .unwrap();
+
+        assert_eq!(
+            view.equity_inflight(&symbol, Venue::Hedging),
+            Some(FractionalShares::ZERO),
+            "The poll must not count an active mint's request"
         );
     }
 

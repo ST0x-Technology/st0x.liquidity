@@ -143,6 +143,102 @@ let filter = contract
 let logs = provider.get_logs(&filter).await?;
 ```
 
+## Canonical State on Load-Balanced RPCs
+
+Separate transaction, head, and `latest` account-state reads can hit different
+backends. A fresh head response does not authenticate an earlier missing
+transaction response or a later `latest` nonce response. Pin the state read to
+the observed header's canonical hash:
+
+```rust
+let next_nonce = provider
+    .get_transaction_count(sender)
+    .block_id(BlockId::hash_canonical(header.hash))
+    .await?;
+```
+
+`BlockId::hash_canonical` requests EIP-1898 `requireCanonical = true`. A backend
+that cannot serve that block must fail rather than silently answer from its
+older state. Missing headers or unsupported/failed hash-pinned state reads are
+inconclusive; never fall back to `latest` to qualify a dropped transaction. If
+this state's nonce exceeds the known transaction nonce, that transaction may
+already be mined but hidden by a stale receipt lookup. Even an unused nonce does
+not prove absence from every backend's mempool: suspected-drop policy still
+needs submission-boundary, head-progress, grace, and consecutive-miss checks.
+HTTP tests should assert the canonical hash parameter, not just FIFO mock
+response order.
+
+Do not count frozen-head polls as consecutive qualified misses merely because
+the head later advances once. Wallet waits and burn checks both begin counting
+only beyond the post-grace reference margin. A lagging or consumed-nonce poll
+resets that reference and miss run, but a bounded burn check keeps polling in
+the same observation window instead of restarting grace on every redrive.
+
+For timer-driven tests using only mocked RPC responses, use a paused Tokio clock
+and `tokio::time::Instant` for the elapsed-time policy as well as Tokio timers.
+A short wall-clock grace can expire before mock polling advances the head on a
+busy runner. Pausing timers alone does not freeze `std::time::Instant`, so
+mixing the two clocks still leaves that race. Do not pause real-I/O recovery
+tests where auto-advancing timers can race network futures.
+
+Bracket each generic send attempt inside the shared send lock, refreshing the
+pre-send head for every nonce or fee recovery retry. A head read before waiting
+for the lock or before a rejected attempt is not the accepted send's boundary.
+Gas estimation and signing must finish before the pre-send read, immediately
+before the raw-envelope broadcast. Bracketing those earlier operations can leave
+the floor stale when a remote signer is slow and the post-send backend lags.
+Bracket send, prepare, and each prepared broadcast with head observations and
+retain the highest submission boundary, never the lowest: a lagging backend must
+not lower a previously seen floor. Preparation may precede broadcast or restart
+recovery by many blocks; its boundary cannot substitute for a broadcast-time
+observation. A failed post-operation read must not turn an already signed or
+broadcast transaction into a submission failure or discard its nonce ownership.
+During a prepared broadcast, an old preparation boundary is not usable until the
+broadcast-time observations complete. Failure or cancellation keeps the boundary
+unknown, while retaining the highest observation for a later successful retry;
+it must not fall back to the stale preparation floor.
+
+Keep preparation's observation under the same send lock as nonce allocation and
+signing. Cancellation cleanup must synchronously release only the fresh unused
+preparation's reservation and hash, invalidate cached allocation, and preserve
+earlier occupied nonces; do not spawn asynchronous cleanup from a drop guard.
+Bound optional post-head reads by the existing receipt-poll interval, returning
+accepted identity with unknown freshness on expiry. Receipt drop checks need
+live submission evidence before and after canonical RPC reads, resetting
+miss/head progress when it changes; a wait-start snapshot is unsafe across
+rebroadcasts.
+
+A deterministic JSON-RPC rejection of hash-pinned state is not an RPC outage.
+Clear the absence progress and keep waiting for the receipt; only transient
+transport failures count toward the outage cap. Repeated unavailable canonical
+state must end in a retryable receipt timeout, not a terminal transport error.
+
+CCTP recovery separates submission evidence from nonce ownership: a
+confirmation-time suspected drop can release generic wallet ownership, but the
+endpoint retains one exact-hash submission context for fresh requalification on
+retry. Never retain a sticky drop verdict or synthesize a missing sender, nonce
+or boundary. A recorded burn's recovery scan must target that hash, not another
+identical `DepositForBurn` in an old scan window. Optional positive scans while
+the burn is Pending do not turn RPC rejection into terminal transfer failure;
+strict confirmation validation still applies after finding the exact hash.
+Hashless or confirmed-revert recovery also checks retained transfer history
+before adopting a fingerprint match: an earlier transfer's burn can fall inside
+a stale scan window, even with a single-flight corridor. Missing ownership
+evidence must fail closed, not silently bypass this check. An empty exact-hash
+log scan needs fresh canonical unused-nonce and head-progress qualification
+after the scan; a separate numeric head does not prove the log backend is caught
+up. Generic recovery needs the complete candidate list before excluding foreign
+owners: the newest foreign match must not hide an older eligible burn, and
+filtering a partial positive response cannot establish an authoritative empty
+result that permits retrying a confirmed-reverted burn.
+
+Anvil's transaction automining does not advance an idle chain. In CCTP restart
+tests, cancellation can race past the mint into `Bridged` before a deposit send
+is recorded. That recovery path needs a finality-qualified empty deposit scan;
+without empty blocks it can repeatedly return `ScanInconclusive` and exhaust the
+job's retries. Mine the required two Ethereum blocks after the first bot stops
+and before restarting it, rather than weakening the scan or increasing retries.
+
 ## Common Pitfalls
 
 1. **Don't use `B256` for tx hashes** - use `TxHash`

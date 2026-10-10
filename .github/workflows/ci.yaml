@@ -397,6 +397,9 @@ jobs:
       - name: pre-commit hooks
         run: nix develop .#ci-hooks -c pre-commit run --all-files
 
+      - name: Audit Rust dependencies
+        run: nix develop .#ci-audit -c bash -c './scripts/test-rust-audit.sh && ./scripts/audit-rust.sh'
+
   # Required hooks check. Inspect the work result even when it was skipped or
   # canceled, so branch protection never accepts an unvalidated commit.
   hooks:

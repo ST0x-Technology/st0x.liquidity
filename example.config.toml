@@ -265,7 +265,7 @@ address = "0xfcad0b19bb29d4674531d6f115237e16afce377c"
 # [wallet]
 # kind = "turnkey"
 # address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-# organization_id = "org-example-turnkey-org-id"
+# organization_id = "00000000-0000-4000-8000-000000000001" # Replace with your organization UUID.
 #
 # Turnkey authentication comes from exactly ONE of:
 #   - api_private_key in the SECRETS file [wallet] section (stored key), or
