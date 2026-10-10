@@ -2194,7 +2194,7 @@
             "properties": [
               {
                 "id": "unit",
-                "value": "time:MMM D, HH:mm:ss [UTC]"
+                "value": "time:MMM D, HH:mm:ss Z"
               }
             ]
           },
@@ -2642,7 +2642,7 @@
             "properties": [
               {
                 "id": "unit",
-                "value": "time:MMM D, HH:mm:ss [UTC]"
+                "value": "time:MMM D, HH:mm:ss Z"
               }
             ]
           },
@@ -2654,7 +2654,7 @@
             "properties": [
               {
                 "id": "unit",
-                "value": "time:MMM D, HH:mm:ss [UTC]"
+                "value": "time:MMM D, HH:mm:ss Z"
               }
             ]
           },

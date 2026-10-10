@@ -342,7 +342,7 @@ def cloudlog_table(title, desc, query, columns, w=12, h=9, x=0, y=0,
       STRINGS; convertFieldType turns them numeric so decimals apply
       (the SPA shows 0.049, not 0.0493843...).
     time_columns: display names formatted in the SPA's "Jul 31, 13:31:50"
-      style (override with time_unit, e.g. TIME_FMT for the "... [UTC]"
+      style (override with time_unit, e.g. TIME_FMT for the "... +00:00"
       variant); string RFC3339 columns (e.g. Started) are also
       convertFieldType'd to real time fields.
     hide_time: drop the Cloud Logging entry's own ingestion timestamp
@@ -584,8 +584,10 @@ def width(px):
     return [{"id": "custom.width", "value": px}]
 
 
-# The SPA's timestamp style: "Jul 31, 13:31:50 UTC" (D7).
-TIME_FMT = [{"id": "unit", "value": "time:MMM D, HH:mm:ss [UTC]"}]
+# The SPA's timestamp style (D7), with the offset Grafana actually renders in:
+# "Jul 31, 13:31:50 +00:00", or "+05:30" when viewed with ?timezone=browser
+# from IST. A literal "UTC" suffix would mislabel non-UTC views.
+TIME_FMT = [{"id": "unit", "value": "time:MMM D, HH:mm:ss Z"}]
 # D5: narrow ratio-deviation column after "Ratio", in band widths
 # ((ratio - target) / deviation): outside +/-1 is colored, inside the band
 # renders in plain text.
