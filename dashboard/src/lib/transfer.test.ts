@@ -500,58 +500,69 @@ describe('transferRecoveryCommands', () => {
     )
     const toBase = failText('withdrawing', 'alpaca_to_base')
     expect(toBase.startsWith('Check the transfer first.')).toBe(true)
-    // The Alpaca to Base burn runs on Ethereum, and a nonce is per chain.
-    // The wallet burned on every earlier transfer too, so the check is anchored.
+    // The checks and the nonce close live in one place, the runbook, so the
+    // dialog gates the fail on them instead of keeping a second copy. The
+    // Alpaca to Base burn runs on Ethereum, and a nonce is per chain.
     expect(
-      toBase.includes('verify on Ethereum that no CCTP burn left the bot wallet after this transfer started')
+      toBase.includes(
+        'do not fail the transfer until you have done every check and the nonce close on Ethereum in docs/cli-ops.md, "Clearing a pre-burn guard latch", with the bot stopped'
+      )
     ).toBe(true)
-    expect(toBase.includes('pending nonce equals latest nonce')).toBe(true)
+    expect(toBase.includes('If a burn landed or you are not certain, run resume-usdc instead')).toBe(true)
+    // A restart sends the burn of a completed withdrawal, so the fail is the
+    // offline command, before the start.
+    expect(
+      toBase.includes('fail it with the offline stox fail-usdc-transfer before you start the bot again')
+    ).toBe(true)
+    expect(toBase.includes('the guard stays held until you settle them with reconcile-usdc')).toBe(true)
     expect(toBase.includes('OperatorWithdraw')).toBe(false)
 
-    // A Base to Alpaca burn comes after the vault withdrawal, so the check is
-    // on the withdrawal, and a landed one is adopted with resume-usdc.
+    // A Base to Alpaca transfer's checks and nonce close run on Base.
     const toAlpaca = failText('withdrawing', 'base_to_alpaca')
+    expect(toAlpaca.includes('only while the vault withdrawal is unrecorded')).toBe(true)
+    // The runbook below this stack has no full withdrawal procedure, so the
+    // dialog keeps it: both withdrawal events, the cash vault, the pending and
+    // queued checks, the nonce close and the recheck.
     expect(toAlpaca.includes('OperatorWithdraw')).toBe(true)
-    // A withdrawal sent before the inventory migration emits the orderbook's
-    // WithdrawV2, not OperatorWithdraw, so the check names both.
     expect(toAlpaca.includes('no WithdrawV2 on the orderbook either')).toBe(true)
-    // Only the cash vault's USDC counts, and the hooks' inventory-sent
-    // WithdrawV2 is not the bot's withdrawal.
     expect(toAlpaca.includes('cash vault_id in the bot config')).toBe(true)
-    expect(toAlpaca.includes('WithdrawV2 with the inventory as sender does not count')).toBe(true)
-    expect(toAlpaca.includes('run resume-usdc instead')).toBe(true)
-    expect(toAlpaca.includes('offline stox fail-usdc-transfer')).toBe(true)
-    // A log scan misses an unmined transaction, so the check also waits out
-    // the attempt and asks for no pending one.
-    expect(toAlpaca.includes('attempt timeout has passed')).toBe(true)
     expect(toAlpaca.includes('pending nonce equals latest nonce on more than one RPC provider')).toBe(true)
-    // A provider can miss a pending withdraw, so the nonce is closed with a
-    // self-transfer and the logs checked again before the transfer is failed.
-    const cancel = toAlpaca.indexOf('close the nonce before you fail the transfer')
-    expect(cancel).toBeGreaterThan(-1)
-    expect(toAlpaca.includes('0-value transfer with no calldata from the bot wallet to itself')).toBe(true)
-    expect(toAlpaca.indexOf('check the withdrawal logs again')).toBeGreaterThan(cancel)
-    expect(toAlpaca.indexOf('Otherwise run the offline stox fail-usdc-transfer')).toBeGreaterThan(
-      toAlpaca.indexOf('check the withdrawal logs again')
-    )
-    // The bot is stopped at that point, and the client resume needs it running.
+    // A queued send waits behind a nonce gap; only empty nonces are filled,
+    // and only after the kept-send check.
+    expect(toAlpaca.includes('fill each empty nonce below it')).toBe(true)
+    const close = toAlpaca.indexOf('close the nonce before you fail the transfer')
+    expect(close).toBeGreaterThan(-1)
+    expect(toAlpaca.indexOf('check the withdrawal logs again')).toBeGreaterThan(close)
     expect(
-      toAlpaca.includes('If a withdrawal mined instead, start the bot and run resume-usdc, and do not fail the transfer')
+      toAlpaca.includes(
+        'If a withdrawal mined instead, a transaction is pending or queued, or you cannot tell, start the bot and run resume-usdc'
+      )
     ).toBe(true)
-    // Between reading the board and stopping the bot, the bot can broadcast a
-    // burn it does not record, and the offline command does not check the chain.
-    expect(toAlpaca.includes('no CCTP burn left the bot wallet')).toBe(true)
-    // A burn sent just before the stop can still be pending after it.
-    expect(toAlpaca.includes('stop the bot, then confirm')).toBe(true)
-    expect(toAlpaca.includes('the wallet has no pending transaction')).toBe(true)
-    expect(toAlpaca.includes('on Base that no CCTP burn left the bot wallet after this transfer started')).toBe(
+    // Resume adopts only the full amount; anything else ends in
+    // WithdrawalFailed with the USDC in the wallet.
+    expect(toAlpaca.includes('any other amount ends the transfer in WithdrawalFailed')).toBe(true)
+    // The unrecorded withdrawal can be failed through the live route too.
+    expect(toAlpaca.includes('Otherwise run the offline stox fail-usdc-transfer, or this command after you restart the bot')).toBe(
       true
     )
+    // Once recorded, the burn checks apply, with the runbook as the source.
+    expect(toAlpaca.includes('"Clearing a pre-burn guard latch"')).toBe(true)
+    // A late burn is finished with the bot stopped, for the amount the mint
+    // printed.
+    expect(toAlpaca.includes('Keep the bot stopped until that USDC is at Alpaca')).toBe(true)
+    expect(toAlpaca.includes('divided by 1,000,000 (it prints USDC base units)')).toBe(true)
+    // A burn found by the recheck of a confirmed withdrawal is resumed,
+    // never failed.
+    expect(
+      toAlpaca.includes(
+        'If a burn landed, something is pending or queued, or you are not certain, start the bot and run resume-usdc, and do not fail the transfer'
+      )
+    ).toBe(true)
     expect(toAlpaca.includes('on Ethereum')).toBe(false)
 
     const unknown = failText('withdrawing', null)
-    expect(unknown.includes('verify on Ethereum')).toBe(true)
-    expect(unknown.includes('OperatorWithdraw')).toBe(true)
+    expect(unknown.includes('nonce close on Ethereum')).toBe(true)
+    expect(unknown.includes('nonce close on Base')).toBe(true)
     expect(unknown.includes('no reconcile is needed')).toBe(false)
   })
 
