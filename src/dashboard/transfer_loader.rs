@@ -12,6 +12,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use st0x_dto::{TransferOperation, TransferWarning};
+use st0x_event_sorcery::EventSourced;
 use st0x_finance::{BlankIdError, Id};
 use st0x_tokenization::IssuerRequestId;
 
@@ -31,9 +32,9 @@ impl TransferKind {
     /// The cqrs-es aggregate type stored in the `events` table.
     pub(crate) fn aggregate_type(self) -> &'static str {
         match self {
-            Self::EquityMint => "TokenizedEquityMint",
-            Self::EquityRedemption => "EquityRedemption",
-            Self::UsdcBridge => "UsdcRebalance",
+            Self::EquityMint => TokenizedEquityMint::AGGREGATE_TYPE,
+            Self::EquityRedemption => EquityRedemption::AGGREGATE_TYPE,
+            Self::UsdcBridge => UsdcRebalance::AGGREGATE_TYPE,
         }
     }
 
@@ -458,12 +459,12 @@ pub(crate) struct LoadedTransfers {
 /// Active: non-terminal transfers (in progress).
 /// Recent: terminal transfers (completed/failed) within the last 24 hours.
 pub(crate) async fn load_transfers(pool: &SqlitePool) -> LoadedTransfers {
-    let cutoff = Utc::now() - Duration::hours(24);
+    let window = RecentWindow::now();
 
     let (mint, redemption, usdc) = tokio::join!(
-        load_category(pool, cutoff, TransferKind::EquityMint),
-        load_category(pool, cutoff, TransferKind::EquityRedemption),
-        load_category(pool, cutoff, TransferKind::UsdcBridge),
+        load_category(pool, window, TransferKind::EquityMint),
+        load_category(pool, window, TransferKind::EquityRedemption),
+        load_category(pool, window, TransferKind::UsdcBridge),
     );
     let categories: [CategoryResult; 3] = (mint, redemption, usdc).into();
 
@@ -489,6 +490,137 @@ pub(crate) async fn load_transfers(pool: &SqlitePool) -> LoadedTransfers {
     }
 }
 
+/// A transfer as its projection holds it, with the sequence of the last event
+/// the projection applied.
+pub(crate) struct VersionedTransfer {
+    pub(crate) transfer: TransferOperation,
+    pub(crate) sequence: usize,
+}
+
+/// A projection row [`load_versioned_transfers`] could not read. The caller
+/// decides how loudly to report it: the same row comes back on every pass.
+pub(crate) struct SkippedTransferRow {
+    pub(crate) kind: TransferKind,
+    pub(crate) view_id: String,
+    pub(crate) version: i64,
+    pub(crate) error: String,
+}
+
+/// The transfers [`load_versioned_transfers`] read, and the rows it skipped.
+#[derive(Default)]
+pub(crate) struct VersionedTransfers {
+    pub(crate) transfers: Vec<VersionedTransfer>,
+    pub(crate) skipped: Vec<SkippedTransferRow>,
+}
+
+/// Every transfer in progress, and every one that ended in the last 24
+/// hours, each with the version of its projection row: the sequence of the
+/// last event it applied. A row that cannot be read is returned in
+/// `skipped`. A table that cannot be read is logged at WARN here.
+pub(crate) async fn load_versioned_transfers(pool: &SqlitePool) -> VersionedTransfers {
+    let window = RecentWindow::now();
+    let categories: [VersionedTransfers; 3] = tokio::join!(
+        load_versioned_category(pool, window, TransferKind::EquityMint),
+        load_versioned_category(pool, window, TransferKind::EquityRedemption),
+        load_versioned_category(pool, window, TransferKind::UsdcBridge),
+    )
+    .into();
+
+    categories
+        .into_iter()
+        .fold(VersionedTransfers::default(), |mut all, category| {
+            all.transfers.extend(category.transfers);
+            all.skipped.extend(category.skipped);
+            all
+        })
+}
+
+/// The transfers the dashboard seed and the transfer line sweep read: every
+/// transfer in progress, and every one that ended in the last 24 hours. The
+/// projection query and the check of each read transfer live here together,
+/// so both readers agree on which transfers are recent.
+#[derive(Debug, Clone, Copy)]
+struct RecentWindow {
+    cutoff: DateTime<Utc>,
+}
+
+/// One projection row in a [`RecentWindow`]: view id, version, payload, and
+/// whether the projection's `terminal_at` is set.
+type WindowRow = (String, i64, String, bool);
+
+impl RecentWindow {
+    fn now() -> Self {
+        Self {
+            cutoff: Utc::now() - Duration::hours(24),
+        }
+    }
+
+    /// The rows of `kind`'s projection that are in progress or whose
+    /// `terminal_at` is within the window.
+    async fn rows(self, pool: &SqlitePool, kind: TransferKind) -> sqlx::Result<Vec<WindowRow>> {
+        let sql = format!(
+            "SELECT view_id, version, payload, FALSE AS projection_terminal FROM {table} \
+             WHERE terminal_at IS NULL \
+             UNION ALL \
+             SELECT view_id, version, payload, TRUE AS projection_terminal FROM {table} \
+             WHERE terminal_at >= ?",
+            table = kind.table(),
+        );
+        sqlx::query_as::<_, WindowRow>(sqlx::AssertSqlSafe(sql))
+            .bind(sortable_timestamp(self.cutoff))
+            .fetch_all(pool)
+            .await
+    }
+
+    /// Whether a transfer read from a row is in the window by its own state:
+    /// the row's `terminal_at` can differ from the payload's terminal status.
+    fn holds(self, transfer: &TransferOperation) -> bool {
+        !transfer.is_terminal() || transfer.updated_at() >= self.cutoff
+    }
+}
+
+async fn load_versioned_category(
+    pool: &SqlitePool,
+    window: RecentWindow,
+    kind: TransferKind,
+) -> VersionedTransfers {
+    let rows = match window.rows(pool, kind).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            warn!(target: "dashboard", %kind, %error, "Failed to load versioned transfers");
+            return VersionedTransfers::default();
+        }
+    };
+
+    let mut loaded = VersionedTransfers::default();
+    for (view_id, version, payload, _projection_terminal) in rows {
+        let read = usize::try_from(version)
+            .map_err(|error| format!("negative version: {error}"))
+            .and_then(|sequence| {
+                convert_projection_row(kind, &view_id, &payload)
+                    .map(|transfer| (transfer, sequence))
+                    .map_err(|error| error.to_string())
+            });
+        match read {
+            Ok((transfer, sequence)) => {
+                if window.holds(&transfer) {
+                    loaded
+                        .transfers
+                        .push(VersionedTransfer { transfer, sequence });
+                }
+            }
+            Err(error) => loaded.skipped.push(SkippedTransferRow {
+                kind,
+                view_id,
+                version,
+                error,
+            }),
+        }
+    }
+
+    loaded
+}
+
 /// Result of loading a single transfer category.
 struct CategoryResult {
     active: Vec<TransferOperation>,
@@ -508,22 +640,10 @@ impl CategoryResult {
 
 async fn load_category(
     pool: &SqlitePool,
-    cutoff: DateTime<Utc>,
+    window: RecentWindow,
     kind: TransferKind,
 ) -> CategoryResult {
-    let sql = format!(
-        "SELECT view_id, payload, FALSE AS projection_terminal FROM {table} \
-         WHERE terminal_at IS NULL \
-         UNION ALL \
-         SELECT view_id, payload, TRUE AS projection_terminal FROM {table} \
-         WHERE terminal_at >= ?",
-        table = kind.table(),
-    );
-    let rows = match sqlx::query_as::<_, (String, String, bool)>(sqlx::AssertSqlSafe(sql))
-        .bind(sortable_timestamp(cutoff))
-        .fetch_all(pool)
-        .await
-    {
+    let rows = match window.rows(pool, kind).await {
         Ok(rows) => rows,
         Err(error) => {
             warn!(target: "dashboard", %kind, %error, "Failed to load transfer projections");
@@ -536,7 +656,7 @@ async fn load_category(
 
     let mut transfers = Vec::with_capacity(rows.len());
     let mut warnings = Vec::new();
-    for (view_id, payload, projection_terminal) in rows {
+    for (view_id, _version, payload, projection_terminal) in rows {
         match convert_projection_row(kind, &view_id, &payload) {
             Ok(transfer) => {
                 warn_on_terminality_mismatch(kind, &view_id, projection_terminal, &transfer);
@@ -569,7 +689,7 @@ async fn load_category(
 
     let (active, recent): (Vec<_>, Vec<_>) = transfers
         .into_iter()
-        .filter(|transfer| !transfer.is_terminal() || transfer.updated_at() >= cutoff)
+        .filter(|transfer| window.holds(transfer))
         .partition(|transfer| !transfer.is_terminal());
 
     CategoryResult {
@@ -649,11 +769,10 @@ mod tests {
 
     #[test]
     fn classify_active_transfer() {
-        let cutoff = Utc::now() - chrono::Duration::hours(24);
         let transfer = mint_transfer(EquityMintStatus::Minting);
 
         assert!(!transfer.is_terminal());
-        assert!(transfer.updated_at() >= cutoff);
+        assert!(RecentWindow::now().holds(&transfer));
     }
 
     #[test]
@@ -663,12 +782,11 @@ mod tests {
         });
 
         assert!(transfer.is_terminal());
+        assert!(RecentWindow::now().holds(&transfer));
     }
 
     #[test]
     fn classify_old_completed_transfer_discarded() {
-        let cutoff = Utc::now() - chrono::Duration::hours(24);
-
         let mut transfer = usdc_transfer(UsdcBridgeStatus::Completed {
             completed_at: Utc::now() - chrono::Duration::hours(48),
         });
@@ -678,7 +796,7 @@ mod tests {
         }
 
         assert!(transfer.is_terminal());
-        assert!(transfer.updated_at() < cutoff);
+        assert!(!RecentWindow::now().holds(&transfer));
     }
 
     #[test]
@@ -760,6 +878,106 @@ mod tests {
         assert_eq!(loaded.active.len(), 1);
         assert!(loaded.recent.is_empty());
         assert!(loaded.warnings.is_empty());
+    }
+
+    /// A mint's view payload, requested at `requested_at` and, when
+    /// `failed_at` is given, failed then.
+    fn mint_view_payload(requested_at: DateTime<Utc>, failed_at: Option<DateTime<Utc>>) -> String {
+        let requested = TokenizedEquityMint::originate(&TokenizedEquityMintEvent::MintRequested {
+            issuer_request_id: None,
+            symbol: Symbol::new("AAPL").unwrap(),
+            chain: Chain::Base,
+            quantity: float!(1),
+            wallet: Address::ZERO,
+            requested_at,
+        })
+        .unwrap();
+        let mint = match failed_at {
+            Some(failed_at) => TokenizedEquityMint::evolve(
+                &requested,
+                &TokenizedEquityMintEvent::MintAcceptanceFailed {
+                    reason: "timed out".to_string(),
+                    failed_at,
+                },
+            )
+            .unwrap()
+            .unwrap(),
+            None => requested,
+        };
+        serde_json::json!({ "Live": mint }).to_string()
+    }
+
+    /// The sweep reads every transfer in progress and every one that ended
+    /// in the last 24 hours, each with its row version, and returns the rows
+    /// it cannot read instead of the transfers.
+    #[tokio::test]
+    async fn load_versioned_transfers_reads_the_window_with_row_versions() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let now = Utc::now();
+        let in_progress = issuer_request_id("versioned-in-progress").to_string();
+        let recent = issuer_request_id("versioned-recent").to_string();
+        let old = issuer_request_id("versioned-old").to_string();
+        let unreadable = issuer_request_id("versioned-unreadable").to_string();
+        let negative = issuer_request_id("versioned-negative").to_string();
+
+        for (view_id, version, payload) in [
+            (&in_progress, 3, mint_view_payload(now, None)),
+            (
+                &recent,
+                5,
+                mint_view_payload(now - Duration::hours(2), Some(now - Duration::hours(1))),
+            ),
+            (
+                &old,
+                7,
+                mint_view_payload(now - Duration::hours(26), Some(now - Duration::hours(25))),
+            ),
+            (
+                &unreadable,
+                2,
+                serde_json::json!({ "Live": { "MintRequested": { "malformed": true } } })
+                    .to_string(),
+            ),
+            (&negative, -1, mint_view_payload(now, None)),
+        ] {
+            sqlx::query(
+                "INSERT INTO tokenized_equity_mint_view (view_id, version, payload) \
+                 VALUES (?1, ?2, ?3)",
+            )
+            .bind(view_id)
+            .bind(version)
+            .bind(payload)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let VersionedTransfers { transfers, skipped } = load_versioned_transfers(&pool).await;
+
+        let mut read: Vec<(String, usize)> = transfers
+            .into_iter()
+            .map(|VersionedTransfer { transfer, sequence }| match transfer {
+                TransferOperation::EquityMint(operation) => (operation.id.to_string(), sequence),
+                other => panic!("only mints were seeded, got: {other:?}"),
+            })
+            .collect();
+        read.sort();
+        let mut expected = vec![(in_progress, 3), (recent, 5)];
+        expected.sort();
+        assert_eq!(read, expected);
+
+        let mut skipped: Vec<(String, i64)> = skipped
+            .into_iter()
+            .map(|row| {
+                assert_eq!(row.kind, TransferKind::EquityMint);
+                (row.view_id, row.version)
+            })
+            .collect();
+        skipped.sort();
+        let mut expected_skipped = vec![(unreadable, 2), (negative, -1)];
+        expected_skipped.sort();
+        assert_eq!(skipped, expected_skipped);
     }
 
     async fn insert_event(

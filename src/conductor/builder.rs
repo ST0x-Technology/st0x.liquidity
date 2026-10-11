@@ -42,6 +42,7 @@ use crate::bot_gas::{
     RecordBotGasReceiptCost, RecordBotGasReceiptCostCtx, RecordBotGasReceiptCostJobQueue,
 };
 use crate::dashboard::equity_price::EquityPriceStore;
+use crate::dashboard::event_lines::TransferLineSweep;
 use crate::dashboard::{
     DashboardTradeDeliveryCtx, DashboardTradeDeliveryJobQueue, DashboardTradeHandoffMonitor,
     DeliverDashboardTrade,
@@ -326,6 +327,7 @@ pub(crate) fn spawn<Prov, Exec>(
     dashboard_trade_delivery_queue: DashboardTradeDeliveryJobQueue,
     dashboard_trade_delivery_ctx: Arc<DashboardTradeDeliveryCtx>,
     dashboard_trade_handoff_monitor: DashboardTradeHandoffMonitor,
+    transfer_line_sweep: TransferLineSweep,
     hedge_queue: HedgeJobQueue,
     poll_status_queue: PollOrderStatusJobQueue,
     reconcile_queue: ReconcileOrderFillJobQueue,
@@ -759,7 +761,9 @@ where
                 task: dashboard_trade_handoff_monitor,
                 token: dashboard_trade_handoff_startup,
             },
-        );
+        )
+        // Never returns: a pass whose read fails waits for the next.
+        .with_task("transfer-line-sweep", transfer_line_sweep);
 
     log_optional_task_status("executor maintenance", maintenance_interval.is_some());
 

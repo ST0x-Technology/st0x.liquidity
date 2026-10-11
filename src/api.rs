@@ -29,7 +29,6 @@ use st0x_dto::{
 };
 use st0x_event_sorcery::{
     AggregateError, EventSourced, LifecycleError, SendError, Store, StoreBuilder, load_entity,
-    send_command,
 };
 use st0x_evm::Chain;
 use st0x_execution::{AlpacaWalletError, Symbol};
@@ -3286,14 +3285,17 @@ async fn reconcile_equity_transfer(
                     }),
                 ));
             }
-            send_command::<TokenizedEquityMint>(
-                &state.pool,
-                &mint_id,
-                TokenizedEquityMintCommand::Reconcile { reason },
-                services,
-            )
-            .await
-            .map_err(ops_command_error)?;
+            // A standalone store, not `send_command`: its projection
+            // writes the view, which the transfer line sweep reads. It runs
+            // no reactor, so the conductor's trigger does not run.
+            let (store, _projection) = StoreBuilder::<TokenizedEquityMint>::new(state.pool.clone())
+                .build(services)
+                .await
+                .map_err(ops_store_error)?;
+            store
+                .send(&mint_id, TokenizedEquityMintCommand::Reconcile { reason })
+                .await
+                .map_err(ops_command_error)?;
         }
         TransferKind::EquityRedemption => {
             let redemption_id: RedemptionAggregateId = id.parse().map_err(|error| {
@@ -3335,17 +3337,21 @@ async fn reconcile_equity_transfer(
                 request.superseding_tx,
             )
             .await?;
-            send_command::<EquityRedemption>(
-                &state.pool,
-                &redemption_id,
-                EquityRedemptionCommand::Reconcile {
-                    reason,
-                    proven_withdrawal,
-                },
-                services,
-            )
-            .await
-            .map_err(ops_command_error)?;
+            // A standalone store, as for the mint above.
+            let (store, _projection) = StoreBuilder::<EquityRedemption>::new(state.pool.clone())
+                .build(services)
+                .await
+                .map_err(ops_store_error)?;
+            store
+                .send(
+                    &redemption_id,
+                    EquityRedemptionCommand::Reconcile {
+                        reason,
+                        proven_withdrawal,
+                    },
+                )
+                .await
+                .map_err(ops_command_error)?;
         }
         TransferKind::UsdcBridge => {
             return Err((
@@ -12508,6 +12514,33 @@ mod tests {
             matches!(entity, TokenizedEquityMint::Reconciled { .. }),
             "the mint must land in the Reconciled terminal, got {entity:?}",
         );
+        assert_view_holds_the_last_event(&state.pool, &id.to_string()).await;
+    }
+
+    /// The reconcile reached the transfer's projection, which the transfer
+    /// line sweep reads: its row holds the aggregate's last event.
+    async fn assert_view_holds_the_last_event(pool: &SqlitePool, id: &str) {
+        let last: i64 =
+            sqlx::query_scalar("SELECT MAX(sequence) FROM events WHERE aggregate_id = ?")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let loaded = crate::dashboard::transfer_loader::load_versioned_transfers(pool).await;
+        let row = loaded
+            .transfers
+            .iter()
+            .find(|row| match &row.transfer {
+                st0x_dto::TransferOperation::EquityMint(operation) => {
+                    operation.id.to_string() == id
+                }
+                st0x_dto::TransferOperation::EquityRedemption(operation) => {
+                    operation.id.to_string() == id
+                }
+                st0x_dto::TransferOperation::UsdcBridge(_) => false,
+            })
+            .expect("the reconciled transfer is in the sweep's window");
+        assert_eq!(i64::try_from(row.sequence).unwrap(), last);
     }
 
     #[tokio::test]
@@ -12542,6 +12575,7 @@ mod tests {
             matches!(entity, EquityRedemption::Reconciled { .. }),
             "the redemption must land in the Reconciled terminal, got {entity:?}",
         );
+        assert_view_holds_the_last_event(&state.pool, &id.to_string()).await;
     }
 
     #[tokio::test]

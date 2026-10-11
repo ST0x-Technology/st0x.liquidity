@@ -28,7 +28,7 @@ use st0x_finance::{FractionalShares, NotPositive, Positive, Usd};
 
 use super::equity_price::EquityPriceStore;
 use super::event_lines::{
-    EventId, EventParent, TransferLines, log_event, log_trade, transfer_kind,
+    EventId, EventParent, TransferLineSweep, TransferLines, log_event, log_trade, transfer_kind,
 };
 use crate::alerts::AlertKind;
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
@@ -113,6 +113,9 @@ pub(crate) struct DashboardTradeDelivery {
     pub(crate) ctx: Arc<DashboardTradeDeliveryCtx>,
     pub(crate) broadcaster: Arc<Broadcaster>,
     pub(crate) handoff_monitor: DashboardTradeHandoffMonitor,
+    /// Heals the `liq_transfer` lines from the transfers' current state,
+    /// sharing the status memory with the broadcaster.
+    pub(crate) line_sweep: TransferLineSweep,
     #[cfg(test)]
     store: Arc<DashboardTradeDeliveryStore>,
     enqueuer: Arc<DashboardTradeEnqueuer>,
@@ -135,6 +138,8 @@ impl DashboardTradeDelivery {
         let test_store = store.clone();
         let (handoff_retry_sender, handoff_retry_receiver) =
             mpsc::channel(HANDOFF_RETRY_QUEUE_CAPACITY);
+        let transfer_lines = Arc::new(TransferLines::new(equity_prices));
+        let line_sweep = TransferLineSweep::new(pool.clone(), transfer_lines.clone());
         let ctx = Arc::new(DashboardTradeDeliveryCtx::with_store(
             sender.clone(),
             store,
@@ -149,7 +154,7 @@ impl DashboardTradeDelivery {
             revision_reload_fault.clone(),
             revision_tracker.clone(),
             publish_lock.clone(),
-            equity_prices,
+            transfer_lines,
         ));
         let handoff_monitor = DashboardTradeHandoffMonitor::new(
             handoff_retry_receiver,
@@ -166,6 +171,7 @@ impl DashboardTradeDelivery {
             ctx,
             broadcaster,
             handoff_monitor,
+            line_sweep,
             #[cfg(test)]
             store: test_store,
             enqueuer,
@@ -980,7 +986,7 @@ pub(crate) struct Broadcaster {
     revision_reload_fault: OnchainRevisionReloadFault,
     revision_tracker: OnchainRevisionTracker,
     publish_lock: Arc<Mutex<()>>,
-    transfer_lines: TransferLines,
+    transfer_lines: Arc<TransferLines>,
 }
 
 impl Broadcaster {
@@ -992,7 +998,7 @@ impl Broadcaster {
         revision_reload_fault: OnchainRevisionReloadFault,
         revision_tracker: OnchainRevisionTracker,
         publish_lock: Arc<Mutex<()>>,
-        equity_prices: EquityPriceStore,
+        transfer_lines: Arc<TransferLines>,
     ) -> Self {
         Self {
             sender,
@@ -1002,7 +1008,7 @@ impl Broadcaster {
             revision_reload_fault,
             revision_tracker,
             publish_lock,
-            transfer_lines: TransferLines::new(equity_prices),
+            transfer_lines,
         }
     }
 
@@ -1485,6 +1491,7 @@ mod tests {
     };
     use crate::position::{PositionCommand, PositionEvent, TradeId};
     use crate::test_utils::setup_test_pools;
+    use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
     use crate::usdc_rebalance::{
         RebalanceDirection, TransferRef, UsdcRebalanceCommand, UsdcRebalanceId,
     };
@@ -3824,6 +3831,177 @@ mod tests {
                 row("liq_event", 4, "BridgingSubmitting"),
                 row("liq_transfer", 4, "bridging"),
             ]
+        );
+    }
+
+    /// Takes a USDC rebalance through withdrawal to `bridging` on `store`.
+    async fn usdc_rebalance_at_bridging(
+        store: &st0x_event_sorcery::Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+    ) {
+        let amount = Usdc::new(st0x_float_macro::float!(500));
+        for command in [
+            UsdcRebalanceCommand::BeginWithdrawal {
+                corridor: UsdcCorridor::BASE_CCTP,
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount,
+                from_block: 1,
+            },
+            UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount,
+                withdrawal: TransferRef::OnchainTx(alloy::primitives::TxHash::repeat_byte(0x22)),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceCommand::BeginBridging {
+                from_block: 2,
+                burn_amount: None,
+            },
+        ] {
+            store.send(id, command).await.unwrap();
+        }
+    }
+
+    fn transfer_lines(captured: &CapturedLines) -> Vec<(String, String)> {
+        captured
+            .take()
+            .into_iter()
+            .filter(|(target, _)| target == "liq_transfer")
+            .map(|(_, line)| (line["event_id"].clone(), line["status"].clone()))
+            .collect()
+    }
+
+    /// A status committed with no reactor (the offline CLI, or a crash
+    /// before the reactor ran) gets its line from the sweep, under the
+    /// transfer's last event. A second pass writes nothing.
+    #[tokio::test]
+    async fn the_sweep_writes_a_status_no_reactor_wrote_once() {
+        let (captured, _guard) = CapturedLines::install();
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (sender, _receiver) = broadcast::channel(16);
+        let delivery =
+            DashboardTradeDelivery::new(&apalis_pool, &pool, sender, EquityPriceStore::new([]));
+        let (standalone, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        usdc_rebalance_at_bridging(&standalone, &id).await;
+
+        delivery.line_sweep.sweep().await;
+        assert_eq!(
+            transfer_lines(&captured),
+            vec![(format!("UsdcRebalance:{id}:4"), "bridging".to_string())]
+        );
+
+        delivery.line_sweep.sweep().await;
+        assert_eq!(transfer_lines(&captured), vec![]);
+
+        standalone
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "operator".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        delivery.line_sweep.sweep().await;
+        assert_eq!(
+            transfer_lines(&captured),
+            vec![(format!("UsdcRebalance:{id}:5"), "failed".to_string())]
+        );
+    }
+
+    /// The sweep seeds the memory the reactor reads, so after a restart an
+    /// event that leaves the status as it was writes no line again.
+    #[tokio::test]
+    async fn after_the_sweep_an_unchanged_status_writes_no_line() {
+        let (captured, _guard) = CapturedLines::install();
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (sender, _receiver) = broadcast::channel(16);
+        let delivery =
+            DashboardTradeDelivery::new(&apalis_pool, &pool, sender, EquityPriceStore::new([]));
+        let (standalone, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        usdc_rebalance_at_bridging(&standalone, &id).await;
+        delivery.line_sweep.sweep().await;
+        transfer_lines(&captured);
+
+        let (wired, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .with(delivery.broadcaster.clone())
+            .build(())
+            .await
+            .unwrap();
+        wired
+            .send(
+                &id,
+                UsdcRebalanceCommand::RecordPendingBurn {
+                    burn_tx: alloy::primitives::TxHash::repeat_byte(0x33),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(transfer_lines(&captured), vec![]);
+    }
+
+    /// The sweep names a mint's event as the reactor does, so both writers
+    /// share one memory entry and one `event_id` per event.
+    #[tokio::test]
+    async fn the_sweep_names_a_mint_event_as_the_reactor_does() {
+        let (captured, _guard) = CapturedLines::install();
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (sender, _receiver) = broadcast::channel(16);
+        let symbol = Symbol::new("AAPL").unwrap();
+        let delivery = DashboardTradeDelivery::new(
+            &apalis_pool,
+            &pool,
+            sender,
+            EquityPriceStore::with_live_mark(symbol.clone(), st0x_float_macro::float!(100)),
+        );
+        let (standalone, _projection) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+            .build(crate::rebalancing::equity::EquityTransferServices::panicking())
+            .await
+            .unwrap();
+        let id = st0x_tokenization::issuer_request_id("sweep-mint");
+        standalone
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol,
+                    chain: Chain::Base,
+                    quantity: st0x_float_macro::float!(10),
+                    wallet: alloy::primitives::Address::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        standalone
+            .send(
+                &id,
+                TokenizedEquityMintCommand::FailAcceptance {
+                    reason: "timed out".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        delivery.line_sweep.sweep().await;
+
+        assert_eq!(
+            transfer_lines(&captured),
+            vec![(
+                EventId::of::<TokenizedEquityMint>(&id, Committed::new(2)).to_string(),
+                "failed".to_string(),
+            )]
         );
     }
 
