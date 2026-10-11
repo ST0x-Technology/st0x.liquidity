@@ -38,9 +38,12 @@
 CLI test runs need `--all-features` (or explicit `--features test-support`). Its
 dev dependencies enable `st0x-hedge/test-support`, which also enables the extra
 test-only CCTP context fields. Without the CLI's own `test-support` feature, its
-initializers omit those fields and fail compilation. For a focused CLI test use
-`cargo nextest run -p st0x-cli --all-features -E 'test(name)'`, matching CI's
-feature selection.
+initializers omit those fields and fail compilation. For a focused CLI test,
+enable its required features and select both the package and test explicitly:
+
+```bash
+cargo nextest run -p st0x-cli --all-features -E 'test(<test_name>)'
+```
 
 ### Common pitfall: dead code warnings
 

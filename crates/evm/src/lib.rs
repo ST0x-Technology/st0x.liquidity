@@ -3877,7 +3877,11 @@ mod tests {
     #[tokio::test]
     async fn wait_for_receipt_waits_for_multiple_confirmations() {
         // Anvil with 1-second block time auto-mines blocks.
-        let anvil = Anvil::new().block_time(1).spawn();
+        let anvil = Anvil::new()
+            .block_time(1)
+            .arg("--max-persisted-states")
+            .arg("0")
+            .spawn();
         let signer = anvil_signer(&anvil);
         let provider = ProviderBuilder::new()
             .wallet(signer)

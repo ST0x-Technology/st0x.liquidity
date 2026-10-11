@@ -143,6 +143,27 @@ let filter = contract
 let logs = provider.get_logs(&filter).await?;
 ```
 
+## Anvil Test Nodes
+
+Anvil keeps recent block states in memory, then writes older states to
+`~/.foundry/anvil/tmp`. Its default disk tier holds up to 3,600 complete state
+snapshots, and those temporary directories remain after a normal exit. A test
+using interval mining can therefore leave several gigabytes per run.
+
+Every interval-mining test node must disable the disk tier:
+
+```rust
+let anvil = Anvil::new()
+    .block_time(1)
+    .arg("--max-persisted-states")
+    .arg("0")
+    .spawn();
+```
+
+This retains recent state in memory and prevents historical snapshots from being
+written to the user's Foundry directory. Do not replace it with
+`--prune-history`; that also changes the available in-memory history.
+
 ## Canonical State on Load-Balanced RPCs
 
 Separate transaction, head, and `latest` account-state reads can hit different

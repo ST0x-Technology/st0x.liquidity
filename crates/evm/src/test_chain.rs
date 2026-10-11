@@ -59,6 +59,8 @@ impl AnvilTestChain<()> {
         let anvil = Anvil::new()
             .block_time(1)
             .chain_id(Chain::Base.chain_id())
+            .arg("--max-persisted-states")
+            .arg("0")
             .spawn();
 
         let key = B256::from_slice(&anvil.keys()[0].to_bytes());
