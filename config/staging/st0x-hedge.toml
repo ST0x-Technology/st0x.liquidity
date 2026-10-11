@@ -21,6 +21,9 @@ server_port = 8001
 board_port = 8002
 # Minimum stdout log level. Docker's gcplogs driver exports TRACE to GCP.
 log_level = "trace"
+# gcplogs forwards each record as a serialized JSON line; Cloud Logging field
+# parsing depends on the ingestion configuration.
+log_format = "json"
 # Directory and minimum level for local rotated log files. INFO reduces
 # within-day volume on the 10 GB SQLite disk; seven-file retention caps file
 # count, not bytes, so it is not a hard disk-usage bound.

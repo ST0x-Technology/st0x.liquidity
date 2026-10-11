@@ -4,6 +4,7 @@
 
 use reqwest::StatusCode;
 use url::Url;
+use uuid::Uuid;
 
 use crate::auth::{AuthError, TokenSource};
 /// Failure talking to the liquidity ops API over HTTP.
@@ -202,6 +203,7 @@ impl<A: TokenSource + Sync> Client<A> {
     ) -> Result<serde_json::Value, TransportError> {
         let response = request
             .bearer_auth(token)
+            .header("x-request-id", Uuid::new_v4().to_string())
             .send()
             .await
             .map_err(|source| TransportError::Transport(target.clone(), source))?;
@@ -286,6 +288,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc::{Receiver, channel};
+    use uuid::Uuid;
 
     use super::{Client, TokenSource, TransportError};
     use crate::auth::AuthError;
@@ -394,6 +397,10 @@ mod tests {
         assert_eq!(
             header(&request, "authorization"),
             Some("Bearer write-token")
+        );
+        assert!(
+            header(&request, "x-request-id").is_some_and(|value| Uuid::parse_str(value).is_ok()),
+            "{request}"
         );
         Ok(())
     }

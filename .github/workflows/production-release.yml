@@ -5,9 +5,9 @@ name: production-release
 #   Actions -> production-release -> Run workflow
 #     version = vX.Y.Z  : images AND config/prod/st0x-hedge.toml from that
 #                         tag (new version, re-deploy or rollback);
-#     version empty     : CONFIG-ONLY release, config/prod/st0x-hedge.toml
-#                         on the digests LIVE in production, taken from the
-#                         branch the run starts from: select master.
+#     version empty     : CONFIG-ONLY release dispatched from master, using
+#                         config/prod/st0x-hedge.toml from master on the
+#                         digests LIVE in production.
 # Nothing fires on its own any more (until 2026-09-08 a merge touching the
 # prod config requested a grant by itself, and release-tag.yml did the same
 # for every tag; RAI-2266). Either way the file is validated inside the
@@ -21,7 +21,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "vX.Y.Z to deploy images and config from that tag; leave empty for a config-only release of config/prod/st0x-hedge.toml onto the live images, taken from the branch selected above (select master)"
+        description: "vX.Y.Z to deploy images and config from that tag; from master, leave empty for a config-only release onto the live images"
         required: false
         default: ""
         type: string
@@ -31,7 +31,27 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  validate-release-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require master for config-only releases
+        if: ${{ inputs.version == '' && github.ref != 'refs/heads/master' }}
+        run: |
+          echo "::error title=Invalid production release source::Config-only releases must be dispatched from master."
+          exit 1
+      - name: Require a semantic version tag
+        if: ${{ inputs.version != '' }}
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error title=Invalid production release version::version must match vMAJOR.MINOR.PATCH"
+            exit 1
+          fi
+
+
   release:
+    needs: validate-release-source
     permissions:
       id-token: write
       contents: read
@@ -47,7 +67,7 @@ jobs:
       service_account: liquidity-releaser@t0-artifacts.iam.gserviceaccount.com
       pam_entitlement: app-deploy
       image_tag: ${{ inputs.version || '' }}
-      ref: ${{ inputs.version || '' }}
+      ref: ${{ inputs.version != '' && format('refs/tags/{0}', inputs.version) || 'master' }}
       config_file: config/prod/st0x-hedge.toml
       config_secret: liquidity-runtime-config
       validate_entrypoint: /bin/validate-config

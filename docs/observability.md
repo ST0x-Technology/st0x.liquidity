@@ -4,11 +4,17 @@ Best practices for logging, tracing, and monitoring in this codebase.
 
 ## Sink levels
 
-`log_level` is the minimum level for stdout and OpenTelemetry exports.
-`RUST_LOG` may refine the stdout filter for an operator session. When local
-daily files are enabled, `log_dir` and `file_log_level` must be configured
-together; neither field has an implicit counterpart. The local file layer uses
-only `file_log_level`, so `RUST_LOG` cannot increase disk usage.
+`log_level` is the minimum level for ordinary stdout and OpenTelemetry log
+records, and `file_log_level` is the minimum for ordinary local-file records.
+`operations_audit` is the deliberate exception: console, OpenTelemetry log, and
+configured local-file sinks all enforce an INFO floor for that target.
+`RUST_LOG` may refine the stdout filter for an operator session, but the console
+filter separately admits `operations_audit` through INFO before combining it
+with the operator filter. Field-specific `RUST_LOG` directives therefore cannot
+hide audit successes. When local daily files are enabled, `log_dir` and
+`file_log_level` must be configured together; neither field has an implicit
+counterpart. The local file layer uses only `file_log_level`, so `RUST_LOG`
+cannot increase disk usage.
 
 Production uses `log_level = "trace"` so Docker's `gcplogs` driver exports full
 diagnostics, while `file_log_level = "info"` limits the rotating files stored
@@ -16,15 +22,14 @@ beside SQLite. Rotation retains seven daily files, which caps file count but not
 bytes. The lower file level reduces within-day growth and disk-exhaustion risk;
 it does not enforce a per-file byte limit or filesystem quota.
 
-The active GCP configs are `config/staging/st0x-hedge.toml` and
-`config/prod/st0x-hedge.toml` in this repository. Each release validates the
-file inside the image that will run it and publishes it as a
-`liquidity-runtime-config` version together with the image digests. A production
-config-only release (empty `version`) rolls no image: it re-uses the digests
-that are live. A logging-schema release must therefore ship the matching image
-and runtime config together: a merge to master rolls staging with both from the
-same commit (`build-oci.yml`), and production pins both in one gated
-`production-release.yml` run.
+The active GCP runtime config sources are `config/prod/st0x-hedge.toml` and
+`config/staging/st0x-hedge.toml` in this repository.
+`.github/workflows/config-drift.yml` validates both against the current schema,
+while `.github/workflows/build-oci.yml` validates and promotes the staging
+config with the image. Production promotion runs only through a manual
+`workflow_dispatch` of `.github/workflows/production-release.yml`: a version
+selects that tag's images and config, while a blank version selects the master
+config and preserves the live image tags.
 
 ## Tracing targets
 
@@ -42,26 +47,59 @@ trace!(target: "wallet", asset_count, "Listed wallet assets");
 info!(%symbol, %shares, "Hedging trade");
 ```
 
-### Existing targets
+### Configured domain targets
 
 | Target              | Subsystem                                                |
 | ------------------- | -------------------------------------------------------- |
-| `hedge`             | Hedging / position management                            |
+| `api`               | HTTP API request handling                                |
+| `backfill`          | Historical data recovery                                 |
+| `bridge`            | Cross-chain bridge processing                            |
+| `broker`            | Offchain broker integration                              |
+| `cqrs`              | Aggregate commands and events                            |
+| `dashboard`         | Dashboard data and updates                               |
+| `equity`            | Equity position and transfer processing                  |
+| `evm`               | EVM RPC and contract interactions                        |
+| `gas`               | Wallet gas monitoring                                    |
+| `hedge`             | Hedging and position management                          |
+| `iap`               | IAP authentication and key verification                  |
+| `inventory`         | Inventory accounting                                     |
+| `market_data`       | Market data ingestion                                    |
 | `operational_alert` | Operator alerts (ERROR events the log pipeline pages on) |
 | `orderbook`         | Onchain orderbook interactions                           |
-| `rebalancing`       | Portfolio rebalancing                                    |
+| `rebalance`         | Portfolio rebalancing                                    |
+| `reliability`       | Reliability and health signals                           |
+| `shutdown`          | Process shutdown                                         |
 | `startup`           | Application initialization                               |
 | `tokenization`      | Tokenized equity minting                                 |
-| `wallet`            | Alpaca wallet / onchain wallet                           |
+| `wallet`            | Alpaca and onchain wallet operations                     |
+| `operations_audit`  | Versioned mutation audit events (mandatory INFO floor)   |
 
-When adding a new subsystem, pick a short, descriptive target name and add it to
-this table AND to `DOMAIN_TARGETS` in `crates/config/src/telemetry.rs`, so the
-default `EnvFilter` captures it.
+This table mirrors `DOMAIN_TARGETS` in `crates/config/src/telemetry.rs`, plus
+the deliberate `operations_audit` exception. Add a new configured domain target
+to both places so the default `EnvFilter` captures it. The audit target instead
+has dedicated console and default sink filters that enforce its INFO floor.
 
 When overriding filtering with `RUST_LOG`, always keep a bare level segment
 (e.g. `RUST_LOG=warn,hedge=trace`): the bare level is what admits targets you
 did not list, so the ERROR-severity `operational_alert` events keep flowing to
 the pipeline that pages operators even while you focus on one subsystem.
+
+## Operations audit delivery
+
+`operations_audit` carries the stable `st0x.operations.audit.v1` fields. The
+production and staging runtime configs select JSON stdout, so Docker's `gcplogs`
+driver forwards each record to Cloud Logging as one serialized JSON line.
+Parsing that line into queryable Cloud Logging fields depends on the configured
+ingestion pipeline. The schema is compatible with VictoriaLogs, but VictoriaLogs
+receives events only when `[telemetry]` configures its OTLP exporter; the
+deployed configs currently rely on stdout and do not invent an OTLP endpoint.
+
+The recorder can synchronously detect that the tracing target is disabled. That
+immediate refusal emits a dimensioned ERROR on `operational_alert` so it remains
+visible without relying on the disabled audit target. Emitting a tracing event
+does not acknowledge per-event delivery by stdout, Cloud Logging, or the
+asynchronous OTLP exporter. Exporter failures are telemetry-pipeline health and
+must be monitored as such; they are not event-correlated recorder failures.
 
 ## Sensitive data
 

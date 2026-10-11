@@ -14,10 +14,12 @@ name: build-oci
 # VM still verifies the liquidity-image attestation of everything it adopts
 # and runs its migration + health gates.
 #
-# PRODUCTION IS DEPLOYED FROM THIS REPO TOO, but never by this workflow and
-# never by a merge or a tag: only a manual production-release.yml run rolls
-# it, behind the app-deploy PAM grant in t0-liquidity. A version tag only
-# runs release-tag.yml, which labels the images and deploys nothing.
+# PRODUCTION IS DEPLOYED FROM THIS REPO TOO, but never by this workflow.
+# `.github/workflows/production-release.yml` runs only from a manual
+# workflow_dispatch; neither a version tag nor a merge touching the production
+# config deploys by itself. The operator selects a version tag for images plus
+# config, or leaves it empty for a master config-only release onto the live
+# images; both paths require the app-deploy PAM grant in t0-liquidity.
 #
 # Auth: GitHub OIDC → the t0-artifacts WIF provider, bound to
 # liquidity-deployer (master only — the WIF binding lives in t0.devops
