@@ -9,6 +9,7 @@
   import { decimalAdd, decimalCompare, decimalIsZero, formatDecimal } from '$lib/decimal'
   import { reactive } from '$lib/frp.svelte'
   import { cashInventoryAmounts } from '$lib/inventory-cash'
+  import { ratioDeviation } from '$lib/inventory-deviation'
   import { cashUsdTooltip, equityUsdTooltip, positionSharesTooltip } from '$lib/inventory-value'
   import { availablePriceUsd, equityExposureUsd, formatExposureUsd } from '$lib/equity-price'
 
@@ -207,8 +208,7 @@
       alpacaUsd: fmt(amounts.alpacaUsd),
       alpacaUsdc: amounts.alpacaUsdc === null ? null : fmt(amounts.alpacaUsdc),
       counterTradeUsd: fmt(amounts.counterTradeUsd),
-      rebalanceableUsd:
-        amounts.rebalanceableUsd === null ? null : fmt(amounts.rebalanceableUsd),
+      rebalanceableUsd: amounts.rebalanceableUsd === null ? null : fmt(amounts.rebalanceableUsd),
       inflight: fmt(inflight),
       ethWallet:
         usdc.inflightCash.ethereumWallet === null ? null : fmt(usdc.inflightCash.ethereumWallet),
@@ -301,27 +301,6 @@
   const statusLabel = (label: string, state: LightState): string =>
     `${label} ${state === 'unknown' ? 'unconfigured' : state}`
 
-  type DeviationStyle = 'normal' | 'high' | 'low'
-
-  type Deviation = { style: DeviationStyle }
-
-  // A null target (only per-symbol overrides configured) styles no row.
-  const ratioDeviation = (ratio: number, isCash: boolean): Deviation | null => {
-    if (!settings) return null
-
-    const target = isCash ? (settings.usdcTarget ?? settings.equityTarget) : settings.equityTarget
-    if (target == null) return null
-
-    const deviation = isCash
-      ? (settings.usdcDeviation ?? settings.equityDeviation)
-      : settings.equityDeviation
-    const diff = ratio - target
-
-    if (diff > deviation) return { style: 'high' }
-    if (diff < -deviation) return { style: 'low' }
-    return { style: 'normal' }
-  }
-
   const exposureDirection = (value: string | null): number =>
     value === null ? 0 : decimalCompare(value, '0')
 
@@ -372,7 +351,7 @@
 </script>
 
 {#if cashCells}
-  {@const dev = ratioDeviation(cashCells.ratio, true)}
+  {@const dev = ratioDeviation(settings, cashCells.ratio, true)}
   <div class="cash-table">
     <Table.Root>
       <Table.Header class="[&_tr:first-child]:border-b-0">
@@ -404,12 +383,14 @@
             >Ratio</Table.Head
           >
           <Table.Head class="h-8 w-full" rowspan={2} aria-hidden="true"></Table.Head>
-          <Table.Head class="info-col {cashGroupHeadClass} {groupSepClass}" colspan={alpacaCashColCount}
-            >Alpaca</Table.Head
+          <Table.Head
+            class="info-col {cashGroupHeadClass} {groupSepClass}"
+            colspan={alpacaCashColCount}>Alpaca</Table.Head
           >
           {#if walletCashColCount > 0}
-            <Table.Head class="info-col {cashGroupHeadClass} {groupSepClass}" colspan={walletCashColCount}
-              >Wallets</Table.Head
+            <Table.Head
+              class="info-col {cashGroupHeadClass} {groupSepClass}"
+              colspan={walletCashColCount}>Wallets</Table.Head
             >
           {/if}
         </Table.Row>
@@ -508,7 +489,11 @@
           <Table.Cell class="w-full" aria-hidden="true"></Table.Cell>
 
           {#if showAlpacaUsdc && cashCells.alpacaUsdc}
-            <Table.Cell class="info-col text-left font-mono {inventoryNumberClass} {cashSectionBoundary('alpacaUsdc')}">
+            <Table.Cell
+              class="info-col text-left font-mono {inventoryNumberClass} {cashSectionBoundary(
+                'alpacaUsdc'
+              )}"
+            >
               <InventoryHoverValue
                 display={cashCells.alpacaUsdc.display}
                 tooltip={cashUsdTooltip(cashCells.alpacaUsdc.full)}
@@ -518,7 +503,11 @@
           {/if}
 
           {#if showRebalanceable && cashCells.rebalanceableUsd}
-            <Table.Cell class="info-col text-left font-mono {inventoryNumberClass} {cashSectionBoundary('rebalanceable')}">
+            <Table.Cell
+              class="info-col text-left font-mono {inventoryNumberClass} {cashSectionBoundary(
+                'rebalanceable'
+              )}"
+            >
               <InventoryHoverValue
                 display={cashCells.rebalanceableUsd.display}
                 tooltip={cashUsdTooltip(cashCells.rebalanceableUsd.full)}
@@ -527,7 +516,11 @@
             </Table.Cell>
           {/if}
 
-          <Table.Cell class="info-col text-left font-mono {inventoryNumberClass} {cashSectionBoundary('counterTrade')}">
+          <Table.Cell
+            class="info-col text-left font-mono {inventoryNumberClass} {cashSectionBoundary(
+              'counterTrade'
+            )}"
+          >
             <InventoryHoverValue
               display={cashCells.counterTradeUsd.display}
               tooltip={cashUsdTooltip(cashCells.counterTradeUsd.full)}
@@ -536,7 +529,11 @@
           </Table.Cell>
 
           {#if showEthWallet && cashCells.ethWallet}
-            <Table.Cell class="info-col text-left font-mono {inventoryNumberClass} {cashSectionBoundary('eth')}">
+            <Table.Cell
+              class="info-col text-left font-mono {inventoryNumberClass} {cashSectionBoundary(
+                'eth'
+              )}"
+            >
               <InventoryHoverValue
                 display={cashCells.ethWallet.display}
                 tooltip={cashUsdTooltip(cashCells.ethWallet.full)}
@@ -546,7 +543,11 @@
           {/if}
 
           {#if showBaseWallet && cashCells.baseWallet}
-            <Table.Cell class="info-col text-left font-mono {inventoryNumberClass} {cashSectionBoundary('base')}">
+            <Table.Cell
+              class="info-col text-left font-mono {inventoryNumberClass} {cashSectionBoundary(
+                'base'
+              )}"
+            >
               <InventoryHoverValue
                 display={cashCells.baseWallet.display}
                 tooltip={cashUsdTooltip(cashCells.baseWallet.full)}
@@ -574,15 +575,18 @@
 
         <Table.Head class={statusGroupHeadClass}>
           <div class={statusGroupClass}>
-            <span title="Counter-trading / hedging for this asset: green enabled, red disabled, grey not configured."
+            <span
+              title="Counter-trading / hedging for this asset: green enabled, red disabled, grey not configured."
               >CT</span
             >
 
-            <span title="Automatic equity rebalancing for this asset: green enabled, red disabled or paused, grey not configured."
+            <span
+              title="Automatic equity rebalancing for this asset: green enabled, red disabled or paused, grey not configured."
               >Rebal</span
             >
 
-            <span title="Extended-hours counter-trading (only active while counter-trading is enabled): green enabled, red disabled, grey not configured."
+            <span
+              title="Extended-hours counter-trading (only active while counter-trading is enabled): green enabled, red disabled, grey not configured."
               >Ext</span
             >
           </div>
@@ -673,7 +677,7 @@
 
     <Table.Body>
       {#each sortedEquities as row, idx (row.asset)}
-        {@const dev = ratioDeviation(row.ratio, false)}
+        {@const dev = ratioDeviation(settings, row.ratio, false)}
         {@const ctActive = row.flags?.counterTrading ?? false}
         {@const ctState = lightState(row.flags, 'counterTrading')}
         {@const rebalState = lightState(row.flags, 'rebalancing')}

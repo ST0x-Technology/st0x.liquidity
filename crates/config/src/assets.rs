@@ -201,6 +201,15 @@ pub struct ChainAssets {
 }
 
 impl ChainAssets {
+    /// This chain's cash asset while it rebalances. The USDC trigger starts
+    /// transfers on a corridor only when this is set for the corridor's chain,
+    /// and the corridor's published active flag uses the same test.
+    pub fn rebalancing_cash(&self) -> Option<&ChainCashAsset> {
+        self.cash
+            .as_ref()
+            .filter(|cash| cash.rebalancing == OperationMode::Enabled)
+    }
+
     /// Returns whether trading is enabled for the given equity on this chain.
     ///
     /// Fail-closed: assets not present in the config are treated as
