@@ -3,8 +3,10 @@
 //! Replay inputs come from the typed, append-only `pnl_*` ledger tables
 //! maintained by [`super::ledger::PnlLedger`] (ADR 0018) -- never from the
 //! `events` table. Freshness is guaranteed by running the ledger's
-//! `catch_up()` before resolving the `asOfRowid` watermark, outside the
-//! replay admission permit.
+//! `catch_up()` before resolving the `asOfRowid` watermark. A live request
+//! runs it outside the replay admission permit; a background caller that
+//! waits for its permit runs it after the wait (see
+//! [`PnlReportAdmission::admit_before_catch_up`]).
 use chrono::{DateTime, Days, NaiveDate, NaiveTime, Utc};
 use chrono_tz::America::New_York;
 use rain_math_float::Float;
@@ -12,9 +14,8 @@ use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::task;
-use tracing::warn;
 
 use st0x_execution::alpaca_broker_api::{AccountActivitiesQuery, AccountActivity};
 use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiError};
@@ -42,8 +43,24 @@ use super::{
 
 pub(crate) const MAX_CONCURRENT_PNL_REPORTS: usize = 2;
 
+/// The replay permits one caller's reports share, and what a report does
+/// when every permit is taken.
 #[derive(Clone)]
-pub(crate) struct PnlReportAdmission(Arc<Semaphore>);
+pub(crate) struct PnlReportAdmission {
+    permits: Arc<Semaphore>,
+    when_full: WhenFull,
+}
+
+/// What a report does when every permit of its admission is taken.
+#[derive(Clone, Copy, Debug)]
+enum WhenFull {
+    /// Fail with [`PnlError::ReplayAdmission`]: a live `/pnl` request sheds
+    /// load instead of queueing.
+    Reject,
+    /// Wait for a permit: a background caller whose reports may outlive the
+    /// wait that started them.
+    Wait,
+}
 
 impl PnlReportAdmission {
     fn new() -> Self {
@@ -51,13 +68,60 @@ impl PnlReportAdmission {
     }
 
     /// An admission of its own, so a caller that is not a live `/pnl`
-    /// request never takes one of the live request permits.
+    /// request never takes one of the live request permits. A report it
+    /// admits fails when every permit is taken.
     pub(crate) fn with_permits(permits: usize) -> Self {
-        Self(Arc::new(Semaphore::new(permits)))
+        Self {
+            permits: Arc::new(Semaphore::new(permits)),
+            when_full: WhenFull::Reject,
+        }
     }
 
-    fn try_acquire(&self) -> Result<OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
-        self.0.clone().try_acquire_owned()
+    /// Like [`Self::with_permits`], but a report waits for a permit instead
+    /// of failing. The permits are FIFO, so reports run in the order they
+    /// asked.
+    pub(crate) fn queued(permits: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(permits)),
+            when_full: WhenFull::Wait,
+        }
+    }
+
+    fn try_acquire(&self) -> Result<OwnedSemaphorePermit, TryAcquireError> {
+        self.permits.clone().try_acquire_owned()
+    }
+
+    /// A permit under this admission's [`WhenFull`] rule.
+    pub(crate) async fn admit(&self) -> Result<OwnedSemaphorePermit, PnlError> {
+        match self.when_full {
+            WhenFull::Reject => acquire_pnl_report_permit(self),
+            // The semaphore is never closed; a closed one would surface as
+            // the admission error rather than hang.
+            WhenFull::Wait => self
+                .permits
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_closed| PnlError::ReplayAdmission(TryAcquireError::Closed)),
+        }
+    }
+
+    /// The permit a report takes before its ledger catch-up, if any.
+    ///
+    /// A waiting admission takes its permit first: the wait can last as long
+    /// as the reports queued ahead, and a head read before it would leave the
+    /// replay behind the live `position_view` and every event ingested during
+    /// the wait. Its permits are the caller's own, so holding one through the
+    /// catch-up takes no live `/pnl` slot. A rejecting admission returns
+    /// `None` and admits after the catch-up, so a live request does not hold
+    /// a replay slot through async I/O.
+    pub(super) async fn admit_before_catch_up(
+        &self,
+    ) -> Result<Option<OwnedSemaphorePermit>, PnlError> {
+        match self.when_full {
+            WhenFull::Reject => Ok(None),
+            WhenFull::Wait => self.admit().await.map(Some),
+        }
     }
 }
 
@@ -129,7 +193,16 @@ pub(crate) enum PnlReportError {
 /// the ledger current within [`PNL_CATCH_UP_TIMEOUT`], check `asOfRowid`
 /// against the head, take a permit from `admission`, fetch the Alpaca
 /// activities for the window and replay. Every caller runs its own catch-up,
-/// so each report sees the events ingested before it.
+/// so each report sees the events ingested before it. A waiting admission
+/// takes its permit before the catch-up instead (see
+/// [`PnlReportAdmission::admit_before_catch_up`]).
+///
+/// Nothing here logs a failure: each caller logs the error it gets back,
+/// so one failure writes one log line.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "the permit moves into the blocking replay, which hands it back or releases it"
+)]
 pub(crate) async fn run_pnl_report(
     deps: &PnlReportDeps<'_>,
     query: &PnlQuery,
@@ -139,15 +212,16 @@ pub(crate) async fn run_pnl_report(
     let until = query.activity_until()?;
     query.symbol_filter(&mut Vec::new())?;
 
+    let early_permit = admission.admit_before_catch_up().await?;
     let head = tokio::time::timeout(PNL_CATCH_UP_TIMEOUT, deps.ledger.catch_up())
         .await
-        .map_err(|_elapsed| {
-            warn!("PnL ledger catch-up exceeded its deadline");
-            PnlReportError::CatchUpTimeout
-        })?
+        .map_err(|_elapsed| PnlReportError::CatchUpTimeout)?
         .map_err(PnlError::Ledger)?;
     validate_pnl_snapshot_rowid(head, query)?;
-    let permit = acquire_pnl_report_permit(admission)?;
+    let permit = match early_permit {
+        Some(permit) => permit,
+        None => admission.admit().await?,
+    };
 
     let activities = deps
         .broker
@@ -176,10 +250,12 @@ pub(crate) async fn build_pnl_report(
 }
 
 /// `head` is the event-log head returned by the ledger's `catch_up()`, which
-/// the caller MUST have run before acquiring the replay permit: freshness is
-/// async I/O and must not burn a blocking-replay slot, and the resolved
+/// the caller MUST have run before building the report: the resolved
 /// `asOfRowid` watermark is only meaningful once the ledger contains
-/// everything at or below it.
+/// everything at or below it. A live request runs it before acquiring the
+/// replay permit, as freshness is async I/O and must not burn a live
+/// blocking-replay slot; a waiting admission runs it after its permit (see
+/// [`PnlReportAdmission::admit_before_catch_up`]).
 pub(crate) async fn build_pnl_report_with_permit(
     pool: &SqlitePool,
     query: &PnlQuery,

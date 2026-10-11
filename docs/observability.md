@@ -353,7 +353,7 @@ sample time, so only `outcome="paused"` shows that stall.
 | `order_fill_poll_duration_seconds`               | histogram | `chain`                              | each order-fill poll cycle                               |
 | `order_fill_block_lag_blocks`                    | gauge     | `chain`                              | each poll that knows the cutoff block and the checkpoint |
 | `order_fill_block_lag_sampled_timestamp_seconds` | gauge     | `chain`                              | same, set to the poll's sample time                      |
-| `metrics_refresh_duration_seconds`               | histogram | `collector`                          | each performance collector run, failed or not            |
+| `metrics_refresh_duration_seconds`               | histogram | `collector`                          | each performance or PnL window refresh, failed or not    |
 | `log_events_total`                               | counter   | `level`, `target`                    | each error and warning the file log writes               |
 
 ### Catalog
@@ -463,7 +463,11 @@ sample time, so only `outcome="paused"` shows that stall.
 
 The `liq_pnl_*` rows are published per `window` (`1d`, `1w`, `1m`, `ytd`, `1y`,
 `all`) every 5 minutes. A window whose report fails keeps its last samples, and
-its `pnl_<window>` collector time stops advancing.
+its `pnl_<window>` collector time stops advancing. A report past its 30-second
+wait keeps running and publishes its window when it ends. The reports still run
+one at a time behind the task's one permit, so a window's
+`metrics_refresh_duration_seconds` includes its wait behind the reports queued
+ahead of it.
 
 ### Adding a family
 
