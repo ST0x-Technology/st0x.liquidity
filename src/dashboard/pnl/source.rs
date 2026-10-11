@@ -25,13 +25,13 @@ use crate::portfolio_snapshot::{
     CAPTURE_BUFFER, EtDayRange, capital_summary, evaluate_portfolio_days, load_portfolio_day_rows,
 };
 
-use super::builder::build_pnl_response_from_rows;
+use super::builder::{PnlReplay, replay_pnl_rows, summarize_pnl_window};
 use super::ledger::{
     CCTP_FEE_SOURCE, DIRECTION_BUY_TEXT, DIRECTION_SELL_TEXT, LedgerHead, PnlLedger,
     TOKENIZATION_FEE_SOURCE,
 };
 use super::query::{PnlError, PnlQuery};
-use super::response::{PnlCapitalSummary, PnlResponse};
+use super::response::{PnlAvailableRange, PnlCapitalSummary, PnlResponse};
 use super::state::{
     BotGasCostRow, CostLedgerRow, CostSource, Direction, ManualAdjustmentRow, OffchainFillRow,
     OffchainPlacementRow, OnchainFillRow, PositionLedgerRow, PositionViewRow,
@@ -235,6 +235,91 @@ pub(crate) async fn run_pnl_report(
     )
 }
 
+/// One report or its failure per window, each with its window's key, in the
+/// windows' order.
+pub(crate) type PnlWindowReports<K> = Vec<(K, Result<PnlResponse, PnlReportError>)>;
+
+/// One report per window, each the way [`run_pnl_report`] builds it for
+/// `base` with the window's dates, but over one ledger catch-up, one
+/// watermark and one replay. The replay reads no date (see
+/// [`replay_pnl_rows`]), so the windows share it, and `windows` picks each
+/// window's key and `(fromDate, toDate)` from that replay's range of days
+/// with fills, so the dates and the figures come from the same head. Each
+/// window still fetches its own Alpaca activities and builds its own summary
+/// and capital, one window after another. The list returns after the last
+/// window, so one window's slow fetch delays every window's report.
+/// A waiting admission takes its permit before the catch-up, as
+/// [`run_pnl_report`] does (see [`PnlReportAdmission::admit_before_catch_up`]).
+///
+/// The outer error is a failure before the replay ends, which fails every
+/// window. Each window's own failure is its entry in the list, which holds
+/// one entry per window `windows` returned, in order. Like
+/// [`run_pnl_report`], nothing here logs a failure.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "the permit moves into the blocking replay, which hands it back or releases it"
+)]
+pub(crate) async fn run_pnl_window_reports<K: Send>(
+    deps: &PnlReportDeps<'_>,
+    base: &PnlQuery,
+    windows: impl FnOnce(&PnlAvailableRange) -> Vec<(K, NaiveDate, NaiveDate)> + Send,
+    admission: &PnlReportAdmission,
+) -> Result<PnlWindowReports<K>, PnlReportError> {
+    base.symbol_filter(&mut Vec::new())?;
+
+    let early_permit = admission.admit_before_catch_up().await?;
+    let head = tokio::time::timeout(PNL_CATCH_UP_TIMEOUT, deps.ledger.catch_up())
+        .await
+        .map_err(|_elapsed| PnlReportError::CatchUpTimeout)?
+        .map_err(PnlError::Ledger)?;
+    validate_pnl_snapshot_rowid(head, base)?;
+    let permit = match early_permit {
+        Some(permit) => permit,
+        None => admission.admit().await?,
+    };
+
+    let (shared, permit) = load_and_replay_pnl(deps.pool, base, head, permit).await?;
+    drop(permit);
+
+    let windows = windows(&shared.replay.available_range);
+    let mut reports = Vec::with_capacity(windows.len());
+    for (key, from, to) in windows {
+        let query = PnlQuery {
+            from_date: Some(from.to_string()),
+            to_date: Some(to.to_string()),
+            ..base.clone()
+        };
+        let report = pnl_window_report(deps, &shared, &query, admission).await;
+        reports.push((key, report));
+    }
+
+    Ok(reports)
+}
+
+/// One window of [`run_pnl_window_reports`]: the same steps as
+/// [`run_pnl_report`] after its replay, in the same order. Each window takes
+/// its own permit after its Alpaca fetch, so a window that fails gives it
+/// back.
+async fn pnl_window_report(
+    deps: &PnlReportDeps<'_>,
+    shared: &SharedPnlReplay,
+    query: &PnlQuery,
+    admission: &PnlReportAdmission,
+) -> Result<PnlResponse, PnlReportError> {
+    let activities = deps
+        .broker
+        .fetch_account_activities(&AccountActivitiesQuery::pnl(
+            query.activity_after()?,
+            query.activity_until()?,
+        ))
+        .await
+        .map_err(|error| PnlReportError::Activities(Box::new(error)))?;
+
+    let permit = admission.admit().await?;
+
+    Ok(summarize_pnl_report(deps.pool, shared, query, activities, Utc::now(), permit).await?)
+}
+
 #[cfg(test)]
 pub(crate) async fn build_pnl_report(
     pool: &SqlitePool,
@@ -256,6 +341,10 @@ pub(crate) async fn build_pnl_report(
 /// replay permit, as freshness is async I/O and must not burn a live
 /// blocking-replay slot; a waiting admission runs it after its permit (see
 /// [`PnlReportAdmission::admit_before_catch_up`]).
+///
+/// The report is [`load_and_replay_pnl`] and then [`summarize_pnl_report`]
+/// for its one window, the same two steps every window of
+/// [`run_pnl_window_reports`] takes.
 pub(crate) async fn build_pnl_report_with_permit(
     pool: &SqlitePool,
     query: &PnlQuery,
@@ -264,6 +353,34 @@ pub(crate) async fn build_pnl_report_with_permit(
     permit: OwnedSemaphorePermit,
     head: LedgerHead,
 ) -> Result<PnlResponse, PnlError> {
+    let (shared, permit) = load_and_replay_pnl(pool, query, head, permit).await?;
+
+    summarize_pnl_report(pool, &shared, query, alpaca_activities, now, permit).await
+}
+
+/// A replay at one resolved watermark, and what every window summarized from
+/// it shares.
+struct SharedPnlReplay {
+    replay: Arc<PnlReplay>,
+    cost_rows: Arc<Vec<CostLedgerRow>>,
+    bot_gas_rows: Arc<Vec<BotGasCostRow>>,
+    symbols: BTreeSet<String>,
+    /// The warnings every report starts with.
+    warnings: Vec<String>,
+    resolved_rowid: ResolvedRowid,
+}
+
+/// The first half of every report: `query`'s starting warnings and symbol
+/// filter, its watermark resolved against `head`, the ledger rows at or
+/// below that watermark, and the replay over them on a blocking thread under
+/// `permit`, which comes back with the replay. Nothing here reads the
+/// query's dates, so every window over the same query shares the result.
+async fn load_and_replay_pnl(
+    pool: &SqlitePool,
+    query: &PnlQuery,
+    head: LedgerHead,
+    permit: OwnedSemaphorePermit,
+) -> Result<(SharedPnlReplay, OwnedSemaphorePermit), PnlError> {
     let mut warnings = vec![
         ATTRIBUTION_WARNING.to_owned(),
         BASELINE_WARNING.to_owned(),
@@ -271,10 +388,6 @@ pub(crate) async fn build_pnl_report_with_permit(
     ];
     let symbols = query.symbol_filter(&mut warnings)?;
     let resolved_rowid = resolve_as_of_rowid(query, head)?;
-    let effective_query = PnlQuery {
-        as_of_rowid: Some(resolved_rowid.resolved),
-        ..query.clone()
-    };
 
     let event_rows = load_position_rows(pool, &symbols, resolved_rowid.resolved).await?;
     let position_rows = load_position_view(pool).await?;
@@ -282,16 +395,51 @@ pub(crate) async fn build_pnl_report_with_permit(
     let bot_gas_rows = load_bot_gas_rows(pool, resolved_rowid.resolved).await?;
 
     let replay_symbols = symbols.clone();
+    let (replay, permit) = run_pnl_replay_with_permit(permit, move || {
+        replay_pnl_rows(event_rows, &position_rows, &replay_symbols)
+    })
+    .await?;
+
+    let shared = SharedPnlReplay {
+        replay: Arc::new(replay),
+        cost_rows: Arc::new(cost_rows),
+        bot_gas_rows: Arc::new(bot_gas_rows),
+        symbols,
+        warnings,
+        resolved_rowid,
+    };
+
+    Ok((shared, permit))
+}
+
+/// The second half of every report: one window's summary of `shared` for
+/// `query`'s dates on a blocking thread under `permit`, then its capital.
+async fn summarize_pnl_report(
+    pool: &SqlitePool,
+    shared: &SharedPnlReplay,
+    query: &PnlQuery,
+    alpaca_activities: Vec<AccountActivity>,
+    now: DateTime<Utc>,
+    permit: OwnedSemaphorePermit,
+) -> Result<PnlResponse, PnlError> {
+    let effective_query = PnlQuery {
+        as_of_rowid: Some(shared.resolved_rowid.resolved),
+        ..query.clone()
+    };
+    let replay = Arc::clone(&shared.replay);
+    let cost_rows = Arc::clone(&shared.cost_rows);
+    let bot_gas_rows = Arc::clone(&shared.bot_gas_rows);
+    let symbols = shared.symbols.clone();
+    let warnings = shared.warnings.clone();
     let ((mut response, daily_net_realized_pnl_usd), permit) =
         run_pnl_replay_with_permit(permit, move || {
-            build_pnl_response_from_rows(
-                event_rows,
-                &position_rows,
+            summarize_pnl_window(
+                &replay,
                 &cost_rows,
                 &bot_gas_rows,
                 &alpaca_activities,
                 &effective_query,
-                &replay_symbols,
+                &symbols,
                 warnings,
             )
         })
@@ -300,8 +448,8 @@ pub(crate) async fn build_pnl_report_with_permit(
     apply_capital_summary(
         pool,
         query,
-        &resolved_rowid,
-        &symbols,
+        &shared.resolved_rowid,
+        &shared.symbols,
         &daily_net_realized_pnl_usd,
         &mut response,
         now,

@@ -1918,33 +1918,40 @@ when the count fails. `liq_raindex_orders_total` and
 `{reason="<why>"} 1` with no total while not.
 
 Every 5 minutes a task publishes the `liq_pnl_*` series of six windows, each
-labelled `window`: `1d`, `1w`, `1m`, `ytd`, `1y` and `all`. Each window is one
-`GET /pnl` report built by the same code path as the endpoint, with its own
-ledger catch-up first. Every window ends on the last day with fills
+labelled `window`: `1d`, `1w`, `1m`, `ytd`, `1y` and `all`. Each window's report
+is the one `GET /pnl` returns for its dates at the same ledger head, but the six
+share one ledger catch-up, one `asOfRowid` watermark and one replay: the replay
+does not read the dates, so only the summary, the Alpaca activities and the
+capital are built per window. Every window ends on the last day with fills
 (`availableRange.lastDate`); the starts are that day, 6 days, 30 days and 364
 days before it, January 1 of its year, and the first day with fills, and no
-start is before the first day with fills. The task has its own report admission
-of one, so it never takes one of the two live `/pnl` permits; a window's report
-waits for that permit instead of failing, so the replays run one at a time. A
-report takes that permit before its ledger catch-up, so the head it replays to
-is read after its wait.
+start is before the first day with fills. Both days come from the shared replay
+itself, so the cycle that first replays a fill on a new day already ends every
+window on that day (the exporter lagged one cycle there). With no fills, no
+window is published. The task has its own report admission of one, so it never
+takes one of the two live `/pnl` permits; its report waits for that permit
+instead of failing, and takes it before the ledger catch-up, so the head it
+replays to is read after the wait.
 
-- The cycle starts the windows in turn inside a 120-second budget and waits up
-  to 30 seconds for each report before it starts the next window. A report that
-  takes longer is not cancelled: it keeps running and publishes its window when
-  it ends. That window starts no new report until then, so one window never has
-  two reports that could publish out of order. No window starts after the
-  budget. The first cycle starts with `1w`, and each later cycle starts one
-  window further along the order `1w`, `1d`, `all`, `1m`, `ytd`, `1y`, so the
-  windows a slow cycle skips change from cycle to cycle.
-- The 30-second wait frees the cycle, not the reports: the reports stay serial
-  behind the one permit, so a slow report delays every report queued behind it,
-  and those windows publish no sooner than in a sequential loop. A window's
-  `metrics_refresh_duration_seconds` includes its wait for the permit.
+- The cycle waits up to 120 seconds for its report. A report that takes longer
+  is not cancelled: it keeps running and publishes its windows when it ends. No
+  cycle starts a new report until then, so two reports never publish one window
+  out of order, and the replay work never exceeds one report at a time.
+- The windows publish together, in the refresh order `1w`, `1d`, `all`, `1m`,
+  `ytd`, `1y`, after the shared report has built all six. Each window fetches
+  its own Alpaca activities one after another, so one window's slow fetch (such
+  as `all` paging through its history, or a call that waits for its HTTP
+  timeout) delays all six, and can push the report past the 120-second wait.
+- A window's `metrics_refresh_duration_seconds` sample runs from the start of
+  the shared report to that window's publish, failed or not. It includes the
+  shared replay and every earlier window's Alpaca fetch and capital step, so a
+  later window in the refresh order always shows a longer duration.
 - Each window is its own family (`collector="pnl_<window>"`). A window whose
-  report fails, whose report is still running, or that does not fit the budget
-  keeps its last samples, and its collector time stops advancing. The exporter
-  dropped such a window until its next cycle; this is a deliberate difference.
+  report fails, or whose cycle's report is still running, keeps its last
+  samples, and its collector time stops advancing. A failure before the shared
+  replay ends, such as a ledger catch-up past its deadline, fails every window,
+  and records a duration sample for each of the six. The exporter dropped such a
+  window until its next cycle; this is a deliberate difference.
 - Summary, cost, capital, per-symbol and sample series copy `/pnl`'s fields. A
   decimal that does not parse, and a capital figure that is not computed, leave
   their series absent. Per-symbol rows whose symbols strip to the same label
