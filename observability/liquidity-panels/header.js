@@ -7,10 +7,10 @@
 // commit, info, equity_target, ...) plus the string labels some of them
 // carry (git_commit on commit; broker, wallet_kind, ... on info).
 //
-// RECOVERY_GUIDE and readHeaderRows are not defined here: the generator
-// prepends them from recovery-guide.json and header-rows.js (see pills() in
-// the generator), because the template output is sanitized and cannot carry
-// data into this code.
+// RECOVERY_GUIDE, readHeaderRows, commandLine and wireCopyButtons are not
+// defined here: the generator prepends them from recovery-guide.json,
+// header-rows.js and copy-command.js (see pills() in the generator), because
+// the template output is sanitized and cannot carry data into this code.
 
 const rows = Array.isArray(context.data) ? context.data : [];
 // header-rows.js, prepended.
@@ -77,7 +77,6 @@ const pills = [
   value.cash_reserved !== null && value.cash_reserved !== undefined
     ? pill(`Reserve <b class="hdr-mono">$${value.cash_reserved}</b>`)
     : '',
-  '<button class="hdr-pill hdr-button" data-open="config">Config</button>',
 ].join('');
 
 const configRow = (name, text) =>
@@ -123,7 +122,7 @@ const guideDialog = `
           .map(
             (entry) => `
           <div class="hdr-command">
-            <pre class="hdr-mono">${escapeHtml(forClientEnv(entry.command, ENV))}</pre>
+            ${commandLine(escapeHtml(forClientEnv(entry.command, ENV)), 'hdr-mono')}
             <div class="hdr-grid">
               <span class="hdr-muted">What</span><span>${escapeHtml(entry.description)}</span>
               <span class="hdr-muted">When</span><span>${escapeHtml(entry.whenToUse)}</span>
@@ -141,44 +140,92 @@ const guideDialog = `
 
 // The board refreshes every minute and each render replaces the markup, which
 // would close a dialog the operator is reading. Remember it to reopen it at
-// the same scroll position.
-const openDialog = root.querySelector('dialog[open]');
-const reopen = openDialog && {
-  name: openDialog.dataset.dialog,
-  scroll: openDialog.querySelector('.hdr-dialog-body')?.scrollTop || 0,
-};
+// the same scroll position. A dialog still open in this panel reopens with
+// no time limit, however long the operator has been reading it. The memory
+// lives on the window, not the element: a refresh with no data shows the
+// panel's "No bot data." in place of this markup, the dialog with it, and the
+// next render with data reopens it. It is per board page, so another tab's
+// header does not open it. The page is read now, not when a handler runs: a
+// handler can run after the operator went to another board. Only when the
+// dialog is gone does the memory age out, after two of the board's
+// one-minute refreshes, with slack for a slow query, so a guide closed by a
+// long stretch without data, or left open on a board the operator left, does
+// not open by itself much later. Each reopen renews it.
+const REOPEN_WITHIN_MS = 150000;
+const page = window.location.pathname;
+const dialogMemory = window.__liqHeaderDialog || (window.__liqHeaderDialog = { page: null, open: null });
+const remembered = dialogMemory.page === page ? dialogMemory.open : null;
+// A dismissal clears the memory before the dialog closes (Escape's cancel),
+// so a dialog open here that the memory does not name is closing.
+const stillOpen = root.querySelector('dialog[open]');
+const reopen =
+  remembered && stillOpen && stillOpen.dataset.dialog === remembered.name
+    ? { name: remembered.name, scroll: stillOpen.querySelector('.hdr-dialog-body').scrollTop }
+    : remembered && !stillOpen && Date.now() - remembered.at <= REOPEN_WITHIN_MS
+      ? remembered
+      : null;
 
 root.innerHTML = `
 <div class="hdr">
-  <div class="hdr-left">${pills}</div>
-  <div class="hdr-right">
-    <button class="hdr-guide" data-open="guide">CLI recovery guide</button>
-    <span class="hdr-mono hdr-muted" data-clock>${clock()}</span>
-    ${commit && commit.sha ? `<span class="hdr-mono hdr-muted" title="Deployed commit">${escapeHtml(commit.sha.slice(0, 7))}</span>` : ''}
-    <span class="hdr-muted" title="Bot uptime">${uptime(value.uptime)}</span>
-    <span class="hdr-badge ${connection[0]}">${connection[1]}</span>
-  </div>
+  <div class="hdr-pills">${pills}</div>
+  <button class="hdr-pill hdr-button" data-open="config">Config</button>
+  <button class="hdr-guide" data-open="guide">CLI recovery guide</button>
+  <span class="hdr-info hdr-muted">${[
+    `<span class="hdr-mono" data-clock>${clock()}</span>`,
+    commit && commit.sha ? `<span class="hdr-mono" title="Deployed commit">${escapeHtml(commit.sha.slice(0, 7))}</span>` : '',
+    value.up === 1 ? `<span title="Bot uptime">${uptime(value.uptime)}</span>` : '',
+  ].join('')}</span>
+  <span class="hdr-badge ${connection[0]}">${connection[1]}</span>
 </div>
 ${configDialog}
 ${guideDialog}`;
 
+const remember = (open) => {
+  dialogMemory.page = page;
+  dialogMemory.open = open && { ...open, at: Date.now() };
+};
 root.querySelectorAll('[data-open]').forEach((button) => {
-  button.addEventListener('click', () => root.querySelector(`[data-dialog="${button.dataset.open}"]`).showModal());
-});
-root.querySelectorAll('dialog').forEach((dialog) => {
-  dialog.querySelector('[data-close]').addEventListener('click', () => dialog.close());
-  // A click on the backdrop closes it, like the SPA.
-  dialog.addEventListener('click', (event) => {
-    if (event.target === dialog) dialog.close();
+  button.addEventListener('click', () => {
+    const dialog = root.querySelector(`[data-dialog="${button.dataset.open}"]`);
+    dialog.showModal();
+    // The body keeps the scroll of an earlier open since the last render.
+    remember({ name: button.dataset.open, scroll: dialog.querySelector('.hdr-dialog-body').scrollTop });
   });
 });
-if (reopen) {
-  const dialog = root.querySelector(`[data-dialog="${reopen.name}"]`);
-  if (dialog) {
-    dialog.showModal();
-    const body = dialog.querySelector('.hdr-dialog-body');
-    if (body) body.scrollTop = reopen.scroll;
-  }
+// The operator's dismissal is recorded when it is asked for: the close
+// button, a backdrop click, or Escape (cancel). The close event comes later,
+// queued, and a refresh can replace the markup before it runs, which would
+// lose the dismissal and reopen the dialog. A callback of a dialog that a
+// render or another board already removed is ignored.
+root.querySelectorAll('dialog').forEach((dialog) => {
+  const dismiss = () => {
+    if (dialog.isConnected) remember(null);
+    dialog.close();
+  };
+  dialog.querySelector('[data-close]').addEventListener('click', dismiss);
+  // A click on the backdrop closes it, like the SPA.
+  dialog.addEventListener('click', (event) => {
+    if (event.target === dialog) dismiss();
+  });
+  dialog.addEventListener('cancel', () => {
+    if (dialog.isConnected) remember(null);
+  });
+  const body = dialog.querySelector('.hdr-dialog-body');
+  body.onscroll = () => {
+    if (body.isConnected && dialog.open) remember({ name: dialog.dataset.dialog, scroll: body.scrollTop });
+  };
+});
+wireCopyButtons(root);
+// The render replaced this panel's dialogs, so a dialog open now is another
+// panel's, the row dialog say, and the remembered one must not open over it
+// and take its focus.
+const reopenDialog = reopen && root.querySelector(`[data-dialog="${reopen.name}"]`);
+if (reopenDialog && !document.querySelector('dialog[open]')) {
+  reopenDialog.showModal();
+  reopenDialog.querySelector('.hdr-dialog-body').scrollTop = reopen.scroll;
+  remember({ name: reopen.name, scroll: reopen.scroll });
+} else if (dialogMemory.page === page) {
+  dialogMemory.open = null;
 }
 
 // The SPA's ticking UTC clock. One interval per element, replaced on every
