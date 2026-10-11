@@ -704,21 +704,13 @@ async fn finish_startup_recovery(deps: StartupRecoveryDeps<'_>) -> anyhow::Resul
     // post-restart poll may emit no events (unchanged values are
     // deduplicated), leaving the view empty and potentially causing
     // incorrect rebalancing.
-    let hydration = restore_inventory_at_boot(
+    restore_inventory_at_boot(
         deps.pool,
         deps.inventory,
         deps.rebalancing_service,
         deps.position_projection,
     )
     .await?;
-    match hydration {
-        Hydration::Complete => deps.inventory.start_publishing_liq_metrics().await,
-        // A partly restored view would publish missing balances as zero.
-        Hydration::Incomplete => error!(
-            "Inventory hydration was incomplete; the liq_ inventory series stay \
-             unpublished until the next start"
-        ),
-    }
     deps.rebalancing_service
         .enqueue_recovery_for_current_wallet_balances()
         .await;
@@ -2048,12 +2040,16 @@ async fn compact_inventory_snapshot_events(pool: &SqlitePool) -> Result<u64, sql
 /// straddled the restart, whose hydrated Hedging balances are therefore
 /// ambiguous): cleared with the gate on entry, seeded with the gate below.
 /// See `InventoryView::set_pending_offchain_orders`.
+///
+/// Last, the seam starts the `liq_*` inventory series, but only after a
+/// complete hydration: a partly restored view would publish its missing
+/// balances as zero. Owning the start here keeps it after hydration.
 pub(crate) async fn restore_inventory_at_boot(
     pool: &SqlitePool,
     inventory: &Arc<BroadcastingInventory>,
     rebalancing_service: &Arc<RebalancingService>,
     position_projection: &Projection<Position>,
-) -> Result<Hydration, ProjectionError<Position>> {
+) -> Result<(), ProjectionError<Position>> {
     inventory
         .write_without_broadcast()
         .await
@@ -2065,11 +2061,21 @@ pub(crate) async fn restore_inventory_at_boot(
         .recover_pending_offchain_orders(position_projection)
         .await?;
 
-    Ok(hydration)
+    match hydration {
+        Hydration::Complete => inventory.start_publishing_liq_metrics().await,
+        Hydration::Incomplete => error!(
+            "Inventory hydration was incomplete; the liq_ inventory series stay \
+             unpublished for this run. A restart does not bring them back while the \
+             failing snapshot is unchanged"
+        ),
+    }
+
+    Ok(())
 }
 
-/// Whether boot read every persisted inventory snapshot. Boot goes on
-/// either way; only the `liq_*` inventory series wait for a complete read.
+/// Whether boot read and applied every persisted inventory snapshot. Boot
+/// goes on either way; only the `liq_*` inventory series wait for a complete
+/// hydration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Hydration {
     Complete,
@@ -2111,10 +2117,25 @@ async fn hydrate_single_snapshot(
         }
     };
 
-    let event_count = snapshot.hydrate_inventory(inventory).await;
-    if event_count > 0 {
-        info!(%id, event_count, "Hydrated InventoryView from persisted snapshot");
+    let report = snapshot.hydrate_inventory(inventory).await;
+    if report.events > 0 {
+        info!(
+            %id,
+            events = report.events,
+            failed = report.failed,
+            "Hydrated InventoryView from persisted snapshot"
+        );
     }
+
+    if report.failed > 0 {
+        warn!(
+            %id,
+            failed = report.failed,
+            "Some InventorySnapshot events failed to apply during hydration"
+        );
+        return Hydration::Incomplete;
+    }
+
     Hydration::Complete
 }
 
@@ -7936,8 +7957,12 @@ mod tests {
     use crate::conductor::builder::CqrsFrameworks;
     use crate::dashboard::{DashboardTradeDeliveryCtx, DashboardTradeDeliveryJobQueue};
     use crate::equity_redemption::{EquityRedemptionCommand, redemption_aggregate_id};
+    use crate::inventory::snapshot::{InventorySnapshotCommand, InventorySnapshotId};
     use crate::inventory::view::Operator;
     use crate::inventory::{ImbalanceThreshold, Inventory, InventoryView, Venue};
+    use crate::metrics::liquidity::LiqFamilies;
+    use crate::metrics::liquidity::inventory::tests::{leaked_families, publisher, rendered_store};
+    use crate::metrics::liquidity::tests::series;
     use crate::mint_authorization::{
         MintAuthorizationError, MockMintAuthorizer, StubVaultModeReader, VaultModeCheckError,
     };
@@ -8969,6 +8994,124 @@ mod tests {
             hydrate_inventory_from_snapshot(&pool, &inventory).await,
             Hydration::Incomplete
         );
+    }
+
+    /// Runs the boot seam over `pool` into a view that publishes the `liq_*`
+    /// inventory series, and returns the families it publishes into.
+    async fn boot_publishing_inventory(pool: &SqlitePool) -> &'static LiqFamilies {
+        let families = leaked_families();
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(
+            BroadcastingInventory::new(InventoryView::default(), event_sender)
+                .publishing_liq_metrics(publisher(families)),
+        );
+        let projection = Projection::<Position>::sqlite(pool.clone());
+        projection.catch_up().await.unwrap();
+
+        restore_inventory_at_boot(
+            pool,
+            &inventory,
+            &freeze_guard_test_service().await,
+            &projection,
+        )
+        .await
+        .unwrap();
+
+        families
+    }
+
+    fn snapshot_id(owner: Address) -> InventorySnapshotId {
+        InventorySnapshotId {
+            orderbook: Address::repeat_byte(0x11),
+            owner,
+        }
+    }
+
+    async fn persist_offchain_aapl(pool: &SqlitePool, id: &InventorySnapshotId) {
+        test_store::<InventorySnapshot>(pool.clone(), ())
+            .send(
+                id,
+                InventorySnapshotCommand::OffchainEquity {
+                    positions: BTreeMap::from([(
+                        Symbol::new("AAPL").unwrap(),
+                        FractionalShares::new(float!(90)),
+                    )]),
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    fn offchain_aapl(families: &LiqFamilies) -> Option<f64> {
+        rendered_store(families)
+            .get(&series(
+                "liq_equity_offchain_available",
+                &[("symbol", "AAPL")],
+            ))
+            .copied()
+    }
+
+    /// Boot starts the `liq_*` inventory series once every snapshot was
+    /// read and applied, with the restored balances.
+    #[tokio::test]
+    async fn boot_publishes_the_inventory_series_after_a_complete_hydration() {
+        let pool = setup_test_db().await;
+        persist_offchain_aapl(&pool, &snapshot_id(Address::repeat_byte(0x22))).await;
+
+        let families = boot_publishing_inventory(&pool).await;
+
+        assert_eq!(offchain_aapl(families), Some(90.0));
+    }
+
+    /// One snapshot that cannot be read keeps every inventory series off,
+    /// even though another snapshot restored its balances: a partly
+    /// restored view would publish the missing balances as zero.
+    #[tokio::test]
+    async fn boot_keeps_the_inventory_series_off_when_a_snapshot_read_fails() {
+        let pool = setup_test_db().await;
+        persist_offchain_aapl(&pool, &snapshot_id(Address::repeat_byte(0x22))).await;
+        sqlx::query(
+            "INSERT INTO events (aggregate_type, aggregate_id, sequence, \
+             event_type, event_version, payload, metadata) \
+             VALUES (?1, ?2, 1, 'InventorySnapshotEvent::OffchainEquity', '1.0', \
+             '{not-json', '{}')",
+        )
+        .bind(InventorySnapshot::AGGREGATE_TYPE)
+        .bind(snapshot_id(Address::repeat_byte(0x33)).to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let families = boot_publishing_inventory(&pool).await;
+
+        assert_eq!(rendered_store(families), BTreeMap::new());
+    }
+
+    /// A snapshot event the view refuses also keeps the series off.
+    #[tokio::test]
+    async fn boot_keeps_the_inventory_series_off_when_a_snapshot_event_fails_to_apply() {
+        let pool = setup_test_db().await;
+        let id = snapshot_id(Address::repeat_byte(0x22));
+        persist_offchain_aapl(&pool, &id).await;
+        test_store::<InventorySnapshot>(pool.clone(), ())
+            .send(
+                &id,
+                InventorySnapshotCommand::InflightEquity {
+                    mints: BTreeMap::from([(
+                        Symbol::new("AAPL").unwrap(),
+                        FractionalShares::new(float!(-3)),
+                    )]),
+                    redemptions: BTreeMap::new(),
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let families = boot_publishing_inventory(&pool).await;
+
+        assert_eq!(rendered_store(families), BTreeMap::new());
     }
 
     async fn freeze_guard_test_service() -> Arc<RebalancingService> {
