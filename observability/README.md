@@ -62,14 +62,15 @@ The test runs in the dashboard build of CI.
 The Dashboard tab's inventory is three Grafana tables, for their column filters:
 USD at Alpaca, USD on each chain, and Equities. Per-chain rows (USD · Onchain)
 and columns (Equities) come from the bot's `chain`-labelled series
-(`liq_usdc_chain_*`, `liq_usdc_corridor_*`, `liq_equity_chain_available`). The
-exporter does not publish them, so with `Source` on `exporter` the tables show
-the single Base row and column from the unlabelled series. The fallback is per
-source: while the bot publishes per-chain series, a chain without a labelled
-value shows none. The Equities Ratio is coloured only where it is the bot's own
-band verdict (a symbol rebalanced on Base, with a balance, with no vault on
-another chain, while the default Base target is set), so it is grey on the
-`exporter` source, which cannot see the other chains.
+(`liq_usdc_chain_*`, `liq_usdc_corridor_*`, `liq_equity_chain_available`; the
+board does not read `liq_equity_chain_inflight` yet). The exporter does not
+publish them, so with `Source` on `exporter` the tables show the single Base row
+and column from the unlabelled series. The fallback is per source: while the bot
+publishes per-chain series, a chain without a labelled value shows none. The
+Equities Ratio is coloured only where it is the bot's own band verdict (a symbol
+rebalanced on Base, with a balance, with no vault on another chain, while the
+default Base target is set), so it is grey on the `exporter` source, which
+cannot see the other chains.
 
 Trades and Rebalances are Grafana tables too. A row's ⓘ sets the hidden `detail`
 variable to the row's id; the `detail` panel, a second Business Text panel in

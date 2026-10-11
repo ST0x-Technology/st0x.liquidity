@@ -1797,19 +1797,25 @@ If the positions fail to load, the last published prices stay.
   0. The reserve is the configured cash reserve, else the gross broker cash
   minus the available broker cash once the gross is read, else 0. It is absent
   until withdrawable cash is read.
-- `liq_equity_chain_available{symbol,chain}` and
+- `liq_equity_chain_{available,inflight}{symbol,chain}` and
   `liq_usdc_chain_{available,inflight,ratio}{chain}` list each hedged chain's
-  vault separately. A chain whose vault no snapshot has read yet is left out: a
-  slot that only a fill, transfer or inflight created holds a delta from 0, not
-  a balance. A chain the config no longer hedges is left out too.
-  `liq_equity_chain_available` is in that chain's wrapped vault shares. Each
-  chain's wrapper has its own underlying-per-wrapped ratio, so the series must
-  not be summed across chains or added to broker shares. `liq_usdc_chain_ratio`
-  is that vault's available USDC over itself plus the gross broker cash. It is
-  absent until the gross broker cash is read and while both are 0: it is a
-  bot-only series, so the Values rule applies and no exporter sentinel stands
-  in. It is not the corridor's trigger ratio, which uses the vault total, in
-  flight included.
+  vault separately. The hedged chains come from the config, not from the view. A
+  chain whose vault no snapshot has read yet is left out: a slot that only a
+  fill, transfer or inflight created holds a delta from 0, not a balance. A
+  chain the config no longer hedges is left out too. `liq_equity_chain_inflight`
+  is the equity in flight from that chain's vault, for example a redemption the
+  broker has not credited yet. Adding it to `liq_equity_chain_available` for the
+  same chain and symbol keeps that redemption from reading as a drop. Its unit
+  changes during a redemption: wrapped vault shares while only the bot tracks
+  it, underlying shares once a provider poll lists the request. So the per-chain
+  sum is exact only where the wrapper's ratio is 1. `liq_equity_chain_available`
+  is in that chain's wrapped vault shares. Each chain's wrapper has its own
+  underlying-per-wrapped ratio, so the series must not be summed across chains
+  or added to broker shares. `liq_usdc_chain_ratio` is that vault's available
+  USDC over itself plus the gross broker cash. It is absent until the gross
+  broker cash is read and while both are 0: it is a bot-only series, so the
+  Values rule applies and no exporter sentinel stands in. It is not the
+  corridor's trigger ratio, which uses the vault total, in flight included.
 
 Every 60 seconds a second task publishes the performance families from the same
 loaders as the `/performance/*` endpoints, over the last 24 hours:
@@ -6927,8 +6933,12 @@ detects imbalances that trigger rebalancing. It is the central projection that
 monitors total system inventory.
 
 Each asset type (equities per symbol, USDC) is tracked via a generic
-`Inventory<T>` containing `Option<VenueBalance<T>>` per venue. The `Option`
-distinguishes "not yet polled" from "polled with zero balance" — imbalance
+`Inventory<T>`: an optional `VenueBalance<T>` for the broker (Hedging), and one
+`VenueBalance<T>` per chain for the onchain vaults (MarketMaking). Venue-
+addressed operations act on the primary chain's slot; snapshot events route by
+their own chain. A slot that a fill, transfer or inflight created before any
+vault snapshot read it is marked unpolled, so it does not count as a reading.
+"Not yet polled" stays distinct from "polled with zero balance": imbalance
 detection requires both venues to have been initialized by snapshot events.
 
 When `InventoryView` applies an equity snapshot (`OnchainEquity` for the
