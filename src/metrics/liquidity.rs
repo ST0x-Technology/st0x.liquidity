@@ -10,7 +10,7 @@
 //! Every name is a gauge: each block has a `# HELP` line and a
 //! `# TYPE <name> gauge` line. Untyped samples would be ingested twice by
 //! Managed Prometheus. See SPEC.md "Prometheus metrics (`liq_*` contract)" and
-//! `adrs/0026-liq-metrics-family-store-and-untyped-exposition.md`.
+//! `adrs/0026-liq-metrics-family-store-typed-as-gauges.md`.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
@@ -1017,8 +1017,7 @@ impl LiqFamilies {
     /// recorder output. A `liq_` name the recorder already rendered is
     /// skipped and logged, so the body never holds two blocks for one name.
     pub(crate) fn render_into(&self, body: &mut String) {
-        let snapshot = self.snapshot();
-        render_snapshot(&snapshot, body);
+        render_snapshot(&self.snapshot(), body);
     }
 
     fn snapshot(&self) -> Vec<(LiqFamily, Arc<[LiqSample]>, SystemTime)> {
@@ -1926,34 +1925,45 @@ pub(crate) mod tests {
         assert_eq!(after.get(&key), Some(&0.0));
     }
 
+    /// A render holds the store lock only while it copies the `Arc`s of its
+    /// snapshot: a replace returns while a large snapshot is held, and the
+    /// held snapshot still renders every series it was taken with.
     #[test]
-    fn a_large_family_renders_while_another_thread_replaces() {
-        let families = Arc::new(LiqFamilies::default());
+    fn a_replace_returns_while_a_large_snapshot_is_held() {
+        let families = LiqFamilies::default();
         let large: Vec<LiqSample> = (0..30_000)
             .map(|index| rebalancing(&format!("SYM{index}"), 1.0))
             .collect();
         families.replace(LiqFamily::Settings, large, at(10));
+        families.replace(LiqFamily::Health, vec![info("before")], at(10));
 
-        let writer = {
-            let families = Arc::clone(&families);
-            std::thread::spawn(move || {
-                for commit in 0..200 {
-                    families.replace(LiqFamily::Health, vec![info(&commit.to_string())], at(20));
-                }
-            })
-        };
-        let rendered = parse_exposition(&render(&families));
-        writer.join().unwrap();
+        let snapshot = families.snapshot();
+        families.replace(LiqFamily::Health, vec![info("after")], at(20));
+        let mut held = String::new();
+        render_snapshot(&snapshot, &mut held);
 
-        let rebalancing_series = rendered
+        let held = parse_exposition(&held);
+        let rebalancing_series = held
             .keys()
             .filter(|(name, _)| name == "liq_asset_rebalancing")
             .count();
         assert_eq!(rebalancing_series, 30_000);
-        let last = parse_exposition(&render(&families));
         assert_eq!(
-            last.get(&series("liq_bot_info", &[("git_commit", "199")])),
+            held.get(&series("liq_bot_info", &[("git_commit", "before")])),
             Some(&1.0)
+        );
+        assert_eq!(
+            held.get(&series("liq_bot_info", &[("git_commit", "after")])),
+            None
+        );
+        let after = parse_exposition(&render(&families));
+        assert_eq!(
+            after.get(&series("liq_bot_info", &[("git_commit", "after")])),
+            Some(&1.0)
+        );
+        assert_eq!(
+            after.get(&series("liq_bot_info", &[("git_commit", "before")])),
+            None
         );
     }
 

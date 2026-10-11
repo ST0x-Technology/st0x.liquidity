@@ -631,9 +631,15 @@ snapshot is read over the IAP SSH access described in `docs/cli-ops.md`.
    line (for example a bot `counter`) is a bug in the port. `2` means a snapshot
    is unusable, and `compare.py` prints the file and the reason. For
    `no ported liq_* series`, the wrong endpoint was read or a target was
-   degraded; check the endpoint and run it again. For any other reason
-   (`not UTF-8 text`, `not a Prometheus text body`, `repeated series`,
-   `repeated label name`, or `repeated TYPE`) in a `bot-N.prom` file, report it
-   as a bug in the port, because a rerun gives the same result.
+   degraded; check the endpoint and run it again. For
+   `partial snapshot, missing ...`, that body lacks a name its side always
+   publishes and another body on the same side has, usually because the target
+   restarted and had not read every source yet. Its pair would compare fewer
+   series, and a series one pair does not compare gives no finding there, so the
+   every-pair rule would drop a real difference the other pairs report. Wait a
+   few minutes and run it again. For any other reason (`not UTF-8 text`,
+   `not a Prometheus text body`, `repeated series`, `repeated label name`, or
+   `repeated TYPE`) in a `bot-N.prom` file, report it as a bug in the port,
+   because a rerun gives the same result.
 
 The block only reads, so it is safe to rerun.
