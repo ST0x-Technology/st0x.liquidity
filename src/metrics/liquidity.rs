@@ -747,10 +747,8 @@ impl LiqMetric {
             | Self::HedgeLatencyMsSamples
             | Self::OpenExposureFillCount
             | Self::OpenExposureOldestTsSeconds => Some(LiqFamily::Latencies),
-            Self::ReliabilityLogCount24h
-            | Self::LogTargetCount24h
-            | Self::FailureEventCount24h
-            | Self::JobQueue => Some(LiqFamily::Reliability),
+            Self::ReliabilityLogCount24h | Self::LogTargetCount24h => Some(LiqFamily::Logs),
+            Self::FailureEventCount24h | Self::JobQueue => Some(LiqFamily::Reliability),
             Self::BlockLagBlocks
             | Self::BlockLagSampledTsSeconds
             | Self::PollCycles24h
@@ -813,6 +811,10 @@ pub(crate) enum LiqFamily {
     /// progress.
     EquityBands,
     Latencies,
+    /// The error and warning counts, from the in-process counter. Apart from
+    /// the reliability family, so a failing database loader does not keep
+    /// them at their last values.
+    Logs,
     Reliability,
     Infra,
     Rebalances,
@@ -833,6 +835,7 @@ impl LiqFamily {
             Self::Prices => "prices",
             Self::EquityBands => "equity_bands",
             Self::Latencies => "latencies",
+            Self::Logs => "logs",
             Self::Reliability => "reliability",
             Self::Infra => "infra",
             Self::Rebalances => "rebalances",
@@ -856,6 +859,7 @@ impl LiqFamily {
             | Self::Prices
             | Self::EquityBands
             | Self::Latencies
+            | Self::Logs
             | Self::Reliability
             | Self::Infra
             | Self::Rebalances
@@ -1531,6 +1535,7 @@ pub(crate) mod tests {
                 LiqFamily::Prices,
                 LiqFamily::EquityBands,
                 LiqFamily::Latencies,
+                LiqFamily::Logs,
                 LiqFamily::Reliability,
                 LiqFamily::Infra,
                 LiqFamily::Rebalances,
@@ -1545,6 +1550,7 @@ pub(crate) mod tests {
                 "prices",
                 "equity_bands",
                 "latencies",
+                "logs",
                 "reliability",
                 "infra",
                 "rebalances",

@@ -1,11 +1,12 @@
-//! The performance families: hedge latencies, reliability, infrastructure
-//! and rebalance timings.
+//! The performance families: log counts, hedge latencies, reliability,
+//! infrastructure and rebalance timings.
 //!
-//! Each builder takes the report the matching `/performance/*` endpoint
-//! serves, so the series hold the numbers the exporter read from those
-//! endpoints. `liq-performance-refresh` builds them every 60 seconds over the
-//! last 24 hours, and the rebalance family every fifth cycle over the last 30
-//! days, like the exporter.
+//! Each builder but the log counts' takes the report the matching
+//! `/performance/*` endpoint serves, so the series hold the numbers the
+//! exporter read from those endpoints. The log counts come from the
+//! in-process counter in [`super::log_counts`]. `liq-performance-refresh`
+//! builds them every 60 seconds over the last 24 hours, and the rebalance
+//! family every fifth cycle over the last 30 days, like the exporter.
 //!
 //! The infrastructure series carry a `chain` label per hedged chain. The
 //! exporter published them without labels, from a report shape the bot no
@@ -70,20 +71,40 @@ pub(crate) fn latency_samples(report: &HedgeLatencies) -> Vec<LiqSample> {
     samples
 }
 
-/// Log counts and failure events in the window, and the instantaneous job
-/// queue counts. With log counts, both level rows are published, 0
-/// included, and a target row only with a positive count. Without them (the
-/// seed is not done) the log names are absent.
+/// Error and warning counts in the window: both level rows, 0 included, and
+/// a target row only with a positive count.
+pub(crate) fn log_count_samples(logs: &LogWindow) -> Vec<LiqSample> {
+    let mut samples = Vec::new();
+
+    for (level, count) in [("error", logs.errors), ("warning", logs.warnings)] {
+        push_sample(
+            &mut samples,
+            LiqMetric::ReliabilityLogCount24h,
+            vec![("level", level.to_string())],
+            integer_value(count),
+        );
+    }
+    for (level, target, count) in &logs.targets {
+        push_sample(
+            &mut samples,
+            LiqMetric::LogTargetCount24h,
+            vec![
+                ("level", level_label(*level).to_string()),
+                ("target", target.clone()),
+            ],
+            integer_value(*count),
+        );
+    }
+
+    samples
+}
+
+/// Failure events in the window and the instantaneous job queue counts.
 pub(crate) fn reliability_samples(
-    logs: Option<&LogWindow>,
     failure_events: &[FailureEventCount],
     job_queues: &[JobQueueHealth],
 ) -> Vec<LiqSample> {
     let mut samples = Vec::new();
-
-    if let Some(logs) = logs {
-        push_log_counts(&mut samples, logs);
-    }
 
     for event in failure_events {
         push_sample(
@@ -117,28 +138,6 @@ pub(crate) fn reliability_samples(
     }
 
     samples
-}
-
-fn push_log_counts(samples: &mut Vec<LiqSample>, logs: &LogWindow) {
-    for (level, count) in [("error", logs.errors), ("warning", logs.warnings)] {
-        push_sample(
-            samples,
-            LiqMetric::ReliabilityLogCount24h,
-            vec![("level", level.to_string())],
-            integer_value(count),
-        );
-    }
-    for (level, target, count) in &logs.targets {
-        push_sample(
-            samples,
-            LiqMetric::LogTargetCount24h,
-            vec![
-                ("level", level_label(*level).to_string()),
-                ("target", target.clone()),
-            ],
-            integer_value(*count),
-        );
-    }
 }
 
 /// Block lag and poll health per hedged chain, and dependency call stats.
@@ -516,24 +515,27 @@ pub(crate) mod tests {
         );
     }
 
+    /// The exporter published the log counts in its reliability family, so
+    /// the one golden covers both bot families.
     #[test]
-    fn reliability_matches_the_exporter_golden() {
+    fn reliability_and_log_counts_match_the_exporter_golden() {
         let report = reliability_fixture();
         assert_fixture(&report, include_str!("testdata/reliability.json"));
+        let golden = include_str!("testdata/reliability.prom");
 
         assert_eq!(
             render_family(
                 LiqFamily::Reliability,
-                reliability_samples(
-                    Some(&log_window_from_dto(&report)),
-                    &report.failure_events,
-                    &report.job_queues,
-                ),
+                reliability_samples(&report.failure_events, &report.job_queues),
             ),
-            golden_for(
-                LiqFamily::Reliability,
-                include_str!("testdata/reliability.prom")
-            )
+            golden_for(LiqFamily::Reliability, golden)
+        );
+        assert_eq!(
+            render_family(
+                LiqFamily::Logs,
+                log_count_samples(&log_window_from_dto(&report)),
+            ),
+            golden_for(LiqFamily::Logs, golden)
         );
     }
 
@@ -571,10 +573,7 @@ pub(crate) mod tests {
     /// there are no target rows, as the endpoint reports.
     #[test]
     fn without_log_counts_both_levels_read_zero() {
-        let rendered = render_family(
-            LiqFamily::Reliability,
-            reliability_samples(Some(&LogWindow::default()), &[], &[]),
-        );
+        let rendered = render_family(LiqFamily::Logs, log_count_samples(&LogWindow::default()));
 
         assert_eq!(
             rendered,
@@ -589,34 +588,6 @@ pub(crate) mod tests {
                 ),
             ])
         );
-    }
-
-    /// Before the seed is done the log names are absent rather than low;
-    /// the rest of the family still publishes.
-    #[test]
-    fn without_seeded_log_counts_the_log_names_are_absent() {
-        let report = reliability_fixture();
-
-        let rendered = render_family(
-            LiqFamily::Reliability,
-            reliability_samples(None, &report.failure_events, &report.job_queues),
-        );
-
-        assert!(
-            rendered
-                .keys()
-                .all(|(name, _)| name != "liq_reliability_log_count_24h"
-                    && name != "liq_log_target_count_24h"),
-            "{rendered:?}"
-        );
-        assert_eq!(
-            rendered.get(&series(
-                "liq_failure_event_count_24h",
-                &[("event_type", "OffchainOrderEvent::Failed")]
-            )),
-            Some(&2.0)
-        );
-        assert_eq!(rendered.len(), 9);
     }
 
     #[test]

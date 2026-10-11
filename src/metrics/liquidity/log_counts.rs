@@ -8,17 +8,25 @@
 //! scan every minute and its 50,000-entry cap.
 //!
 //! The counter is active only when file logging is, like the endpoint. It
-//! records when it was activated, before the subscriber is installed, so
-//! every file event of this process is later than that instant. Once per
-//! process, in the background, the buckets are seeded from the files with
-//! only the entries before that instant, so an event of this process is not
-//! counted twice and the previous process's events survive a restart. Until
-//! the seed is done the log names are not published.
+//! is activated before the subscriber is installed, and it then records the
+//! length of every log file, so every byte this process writes lies past
+//! those lengths. Once per process, in the background, the buckets are
+//! seeded from the files, each read only up to its recorded length. So an
+//! event of this process is not counted twice, the previous processes'
+//! events survive a restart, and neither depends on the wall clock: a clock
+//! that steps back after the start cannot make an entry of this process read
+//! as an earlier one. Until the seed is done the log names are not
+//! published.
 //!
 //! Only this process's events are counted live. Lines another process writes
 //! into the same files after activation, such as an operator's `st0x-cli`
 //! run with the production config, are read by the endpoint but not counted
 //! here until the next restart seeds them.
+//!
+//! Time is bounded on both sides, as the endpoint bounds it. The seed reads
+//! no entry dated after activation, such as one a previous process logged
+//! while its clock ran ahead, and a window counts no minute after its own:
+//! such a minute is kept and counts once the clock reaches it.
 //!
 //! A bucket covers a whole minute, so the 24-hour window can differ from the
 //! endpoint's exact interval by the events in its first minute. An event is
@@ -36,7 +44,7 @@ use tracing::{Level, error, warn};
 use st0x_config::LogEventSink;
 use st0x_dto::CountedLogLevel;
 
-use crate::api::{LogFilter, visit_matching_entries};
+use crate::api::{LogFileExtent, LogFilter, log_file_extents, visit_extent_entries};
 
 /// The window both log names count over.
 const LOG_COUNT_WINDOW: chrono::Duration = chrono::Duration::hours(24);
@@ -46,13 +54,15 @@ const SECONDS_PER_MINUTE: i64 = 60;
 /// The process-wide counter, set once when file logging is configured.
 static LOG_COUNTS: OnceLock<Arc<LogCounts>> = OnceLock::new();
 
-/// Activates counting for this process.
+/// Activates counting for this process and records the lengths of the log
+/// files in `log_dir`, which bound the seed.
 ///
-/// Returns the sink to pass to the tracing setup. Call it only when file logging is configured, before the
-/// subscriber is installed. A second call returns the same counter.
-pub fn activate_log_counts() -> Arc<dyn LogEventSink> {
+/// Returns the sink to pass to the tracing setup. Call it only when file
+/// logging is configured, before the subscriber is installed. A second call
+/// returns the same counter.
+pub fn activate_log_counts(log_dir: &str) -> Arc<dyn LogEventSink> {
     LOG_COUNTS
-        .get_or_init(|| Arc::new(LogCounts::new(Utc::now())))
+        .get_or_init(|| Arc::new(LogCounts::activate(log_dir, Utc::now())))
         .clone()
 }
 
@@ -66,6 +76,13 @@ type Buckets = BTreeMap<String, BTreeMap<i64, u64>>;
 
 pub(crate) struct LogCounts {
     activated_at: DateTime<Utc>,
+    /// The log files and their lengths at activation: what the previous
+    /// processes wrote. The seed reads these bytes and no others.
+    previous_files: Vec<LogFileExtent>,
+    /// Why the listing at activation missed files, if it did. No subscriber
+    /// exists then, so the seed logs it. A later listing would also see this
+    /// process's bytes, so the miss is final.
+    listing_error: Option<std::io::Error>,
     /// Indexed by [`level_index`].
     buckets: Mutex<[Buckets; 2]>,
     seed: Mutex<SeedState>,
@@ -115,9 +132,15 @@ impl LogEventSink for LogCounts {
 }
 
 impl LogCounts {
-    pub(crate) fn new(activated_at: DateTime<Utc>) -> Self {
+    /// A counter activated at `now`, with the lengths the log files in
+    /// `log_dir` have now. A missing directory has no previous files.
+    pub(crate) fn activate(log_dir: &str, now: DateTime<Utc>) -> Self {
+        let (previous_files, listing_error) = log_file_extents(log_dir, &seed_filter(now));
+
         Self {
-            activated_at,
+            activated_at: now,
+            previous_files,
+            listing_error,
             buckets: Mutex::new([Buckets::new(), Buckets::new()]),
             seed: Mutex::new(SeedState::NotStarted { failed_attempts: 0 }),
         }
@@ -156,8 +179,12 @@ impl LogCounts {
 
     /// The counts of the minutes that overlap the 24 hours before `now`.
     /// Older minutes are dropped, and a target with none left is forgotten.
+    /// Minutes after `now`'s minute, from a clock that stepped back, are kept
+    /// but not counted, as the endpoint's upper bound skips their lines; a
+    /// target with only such minutes is not listed.
     pub(crate) fn window(&self, now: DateTime<Utc>) -> LogWindow {
         let oldest_kept = unix_minute(now - LOG_COUNT_WINDOW);
+        let newest_counted = unix_minute(now);
         let mut buckets = self.buckets.lock().unwrap_or_else(PoisonError::into_inner);
         let mut window = LogWindow::default();
 
@@ -169,7 +196,13 @@ impl LogCounts {
             });
 
             for (target, minutes) in by_target.iter() {
-                let count: u64 = minutes.values().sum();
+                let count: u64 = minutes
+                    .range(..=newest_counted)
+                    .map(|(_, count)| count)
+                    .sum();
+                if count == 0 {
+                    continue;
+                }
                 match level {
                     CountedLogLevel::Error => window.errors += count,
                     CountedLogLevel::Warn => window.warnings += count,
@@ -186,7 +219,7 @@ impl LogCounts {
     /// failed, it starts in the background and this returns false. The
     /// state is per process, so a restarted refresh task neither repeats a
     /// finished seed nor starts a second one.
-    pub(crate) fn seeded_or_start(self: &Arc<Self>, log_dir: &str) -> bool {
+    pub(crate) fn seeded_or_start(self: &Arc<Self>) -> bool {
         let mut state = self.seed.lock().unwrap_or_else(PoisonError::into_inner);
         let failed_attempts = match *state {
             SeedState::Done => return true,
@@ -197,10 +230,9 @@ impl LogCounts {
         drop(state);
 
         let counts = Arc::clone(self);
-        let log_dir = log_dir.to_string();
         let last_attempt = failed_attempts + 1 >= MAX_SEED_ATTEMPTS;
         tokio::spawn(async move {
-            let next = match counts.seed(&log_dir, last_attempt).await {
+            let next = match counts.seed(last_attempt).await {
                 Ok(()) => SeedState::Done,
                 Err(error) if last_attempt => {
                     error!(%error, "Log counts seeded without the previous process's entries");
@@ -221,12 +253,14 @@ impl LogCounts {
 
     /// Adds the entries the previous processes wrote in the 24 hours before
     /// activation. A scan that hit a read error adds nothing, unless
-    /// `accept_partial` (the last attempt), when it adds what it read.
-    async fn seed(&self, log_dir: &str, accept_partial: bool) -> Result<(), SeedError> {
-        let activated_at = self.activated_at;
-        let log_dir = log_dir.to_string();
+    /// `accept_partial` (the last attempt), when it adds what it read. A
+    /// retry cannot recover files the listing at activation missed, so the
+    /// seed then adds the files it has and logs the miss.
+    async fn seed(&self, accept_partial: bool) -> Result<(), SeedError> {
+        let filter = seed_filter(self.activated_at);
+        let previous_files = self.previous_files.clone();
         let Scan { seed, error } =
-            tokio::task::spawn_blocking(move || scan_previous_entries(&log_dir, activated_at))
+            tokio::task::spawn_blocking(move || scan_previous_entries(&previous_files, &filter))
                 .await?;
 
         match error {
@@ -236,6 +270,10 @@ impl LogCounts {
                 error!(%error, "Log counts seeded from the log files that could be read");
             }
             Some(error) => return Err(error.into()),
+        }
+
+        if let Some(error) = &self.listing_error {
+            error!(%error, "Log counts seeded without the log files the start could not list");
         }
         Ok(())
     }
@@ -254,11 +292,12 @@ impl LogCounts {
     }
 }
 
-/// Error and warning entries in `log_dir` from the 24 hours before
-/// `activated_at`, strictly before it, bucketed like live events. An entry
-/// without a timestamp is skipped, as the endpoint skips it.
-fn scan_previous_entries(log_dir: &str, activated_at: DateTime<Utc>) -> Scan {
-    let filter = LogFilter {
+/// The error and warning entries from the 24 hours before activation. The
+/// recorded file lengths, not the upper time bound, separate the previous
+/// processes' entries from this process's; the bound only drops entries a
+/// previous process dated after activation, while its clock ran ahead.
+fn seed_filter(activated_at: DateTime<Utc>) -> LogFilter {
+    LogFilter {
         search_lower: None,
         levels: Some(vec![
             level_label(CountedLogLevel::Error).to_string(),
@@ -267,10 +306,16 @@ fn scan_previous_entries(log_dir: &str, activated_at: DateTime<Utc>) -> Scan {
         targets: None,
         since: Some(activated_at - LOG_COUNT_WINDOW),
         until: Some(activated_at),
-    };
+    }
+}
+
+/// The entries of `previous_files` that pass `filter`, each file read up to
+/// its recorded length, bucketed like live events. An entry without a
+/// timestamp is skipped, as the endpoint skips it.
+fn scan_previous_entries(previous_files: &[LogFileExtent], filter: &LogFilter) -> Scan {
     let mut seed = [Buckets::new(), Buckets::new()];
 
-    let read = visit_matching_entries(log_dir, &filter, |entry| {
+    let read = visit_extent_entries(previous_files, filter, |entry| {
         let Some(at) = entry["timestamp"]
             .as_str()
             .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
@@ -278,9 +323,6 @@ fn scan_previous_entries(log_dir: &str, activated_at: DateTime<Utc>) -> Scan {
         else {
             return;
         };
-        if at >= activated_at {
-            return;
-        }
 
         let level = match entry["level"].as_str() {
             Some(raw) if raw.eq_ignore_ascii_case("ERROR") => CountedLogLevel::Error,
@@ -338,8 +380,13 @@ mod tests {
 
     const ACTIVATED: &str = "2026-03-02T12:00:30Z";
 
+    /// A counter without previous log files.
     fn counts() -> LogCounts {
-        LogCounts::new(at(ACTIVATED))
+        LogCounts::activate("/nonexistent/log/dir", at(ACTIVATED))
+    }
+
+    fn counts_in(dir: &std::path::Path) -> LogCounts {
+        LogCounts::activate(dir.to_str().unwrap(), at(ACTIVATED))
     }
 
     fn window(errors: u64, warnings: u64, targets: &[(CountedLogLevel, &str, u64)]) -> LogWindow {
@@ -423,6 +470,33 @@ mod tests {
         );
     }
 
+    /// A minute after `now`, from a clock that stepped back after the event,
+    /// is not counted yet; it counts once the clock reaches it.
+    #[test]
+    fn a_minute_after_now_counts_once_the_clock_reaches_it() {
+        let counts = counts();
+        let now = at("2026-03-02T12:05:00Z");
+        let ahead = now + chrono::Duration::minutes(10);
+        counts.record_at(Level::ERROR, "hedge", now);
+        counts.record_at(Level::ERROR, "bridge", ahead);
+
+        assert_eq!(
+            counts.window(now),
+            window(1, 0, &[(CountedLogLevel::Error, "hedge", 1)])
+        );
+        assert_eq!(
+            counts.window(ahead),
+            window(
+                2,
+                0,
+                &[
+                    (CountedLogLevel::Error, "bridge", 1),
+                    (CountedLogLevel::Error, "hedge", 1),
+                ]
+            )
+        );
+    }
+
     #[test]
     fn a_target_without_events_in_the_window_disappears() {
         let counts = counts();
@@ -440,8 +514,13 @@ mod tests {
         );
     }
 
+    /// Appends the lines to the file, creating it if needed.
     fn write_log(dir: &std::path::Path, name: &str, lines: &[(&str, &str, &str)]) {
-        let mut file = std::fs::File::create(dir.join(name)).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(name))
+            .unwrap();
         for (timestamp, level, target) in lines {
             writeln!(
                 file,
@@ -451,11 +530,13 @@ mod tests {
         }
     }
 
-    /// The seed takes the previous processes' entries, strictly before
-    /// activation; the events this process logged after activation are
-    /// already counted live, so nothing is counted twice.
+    /// The seed takes the previous processes' entries from the 24 hours
+    /// before activation, and only the bytes the files held at activation.
+    /// The lines this process writes after it are counted live, so nothing
+    /// is counted twice, even when a clock stepped back gives them a time
+    /// before activation, and a file created after activation is not read.
     #[tokio::test]
-    async fn the_seed_adds_only_entries_before_activation() {
+    async fn the_seed_reads_only_what_the_files_held_at_activation() {
         let dir = tempfile::tempdir().unwrap();
         write_log(
             dir.path(),
@@ -465,35 +546,93 @@ mod tests {
                 ("2026-03-02T11:59:00Z", "ERROR", "hedge"),
                 ("2026-03-02T12:00:00Z", "WARN", "inventory"),
                 ("2026-03-02T12:00:00Z", "INFO", "hedge"),
-                ("2026-03-02T12:00:30Z", "ERROR", "hedge"),
-                ("2026-03-02T12:00:40Z", "ERROR", "hedge"),
             ],
         );
-        let counts = counts();
-        counts.record_at(Level::ERROR, "hedge", at("2026-03-02T12:00:30Z"));
-        counts.record_at(Level::ERROR, "hedge", at("2026-03-02T12:00:40Z"));
+        let counts = counts_in(dir.path());
 
-        counts
-            .seed(dir.path().to_str().unwrap(), false)
-            .await
-            .unwrap();
+        let stepped_back = [
+            ("2026-03-02T11:59:40Z", "ERROR", "hedge"),
+            ("2026-03-02T11:59:50Z", "WARN", "inventory"),
+        ];
+        write_log(dir.path(), "st0x-hedge.log.2026-03-02", &stepped_back[..1]);
+        write_log(dir.path(), "st0x-hedge.log.2026-03-03", &stepped_back[1..]);
+        counts.record_at(Level::ERROR, "hedge", at(stepped_back[0].0));
+        counts.record_at(Level::WARN, "inventory", at(stepped_back[1].0));
+
+        counts.seed(false).await.unwrap();
 
         assert_eq!(
             counts.window(at("2026-03-02T12:01:00Z")),
             window(
-                3,
-                1,
+                2,
+                2,
                 &[
-                    (CountedLogLevel::Error, "hedge", 3),
-                    (CountedLogLevel::Warn, "inventory", 1),
+                    (CountedLogLevel::Error, "hedge", 2),
+                    (CountedLogLevel::Warn, "inventory", 2),
                 ]
             )
         );
     }
 
-    async fn wait_until_seeded(counts: &Arc<LogCounts>, log_dir: &str) {
+    /// A line another process was writing at activation is cut by the
+    /// recorded length. The cut part does not parse, so the seed skips it
+    /// instead of reading past the length; the lines before it count.
+    #[tokio::test]
+    async fn a_line_cut_by_the_recorded_length_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "st0x-hedge.log.2026-03-02";
+        write_log(
+            dir.path(),
+            name,
+            &[("2026-03-02T11:58:00Z", "ERROR", "hedge")],
+        );
+        let append = |bytes: &[u8]| {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(dir.path().join(name))
+                .unwrap()
+                .write_all(bytes)
+                .unwrap();
+        };
+        append(br#"{"timestamp":"2026-03-02T11:59:00Z","level":"ERROR","#);
+        let counts = counts_in(dir.path());
+        append(b"\"target\":\"bridge\"}\n");
+
+        counts.seed(false).await.unwrap();
+
+        assert_eq!(
+            counts.window(at("2026-03-02T12:01:00Z")),
+            window(1, 0, &[(CountedLogLevel::Error, "hedge", 1)])
+        );
+    }
+
+    /// A previous process whose clock ran ahead dated an entry after this
+    /// activation. The seed leaves it out, so it never counts, even once
+    /// the clock passes its time.
+    #[tokio::test]
+    async fn the_seed_skips_entries_dated_after_activation() {
+        let dir = tempfile::tempdir().unwrap();
+        write_log(
+            dir.path(),
+            "st0x-hedge.log.2026-03-02",
+            &[
+                ("2026-03-02T11:59:00Z", "ERROR", "hedge"),
+                ("2026-03-02T12:30:00Z", "ERROR", "bridge"),
+            ],
+        );
+        let counts = counts_in(dir.path());
+
+        counts.seed(false).await.unwrap();
+
+        assert_eq!(
+            counts.window(at("2026-03-02T12:31:00Z")),
+            window(1, 0, &[(CountedLogLevel::Error, "hedge", 1)])
+        );
+    }
+
+    async fn wait_until_seeded(counts: &Arc<LogCounts>) {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while !counts.seeded_or_start(log_dir) {
+            while !counts.seeded_or_start() {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         })
@@ -511,15 +650,11 @@ mod tests {
             "st0x-hedge.log.2026-03-02",
             &[("2026-03-02T11:59:00Z", "ERROR", "hedge")],
         );
-        let counts = Arc::new(counts());
-        let log_dir = dir.path().to_str().unwrap();
+        let counts = Arc::new(counts_in(dir.path()));
 
-        assert!(
-            !counts.seeded_or_start(log_dir),
-            "the first call only starts it"
-        );
-        wait_until_seeded(&counts, log_dir).await;
-        assert!(counts.seeded_or_start(log_dir));
+        assert!(!counts.seeded_or_start(), "the first call only starts it");
+        wait_until_seeded(&counts).await;
+        assert!(counts.seeded_or_start());
 
         assert_eq!(counts.window(at("2026-03-02T12:01:00Z")).errors, 1);
     }
@@ -528,7 +663,7 @@ mod tests {
     async fn a_missing_log_directory_seeds_nothing() {
         let counts = counts();
 
-        counts.seed("/nonexistent/log/dir", false).await.unwrap();
+        counts.seed(false).await.unwrap();
 
         assert_eq!(
             counts.window(at("2026-03-02T12:01:00Z")),
@@ -559,39 +694,47 @@ mod tests {
             &[("2026-03-02T11:59:00Z", "ERROR", "hedge")],
         );
         std::fs::create_dir(dir.path().join("st0x-hedge.log.backup")).unwrap();
-        let log_dir = dir.path().to_str().unwrap();
-        let counts = counts();
+        let counts = counts_in(dir.path());
 
-        assert!(matches!(
-            counts.seed(log_dir, false).await,
-            Err(SeedError::Read(_))
-        ));
+        assert!(matches!(counts.seed(false).await, Err(SeedError::Read(_))));
         assert_eq!(
             counts.window(at("2026-03-02T12:01:00Z")),
             LogWindow::default()
         );
 
-        counts.seed(log_dir, true).await.unwrap();
+        counts.seed(true).await.unwrap();
         assert_eq!(counts.window(at("2026-03-02T12:01:00Z")).errors, 1);
     }
 
-    /// A seed that keeps failing is retried on the next refreshes, then
-    /// accepted with what it read, so the log names do not stay absent until
-    /// a restart.
+    /// A seed that keeps failing, here on an unreadable file, is retried
+    /// on the next refreshes, then accepted with what it read, so the log
+    /// names do not stay absent until a restart.
     #[tokio::test]
     async fn a_failing_seed_is_retried_then_accepted() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        let not_a_directory = file.path().to_str().unwrap();
-        let counts = Arc::new(counts());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("st0x-hedge.log.backup")).unwrap();
+        let counts = Arc::new(counts_in(dir.path()));
 
         for failed_attempts in 1..MAX_SEED_ATTEMPTS {
-            assert!(!counts.seeded_or_start(not_a_directory));
+            assert!(!counts.seeded_or_start());
             wait_for_state(&counts, SeedState::NotStarted { failed_attempts }).await;
         }
-        assert!(!counts.seeded_or_start(not_a_directory));
+        assert!(!counts.seeded_or_start());
         wait_for_state(&counts, SeedState::Done).await;
 
-        assert!(counts.seeded_or_start(not_a_directory));
+        assert!(counts.seeded_or_start());
+    }
+
+    /// A listing that failed at activation cannot heal on a retry, so the
+    /// first attempt seeds what it has instead of failing.
+    #[tokio::test]
+    async fn a_failed_listing_seeds_on_the_first_attempt() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let counts = Arc::new(counts_in(file.path()));
+        assert!(counts.listing_error.is_some());
+
+        assert!(!counts.seeded_or_start());
+        wait_for_state(&counts, SeedState::Done).await;
     }
 
     #[test]

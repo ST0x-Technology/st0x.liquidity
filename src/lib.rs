@@ -98,6 +98,16 @@ pub use st0x_config::{
 pub use startup::PROCESS_START;
 pub use tls::install_tls_crypto_provider;
 
+/// Installs the process-wide Prometheus recorder; the bot session reuses it.
+///
+/// Call it before the tracing setup: an event the counting layer forwards
+/// before the recorder exists increments no `log_events_total`, so the
+/// warnings logged while the bot boots would be missing from it.
+pub fn install_metrics_recorder() -> anyhow::Result<()> {
+    metrics::setup().context("failed to install Prometheus recorder")?;
+    Ok(())
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub use offchain::order::{OffchainOrder, OffchainOrderId};
 #[cfg(any(test, feature = "test-support"))]

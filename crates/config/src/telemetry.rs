@@ -546,8 +546,11 @@ pub type ExtraLayer =
 
 /// Installs the global subscriber.
 ///
-/// `log_sink` receives every event the file log writes and is attached only when a file layer is built, so it counts
-/// exactly what `/logs` and `/performance/reliability` can read back.
+/// `log_sink` is attached only when a file layer is built, behind the file
+/// layer's own filter, so it receives the events the file log writes. That
+/// is close to, not exactly, what `/logs` reads back: SPEC.md lists how the
+/// log counts differ (lines the file writer drops, lines other processes
+/// append).
 pub fn setup_tracing(
     log_level: &LogLevel,
     log_format: LogFormat,
@@ -1155,6 +1158,80 @@ mod tests {
 
         assert!(file_guard.is_none());
         assert_eq!(*sink.0.lock(), []);
+    }
+
+    /// With a file layer, the subscriber `setup_tracing` installs feeds the
+    /// sink: dropping the counting layer from it fails this test.
+    ///
+    /// It installs the global subscriber, so it needs a process of its own.
+    /// The repository runs tests with cargo-nextest, which runs every test in
+    /// its own process; under `cargo test` it fails on the guard assertion
+    /// below, not silently.
+    #[test]
+    fn setup_tracing_feeds_the_sink_from_the_file_layer() {
+        let dir = tempdir().unwrap();
+        let file_logging =
+            FileLogging::new(dir.path().to_str().unwrap().to_owned(), LogLevel::Info);
+        let sink = Arc::new(RecordingSink::default());
+
+        let file_guard = setup_tracing(
+            &LogLevel::Info,
+            LogFormat::Text,
+            Some(&file_logging),
+            None,
+            Some(sink.clone()),
+        );
+        tracing::error!(target: "hedge", "written to the file");
+
+        assert!(
+            file_guard.is_some(),
+            "no global subscriber installed: another test in this process set \
+             one first; run the tests with cargo-nextest"
+        );
+        let recorded = sink.0.lock().clone();
+        assert!(
+            recorded.contains(&(tracing::Level::ERROR, "hedge".to_string())),
+            "{recorded:?}"
+        );
+    }
+
+    /// The same for the subscriber `TelemetryCtx::setup` installs with a
+    /// file layer. The exporters point at a closed local port; nothing here
+    /// waits on them. It also installs the global subscriber, so it relies on
+    /// cargo-nextest's process per test in the same way.
+    #[test]
+    fn telemetry_setup_feeds_the_sink_from_the_file_layer() {
+        let dir = tempdir().unwrap();
+        let file_logging =
+            FileLogging::new(dir.path().to_str().unwrap().to_owned(), LogLevel::Info);
+        let sink = Arc::new(RecordingSink::default());
+        let ctx = TelemetryCtx {
+            service_name: "test-service".to_string(),
+            environment: "test".to_string(),
+            traces_endpoint: Url::parse("http://localhost:10428").unwrap(),
+            logs_endpoint: Url::parse("http://localhost:9428").unwrap(),
+        };
+
+        let (file_guard, _telemetry_guard) = ctx
+            .setup(
+                tracing::Level::INFO,
+                LogFormat::Text,
+                Some(&file_logging),
+                None,
+                Some(sink.clone()),
+            )
+            .expect(
+                "setup failed; a global subscriber already set by another test in \
+                 this process fails it: run the tests with cargo-nextest",
+            );
+        tracing::error!(target: "hedge", "written to the file");
+
+        assert!(file_guard.is_some(), "the file layer was built");
+        let recorded = sink.0.lock().clone();
+        assert!(
+            recorded.contains(&(tracing::Level::ERROR, "hedge".to_string())),
+            "{recorded:?}"
+        );
     }
 
     #[test]
