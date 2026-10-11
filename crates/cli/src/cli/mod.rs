@@ -528,12 +528,18 @@ pub enum Commands {
         chain: Option<TokenizationNetwork>,
     },
 
-    /// Mark a pre-burn USDC rebalance as failed, clearing the in-progress guard.
+    /// Mark a pre-burn USDC rebalance as failed.
     ///
-    /// Valid only from `BridgingSubmitting` or `WithdrawalComplete`. Refused for
-    /// any state where a CCTP burn transaction has been submitted. Drives the
-    /// aggregate to `BridgingFailed { burn_tx_hash: None }`, which is
-    /// non-guard-holding. Guard clears on the next bot restart.
+    /// Valid from `WithdrawalComplete`, from `BridgingSubmitting` with no
+    /// recorded burn, and from a BaseToAlpaca `WithdrawalSubmitting` whose
+    /// withdrawal never reached the chain. Refused for any state where a CCTP
+    /// burn transaction has been submitted. The first two end in
+    /// `BridgingFailed { burn_tx_hash: None }`, the last in `WithdrawalFailed`.
+    /// A BaseToAlpaca guard clears on the next bot restart; at
+    /// `WithdrawalComplete` or `BridgingSubmitting` its withdrawn USDC sits in
+    /// the market-maker wallet, so move it back to the vault by hand. An
+    /// AlpacaToBase guard stays held until `transfer reconcile --kind usdc`
+    /// settles the withdrawn funds.
     ///
     /// Safety procedure:
     /// - Stop the bot before running to avoid the concurrent-burn race where the
@@ -541,7 +547,13 @@ pub enum Commands {
     ///   send.
     /// - For a `BridgingSubmitting` transfer, verify on-chain that no recent
     ///   CCTP burn left the market-maker wallet before running (a crash at this
-    ///   state may have broadcast a burn whose event never persisted).
+    ///   state may have broadcast a burn whose event never persisted), and close
+    ///   the wallet's nonce first as docs/cli-ops.md describes.
+    /// - For a BaseToAlpaca `WithdrawalSubmitting` transfer, confirm on Base
+    ///   that the bot wallet made no `OperatorWithdraw` after the transfer's
+    ///   `from_block` and that none is pending, as docs/cli-ops.md
+    ///   ("Withdrawal that never reached the chain") describes. If one landed,
+    ///   use `transfer resume --kind usdc` instead.
     /// - Post-burn terminal failures (e.g. `DepositFailed`) use
     ///   `transfer reconcile`. In-flight post-burn states (`Bridging`,
     ///   `AwaitingAttestation`, `Attested`, `Bridged`, `DepositInitiated`)
@@ -1039,8 +1051,11 @@ pub enum CctpCommand {
     /// Live RPC only: touches no database state or aggregate. Ensure the bot is
     /// not concurrently driving the same on-chain mint. After completing the
     /// mint, bring a stuck `UsdcRebalance` aggregate back in sync: `transfer
-    /// resume` while it is still non-terminal (it adopts the existing mint), or
-    /// `transfer reconcile` if it already reached a post-burn terminal failure.
+    /// resume` while it is still non-terminal (it adopts the existing mint),
+    /// and `transfer reconcile` only after a terminal failure whose funds leg
+    /// is done and verified at the destination. For a BaseToAlpaca bridge that
+    /// failed after its burn, run this mint only as a step of docs/cli-ops.md,
+    /// "Settling a post-burn Base to Alpaca failure by hand".
     CompleteMint {
         /// Transaction hash of the burn transaction on the source chain
         #[arg(long = "burn-tx")]
@@ -4177,6 +4192,62 @@ mod tests {
                 assert!(!all);
             }
             _ => panic!("expected view rebuild simple command"),
+        }
+    }
+
+    /// Every offline stox command the SPA shows, written by
+    /// `dashboard/src/lib/transfer-board.test.ts`.
+    const SHOWN_STOX_COMMANDS: &str = include_str!("../../testdata/shown-stox-commands.txt");
+
+    /// Each way to fill a shown command's `<a|b>` placeholders, split into
+    /// words.
+    fn expand_shown_stox(line: &str) -> Vec<Vec<String>> {
+        line.split_whitespace()
+            .fold(vec![Vec::new()], |argvs, word| {
+                let choices: Vec<String> = match word
+                    .strip_prefix('<')
+                    .and_then(|rest| rest.strip_suffix('>'))
+                {
+                    Some(inner) if inner.contains('|') => {
+                        inner.split('|').map(str::to_string).collect()
+                    }
+                    Some(inner) => panic!("no test value for the placeholder <{inner}> in {line}"),
+                    None => vec![word.to_string()],
+                };
+                argvs
+                    .iter()
+                    .flat_map(|argv| {
+                        choices.iter().map(move |choice| {
+                            let mut next = argv.clone();
+                            next.push(choice.clone());
+                            next
+                        })
+                    })
+                    .collect()
+            })
+    }
+
+    /// The SPA shows offline stox commands for the steps that run with the
+    /// bot stopped. Each must parse and classify, so a USDC reconcile's id is
+    /// a UUID and its reason one the command accepts.
+    #[test]
+    fn every_shown_stox_command_parses() {
+        let lines: Vec<&str> = SHOWN_STOX_COMMANDS
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+            .collect();
+        assert!(!lines.is_empty(), "the shown stox command file is empty");
+
+        for line in lines {
+            for argv in expand_shown_stox(line) {
+                assert_eq!(argv.first().map(String::as_str), Some("stox"), "{line}");
+                let argv = std::iter::once("st0x-cli".to_string()).chain(argv.into_iter().skip(1));
+                let cli = Cli::try_parse_from(argv)
+                    .unwrap_or_else(|error| panic!("{line} does not parse: {error}"));
+                if let Err(error) = classify_command(cli.command) {
+                    panic!("{line} does not classify: {error:#}");
+                }
+            }
         }
     }
 

@@ -45,14 +45,14 @@
         },
         {
           "command": "st0x-liquidity-client --env production debug reconcile-equity <mint|redemption> <id> --reason \"<reason>\"",
-          "description": "Mark a terminally-failed equity transfer Reconciled after handling residue manually.",
+          "description": "Mark a terminally-failed equity transfer Reconciled after handling residue manually. For a redemption that failed at detection or was rejected before the bot started, its amount stays in flight until the next restart.",
           "whenToUse": "An equity transfer is in a terminal failure and its residue was settled out-of-band (bookkeeping).",
           "appliesTo": "Failed equity mint / redemption",
           "mode": "requires-bot"
         },
         {
           "command": "st0x-liquidity-client --env production debug reconcile-usdc <id> --reason <funds-moved-manually|deposit-credited-offline>",
-          "description": "Mark a failed USDC bridge Reconciled after its funds were settled manually.",
+          "description": "Mark a failed USDC bridge Reconciled after its funds were settled manually. Base to Alpaca after its burn (not a deposit or conversion failure): unless the mint was reported unresolvable or funds were already moved by hand, keep the bot running and run resume-usdc base-to-alpaca, which re-polls Circle, then mints and sends. Otherwise do not mint, send or reconcile it with the bot running: the bot re-runs its recovery at every start and can send the USDC to Alpaca itself, with no check for an earlier send. Follow docs/cli-ops.md, \"Settling a post-burn Base to Alpaca failure by hand\". The offline form is stox transfer reconcile --kind usdc --id <id> --reason <funds-moved-manually|deposit-credited-offline>.",
           "whenToUse": "A USDC bridge failed after its funds left the source venue, and they were settled out-of-band.",
           "appliesTo": "USDC failure with funds off the source venue (DepositFailed, any AlpacaToBase BridgingFailed, a post-burn BaseToAlpaca BridgingFailed, or BaseToAlpaca ConversionFailed)",
           "mode": "requires-bot"
@@ -95,7 +95,7 @@
       "commands": [
         {
           "command": "st0x-liquidity-client --env production debug cctp complete-mint --burn-tx <hash> --source-chain <ethereum|base>",
-          "description": "Complete the destination-chain mint of a stuck CCTP transfer. A burn Circle has not attested yet fails at once as retryable; rerun it later.",
+          "description": "Complete the destination-chain mint of a stuck CCTP transfer. A burn Circle has not attested yet fails at once as retryable; rerun it later. If the burn belongs to a stuck USDC bridge, run resume-usdc afterwards while the bridge is not terminal. Run reconcile-usdc only after a terminal failure whose funds leg is done and verified at the destination. For a Base to Alpaca bridge that failed after its burn, follow docs/cli-ops.md, \"Settling a post-burn Base to Alpaca failure by hand\", instead.",
           "whenToUse": "A CCTP burn succeeded but attestation polling was interrupted before the mint.",
           "appliesTo": "CCTP cross-chain USDC transfer",
           "mode": "requires-bot"
