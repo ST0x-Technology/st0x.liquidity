@@ -149,8 +149,12 @@ pub(crate) fn infra_samples(report: &InfraReport) -> Vec<LiqSample> {
         let Some(chain) = label_value(&lag.chain) else {
             continue;
         };
+
         let labels = vec![("chain", chain)];
 
+        // Each series copies its report field. A sample time without a lag
+        // is a latest sample with no cutoff block (ingestion paused); the
+        // board tells it apart from a chain never sampled.
         if let Some(blocks) = lag.current_lag_blocks {
             push_sample(
                 &mut samples,
@@ -706,6 +710,28 @@ pub(crate) mod tests {
                 (series("liq_poll_errors_24h", &robinhood), 0.0),
                 (series("liq_poll_skipped_ticks_24h", &robinhood), 0.0),
             ])
+        );
+    }
+
+    /// A latest sample with no cutoff block has a sample time and no lag in
+    /// the report: ingestion is paused. The series copy the report, so the
+    /// board can show "ingestion paused" apart from "never sampled".
+    #[test]
+    fn a_paused_chain_publishes_its_sample_time_without_a_lag() {
+        let mut report = infra_fixture();
+        report.dependencies.clear();
+        report.monitor.block_lag[1].current_lag_sampled_at = Some(at("2026-03-01T12:01:00Z"));
+
+        let rendered = render_family(LiqFamily::Infra, infra_samples(&report));
+
+        let robinhood = [("chain", "robinhood")];
+        assert_eq!(
+            rendered.get(&series("liq_block_lag_sampled_ts_seconds", &robinhood)),
+            Some(&1_772_366_460.0)
+        );
+        assert_eq!(
+            rendered.get(&series("liq_block_lag_blocks", &robinhood)),
+            None
         );
     }
 

@@ -1487,7 +1487,7 @@
       "id": 49,
       "type": "stat",
       "title": "",
-      "description": "SPA secondary line: age of the current block-lag sample.",
+      "description": "SPA secondary line: age of the oldest hedged chain's block-lag sample, so one stale chain shows behind a fresh one. A chain whose latest sample has a time but no lag has no cutoff block, and the stat reads \"ingestion paused\" (the SPA's warning). A chain with neither series has no checkpointed sample yet and reads \"no checkpoint yet\" (the SPA's 'no checkpointed samples yet'). Paused wins over no checkpoint, and both win over an age.",
       "datasource": {
         "type": "stackdriver",
         "uid": "cloudmon"
@@ -1502,7 +1502,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "time() - max(liq_block_lag_sampled_ts_seconds{job=~\"$source\"})",
+            "expr": "min(0 * (liq_block_lag_sampled_ts_seconds{job=~\"$source\"} unless on(chain) liq_block_lag_blocks{job=~\"$source\"}) - 2 or on(chain) (0 * (liq_poll_cycles_24h{job=~\"$source\"} unless on(chain) liq_block_lag_sampled_ts_seconds{job=~\"$source\"}) - 1)) or max(clamp_min(time() - (liq_block_lag_sampled_ts_seconds{job=~\"$source\"} and on(chain) liq_block_lag_blocks{job=~\"$source\"}), 0))",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1524,6 +1524,21 @@
       "fieldConfig": {
         "defaults": {
           "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "-2": {
+                  "text": "ingestion paused",
+                  "color": "orange",
+                  "index": 0
+                },
+                "-1": {
+                  "text": "no checkpoint yet",
+                  "color": "text",
+                  "index": 1
+                }
+              }
+            },
             {
               "type": "special",
               "options": {
@@ -1552,7 +1567,7 @@
         "overrides": []
       },
       "options": {
-        "colorMode": "none",
+        "colorMode": "value",
         "graphMode": "none",
         "textMode": "value_and_name",
         "justifyMode": "center",

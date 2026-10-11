@@ -2104,6 +2104,11 @@ panels.append(stat(
            {"color": "red", "value": 300}],
     w=4, h=4, x=20, y=2, text_mode="value"))
 
+# Sentinels of the "sampled ago" stat. Real ages are clamped at 0, so a
+# negative value is always a state; the lower one wins under min().
+LAG_PAUSED = -2
+LAG_NEVER_SAMPLED = -1
+
 # F1: the SPA's secondary context line per SLO card (e.g. "p50 118ms · 42
 # fills") as a thin strip of small stats directly under the card row —
 # chosen over hover descriptions because the pill row above already
@@ -2171,9 +2176,26 @@ panels.append(stat(
         "0": {"text": "all hedged", "color": "green", "index": 0}}}],
     w=3, h=1, x=17, y=6, value_size=10))
 panels.append(stat(
-    "", "SPA secondary line: age of the current block-lag sample.",
-    "time() - max(liq_block_lag_sampled_ts_seconds)",
-    display="sampled ago", unit="s", decimals=0, color_mode="none",
+    "", "SPA secondary line: age of the oldest hedged chain's block-lag "
+    "sample, so one stale chain shows behind a fresh one. A chain whose "
+    "latest sample has a time but no lag has no cutoff block, and the "
+    "stat reads \"ingestion paused\" (the SPA's warning). A chain with "
+    "neither series has no checkpointed sample yet and reads \"no "
+    "checkpoint yet\" (the SPA's 'no checkpointed samples yet'). Paused "
+    "wins over no checkpoint, and both win over an age.",
+    "min(0 * (liq_block_lag_sampled_ts_seconds "
+    f"unless on(chain) liq_block_lag_blocks) - {-LAG_PAUSED} "
+    "or on(chain) (0 * (liq_poll_cycles_24h "
+    "unless on(chain) liq_block_lag_sampled_ts_seconds) "
+    f"- {-LAG_NEVER_SAMPLED})) "
+    "or max(clamp_min(time() - (liq_block_lag_sampled_ts_seconds "
+    "and on(chain) liq_block_lag_blocks), 0))",
+    display="sampled ago", unit="s", decimals=0,
+    mappings=[{"type": "value", "options": {
+        str(LAG_PAUSED): {"text": "ingestion paused", "color": "orange",
+                          "index": 0},
+        str(LAG_NEVER_SAMPLED): {"text": "no checkpoint yet",
+                                 "color": "text", "index": 1}}}],
     w=2, h=1, x=20, y=6, value_size=10))
 panels.append(stat(
     "", "SPA secondary line: order-fill monitor poll ticks skipped "
@@ -2921,8 +2943,52 @@ def check_no_custom_hidden(boards):
         raise SystemExit(f"{len(failures)} tables use custom.hidden")
 
 
+def check_lag_age_states(boards):
+    """The "sampled ago" stat maps each sentinel its expression can give to
+    its state, builds the paused branch from a sample time without a lag,
+    and gives the sentinels precedence over the ages. The ages sit under
+    `max`, so with two valid chains (say 30s and 600s old) the stat shows
+    600s; the sentinels sit under `min`, so paused wins over no checkpoint.
+    CI runs this on --check."""
+    panels = [panel for board in boards for panel in board_panels(board)
+              if panel.get("fieldConfig", {}).get("defaults", {})
+              .get("displayName") == "sampled ago"]
+    if len(panels) != 1:
+        raise SystemExit(f"expected one 'sampled ago' stat, found {len(panels)}")
+    panel = panels[0]
+    expr = panel["targets"][0]["promQLQuery"]["expr"]
+    texts = {key: result["text"]
+             for mapping in panel["fieldConfig"]["defaults"]["mappings"]
+             if mapping["type"] == "value"
+             for key, result in mapping["options"].items()}
+    want = {str(LAG_PAUSED): "ingestion paused",
+            str(LAG_NEVER_SAMPLED): "no checkpoint yet"}
+    problems = [f"{key} maps to {texts.get(key)!r}, not {text!r}"
+                for key, text in want.items() if texts.get(key) != text]
+    sentinels, sep, ages = expr.partition(") or max(")
+    if not sep or not sentinels.startswith("min("):
+        problems.append("want min(<sentinels>) or max(<ages>)")
+    for branch in (f"liq_block_lag_blocks{{{LIQ_JOB_MATCHER}}}) "
+                   f"- {-LAG_PAUSED} ",
+                   f"liq_block_lag_sampled_ts_seconds{{{LIQ_JOB_MATCHER}}}) "
+                   f"- {-LAG_NEVER_SAMPLED})",
+                   "unless on(chain) liq_block_lag_blocks",
+                   "unless on(chain) liq_block_lag_sampled_ts_seconds"):
+        if branch not in sentinels:
+            problems.append(f"sentinels miss {branch!r}")
+    for branch in ("clamp_min(", "and on(chain) liq_block_lag_blocks"):
+        if branch not in ages:
+            problems.append(f"ages miss {branch!r}")
+    if "clamp_min(" in sentinels:
+        problems.append("ages must not sit under the sentinels' min")
+    if LAG_PAUSED >= LAG_NEVER_SAMPLED or LAG_NEVER_SAMPLED >= 0:
+        problems.append("paused must sort below no checkpoint, below 0")
+    if problems:
+        raise SystemExit(f"'sampled ago' stat: {problems} in {expr}")
+
 check_pin_liq()
 check_bar_cells()
+check_lag_age_states(dashboards)
 check_liq_pinned(dashboards)
 check_log_sources(dashboards)
 check_series_names(dashboards)

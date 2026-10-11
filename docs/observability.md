@@ -332,8 +332,14 @@ second writer. A test scans `src/` for this.
 These typed recorder metrics count at the source, so a later board can use
 `increase()` and `histogram_quantile()` instead of the 24-hour `liq_*`
 snapshots. Duration histograms render with fixed buckets (`_bucket{le}` lines),
-not as summaries. A supervised upkeep task drains the histogram buffers every 5
-seconds, so they stay bounded when nothing scrapes `/metrics`.
+not as summaries; `metrics_refresh_duration_seconds` adds buckets from 90 to 300
+seconds, because a P&L refresh can take longer than a minute. A supervised
+upkeep task drains the histogram buffers every 5 seconds, so they stay bounded
+when nothing scrapes `/metrics`. Each fill watcher registers its
+`order_fill_poll_cycles_total` outcomes and
+`order_fill_poll_skipped_ticks_total` at 0 when it starts, and the telemetry
+channel does the same for `telemetry_samples_dropped_total`, so `increase()`
+sees the first error, pause or drop.
 
 `order_fill_poll_cycles_total{outcome}` is `ok`, `error`, or `paused`. A
 `paused` cycle succeeds but ingests nothing, because the cutoff block is unknown
@@ -353,7 +359,7 @@ sample time, so only `outcome="paused"` shows that stall.
 | `order_fill_poll_duration_seconds`               | histogram | `chain`                              | each order-fill poll cycle                               |
 | `order_fill_block_lag_blocks`                    | gauge     | `chain`                              | each poll that knows the cutoff block and the checkpoint |
 | `order_fill_block_lag_sampled_timestamp_seconds` | gauge     | `chain`                              | same, set to the poll's sample time                      |
-| `metrics_refresh_duration_seconds`               | histogram | `collector`                          | each performance or PnL window refresh (PnL: see below)  |
+| `metrics_refresh_duration_seconds`               | histogram | `collector`                          | each prices/performance/orders/PnL run (PnL: see below)  |
 | `log_events_total`                               | counter   | `level`, `target`                    | each error and warning the file log writes               |
 
 ### Catalog
@@ -416,7 +422,7 @@ sample time, so only `outcome="paused"` shows that stall.
 | `liq_failure_event_count_24h`           | `event_type`                                                                                                               | `reliability`    | lifecycle failure events in 24 h                                                                                               |
 | `liq_job_queue`                         | `job_type`, `state`                                                                                                        | `reliability`    | queue counts now, not windowed                                                                                                 |
 | `liq_block_lag_blocks`                  | `chain`                                                                                                                    | `infra`          | latest sampled lag of each hedged chain; absent until known                                                                    |
-| `liq_block_lag_sampled_ts_seconds`      | `chain`                                                                                                                    | `infra`          | time of that sample                                                                                                            |
+| `liq_block_lag_sampled_ts_seconds`      | `chain`                                                                                                                    | `infra`          | time of that sample; present without the lag while ingestion is paused                                                         |
 | `liq_poll_cycles_24h`                   | `chain`                                                                                                                    | `infra`          | order-fill poll cycles in 24 h                                                                                                 |
 | `liq_poll_errors_24h`                   | `chain`                                                                                                                    | `infra`          | failed cycles in 24 h                                                                                                          |
 | `liq_poll_skipped_ticks_24h`            | `chain`                                                                                                                    | `infra`          | dropped poll ticks in 24 h                                                                                                     |
@@ -454,7 +460,7 @@ sample time, so only `outcome="paused"` shows that stall.
 | `liq_pending_orders`                    | `status`                                                                                                                   | `pending_orders` | count per status among the newest 100 live broker order rows, without unparseable ones; absent at 0; every 60 s                |
 | `liq_pending_orders_total`              |                                                                                                                            | `pending_orders` | the newest 100 live broker order rows, without unparseable ones (they still take a slot); kept when the read fails             |
 | `liq_pending_orders_uncapped_total`     |                                                                                                                            | `pending_orders` | every live broker order row, uncapped and unparsed; absent when the count fails                                                |
-| `liq_raindex_orders_total`              |                                                                                                                            | `raindex`        | `pagination.totalOrders` of the st0x REST API (missing reads as 0); absent while unavailable                                   |
+| `liq_raindex_orders_total`              |                                                                                                                            | `raindex`        | `pagination.totalOrders` of the st0x REST API (missing reads as 0, a numeric string as its number); absent while unavailable   |
 | `liq_raindex_orders_unavailable`        | `reason`                                                                                                                   | `raindex`        | `1` with the reason while unavailable, else `0` with `reason=""`                                                               |
 | `liq_collector_last_success_ts_seconds` | `collector`                                                                                                                | store            | Unix time each family was last published                                                                                       |
 
@@ -486,7 +492,12 @@ window.
 3. Write the builder in its own submodule. It takes a metrics-owned input type,
    not a dashboard DTO, computes in exact types, and converts once with
    `float_value` or `integer_value`. A value that does not convert is skipped
-   and logged.
+   and logged. The exception is a family that copies an endpoint: it takes that
+   endpoint's DTO from the same loader, so the two cannot drift. The performance
+   families take the DTO of their `/performance/*` endpoint, the pending orders
+   take `PendingOrderResponse` and the P&L windows take the `/pnl` response.
+   Their label values are the DTO's serde names, so a serde rename changes a
+   published label value: a contract change, as in step 1.
 4. Publish with `LIQ_FAMILIES.replace(family, samples, now)`. Each call replaces
    the whole family.
 5. Add a golden case: a fixture JSON under `src/metrics/liquidity/testdata/`, a

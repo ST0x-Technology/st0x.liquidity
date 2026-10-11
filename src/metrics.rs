@@ -24,21 +24,35 @@ const DURATION_BUCKETS: [f64; 13] = [
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
 
-/// Duration histograms rendered with [`DURATION_BUCKETS`].
-const BUCKETED_HISTOGRAMS: [&str; 3] = [
-    "dependency_call_duration_seconds",
-    "order_fill_poll_duration_seconds",
-    "metrics_refresh_duration_seconds",
+/// Bucket bounds, in seconds, for `metrics_refresh_duration_seconds`:
+/// [`DURATION_BUCKETS`] plus bounds above 60 seconds. A P&L window may use
+/// its whole 120-second budget, and a slower run must not fall only into
+/// `+Inf`, where `histogram_quantile` cannot place it.
+const REFRESH_DURATION_BUCKETS: [f64; 17] = [
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 90.0, 120.0, 180.0,
+    300.0,
+];
+
+/// Each duration histogram that renders as a Prometheus histogram, with its
+/// bucket bounds.
+const BUCKETED_HISTOGRAMS: [(&str, &[f64]); 3] = [
+    ("dependency_call_duration_seconds", &DURATION_BUCKETS),
+    ("order_fill_poll_duration_seconds", &DURATION_BUCKETS),
+    (
+        "metrics_refresh_duration_seconds",
+        &REFRESH_DURATION_BUCKETS,
+    ),
 ];
 
 fn builder() -> Result<PrometheusBuilder, BuildError> {
     // Kept as a function so tests build a local recorder with the same
     // buckets the process-global one has.
-    BUCKETED_HISTOGRAMS
-        .into_iter()
-        .try_fold(PrometheusBuilder::new(), |builder, name| {
-            builder.set_buckets_for_metric(Matcher::Full(name.to_string()), &DURATION_BUCKETS)
-        })
+    BUCKETED_HISTOGRAMS.into_iter().try_fold(
+        PrometheusBuilder::new(),
+        |builder, (name, buckets)| {
+            builder.set_buckets_for_metric(Matcher::Full(name.to_string()), buckets)
+        },
+    )
 }
 
 /// How often [`RecorderUpkeep`] drains the recorder's histogram buffers.
@@ -307,6 +321,7 @@ mod tests {
 
     use super::*;
     use crate::metrics::liquidity::settings::health_samples;
+    use crate::metrics::liquidity::tests::{parse_exposition, series};
     use crate::metrics::liquidity::{LIQ_FAMILIES, LiqFamily};
 
     // These tests install the process-global Prometheus recorder. nextest runs
@@ -411,6 +426,33 @@ mod tests {
             "every liq_ name is a gauge, got:\n{body}"
         );
         assert!(body.contains("liq_bot_info{git_commit=\"0123456789ab\"} 1\n"));
+    }
+
+    /// A refresh slower than 60 seconds lands in a finite bucket, so a P&L
+    /// window that uses its 120-second budget shows in the quantiles.
+    #[test]
+    fn the_refresh_histogram_has_buckets_above_sixty_seconds() {
+        let recorder = local_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || {
+            metrics::histogram!("metrics_refresh_duration_seconds", "collector" => "pnl_all")
+                .record(Duration::from_secs(100));
+        });
+
+        let rendered = parse_exposition(&handle.render());
+        let bucket = |le: &str| {
+            rendered
+                .get(&series(
+                    "metrics_refresh_duration_seconds_bucket",
+                    &[("collector", "pnl_all"), ("le", le)],
+                ))
+                .copied()
+        };
+        assert_eq!(bucket("60"), Some(0.0));
+        assert_eq!(bucket("90"), Some(0.0));
+        assert_eq!(bucket("120"), Some(1.0));
+        assert_eq!(bucket("300"), Some(1.0));
     }
 
     /// `liq_` names belong to the family store; a `metrics` macro with one
