@@ -8731,7 +8731,9 @@ field unchanged; the bot pins that list against the rules. A kind the extractor
 does not know yet pages as unclassified until the extractor and the rules learn
 it. A wrapper alert that embeds a rendered error (a dead-lettered job, a
 supervised worker's terminal failure) takes the most specific known kind named
-in its text, as the extractor does, and falls back to its own kind. The message
+in its text, as the extractor does. Each job's terminal failure message carries
+its own kind's phrase, so that kind applies when the error names nothing more
+specific; the bot pins that every such message holds a known phrase. The message
 text stays the same. A text log line also renders `kind="..."` after the
 message, and the extractor takes the rightmost phrase on the line, so a text
 line now classifies by the field unless a later field names another phrase. This

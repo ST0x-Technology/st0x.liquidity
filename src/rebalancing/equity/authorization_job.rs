@@ -115,7 +115,6 @@ impl Job<DeliverMintAuthorizationCtx> for DeliverMintAuthorization {
     const TERMINAL_FAILURE_MSG: &'static str = "Mint authorization delivery failed all retries; the orchestrator-mode \
          mint cannot proceed until the authorization reaches issuance. \
          Operator action required.";
-    const TERMINAL_FAILURE_KIND: AlertKind = AlertKind::MintAuthorizationDeliveryFailed;
 
     #[cfg(any(test, feature = "test-support"))]
     const JOB_KIND: crate::conductor::job::JobKind =
@@ -402,7 +401,7 @@ mod tests {
     fn terminal_failure_message_carries_its_kind() {
         assert_eq!(
             AlertKind::most_specific_in(<DeliverMintAuthorization as Job<DeliverMintAuthorizationCtx>>::TERMINAL_FAILURE_MSG),
-            Some(<DeliverMintAuthorization as Job<DeliverMintAuthorizationCtx>>::TERMINAL_FAILURE_KIND)
+            Some(AlertKind::MintAuthorizationDeliveryFailed)
         );
     }
 
