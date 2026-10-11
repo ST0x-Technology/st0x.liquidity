@@ -34,8 +34,7 @@
             "promQLQuery": {
               "projectName": "$env",
               "expr": "max(hedge_fill_latency_seconds{quantile=\"0.5\"})",
-              "step": "60s",
-              "legendFormat": "p50"
+              "step": "60s"
             },
             "timeSeriesList": {
               "projectName": "",
@@ -54,8 +53,7 @@
             "promQLQuery": {
               "projectName": "$env",
               "expr": "max(hedge_fill_latency_seconds{quantile=\"0.9\"})",
-              "step": "60s",
-              "legendFormat": "p90"
+              "step": "60s"
             },
             "timeSeriesList": {
               "projectName": "",
@@ -74,8 +72,7 @@
             "promQLQuery": {
               "projectName": "$env",
               "expr": "max(hedge_fill_latency_seconds{quantile=\"0.99\"})",
-              "step": "60s",
-              "legendFormat": "p99"
+              "step": "60s"
             },
             "timeSeriesList": {
               "projectName": "",
@@ -111,7 +108,44 @@
               "axisSoftMin": 0
             }
           },
-          "overrides": []
+          "overrides": [
+            {
+              "matcher": {
+                "id": "byFrameRefID",
+                "options": "A"
+              },
+              "properties": [
+                {
+                  "id": "displayName",
+                  "value": "p50"
+                }
+              ]
+            },
+            {
+              "matcher": {
+                "id": "byFrameRefID",
+                "options": "B"
+              },
+              "properties": [
+                {
+                  "id": "displayName",
+                  "value": "p90"
+                }
+              ]
+            },
+            {
+              "matcher": {
+                "id": "byFrameRefID",
+                "options": "C"
+              },
+              "properties": [
+                {
+                  "id": "displayName",
+                  "value": "p99"
+                }
+              ]
+            }
+          ]
         },
         "options": {
           "legend": {
@@ -146,8 +180,7 @@
             "promQLQuery": {
               "projectName": "$env",
               "expr": "sum by (symbol) (increase(hedge_fill_latency_seconds_sum[1h])) / sum by (symbol) (increase(hedge_fill_latency_seconds_count[1h]))",
-              "step": "60s",
-              "legendFormat": "{{symbol}}"
+              "step": "60s"
             },
             "timeSeriesList": {
               "projectName": "",
@@ -183,7 +216,20 @@
               "axisSoftMin": 0
             }
           },
-          "overrides": []
+          "overrides": [
+            {
+              "matcher": {
+                "id": "byFrameRefID",
+                "options": "A"
+              },
+              "properties": [
+                {
+                  "id": "displayName",
+                  "value": "${__field.labels.symbol}"
+                }
+              ]
+            }
+          ]
         },
         "options": {
           "legend": {
@@ -221,8 +267,7 @@
             "promQLQuery": {
               "projectName": "$env",
               "expr": "sum by (kind, symbol) (increase(broker_errors_total[1h]))",
-              "step": "60s",
-              "legendFormat": "{{kind}} \u00b7 {{symbol}}"
+              "step": "60s"
             },
             "timeSeriesList": {
               "projectName": "",
@@ -256,7 +301,20 @@
               "axisPlacement": "auto"
             }
           },
-          "overrides": []
+          "overrides": [
+            {
+              "matcher": {
+                "id": "byFrameRefID",
+                "options": "A"
+              },
+              "properties": [
+                {
+                  "id": "displayName",
+                  "value": "${__field.labels.kind} \u00b7 ${__field.labels.symbol}"
+                }
+              ]
+            }
+          ]
         },
         "options": {
           "legend": {
@@ -291,8 +349,7 @@
             "promQLQuery": {
               "projectName": "$env",
               "expr": "sum by (reason, symbol) (increase(hedge_scan_skipped_total[1h]))",
-              "step": "60s",
-              "legendFormat": "{{reason}} \u00b7 {{symbol}}"
+              "step": "60s"
             },
             "timeSeriesList": {
               "projectName": "",
@@ -326,7 +383,20 @@
               "axisPlacement": "auto"
             }
           },
-          "overrides": []
+          "overrides": [
+            {
+              "matcher": {
+                "id": "byFrameRefID",
+                "options": "A"
+              },
+              "properties": [
+                {
+                  "id": "displayName",
+                  "value": "${__field.labels.reason} \u00b7 ${__field.labels.symbol}"
+                }
+              ]
+            }
+          ]
         },
         "options": {
           "legend": {
@@ -361,8 +431,7 @@
             "promQLQuery": {
               "projectName": "$env",
               "expr": "sum by (reason, symbol) (increase(hedge_dead_lettered_total[1h]))",
-              "step": "60s",
-              "legendFormat": "{{reason}} \u00b7 {{symbol}}"
+              "step": "60s"
             },
             "timeSeriesList": {
               "projectName": "",
@@ -396,7 +465,20 @@
               "axisPlacement": "auto"
             }
           },
-          "overrides": []
+          "overrides": [
+            {
+              "matcher": {
+                "id": "byFrameRefID",
+                "options": "A"
+              },
+              "properties": [
+                {
+                  "id": "displayName",
+                  "value": "${__field.labels.reason} \u00b7 ${__field.labels.symbol}"
+                }
+              ]
+            }
+          ]
         },
         "options": {
           "legend": {
@@ -431,8 +513,7 @@
             "promQLQuery": {
               "projectName": "$env",
               "expr": "sum by (source, path) (increase(hedge_price_source_total[1h]))",
-              "step": "60s",
-              "legendFormat": "{{source}} \u00b7 {{path}}"
+              "step": "60s"
             },
             "timeSeriesList": {
               "projectName": "",
@@ -466,7 +547,20 @@
               "axisPlacement": "auto"
             }
           },
-          "overrides": []
+          "overrides": [
+            {
+              "matcher": {
+                "id": "byFrameRefID",
+                "options": "A"
+              },
+              "properties": [
+                {
+                  "id": "displayName",
+                  "value": "${__field.labels.source} \u00b7 ${__field.labels.path}"
+                }
+              ]
+            }
+          ]
         },
         "options": {
           "legend": {
@@ -520,8 +614,7 @@
             "promQLQuery": {
               "projectName": "$env",
               "expr": "sum by (reason) (increase(close_flatten_attempts_total[1h]))",
-              "step": "60s",
-              "legendFormat": "{{reason}}"
+              "step": "60s"
             },
             "timeSeriesList": {
               "projectName": "",
@@ -555,7 +648,20 @@
               "axisPlacement": "auto"
             }
           },
-          "overrides": []
+          "overrides": [
+            {
+              "matcher": {
+                "id": "byFrameRefID",
+                "options": "A"
+              },
+              "properties": [
+                {
+                  "id": "displayName",
+                  "value": "${__field.labels.reason}"
+                }
+              ]
+            }
+          ]
         },
         "options": {
           "legend": {
@@ -590,8 +696,7 @@
             "promQLQuery": {
               "projectName": "$env",
               "expr": "sum by (reason) (increase(close_flatten_blocked_total[1h]))",
-              "step": "60s",
-              "legendFormat": "{{reason}}"
+              "step": "60s"
             },
             "timeSeriesList": {
               "projectName": "",
@@ -625,7 +730,20 @@
               "axisPlacement": "auto"
             }
           },
-          "overrides": []
+          "overrides": [
+            {
+              "matcher": {
+                "id": "byFrameRefID",
+                "options": "A"
+              },
+              "properties": [
+                {
+                  "id": "displayName",
+                  "value": "${__field.labels.reason}"
+                }
+              ]
+            }
+          ]
         },
         "options": {
           "legend": {
@@ -660,8 +778,7 @@
             "promQLQuery": {
               "projectName": "$env",
               "expr": "sum by (cross_bucket, direction) (increase(close_flatten_placements_total[1h]))",
-              "step": "60s",
-              "legendFormat": "{{cross_bucket}} \u00b7 {{direction}}"
+              "step": "60s"
             },
             "timeSeriesList": {
               "projectName": "",
@@ -695,7 +812,20 @@
               "axisPlacement": "auto"
             }
           },
-          "overrides": []
+          "overrides": [
+            {
+              "matcher": {
+                "id": "byFrameRefID",
+                "options": "A"
+              },
+              "properties": [
+                {
+                  "id": "displayName",
+                  "value": "${__field.labels.cross_bucket} \u00b7 ${__field.labels.direction}"
+                }
+              ]
+            }
+          ]
         },
         "options": {
           "legend": {
@@ -730,8 +860,7 @@
             "promQLQuery": {
               "projectName": "$env",
               "expr": "sum by (outcome) (increase(close_flatten_outcomes_total[1h]))",
-              "step": "60s",
-              "legendFormat": "{{outcome}}"
+              "step": "60s"
             },
             "timeSeriesList": {
               "projectName": "",
@@ -765,7 +894,20 @@
               "axisPlacement": "auto"
             }
           },
-          "overrides": []
+          "overrides": [
+            {
+              "matcher": {
+                "id": "byFrameRefID",
+                "options": "A"
+              },
+              "properties": [
+                {
+                  "id": "displayName",
+                  "value": "${__field.labels.outcome}"
+                }
+              ]
+            }
+          ]
         },
         "options": {
           "legend": {
@@ -1181,8 +1323,7 @@
             "promQLQuery": {
               "projectName": "$env",
               "expr": "up{job=~\"t0-liquidity.*\"}",
-              "step": "60s",
-              "legendFormat": "{{job}} \u00b7 {{instance}}"
+              "step": "60s"
             },
             "timeSeriesList": {
               "projectName": "",
@@ -1219,7 +1360,20 @@
               "axisPlacement": "auto"
             }
           },
-          "overrides": []
+          "overrides": [
+            {
+              "matcher": {
+                "id": "byFrameRefID",
+                "options": "A"
+              },
+              "properties": [
+                {
+                  "id": "displayName",
+                  "value": "${__field.labels.job} \u00b7 ${__field.labels.instance}"
+                }
+              ]
+            }
+          ]
         },
         "options": {
           "legend": {
@@ -1254,8 +1408,7 @@
             "promQLQuery": {
               "projectName": "$env",
               "expr": "scrape_duration_seconds{job=~\"t0-liquidity.*\"}",
-              "step": "60s",
-              "legendFormat": "scrape duration"
+              "step": "60s"
             },
             "timeSeriesList": {
               "projectName": "",
@@ -1274,8 +1427,7 @@
             "promQLQuery": {
               "projectName": "$env",
               "expr": "scrape_samples_scraped{job=~\"t0-liquidity.*\"}",
-              "step": "60s",
-              "legendFormat": "samples scraped"
+              "step": "60s"
             },
             "timeSeriesList": {
               "projectName": "",
@@ -1310,7 +1462,32 @@
               "axisSoftMin": 0
             }
           },
-          "overrides": []
+          "overrides": [
+            {
+              "matcher": {
+                "id": "byFrameRefID",
+                "options": "A"
+              },
+              "properties": [
+                {
+                  "id": "displayName",
+                  "value": "scrape duration"
+                }
+              ]
+            },
+            {
+              "matcher": {
+                "id": "byFrameRefID",
+                "options": "B"
+              },
+              "properties": [
+                {
+                  "id": "displayName",
+                  "value": "samples scraped"
+                }
+              ]
+            }
+          ]
         },
         "options": {
           "legend": {
@@ -1345,8 +1522,7 @@
             "promQLQuery": {
               "projectName": "$env",
               "expr": "sum by (job) (increase(bot_gas_redrive_total[1h]))",
-              "step": "60s",
-              "legendFormat": "bot-gas redrive \u00b7 {{job}}"
+              "step": "60s"
             },
             "timeSeriesList": {
               "projectName": "",
@@ -1365,8 +1541,7 @@
             "promQLQuery": {
               "projectName": "$env",
               "expr": "sum(increase(pnl_ledger_catch_up_failures_total[1h]))",
-              "step": "60s",
-              "legendFormat": "PnL catch-up failures"
+              "step": "60s"
             },
             "timeSeriesList": {
               "projectName": "",
@@ -1401,7 +1576,32 @@
               "axisSoftMin": 0
             }
           },
-          "overrides": []
+          "overrides": [
+            {
+              "matcher": {
+                "id": "byFrameRefID",
+                "options": "A"
+              },
+              "properties": [
+                {
+                  "id": "displayName",
+                  "value": "bot-gas redrive \u00b7 ${__field.labels.job}"
+                }
+              ]
+            },
+            {
+              "matcher": {
+                "id": "byFrameRefID",
+                "options": "B"
+              },
+              "properties": [
+                {
+                  "id": "displayName",
+                  "value": "PnL catch-up failures"
+                }
+              ]
+            }
+          ]
         },
         "options": {
           "legend": {

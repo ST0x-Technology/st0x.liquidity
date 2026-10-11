@@ -61,12 +61,14 @@ NATIVE_ROWS = os.path.join(HERE, "t0-liquidity-native-rows.json")
 # boards reads the one job the `source` variable picks (SOURCE_VAR). PromQL
 # anchors a regex matcher, so the bot's value never matches the exporter job.
 LIQ_JOB_MATCHER = 'job=~"$source"'
+# The exporter sidecar's scrape job, the `source` variable's exporter value.
+EXPORTER_JOB = "t0-liquidity-exporter"
 # The header's Bot light. The bot source has no liq_up and reads its scrape's
 # up. The exporter source never falls back to up: the exporter's own up says
 # nothing about the bot, so a stopped exporter shows no data, not red.
 # pin_liq leaves both selectors alone, since each already names its job.
 LIQ_UP = ('max(liq_up{job=~"$source"}) or '
-          'max(up{job=~"$source",job!="t0-liquidity-exporter"})')
+          f'max(up{{job=~"$source",job!="{EXPORTER_JOB}"}})')
 LIQ_NAME = re.compile(r"(?<![A-Za-z0-9_:])liq_[a-z0-9_]+")
 LIQ_PREFIX = re.compile(r"(?<![A-Za-z0-9_:])liq_")
 
@@ -99,22 +101,66 @@ def nid():
 # Target + panel helpers
 # --------------------------------------------------------------------------
 
+# Spans of a PromQL expression where a liq_ name is not a selector: string
+# literals ("...", '...', `...`) and the label lists of by, without, on,
+# ignoring, group_left and group_right.
+PROMQL_STRING = re.compile(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|`[^`]*`')
+PROMQL_LABEL_LIST = re.compile(
+    r"(?<![A-Za-z0-9_:])(?:by|without|on|ignoring|group_left|group_right)"
+    r"\s*(\([^()]*\))")
+
+
+def _not_selector_spans(expr):
+    strings = [found.span() for found in PROMQL_STRING.finditer(expr)]
+    in_string = lambda pos: any(start <= pos < end for start, end in strings)
+    lists = [found.span(1) for found in PROMQL_LABEL_LIST.finditer(expr)
+             if not in_string(found.start())]
+    return strings + lists
+
+
+def _liq_names(pattern, expr):
+    """`pattern`'s matches in `expr` outside the spans where a liq_ name is
+    not a selector."""
+    spans = _not_selector_spans(expr)
+    return [found for found in pattern.finditer(expr)
+            if not any(start <= found.start() < end for start, end in spans)]
+
+
+def _matchers_close(expr, open_pos):
+    """The index of the `}` closing the label matchers that open at
+    `open_pos`, skipping string literals, or -1."""
+    pos = open_pos + 1
+    while pos < len(expr):
+        literal = PROMQL_STRING.match(expr, pos)
+        if literal:
+            pos = literal.end()
+        elif expr[pos] == "}":
+            return pos
+        else:
+            pos += 1
+    return -1
+
+
 def pin_liq(expr):
     """Adds the `source` job matcher to every liq_ selector in `expr`.
 
     Handles bare names (`liq_x` -> `liq_x{job="..."}`) and names that already
     carry matchers (`liq_x{a="b"}` -> `liq_x{job="...",a="b"}`). A selector
     that already names a job is left for `unpinned_liq_selectors` to judge.
+    A liq_ name inside a string literal or a by/on/... label list is not a
+    selector and stays as it is.
     """
     out = []
     pos = 0
-    for match in LIQ_NAME.finditer(expr):
+    for match in _liq_names(LIQ_NAME, expr):
+        if match.start() < pos:
+            continue
         out.append(expr[pos:match.end()])
         pos = match.end()
         if not expr.startswith("{", pos):
             out.append("{" + LIQ_JOB_MATCHER + "}")
             continue
-        close = expr.find("}", pos)
+        close = _matchers_close(expr, pos)
         if close == -1:
             raise SystemExit(f"unterminated label matcher in PromQL: {expr}")
         matchers = expr[pos + 1:close].strip()
@@ -129,19 +175,62 @@ def pin_liq(expr):
 
 def unpinned_liq_selectors(expr):
     """Every liq_ occurrence in `expr` that is not a selector pinned to
-    exactly LIQ_JOB_MATCHER. A templated name such as `liq_$col` is never a valid
-    selector, so it is reported too: the check fails closed."""
-    pinned = {match.start() for match in LIQ_NAME.finditer(expr)
+    exactly LIQ_JOB_MATCHER, outside string literals and label lists. A
+    templated name such as `liq_$col` is never a valid selector, so it is
+    reported too: the check fails closed. So is a nameless selector whose
+    `__name__` matcher can pick a liq_ series (see _name_matcher_selectors),
+    which pin_liq does not pin."""
+    pinned = {match.start() for match in _liq_names(LIQ_NAME, expr)
               if _selector_is_pinned(expr, match.end())}
     return [expr[found.start():found.start() + 40]
-            for found in LIQ_PREFIX.finditer(expr)
-            if found.start() not in pinned]
+            for found in _liq_names(LIQ_PREFIX, expr)
+            if found.start() not in pinned] + _name_matcher_selectors(expr)
+
+
+PROMQL_MATCHER = re.compile(
+    r"([A-Za-z_][A-Za-z0-9_]*)\s*(=~|!~|!=|=)\s*"
+    r"(\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'|`[^`]*`)")
+
+
+def _name_matcher_selectors(expr):
+    """Every nameless selector in `expr`, `{__name__=...}` or `{"name"}`,
+    that can read a liq_ series and is not pinned to exactly
+    LIQ_JOB_MATCHER. Its metric name is a string literal, which pin_liq
+    never touches. An equality matcher counts when its value names a liq_
+    metric; a regex or negative matcher always counts, since it can match a
+    liq_ name. A bare quoted string as the first item is Prometheus's
+    quoted metric name, `{__name__="name"}`, and counts when it names a
+    liq_ metric."""
+    strings = [found.span() for found in PROMQL_STRING.finditer(expr)]
+    found = []
+    for pos, char in enumerate(expr):
+        if char != "{" or any(start <= pos < end for start, end in strings):
+            continue
+        if pos and re.match(r"[A-Za-z0-9_:]", expr[pos - 1]):
+            continue
+        close = _matchers_close(expr, pos)
+        if close == -1:
+            continue
+        inner = expr[pos + 1:close]
+        matchers = PROMQL_MATCHER.findall(inner)
+        quoted_name = re.match(r"\s*(" + PROMQL_STRING.pattern + r")\s*(?:,|$)",
+                               inner)
+        reads_liq = any(
+            label == "__name__"
+            and (op != "=" or LIQ_PREFIX.match(value[1:-1]))
+            for label, op, value in matchers) or bool(
+                quoted_name and LIQ_PREFIX.match(quoted_name.group(1)[1:-1]))
+        jobs = [f"{label}{op}{value}" for label, op, value in matchers
+                if label == "job"]
+        if reads_liq and jobs != [LIQ_JOB_MATCHER]:
+            found.append(expr[pos:pos + 40])
+    return found
 
 
 def _selector_is_pinned(expr, name_end):
     if not expr.startswith("{", name_end):
         return False
-    close = expr.find("}", name_end)
+    close = _matchers_close(expr, name_end)
     if close == -1:
         return False
     matchers = [part.strip() for part in expr[name_end + 1:close].split(",")]
@@ -149,7 +238,7 @@ def _selector_is_pinned(expr, name_end):
     return jobs == [LIQ_JOB_MATCHER]
 
 
-def promql(expr, legend=None, instant=False, ref="A", step="60s"):
+def promql(expr, instant=False, ref="A", step="60s"):
     expr = pin_liq(expr)
     target = {
         "refId": ref,
@@ -161,11 +250,26 @@ def promql(expr, legend=None, instant=False, ref="A", step="60s"):
     }
     if instant:
         target["instant"] = True
-    if legend:
-        # NOTE: top-level, not inside promQLQuery — the stackdriver plugin
-        # only honors it there (see st0x-pricing.json).
-        target["legendFormat"] = legend
+    # NOTE: no legendFormat. Grafana 13.1.0's Cloud Monitoring query has no
+    # such field, and its PromQL path returns the frames with no alias or
+    # legend applied, so a legendFormat names nothing. A panel names its
+    # series with series_names instead (check_series_names).
     return target
+
+
+def series_names(names, colors=None):
+    """Field overrides that name each PromQL target's series: `names` maps
+    a refId to its display name, which may template a series label as
+    `${__field.labels.<label>}`. `colors` maps a refId to a fixed colour.
+    The colour goes in the same override: a byName matcher sees the
+    series' name from before the displayName override, not the new one."""
+    colors = colors or {}
+    return [{"matcher": {"id": "byFrameRefID", "options": ref},
+             "properties": [{"id": "displayName", "value": name}] + (
+                 [{"id": "color", "value": {"mode": "fixed",
+                                            "fixedColor": colors[ref]}}]
+                 if ref in colors else [])}
+            for ref, name in names.items()]
 
 
 def cloudlog(query, ref="A"):
@@ -187,7 +291,7 @@ def pick_source(name):
 
 
 def stat(title, desc, expr, display=None, unit="short", decimals=None,
-         steps=None, mappings=None, w=3, h=3, x=0, y=0, legend=None,
+         steps=None, mappings=None, w=3, h=3, x=0, y=0,
          text_mode="value_and_name", color_mode="value", value_size=None):
     options_text = {}
     if value_size:
@@ -209,7 +313,7 @@ def stat(title, desc, expr, display=None, unit="short", decimals=None,
     return {
         "id": nid(), "type": "stat", "title": title, "description": desc,
         "datasource": CM,
-        "targets": [promql(expr, instant=True, legend=legend)],
+        "targets": [promql(expr, instant=True)],
         "transparent": True,
         "gridPos": {"h": h, "w": w, "x": x, "y": y},
         "fieldConfig": {"defaults": defaults, "overrides": []},
@@ -256,12 +360,13 @@ def timeseries(title, desc, targets, w=8, h=8, x=0, y=0, unit="short",
     }
 
 
-def bargauge(title, desc, expr, legend, unit="ms", w=8, h=8, x=0, y=0,
+def bargauge(title, desc, expr, name, unit="ms", w=8, h=8, x=0, y=0,
              steps=None, decimals=0):
+    """`name` names each bar, see series_names."""
     return {
         "id": nid(), "type": "bargauge", "title": title, "description": desc,
         "datasource": CM,
-        "targets": [promql(expr, legend=legend, instant=True)],
+        "targets": [promql(expr, instant=True)],
         "gridPos": {"h": h, "w": w, "x": x, "y": y},
         "fieldConfig": {
             "defaults": {
@@ -270,7 +375,7 @@ def bargauge(title, desc, expr, legend, unit="ms", w=8, h=8, x=0, y=0,
                                "steps": steps or [{"color": "blue", "value": None}]},
                 "mappings": [],
             },
-            "overrides": [],
+            "overrides": series_names({"A": name}),
         },
         "options": {
             "displayMode": "gradient", "orientation": "horizontal",
@@ -714,9 +819,10 @@ def pills(y, w=24):
     the right. Config and the recovery guide open the SPA's dialogs.
 
     Every series carries a `k` label naming it; liquidity-panels/header.js
-    reads the rows by `k`. The commit series is its sample timestamp, so
-    the script can keep the newest commit when a deploy leaves the previous
-    one in the lookback window. The recovery guide is static data exported
+    reads the rows by `k` (liquidity-panels/header-rows.js). The commit and
+    info series are their sample timestamps, so the script can keep the
+    newest label set when a deploy or restart leaves the previous one in the
+    lookback window. The recovery guide is static data exported
     from the SPA (liquidity-panels/recovery-guide.json) and prepended to
     the script with client-env.js, which retargets its commands at the
     board's environment.
@@ -732,7 +838,8 @@ def pills(y, w=24):
         named("time() - max(liq_bot_start_timestamp_seconds)", "uptime"),
         named("max by (git_commit) (timestamp(liq_bot_info))", "commit"),
         named("max by (broker, log_level, wallet_kind, wallet_address, orderbook, "
-              "turnkey_organization, server_port) (liq_settings_info)", "info"),
+              "turnkey_organization, server_port) (timestamp(liq_settings_info))",
+              "info"),
         named("max(liq_settings_equity_target)", "equity_target"),
         named("max(liq_settings_equity_deviation)", "equity_deviation"),
         named("max(liq_settings_usdc_target)", "usdc_target"),
@@ -745,9 +852,10 @@ def pills(y, w=24):
     ])
     with open(os.path.join(HERE, "liquidity-panels", "recovery-guide.json")) as f:
         guide = json.load(f)
-    with open(os.path.join(HERE, "liquidity-panels", "header.js")) as f:
-        after_render = (f"const RECOVERY_GUIDE = {json.dumps(guide)};\n\n"
-                        + panel_module("client-env.js") + "\n" + f.read())
+    after_render = (f"const RECOVERY_GUIDE = {json.dumps(guide)};\n\n"
+                    + panel_module("client-env.js") + "\n"
+                    + panel_module("header-rows.js") + "\n"
+                    + panel_module("header.js"))
     with open(os.path.join(HERE, "liquidity-panels", "header.css")) as f:
         styles = f.read()
     return [{
@@ -811,13 +919,13 @@ SOURCE_VAR = {
     "description": "Which process serves the liq_* metrics: the exporter "
                    "sidecar (the default for now) or the bot's own "
                    "/metrics. Pick bot to compare the two.",
-    "query": "exporter : t0-liquidity-exporter, "
+    "query": f"exporter : {EXPORTER_JOB}, "
              "bot : t0-liquidity|t0-liquidity-staging",
     "includeAll": False, "multi": False, "hide": 0,
     "current": {"selected": True, "text": "exporter",
-                "value": "t0-liquidity-exporter"},
+                "value": EXPORTER_JOB},
     "options": [{"selected": True, "text": "exporter",
-                 "value": "t0-liquidity-exporter"},
+                 "value": EXPORTER_JOB},
                 {"selected": False, "text": "bot",
                  "value": "t0-liquidity|t0-liquidity-staging"}],
 }
@@ -872,11 +980,13 @@ panels = []
 panels += pills(0, w=23)
 
 def native_table(title, desc, expr, row_label, columns, w, h, x, y,
-                 first_col, sort_by=None, widths=None, bars=(),
+                 first_col, sort_by=(), widths=None, bars=(),
                  align="right", stretch=None, first_col_mappings=None):
     """A Grafana table from one or-chain query pivoted on (row_label, col),
     like matrix_table. columns: [(col, display name, [field override
-    properties])]; bars: columns drawn as HTML bars (see bar_cell)."""
+    properties])]; bars: columns drawn as HTML bars (see bar_cell);
+    sort_by: the default sort, a list of {displayName, desc}, first key
+    first."""
     matrix_key = f"{row_label}\\col"
     names = {col: name for col, name, _ in columns}
     # Fixed widths, except one `stretch` column that takes the rest of the
@@ -941,7 +1051,7 @@ def native_table(title, desc, expr, row_label, columns, w, h, x, y,
             ],
         },
         "options": {"showHeader": True, "cellHeight": "md",
-                    **({"sortBy": [sort_by]} if sort_by else {})},
+                    **({"sortBy": list(sort_by)} if sort_by else {})},
         **LATEST_ONLY,
     }
 
@@ -953,11 +1063,29 @@ def native_table(title, desc, expr, row_label, columns, w, h, x, y,
 BAND_SIGN_OFFSET = 0.0001
 
 
+# A ratio outside [0, 1], from a negative balance say, is no share a bar can
+# draw: every bar encoding sends it to OUT_OF_RANGE instead. That value
+# matches none of the bar cell's percent patterns, so the cell writes
+# "out of range" for it (see bar_cell).
+OUT_OF_RANGE = 2000
+
+
+def in_range(ratio, encoded):
+    """`encoded` where `ratio` is in [0, 1], else OUT_OF_RANGE. A NaN ratio
+    stays NaN, which the bar cell leaves empty. The sentinel is built with
+    clamp, not `* 0`: clamp maps +Inf and -Inf (a share of a zero total) to
+    0 and keeps NaN, where `Inf * 0` is NaN and would show as no vault."""
+    bounded = f"((({ratio}) >= 0) <= 1)"
+    return (f"((({encoded}) and {bounded}) "
+            f"or ((clamp(({ratio}), 0, 0) + {OUT_OF_RANGE}) "
+            f"unless {bounded}))")
+
+
 def banded_pct(expr, inside):
     """pct_bar's sign encoding: the percent rounded to 0.1, negative when
     `inside` (a 0/1 PromQL bool) says it is outside the band."""
-    return (f"(round(100 * ({expr}), 0.1) + {BAND_SIGN_OFFSET}) "
-            f"* (2 * {inside} - 1)")
+    return in_range(expr, f"(round(100 * ({expr}), 0.1) + {BAND_SIGN_OFFSET}) "
+                          f"* (2 * {inside} - 1)")
 
 
 # Added to a percent the board cannot judge against a band, so the bar cell
@@ -968,8 +1096,8 @@ UNJUDGED_OFFSET = 1000
 
 def unjudged_pct(expr):
     """A percent with no band verdict: grey in a banded bar cell."""
-    return (f"round(100 * ({expr}), 0.1) + {UNJUDGED_OFFSET} "
-            f"+ {BAND_SIGN_OFFSET}")
+    return in_range(expr, f"round(100 * ({expr}), 0.1) + {UNJUDGED_OFFSET} "
+                          f"+ {BAND_SIGN_OFFSET}")
 
 
 def pct_bar(expr, band=None):
@@ -979,7 +1107,7 @@ def pct_bar(expr, band=None):
     sign. band: (target metric, deviation metric), or None for a neutral
     share."""
     if not band:
-        return f"round(100 * ({expr}), 0.1)"
+        return in_range(expr, f"round(100 * ({expr}), 0.1)")
     target, deviation = band
     inside = (f"(abs(({expr}) - scalar(max({target}))) "
               f"<= bool scalar(max({deviation})))")
@@ -999,28 +1127,40 @@ def bar_html(fill, text):
 # beside its bar, so this is a Markdown + HTML cell: the value turns into a
 # string and a regex mapping writes the HTML, its capture group the percent.
 # Negative means outside the band (see pct_bar): red, else green. With
-# `unjudged`, a value with four integer digits is a percent plus
-# UNJUDGED_OFFSET (see unjudged_pct): grey, its percent read after the offset.
+# `unjudged`, a value from 1000 to 1100 is a percent plus UNJUDGED_OFFSET
+# (see unjudged_pct): grey, its percent read after the offset. The patterns
+# take percents from 0 to 100 only, so OUT_OF_RANGE, or any value a broken
+# encoding makes, is written "out of range", never as a coloured bar.
 GREY_FILL = "rgba(148,163,184,0.45)"
-UNJUDGED_PATTERN = r"^(?=\d{4})10*(\d+(?:\.[1-9])?).*$"
+PCT_PATTERN = r"(100|[1-9]?\d(?:\.[1-9])?)\.?\d*"
+UNJUDGED_PATTERN = r"^(?=1(?:0\d\d|100)(?!\d))10*(\d+(?:\.[1-9])?).*$"
+OUT_OF_RANGE_HTML = ('<div style="height:20px;border-radius:4px;'
+                     f'text-align:center;background:{GREY_FILL}">'
+                     'out of range</div>')
 
 
 def bar_cell(neutral=False, unjudged=False):
     # No value (a chain without a vault) shows nothing.
     mappings = [{"type": "regex", "options": {"pattern": "^(null|NaN)?$",
                  "result": {"text": " ", "index": 0}}}]
+    mappings.append({"type": "regex", "options": {
+        "pattern": f"^{OUT_OF_RANGE}$",
+        "result": {"text": OUT_OF_RANGE_HTML, "index": len(mappings)}}})
     mappings += ([] if not unjudged else [
         {"type": "regex", "options": {"pattern": UNJUDGED_PATTERN, "result": {
             "text": bar_html(GREY_FILL, "$1"), "index": len(mappings)}}}])
     # The percent keeps at most one decimal, which drops pct_bar's offset
     # and any float noise from the rounding.
     mappings += ([] if neutral else [
-        {"type": "regex", "options": {"pattern": r"^-(\d+(?:\.[1-9])?).*$", "result": {
+        {"type": "regex", "options": {"pattern": f"^-{PCT_PATTERN}$", "result": {
             "text": bar_html("rgba(239,68,68,0.6)", "$1"), "index": len(mappings)}}}])
     mappings.append({"type": "regex", "options": {
-        "pattern": r"^(\d+(?:\.[1-9])?).*$" if not neutral else "^(.*)$", "result": {
+        "pattern": f"^{PCT_PATTERN}$" if not neutral else "^(.*)$", "result": {
         "text": bar_html(GREY_FILL if neutral else "rgba(34,197,94,0.6)", "$1"),
         "index": len(mappings)}}})
+    mappings += ([] if neutral else [
+        {"type": "regex", "options": {"pattern": "^.*$", "result": {
+            "text": OUT_OF_RANGE_HTML, "index": len(mappings)}}}])
     # The cell is an encoded string, so sorting or filtering it would order
     # the encodings, not the percents.
     return [{"id": "mappings", "value": mappings},
@@ -1065,6 +1205,21 @@ NO_PRICE = {"id": "mappings", "value": [{"type": "special", "options": {
 # listed here still gets its row and column, under its raw key.
 CHAIN_NAMES = {"base": "Base", "robinhood": "Robinhood", "hyperevm": "HyperEVM",
                "ethereum": "Ethereum"}
+# The Equities table's chain column headers: a short one where the full name
+# would widen the column past its numbers.
+EQUITY_CHAIN_HEADERS = {**CHAIN_NAMES, "robinhood": "RH"}
+# The Equities card's inner width on the reference 1934px viewport, about
+# 950px (913px of fixed columns, before Robinhood, left Ratio under its
+# 50px), less Ratio's minimum width. check_equity_widths holds the fixed
+# columns to it with the EQUITY_MAX_CHAIN_COLUMNS widest chain columns
+# showing. A third chain column (HyperEVM beside Base and RH) does not fit:
+# every chain column is at its 74px balance floor, so a shorter header saves
+# nothing, and the table scrolls sideways until other columns are narrowed.
+EQUITY_FIXED_PX_MAX = 950 - 60
+EQUITY_MAX_CHAIN_COLUMNS = 2
+# A balance column filtered by its distinct values filters nothing useful,
+# and its filter icon costs the header about 20px.
+NOT_FILTERABLE = {"id": "custom.filterable", "value": False}
 
 
 # The Equities Ratio is Base vault / (Base vault + Alpaca), both available,
@@ -1192,6 +1347,10 @@ def native_inventory(w, x, y, heights):
         ("liq_equity_exposure_usd or (liq_equity_total * NaN)", "exposure"),
         ("liq_equity_unwrapped", "unwrapped"),
         ("liq_equity_wrapped", "wrapped"),
+        # The SPA lists counter-trading assets first: the hidden sort key, 1
+        # for counter trading, else 0, unset included.
+        ("max by (symbol) (liq_asset_counter_trading) "
+         "or (max by (symbol) (liq_equity_total) * 0)", "counter_trading"),
     ])
     pct = [{"id": "unit", "value": "percentunit"}, {"id": "decimals", "value": 0}]
     return [
@@ -1241,7 +1400,8 @@ def native_inventory(w, x, y, heights):
             "Equities",
             "Flags: counter trading, rebalancing and extended hours, green "
             "when on, red when off, hollow grey when not set. "
-            "Share balances per venue, one column per chain. Total and "
+            "Share balances per venue, one column per chain (RH is "
+            "Robinhood). Counter-trading assets come first. Total and "
             "Total USD count only the primary chain (Base) with Alpaca and "
             "the shares in flight: a wrapped share on another chain is "
             "worth that chain's underlying, so the chains are not added "
@@ -1256,39 +1416,56 @@ def native_inventory(w, x, y, heights):
             "percent. Exposure = net x live price, empty without a "
             "price.", equity, "symbol",
             [("flags", "Flags", FLAGS_CELL),
-             *[(f"onchain_{key}", name, None)
-               for key, name in CHAIN_NAMES.items() if key != "ethereum"],
-             ("inflight", "Inflight", None),
-             ("alpaca", "Alpaca", None), ("total", "Total", None),
+             *[(f"onchain_{key}", name, [NOT_FILTERABLE])
+               for key, name in EQUITY_CHAIN_HEADERS.items()
+               if key != "ethereum"],
+             ("inflight", "Inflight", [NOT_FILTERABLE]),
+             ("alpaca", "Alpaca", [NOT_FILTERABLE]),
+             ("total", "Total", [NOT_FILTERABLE]),
              ("total_usd", "Total USD", [
                  {"id": "unit", "value": "currencyUSD"},
-                 {"id": "decimals", "value": 0}, NO_PRICE]),
+                 {"id": "decimals", "value": 0}, NO_PRICE, NOT_FILTERABLE]),
              ("ratio", "Ratio", bar_cell(unjudged=True)),
              ("exposure", "Exposure", [
                  {"id": "unit", "value": "currencyUSD"}, NO_PRICE,
+                 NOT_FILTERABLE,
                  {"id": "thresholds", "value": {"mode": "absolute", "steps": [
                      {"color": "red", "value": None},
                      {"color": "text", "value": -0.005},
                      {"color": "green", "value": 0.005}]}},
                  {"id": "custom.cellOptions", "value": {"type": "color-text"}}]),
              # Left-aligned like the SPA's table, except the wrap columns.
-             ("unwrapped", "Unwrapped", [{"id": "custom.align", "value": "right"}]),
-             ("wrapped", "Wrapped", [{"id": "custom.align", "value": "right"}])],
+             ("unwrapped", "Unwrapped", [{"id": "custom.align", "value": "right"},
+                                         NOT_FILTERABLE]),
+             ("wrapped", "Wrapped", [{"id": "custom.align", "value": "right"},
+                                     NOT_FILTERABLE]),
+             ("counter_trading", "Counter trading", [HIDDEN_COLUMN])],
             w, equity_h, x, y + alpaca_h + chains_h, first_col="Asset",
-            # Each width fits its header's text plus the filter icon
-            # (measured). A column under Grafana's 50px minimum renders at the
-            # minimum and would leave the stretching Ratio column too wide by
-            # the difference. With Total USD and Exposure both
-            # showing, the fixed columns no longer leave Ratio its 50px.
+            # Asset's width fits its header's text plus the filter icon
+            # (measured). The balance columns have no filter icon, so each
+            # fits its header's text (the measured width less the icon) or
+            # a balance, Total's 74px, whichever is wider. A column under
+            # Grafana's 50px minimum renders at the minimum and would leave
+            # the stretching Ratio column too wide by the difference.
             widths={"symbol": 96, "flags": 64,
                     # One per chain; only chains with balances show up.
-                    **{f"onchain_{key}": 92 for key in CHAIN_NAMES},
-                    "inflight": 86, "alpaca": 86, "total": 74,
-                    "total_usd": 100, "ratio": 158, "exposure": 95,
-                    "unwrapped": 118, "wrapped": 102},
+                    **{f"onchain_{key}": 74 for key in CHAIN_NAMES},
+                    "inflight": 74, "alpaca": 74, "total": 74,
+                    "total_usd": 80, "ratio": 158, "exposure": 88,
+                    "unwrapped": 98, "wrapped": 82},
             bars=("ratio", "flags"), align="left", stretch="ratio",
-            sort_by={"displayName": "Asset", "desc": False}),
+            sort_by=[{"displayName": "Counter trading", "desc": True},
+                     {"displayName": "Asset", "desc": False}]),
     ]
+
+
+# A table column kept for sorting but not drawn. Grafana 13.1.0's table
+# hides a field only on custom.hideFrom.viz. It rewrites the older
+# custom.hidden to that only when it migrates a panel saved by another
+# version, and these tables save 13.1.0, so custom.hidden would draw the
+# column (check_no_custom_hidden). A sort still sees a hidden field.
+HIDDEN_COLUMN = {"id": "custom.hideFrom",
+                 "value": {"viz": True, "legend": False, "tooltip": False}}
 
 
 # The inventory tables (8 + 9 + 35 rows) beside Trades stacked on
@@ -2007,7 +2184,7 @@ panels.append(bargauge(
     "Hedge cycle stages (p95, 24h)",
     "The SPA waterfall's aggregate form: p95 per stage. Per-cycle "
     "waterfalls live in the SPA.",
-    'max by (stage) (liq_hedge_latency_ms{quantile="p95"})', "{{stage}}",
+    'max by (stage) (liq_hedge_latency_ms{quantile="p95"})', "${__field.labels.stage}",
     w=8, h=8, x=0, y=7,
     steps=[{"color": "green", "value": None}, {"color": "yellow", "value": 30000},
            {"color": "red", "value": 120000}]))
@@ -2015,18 +2192,12 @@ panels.append(timeseries(
     "Latency percentiles over time — $stage",
     "p50/p90/p99 of the selected hedge stage, from the exporter's rolling "
     "24h summary scraped once a minute.",
-    [promql('max(liq_hedge_latency_ms{stage="$stage",quantile="p50"})', legend="p50", ref="A"),
-     promql('max(liq_hedge_latency_ms{stage="$stage",quantile="p90"})', legend="p90", ref="B"),
-     promql('max(liq_hedge_latency_ms{stage="$stage",quantile="p99"})', legend="p99", ref="C")],
+    [promql('max(liq_hedge_latency_ms{stage="$stage",quantile="p50"})', ref="A"),
+     promql('max(liq_hedge_latency_ms{stage="$stage",quantile="p90"})', ref="B"),
+     promql('max(liq_hedge_latency_ms{stage="$stage",quantile="p99"})', ref="C")],
     w=8, h=8, x=8, y=7, unit="ms",
-    overrides=[
-        {"matcher": {"id": "byName", "options": "p50"},
-         "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]},
-        {"matcher": {"id": "byName", "options": "p90"},
-         "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "yellow"}}]},
-        {"matcher": {"id": "byName", "options": "p99"},
-         "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]},
-    ]))
+    overrides=series_names({"A": "p50", "B": "p90", "C": "p99"},
+                           colors={"A": "green", "B": "yellow", "C": "red"})))
 errors_by_module = matrix_table(
     "Errors & warnings by module (24h)",
     "The SPA's per-target error/warning counts. The Logs tab has the "
@@ -2051,13 +2222,15 @@ errors_by_module = matrix_table(
     decimals=0)
 # F4: data link on the Module column -> Logs board, pre-filtered via the
 # `target` textbox var there (labels.target=~"${target}"), keeping the
-# current time range. Added by mutating the returned panel, not by
+# current time range, environment and source. Added by mutating the returned panel, not by
 # changing the shared matrix_table() helper.
 errors_by_module["fieldConfig"]["overrides"].append({
     "matcher": {"id": "byName", "options": "Module"},
     "properties": [{"id": "links", "value": [{
         "title": "View in Logs tab",
         "url": "/d/t0-liquidity-logs/?${__url_time_range}"
+               "&var-env=${env:percentencode}"
+               "&var-source=${source:percentencode}"
                "&var-target=${__value.text}&theme=light",
         "targetBlank": False,
     }]}],
@@ -2068,12 +2241,12 @@ panels.append(bargauge(
     "USDC rebalance stages (p95, 30d)",
     "Stage timings for USDC rebalances. From the server's stageSummary; "
     "per-operation waterfalls live in the SPA.",
-    'max by (stage) (liq_rebalance_stage_ms{kind="usdc",quantile="p95"})', "{{stage}}",
+    'max by (stage) (liq_rebalance_stage_ms{kind="usdc",quantile="p95"})', "${__field.labels.stage}",
     w=8, h=7, x=0, y=15))
 panels.append(bargauge(
     "Equity rebalance stages (p95, 30d)",
     "Stage timings for equity mints/redemptions.",
-    'max by (stage) (liq_rebalance_stage_ms{kind="equity",quantile="p95"})', "{{stage}}",
+    'max by (stage) (liq_rebalance_stage_ms{kind="equity",quantile="p95"})', "${__field.labels.stage}",
     w=8, h=7, x=8, y=15))
 panels.append(matrix_table(
     "Dependency health (24h)",
@@ -2114,21 +2287,18 @@ panels.append(timeseries(
     "scrape time', so the line only accrues from whenever this panel "
     "started being scraped forward — a short/flat history here does not "
     "mean attestations were fast, it means the metric is young.",
-    [promql('max(liq_attestation_last_ms{kind="usdc"})', legend="usdc", ref="A"),
-     promql('max(liq_attestation_last_ms{kind="equity"})', legend="equity", ref="B")],
+    [promql('max(liq_attestation_last_ms{kind="usdc"})', ref="A"),
+     promql('max(liq_attestation_last_ms{kind="equity"})', ref="B")],
     w=24, h=6, x=0, y=22, unit="ms",
-    overrides=[
-        {"matcher": {"id": "byName", "options": "usdc"},
-         "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]},
-        {"matcher": {"id": "byName", "options": "equity"},
-         "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "purple"}}]},
-    ]))
+    overrides=series_names({"A": "usdc", "B": "equity"},
+                           colors={"A": "blue", "B": "purple"})))
 
 panels.append(timeseries(
     "Block lag over time",
     "The ingestion-health chart: how far fill detection trails the chain.",
-    [promql("max(liq_block_lag_blocks)", legend="blocks behind")],
-    w=8, h=6, x=0, y=28, decimals=0, fill=15))
+    [promql("max(liq_block_lag_blocks)")],
+    w=8, h=6, x=0, y=28, decimals=0, fill=15,
+    overrides=series_names({"A": "blocks behind"})))
 panels.append(stat(
     "Poll cycles (24h)", "Order-fill monitor poll cycles.",
     "max(liq_poll_cycles_24h)", decimals=0, color_mode="none",
@@ -2146,7 +2316,7 @@ panels.append(stat(
 panels.append(bargauge(
     "Poll duration percentiles",
     "The monitor's own cycle duration.",
-    "max by (quantile) (liq_poll_duration_ms)", "{{quantile}}",
+    "max by (quantile) (liq_poll_duration_ms)", "${__field.labels.quantile}",
     w=7, h=6, x=17, y=28))
 panels.append(matrix_table(
     "Job queues",
@@ -2422,6 +2592,155 @@ def check_log_sources(boards):
         raise SystemExit(f"{len(failures)} log queries do not follow source")
 
 
+def series_name_problems(panel):
+    """Why a panel's PromQL series would show unnamed: a PromQL target
+    with a legendFormat, which the Cloud Monitoring datasource ignores
+    (see promql), or a timeseries or bargauge target whose refId no
+    byFrameRefID override names (see series_names)."""
+    targets = [target for target in panel.get("targets", [])
+               if target.get("queryType") == "promQL"]
+    problems = [f"target {target.get('refId')}: legendFormat"
+                for target in targets
+                if "legendFormat" in target
+                or "legendFormat" in target.get("promQLQuery", {})]
+    if panel.get("type") in ("timeseries", "bargauge"):
+        named = {override["matcher"]["options"]
+                 for override in panel.get("fieldConfig", {})
+                 .get("overrides", [])
+                 if override["matcher"]["id"] == "byFrameRefID"
+                 and any(prop["id"] == "displayName"
+                         for prop in override["properties"])}
+        problems += [f"target {target.get('refId')}: no displayName override"
+                     for target in targets if target.get("refId") not in named]
+    return problems
+
+
+def check_series_names(boards):
+    """Every PromQL series is named by a field override Grafana applies,
+    not by a legendFormat it ignores."""
+    failures = [(board["uid"], panel.get("title"), problem)
+                for board in boards
+                for panel in board_panels(board)
+                for problem in series_name_problems(panel)]
+    for uid, title, problem in failures:
+        print(f"{uid}: panel {title!r} {problem}", file=sys.stderr)
+    if failures:
+        raise SystemExit(f"{len(failures)} PromQL series are not named by "
+                         "a byFrameRefID displayName override")
+    stray = series_name_problems({
+        "type": "timeseries", "targets": [promql("up", ref="B")],
+        "fieldConfig": {"overrides": series_names({"A": "up"})}})
+    legend = series_name_problems({"targets": [
+        {**promql("up"), "legendFormat": "up"},
+        {**promql("up", ref="B"), "promQLQuery": {"legendFormat": "up"}}]})
+    if len(stray) != 1 or len(legend) != 2:
+        raise SystemExit(f"series_name_problems misses a case: {stray} "
+                         f"{legend}")
+
+
+def panel_link_urls(node):
+    """Every data link url in a panel's field config, wherever it is nested."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "url" and isinstance(value, str):
+                yield value
+            else:
+                yield from panel_link_urls(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from panel_link_urls(value)
+
+
+def check_links_keep_env(boards):
+    """A data link to another board keeps the board's env and source, so the
+    target board reads the same project and job. A link that copies every
+    URL parameter (__url.params) keeps them already."""
+    failures = [(board["uid"], panel.get("title"), url)
+                for board in boards
+                for panel in board_panels(board)
+                for url in panel_link_urls(panel.get("fieldConfig", {}))
+                if url.startswith("/d/") and "__url.params" not in url
+                and not ("var-env=" in url and "var-source=" in url)]
+    for uid, title, url in failures:
+        print(f"{uid}: panel {title!r}: link drops env or source: {url}",
+              file=sys.stderr)
+    if failures:
+        raise SystemExit(f"{len(failures)} data links drop env or source")
+
+
+def table_columns(panel):
+    """The column names a table panel's sortBy can name: organize's ordered
+    fields under their new names, and the fields its overrides match by
+    name."""
+    organized = set()
+    for transform in panel.get("transformations", []):
+        if transform["id"] == "organize":
+            renames = transform["options"].get("renameByName", {})
+            organized |= {renames.get(name, name) for name in
+                          transform["options"].get("indexByName", {})}
+            organized |= set(renames.values())
+    matched = {override["matcher"]["options"]
+               for override in panel["fieldConfig"]["overrides"]
+               if override["matcher"]["id"] == "byName"}
+    return organized | matched
+
+
+def check_table_sorts(boards):
+    """Every default sort key of a table names one of its columns, so the
+    default order is not silently dropped."""
+    failures = [(board["uid"], panel.get("title"), key["displayName"])
+                for board in boards
+                for panel in board_panels(board) if panel["type"] == "table"
+                for key in panel.get("options", {}).get("sortBy", [])
+                if key["displayName"] not in table_columns(panel)]
+    for uid, title, name in failures:
+        print(f"{uid}: panel {title!r} sorts by a missing column {name!r}",
+              file=sys.stderr)
+    if failures:
+        raise SystemExit(f"{len(failures)} tables sort by a missing column")
+
+
+def check_equity_widths(boards):
+    """Every Equities column but Ratio has a fixed width, and with the
+    EQUITY_MAX_CHAIN_COLUMNS widest chain columns showing the fixed columns
+    leave the stretching Ratio column room (EQUITY_FIXED_PX_MAX). The budget
+    covers at most that many chain columns, not every chain at once."""
+    equities = next(panel for board in boards for panel in board_panels(board)
+                    if panel.get("title") == "Equities")
+    chains = {name for key, name in EQUITY_CHAIN_HEADERS.items()
+              if key != "ethereum"}
+    others = {"Asset", "Flags", "Inflight", "Alpaca", "Total", "Total USD",
+              "Exposure", "Unwrapped", "Wrapped"}
+    widths = {override["matcher"]["options"]: prop["value"]
+              for override in equities["fieldConfig"]["overrides"]
+              for prop in override["properties"] if prop["id"] == "custom.width"}
+    missing = (chains | others) - widths.keys()
+    if missing:
+        raise SystemExit(f"Equities columns have no width: {sorted(missing)}")
+    widest_chains = sorted((widths[name] for name in chains),
+                           reverse=True)[:EQUITY_MAX_CHAIN_COLUMNS]
+    fixed = sum(widths[name] for name in others) + sum(widest_chains)
+    if fixed > EQUITY_FIXED_PX_MAX:
+        raise SystemExit(f"Equities fixed columns take {fixed}px with "
+                         f"{EQUITY_MAX_CHAIN_COLUMNS} chain columns, over "
+                         f"{EQUITY_FIXED_PX_MAX}px")
+
+
+def check_after_render_scripts(boards):
+    """An afterRender script is not a module, so an export line left in it
+    (see panel_module) breaks the whole panel."""
+    failures = [(board["uid"], panel.get("title"))
+                for board in boards
+                for panel in board_panels(board)
+                if any(line.startswith("export ") for line in panel.get(
+                    "options", {}).get("afterRender", "").splitlines())]
+    for uid, title in failures:
+        print(f"{uid}: panel {title!r}: afterRender has an export line",
+              file=sys.stderr)
+    if failures:
+        raise SystemExit(f"{len(failures)} afterRender scripts export")
+
+
 def board_path(root, board):
     # A board's directory IS its Grafana folder (the provider builds folders
     # from the directory tree). The main board sits in dashboards/liquidity/,
@@ -2461,9 +2780,58 @@ def check_committed(boards):
     print(f"{len(boards)} boards match the generator")
 
 
+def check_pin_liq():
+    """pin_liq pins bare and labelled liq_ selectors, and leaves string
+    literals and by/on/... label lists alone. CI runs this on --check."""
+    pin = "{" + LIQ_JOB_MATCHER
+    cases = {
+        "liq_a": f"liq_a{pin}}}",
+        'liq_a{chain="base"}': f'liq_a{pin},chain="base"}}',
+        'liq_a{chain="}liq_b"} + liq_c':
+            f'liq_a{pin},chain="}}liq_b"}} + liq_c{pin}}}',
+        'label_replace(liq_a, "k", "liq_b", "", "")':
+            f'label_replace(liq_a{pin}}}, "k", "liq_b", "", "")',
+        "'liq_a' + `liq_b`": "'liq_a' + `liq_b`",
+        "max by (liq_x) (liq_a)": f"max by (liq_x) (liq_a{pin}}})",
+        "sum without(liq_x)(liq_a)": f"sum without(liq_x)(liq_a{pin}}})",
+        "liq_a * on (symbol, liq_x) group_left (liq_y) liq_b":
+            f"liq_a{pin}}} * on (symbol, liq_x) group_left (liq_y) liq_b{pin}}}",
+        "liq_a / ignoring(liq_x) group_right(liq_y) liq_b":
+            f"liq_a{pin}}} / ignoring(liq_x) group_right(liq_y) liq_b{pin}}}",
+        'label_replace(liq_a, "k", "by (liq_b)", "", "")':
+            f'label_replace(liq_a{pin}}}, "k", "by (liq_b)", "", "")',
+    }
+    wrong = {expr: (pin_liq(expr), want) for expr, want in cases.items()
+             if pin_liq(expr) != want}
+    still_unpinned = {expr: unpinned_liq_selectors(pin_liq(expr))
+                      for expr in cases
+                      if unpinned_liq_selectors(pin_liq(expr))}
+    if unpinned_liq_selectors("liq_a") != ["liq_a"]:
+        still_unpinned["bare liq_a not reported"] = unpinned_liq_selectors("liq_a")
+    # A metric name in a __name__ matcher is a string literal that pin_liq
+    # leaves alone, so the check reports the selector instead.
+    for expr in ('{__name__="liq_equity_total"}',
+                 'count({__name__=~"liq_.*"})',
+                 'sum({__name__!="up"})',
+                 '{__name__="liq_a",job="other"}',
+                 'sum({"liq_equity_total"})', "{'liq_a', chain=\"base\"}",
+                 '{ `liq_a` }', '{"liq_a",job="other"}'):
+        if not unpinned_liq_selectors(pin_liq(expr)):
+            still_unpinned[f"{expr} not reported"] = []
+    for expr in ('{__name__="liq_a",' + LIQ_JOB_MATCHER + "}",
+                 '{"liq_a",' + LIQ_JOB_MATCHER + "}", '{"up"}',
+                 '{__name__="up"}', 'label_replace(up, "k", "{v}", "", "")'):
+        if unpinned_liq_selectors(pin_liq(expr)):
+            still_unpinned[expr] = unpinned_liq_selectors(pin_liq(expr))
+    if wrong or still_unpinned:
+        raise SystemExit(f"pin_liq pins the wrong names: {wrong} "
+                         f"{still_unpinned}")
+
+
 def bar_cell_shows(cell, value):
     """(fill, percent) that a bar cell's first matching regex mapping draws
-    for `value` as Grafana passes it, the number's string form."""
+    for `value` as Grafana passes it, the number's string form. A cell with
+    no percent gives its text in place of the percent."""
     mappings = next(o["value"] for o in cell if o["id"] == "mappings")
     for mapping in mappings:
         match = re.fullmatch(mapping["options"]["pattern"], value)
@@ -2471,7 +2839,8 @@ def bar_cell_shows(cell, value):
             html = match.expand(mapping["options"]["result"]["text"]
                                 .replace("$1", r"\1"))
             fill = re.search(r"90deg, (rgba\([^)]*\))", html)
-            text = re.search(r">([^<]*)%</div>", html)
+            text = (re.search(r">([^<]*)%</div>", html)
+                    or re.search(r">([^<]*)</div>", html))
             return (fill.group(1) if fill else None,
                     text.group(1) if text else None)
     return None
@@ -2479,8 +2848,10 @@ def bar_cell_shows(cell, value):
 
 def check_bar_cells():
     """The banded and unjudged encodings draw the colour and percent they
-    mean, for values with and without float noise. CI runs this on --check."""
+    mean, for values with and without float noise, and anything outside
+    them reads "out of range". CI runs this on --check."""
     green, red = "rgba(34,197,94,0.6)", "rgba(239,68,68,0.6)"
+    out_of_range = (None, "out of range")
     cell = bar_cell(unjudged=True)
     cases = {
         "45.5001": (green, "45.5"), "100.0001": (green, "100"),
@@ -2491,6 +2862,14 @@ def check_bar_cells():
         "1100.0001": (GREY_FILL, "100"), "1005.0001": (GREY_FILL, "5"),
         "1010.0001": (GREY_FILL, "10"), "1000.5001": (GREY_FILL, "0.5"),
         "1045.5000999999999": (GREY_FILL, "45.5"),
+        # A negative or above-one ratio: the encodings send it to
+        # OUT_OF_RANGE, and what an encoding without that guard made of it
+        # (an unjudged -10% was 990.0001, a judged -10% inside the band
+        # -9.9999) never draws a percent bar the encoding did not mean.
+        str(OUT_OF_RANGE): out_of_range, "990.0001": out_of_range,
+        "-110.0001": out_of_range, "110.0001": out_of_range,
+        "1200.0001": out_of_range, "1990.0001": out_of_range,
+        "-990.0001": out_of_range,
     }
     wrong = {value: (bar_cell_shows(cell, value), want)
              for value, want in cases.items()
@@ -2498,13 +2877,58 @@ def check_bar_cells():
     # Cells without the unjudged mapping keep their two colours.
     if bar_cell_shows(bar_cell(), "100.0001") != (green, "100"):
         wrong["banded 100.0001"] = bar_cell_shows(bar_cell(), "100.0001")
+    if bar_cell_shows(bar_cell(), "1045.5001") != out_of_range:
+        wrong["banded 1045.5001"] = bar_cell_shows(bar_cell(), "1045.5001")
+    for neutral_value, want in {"45.5": (GREY_FILL, "45.5"),
+                                str(OUT_OF_RANGE): out_of_range}.items():
+        if bar_cell_shows(bar_cell(neutral=True), neutral_value) != want:
+            wrong[f"neutral {neutral_value}"] = bar_cell_shows(
+                bar_cell(neutral=True), neutral_value)
+    # Every encoding guards its ratio with in_range, so a ratio outside
+    # [0, 1] reaches the cell as OUT_OF_RANGE.
+    bounded = "(((ratio) >= 0) <= 1)"
+    guarded = (f") and {bounded}) or ((clamp((ratio), 0, 0) + "
+               f"{OUT_OF_RANGE}) unless {bounded}))")
+    for name, encoded in {
+            "banded_pct": banded_pct("ratio", "inside"),
+            "unjudged_pct": unjudged_pct("ratio"),
+            "pct_bar": pct_bar("ratio"),
+            "pct_bar banded": pct_bar("ratio", ("target", "deviation"))}.items():
+        if not encoded.endswith(guarded):
+            wrong[f"{name} out of range"] = encoded
     if wrong:
         raise SystemExit(f"bar cell mappings draw the wrong bar: {wrong}")
 
 
+def check_no_custom_hidden(boards):
+    """No table saved as 13.1.0 hides a column with custom.hidden, which
+    that version draws (see HIDDEN_COLUMN)."""
+    failures = [(board["uid"], panel.get("title"))
+                for board in boards
+                for panel in board_panels(board)
+                if panel["type"] == "table"
+                and panel.get("pluginVersion") == "13.1.0"
+                and any(prop["id"] == "custom.hidden"
+                        for override in panel.get("fieldConfig", {})
+                        .get("overrides", [])
+                        for prop in override["properties"])]
+    for uid, title in failures:
+        print(f"{uid}: panel {title!r} hides a column with custom.hidden; "
+              "use custom.hideFrom", file=sys.stderr)
+    if failures:
+        raise SystemExit(f"{len(failures)} tables use custom.hidden")
+
+
+check_pin_liq()
 check_bar_cells()
 check_liq_pinned(dashboards)
 check_log_sources(dashboards)
+check_series_names(dashboards)
+check_links_keep_env(dashboards)
+check_table_sorts(dashboards)
+check_equity_widths(dashboards)
+check_no_custom_hidden(dashboards)
+check_after_render_scripts(dashboards)
 if sys.argv[1:] == ["--check"]:
     check_committed(dashboards)
 elif sys.argv[1:]:
