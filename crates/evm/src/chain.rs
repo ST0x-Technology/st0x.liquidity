@@ -8,10 +8,14 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, address};
 use serde::{Deserialize, Serialize};
 
 use crate::tokens::{USDC_BASE, USDC_ETHEREUM, USDC_HYPEREVM, USDC_ROBINHOOD, USDG_ROBINHOOD};
+
+/// Relay's v2 depository, at the same address on every chain Relay serves
+/// here (`protocol.v2.depository` of `GET /chains`).
+const RELAY_DEPOSITORY: Address = address!("0x4cd00e387622c35bddb9b4c962c136462338bc31");
 
 /// An EVM chain the bot acts on.
 ///
@@ -102,6 +106,27 @@ impl Chain {
             Self::Ethereum => Some(USDC_ETHEREUM),
             Self::HyperEvm => Some(USDC_HYPEREVM),
             Self::Robinhood => None,
+        }
+    }
+
+    /// Relay's depository on this chain: the contract a Relay deposit pays
+    /// into and the only spender a Relay approve may name. `Some` on the two
+    /// ends of the Robinhood corridor's Relay hop, `None` elsewhere.
+    pub const fn relay_depository(self) -> Option<Address> {
+        match self {
+            Self::Ethereum | Self::Robinhood => Some(RELAY_DEPOSITORY),
+            Self::Base | Self::HyperEvm => None,
+        }
+    }
+
+    /// The name Relay gives this chain in a quote's order (`chainId` on the
+    /// order output, payment details and refunds). `Some` exactly where
+    /// [`Self::relay_depository`] is.
+    pub const fn relay_name(self) -> Option<&'static str> {
+        match self {
+            Self::Ethereum => Some("ethereum"),
+            Self::Robinhood => Some("robinhood"),
+            Self::Base | Self::HyperEvm => None,
         }
     }
 
@@ -307,6 +332,31 @@ mod tests {
         assert_eq!(
             Chain::Robinhood.usdc(),
             alloy::primitives::address!("0x80e0e24718dbFcad49ECAA6F1e6C89A190586cA8")
+        );
+    }
+
+    /// A wrong depository would approve and pay an arbitrary contract, so
+    /// the pin is asserted as a literal per chain.
+    #[test]
+    fn relay_depositories_are_pinned_literals() {
+        assert_eq!(
+            Chain::ALL.map(Chain::relay_depository),
+            [
+                None,
+                Some(address!("0x4cd00e387622c35bddb9b4c962c136462338bc31")),
+                None,
+                Some(address!("0x4cd00e387622c35bddb9b4c962c136462338bc31")),
+            ]
+        );
+    }
+
+    /// Quote checks compare these to the order's chain names, so they are
+    /// asserted as literals, as Relay spelled them in live quotes.
+    #[test]
+    fn relay_names_are_pinned_literals() {
+        assert_eq!(
+            Chain::ALL.map(Chain::relay_name),
+            [None, Some("ethereum"), None, Some("robinhood")]
         );
     }
 
