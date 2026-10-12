@@ -280,10 +280,10 @@ rebalancing on it (the wrappers are deployed and Alpaca's issuer serves its
 USDG and hedged, and Bebop's Robinhood hook is mapped as the inventory adapter,
 so its fills are attributed to Bebop. The production configuration runs it as an
 `active` secondary with the issuer's `redemption_wallet`, and rebalances against
-Alpaca the listings the pinned token file enables there (DNUT); every other
-listing keeps `rebalancing = "disabled"`. Staging watches the same inventory and
-runs it as a prefunded hedge-only secondary: every listing trades, and none
-rebalances. Its settlement stable is USDG at
+Alpaca the listings the pinned token file enables there (DNUT, PLBY, GRND, and
+WMT); every other listing keeps `rebalancing = "disabled"`. Staging watches the
+same inventory and runs it as a prefunded hedge-only secondary: every listing
+trades, and none rebalances. Its settlement stable is USDG at
 `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168` (6 decimals), so it is the first
 chain whose stable CCTP cannot carry. It pays gas in ETH, so the Base Chainlink
 ETH/USD read values its gas and `active` is reachable. Rebalancing an equity

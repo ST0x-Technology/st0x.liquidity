@@ -10115,7 +10115,8 @@ mod tests {
     }
 
     /// Robinhood's equities as the shipped configs list them, by symbol:
-    /// the two launch equities everywhere, plus PLBY, GRND, and SNES in prod.
+    /// the two launch equities everywhere, plus PLBY, GRND, SNES, and WMT in
+    /// prod.
     fn robinhood_equities(with_prod_only: bool) -> BTreeMap<Symbol, (Address, Address)> {
         let launch_equities = [
             (
@@ -10153,6 +10154,13 @@ mod tests {
                 (
                     address!("0xF8bF43D61E4Cd2a5b5DfaD01BaC84693d7B95e51"),
                     address!("0x06096908dBC38fc54509024674E4fd1891B5F7CA"),
+                ),
+            ),
+            (
+                Symbol::new("WMT").unwrap(),
+                (
+                    address!("0xfAE9AfE275E57759f8Fbae5f252c65aDBF1b773F"),
+                    address!("0x23A0944e82766242dA76cb0f77e0b7812e5487EA"),
                 ),
             ),
         ];
@@ -10272,12 +10280,12 @@ mod tests {
         );
     }
 
-    /// Prod runs Robinhood as an active secondary that rebalances DNUT, and
-    /// only DNUT, against Alpaca: with its own target share and a small
-    /// per-operation limit, and with redemptions sent to the issuer wallet
-    /// st0x.issuance signs with on every chain.
+    /// Prod runs Robinhood as an active secondary that rebalances DNUT, PLBY,
+    /// GRND, and WMT against Alpaca, each with its own target share and
+    /// per-operation limit, and sends redemptions to the issuer wallet
+    /// st0x.issuance signs with on every chain. FGI and SNES only hedge.
     #[test]
-    fn shipped_prod_config_rebalances_only_dnut_on_robinhood() {
+    fn shipped_prod_config_rebalances_the_robinhood_set() {
         let (robinhood, mut chains) = shipped_robinhood(
             "prod",
             include_str!("../../../config/prod/st0x-hedge.toml"),
@@ -10297,9 +10305,22 @@ mod tests {
             "issuance signs every chain with one key, so both chains redeem to one address"
         );
 
-        let dnut = Symbol::new("DNUT").unwrap();
+        // (symbol, Robinhood target_share, operational_limit, Base target_share).
+        // A symbol listed on Base sets its Base target to 0.4, so both upper
+        // bands (0.45 + 0.45) leave the broker its 0.1 floor. WMT has no Base
+        // listing, so Robinhood and the broker split it alone.
+        let rebalanced = [
+            ("DNUT", float!(0.4), float!(25), Some(float!(0.4))),
+            ("PLBY", float!(0.4), float!(4000), Some(float!(0.4))),
+            ("GRND", float!(0.4), float!(300), Some(float!(0.4))),
+            ("WMT", float!(0.5), float!(50), None),
+        ];
+        let rebalanced_symbols: BTreeSet<Symbol> = rebalanced
+            .iter()
+            .map(|(symbol, ..)| Symbol::new(*symbol).unwrap())
+            .collect();
         for (symbol, equity) in &trading.assets.equities.symbols {
-            let expected = if *symbol == dnut {
+            let expected = if rebalanced_symbols.contains(symbol) {
                 RebalancingMode::Enabled
             } else {
                 RebalancingMode::Disabled
@@ -10307,38 +10328,56 @@ mod tests {
             assert_eq!(equity.rebalancing, expected, "{symbol}");
         }
 
-        // Both upper bands (0.45 + 0.45) leave the broker its 0.1 floor.
-        assert!(
-            base_trading.assets.equities.symbols[&dnut]
-                .target_share
-                .expect("DNUT must set its own Base target_share")
-                .inner()
-                .eq(float!(0.4))
-                .unwrap()
-        );
+        for (symbol, target_share, operational_limit, base_target_share) in rebalanced {
+            let symbol = Symbol::new(symbol).unwrap();
+            let equity = &trading.assets.equities.symbols[&symbol];
+            assert_eq!(
+                equity.wrapped_equity_recovery,
+                OperationMode::Enabled,
+                "{symbol}"
+            );
+            assert!(
+                equity
+                    .target_share
+                    .unwrap_or_else(|| panic!("{symbol} must set its own Robinhood target_share"))
+                    .inner()
+                    .eq(target_share)
+                    .unwrap(),
+                "{symbol}"
+            );
+            // Also the hedge cap for Robinhood fills and for the CheckPositions
+            // backstop, which takes the tightest limit across chains.
+            assert!(
+                equity
+                    .operational_limit
+                    .unwrap_or_else(|| panic!(
+                        "{symbol} must cap each Robinhood rebalancing operation and hedge order"
+                    ))
+                    .inner()
+                    .inner()
+                    .eq(operational_limit)
+                    .unwrap(),
+                "{symbol}"
+            );
 
-        let dnut = &trading.assets.equities.symbols[&dnut];
-        assert_eq!(dnut.wrapped_equity_recovery, OperationMode::Enabled);
-        assert!(
-            dnut.target_share
-                .expect("DNUT must set its own Robinhood target_share")
-                .inner()
-                .eq(float!(0.4))
-                .unwrap()
-        );
-        // Also the hedge cap for Robinhood DNUT fills and for the CheckPositions
-        // backstop, which takes the tightest limit across chains. A Base DNUT
-        // fill hedges with Base's limit, which is unset.
-        assert!(
-            dnut.operational_limit
-                .expect(
-                    "DNUT must cap each Robinhood rebalancing operation and Robinhood hedge order"
-                )
-                .inner()
-                .inner()
-                .eq(float!(25))
-                .unwrap()
-        );
+            let base_target = base_trading
+                .assets
+                .equities
+                .symbols
+                .get(&symbol)
+                .and_then(|equity| equity.target_share);
+            match base_target_share {
+                Some(expected) => assert!(
+                    base_target
+                        .unwrap_or_else(|| panic!("{symbol} must set its own Base target_share"))
+                        .inner()
+                        .eq(expected)
+                        .unwrap(),
+                    "{symbol}"
+                ),
+                None => assert!(base_target.is_none(), "{symbol} has no Base target"),
+            }
+        }
     }
 
     #[test]
