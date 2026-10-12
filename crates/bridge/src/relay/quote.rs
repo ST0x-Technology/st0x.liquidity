@@ -21,7 +21,7 @@ sol! {
     function depositErc20(address depositor, address token, uint256 amount, bytes32 id) external;
 }
 
-/// The only `orderData.version` whose shape [`derive_order_id`] hashes.
+/// The only `orderData.version` whose shape [`eip712_order`] builds.
 const ORDER_VERSION: &str = "v1";
 
 /// Relay's v1 order as its settlement SDK hashes it: `getOrderId` is the
@@ -597,15 +597,13 @@ impl QuoteResponse {
             });
         }
 
-        let derived = derive_order_id(&self.protocol.v2.order_data)?;
+        let order = eip712_order(&self.protocol.v2.order_data)?;
+        let derived = RelayOrderId(order.eip712_hash_struct());
         if derived != quoted {
             return Err(QuoteMismatch::OrderIdNotDerived { derived, quoted });
         }
 
-        let seconds = self.protocol.v2.order_data.output.deadline;
-        let deadline = UNIX_EPOCH
-            .checked_add(Duration::from_secs(seconds))
-            .ok_or(QuoteMismatch::Deadline { seconds })?;
+        let deadline = UNIX_EPOCH + Duration::from_secs(u64::from(order.output.deadline));
 
         Ok(RelayQuote {
             request_id: self.request_id,
@@ -627,9 +625,10 @@ impl QuoteResponse {
     }
 }
 
-/// Relay's `getOrderId` over the order as quoted. The fees hash as an empty
-/// list: a quote with an order fee is refused before this runs.
-fn derive_order_id(order: &RawOrderData) -> Result<RelayOrderId, QuoteMismatch> {
+/// The order as quoted, in the shape whose struct hash is Relay's
+/// `getOrderId`. The fees hash as an empty list: a quote with an order fee is
+/// refused before this runs.
+fn eip712_order(order: &RawOrderData) -> Result<order_eip712::Order, QuoteMismatch> {
     let address_bytes = |address: Address| Bytes::copy_from_slice(address.as_slice());
     let deadline =
         |seconds: u64| u32::try_from(seconds).map_err(|_| QuoteMismatch::Deadline { seconds });
@@ -683,7 +682,7 @@ fn derive_order_id(order: &RawOrderData) -> Result<RelayOrderId, QuoteMismatch> 
         extraData: order.output.extra_data.clone(),
     };
 
-    let hashed = order_eip712::Order {
+    Ok(order_eip712::Order {
         version: order.version.clone(),
         solverChainId: order.solver_chain_id.clone(),
         solver: order.solver,
@@ -691,9 +690,7 @@ fn derive_order_id(order: &RawOrderData) -> Result<RelayOrderId, QuoteMismatch> 
         inputs,
         output,
         fees: vec![],
-    };
-
-    Ok(RelayOrderId(hashed.eip712_hash_struct()))
+    })
 }
 
 fn check_currency(
@@ -740,7 +737,7 @@ fn check_fees(fees: &RawFees, origin: Chain) -> Result<(), QuoteMismatch> {
     Ok(())
 }
 
-/// The order is the v1 shape [`derive_order_id`] hashes, takes exactly one
+/// The order is the v1 shape [`eip712_order`] builds, takes exactly one
 /// input, the requested amount of the origin stable on the origin chain, and
 /// carries no extra fee.
 fn check_order_input(order: &RawOrderData, request: &QuoteRequest) -> Result<(), QuoteMismatch> {
