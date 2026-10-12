@@ -90,6 +90,8 @@ PORTED = {
     "liq_usdc_total",
     "liq_usdc_ratio",
     "liq_usdc_rebalanceable",
+    "liq_position_last_price_usd",
+    "liq_equity_exposure_usd",
 }
 
 # Names only the bot publishes.

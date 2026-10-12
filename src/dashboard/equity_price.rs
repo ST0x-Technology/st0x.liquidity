@@ -190,6 +190,25 @@ impl EquityPriceStore {
         snapshot
     }
 
+    /// Every symbol's wrapped-token price that has not expired at `now`, in
+    /// symbol order.
+    pub(crate) async fn live_prices(&self, now: DateTime<Utc>) -> Vec<(Symbol, Float)> {
+        let mut live: Vec<(Symbol, Float)> = self
+            .prices
+            .read()
+            .await
+            .iter()
+            .filter_map(|(symbol, price)| {
+                price
+                    .as_ref()
+                    .filter(|price| price.expires_at > now)
+                    .map(|price| (symbol.clone(), price.price_usd))
+            })
+            .collect();
+        live.sort_by(|(left, _), (right, _)| left.cmp(right));
+        live
+    }
+
     /// A store holding one live mark for `symbol`, observed now, with a
     /// wrapper ratio of 1.
     #[cfg(test)]
@@ -908,6 +927,50 @@ mod tests {
     use st0x_config::{ChainEquities, ChainEquityAsset, OperationMode, RebalancingMode};
 
     use super::*;
+
+    #[tokio::test]
+    async fn live_prices_lists_unexpired_prices_in_symbol_order() {
+        let now = Utc::now();
+        let available = |price_usd, expires_at| {
+            Some(AvailablePrice {
+                price_usd,
+                underlying_price_usd: None,
+                observed_at: now,
+                expires_at,
+            })
+        };
+        let store = EquityPriceStore {
+            prices: Arc::new(RwLock::new(HashMap::from([
+                (
+                    Symbol::new("TSLA").unwrap(),
+                    available(float!(9), now + TimeDelta::seconds(30)),
+                ),
+                (
+                    Symbol::new("AAPL").unwrap(),
+                    available(float!(2.5), now + TimeDelta::seconds(30)),
+                ),
+                (Symbol::new("RKLB").unwrap(), available(float!(4), now)),
+                (Symbol::new("SPYM").unwrap(), None),
+            ]))),
+            mark_listener: Arc::default(),
+            last_marks: Arc::default(),
+        };
+
+        let live: Vec<(String, String)> = store
+            .live_prices(now)
+            .await
+            .into_iter()
+            .map(|(symbol, price)| (symbol.to_string(), price.format().unwrap()))
+            .collect();
+
+        assert_eq!(
+            live,
+            [
+                ("AAPL".to_string(), "2.5".to_string()),
+                ("TSLA".to_string(), "9".to_string()),
+            ]
+        );
+    }
 
     struct AssertDashboardAuthorization;
 

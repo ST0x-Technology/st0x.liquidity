@@ -9,7 +9,7 @@ use std::ops::{Deref, DerefMut};
 
 use chrono::Utc;
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, broadcast};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use st0x_dto::{InventorySnapshot, Statement};
 
@@ -57,6 +57,25 @@ impl BroadcastingInventory {
 
     pub(crate) async fn read(&self) -> RwLockReadGuard<'_, InventoryView> {
         self.view.read().await
+    }
+
+    /// Publishes the `liq_*` inventory series again from the current view.
+    /// Covers quiet periods and any write path that skipped the publish; a
+    /// write that lands meanwhile carries a newer generation and wins.
+    pub(crate) async fn republish_liq_metrics(&self) {
+        let Some(publisher) = &self.liq_metrics else {
+            warn!(target: "inventory", "No liq_ inventory publisher attached; skipped the republish");
+            return;
+        };
+
+        let Some(read) = publisher.read_current(&*self.view.read().await) else {
+            debug!(
+                target: "inventory",
+                "Skipped the liq_ inventory republish: boot has not restored the inventory yet"
+            );
+            return;
+        };
+        publisher.publish(read);
     }
 
     pub(crate) async fn write(&self) -> BroadcastingWriteGuard<'_> {
