@@ -6165,6 +6165,10 @@ impl UsdcRebalance {
                 ..
             } => (current.amount_in, signed_order_ids),
             Self::SwapRefunded {
+                short_of_floor: Some(floor),
+                ..
+            } => return Err(UsdcRebalanceError::ShortRefundHeld { floor: *floor }),
+            Self::SwapRefunded {
                 direction: RebalanceDirection::AlpacaToBase,
                 side: RefundSide::Origin,
                 amount_refunded,
@@ -7533,6 +7537,41 @@ mod tests {
         assert_eq!(
             state.ethereum_wallet_credit(),
             Some(EthereumWalletCredit::Held(Usdc::new(float!(99))))
+        );
+    }
+
+    /// A refund at the hub below its refund floor is never quoted again.
+    #[tokio::test]
+    async fn short_refund_toward_chain_is_not_requoted() {
+        let deposited = deposited(RebalanceDirection::AlpacaToBase);
+        let refunded = TestHarness::<UsdcRebalance>::with(())
+            .given(deposited.clone())
+            .when(UsdcRebalanceCommand::RecordSwapRefund {
+                refund_tx: TxHash::repeat_byte(0xe1),
+                side: RefundSide::Origin,
+                amount_refunded: U256::from(99_000_000u64),
+            })
+            .await
+            .events();
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given([deposited, refunded].concat())
+            .when(UsdcRebalanceCommand::RequoteSwap {
+                quote: Box::new(swap_quote_for_test(
+                    U256::from(99_000_000u64),
+                    B256::repeat_byte(0x1e),
+                )),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(UsdcRebalanceError::ShortRefundHeld { floor })
+                    if floor == U256::from(99_500_000u64)
+            ),
+            "got {error:?}"
         );
     }
 

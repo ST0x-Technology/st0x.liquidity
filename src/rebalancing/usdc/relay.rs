@@ -743,6 +743,9 @@ where
                 amount_refunded,
                 ..
             }) => {
+                if self.hold_short_refund(id).await? {
+                    return Ok(());
+                }
                 warn!(target: "rebalance", %id, %refund_tx, %amount_refunded, "Relay refunded the deposit in the chain's stable to the chain wallet; the transfer holds its guard for the operator to move it and reconcile");
                 Ok(())
             }
@@ -1431,9 +1434,10 @@ where
     /// Quotes again, from the hub, an Alpaca-to-chain refund paid in USDC at
     /// the hub, then signs and sends the new deposit: while fewer than
     /// `max_refund_retries` re-quotes followed a refund and the refund is at
-    /// least `min_transfer`. Otherwise, or when Relay refuses the quote, the
-    /// transfer holds at `SwapRefunded`, paged, for `transfer reconcile`; a
-    /// transient failure is left for the retry.
+    /// least `min_transfer` and not below its refund floor. Otherwise, or
+    /// when Relay refuses the quote, the transfer holds at `SwapRefunded`,
+    /// paged, for `transfer reconcile`; a transient failure is left for the
+    /// retry.
     async fn requote_refund_toward_chain(
         &self,
         id: &UsdcRebalanceId,
@@ -1449,6 +1453,9 @@ where
             warn!(target: "rebalance", %id, "No Alpaca-to-chain refund at the hub to quote again");
             return Ok(());
         };
+        if self.hold_short_refund(id).await? {
+            return Ok(());
+        }
 
         let RelayHopCtx {
             max_refund_retries,
@@ -6356,7 +6363,7 @@ mod tests {
             .await
             .unwrap();
         record_pair_deposited(&store, &id, 8).await;
-        store.send(&id, refund(99_000_000)).await.unwrap();
+        store.send(&id, refund(99_100_000)).await.unwrap();
 
         transfer
             .resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
