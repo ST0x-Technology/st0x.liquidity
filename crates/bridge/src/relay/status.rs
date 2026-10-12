@@ -507,6 +507,35 @@ mod tests {
         );
     }
 
+    /// Only the statuses whose outcome hangs on the tx list need `txHashes`.
+    #[test]
+    fn terminal_status_that_reads_no_tx_decodes_without_tx_hashes() {
+        for (body, expected) in [
+            (
+                json!({
+                    "status": "refund",
+                    "failReason": "SLIPPAGE",
+                    "refundFailReason": "BLOCKED_WALLET",
+                }),
+                IntentStatus::RefundFailed {
+                    reason: Some(FailReason::Slippage),
+                    refund_fail_reason: FailReason::BlockedWallet,
+                },
+            ),
+            (
+                json!({"status": "failure", "failReason": "SOLVER_CAPACITY_EXCEEDED"}),
+                IntentStatus::Failure {
+                    reason: Some(FailReason::SolverCapacityExceeded),
+                },
+            ),
+        ] {
+            let report = report(&body.to_string());
+
+            assert_eq!(report.status, expected);
+            assert_eq!(report.txs, Vec::<TxHash>::new());
+        }
+    }
+
     #[test]
     fn failure_not_included_with_no_tx_is_terminal() {
         let report = report(
