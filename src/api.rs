@@ -7885,17 +7885,17 @@ mod tests {
             let audited_not_found = lines.iter().any(|line| {
                 line.contains("operations_audit: Operations audit event")
                     && line.contains(&request_id.to_string())
-                    && line.contains("principal=local-loopback")
+                    && line.contains("principal=\"local-loopback\"")
                     && line.contains("role=\"local\"")
-                    && line.contains("route=/transfers/{*path}")
-                    && line.contains("target_id=not_identified")
+                    && line.contains("route=\"/transfers/{*path}\"")
+                    && line.contains("target_id=\"not_identified\"")
                     && line.contains("outcome=\"validation_failure\"")
             });
             let audited_denial = lines.iter().any(|line| {
                 line.contains("operations_audit: Operations audit event")
                     && line.contains(&denied_request_id)
                     && line.contains("role=\"local\"")
-                    && line.contains("route=/transfers/{*path}")
+                    && line.contains("route=\"/transfers/{*path}\"")
                     && line.contains("outcome=\"denied\"")
             });
             (audited_not_found && audited_denial)
@@ -8095,7 +8095,7 @@ mod tests {
                 if !lines.iter().any(|line| {
                     line.contains("operations_audit: Operations audit event")
                         && line.contains(request_id)
-                        && line.contains("route=/liquidity-write/{*path}")
+                        && line.contains("route=\"/liquidity-write/{*path}\"")
                         && line.contains("outcome=\"denied\"")
                 }) {
                     return Err(format!(
@@ -8152,7 +8152,7 @@ mod tests {
                 line.contains("operations_audit: Operations audit event")
                     && line.contains(write_request_id)
                     && line.contains("role=\"write\"")
-                    && line.contains("route=/liquidity-write/{*path}")
+                    && line.contains("route=\"/liquidity-write/{*path}\"")
                     && line.contains("outcome=\"denied\"")
             });
             let audited_unrelated = lines.iter().any(|line| {

@@ -208,17 +208,20 @@ impl OperationsAuditRecorder for LogOperationsAuditRecorder {
             return Err(AuditRecordError::TargetDisabled { level });
         }
 
+        // Every caller-influenced value is recorded as a string value, so the
+        // text formatter quotes and escapes it and a newline in a decoded path
+        // segment or reason cannot start a forged record line.
         match event.outcome {
             AuditOutcome::Success => info!(
                 target: "operations_audit",
                 audit_schema = AUDIT_SCHEMA,
                 service = SERVICE,
-                principal = %event.principal,
+                principal = event.principal.as_str(),
                 role = event.role,
-                route = %event.route,
+                route = event.route.as_str(),
                 request_id = %event.request_id,
-                target_id = %event.target_id,
-                reason = %event.reason,
+                target_id = event.target_id.as_str(),
+                reason = event.reason.as_str(),
                 outcome = event.outcome.as_str(),
                 timestamp = %event.timestamp,
                 "Operations audit event"
@@ -229,12 +232,12 @@ impl OperationsAuditRecorder for LogOperationsAuditRecorder {
                 target: "operations_audit",
                 audit_schema = AUDIT_SCHEMA,
                 service = SERVICE,
-                principal = %event.principal,
+                principal = event.principal.as_str(),
                 role = event.role,
-                route = %event.route,
+                route = event.route.as_str(),
                 request_id = %event.request_id,
-                target_id = %event.target_id,
-                reason = %event.reason,
+                target_id = event.target_id.as_str(),
+                reason = event.reason.as_str(),
                 outcome = event.outcome.as_str(),
                 timestamp = %event.timestamp,
                 "Operations audit event"
@@ -252,12 +255,12 @@ fn record_with(recorder: &dyn OperationsAuditRecorder, event: &OperationsAuditEv
             alert = true,
             audit_schema = AUDIT_SCHEMA,
             service = SERVICE,
-            principal = %event.principal,
+            principal = event.principal.as_str(),
             role = event.role,
-            route = %event.route,
+            route = event.route.as_str(),
             request_id = %event.request_id,
-            target_id = %event.target_id,
-            reason = %event.reason,
+            target_id = event.target_id.as_str(),
+            reason = event.reason.as_str(),
             outcome = event.outcome.as_str(),
             timestamp = %event.timestamp,
             %record_error,
@@ -842,11 +845,11 @@ mod tests {
                     line.contains("operations_audit: Operations audit event")
                         && line.contains("audit_schema=\"st0x.operations.audit.v1\"")
                         && line.contains("service=\"liquidity\"")
-                        && line.contains("principal=accounts.google.com:1234")
+                        && line.contains("principal=\"accounts.google.com:1234\"")
                         && line.contains("role=\"write\"")
                         && line.contains("request_id=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
-                        && line.contains("target_id=mint:mint-9")
-                        && line.contains("reason=incident 42")
+                        && line.contains("target_id=\"mint:mint-9\"")
+                        && line.contains("reason=\"incident 42\"")
                         && line.contains(&format!("outcome=\"{outcome}\""))
                 });
                 if !matched {
@@ -1017,10 +1020,10 @@ mod tests {
             ] {
                 let matched = lines.iter().any(|line| {
                     line.contains("operations_audit: Operations audit event")
-                        && line.contains(&format!("principal={principal}"))
+                        && line.contains(&format!("principal=\"{principal}\""))
                         && line.contains(&format!("request_id={request_id}"))
-                        && line.contains(&format!("target_id={target_id}"))
-                        && line.contains(&format!("reason={reason}"))
+                        && line.contains(&format!("target_id=\"{target_id}\""))
+                        && line.contains(&format!("reason=\"{reason}\""))
                         && line.contains(&format!("outcome=\"{outcome}\""))
                 });
                 if !matched {
@@ -1030,6 +1033,43 @@ mod tests {
                 }
             }
             Ok(())
+        });
+    }
+
+    /// Path targets are percent-decoded and reasons are free text, so an
+    /// encoded or literal newline must stay inside its quoted value rather
+    /// than start a forged record line in text output.
+    #[traced_test]
+    #[tokio::test]
+    async fn newlines_in_path_targets_and_reasons_cannot_forge_a_record() {
+        let response = audited_router()
+            .oneshot(request(
+                "/liquidity-write/transfers/success/x%0Aoperations_audit:%20forged/reconcile",
+                "55555555-5555-5555-5555-555555555555",
+                Some("accounts.google.com:1234"),
+                r#"{"reason":"ok\noperations_audit: forged"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        logs_assert(|lines| {
+            if let Some(forged) = lines
+                .iter()
+                .find(|line| line.starts_with("operations_audit:"))
+            {
+                return Err(format!("forged record line: {forged}"));
+            }
+            lines
+                .iter()
+                .any(|line| {
+                    line.contains("operations_audit: Operations audit event")
+                        && line.contains("55555555-5555-5555-5555-555555555555")
+                        && line.contains(r#"target_id="success:x\noperations_audit: forged""#)
+                        && line.contains(r#"reason="ok\noperations_audit: forged""#)
+                })
+                .then_some(())
+                .ok_or_else(|| format!("missing escaped audit event: {lines:?}"))
         });
     }
 
@@ -1381,8 +1421,8 @@ mod tests {
                 .iter()
                 .any(|line| {
                     line.contains("operational_alert: Operations audit recording failed")
-                        && line.contains("principal=accounts.google.com:1234")
-                        && line.contains("target_id=mint:mint-9")
+                        && line.contains("principal=\"accounts.google.com:1234\"")
+                        && line.contains("target_id=\"mint:mint-9\"")
                         && line.contains("request_id=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
                         && line.contains("outcome=\"success\"")
                 })

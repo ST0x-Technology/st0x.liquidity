@@ -7200,12 +7200,14 @@ not depend on service-specific log messages:
 
 Authentication and the loopback gate run before request-body capture. A request
 denied there is not parsed for untrusted identifiers or reasons and therefore
-uses `target_id=not_identified` and `reason=not_provided`. After authentication,
-dynamic path targets are percent-decoded to the same UTF-8 values accepted by
-the route extractor; invalid UTF-8 is rejected without lossy conversion.
-Authenticated requests whose canonical target or reason exceeds its limit are
-rejected before the mutation; values are never truncated. Nested values and
-alternate field aliases are not audit inputs.
+uses `not_identified` as `target_id` and `not_provided` as `reason`. After
+authentication, dynamic path targets are percent-decoded to the same UTF-8
+values accepted by the route extractor; invalid UTF-8 is rejected without lossy
+conversion. Authenticated requests whose canonical target or reason exceeds its
+limit are rejected before the mutation; values are never truncated. Nested
+values and alternate field aliases are not audit inputs. `principal`, `route`,
+`target_id`, and `reason` are recorded as quoted, escaped strings, so a newline
+in a decoded path segment or reason cannot start a forged record line.
 
 The tracing target is `operations_audit`, with an unconditional INFO filter
 floor even when `RUST_LOG` is stricter. Success is INFO; every other outcome is
