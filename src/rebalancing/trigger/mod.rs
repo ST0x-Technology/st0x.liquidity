@@ -46881,7 +46881,7 @@ mod tests {
         let refund = UsdcRebalanceCommand::RecordSwapRefund {
             refund_tx: TxHash::repeat_byte(0xe1),
             side: RefundSide::Origin,
-            amount_refunded: U256::from(99_000_000u64),
+            amount_refunded: U256::from(99_500_000u64),
         };
         let deposit = PreparedTransaction::for_test(TxHash::repeat_byte(0xa2), 6);
         let confirm = UsdcRebalanceCommand::ConfirmSwapDeposit {
