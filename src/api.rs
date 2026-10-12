@@ -10,8 +10,8 @@ use alloy::primitives::{TxHash, U256};
 use axum::Json;
 use axum::Router;
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
-use axum::http::StatusCode;
 use axum::http::header::{CACHE_CONTROL, HeaderName};
+use axum::http::{Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
 use axum::routing::{get, post};
@@ -4430,7 +4430,12 @@ macro_rules! ops_role {
     };
 }
 
-#[cfg(test)]
+/// One declared route: the method and path pattern the route guard admits.
+struct DeclaredRoute {
+    method: Method,
+    path: &'static str,
+}
+
 macro_rules! ops_method {
     (get) => {
         axum::http::Method::GET
@@ -4461,6 +4466,13 @@ macro_rules! mount_ops_route {
 
 macro_rules! define_ops_api_routes {
     ($( $role:ident $method:ident $path:literal => $handler:path; )+) => {
+        const OPS_API_DECLARED: &[DeclaredRoute] = &[
+            $(DeclaredRoute {
+                method: ops_method!($method),
+                path: ops_path!($role, $path),
+            }),+
+        ];
+
         #[cfg(test)]
         const OPS_API_ROUTES: &[OpsRoute] = &[
             $(OpsRoute {
@@ -4635,8 +4647,9 @@ async fn require_loopback(
 
 macro_rules! define_loopback_routes {
     ($( $path:literal => $handler:path; )+) => {
-        #[cfg(test)]
-        const LOOPBACK_ROUTES: &[&str] = &[$($path),+];
+        const LOOPBACK_DECLARED: &[DeclaredRoute] = &[
+            $(DeclaredRoute { method: Method::POST, path: $path }),+
+        ];
 
         fn mount_loopback_routes() -> Router<AppState> {
             let mut router = Router::new();
@@ -4660,12 +4673,16 @@ define_loopback_routes! {
 
 macro_rules! define_public_routes {
     ($( $path:literal => $handler:path; )+) => {
+        const PUBLIC_DECLARED: &[DeclaredRoute] = &[
+            $(DeclaredRoute { method: Method::GET, path: $path }),+
+        ];
+
         #[cfg(test)]
         const PUBLIC_ROUTES: &[(&str, &str)] = &[$(($path, stringify!($handler))),+];
 
         /// Mounts the read tier handlers at their bare paths with no IAP
-        /// guard, for the dashboard. A test holds this list to the read
-        /// declaration, so no mutation handler can be declared here.
+        /// guard, for the dashboard. A test holds this list to the handlers
+        /// and paths of the read declaration.
         fn mount_public_routes() -> Router<AppState> {
             let mut router = Router::new();
             $(
@@ -4694,19 +4711,143 @@ define_public_routes! {
     "/transfers/interrupted" => interrupted_transfers;
 }
 
+macro_rules! define_service_routes {
+    ($( $path:literal => $handler:path; )+) => {
+        const SERVICE_DECLARED: &[DeclaredRoute] = &[
+            $(DeclaredRoute { method: Method::GET, path: $path }),+
+        ];
+
+        fn mount_service_routes() -> Router<AppState> {
+            let mut router = Router::new();
+            $(
+                router = router.route($path, get($handler));
+            )+
+            router
+        }
+    };
+}
+
+// Server endpoints outside the operator API: Prometheus scraping and the
+// dashboard WebSocket.
+define_service_routes! {
+    "/metrics" => crate::metrics::endpoint;
+    "/api/ws" => crate::dashboard::ws_endpoint;
+}
+
+const DECLARED_ROUTES: [&[DeclaredRoute]; 4] = [
+    OPS_API_DECLARED,
+    LOOPBACK_DECLARED,
+    PUBLIC_DECLARED,
+    SERVICE_DECLARED,
+];
+
+const UNDECLARED_ROUTE_ERROR: &str = "route is not declared";
+
+const UNDECLARED_METHOD_ERROR: &str = "method is not declared for this route";
+
+enum RouteAdmission {
+    Declared,
+    UndeclaredMethod { allow: String },
+    UndeclaredRoute,
+}
+
+/// Checks a request against the declarations by its method and its matched
+/// route pattern. A GET route also answers HEAD, as axum mounts it.
+fn route_admission(method: &Method, pattern: Option<&str>) -> RouteAdmission {
+    let Some(pattern) = pattern else {
+        return RouteAdmission::UndeclaredRoute;
+    };
+    let declared = || {
+        DECLARED_ROUTES
+            .into_iter()
+            .flatten()
+            .filter(move |route| route.path == pattern)
+    };
+
+    if declared().any(|route| {
+        route.method == *method || (*method == Method::HEAD && route.method == Method::GET)
+    }) {
+        return RouteAdmission::Declared;
+    }
+
+    let allow = declared()
+        .map(|route| {
+            if route.method == Method::GET {
+                "GET,HEAD"
+            } else {
+                route.method.as_str()
+            }
+        })
+        .collect::<Vec<_>>();
+    if allow.is_empty() {
+        RouteAdmission::UndeclaredRoute
+    } else {
+        RouteAdmission::UndeclaredMethod {
+            allow: allow.join(","),
+        }
+    }
+}
+
+/// Admits only a request whose method and matched route come from a
+/// declaration, before any handler runs. The declarations are where each
+/// route gets its guard (IAP on the role prefixes when the ops API is
+/// configured, loopback, or none for the dashboard reads and service routes),
+/// so a route, method, nested service, or fallback mounted any other way fails
+/// closed: an unknown route gets 404 and an undeclared method on a declared
+/// route gets 405.
+async fn refuse_undeclared_route(request: Request, next: Next) -> Response {
+    use axum::response::IntoResponse as _;
+
+    let matched = request.extensions().get::<axum::extract::MatchedPath>();
+    match route_admission(
+        request.method(),
+        matched.map(axum::extract::MatchedPath::as_str),
+    ) {
+        RouteAdmission::Declared => next.run(request).await,
+        RouteAdmission::UndeclaredMethod { allow } => (
+            StatusCode::METHOD_NOT_ALLOWED,
+            [(axum::http::header::ALLOW, allow)],
+            Json(ErrorResponse {
+                error: UNDECLARED_METHOD_ERROR.to_string(),
+            }),
+        )
+            .into_response(),
+        RouteAdmission::UndeclaredRoute => {
+            // Only a handler mounted outside the declarations gets here with
+            // a matched route; an unknown path has none.
+            if let Some(route) = matched {
+                error!(
+                    target: "api",
+                    route = route.as_str(),
+                    "Refusing a mounted route that no route declaration lists"
+                );
+            }
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: UNDECLARED_ROUTE_ERROR.to_string(),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Every route the server mounts on its main port.
 pub(crate) fn routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
     routes_with_ops_api(ops_api_routes(ops_api))
 }
 
-/// Every route in this router comes from one of the three declarations above,
-/// and the tests in this module check each declaration. A route mounted here
-/// with a bare `route` call, or beside this router where the server adds
-/// `/metrics` and the dashboard `/api` routes, escapes those tests.
+/// Merges the declared routers and guards the result. The guard must stay the
+/// last call: it wraps only the routes mounted before it, so a route added
+/// after it, here or on the router `routes` returns, would skip the check.
 fn routes_with_ops_api(ops_api: Router<AppState>) -> Router<AppState> {
     Router::new()
         .merge(ops_api)
         .merge(mount_loopback_routes())
         .merge(mount_public_routes())
+        .merge(mount_service_routes())
+        .layer(axum::middleware::from_fn(refuse_undeclared_route))
 }
 
 #[cfg(test)]
@@ -4905,8 +5046,18 @@ mod tests {
     struct RouteResponse {
         status: StatusCode,
         matched: bool,
+        allow: Option<String>,
         body: String,
     }
+
+    /// Every method the route tests probe each declared route with.
+    const PROBE_METHODS: [Method; 5] = [
+        Method::GET,
+        Method::POST,
+        Method::PUT,
+        Method::PATCH,
+        Method::DELETE,
+    ];
 
     async fn route_response(
         app: &Router,
@@ -4935,14 +5086,53 @@ mod tests {
         RouteResponse {
             status: response.status(),
             matched: response.headers().contains_key(MATCHED_ROUTE_HEADER),
+            allow: response
+                .headers()
+                .get(axum::http::header::ALLOW)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned),
             body: body_to_string(response).await,
         }
     }
 
-    /// The IAP guard's own refusal when it cannot load signing keys.
-    fn is_iap_keys_unavailable(status: u16, body: &str) -> bool {
-        status == StatusCode::SERVICE_UNAVAILABLE.as_u16()
-            && body.contains(&IapError::KeysUnavailable.to_string())
+    /// The route guard refused a method that no declaration lists for this
+    /// route, and named the declared ones.
+    fn assert_undeclared_method(
+        response: &RouteResponse,
+        allow: &str,
+        context: &impl std::fmt::Debug,
+    ) {
+        assert_eq!(
+            response.status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{context:?}: {response:?}"
+        );
+        assert!(
+            response.body.contains(UNDECLARED_METHOD_ERROR),
+            "{context:?}: {response:?}"
+        );
+        assert_eq!(response.allow.as_deref(), Some(allow), "{context:?}");
+    }
+
+    /// The route guard refused a route that no declaration lists.
+    fn assert_undeclared_route(response: &RouteResponse, context: &impl std::fmt::Debug) {
+        assert_eq!(
+            response.status,
+            StatusCode::NOT_FOUND,
+            "{context:?}: {response:?}"
+        );
+        assert!(
+            response.body.contains(UNDECLARED_ROUTE_ERROR),
+            "{context:?}: {response:?}"
+        );
+    }
+
+    /// A refusal from the IAP key loader or the route guard. Both answer with
+    /// a status a handler may also use, so only the body tells them apart.
+    fn is_guard_refusal(status: u16, body: &str) -> bool {
+        (status == StatusCode::SERVICE_UNAVAILABLE.as_u16()
+            && body.contains(&IapError::KeysUnavailable.to_string()))
+            || (status == StatusCode::NOT_FOUND.as_u16() && body.contains(UNDECLARED_ROUTE_ERROR))
     }
 
     /// The request matched a route and passed every access guard. No ops
@@ -4961,7 +5151,7 @@ mod tests {
             assert_ne!(response.status, refused, "{context:?}: {response:?}");
         }
         assert!(
-            !is_iap_keys_unavailable(response.status.as_u16(), &response.body),
+            !is_guard_refusal(response.status.as_u16(), &response.body),
             "{context:?}: {response:?}"
         );
     }
@@ -4975,7 +5165,7 @@ mod tests {
             Err(CommandError::Transport(TransportError::Http(status, body))) => {
                 assert_ne!(status, reqwest::StatusCode::METHOD_NOT_ALLOWED, "{case:?}");
                 assert!(
-                    !is_iap_keys_unavailable(status.as_u16(), &body),
+                    !is_guard_refusal(status.as_u16(), &body),
                     "{case:?}: {body}"
                 );
             }
@@ -7869,7 +8059,7 @@ mod tests {
         let ctx = create_test_ctx_with_order_owner(Address::ZERO);
         let app = with_route_marker(build_app(empty_app_state(ctx).await));
 
-        for &route in LOOPBACK_ROUTES {
+        for route in LOOPBACK_DECLARED.iter().map(|declared| declared.path) {
             let path = concrete_path(route);
             for (peer, label) in [
                 (Some(SocketAddr::from(([172, 18, 0, 1], 9))), "bridge peer"),
@@ -7888,6 +8078,21 @@ mod tests {
             )
             .await;
             assert_handler_reached(&response, &route);
+
+            for method in PROBE_METHODS
+                .iter()
+                .filter(|method| **method != Method::POST)
+            {
+                let response = route_response(
+                    &app,
+                    method.clone(),
+                    &path,
+                    None,
+                    Some(SocketAddr::from(([127, 0, 0, 1], 9))),
+                )
+                .await;
+                assert_undeclared_method(&response, "POST", &(method, route));
+            }
 
             let write_mount = format!("/liquidity-write{route}");
             assert!(
@@ -7992,13 +8197,18 @@ mod tests {
                 );
             }
 
-            let wrong_method = match route.method {
-                Method::GET => Method::POST,
-                Method::POST => Method::GET,
-                ref method => panic!("unexpected ops method {method}"),
+            let allow = if route.method == Method::GET {
+                "GET,HEAD"
+            } else {
+                route.method.as_str()
             };
-            let response = route_response(&app, wrong_method, &path, Some(own), None).await;
-            assert_eq!(response.status, StatusCode::METHOD_NOT_ALLOWED, "{route:?}");
+            for method in PROBE_METHODS
+                .iter()
+                .filter(|method| **method != route.method)
+            {
+                let response = route_response(&app, method.clone(), &path, Some(own), None).await;
+                assert_undeclared_method(&response, allow, &(method, route));
+            }
         }
     }
 
@@ -8017,7 +8227,10 @@ mod tests {
                 .path
                 .strip_prefix("/liquidity-write")
                 .expect("write route has its role prefix");
-            if LOOPBACK_ROUTES.contains(&bare_pattern) {
+            if LOOPBACK_DECLARED
+                .iter()
+                .any(|loopback| loopback.path == bare_pattern)
+            {
                 continue;
             }
             let path = concrete_path(bare_pattern);
@@ -8044,23 +8257,94 @@ mod tests {
         assert_eq!(public_routes, read_routes);
     }
 
-    /// Every public route refuses each mutation method.
+    /// Every public and service route serves GET, and the route guard refuses
+    /// every other method on it.
     #[tokio::test]
-    async fn public_routes_refuse_every_mutation_method() {
+    async fn public_and_service_routes_serve_only_get() {
         let ctx = create_test_ctx_with_order_owner(Address::ZERO);
         let app = with_route_marker(build_app(empty_app_state(ctx).await));
 
-        for &(route, _) in PUBLIC_ROUTES {
+        for route in PUBLIC_DECLARED
+            .iter()
+            .chain(SERVICE_DECLARED)
+            .map(|declared| declared.path)
+        {
             let path = concrete_path(route);
-            for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+            let response = route_response(&app, Method::GET, &path, None, None).await;
+            assert_handler_reached(&response, &route);
+
+            for method in PROBE_METHODS
+                .iter()
+                .filter(|method| **method != Method::GET)
+            {
                 let response = route_response(&app, method.clone(), &path, None, None).await;
-                assert_eq!(
-                    response.status,
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "{method} {route}"
-                );
+                assert_undeclared_method(&response, "GET,HEAD", &(method, route));
             }
         }
+    }
+
+    /// A GET declaration also admits HEAD, as axum serves HEAD from a GET
+    /// route; a route declared only for POST refuses HEAD.
+    #[test]
+    fn head_follows_get_declarations() {
+        assert!(matches!(
+            route_admission(&Method::HEAD, Some("/health")),
+            RouteAdmission::Declared
+        ));
+        assert!(matches!(
+            route_admission(&Method::HEAD, Some("/transfers/resume")),
+            RouteAdmission::UndeclaredMethod { ref allow } if allow == "POST"
+        ));
+    }
+
+    /// A route, method, nested service, or fallback mounted outside every
+    /// declaration is refused before its handler runs, so it cannot reach the
+    /// network without the guard its declaration would give it.
+    #[tokio::test]
+    async fn undeclared_routes_are_refused_before_their_handler() {
+        let reached = Arc::new(AtomicBool::new(false));
+        let handler_reached = Arc::clone(&reached);
+        let handler = move || {
+            let reached = Arc::clone(&handler_reached);
+            async move {
+                reached.store(true, Ordering::SeqCst);
+                "handler ran"
+            }
+        };
+        let undeclared = Router::new()
+            .route("/resume-all", post(handler.clone()))
+            .route("/liquidity-write/resume-all", post(handler.clone()))
+            .route("/status-dump", get(handler.clone()))
+            .route("/transfers/resume", get(handler.clone()))
+            .route("/health", axum::routing::put(handler.clone()))
+            .route(
+                "/liquidity-write/transfers/resume",
+                axum::routing::delete(handler.clone()),
+            )
+            .nest_service("/files", get(handler.clone()).with_state::<()>(()))
+            .fallback(handler);
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = routes_with_ops_api(undeclared).with_state(empty_app_state(ctx).await);
+
+        for (method, path) in [
+            (Method::POST, "/resume-all"),
+            (Method::POST, "/liquidity-write/resume-all"),
+            (Method::GET, "/status-dump"),
+            (Method::GET, "/files/report"),
+            (Method::GET, "/no-such-route"),
+        ] {
+            let response = route_response(&app, method.clone(), path, None, None).await;
+            assert_undeclared_route(&response, &(&method, path));
+        }
+        for (method, path, allow) in [
+            (Method::GET, "/transfers/resume", "POST"),
+            (Method::PUT, "/health", "GET,HEAD"),
+            (Method::DELETE, "/liquidity-write/transfers/resume", "POST"),
+        ] {
+            let response = route_response(&app, method.clone(), path, None, None).await;
+            assert_undeclared_method(&response, allow, &(&method, path));
+        }
+        assert!(!reached.load(Ordering::SeqCst));
     }
 
     /// An accepted write records the verified operator identity and the role

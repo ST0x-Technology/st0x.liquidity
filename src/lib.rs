@@ -685,11 +685,7 @@ fn spawn_server_supervisor(
     // Read before `state` moves into the router below.
     let ops_api = state.ctx.ops_api.clone();
 
-    let main_router = Router::new()
-        .merge(api::routes(ops_api.as_ref()))
-        .nest("/api", dashboard::routes())
-        .route("/metrics", axum::routing::get(metrics::endpoint))
-        .with_state(state);
+    let main_router = api::routes(ops_api.as_ref()).with_state(state);
 
     // apalis-board's embedded UI is built with hardcoded absolute paths
     // (`/apalis-board-web-*`) and the wasm calls `/api/v1/*` directly,

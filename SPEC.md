@@ -7400,6 +7400,15 @@ effect rather than a generic intent:
   (`/transfers/resume`, `/transfers/recheck`, `/transfers/fail`), its bare path
   is restricted to loopback callers for the in-container CLI. Network operators
   use the IAP-verified `/liquidity-write/transfers/*` mounts.
+- **Every main port route comes from a route declaration.** `src/api.rs`
+  declares each route's method and path: the role gated ops routes, the loopback
+  recovery routes, the unauthenticated dashboard reads, and the `/metrics` and
+  `/api/ws` service routes. Each group gets its own guard: IAP on the role
+  prefixes when the ops API is configured, `require_loopback` on the loopback
+  routes, and none on the dashboard reads and service routes. A route guard
+  admits only declared methods and paths, before any handler runs: an unknown
+  route, nested service, or fallback gets `404`, and an undeclared method on a
+  declared route gets `405` with the declared methods in `Allow`.
 - **Both bot-routed USDC recovery routes quiesce the rebalancing driver first.**
   `transfer resume --kind usdc` and `transfer recheck --kind usdc` send
   transactions from the rebalancing wallet or advance the `UsdcRebalance`
