@@ -309,7 +309,7 @@ pub enum QuoteMismatch {
         derived: RelayOrderId,
         quoted: RelayOrderId,
     },
-    #[error("order deadline {seconds} is not a representable time")]
+    #[error("order deadline {seconds} does not fit uint32")]
     Deadline { seconds: u64 },
 }
 
@@ -2132,7 +2132,12 @@ pub(super) mod tests {
 
             let error = serde_json::from_value::<QuoteResponse>(body).unwrap_err();
 
-            assert!(error.is_data(), "{amount:?}: {error:?}");
+            assert!(
+                error
+                    .to_string()
+                    .starts_with(&format!("amount {amount:?} is not a base-10 integer")),
+                "{amount:?}: {error}"
+            );
         }
     }
 
