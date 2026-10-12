@@ -19,13 +19,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use chrono::{DateTime, Utc};
 use metrics_exporter_prometheus::formatting::{write_help_line, write_type_line};
 use rain_math_float::{Float, FloatError};
+use serde::Serialize;
 use tracing::{debug, error, warn};
 
 use st0x_float_serde::format_float;
 
 pub(crate) mod inventory;
+pub(crate) mod performance;
 pub(crate) mod prices;
 pub(crate) mod refresh;
 pub(crate) mod settings;
@@ -81,6 +84,23 @@ pub(crate) enum LiqMetric {
     UsdcChainRatio,
     PositionLastPriceUsd,
     EquityExposureUsd,
+    HedgeLatencyMs,
+    HedgeLatencyMsSamples,
+    OpenExposureFillCount,
+    OpenExposureOldestTsSeconds,
+    FailureEventCount24h,
+    JobQueue,
+    BlockLagBlocks,
+    BlockLagSampledTsSeconds,
+    PollCycles24h,
+    PollErrors24h,
+    PollSkippedTicks24h,
+    PollDurationMs,
+    DependencyCalls24h,
+    DependencyErrors24h,
+    DependencyLatencyMs,
+    RebalanceStageMs,
+    AttestationLastMs,
     CollectorLastSuccessTsSeconds,
 }
 
@@ -88,7 +108,7 @@ impl LiqMetric {
     /// Every variant, for the catalog tests. A new variant needs an entry
     /// here and its name in the catalog test.
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 44] = [
+    pub(crate) const ALL: [Self; 61] = [
         Self::BotInfo,
         Self::BotStartTimestampSeconds,
         Self::SettingsInfo,
@@ -132,6 +152,23 @@ impl LiqMetric {
         Self::UsdcChainRatio,
         Self::PositionLastPriceUsd,
         Self::EquityExposureUsd,
+        Self::HedgeLatencyMs,
+        Self::HedgeLatencyMsSamples,
+        Self::OpenExposureFillCount,
+        Self::OpenExposureOldestTsSeconds,
+        Self::FailureEventCount24h,
+        Self::JobQueue,
+        Self::BlockLagBlocks,
+        Self::BlockLagSampledTsSeconds,
+        Self::PollCycles24h,
+        Self::PollErrors24h,
+        Self::PollSkippedTicks24h,
+        Self::PollDurationMs,
+        Self::DependencyCalls24h,
+        Self::DependencyErrors24h,
+        Self::DependencyLatencyMs,
+        Self::RebalanceStageMs,
+        Self::AttestationLastMs,
         Self::CollectorLastSuccessTsSeconds,
     ];
 
@@ -180,6 +217,23 @@ impl LiqMetric {
             Self::UsdcChainRatio => "liq_usdc_chain_ratio",
             Self::PositionLastPriceUsd => "liq_position_last_price_usd",
             Self::EquityExposureUsd => "liq_equity_exposure_usd",
+            Self::HedgeLatencyMs => "liq_hedge_latency_ms",
+            Self::HedgeLatencyMsSamples => "liq_hedge_latency_ms_samples",
+            Self::OpenExposureFillCount => "liq_open_exposure_fill_count",
+            Self::OpenExposureOldestTsSeconds => "liq_open_exposure_oldest_ts_seconds",
+            Self::FailureEventCount24h => "liq_failure_event_count_24h",
+            Self::JobQueue => "liq_job_queue",
+            Self::BlockLagBlocks => "liq_block_lag_blocks",
+            Self::BlockLagSampledTsSeconds => "liq_block_lag_sampled_ts_seconds",
+            Self::PollCycles24h => "liq_poll_cycles_24h",
+            Self::PollErrors24h => "liq_poll_errors_24h",
+            Self::PollSkippedTicks24h => "liq_poll_skipped_ticks_24h",
+            Self::PollDurationMs => "liq_poll_duration_ms",
+            Self::DependencyCalls24h => "liq_dependency_calls_24h",
+            Self::DependencyErrors24h => "liq_dependency_errors_24h",
+            Self::DependencyLatencyMs => "liq_dependency_latency_ms",
+            Self::RebalanceStageMs => "liq_rebalance_stage_ms",
+            Self::AttestationLastMs => "liq_attestation_last_ms",
             Self::CollectorLastSuccessTsSeconds => "liq_collector_last_success_ts_seconds",
         }
     }
@@ -270,6 +324,51 @@ impl LiqMetric {
                 "Live wrapped-token mid price in USD of each symbol with a position"
             }
             Self::EquityExposureUsd => "Net position times its live price, in USD",
+            Self::HedgeLatencyMs => {
+                "Hedge pipeline stage latency over the last 24 hours, by stage and \
+                 nearest-rank quantile (p50, p90, p95, p99, max)"
+            }
+            Self::HedgeLatencyMsSamples => "Samples behind each liq_hedge_latency_ms stage",
+            Self::OpenExposureFillCount => {
+                "Fills observed after the symbol's latest hedge placement"
+            }
+            Self::OpenExposureOldestTsSeconds => {
+                "Block time of the oldest fill not yet covered by a hedge"
+            }
+            Self::FailureEventCount24h => {
+                "Money-at-risk lifecycle failure events over the last 24 hours, by event type"
+            }
+            Self::JobQueue => "Jobs in each apalis queue now, by job type and state; not windowed",
+            Self::BlockLagBlocks => "Latest sampled order-fill block lag of each hedged chain",
+            Self::BlockLagSampledTsSeconds => {
+                "Unix time of each hedged chain's latest block-lag sample"
+            }
+            Self::PollCycles24h => {
+                "Order-fill poll cycles of each hedged chain over the last 24 hours"
+            }
+            Self::PollErrors24h => {
+                "Failed order-fill poll cycles of each hedged chain over the last 24 hours"
+            }
+            Self::PollSkippedTicks24h => {
+                "Order-fill poll ticks each hedged chain dropped over the last 24 hours"
+            }
+            Self::PollDurationMs => {
+                "Order-fill poll cycle duration over the last 24 hours, by chain and quantile"
+            }
+            Self::DependencyCalls24h => {
+                "External dependency calls over the last 24 hours, by dependency and operation"
+            }
+            Self::DependencyErrors24h => "Failed external dependency calls over the last 24 hours",
+            Self::DependencyLatencyMs => {
+                "External dependency call latency over the last 24 hours, by quantile"
+            }
+            Self::RebalanceStageMs => {
+                "Completed rebalance stage duration over the last 30 days, by kind (usdc, \
+                 equity), stage and quantile"
+            }
+            Self::AttestationLastMs => {
+                "Duration of the latest CCTP attestation in the last 30 days"
+            }
             Self::CollectorLastSuccessTsSeconds => {
                 "Unix time each liq_ collector last published its family"
             }
@@ -301,13 +400,29 @@ impl LiqMetric {
             | Self::EquityWrapped
             | Self::EquityRatio
             | Self::PositionLastPriceUsd
-            | Self::EquityExposureUsd => &["symbol"],
+            | Self::EquityExposureUsd
+            | Self::OpenExposureFillCount
+            | Self::OpenExposureOldestTsSeconds => &["symbol"],
             Self::EquityChainAvailable => &["chain", "symbol"],
             Self::UsdcCorridorTarget
             | Self::UsdcCorridorDeviation
             | Self::UsdcChainAvailable
             | Self::UsdcChainInflight
-            | Self::UsdcChainRatio => &["chain"],
+            | Self::UsdcChainRatio
+            | Self::BlockLagBlocks
+            | Self::BlockLagSampledTsSeconds
+            | Self::PollCycles24h
+            | Self::PollErrors24h
+            | Self::PollSkippedTicks24h => &["chain"],
+            Self::HedgeLatencyMs => &["quantile", "stage"],
+            Self::HedgeLatencyMsSamples => &["stage"],
+            Self::FailureEventCount24h => &["event_type"],
+            Self::JobQueue => &["job_type", "state"],
+            Self::PollDurationMs => &["chain", "quantile"],
+            Self::DependencyCalls24h | Self::DependencyErrors24h => &["dependency", "operation"],
+            Self::DependencyLatencyMs => &["dependency", "operation", "quantile"],
+            Self::RebalanceStageMs => &["kind", "quantile", "stage"],
+            Self::AttestationLastMs => &["kind"],
             Self::CollectorLastSuccessTsSeconds => &["collector"],
             Self::BotStartTimestampSeconds
             | Self::SettingsEquityTarget
@@ -380,6 +495,21 @@ impl LiqMetric {
             | Self::UsdcChainInflight
             | Self::UsdcChainRatio => Some(LiqFamily::Inventory),
             Self::PositionLastPriceUsd | Self::EquityExposureUsd => Some(LiqFamily::Prices),
+            Self::HedgeLatencyMs
+            | Self::HedgeLatencyMsSamples
+            | Self::OpenExposureFillCount
+            | Self::OpenExposureOldestTsSeconds => Some(LiqFamily::Latencies),
+            Self::FailureEventCount24h | Self::JobQueue => Some(LiqFamily::Reliability),
+            Self::BlockLagBlocks
+            | Self::BlockLagSampledTsSeconds
+            | Self::PollCycles24h
+            | Self::PollErrors24h
+            | Self::PollSkippedTicks24h
+            | Self::PollDurationMs
+            | Self::DependencyCalls24h
+            | Self::DependencyErrors24h
+            | Self::DependencyLatencyMs => Some(LiqFamily::Infra),
+            Self::RebalanceStageMs | Self::AttestationLastMs => Some(LiqFamily::Rebalances),
             Self::CollectorLastSuccessTsSeconds => None,
         }
     }
@@ -392,6 +522,10 @@ pub(crate) enum LiqFamily {
     Settings,
     Inventory,
     Prices,
+    Latencies,
+    Reliability,
+    Infra,
+    Rebalances,
 }
 
 impl LiqFamily {
@@ -402,6 +536,10 @@ impl LiqFamily {
             Self::Settings => "settings",
             Self::Inventory => "inventory",
             Self::Prices => "prices",
+            Self::Latencies => "latencies",
+            Self::Reliability => "reliability",
+            Self::Infra => "infra",
+            Self::Rebalances => "rebalances",
         }
     }
 }
@@ -653,8 +791,47 @@ pub(crate) fn integer_value(value: u64) -> Result<f64, LiqValueError> {
     Ok(value.to_string().parse()?)
 }
 
+/// Converts a signed integer to `f64`, refusing values `f64` cannot hold
+/// exactly.
+pub(crate) fn signed_integer_value(value: i64) -> Result<f64, LiqValueError> {
+    let magnitude = integer_value(value.unsigned_abs())?;
+    Ok(if value < 0 { -magnitude } else { magnitude })
+}
+
+/// Converts a count to `f64`, refusing values `f64` cannot hold exactly.
+pub(crate) fn count_value(count: usize) -> Result<f64, LiqValueError> {
+    integer_value(u64::try_from(count)?)
+}
+
+/// Unix seconds with microsecond precision, as the exporter computed them
+/// from the RFC 3339 text: whole microseconds divided by one million.
+pub(crate) fn timestamp_value(at: DateTime<Utc>) -> Result<f64, LiqValueError> {
+    const MICROS_PER_SECOND: f64 = 1_000_000.0;
+
+    Ok(signed_integer_value(at.timestamp_micros())? / MICROS_PER_SECOND)
+}
+
+/// The serde wire name of a unit enum variant, which is the label value the
+/// exporter read from the bot's JSON.
+pub(crate) fn wire_name<T: Serialize>(value: &T) -> Result<String, WireNameError> {
+    match serde_json::to_value(value)? {
+        serde_json::Value::String(name) => Ok(name),
+        _ => Err(WireNameError::NotAString),
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum WireNameError {
+    #[error("failed to serialize the value")]
+    Serialize(#[from] serde_json::Error),
+    #[error("the value does not serialize to a string")]
+    NotAString,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum LiqValueError {
+    #[error("count does not fit in u64")]
+    Count(#[from] std::num::TryFromIntError),
     #[error("failed to format the Float value")]
     Format(#[from] FloatError),
     #[error("formatted Float value does not parse as f64")]
@@ -947,6 +1124,23 @@ pub(crate) mod tests {
                 "liq_usdc_chain_ratio",
                 "liq_position_last_price_usd",
                 "liq_equity_exposure_usd",
+                "liq_hedge_latency_ms",
+                "liq_hedge_latency_ms_samples",
+                "liq_open_exposure_fill_count",
+                "liq_open_exposure_oldest_ts_seconds",
+                "liq_failure_event_count_24h",
+                "liq_job_queue",
+                "liq_block_lag_blocks",
+                "liq_block_lag_sampled_ts_seconds",
+                "liq_poll_cycles_24h",
+                "liq_poll_errors_24h",
+                "liq_poll_skipped_ticks_24h",
+                "liq_poll_duration_ms",
+                "liq_dependency_calls_24h",
+                "liq_dependency_errors_24h",
+                "liq_dependency_latency_ms",
+                "liq_rebalance_stage_ms",
+                "liq_attestation_last_ms",
                 "liq_collector_last_success_ts_seconds",
             ]
         );
@@ -956,9 +1150,22 @@ pub(crate) mod tests {
                 LiqFamily::Settings,
                 LiqFamily::Inventory,
                 LiqFamily::Prices,
+                LiqFamily::Latencies,
+                LiqFamily::Reliability,
+                LiqFamily::Infra,
+                LiqFamily::Rebalances,
             ]
             .map(LiqFamily::collector),
-            ["health", "settings", "inventory", "prices"]
+            [
+                "health",
+                "settings",
+                "inventory",
+                "prices",
+                "latencies",
+                "reliability",
+                "infra",
+                "rebalances",
+            ]
         );
     }
 
@@ -1013,6 +1220,31 @@ pub(crate) mod tests {
             integer_value((1 << 53) + 1),
             Err(LiqValueError::Inexact(9_007_199_254_740_993))
         ));
+    }
+
+    #[test]
+    fn signed_count_and_timestamp_values_are_exact() {
+        assert_eq!(signed_integer_value(-12).ok(), Some(-12.0));
+        assert_eq!(signed_integer_value(i64::MIN).ok(), None);
+        assert_eq!(count_value(42).ok(), Some(42.0));
+
+        let at = DateTime::parse_from_rfc3339("2026-03-01T12:30:15.250Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(timestamp_value(at).ok(), Some(1_772_368_215.25));
+    }
+
+    #[test]
+    fn wire_name_reads_the_serde_name() {
+        assert_eq!(
+            wire_name(&st0x_dto::ChainName::HyperEvm).unwrap(),
+            "hyperevm"
+        );
+        assert_eq!(
+            wire_name(&st0x_dto::FailureEventType::OffchainOrderFailed).unwrap(),
+            "OffchainOrderEvent::Failed"
+        );
+        assert!(matches!(wire_name(&3), Err(WireNameError::NotAString)));
     }
 
     #[test]

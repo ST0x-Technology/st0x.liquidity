@@ -410,6 +410,11 @@ async fn run_bot_session_inner(
             pool: pools.cqrs.clone(),
             families: &metrics::liquidity::LIQ_FAMILIES,
         },
+        metrics::liquidity::refresh::LiqPerformanceRefresh {
+            pool: pools.cqrs.clone(),
+            chains: ctx.chains.clone(),
+            families: &metrics::liquidity::LIQ_FAMILIES,
+        },
     );
     let mut bot_task = tokio::spawn(Box::pin(run_conductor_session(
         ctx.clone(),
@@ -751,11 +756,12 @@ fn spawn_server_supervisor(
 
 /// The supervisor for tasks that must never stop trading: the dashboard
 /// price feed (when pricing is configured), the metrics recorder upkeep and
-/// the `liq_*` refresh.
+/// the `liq_*` refreshes.
 fn spawn_auxiliary_supervisor(
     equity_price_task: Option<startup::StartupTask<dashboard::equity_price::EquityPriceMonitor>>,
     metrics_handle: PrometheusHandle,
     liq_state_refresh: metrics::liquidity::refresh::LiqStateRefresh,
+    liq_performance_refresh: metrics::liquidity::refresh::LiqPerformanceRefresh,
 ) -> SupervisorHandle {
     let builder = non_escalating_supervisor_builder()
         .with_task(
@@ -764,7 +770,8 @@ fn spawn_auxiliary_supervisor(
                 handle: metrics_handle,
             },
         )
-        .with_task("liq-state-refresh", liq_state_refresh);
+        .with_task("liq-state-refresh", liq_state_refresh)
+        .with_task("liq-performance-refresh", liq_performance_refresh);
 
     match equity_price_task {
         Some(task) => builder.with_task("dashboard-equity-prices", task),

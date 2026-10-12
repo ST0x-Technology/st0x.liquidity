@@ -47,12 +47,47 @@ def run_full_state(exporter, fixture):
     exporter.collect_state()
 
 
+def serve(fixture_by_path):
+    """A bot_get stub that answers each path from the fixture."""
+    def bot_get(path, params=None, timeout=15):
+        return fixture_by_path[path]
+    return bot_get
+
+
+def run_latencies(exporter, fixture):
+    exporter.bot_get = serve({"/performance/latencies": fixture})
+    exporter.collect_latencies("from", "to")
+
+
+def run_reliability(exporter, fixture):
+    exporter.bot_get = serve({"/performance/reliability": fixture})
+    exporter.collect_reliability("from", "to")
+
+
+def run_infra(exporter, fixture):
+    exporter.bot_get = serve({"/performance/infra": fixture})
+    exporter.collect_infra("from", "to")
+
+
+def run_rebalance(exporter, fixture):
+    """The fixture holds both reports: {"usdc": ..., "equity": ...}."""
+    exporter.bot_get = serve({
+        "/performance/rebalances": fixture["usdc"],
+        "/performance/equity-rebalances": fixture["equity"],
+    })
+    exporter.collect_rebalance_timings("from", "to")
+
+
 # case name -> how the fixture reaches the exporter
 CASES = {
     "settings": run_state,
     "settings-minimal": run_state,
     "state": run_full_state,
     "state-reserved": run_full_state,
+    "latencies": run_latencies,
+    "reliability": run_reliability,
+    "infra": run_infra,
+    "rebalance": run_rebalance,
 }
 
 
