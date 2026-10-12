@@ -855,6 +855,7 @@ def pills(y, w=24):
     after_render = (f"const RECOVERY_GUIDE = {json.dumps(guide)};\n\n"
                     + panel_module("client-env.js") + "\n"
                     + panel_module("header-rows.js") + "\n"
+                    + panel_module("copy-command.js") + "\n"
                     + panel_module("header.js"))
     with open(os.path.join(HERE, "liquidity-panels", "header.css")) as f:
         styles = f.read()
@@ -1517,14 +1518,15 @@ def detail_panel(x, y, trades_id, transfers_id):
     MODE_LABELS (how each recovery command runs) is prepended from
     recovery-guide.json, like the header's guide, the client prefix from
     client-env.js, the per-row command builders from recovery-commands.js,
-    the status-history order from status-history.js, and the bot-line
-    helpers from log-lines.js.
+    the status-history order from status-history.js, the bot-line
+    helpers from log-lines.js, and the commands' Copy buttons from
+    copy-command.js.
     """
     with open(os.path.join(HERE, "liquidity-panels", "recovery-guide.json")) as f:
         mode_labels = json.load(f)["modeLabels"]
     commands = "".join(panel_module(module) + "\n" for module in (
         "client-env.js", "recovery-commands.js", "status-history.js",
-        "log-lines.js"))
+        "log-lines.js", "copy-command.js"))
     with open(os.path.join(HERE, "liquidity-panels", "detail.js")) as f:
         after_render = (f"const MODE_LABELS = {json.dumps(mode_labels)};\n\n"
                         + commands + "\n" + f.read())
