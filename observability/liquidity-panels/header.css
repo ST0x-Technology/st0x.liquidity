@@ -1,0 +1,161 @@
+/* Business Text "styles" for the Liquidity bot header row and its two
+   dialogs. Theme colours come in as --hdr-* variables set by header.js. */
+
+.hdr {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  height: 100%;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.hdr-left,
+.hdr-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.hdr-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 10px;
+  border-radius: 9999px;
+  background: var(--hdr-pill);
+  color: var(--hdr-text);
+  font-size: 13px;
+  line-height: 18px;
+  border: 0;
+}
+
+.hdr-button {
+  color: var(--hdr-muted);
+  cursor: pointer;
+}
+
+.hdr-button:hover,
+.hdr-guide:hover,
+.hdr-close:hover {
+  color: var(--hdr-text);
+}
+
+.hdr-guide {
+  padding: 2px 8px;
+  border: 1px solid var(--hdr-border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--hdr-text);
+  font-size: 13px;
+  line-height: 18px;
+  cursor: pointer;
+}
+
+.hdr-badge {
+  padding: 2px 8px;
+  border-radius: 9999px;
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 600;
+}
+
+.hdr-ok { background: #f5f5f5; color: #171717; }
+.hdr-bad { background: #ef4444; color: #fff; }
+.hdr-unknown { border: 1px solid var(--hdr-border); color: var(--hdr-muted); }
+
+.hdr-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.hdr-muted { color: var(--hdr-muted); }
+
+.hdr-dialog {
+  padding: 0;
+  border: 1px solid var(--hdr-border);
+  border-radius: 8px;
+  background: var(--hdr-card);
+  color: var(--hdr-text);
+  white-space: normal;
+}
+
+.hdr-dialog::backdrop { background: rgba(0, 0, 0, 0.5); }
+.hdr-narrow { width: min(28rem, 92vw); }
+.hdr-wide { width: min(42rem, 92vw); }
+
+.hdr-dialog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--hdr-border);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.hdr-close {
+  border: 0;
+  background: transparent;
+  color: var(--hdr-muted);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.hdr-dialog-body {
+  max-height: 70vh;
+  overflow-y: auto;
+  padding: 16px 20px;
+  font-size: 13px;
+}
+
+.hdr-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 4px 0;
+}
+
+.hdr-trunc {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hdr-rule { border-top: 1px solid var(--hdr-border); margin: 8px 0; }
+.hdr-intro { margin: 0 0 16px; }
+.hdr-group { margin-bottom: 20px; }
+.hdr-group h3 { margin: 0 0 8px; font-size: 13px; text-transform: capitalize; }
+
+.hdr-command {
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--hdr-border);
+  border-radius: 6px;
+  background: var(--hdr-pill);
+}
+
+.hdr-command pre {
+  margin: 0;
+  padding: 8px;
+  border-radius: 4px;
+  background: var(--hdr-card);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.hdr-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 12px;
+  margin-top: 6px;
+  font-size: 12px;
+}
+
+.hdr-amber { color: #f59e0b; }
+.hdr-red { color: #ef4444; }
+
+/* Tailwind 700 on the light theme, like detail.css, for a 4.5:1 contrast
+   against the white dialog. */
+.hdr-light .hdr-amber { color: #b45309; }
+.hdr-light .hdr-red { color: #b91c1c; }

@@ -35,6 +35,18 @@ every `liq_` selector and fails on one without it, because an unpinned selector
 adds both sources together. Stage 4 of the migration makes `bot` the default
 (`SOURCE_VAR` in the generator). See `docs/observability.md`, "Board source".
 
+The header row is a Business Text panel (`marcusolsson-dynamictext-panel`): its
+JavaScript and CSS live in `liquidity-panels/`, and the generator inlines them
+into the board JSON. The plugin is installed on the box by `T0Trade/t0.devops`
+(`GF_INSTALL_PLUGINS`); the PR check's throwaway Grafana does not have it, so it
+loads these panels as "Panel plugin not found" and still passes.
+
+The recovery commands in the header's guide (`recovery-guide.json`) are a copy
+of the SPA's (`dashboard/src/lib/transfer.ts`), in the operations client form
+for the environment the board shows. `dashboard/src/lib/transfer-board.test.ts`
+fails when the copy drifts, so change the SPA and the copy together. It runs in
+the dashboard build of CI.
+
 `alerting/liquidity.rules.yml` is the alert rules, in the `Alerts` folder. Each
 rule's `uid` is permanent and must be unique across every repo's file. Removing
 a rule from the file does not remove it from Grafana: add its `uid` to
