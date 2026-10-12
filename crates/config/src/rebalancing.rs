@@ -245,7 +245,8 @@ pub struct RelayHopConfig {
     /// Sent with each quote: Relay's floor must not sit further below the
     /// expected output.
     pub slippage_bps: u16,
-    /// The most the expected output may lose to the input, fees included.
+    /// The most the quote's minimum (what a fill guarantees) may lose to the
+    /// input, fees and slippage included.
     pub max_quote_loss_bps: u16,
     #[serde(deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string")]
     pub min_transfer: Float,

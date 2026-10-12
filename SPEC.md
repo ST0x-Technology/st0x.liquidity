@@ -2467,7 +2467,7 @@ The `relay` sub-table:
 ```toml
 [rebalancing.usdc.corridors.robinhood.relay]
 slippage_bps = 30               # sent with each quote; Relay's floor below it
-max_quote_loss_bps = 50         # most the expected output may lose to the input
+max_quote_loss_bps = 50         # most the quote's minimum may lose to the input
 min_transfer = 500              # USDC; the trigger declines below it
 max_transfer = 50000            # USDC; the trigger caps at it
 quote_max_age_secs = 60         # a persisted quote older than this is re-quoted
