@@ -713,6 +713,21 @@ mod tests {
     }
 
     #[test]
+    fn setup_tracing_degrades_to_console_only_when_log_dir_is_invalid() {
+        let file = NamedTempFile::new().unwrap();
+        let uncreatable_dir = file.path().join("nested");
+        let file_logging =
+            FileLogging::new(uncreatable_dir.to_str().unwrap().to_owned(), LogLevel::Info);
+
+        let file_guard = setup_tracing(&LogLevel::Info, LogFormat::Text, Some(&file_logging), None);
+
+        assert!(
+            file_guard.is_none(),
+            "an invalid log dir must degrade to console-only logging, not return a file guard"
+        );
+    }
+
+    #[test]
     fn build_log_file_appender_prunes_files_beyond_retention_limit() {
         assert_eq!(LOG_RETENTION_DAYS, 7, "production keeps seven daily logs");
 
@@ -795,5 +810,39 @@ mod tests {
         assert!(stdout.contains("retained locally"));
         assert!(!file.contains("remote-only detail"));
         assert!(file.contains("retained locally"));
+    }
+
+    #[test]
+    fn telemetry_setup_continues_without_file_logging_when_log_dir_is_invalid() {
+        // A regular file cannot contain a subdirectory, so the log directory
+        // cannot be created. setup() must keep the OTLP trace/log pipeline live
+        // and degrade only the file-logging half, returning a None file guard
+        // rather than failing the whole telemetry stack.
+        let file = NamedTempFile::new().unwrap();
+        let uncreatable_dir = file.path().join("nested");
+        let file_logging =
+            FileLogging::new(uncreatable_dir.to_str().unwrap().to_owned(), LogLevel::Info);
+
+        let ctx = TelemetryCtx {
+            service_name: "test-service".to_string(),
+            environment: "test".to_string(),
+            traces_endpoint: Url::parse("http://localhost:10428").unwrap(),
+            logs_endpoint: Url::parse("http://localhost:9428").unwrap(),
+        };
+
+        let (file_guard, _telemetry_guard) = ctx
+            .setup(
+                tracing::Level::INFO,
+                LogFormat::Text,
+                Some(&file_logging),
+                None,
+            )
+            .unwrap();
+
+        assert!(
+            file_guard.is_none(),
+            "an invalid log dir must degrade to console-only logging (None file \
+             guard) while the OTLP exporters stay live"
+        );
     }
 }

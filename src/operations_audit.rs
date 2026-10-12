@@ -16,8 +16,11 @@ use http_body_util::LengthLimitError;
 use parking_lot::Mutex;
 use percent_encoding::percent_decode_str;
 use serde_json::Value;
+use tokio_util::task::TaskTracker;
 use tracing::{Level, error, info, warn};
 use uuid::Uuid;
+
+use crate::api::spawn_detached;
 
 const AUDIT_SCHEMA: &str = "st0x.operations.audit.v1";
 const SERVICE: &str = "liquidity";
@@ -96,8 +99,19 @@ impl OperationsAuditContext {
         Ok(())
     }
 
-    fn capture_body(&self, body: &Value) -> Result<(), AuditValueError> {
-        let metadata = audit_body_metadata(&self.inner.route, body)?;
+    /// Captures the route's audited body fields. A non-empty body that does not
+    /// parse as JSON is refused on a route with audited fields: the typed
+    /// extractor accepts some bodies this parse rejects (it skips unknown
+    /// fields without serde_json's recursion limit), and the command must not
+    /// run with its reason and targets unrecorded.
+    fn capture_body(&self, bytes: &[u8]) -> Result<(), AuditValueError> {
+        let fields = audit_body_fields(&self.inner.route);
+        if bytes.is_empty() || (fields.targets.is_empty() && !fields.reason) {
+            return Ok(());
+        }
+        let body =
+            serde_json::from_slice::<Value>(bytes).map_err(|_| AuditValueError::UnparseableBody)?;
+        let metadata = audit_body_metadata(&self.inner.route, &body)?;
         let mut targets = self.inner.targets.lock();
         for target in metadata.targets {
             if !targets.contains(&target) {
@@ -283,10 +297,13 @@ fn finalize_response(context: &OperationsAuditContext, mut response: Response) -
 }
 
 /// Wraps authentication, request extraction, and the handler so every final
-/// response produces one audit record. The owned task outlives a disconnected
-/// HTTP waiter, so client cancellation cannot cancel command completion or its
-/// final audit event.
+/// response produces one audit record. The command and its final audit event
+/// run as one task on `detached_tasks`: a disconnected HTTP waiter cannot cancel
+/// it, and the shutdown drain waits for it. A request that arrives after the
+/// drain closed the tracker is refused with 503 and audited as a command
+/// failure.
 pub(crate) async fn audit_request(
+    detached_tasks: &TaskTracker,
     role: &'static str,
     mut request: Request,
     next: Next,
@@ -295,32 +312,41 @@ pub(crate) async fn audit_request(
     request.extensions_mut().insert(context.clone());
 
     let task_context = context.clone();
-    let completion = tokio::spawn(async move {
-        let response =
-            if let Ok(response) = AssertUnwindSafe(next.run(request)).catch_unwind().await {
-                response
-            } else {
-                error!(
-                    target: "operational_alert",
-                    alert = true,
-                    audit_schema = AUDIT_SCHEMA,
-                    service = SERVICE,
-                    role,
-                    request_id = %task_context.inner.request_id,
-                    "Audited operator command panicked"
-                );
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": "operator command failed" })),
-                )
-                    .into_response()
-            };
-        finalize_response(&task_context, response)
-    });
+    let spawned = spawn_detached(
+        detached_tasks,
+        "audited operator command",
+        context.inner.request_id,
+        async move {
+            let response =
+                if let Ok(response) = AssertUnwindSafe(next.run(request)).catch_unwind().await {
+                    response
+                } else {
+                    error!(
+                        target: "operational_alert",
+                        alert = true,
+                        audit_schema = AUDIT_SCHEMA,
+                        service = SERVICE,
+                        role,
+                        request_id = %task_context.inner.request_id,
+                        "Audited operator command panicked"
+                    );
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "error": "operator command failed" })),
+                    )
+                        .into_response()
+                };
+            finalize_response(&task_context, response)
+        },
+    );
+    let completion = match spawned {
+        Ok(completion) => completion,
+        Err(refusal) => return finalize_response(&context, refusal.into_response()),
+    };
 
     match completion.await {
         Ok(response) => response,
-        Err(join_error) => {
+        Err(failure) => {
             error!(
                 target: "operational_alert",
                 alert = true,
@@ -328,15 +354,9 @@ pub(crate) async fn audit_request(
                 service = SERVICE,
                 role,
                 request_id = %context.inner.request_id,
-                task_cancelled = join_error.is_cancelled(),
                 "Audited operator command task failed"
             );
-            let response = (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "operator command failed" })),
-            )
-                .into_response();
-            finalize_response(&context, response)
+            finalize_response(&context, failure.into_response())
         }
     }
 }
@@ -389,8 +409,7 @@ pub(crate) async fn capture_request_body(request: Request, next: Next) -> Respon
     };
 
     if let Some(context) = context
-        && let Ok(body) = serde_json::from_slice::<Value>(&bytes)
-        && let Err(error) = context.capture_body(&body)
+        && let Err(error) = context.capture_body(&bytes)
     {
         return audit_value_error_response(&error);
     }
@@ -437,6 +456,7 @@ enum AuditValueError {
         max_bytes: usize,
     },
     InvalidPathUtf8,
+    UnparseableBody,
 }
 
 fn audit_body_fields(route: &str) -> AuditBodyFields {
@@ -570,6 +590,13 @@ fn audit_value_error_response(error: &AuditValueError) -> Response {
             );
             "audit path parameter is not valid UTF-8".to_string()
         }
+        AuditValueError::UnparseableBody => {
+            warn!(
+                target: "api",
+                "Operations audit request body is not parseable JSON"
+            );
+            "request body is not parseable JSON".to_string()
+        }
     };
     (
         StatusCode::BAD_REQUEST,
@@ -615,6 +642,7 @@ mod tests {
     use axum::{Json, Router};
     use serde_json::Value;
     use tokio::sync::Notify;
+    use tokio_util::task::TaskTracker;
     use tower::ServiceExt;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::{EnvFilter, Registry};
@@ -902,11 +930,16 @@ mod tests {
     }
 
     fn with_audit_layers(router: Router) -> Router {
+        with_tracked_audit_layers(router, TaskTracker::new())
+    }
+
+    fn with_tracked_audit_layers(router: Router, detached_tasks: TaskTracker) -> Router {
         router
             .layer(axum::middleware::from_fn(capture_request_body))
             .layer(axum::middleware::from_fn(test_authentication))
-            .layer(axum::middleware::from_fn(|request, next| async move {
-                audit_request("write", request, next).await
+            .layer(axum::middleware::from_fn(move |request, next| {
+                let detached_tasks = detached_tasks.clone();
+                async move { audit_request(&detached_tasks, "write", request, next).await }
             }))
     }
 
@@ -1389,6 +1422,146 @@ mod tests {
             } else {
                 Ok(())
             }
+        });
+    }
+
+    /// The shutdown drain waits for an audited command that is in flight, so
+    /// the runtime cannot exit between the command finishing and its audit
+    /// event. A request that arrives after the drain closed the tracker is
+    /// refused with 503 and still audited.
+    #[traced_test]
+    #[tokio::test]
+    async fn shutdown_drain_waits_for_the_audit_and_refuses_later_requests() {
+        let detached_tasks = TaskTracker::new();
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let handler_started = Arc::clone(&started);
+        let handler_release = Arc::clone(&release);
+        let app = with_tracked_audit_layers(
+            Router::new().route(
+                "/liquidity-write/transfers/resume",
+                post(move || {
+                    let started = Arc::clone(&handler_started);
+                    let release = Arc::clone(&handler_release);
+                    async move {
+                        started.notify_one();
+                        release.notified().await;
+                        StatusCode::OK
+                    }
+                }),
+            ),
+            detached_tasks.clone(),
+        );
+        let in_flight_id = "cdcdcdcd-cdcd-cdcd-cdcd-cdcdcdcdcdcd";
+        let in_flight = tokio::spawn(app.clone().oneshot(request(
+            "/liquidity-write/transfers/resume",
+            in_flight_id,
+            Some("accounts.google.com:1234"),
+            "{}",
+        )));
+        wait_for_signal(&started).await;
+
+        detached_tasks.close();
+        let drain = tokio::spawn({
+            let detached_tasks = detached_tasks.clone();
+            async move { detached_tasks.wait().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !drain.is_finished(),
+            "the drain must wait for the audited command"
+        );
+
+        let refused_id = "efefefef-efef-efef-efef-efefefefefef";
+        let refused = app
+            .oneshot(request(
+                "/liquidity-write/transfers/resume",
+                refused_id,
+                Some("accounts.google.com:1234"),
+                "{}",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refused.headers().get("x-request-id").unwrap(), refused_id);
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), drain)
+            .await
+            .expect("the drain must finish once the command and its audit are done")
+            .unwrap();
+        assert!(logs_contain(&format!("request_id={in_flight_id}")));
+        assert_eq!(in_flight.await.unwrap().unwrap().status(), StatusCode::OK);
+
+        logs_assert(|lines| {
+            for (request_id, outcome) in
+                [(in_flight_id, "success"), (refused_id, "command_failure")]
+            {
+                let count = lines
+                    .iter()
+                    .filter(|line| {
+                        line.contains("operations_audit: Operations audit event")
+                            && line.contains(request_id)
+                            && line.contains(&format!("outcome=\"{outcome}\""))
+                    })
+                    .count();
+                if count != 1 {
+                    return Err(format!(
+                        "expected one {outcome} audit for {request_id}, found {count}: {lines:?}"
+                    ));
+                }
+            }
+            Ok(())
+        });
+    }
+
+    /// The typed extractor skips unknown fields without serde_json's recursion
+    /// limit, so a body this parse rejects could otherwise run the command with
+    /// its reason unrecorded. Such a body is refused before the handler.
+    #[traced_test]
+    #[tokio::test]
+    async fn unparseable_body_on_an_audited_route_is_refused_before_the_handler() {
+        let called = Arc::new(AtomicBool::new(false));
+        let handler_called = Arc::clone(&called);
+        let app = with_audit_layers(Router::new().route(
+            "/liquidity-write/positions/{symbol}/set",
+            post(move || {
+                handler_called.store(true, Ordering::SeqCst);
+                async { StatusCode::OK }
+            }),
+        ));
+        let nested = format!("{}{}", "[".repeat(200), "]".repeat(200));
+        let body = format!(r#"{{"reason":"incident 42","ignored":{nested}}}"#);
+        let request_id = "12121212-1212-1212-1212-121212121212";
+
+        let response = app
+            .oneshot(request(
+                "/liquidity-write/positions/AAPL/set",
+                request_id,
+                Some("accounts.google.com:1234"),
+                &body,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!called.load(Ordering::SeqCst), "the handler must not run");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({ "error": "request body is not parseable JSON" })
+        );
+        logs_assert(|lines| {
+            lines
+                .iter()
+                .any(|line| {
+                    line.contains("operations_audit: Operations audit event")
+                        && line.contains(request_id)
+                        && line.contains("outcome=\"validation_failure\"")
+                })
+                .then_some(())
+                .ok_or_else(|| format!("missing validation-failure audit: {lines:?}"))
         });
     }
 

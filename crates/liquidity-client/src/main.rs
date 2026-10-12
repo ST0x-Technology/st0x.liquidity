@@ -28,8 +28,15 @@ async fn main() -> ExitCode {
             eprintln!("error: {error:#}");
             ExitCode::from(2)
         }
-        Err(Failure::Api { error, logging_url }) => {
+        Err(Failure::Api {
+            error,
+            logging_url,
+            request_id,
+        }) => {
             eprintln!("error: {error}");
+            if let Some(request_id) = request_id {
+                eprintln!("\nRequest id: {request_id}");
+            }
             if let Some(url) = logging_url {
                 eprintln!("\nT0 Cloud Logging: {url}");
             }
@@ -43,6 +50,9 @@ enum Failure {
     Api {
         error: ApiError,
         logging_url: Option<String>,
+        /// The write's `x-request-id`, which names its audit event. Reads and
+        /// failures before the request was sent have none to find.
+        request_id: Option<uuid::Uuid>,
     },
 }
 
@@ -125,6 +135,7 @@ async fn execute(cli: Cli) -> Result<(), Failure> {
     .map_err(|error| Failure::Api {
         error: error.into(),
         logging_url: logging_url.clone(),
+        request_id: None,
     })?;
     let client = Client::new(
         target.base_url,
@@ -134,9 +145,28 @@ async fn execute(cli: Cli) -> Result<(), Failure> {
         target.connect_timeout,
     )
     .map_err(Failure::Setup)?;
+    let is_write = matches!(cli.command, Command::Debug(_) | Command::Capital(_));
     dispatch(&client, cli.command)
         .await
-        .map_err(|error| Failure::Api { error, logging_url })
+        .map_err(|error| Failure::Api {
+            request_id: audited_request_id(is_write, &error, client.request_id),
+            error,
+            logging_url,
+        })
+}
+
+/// The request id worth printing after a failure: only a write is audited,
+/// and a token that could not be minted means the request was never sent.
+fn audited_request_id(
+    is_write: bool,
+    error: &ApiError,
+    request_id: uuid::Uuid,
+) -> Option<uuid::Uuid> {
+    let sent = !matches!(
+        error,
+        ApiError::Auth(_) | ApiError::Transport(TransportError::Auth(_))
+    );
+    (is_write && sent).then_some(request_id)
 }
 
 /// A single query parameter when `value` is given, none otherwise, so an
@@ -509,12 +539,13 @@ fn vault_request(args: VaultArgs) -> wire::VaultTransferRequest {
 #[cfg(test)]
 mod tests {
     //! Tests for command dispatch and CLI-boundary error classification.
+    use reqwest::StatusCode;
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
     use std::sync::mpsc::{Receiver, channel};
     use std::time::Duration;
 
-    use super::{ApiError, dispatch, records_operation};
+    use super::{ApiError, audited_request_id, dispatch, records_operation};
     use crate::auth::{AuthError, StaticToken};
     use crate::cli::{
         Capital, Cctp, CctpSourceChain, Command, Debug, EquityTransferKind, HedgedChain,
@@ -1284,6 +1315,22 @@ mod tests {
             ApiError::Transport(TransportError::Auth(AuthError::Flow("x".to_owned()))).exit_code(),
             77
         );
+    }
+
+    #[test]
+    fn only_a_sent_write_prints_its_request_id() {
+        let request_id = uuid::Uuid::new_v4();
+        let rejected =
+            || ApiError::Transport(TransportError::Http(StatusCode::CONFLICT, String::new()));
+        let unminted =
+            || ApiError::Transport(TransportError::Auth(AuthError::Flow("x".to_owned())));
+
+        assert_eq!(
+            audited_request_id(true, &rejected(), request_id),
+            Some(request_id)
+        );
+        assert_eq!(audited_request_id(false, &rejected(), request_id), None);
+        assert_eq!(audited_request_id(true, &unminted(), request_id), None);
     }
 
     #[test]

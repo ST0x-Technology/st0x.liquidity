@@ -104,6 +104,9 @@ pub struct Client<A> {
     base_url: Url,
     read_auth: A,
     write_auth: A,
+    /// Sent as `x-request-id`. One CLI invocation sends one request, so this
+    /// names the audit event of the write it performed.
+    pub(crate) request_id: Uuid,
 }
 
 impl<A: TokenSource + Sync> Client<A> {
@@ -124,6 +127,7 @@ impl<A: TokenSource + Sync> Client<A> {
             base_url,
             read_auth,
             write_auth,
+            request_id: Uuid::new_v4(),
         })
     }
 
@@ -203,7 +207,7 @@ impl<A: TokenSource + Sync> Client<A> {
     ) -> Result<serde_json::Value, TransportError> {
         let response = request
             .bearer_auth(token)
-            .header("x-request-id", Uuid::new_v4().to_string())
+            .header("x-request-id", self.request_id.to_string())
             .send()
             .await
             .map_err(|source| TransportError::Transport(target.clone(), source))?;
@@ -288,7 +292,6 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc::{Receiver, channel};
-    use uuid::Uuid;
 
     use super::{Client, TokenSource, TransportError};
     use crate::auth::AuthError;
@@ -398,9 +401,9 @@ mod tests {
             header(&request, "authorization"),
             Some("Bearer write-token")
         );
-        assert!(
-            header(&request, "x-request-id").is_some_and(|value| Uuid::parse_str(value).is_ok()),
-            "{request}"
+        assert_eq!(
+            header(&request, "x-request-id"),
+            Some(client.request_id.to_string().as_str())
         );
         Ok(())
     }

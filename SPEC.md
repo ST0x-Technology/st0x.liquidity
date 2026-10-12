@@ -7214,11 +7214,16 @@ floor even when `RUST_LOG` is stricter. Success is INFO; every other outcome is
 WARN. A `2xx` response is `success`, `401` or `403` is `denied`, request shape
 and route errors (`400`, `404`, `405`, `413`, `415`, `422`) are
 `validation_failure`, and every other response is `command_failure`. Downstream
-handling and final recording run in an owned task so client cancellation cannot
-cancel the command or its audit completion. A handler panic is converted inside
-that task to a generic `500` response and one command-failure audit; neither the
-response nor the audit fields include the panic payload. An outer task join
-failure likewise returns and records one `500` command failure.
+handling and final recording run in one task on the bot's detached-task tracker,
+so client cancellation cannot cancel the command or its audit completion, and
+the shutdown drain waits for both. A request that arrives after the drain began
+is refused with `503` and recorded as a command failure. A handler panic is
+converted inside that task to a generic `500` response and one command-failure
+audit; neither the response nor the audit fields include the panic payload. An
+outer task join failure likewise returns and records one `500` command failure.
+On a route with audited body fields, a non-empty body that does not parse as
+JSON is refused with `400` before the handler, so a command cannot run with its
+reason unrecorded.
 
 Audit recording is fail-open with respect to the operator command. An immediate
 recorder refusal, such as a disabled `operations_audit` target, emits an ERROR

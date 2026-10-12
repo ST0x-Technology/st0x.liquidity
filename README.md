@@ -59,7 +59,7 @@ has no CCTP domain.
   Cloud Logging as a serialized line; field parsing depends on the ingestion
   configuration. VictoriaLogs receives the compatible event only when
   `[telemetry]` configures the OTLP log exporter. Responses echo the UUID in
-  `x-request-id`.
+  `x-request-id`, and the operator CLI prints it when a write fails.
 - **Public Incident Messaging**: The
   [`scripts/turnkey-message`](scripts/turnkey-message/README.md) utility
   prepares, signs, verifies, sends, and reads zero-value Base messages from an

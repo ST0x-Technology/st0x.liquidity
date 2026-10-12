@@ -1324,7 +1324,7 @@ async fn raindex_orders(
 }
 
 #[derive(Debug, Serialize)]
-struct ErrorResponse {
+pub(crate) struct ErrorResponse {
     error: String,
 }
 
@@ -4095,7 +4095,7 @@ struct DetachedProcessTx<'a> {
 /// The join future does not borrow `detached_tasks` (`use<..>` leaves its
 /// lifetime out), so a caller that answers before the work ends can hand
 /// the join to a tracked task of its own and keep the failure log.
-fn spawn_detached<Output, Subject, Work>(
+pub(crate) fn spawn_detached<Output, Subject, Work>(
     detached_tasks: &TaskTracker,
     operation: &'static str,
     subject: Subject,
@@ -4413,7 +4413,11 @@ async fn unknown_operator_mutation() -> (StatusCode, Json<ErrorResponse>) {
     )
 }
 
-async fn audit_write_mutation(mut request: Request, next: Next) -> Response {
+async fn audit_write_mutation(
+    State(detached_tasks): State<TaskTracker>,
+    mut request: Request,
+    next: Next,
+) -> Response {
     if request.method() == axum::http::Method::POST
         && matches!(
             request.uri().path(),
@@ -4422,7 +4426,7 @@ async fn audit_write_mutation(mut request: Request, next: Next) -> Response {
     {
         set_audit_route_template(&mut request, "/liquidity-write/{*path}");
     }
-    audit_request("write", request, next).await
+    audit_request(&detached_tasks, "write", request, next).await
 }
 
 fn is_loopback_mutation(request: &Request) -> bool {
@@ -4467,7 +4471,10 @@ async fn api_fallback(request: Request) -> Response {
 /// Returns nothing when no audiences are configured: a deployment with no load
 /// balancer in front of it must not expose these paths, and unmounting them is
 /// a stronger guarantee than serving a 401.
-fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
+fn ops_api_routes(
+    ops_api: Option<&OpsApiConfig>,
+    detached_tasks: &TaskTracker,
+) -> Router<AppState> {
     let Some(ops_api) = ops_api else {
         return Router::new();
     };
@@ -4637,7 +4644,10 @@ fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
             let verifier = Arc::clone(&write_verifier);
             async move { require_iap(verifier, request, next).await }
         }))
-        .layer(axum::middleware::from_fn(audit_write_mutation));
+        .layer(axum::middleware::from_fn_with_state(
+            detached_tasks.clone(),
+            audit_write_mutation,
+        ));
 
     read.merge(write)
 }
@@ -4704,7 +4714,11 @@ async fn require_loopback_mutation(request: Request, next: Next) -> Response {
         .unwrap_or_else(IntoResponse::into_response)
 }
 
-async fn audit_loopback_mutation(mut request: Request, next: Next) -> Response {
+async fn audit_loopback_mutation(
+    State(detached_tasks): State<TaskTracker>,
+    mut request: Request,
+    next: Next,
+) -> Response {
     if !is_loopback_mutation(&request) {
         return next.run(request).await;
     }
@@ -4712,10 +4726,13 @@ async fn audit_loopback_mutation(mut request: Request, next: Next) -> Response {
     if !is_known_loopback_mutation_route(&request) {
         set_audit_route_template(&mut request, "/transfers/{*path}");
     }
-    audit_request("local", request, next).await
+    audit_request(&detached_tasks, "local", request, next).await
 }
 
-pub(crate) fn routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
+pub(crate) fn routes(
+    ops_api: Option<&OpsApiConfig>,
+    detached_tasks: &TaskTracker,
+) -> Router<AppState> {
     // The operator socket: mutation endpoints for the in-container CLI only.
     // The IAP-gated `/liquidity-write` mount is the network route to the same
     // handlers.
@@ -4726,10 +4743,11 @@ pub(crate) fn routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
             "/transfers/usdc/resume/{direction}/{id}",
             post(resume_usdc_transfer),
         )
-        .route("/transfers/recheck/{kind}/{id}", post(recheck_transfer));
+        .route("/transfers/recheck/{kind}/{id}", post(recheck_transfer))
+        .route_layer(axum::middleware::from_fn(require_loopback));
 
     Router::new()
-        .merge(ops_api_routes(ops_api))
+        .merge(ops_api_routes(ops_api, detached_tasks))
         .merge(loopback_only)
         .route("/health", get(health))
         .route("/performance/latencies", get(performance_latencies))
@@ -4761,7 +4779,10 @@ pub(crate) fn routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
         .fallback(api_fallback)
         .layer(axum::middleware::from_fn(capture_loopback_mutation_body))
         .layer(axum::middleware::from_fn(require_loopback_mutation))
-        .layer(axum::middleware::from_fn(audit_loopback_mutation))
+        .layer(axum::middleware::from_fn_with_state(
+            detached_tasks.clone(),
+            audit_loopback_mutation,
+        ))
 }
 
 #[cfg(test)]
@@ -5953,7 +5974,13 @@ mod tests {
     }
 
     fn build_app(state: AppState) -> Router {
-        routes(None).with_state(state)
+        let detached_tasks = state.detached_tasks.clone();
+        routes(None, &detached_tasks).with_state(state)
+    }
+
+    fn build_ops_app(state: AppState, ops_api: &st0x_config::OpsApiConfig) -> Router {
+        let detached_tasks = state.detached_tasks.clone();
+        routes(Some(ops_api), &detached_tasks).with_state(state)
     }
 
     async fn body_to_string(response: axum::response::Response) -> String {
@@ -8000,7 +8027,7 @@ mod tests {
             read_audience: "/projects/1/global/backendServices/11".to_string(),
             write_audience: "/projects/1/global/backendServices/22".to_string(),
         };
-        let app = routes(Some(&ops_api)).with_state(empty_app_state(ctx).await);
+        let app = build_ops_app(empty_app_state(ctx).await, &ops_api);
 
         for (method, uri) in [
             ("GET", "/liquidity-read/transfers/interrupted"),
@@ -8066,7 +8093,7 @@ mod tests {
             read_audience: "/projects/1/global/backendServices/11".to_string(),
             write_audience: "/projects/1/global/backendServices/22".to_string(),
         };
-        let app = routes(Some(&ops_api)).with_state(empty_app_state(ctx).await);
+        let app = build_ops_app(empty_app_state(ctx).await, &ops_api);
 
         for (uri, request_id) in [
             ("/liquidity-write", "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"),
@@ -8115,7 +8142,7 @@ mod tests {
             read_audience: "/projects/1/global/backendServices/11".to_string(),
             write_audience: "/projects/1/global/backendServices/22".to_string(),
         };
-        let app = routes(Some(&ops_api)).with_state(empty_app_state(ctx).await);
+        let app = build_ops_app(empty_app_state(ctx).await, &ops_api);
         let write_request_id = "c3c3c3c3-c3c3-c3c3-c3c3-c3c3c3c3c3c3";
         let unrelated_request_id = "d4d4d4d4-d4d4-d4d4-d4d4-d4d4d4d4d4d4";
 
