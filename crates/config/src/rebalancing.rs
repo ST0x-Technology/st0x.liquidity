@@ -439,6 +439,7 @@ impl UsdcCorridors {
     /// Takes the secrets file's `[relay]` table. A Relay corridor without
     /// it is refused; a key with no Relay corridor is kept, so the shared
     /// secrets file can carry it before any environment configures one.
+    /// A binary older than this table refuses it as an unknown field.
     pub(crate) fn with_relay_secrets(
         mut self,
         secrets: Option<RelaySecrets>,

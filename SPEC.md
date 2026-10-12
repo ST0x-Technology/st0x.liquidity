@@ -2478,7 +2478,9 @@ max_deposit_revert_redrives = 5 # reverted deposits before the transfer holds
 
 The Relay API key is a secret: `[relay] api_key` in the secrets file. Relay
 refuses every quote without one, so a Relay corridor with no key fails at config
-load; without a Relay corridor the key is optional.
+load; without a Relay corridor the key is optional. A build older than this
+table refuses it as an unknown field, so the deployed secrets gain it only once
+every environment runs a build that reads it.
 
 The hub (the Ethereum wallet), the CCTP domains and the USDC addresses are
 pinned in code per chain, never configured.
