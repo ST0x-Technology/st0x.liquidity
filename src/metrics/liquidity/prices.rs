@@ -119,6 +119,7 @@ pub(crate) mod tests {
     use st0x_float_macro::float;
 
     use super::*;
+    use crate::dashboard::equity_price::EquityPriceStore;
     use crate::metrics::liquidity::LiqFamily;
     use crate::metrics::liquidity::inventory::tests::{
         golden_for, render_family, state_fixture, state_reserved_fixture,
@@ -138,28 +139,11 @@ pub(crate) mod tests {
         (Symbol::new(symbol).unwrap(), price)
     }
 
-    /// The exporter's live-price rule over the dashboard DTO: an available
-    /// price that has not expired at `now`.
-    fn live_prices_from_dto(
-        prices: &[st0x_dto::EquityPrice],
-        now: DateTime<Utc>,
-    ) -> Vec<(Symbol, Float)> {
-        prices
-            .iter()
-            .filter_map(|price| match price.status {
-                st0x_dto::EquityPriceStatus::Available {
-                    price_usd,
-                    expires_at,
-                    ..
-                } if expires_at > now => Some((price.symbol.clone(), price_usd)),
-                st0x_dto::EquityPriceStatus::Available { .. }
-                | st0x_dto::EquityPriceStatus::Unavailable => None,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn prices_match_the_exporter_goldens() {
+    /// The prices come from [`EquityPriceStore::live_prices`], the call the
+    /// refresh task makes, so a change to its expiry or ordering rule is a
+    /// golden change.
+    #[tokio::test]
+    async fn prices_match_the_exporter_goldens() {
         let now: DateTime<Utc> = "2026-10-08T12:00:00Z".parse().unwrap();
 
         for (fixture, golden) in [
@@ -177,7 +161,9 @@ pub(crate) mod tests {
                     net: position.net,
                 })
                 .collect();
-            let live = live_prices_from_dto(&fixture.equity_prices, now);
+            let live = EquityPriceStore::with_prices(&fixture.equity_prices)
+                .live_prices(now)
+                .await;
 
             assert_eq!(
                 render_family(LiqFamily::Prices, price_samples(&positions, &live)),

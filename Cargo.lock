@@ -7929,6 +7929,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "p256 0.13.2",
+ "proc-macro2",
  "proptest",
  "rain-error-decoding",
  "rain-math-float",
