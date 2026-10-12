@@ -18,7 +18,7 @@ use super::proof::{
     PaymentTerms, RelayErc20Deposit, UnverifiedReason, check_payment, deposit_event,
 };
 use super::quote::{StepTerms, check_steps};
-use super::{QuoteMismatch, RelayOrderId, RelayQuote};
+use super::{AcceptedRelayQuote, QuoteMismatch, RelayOrderId};
 use crate::{
     DepositScan, HopDirection, PreparedSwap, PreparedSwapDeposit, SwapBridge, SwapDeposit,
     SwapPayment, SwapSide,
@@ -275,13 +275,13 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> RelayBridge<EthWallet, ChainWallet>
 #[async_trait]
 impl<EthWallet: Wallet, ChainWallet: Wallet> SwapBridge for RelayBridge<EthWallet, ChainWallet> {
     type Error = RelayBridgeError;
-    type Quote = RelayQuote;
+    type Quote = AcceptedRelayQuote;
     type OrderId = RelayOrderId;
 
     async fn prepare_deposit(
         &self,
         direction: HopDirection,
-        quote: &RelayQuote,
+        quote: &AcceptedRelayQuote,
     ) -> Result<PreparedSwap, RelayBridgeError> {
         match direction {
             HopDirection::ToHub => self.chain.prepare_deposit(quote).await,
@@ -454,14 +454,17 @@ impl<W: Wallet> RelayEnd<W> {
     /// between. Then only the deposit is discarded: the approve is returned to
     /// go out alone, so its nonce is not left as a gap the other send waits
     /// behind.
-    async fn prepare_deposit(&self, quote: &RelayQuote) -> Result<PreparedSwap, RelayBridgeError> {
+    async fn prepare_deposit(
+        &self,
+        quote: &AcceptedRelayQuote,
+    ) -> Result<PreparedSwap, RelayBridgeError> {
         let wallet_chain = self.wallet.provider().get_chain_id().await?;
 
         self.check_steps(quote, wallet_chain)?;
 
-        let approve = match &quote.approve {
+        let approve = match quote.approve() {
             Some(step) => Some(step.data.clone()),
-            None => self.approve_if_short(quote.amounts.amount_in).await?,
+            None => self.approve_if_short(quote.amounts().amount_in).await?,
         };
 
         let approve = match approve {
@@ -477,7 +480,7 @@ impl<W: Wallet> RelayEnd<W> {
             .wallet
             .prepare_pending_with_gas_limit(
                 self.depository,
-                quote.deposit.data.clone(),
+                quote.deposit().data.clone(),
                 RELAY_DEPOSIT_GAS_LIMIT,
                 "Relay deposit",
             )
@@ -519,7 +522,7 @@ impl<W: Wallet> RelayEnd<W> {
         debug!(
             target: "bridge",
             chain = %self.chain,
-            order_id = %quote.order_id,
+            order_id = %quote.order_id(),
             approve = ?approve.as_ref().map(PreparedTransaction::tx_hash),
             deposit = %deposit.tx_hash(),
             "Relay deposit signed"
@@ -534,24 +537,26 @@ impl<W: Wallet> RelayEnd<W> {
     /// [`check_steps`] again, against this end: the steps must be for this
     /// wallet's chain, call this end's stable and depository with no native
     /// value, and move the quoted amount from our wallet for the quote's order.
-    fn check_steps(&self, quote: &RelayQuote, wallet_chain: u64) -> Result<(), QuoteMismatch> {
+    fn check_steps(
+        &self,
+        quote: &AcceptedRelayQuote,
+        wallet_chain: u64,
+    ) -> Result<(), QuoteMismatch> {
         let calldata = check_steps(
-            quote.approve.as_ref(),
-            &quote.deposit,
+            quote.approve(),
+            quote.deposit(),
             &StepTerms {
                 chain_id: wallet_chain,
                 stable: self.stable,
                 depository: self.depository,
                 depositor: self.wallet.address(),
-                amount: quote.amounts.amount_in,
+                amount: quote.amounts().amount_in,
             },
         )?;
 
-        if calldata != quote.order_id {
-            return Err(QuoteMismatch::OrderIdMismatch {
-                quoted: quote.order_id,
-                calldata,
-            });
+        let quoted = quote.order_id();
+        if calldata != quoted {
+            return Err(QuoteMismatch::OrderIdMismatch { quoted, calldata });
         }
 
         Ok(())
@@ -990,8 +995,8 @@ mod tests {
     use super::super::quote::depositErc20Call;
     use super::super::test_chain::RelayChain;
     use super::super::{
-        BasisPoints, QuoteAmounts, QuoteFees, QuoteField, QuoteStep, RelayRequestId,
-        StepTransaction,
+        BasisPoints, QuoteAmounts, QuoteBounds, QuoteFees, QuoteField, QuoteStep, RelayQuote,
+        RelayRequestId, StepTransaction,
     };
     use super::*;
 
@@ -1034,7 +1039,7 @@ mod tests {
         /// Signs and broadcasts a Robinhood -> hub deposit, mined in one block.
         async fn send_deposit_to_hub(&self, order_id: B256) -> TxHash {
             self.chain.mint(self.chain.wallet(), AMOUNT).await;
-            let quote = quote(&self.chain, order_id, true);
+            let quote = accepted(quote(&self.chain, order_id, true));
 
             let prepared = self
                 .bridge
@@ -1225,6 +1230,16 @@ mod tests {
                 .abi_encode(),
             ),
         }
+    }
+
+    /// `quote` accepted within bounds loose enough for its 4.7% relayer fee.
+    fn accepted(quote: RelayQuote) -> AcceptedRelayQuote {
+        quote
+            .accept(&QuoteBounds {
+                max_loss: BasisPoints::new(500).unwrap(),
+                downstream_minimum: U256::ZERO,
+            })
+            .unwrap()
     }
 
     /// Our corridor-chain wallet, with a hook on its first deposit signing, and
@@ -1540,7 +1555,7 @@ mod tests {
     #[tokio::test]
     async fn prepared_pair_holds_consecutive_nonces_and_pinned_deposit_gas() {
         let harness = Harness::new().await;
-        let quote = quote(&harness.chain, B256::random(), true);
+        let quote = accepted(quote(&harness.chain, B256::random(), true));
 
         let prepared = harness
             .bridge
@@ -1564,7 +1579,7 @@ mod tests {
     async fn pair_split_by_another_send_sends_its_approve_alone_and_a_retry_pairs() {
         let harness = Harness::new().await;
         let bridge = pair_bridge(&harness, OnDepositSigning::AnotherSendFirst);
-        let quote = quote(&harness.chain, B256::random(), true);
+        let quote = accepted(quote(&harness.chain, B256::random(), true));
 
         let split = bridge
             .prepare_deposit(HopDirection::ToHub, &quote)
@@ -1606,7 +1621,7 @@ mod tests {
     async fn failed_deposit_signing_releases_its_approve() {
         let harness = Harness::new().await;
         let bridge = pair_bridge(&harness, OnDepositSigning::Fail);
-        let quote = quote(&harness.chain, B256::random(), true);
+        let quote = accepted(quote(&harness.chain, B256::random(), true));
 
         let error = bridge
             .prepare_deposit(HopDirection::ToHub, &quote)
@@ -1623,7 +1638,7 @@ mod tests {
     #[tokio::test]
     async fn discarded_swap_frees_its_nonces() {
         let harness = Harness::new().await;
-        let quote = quote(&harness.chain, B256::random(), true);
+        let quote = accepted(quote(&harness.chain, B256::random(), true));
         let prepared = harness
             .bridge
             .prepare_deposit(HopDirection::ToHub, &quote)
@@ -1641,7 +1656,7 @@ mod tests {
     #[tokio::test]
     async fn restored_swap_keeps_its_nonces_after_a_restart() {
         let harness = Harness::new().await;
-        let quote = quote(&harness.chain, B256::random(), true);
+        let quote = accepted(quote(&harness.chain, B256::random(), true));
         let prepared = harness
             .bridge
             .prepare_deposit(HopDirection::ToHub, &quote)
@@ -1669,7 +1684,7 @@ mod tests {
         let harness = Harness::new().await;
         harness.chain.mint(harness.chain.wallet(), AMOUNT).await;
         let order_id = B256::random();
-        let quote = quote(&harness.chain, order_id, true);
+        let quote = accepted(quote(&harness.chain, order_id, true));
 
         let prepared = harness
             .bridge
@@ -1712,7 +1727,7 @@ mod tests {
         harness.chain.mint(harness.chain.wallet(), AMOUNT).await;
         harness.hub.mint(harness.hub.solver(), MINIMUM_OUT).await;
         let order_id = B256::random();
-        let quote = quote(&harness.chain, order_id, true);
+        let quote = accepted(quote(&harness.chain, order_id, true));
         let prepared = harness
             .bridge
             .prepare_deposit(HopDirection::ToHub, &quote)
@@ -1799,7 +1814,7 @@ mod tests {
     #[tokio::test]
     async fn quote_without_approve_signs_one_only_when_the_allowance_is_short() {
         let harness = Harness::new().await;
-        let quote = quote(&harness.chain, B256::random(), false);
+        let quote = accepted(quote(&harness.chain, B256::random(), false));
 
         let short = harness
             .bridge
@@ -1877,7 +1892,7 @@ mod tests {
 
         let error = harness
             .bridge
-            .prepare_deposit(HopDirection::ToHub, &quote)
+            .prepare_deposit(HopDirection::ToHub, &accepted(quote))
             .await
             .unwrap_err();
 
@@ -1908,7 +1923,7 @@ mod tests {
 
         match harness
             .bridge
-            .prepare_deposit(HopDirection::ToHub, &quote)
+            .prepare_deposit(HopDirection::ToHub, &accepted(quote))
             .await
         {
             Err(RelayBridgeError::Quote(mismatch)) => mismatch,
@@ -2033,7 +2048,7 @@ mod tests {
 
         let error = harness
             .bridge
-            .prepare_deposit(HopDirection::ToHub, &quote)
+            .prepare_deposit(HopDirection::ToHub, &accepted(quote))
             .await
             .unwrap_err();
 
@@ -2058,7 +2073,7 @@ mod tests {
 
         let error = harness
             .bridge
-            .prepare_deposit(HopDirection::ToHub, &quote)
+            .prepare_deposit(HopDirection::ToHub, &accepted(quote))
             .await
             .unwrap_err();
 
@@ -2088,7 +2103,7 @@ mod tests {
         for (step, quote) in [(QuoteStep::Approve, approve), (QuoteStep::Deposit, deposit)] {
             let error = harness
                 .bridge
-                .prepare_deposit(HopDirection::ToHub, &quote)
+                .prepare_deposit(HopDirection::ToHub, &accepted(quote))
                 .await
                 .unwrap_err();
 

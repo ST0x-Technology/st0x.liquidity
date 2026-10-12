@@ -1,6 +1,7 @@
 //! `POST /quote/v2`: the request we send, the quote we accept, and the checks
 //! that bind Relay's approve and deposit steps to the transfer we asked for.
 
+use std::ops::Deref;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, B256, Bytes, U256};
@@ -11,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use st0x_evm::Chain;
 
-use super::acceptance::{BasisPoints, QuoteAmounts};
+use super::acceptance::{BasisPoints, QuoteAcceptanceError, QuoteAmounts, QuoteBounds};
 
 sol! {
     function approve(address spender, uint256 amount) external returns (bool);
@@ -133,20 +134,82 @@ impl std::fmt::Display for RelayOrderId {
 }
 
 /// A quote whose approve and deposit steps were checked against the request.
+///
+/// Only [`RelayClient::quote`](super::RelayClient::quote) builds one, and its
+/// steps are signable only once [`Self::accept`] clears its amounts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayQuote {
-    pub request_id: RelayRequestId,
+    pub(super) request_id: RelayRequestId,
     /// Decoded from the deposit step's calldata, equal to
     /// `protocol.v2.orderId` and to the hash of the checked order.
-    pub order_id: RelayOrderId,
-    pub amounts: QuoteAmounts,
+    pub(super) order_id: RelayOrderId,
+    pub(super) amounts: QuoteAmounts,
     /// The order's `output.deadline`: until then the solver may still fill.
     /// Relay sets it a week after the quote whatever `ttl` asks for.
-    pub deadline: SystemTime,
-    pub fees: QuoteFees,
+    pub(super) deadline: SystemTime,
+    pub(super) fees: QuoteFees,
     /// `None` when Relay sends no approve step.
-    pub approve: Option<StepTransaction>,
-    pub deposit: StepTransaction,
+    pub(super) approve: Option<StepTransaction>,
+    pub(super) deposit: StepTransaction,
+}
+
+impl RelayQuote {
+    pub const fn request_id(&self) -> RelayRequestId {
+        self.request_id
+    }
+
+    /// Decoded from the deposit step's calldata, equal to
+    /// `protocol.v2.orderId` and to the hash of the checked order.
+    pub const fn order_id(&self) -> RelayOrderId {
+        self.order_id
+    }
+
+    pub const fn amounts(&self) -> QuoteAmounts {
+        self.amounts
+    }
+
+    /// The order's `output.deadline`: until then the solver may still fill.
+    /// Relay sets it a week after the quote whatever `ttl` asks for.
+    pub const fn deadline(&self) -> SystemTime {
+        self.deadline
+    }
+
+    pub const fn fees(&self) -> QuoteFees {
+        self.fees
+    }
+
+    /// The quote, ready to sign, if its amounts clear `bounds`.
+    pub fn accept(self, bounds: &QuoteBounds) -> Result<AcceptedRelayQuote, QuoteAcceptanceError> {
+        self.amounts.accept(bounds)?;
+        Ok(AcceptedRelayQuote(self))
+    }
+}
+
+/// A [`RelayQuote`] whose amounts cleared the caller's bounds: the only form
+/// whose steps [`RelayBridge`](super::RelayBridge) signs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedRelayQuote(RelayQuote);
+
+impl Deref for AcceptedRelayQuote {
+    type Target = RelayQuote;
+
+    fn deref(&self) -> &RelayQuote {
+        let Self(quote) = self;
+        quote
+    }
+}
+
+impl AcceptedRelayQuote {
+    /// `None` when Relay sends no approve step.
+    pub const fn approve(&self) -> Option<&StepTransaction> {
+        let Self(quote) = self;
+        quote.approve.as_ref()
+    }
+
+    pub const fn deposit(&self) -> &StepTransaction {
+        let Self(quote) = self;
+        &quote.deposit
+    }
 }
 
 /// Fees Relay quoted, both paid on the origin chain.
@@ -1118,7 +1181,6 @@ pub(super) mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::relay::acceptance::QuoteBounds;
 
     pub(in crate::relay) const FUNDED_QUOTE: &str =
         include_str!("../../relay-fixtures/quote_funded_robinhood_to_ethereum.json");
@@ -1371,8 +1433,32 @@ pub(super) mod tests {
         ] {
             let quote = validate(&serde_json::from_str(fixture).unwrap(), &request).unwrap();
 
-            assert_eq!(quote.amounts.accept(&bounds), Ok(()), "{:?}", quote.amounts);
+            let accepted = quote.clone().accept(&bounds).unwrap();
+
+            assert_eq!(accepted.approve(), quote.approve.as_ref());
+            assert_eq!(accepted.deposit(), &quote.deposit);
         }
+    }
+
+    /// The fixed relayer fee is 4.7% of the funded 5 dollar transfer.
+    #[test]
+    fn quote_losing_more_than_the_bound_is_not_accepted() {
+        let quote = validate(&funded_body(), &funded_request()).unwrap();
+
+        let error = quote
+            .accept(&QuoteBounds {
+                max_loss: BasisPoints::new(50).unwrap(),
+                downstream_minimum: U256::ZERO,
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            QuoteAcceptanceError::QuoteLossExceedsBound {
+                expected: U256::from(4_763_755),
+                bound: U256::from(4_975_000),
+            }
+        );
     }
 
     #[test]

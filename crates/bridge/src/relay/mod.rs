@@ -25,8 +25,8 @@ pub use evm::RelayEndContracts;
 pub use evm::{RelayBridge, RelayBridgeError, RelayCtx};
 pub use proof::UnverifiedReason;
 pub use quote::{
-    QuoteFees, QuoteField, QuoteMismatch, QuoteRequest, QuoteStep, QuotedCurrency, RelayOrderId,
-    RelayQuote, RelayRequestId, StepTransaction,
+    AcceptedRelayQuote, QuoteFees, QuoteField, QuoteMismatch, QuoteRequest, QuoteStep,
+    QuotedCurrency, RelayOrderId, RelayQuote, RelayRequestId, StepTransaction,
 };
 pub use status::{FailReason, InFlightStage, IntentStatus, IntentStatusReport};
 #[cfg(feature = "mock")]
@@ -119,7 +119,8 @@ impl RelayClient {
     }
 
     /// Fetches an exact-input quote and checks its steps against `request`.
-    /// Bound checks on the amounts are the caller's ([`QuoteAmounts::accept`]).
+    /// Bound checks on the amounts are the caller's: [`RelayQuote::accept`]
+    /// yields the [`AcceptedRelayQuote`] whose steps [`RelayBridge`] signs.
     /// An origin with no pinned depository, or a client with no API key, is
     /// refused before any request.
     pub async fn quote(&self, request: &QuoteRequest) -> Result<RelayQuote, RelayError> {

@@ -178,12 +178,14 @@ already covers the amount (not observed; the funded test always had one). With
 no approve step the caller must recheck the allowance before skipping the
 approve: another transfer from the same wallet can consume a standing allowance.
 
-`QuoteAmounts::accept` then checks the amounts against `QuoteBounds`, in checked
+`RelayQuote::accept` then checks the amounts against `QuoteBounds`, in checked
 integer basis points (an overflow is `QuoteAcceptanceError::Overflow`, never a
 panic). The loss bound rounds up, so it never sits below its exact value. The
 slippage floor rounds down: Relay rounds its own `minimumAmount` down (999303522
 at 50 bps is 994307004.39, and Relay quotes 994307004), so a floor rounded up
-would refuse an honest quote.
+would refuse an honest quote. Only the `AcceptedRelayQuote` it returns exposes
+the steps, and `RelayBridge` signs nothing else; `RelayQuote`'s fields are
+private, so no caller builds or edits one outside `RelayClient::quote`.
 
 - `minimum_out >= amount_in * (10000 - max_loss) / 10000`, else
   `QuoteLossExceedsBound`: a fill only guarantees `minimum_out`, so the loss
