@@ -401,4 +401,4 @@ retired_symbols = []
 # [assets.equities.<SYM>]) come from t0.tokens' token file in the bucket.
 [registry]
 url = "gs://t0-artifacts-tokens/production/tokens.toml"
-generation = 1791378253362331
+generation = 1791818500338410
