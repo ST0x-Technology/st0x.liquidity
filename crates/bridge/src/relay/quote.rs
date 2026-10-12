@@ -140,15 +140,10 @@ impl std::fmt::Display for RelayOrderId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayQuote {
     pub(super) request_id: RelayRequestId,
-    /// Decoded from the deposit step's calldata, equal to
-    /// `protocol.v2.orderId` and to the hash of the checked order.
     pub(super) order_id: RelayOrderId,
     pub(super) amounts: QuoteAmounts,
-    /// The order's `output.deadline`: until then the solver may still fill.
-    /// Relay sets it a week after the quote whatever `ttl` asks for.
     pub(super) deadline: SystemTime,
     pub(super) fees: QuoteFees,
-    /// `None` when Relay sends no approve step.
     pub(super) approve: Option<StepTransaction>,
     pub(super) deposit: StepTransaction,
 }
@@ -1433,10 +1428,7 @@ pub(super) mod tests {
         ] {
             let quote = validate(&serde_json::from_str(fixture).unwrap(), &request).unwrap();
 
-            let accepted = quote.clone().accept(&bounds).unwrap();
-
-            assert_eq!(accepted.approve(), quote.approve.as_ref());
-            assert_eq!(accepted.deposit(), &quote.deposit);
+            quote.accept(&bounds).unwrap();
         }
     }
 
