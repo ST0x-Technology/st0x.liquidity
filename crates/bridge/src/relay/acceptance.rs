@@ -199,6 +199,24 @@ mod tests {
         );
     }
 
+    /// 475 bps off 5,000,000 is 4,762,500: the expected output clears it, but
+    /// a fill is only guaranteed the minimum, which loses more than 475 bps.
+    #[test]
+    fn minimum_below_the_loss_bound_is_refused() {
+        let error = funded_amounts()
+            .accept(&bounds(475, 1_000_000))
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                QuoteAcceptanceError::QuoteLossExceedsBound { bound, .. }
+                    if bound == U256::from(4_762_500)
+            ),
+            "{error:?}"
+        );
+    }
+
     /// The floor is checked at the slippage the quote was requested at.
     #[test]
     fn relay_minimum_below_our_floor_is_refused() {
