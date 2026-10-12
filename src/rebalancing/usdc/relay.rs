@@ -4722,6 +4722,61 @@ mod tests {
         assert_eq!(rig.vault_usdg().await, refunded);
     }
 
+    /// A refund below the corridor's floor (the deposit less
+    /// `max_quote_loss_bps`) is recorded, paged and held with the guard:
+    /// nothing goes back into the vault and no next transfer starts.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn short_refund_toward_hub_holds_the_guard() {
+        let rig = RelayRig::deploy().await;
+        let order_id = B256::repeat_byte(0x0d);
+        let refund_tx = rig.refund_on_chain(U256::from(1), order_id).await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_status(
+            &relay_api,
+            json!({
+                "status": "refund",
+                "txHashes": [refund_tx],
+                "failReason": "DEPOSITED_AMOUNT_TOO_LOW_TO_FILL"
+            }),
+        );
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_quoted(
+            &store,
+            &id,
+            exact_quote(&rig.chain.bot_wallet, rig.chain_contracts, order_id).await,
+        )
+        .await;
+
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends")
+        .unwrap();
+
+        let state = store.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::SwapRefunded {
+            side: RefundSide::Origin,
+            amount_refunded,
+            ..
+        } = state
+        else {
+            panic!("expected an origin-side SwapRefunded, got {state:?}");
+        };
+        assert_eq!(amount_refunded, Usdc::new(float!(0.000001)));
+        assert!(state.holds_rebalance_guard());
+        assert_eq!(rig.vault_usdg().await, U256::ZERO);
+        assert!(logs_contain("refund floor"));
+        assert!(logs_contain(&id.to_string()));
+    }
+
     /// A fill Relay names is adopted only once proven on the hub; the
     /// transfer then enters `Bridged` and sends the filled USDC to Alpaca's
     /// deposit address, as after a CCTP mint.
