@@ -95,6 +95,12 @@ PORTED = {
 # Names only the bot publishes.
 BOT_ONLY = {
     "liq_collector_last_success_ts_seconds",
+    "liq_usdc_corridor_target",
+    "liq_usdc_corridor_deviation",
+    "liq_equity_chain_available",
+    "liq_usdc_chain_available",
+    "liq_usdc_chain_inflight",
+    "liq_usdc_chain_ratio",
 }
 
 # Exporter names that are not ported, because nothing reads them or the bot

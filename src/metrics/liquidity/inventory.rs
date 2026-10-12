@@ -1,5 +1,6 @@
 //! The `Inventory` family: equity and cash balances on the primary chain
-//! vault, at the broker and in the Base wallet.
+//! vault, at the broker and in the Base wallet, and each hedged chain's vault
+//! on its own.
 //!
 //! The inventory write guard publishes this family each time it releases the
 //! write lock (see `BroadcastingWriteGuard`), so the series follow every
@@ -21,7 +22,7 @@ use super::{
     strip_prefix,
 };
 use crate::inventory::InventoryView;
-use crate::inventory::view::{SymbolBalances, UsdcBalances};
+use crate::inventory::view::{OnchainByChain, SymbolBalances, UsdcBalances};
 
 /// What the inventory builder reads, copied from the view while its lock is
 /// held so the samples can be built after the lock is released.
@@ -29,6 +30,7 @@ use crate::inventory::view::{SymbolBalances, UsdcBalances};
 pub(crate) struct InventoryInput {
     symbols: Vec<SymbolBalances>,
     usdc: UsdcBalances,
+    by_chain: OnchainByChain,
 }
 
 impl InventoryInput {
@@ -36,6 +38,7 @@ impl InventoryInput {
         Self {
             symbols: view.symbol_balances(),
             usdc: view.usdc_balances(),
+            by_chain: view.onchain_by_chain(),
         }
     }
 }
@@ -118,9 +121,9 @@ impl InventoryPublisher {
     }
 }
 
-/// Every `liq_equity_*` and `liq_usdc_*` sample, with the exporter's
-/// formulas: ratios are 0 when their denominator is 0, and the primary-chain
-/// series exclude other chains and wallet tokens.
+/// Every `liq_equity_*` and `liq_usdc_*` sample. The ported series keep the
+/// exporter's formulas: their ratios are 0 when the denominator is 0, and the
+/// primary-chain series exclude other chains and wallet tokens.
 pub(crate) fn inventory_samples(
     input: &InventoryInput,
     cash_reserved: Option<Float>,
@@ -132,8 +135,53 @@ pub(crate) fn inventory_samples(
     }
 
     usdc_samples(&mut samples, &input.usdc, cash_reserved);
+    let broker_gross = input.usdc.offchain_gross.map(Usdc::inner);
+    chain_samples(&mut samples, &input.by_chain, broker_gross);
 
     samples
+}
+
+/// The per-chain series. Each vault's ratio divides by the gross broker
+/// cash, so it is absent until that cash is read, and absent while the vault
+/// and the broker are both 0: these series are the bot's own, with no
+/// exporter value to keep.
+fn chain_samples(
+    samples: &mut Vec<LiqSample>,
+    by_chain: &OnchainByChain,
+    broker_gross: Option<Float>,
+) {
+    for balance in &by_chain.equities {
+        push_sample(
+            samples,
+            LiqMetric::EquityChainAvailable,
+            vec![
+                ("chain", balance.chain.as_str().to_string()),
+                ("symbol", strip_prefix(balance.symbol.as_str()).to_string()),
+            ],
+            float_value(balance.available.inner()),
+        );
+    }
+
+    for balance in &by_chain.usdc {
+        let labels = vec![("chain", balance.chain.as_str().to_string())];
+        let available = balance.available.inner();
+        let values = [
+            (LiqMetric::UsdcChainAvailable, Ok(available)),
+            (LiqMetric::UsdcChainInflight, Ok(balance.inflight.inner())),
+        ];
+        for (metric, value) in values {
+            push_sample(samples, metric, labels.clone(), exact(value));
+        }
+
+        let ratio = broker_gross.and_then(|broker_gross| {
+            (available + broker_gross)
+                .and_then(|whole| defined_share_of(available, whole))
+                .transpose()
+        });
+        if let Some(ratio) = ratio {
+            push_sample(samples, LiqMetric::UsdcChainRatio, labels, exact(ratio));
+        }
+    }
 }
 
 fn symbol_samples(samples: &mut Vec<LiqSample>, balances: &SymbolBalances) {
@@ -173,6 +221,7 @@ fn symbol_samples(samples: &mut Vec<LiqSample>, balances: &SymbolBalances) {
     }
 }
 
+/// Pushes the unlabelled cash samples.
 fn usdc_samples(samples: &mut Vec<LiqSample>, usdc: &UsdcBalances, cash_reserved: Option<Float>) {
     let onchain = usdc.onchain_available.inner();
     let onchain_inflight = usdc.onchain_inflight.inner();
@@ -267,6 +316,15 @@ fn share_of(part: Float, whole: Float) -> Result<Float, FloatError> {
     part / whole
 }
 
+/// `part / whole`, or `None` when `whole` is 0 and the share is undefined.
+fn defined_share_of(part: Float, whole: Float) -> Result<Option<Float>, FloatError> {
+    if whole.is_zero()? {
+        return Ok(None);
+    }
+
+    (part / whole).map(Some)
+}
+
 fn exact(value: Result<Float, FloatError>) -> Result<f64, LiqValueError> {
     float_value(value?)
 }
@@ -279,10 +337,12 @@ pub(crate) mod tests {
     use serde_json::{Value, json};
 
     use st0x_config::create_test_ctx_with_order_owner;
+    use st0x_evm::Chain;
     use st0x_execution::{FractionalShares, Symbol};
     use st0x_float_macro::float;
 
     use super::*;
+    use crate::inventory::view::{ChainEquityBalance, ChainUsdcBalance};
     use crate::metrics::liquidity::tests::{SeriesKey, parse_exposition, series};
 
     fn shares(value: Float) -> FractionalShares {
@@ -316,7 +376,11 @@ pub(crate) mod tests {
     }
 
     fn input(symbols: Vec<SymbolBalances>, usdc: UsdcBalances) -> InventoryInput {
-        InventoryInput { symbols, usdc }
+        InventoryInput {
+            symbols,
+            usdc,
+            by_chain: OnchainByChain::default(),
+        }
     }
 
     pub(crate) fn render_family(
@@ -346,7 +410,8 @@ pub(crate) mod tests {
     }
 
     /// The goldens feed the exporter the dashboard DTO, so the same fixture
-    /// reaches the builder through this adapter.
+    /// reaches the builder through this adapter. The DTO has no per-chain
+    /// rows; those have their own tests.
     pub(crate) fn input_from_dto(inventory: &st0x_dto::Inventory) -> InventoryInput {
         let usdc = &inventory.usdc;
 
@@ -375,6 +440,7 @@ pub(crate) mod tests {
                 ethereum_wallet: usdc.inflight_cash.ethereum_wallet,
                 base_wallet: usdc.inflight_cash.base_wallet,
             },
+            by_chain: OnchainByChain::default(),
         }
     }
 
@@ -737,6 +803,146 @@ pub(crate) mod tests {
         assert_eq!(usdc_series(&rendered, "liq_usdc_rebalanceable"), None);
     }
 
+    #[test]
+    fn per_chain_series_list_each_vault_with_its_own_ratio() {
+        let mut cash = usdc(float!(2000), float!(1000));
+        cash.offchain_gross = Some(Usdc::new(float!(1500)));
+        let input = InventoryInput {
+            symbols: Vec::new(),
+            usdc: cash,
+            by_chain: OnchainByChain {
+                equities: vec![
+                    ChainEquityBalance {
+                        symbol: Symbol::new("tAAPL").unwrap(),
+                        chain: Chain::Base,
+                        available: shares(float!(50)),
+                    },
+                    ChainEquityBalance {
+                        symbol: Symbol::new("tAAPL").unwrap(),
+                        chain: Chain::Robinhood,
+                        available: shares(float!(9)),
+                    },
+                ],
+                usdc: vec![
+                    ChainUsdcBalance {
+                        chain: Chain::Base,
+                        available: Usdc::new(float!(2000)),
+                        inflight: Usdc::new(float!(250)),
+                    },
+                    ChainUsdcBalance {
+                        chain: Chain::Robinhood,
+                        available: Usdc::new(float!(500)),
+                        inflight: Usdc::new(float!(0)),
+                    },
+                ],
+            },
+        };
+
+        let per_chain: BTreeMap<SeriesKey, f64> = render(&input, None)
+            .into_iter()
+            .filter(|((name, _), _)| name.contains("_chain_"))
+            .collect();
+
+        assert_eq!(
+            per_chain,
+            BTreeMap::from([
+                (
+                    series(
+                        "liq_equity_chain_available",
+                        &[("chain", "base"), ("symbol", "AAPL")]
+                    ),
+                    50.0
+                ),
+                (
+                    series(
+                        "liq_equity_chain_available",
+                        &[("chain", "robinhood"), ("symbol", "AAPL")]
+                    ),
+                    9.0
+                ),
+                (
+                    series("liq_usdc_chain_available", &[("chain", "base")]),
+                    2000.0
+                ),
+                (
+                    series("liq_usdc_chain_inflight", &[("chain", "base")]),
+                    250.0
+                ),
+                (
+                    series("liq_usdc_chain_ratio", &[("chain", "base")]),
+                    4.0 / 7.0
+                ),
+                (
+                    series("liq_usdc_chain_available", &[("chain", "robinhood")]),
+                    500.0
+                ),
+                (
+                    series("liq_usdc_chain_inflight", &[("chain", "robinhood")]),
+                    0.0
+                ),
+                (
+                    series("liq_usdc_chain_ratio", &[("chain", "robinhood")]),
+                    0.25
+                ),
+            ])
+        );
+    }
+
+    fn one_chain_vault(available: Float, cash: UsdcBalances) -> InventoryInput {
+        InventoryInput {
+            symbols: Vec::new(),
+            usdc: cash,
+            by_chain: OnchainByChain {
+                equities: Vec::new(),
+                usdc: vec![ChainUsdcBalance {
+                    chain: Chain::HyperEvm,
+                    available: Usdc::new(available),
+                    inflight: Usdc::new(float!(0)),
+                }],
+            },
+        }
+    }
+
+    fn hyperevm_ratio(input: &InventoryInput) -> Option<f64> {
+        render(input, None)
+            .get(&series("liq_usdc_chain_ratio", &[("chain", "hyperevm")]))
+            .copied()
+    }
+
+    /// The share is undefined, so the bot-only ratio is absent rather than
+    /// the exporter's 0; the vault's own series stay.
+    #[test]
+    fn a_chain_vault_and_broker_both_empty_leave_the_ratio_absent() {
+        let mut cash = usdc(float!(0), float!(0));
+        cash.offchain_gross = Some(Usdc::new(float!(0)));
+        let input = one_chain_vault(float!(0), cash);
+
+        assert_eq!(hyperevm_ratio(&input), None);
+        assert_eq!(
+            render(&input, None)
+                .get(&series(
+                    "liq_usdc_chain_available",
+                    &[("chain", "hyperevm")]
+                ))
+                .copied(),
+            Some(0.0)
+        );
+    }
+
+    /// Before the gross broker cash is read, the available broker cash can
+    /// be 0 while the broker holds cash, which would publish a vault holding
+    /// part of the cash as 1. The ratio waits for the gross reading.
+    #[test]
+    fn an_unread_gross_broker_cash_leaves_the_ratio_absent() {
+        let unread = one_chain_vault(float!(400), usdc(float!(0), float!(0)));
+        assert_eq!(hyperevm_ratio(&unread), None);
+
+        let mut cash = usdc(float!(0), float!(0));
+        cash.offchain_gross = Some(Usdc::new(float!(600)));
+        let read = one_chain_vault(float!(400), cash);
+        assert_eq!(hyperevm_ratio(&read), Some(0.4));
+    }
+
     /// The view read is the same data the dashboard DTO shows, so the
     /// builder sees what the exporter saw.
     #[test]
@@ -754,7 +960,16 @@ pub(crate) mod tests {
         let from_view = InventoryInput::from_view(&view);
         let from_dashboard = input_from_dto(&view.to_dto());
 
-        assert_eq!(from_view, from_dashboard);
+        assert_eq!(from_view.symbols, from_dashboard.symbols);
+        assert_eq!(from_view.usdc, from_dashboard.usdc);
+        assert_eq!(
+            from_view.by_chain.usdc,
+            vec![ChainUsdcBalance {
+                chain: Chain::Base,
+                available: Usdc::new(float!(2500.5)),
+                inflight: Usdc::new(float!(0)),
+            }]
+        );
     }
 
     pub(crate) fn leaked_families() -> &'static LiqFamilies {

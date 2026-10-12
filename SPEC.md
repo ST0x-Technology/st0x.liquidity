@@ -1763,6 +1763,8 @@ instant), `liq_settings_*` and `liq_asset_*` for every symbol the primary chain
 lists. An optional setting that is not configured has no series.
 `liq_asset_extended_hours` is absent while counter trading is disabled.
 `liq_settings_info{trading_mode}` is always empty, as it was in the exporter.
+`liq_usdc_corridor_target{chain}` and `liq_usdc_corridor_deviation{chain}` give
+the band of every configured USDC corridor, whatever the USDC mode.
 
 Inventory is published each time the inventory write lock is released, from a
 copy of the balances taken while the lock is held. Each copy is numbered in
@@ -1780,6 +1782,19 @@ inventory series stay unpublished until the next start and an error is logged.
   0. The reserve is the configured cash reserve, else the gross broker cash
   minus the available broker cash once the gross is read, else 0. It is absent
   until withdrawable cash is read.
+- `liq_equity_chain_available{symbol,chain}` and
+  `liq_usdc_chain_{available,inflight,ratio}{chain}` list each hedged chain's
+  vault separately. A chain whose vault no snapshot has read yet is left out: a
+  slot that only a fill, transfer or inflight created holds a delta from 0, not
+  a balance. A chain the config no longer hedges is left out too.
+  `liq_equity_chain_available` is in that chain's wrapped vault shares. Each
+  chain's wrapper has its own underlying-per-wrapped ratio, so the series must
+  not be summed across chains or added to broker shares. `liq_usdc_chain_ratio`
+  is that vault's available USDC over itself plus the gross broker cash. It is
+  absent until the gross broker cash is read and while both are 0: it is a
+  bot-only series, so the Values rule applies and no exporter sentinel stands
+  in. It is not the corridor's trigger ratio, which uses the vault total, in
+  flight included.
 
 **Exception to financial-integrity rules.** Some ported series reproduce the
 exporter's published sentinels: a ratio with a zero denominator is published as
