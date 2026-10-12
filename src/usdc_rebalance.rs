@@ -3404,7 +3404,9 @@ impl EventSourced for UsdcRebalance {
     // that record them. No existing event changed shape, so replay rebuilds
     // every snapshot into the new shape.
     // v15: the Relay fill, refund, escrow, failure and redeposit states and
-    // events, `HopEvidence::Relay`, and `deposit_reverts` on the swap states.
+    // events, `HopEvidence::Relay`, `deposit_reverts` on the swap states,
+    // `max_quote_loss_bps` on `SwapQuote` and `short_of_floor` on
+    // `SwapRefunded`.
     const SCHEMA_VERSION: u64 = 15;
 
     fn originate(event: &Self::Event) -> Option<Self> {
@@ -7321,7 +7323,7 @@ mod tests {
             after_deposit(UsdcRebalanceEvent::SwapRefunded {
                 refund_tx: TxHash::repeat_byte(0xe1),
                 side: RefundSide::Destination,
-                amount_refunded: Usdc::new(float!(99)),
+                amount_refunded: Usdc::new(float!(99.5)),
                 short_of_floor: None,
                 refunded_at: Utc::now(),
             }),
@@ -7556,7 +7558,7 @@ mod tests {
             vec![UsdcRebalanceEvent::SwapRefunded {
                 refund_tx: TxHash::repeat_byte(0xe1),
                 side: RefundSide::Destination,
-                amount_refunded: Usdc::new(float!(99)),
+                amount_refunded: Usdc::new(float!(99.5)),
                 short_of_floor: None,
                 refunded_at: Utc::now(),
             }],
@@ -7693,7 +7695,7 @@ mod tests {
                 vec![UsdcRebalanceEvent::SwapRefunded {
                     refund_tx: TxHash::repeat_byte(0xe1),
                     side,
-                    amount_refunded: Usdc::new(float!(99)),
+                    amount_refunded: Usdc::new(float!(99.5)),
                     short_of_floor: None,
                     refunded_at: Utc::now(),
                 }],
@@ -7721,7 +7723,7 @@ mod tests {
             (
                 refunded(RefundSide::Destination),
                 true,
-                Some(EthereumWalletCredit::Held(Usdc::new(float!(99)))),
+                Some(EthereumWalletCredit::Held(Usdc::new(float!(99.5)))),
             ),
             (failed.clone(), true, None),
             (unresolved, false, None),
@@ -7928,7 +7930,7 @@ mod tests {
         let refunded = |side| UsdcRebalanceEvent::SwapRefunded {
             refund_tx: TxHash::repeat_byte(0xe1),
             side,
-            amount_refunded: Usdc::new(float!(99)),
+            amount_refunded: Usdc::new(float!(99.5)),
             short_of_floor: None,
             refunded_at: Utc::now(),
         };
@@ -8000,10 +8002,15 @@ mod tests {
                 fill_tx: TxHash::repeat_byte(0xf1),
                 amount_received: U256::from(100_000_000u64),
             },
+            // At the 100 quote's refund floor, or short of it.
             7 => UsdcRebalanceCommand::RecordSwapRefund {
                 refund_tx: TxHash::repeat_byte(0xe1),
                 side: RefundSide::Origin,
-                amount_refunded: U256::from(99_000_000u64),
+                amount_refunded: U256::from(if order.is_multiple_of(2) {
+                    99_500_000u64
+                } else {
+                    1_000_000u64
+                }),
             },
             8 => UsdcRebalanceCommand::RecordSwapRefund {
                 refund_tx: TxHash::repeat_byte(0xe2),
@@ -8076,6 +8083,10 @@ mod tests {
                             | UsdcRebalanceEvent::RedepositStarted { .. }
                             | UsdcRebalanceEvent::SwapRefunded {
                                 side: RefundSide::Destination,
+                                ..
+                            }
+                            | UsdcRebalanceEvent::SwapRefunded {
+                                short_of_floor: Some(_),
                                 ..
                             }
                     ));
