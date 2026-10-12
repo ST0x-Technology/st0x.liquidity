@@ -7231,11 +7231,10 @@ on `operational_alert` with the same query dimensions and never replaces the
 mutation's response. The production recorder emits to tracing; it does not
 acknowledge per-event delivery by Cloud Logging, stdout consumers, or an OTLP
 exporter. Downstream exporter failure is telemetry-pipeline health, not an
-event-correlated recorder failure. Docker's `gcplogs` driver forwards each JSON
-stdout record to Cloud Logging as a serialized line; parsing it into queryable
-fields depends on the ingestion configuration. VictoriaLogs receives the same
-compatible event without a second schema only when `[telemetry]` configures the
-OTLP log exporter.
+event-correlated recorder failure. The event is an ordinary stdout log line,
+which Docker's `gcplogs` driver forwards to Cloud Logging as message text.
+VictoriaLogs receives the same compatible event without a second schema only
+when `[telemetry]` configures the OTLP log exporter.
 
 **Standing rules:**
 

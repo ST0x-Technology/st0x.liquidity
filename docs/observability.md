@@ -88,12 +88,11 @@ the pipeline that pages operators even while you focus on one subsystem.
 ## Operations audit delivery
 
 `operations_audit` carries the stable `st0x.operations.audit.v1` fields. The
-production and staging runtime configs select JSON stdout, so Docker's `gcplogs`
-driver forwards each record to Cloud Logging as one serialized JSON line.
-Parsing that line into queryable Cloud Logging fields depends on the configured
-ingestion pipeline. The schema is compatible with VictoriaLogs, but VictoriaLogs
-receives events only when `[telemetry]` configures its OTLP exporter; the
-deployed configs currently rely on stdout and do not invent an OTLP endpoint.
+event is an ordinary stdout log line in the configured `log_format`, so Docker's
+`gcplogs` driver forwards it to Cloud Logging as message text, like every other
+record. The schema is compatible with VictoriaLogs, but VictoriaLogs receives
+events only when `[telemetry]` configures its OTLP exporter; the deployed
+configs currently rely on stdout and do not invent an OTLP endpoint.
 
 The recorder can synchronously detect that the tracing target is disabled. That
 immediate refusal emits a dimensioned ERROR on `operational_alert` so it remains
