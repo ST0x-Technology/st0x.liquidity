@@ -332,3 +332,9 @@ refund minimum of 0). A refund paid on the destination chain looks exactly like
 a fill, so the side alone does not tell them apart: Relay's status does. A
 failed check is `FillUnverified` or `RefundUnverified` with an
 `UnverifiedReason`.
+
+The bridge proves any refund from one unit up to the deposit; bounding it from
+below is the hedge's job. A refund under the refund floor (the deposit less the
+corridor's `max_quote_loss_bps` recorded with the quote, rounded up) is recorded
+at `SwapRefunded` and held there, paged, guard kept, instead of being
+redeposited or quoted again (SPEC.md, Relay hop step 8).

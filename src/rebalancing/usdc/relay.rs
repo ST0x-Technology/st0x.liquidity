@@ -8,7 +8,8 @@
 //! attempt until a proven fill (`Bridged`, then the Alpaca deposit) or a
 //! proven refund. A refused quote, a spent budget of reverted deposits, or a
 //! refund on the origin chain returns the stable to the vault
-//! (`Redepositing` -> `ReturnedToSource`).
+//! (`Redepositing` -> `ReturnedToSource`); a refund below its refund floor
+//! holds at `SwapRefunded` for the operator.
 
 use alloy::primitives::{Address, B256, TxHash, U256};
 use async_trait::async_trait;
@@ -497,6 +498,9 @@ where
                 ..
             }) => {
                 Self::require_base_to_alpaca(id, direction)?;
+                if self.hold_short_refund(id).await? {
+                    return Ok(());
+                }
                 self.redeposit(id, RedepositReason::Refunded).await
             }
 
@@ -508,6 +512,9 @@ where
                 ..
             }) => {
                 Self::require_base_to_alpaca(id, direction)?;
+                if self.hold_short_refund(id).await? {
+                    return Ok(());
+                }
                 warn!(target: "rebalance", %id, %refund_tx, %amount_refunded, "Relay refunded the deposit in USDC at the hub; the transfer holds its guard for the operator to move it and reconcile");
                 Ok(())
             }
@@ -628,11 +635,7 @@ where
             .map_err(Box::new)?;
         let quote = self.accepted_quote(id, amount_in).await?;
 
-        Ok(swap_quote(
-            &quote,
-            self.hop.bounds.slippage_bps,
-            origin_from_block,
-        ))
+        Ok(swap_quote(&quote, &self.hop.bounds, origin_from_block))
     }
 
     /// Readies a `SwapQuoted` for signing: past the corridor's budget of
@@ -959,8 +962,9 @@ where
         self.resume_base_to_alpaca_past_hop(id, state).await
     }
 
-    /// Records the proven refund. An origin-side one goes back into the
-    /// vault; a destination-side one waits at the hub for the operator.
+    /// Records the proven refund. One below the refund floor holds for the
+    /// operator; otherwise an origin-side one goes back into the vault and a
+    /// destination-side one waits at the hub for the operator.
     async fn adopt_refund(
         &self,
         id: &UsdcRebalanceId,
@@ -982,6 +986,10 @@ where
             )
             .await?;
 
+        if self.hold_short_refund(id).await? {
+            return Ok(());
+        }
+
         match side {
             RefundSide::Origin => {
                 warn!(target: "rebalance", %id, refund_tx = %payment.tx, amount = %payment.amount, ?reason, "Relay refunded the deposit on the origin chain; returning it to the vault");
@@ -992,6 +1000,32 @@ where
                 Ok(())
             }
         }
+    }
+
+    /// Pages a refund recorded short of its refund floor: `true` when it
+    /// holds at `SwapRefunded`, guard kept, for the operator.
+    async fn hold_short_refund(&self, id: &UsdcRebalanceId) -> Result<bool, UsdcTransferError> {
+        let Some(UsdcRebalance::SwapRefunded {
+            quote,
+            refund_tx,
+            side,
+            amount_refunded,
+            short_of_floor,
+            ..
+        }) = self.cqrs.load(id).await?
+        else {
+            warn!(target: "rebalance", %id, "No recorded Relay refund to check against its refund floor");
+            return Ok(false);
+        };
+        let Some(floor) = short_of_floor else {
+            return Ok(false);
+        };
+
+        let deposited = quote.amount_in;
+        let refunded = usdc_to_u256(amount_refunded)?;
+        let shortfall = deposited.saturating_sub(refunded);
+        error!(target: "operational_alert", alert = true, %id, %refund_tx, ?side, %deposited, %refunded, %floor, %shortfall, "Relay refunded less than the refund floor; the transfer holds its guard at SwapRefunded until the operator settles it and reconciles");
+        Ok(true)
     }
 
     /// Ends an attempt with no payment: `RelayFillPending` within the fill
@@ -1391,7 +1425,11 @@ fn accept_quote(
 }
 
 /// The persisted form of an accepted quote.
-fn swap_quote(quote: &AcceptedRelayQuote, slippage_bps: u16, origin_from_block: u64) -> SwapQuote {
+fn swap_quote(
+    quote: &AcceptedRelayQuote,
+    bounds: &RelayHopCtx,
+    origin_from_block: u64,
+) -> SwapQuote {
     let RelayRequestId(request_id) = quote.request_id();
     let RelayOrderId(order_id) = quote.order_id();
     let amounts = quote.amounts();
@@ -1403,7 +1441,8 @@ fn swap_quote(quote: &AcceptedRelayQuote, slippage_bps: u16, origin_from_block: 
         amount_in: amounts.amount_in,
         expected_out: amounts.expected_out,
         minimum_out: amounts.minimum_out,
-        slippage_bps,
+        slippage_bps: bounds.slippage_bps,
+        max_quote_loss_bps: bounds.max_quote_loss_bps,
         relayer_fee: fees.relayer,
         gas_fee: fees.gas,
         deadline: DateTime::<Utc>::from(quote.deadline()),
@@ -4308,6 +4347,62 @@ mod tests {
         let state = store.load(&id).await.unwrap().unwrap();
         assert_eq!(state.state_name(), "SwapDeposited");
         assert!(state.holds_rebalance_guard());
+    }
+
+    /// A short refund recorded before a restart stays held on resume, on
+    /// either side: it is paged again and neither redeposited nor released.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn resumed_short_refund_stays_held() {
+        let anvil = spawn_anvil(Anvil::new());
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let contracts = RelayEndContracts {
+            stable: Address::repeat_byte(0x51),
+            depository: Address::repeat_byte(0x52),
+        };
+        let transfer = relay_transfer(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet,
+            contracts,
+            store.clone(),
+        )
+        .await;
+
+        for side in [RefundSide::Origin, RefundSide::Destination] {
+            let id = UsdcRebalanceId(Uuid::new_v4());
+            record_deposited(&store, &id).await;
+            store
+                .send(
+                    &id,
+                    UsdcRebalanceCommand::RecordSwapRefund {
+                        refund_tx: TxHash::repeat_byte(0xe1),
+                        side,
+                        amount_refunded: U256::from(1),
+                    },
+                )
+                .await
+                .unwrap();
+
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+            )
+            .await
+            .expect("a held refund ends at once")
+            .unwrap();
+
+            let state = store.load(&id).await.unwrap().unwrap();
+            assert_eq!(state.state_name(), "SwapRefunded", "{side:?}: {state:?}");
+            assert!(state.holds_rebalance_guard(), "{side:?}");
+            assert!(logs_contain(&format!("id={id}")), "{side:?}");
+        }
+        assert!(logs_contain("refund floor"));
     }
 
     /// Past `fill_timeout` with no terminal status the deposit may still sit

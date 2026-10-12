@@ -2470,7 +2470,7 @@ The `relay` sub-table:
 ```toml
 [rebalancing.usdc.corridors.robinhood.relay]
 slippage_bps = 30               # sent with each quote; Relay's floor below it
-max_quote_loss_bps = 50         # most the quote's minimum may lose to the input
+max_quote_loss_bps = 50         # most the quote's minimum, or a refund, may lose to the input
 min_transfer = 500              # USDC; the trigger declines below it
 max_transfer = 50000            # USDC; the trigger caps at it
 quote_max_age_secs = 60         # a persisted quote older than this is re-quoted
@@ -4766,6 +4766,8 @@ struct SwapQuote {
     expected_out: U256,
     minimum_out: U256,
     slippage_bps: u16,
+    // The corridor's loss bound when quoted; it sets the refund floor.
+    max_quote_loss_bps: u16,
     relayer_fee: U256,
     gas_fee: U256,
     deadline: DateTime<Utc>,
@@ -4951,7 +4953,8 @@ enum UsdcRebalance {
         initiated_at: DateTime<Utc>,
         deposited_at: DateTime<Utc>,
     },
-    // Relay proved a refund of the deposit. On the origin side the stable is
+    // Relay proved a refund of the deposit. One below the refund floor holds,
+    // guard held, for the operator. Otherwise on the origin side the stable is
     // redeposited next; on the destination side it waits at the other end for
     // the operator (or the Alpaca-to-chain side's re-quote), guard held.
     SwapRefunded {
@@ -4964,6 +4967,8 @@ enum UsdcRebalance {
         refund_tx: TxHash,
         side: RefundSide,
         amount_refunded: Usdc,
+        // The refund floor, when the refund is below it.
+        short_of_floor: Option<U256>,
         initiated_at: DateTime<Utc>,
         refunded_at: DateTime<Utc>,
     },
@@ -5163,9 +5168,17 @@ proven fill or the stable back in the vault, never in a guard-freeing failure:
    send and the USD conversion. A fill that does not prove (`FillUnverified`)
    holds the guard, pages, and is read again every 30 minutes.
 8. A `refund` is adopted only once `verify_refund` proves it, on either chain,
-   at most the deposited amount: `RecordSwapRefund` -> `SwapRefunded`. An
-   origin-side refund redeposits (step 9). A destination-side refund leaves the
-   other stable at the other end: the transfer holds its guard at
+   at most the deposited amount: `RecordSwapRefund` -> `SwapRefunded`. A refund
+   below the refund floor, the quote's `amount_in` less its `max_quote_loss_bps`
+   (recorded with the quote) rounded up, is short (both stables have 6 decimals
+   and compare unit for unit), and `SwapRefunded` records the floor in
+   `short_of_floor`: on either side it pages with the deposit, the refund, the
+   floor and the shortfall, and holds at `SwapRefunded`, guard kept, on adoption
+   and on every resume, never redeposited, quoted again or released, until the
+   operator settles it with `transfer reconcile`. A short refund so costs at
+   most one deposit, capped by `max_transfer`, and stops the corridor. Otherwise
+   an origin-side refund redeposits (step 9). A destination-side refund leaves
+   the other stable at the other end: the transfer holds its guard at
    `SwapRefunded`, pages, and is accepted by `transfer reconcile` once the
    operator has moved it. A `failure`, or a `refund` with a refund fail reason,
    is terminal at Relay with nothing paid back: `FailSwap` -> `SwapFailed`,
@@ -5202,17 +5215,18 @@ startup skips that chain's approvals and revokes.
 
 Every swap state except `ReturnedToSource` holds the corridor guard and refuses
 `fail-usdc-transfer` (a deposit may be on chain). Only `SwapFailed`,
-`Redepositing` and a destination-side `SwapRefunded` are reconcilable. The
-operator exit of a chain-to-Alpaca transfer held at `WithdrawalComplete` or
-`SwapQuoted` is `transfer resume --kind usdc --direction to-alpaca`: the job
-re-quotes and signs, or redeposits on a refusal, as the bot's own retry does. On
-the shared Ethereum wallet's credit ledger an Ethereum-origin `SwapQuoted` is
-held credit, a persisted Ethereum pair is in flight, and a refund paid in
-Ethereum USDC (`SwapRefunded` on the Ethereum side) is held credit, so a Base
-deposit send that would spend the USDC a Relay swap is about to deposit or was
-refunded pages a shortfall. The ledger only pages: it reserves nothing and does
-not block the send. `transfer recheck --kind usdc` refuses Relay transfers in
-this build: a Relay `DepositFailed` is settled with `transfer reconcile`.
+`Redepositing`, a short `SwapRefunded` and a destination-side `SwapRefunded` are
+reconcilable. The operator exit of a chain-to-Alpaca transfer held at
+`WithdrawalComplete` or `SwapQuoted` is
+`transfer resume --kind usdc --direction to-alpaca`: the job re-quotes and
+signs, or redeposits on a refusal, as the bot's own retry does. On the shared
+Ethereum wallet's credit ledger an Ethereum-origin `SwapQuoted` is held credit,
+a persisted Ethereum pair is in flight, and a refund paid in Ethereum USDC
+(`SwapRefunded` on the Ethereum side) is held credit, so a Base deposit send
+that would spend the USDC a Relay swap is about to deposit or was refunded pages
+a shortfall. The ledger only pages: it reserves nothing and does not block the
+send. `transfer recheck --kind usdc` refuses Relay transfers in this build: a
+Relay `DepositFailed` is settled with `transfer reconcile`.
 
 ##### Crash-safe resume
 
@@ -5383,7 +5397,8 @@ enum UsdcRebalanceCommand {
     // A fill `verify_fill` proved, at least the quote's `minimum_out`. Valid
     // from `SwapDeposited` and `SwapEscrowUnresolved`, as are the next two.
     ConfirmSwapFill { fill_tx: TxHash, amount_received: U256 },
-    // A refund `verify_refund` proved, more than zero and at most the input.
+    // A refund `verify_refund` proved, more than zero and at most the input;
+    // recorded short of the quote's refund floor when below it.
     RecordSwapRefund { refund_tx: TxHash, side: RefundSide, amount_refunded: U256 },
     // Relay reported a terminal failure with nothing paid back.
     FailSwap { reason: String },
@@ -5515,6 +5530,7 @@ enum UsdcRebalanceEvent {
         refund_tx: TxHash,
         side: RefundSide,
         amount_refunded: Usdc,
+        short_of_floor: Option<U256>,
         refunded_at: DateTime<Utc>,
     },
     SwapEscrowUnresolved { unresolved_at: DateTime<Utc> },

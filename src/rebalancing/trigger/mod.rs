@@ -38661,6 +38661,7 @@ mod tests {
                 refund_tx: TxHash::repeat_byte(0xe1),
                 side: RefundSide::Origin,
                 amount_refunded: usdc(99),
+                short_of_floor: None,
                 refunded_at: Utc::now(),
             },
             UsdcRebalanceEvent::RedepositStarted {

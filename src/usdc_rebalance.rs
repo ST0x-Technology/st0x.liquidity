@@ -346,6 +346,17 @@ pub enum UsdcRebalanceError {
     /// deposit's refund.
     #[error("swap refund of {refunded} is not within the deposited {deposited}")]
     SwapRefundOutOfRange { refunded: U256, deposited: U256 },
+    /// The quote's refund floor does not compute: a loss bound above 10000
+    /// basis points, or an input too large to scale.
+    #[error("the refund floor of {amount_in} at {max_quote_loss_bps} bps does not compute")]
+    RefundFloorUndefined {
+        amount_in: U256,
+        max_quote_loss_bps: u16,
+    },
+    /// The refund is below its refund floor: it holds for the operator and is
+    /// neither redeposited nor quoted again.
+    #[error("the swap refund is below its refund floor {floor}; it holds for the operator")]
+    ShortRefundHeld { floor: U256 },
     /// A refund paid at the other end is not in the vault chain's wallet.
     #[error("the swap refund was paid on the destination chain; there is nothing to redeposit")]
     RefundNotOnOrigin,
@@ -870,11 +881,13 @@ pub enum UsdcRebalanceEvent {
         relayer_fee: Usdc,
         filled_at: DateTime<Utc>,
     },
-    /// Relay's refund of the deposit, proven on `side`.
+    /// Relay's refund of the deposit, proven on `side`. `short_of_floor` is
+    /// the quote's refund floor when the refund is below it.
     SwapRefunded {
         refund_tx: TxHash,
         side: RefundSide,
         amount_refunded: Usdc,
+        short_of_floor: Option<U256>,
         refunded_at: DateTime<Utc>,
     },
     /// The fill window passed with no fill and no refund.
@@ -1124,6 +1137,9 @@ pub struct SwapQuote {
     pub expected_out: U256,
     pub minimum_out: U256,
     pub slippage_bps: u16,
+    /// The corridor's loss bound when quoted: a refund below `amount_in`
+    /// less it is short (see [`SwapQuote::refund_floor`]).
+    pub max_quote_loss_bps: u16,
     /// In the origin stable, already out of `expected_out`.
     pub relayer_fee: U256,
     /// In the origin chain's native token: Relay's estimate of our gas.
@@ -1141,6 +1157,29 @@ pub struct SwapQuote {
     /// The origin chain's head read before the quote: no deposit for this
     /// order sits below it.
     pub origin_from_block: u64,
+}
+
+impl SwapQuote {
+    /// The least a refund of this deposit may pay before it is short:
+    /// `amount_in` less `max_quote_loss_bps`, rounded up, in the stables'
+    /// 6-decimal units (both stables have 6, so they compare unit for unit).
+    pub(crate) fn refund_floor(&self) -> Result<U256, UsdcRebalanceError> {
+        const SCALE: u16 = 10_000;
+
+        let undefined = || UsdcRebalanceError::RefundFloorUndefined {
+            amount_in: self.amount_in,
+            max_quote_loss_bps: self.max_quote_loss_bps,
+        };
+        let kept = SCALE
+            .checked_sub(self.max_quote_loss_bps)
+            .ok_or_else(undefined)?;
+
+        Ok(self
+            .amount_in
+            .checked_mul(U256::from(kept))
+            .ok_or_else(undefined)?
+            .div_ceil(U256::from(SCALE)))
+    }
 }
 
 /// USDC rebalance aggregate state machine.
@@ -1346,9 +1385,10 @@ pub enum UsdcRebalance {
         initiated_at: DateTime<Utc>,
         deposited_at: DateTime<Utc>,
     },
-    /// Relay proved a refund of the deposit. An origin-side refund is
-    /// redeposited next; a destination-side one waits, guard held, for the
-    /// operator.
+    /// Relay proved a refund of the deposit. One below the quote's refund
+    /// floor (`short_of_floor` set to it) waits, guard held, for the operator
+    /// on either side. Otherwise an origin-side refund is redeposited next; a
+    /// destination-side one waits, guard held, for the operator.
     SwapRefunded {
         direction: RebalanceDirection,
         corridor: UsdcCorridor,
@@ -1359,6 +1399,7 @@ pub enum UsdcRebalance {
         refund_tx: TxHash,
         side: RefundSide,
         amount_refunded: Usdc,
+        short_of_floor: Option<U256>,
         initiated_at: DateTime<Utc>,
         refunded_at: DateTime<Utc>,
     },
@@ -1684,8 +1725,9 @@ impl UsdcRebalance {
     /// compile time instead of silently landing in a wildcard arm.
     pub fn is_reconcilable_failure(&self) -> bool {
         match self {
-            // A Relay failure with nothing paid back, a chain-to-Alpaca refund
-            // paid in USDC at the hub, and a redeposit that does not confirm:
+            // A Relay failure with nothing paid back, a refund below its floor,
+            // a chain-to-Alpaca refund paid in USDC at the hub, and a
+            // redeposit that does not confirm:
             // no automated step settles them, and the operator moves the
             // funds.
             Self::DepositFailed { .. }
@@ -1695,6 +1737,10 @@ impl UsdcRebalance {
             }
             | Self::SwapFailed { .. }
             | Self::Redepositing { .. }
+            | Self::SwapRefunded {
+                short_of_floor: Some(_),
+                ..
+            }
             | Self::SwapRefunded {
                 direction: RebalanceDirection::BaseToAlpaca,
                 side: RefundSide::Destination,
@@ -2452,8 +2498,9 @@ impl UsdcRebalance {
     /// - `BridgingFailed { direction: AlpacaToBase, burn_tx_hash: Some }`:
     ///   post-burn, no recovery job (only `BaseToAlpaca` is re-armed on
     ///   startup via `resumable_post_burn_transfer`).
-    /// - The Relay holds `SwapFailed`, a destination-side `SwapRefunded` and
-    ///   `Redepositing`: no startup re-arm, no `DepositConfirmed` path.
+    /// - The Relay holds `SwapFailed`, a short or destination-side
+    ///   `SwapRefunded` and `Redepositing`: no startup re-arm, no
+    ///   `DepositConfirmed` path.
     ///
     /// All of them are accepted by `transition_reconcile_stuck_rebalance` (the
     /// CLI `transfer reconcile` target), hold the guard on restart
@@ -2512,6 +2559,13 @@ impl UsdcRebalance {
                 direction,
                 amount,
                 failed_at,
+                ..
+            }
+            | Self::SwapRefunded {
+                direction,
+                amount,
+                short_of_floor: Some(_),
+                refunded_at: failed_at,
                 ..
             }
             | Self::SwapRefunded {
@@ -4087,6 +4141,7 @@ impl EventSourced for UsdcRebalance {
                     refund_tx,
                     side,
                     amount_refunded,
+                    short_of_floor,
                     refunded_at,
                 },
                 Self::SwapDeposited {
@@ -4119,6 +4174,7 @@ impl EventSourced for UsdcRebalance {
                 refund_tx: *refund_tx,
                 side: *side,
                 amount_refunded: *amount_refunded,
+                short_of_floor: *short_of_floor,
                 initiated_at: *initiated_at,
                 refunded_at: *refunded_at,
             },
@@ -6098,7 +6154,8 @@ impl UsdcRebalance {
         }])
     }
 
-    /// Records a proven refund: more than nothing, at most the input.
+    /// Records a proven refund: more than nothing, at most the input, and
+    /// short when below the quote's refund floor.
     fn transition_record_swap_refund(
         &self,
         refund_tx: TxHash,
@@ -6114,6 +6171,8 @@ impl UsdcRebalance {
             });
         }
 
+        let floor = quote.refund_floor()?;
+        let short_of_floor = (amount_refunded < floor).then_some(floor);
         let amount_refunded = Float::from_fixed_decimal(amount_refunded, 6)
             .map(Usdc::new)
             .map_err(|_| UsdcRebalanceError::SwapInputUnconvertible {
@@ -6124,13 +6183,14 @@ impl UsdcRebalance {
             refund_tx,
             side,
             amount_refunded,
+            short_of_floor,
             refunded_at: Utc::now(),
         }])
     }
 
     /// Starts returning the withdrawn or refunded stable to the vault of a
     /// chain-to-Alpaca Relay transfer. Never while a signed deposit may be
-    /// on chain, nor for a refund paid at the other end.
+    /// on chain, nor for a short refund or one paid at the other end.
     fn transition_begin_redeposit(
         &self,
         reason: RedepositReason,
@@ -6141,6 +6201,10 @@ impl UsdcRebalance {
         };
 
         let redeposit_amount = match self {
+            Self::SwapRefunded {
+                short_of_floor: Some(floor),
+                ..
+            } => return Err(UsdcRebalanceError::ShortRefundHeld { floor: *floor }),
             Self::WithdrawalComplete {
                 direction: RebalanceDirection::BaseToAlpaca,
                 corridor,
@@ -6658,6 +6722,7 @@ pub(crate) fn swap_quote_for_test(amount_in: U256, order_id: B256) -> SwapQuote 
         expected_out: amount_in,
         minimum_out: amount_in,
         slippage_bps: 30,
+        max_quote_loss_bps: 50,
         relayer_fee: U256::ZERO,
         gas_fee: U256::ZERO,
         deadline: DateTime::<Utc>::UNIX_EPOCH,
@@ -7257,6 +7322,7 @@ mod tests {
                 refund_tx: TxHash::repeat_byte(0xe1),
                 side: RefundSide::Destination,
                 amount_refunded: Usdc::new(float!(99)),
+                short_of_floor: None,
                 refunded_at: Utc::now(),
             }),
             after_deposit(UsdcRebalanceEvent::SwapEscrowUnresolved {
@@ -7491,6 +7557,7 @@ mod tests {
                 refund_tx: TxHash::repeat_byte(0xe1),
                 side: RefundSide::Destination,
                 amount_refunded: Usdc::new(float!(99)),
+                short_of_floor: None,
                 refunded_at: Utc::now(),
             }],
         ]
@@ -7627,6 +7694,7 @@ mod tests {
                     refund_tx: TxHash::repeat_byte(0xe1),
                     side,
                     amount_refunded: Usdc::new(float!(99)),
+                    short_of_floor: None,
                     refunded_at: Utc::now(),
                 }],
             ]
@@ -7743,6 +7811,115 @@ mod tests {
         }
     }
 
+    /// The refund floor is the input less `max_quote_loss_bps`, rounded up,
+    /// and is refused when it does not compute.
+    #[test]
+    fn refund_floor_rounds_up() {
+        let quote = |amount_in: U256, max_quote_loss_bps| SwapQuote {
+            max_quote_loss_bps,
+            ..swap_quote_for_test(amount_in, B256::repeat_byte(0x0a))
+        };
+
+        assert_eq!(
+            quote(U256::from(100_000_000u64), 50).refund_floor(),
+            Ok(U256::from(99_500_000u64))
+        );
+        // 1_000_001 * 9_950 / 10_000 = 995_000.995
+        assert_eq!(
+            quote(U256::from(1_000_001u64), 50).refund_floor(),
+            Ok(U256::from(995_001u64))
+        );
+        assert_eq!(
+            quote(U256::from(100_000_000u64), 0).refund_floor(),
+            Ok(U256::from(100_000_000u64))
+        );
+        assert_eq!(
+            quote(U256::from(100_000_000u64), 10_000).refund_floor(),
+            Ok(U256::ZERO)
+        );
+        for (amount_in, max_quote_loss_bps) in [(U256::from(1u64), 10_001), (U256::MAX, 50)] {
+            assert_eq!(
+                quote(amount_in, max_quote_loss_bps).refund_floor(),
+                Err(UsdcRebalanceError::RefundFloorUndefined {
+                    amount_in,
+                    max_quote_loss_bps,
+                })
+            );
+        }
+    }
+
+    /// A refund one unit below the floor is recorded short, on either side,
+    /// and holds for the operator: no redeposit, reconcilable, and seeded
+    /// for the sweep. One at the floor is not short.
+    #[tokio::test]
+    async fn short_refund_holds_for_the_operator() {
+        let record = |side, refunded: u64| {
+            let deposited = deposited(RebalanceDirection::BaseToAlpaca);
+            async move {
+                let events = TestHarness::<UsdcRebalance>::with(())
+                    .given(deposited.clone())
+                    .when(UsdcRebalanceCommand::RecordSwapRefund {
+                        refund_tx: TxHash::repeat_byte(0xe1),
+                        side,
+                        amount_refunded: U256::from(refunded),
+                    })
+                    .await
+                    .events();
+                [deposited, events].concat()
+            }
+        };
+
+        let at_floor = replay::<UsdcRebalance>(record(RefundSide::Origin, 99_500_000).await)
+            .unwrap()
+            .unwrap();
+        let UsdcRebalance::SwapRefunded { short_of_floor, .. } = &at_floor else {
+            panic!("expected SwapRefunded, got {at_floor:?}");
+        };
+        assert_eq!(*short_of_floor, None);
+        assert!(!at_floor.is_reconcilable_failure());
+
+        for side in [RefundSide::Origin, RefundSide::Destination] {
+            let short = record(side, 99_499_999).await;
+            let state = replay::<UsdcRebalance>(short.clone()).unwrap().unwrap();
+            let UsdcRebalance::SwapRefunded { short_of_floor, .. } = &state else {
+                panic!("expected SwapRefunded, got {state:?}");
+            };
+            assert_eq!(*short_of_floor, Some(U256::from(99_500_000u64)));
+            assert!(state.holds_rebalance_guard());
+            assert!(state.is_reconcilable_failure(), "{side:?}");
+            assert!(state.guard_recovery_tracking_data().is_some(), "{side:?}");
+
+            let error = TestHarness::<UsdcRebalance>::with(())
+                .given(short.clone())
+                .when(UsdcRebalanceCommand::BeginRedeposit {
+                    reason: RedepositReason::Refunded,
+                })
+                .await
+                .then_expect_error();
+            assert!(
+                matches!(
+                    error,
+                    LifecycleError::Apply(UsdcRebalanceError::ShortRefundHeld { floor })
+                        if floor == U256::from(99_500_000u64)
+                ),
+                "got {error:?}"
+            );
+
+            let events = TestHarness::<UsdcRebalance>::with(())
+                .given(short.clone())
+                .when(UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: ReconcileReason::FundsMovedManually,
+                })
+                .await
+                .events();
+            let reconciled = replay::<UsdcRebalance>([short, events].concat())
+                .unwrap()
+                .unwrap();
+            assert_eq!(reconciled.state_name(), "Reconciled");
+            assert!(!reconciled.holds_rebalance_guard());
+        }
+    }
+
     /// The reconcilable Relay holds seed startup tracking, so the sweep can
     /// clear their guard after a reconcile from the CLI; the others do not.
     #[test]
@@ -7752,6 +7929,7 @@ mod tests {
             refund_tx: TxHash::repeat_byte(0xe1),
             side,
             amount_refunded: Usdc::new(float!(99)),
+            short_of_floor: None,
             refunded_at: Utc::now(),
         };
         let redepositing = [
