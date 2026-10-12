@@ -11,7 +11,8 @@ Check that the committed JSON matches the generator (CI runs this):
     python3 observability/gen-t0-liquidity.py --check
 
 Data comes from the exporter sidecar on the liquidity VM
-(terraform/staging-liquidity/exporter/exporter.py):
+(terraform/liquidity-exporter/exporter.py in T0Trade/t0.devops) or, for the
+liq_* gauges, from the bot's own /metrics, as the `source` variable picks:
 
   cloudmon  liq_* gauges via Ops Agent scrape -> managed prometheus
   cloudlog  logNames liquidity-trades / liquidity-transfers /
@@ -57,9 +58,15 @@ NATIVE_ROWS = os.path.join(HERE, "t0-liquidity-native-rows.json")
 
 # The bot serves liq_* on its own /metrics too, so an unpinned liq_ selector
 # would sum the exporter and the bot together. Every liq_ selector on these
-# boards reads the exporter's job until the board learns a source switch.
-LIQ_JOB = "t0-liquidity-exporter"
-LIQ_JOB_MATCHER = f'job="{LIQ_JOB}"'
+# boards reads the one job the `source` variable picks (SOURCE_VAR). PromQL
+# anchors a regex matcher, so the bot's value never matches the exporter job.
+LIQ_JOB_MATCHER = 'job=~"$source"'
+# The header's Bot light. The bot source has no liq_up and reads its scrape's
+# up. The exporter source never falls back to up: the exporter's own up says
+# nothing about the bot, so a stopped exporter shows no data, not red.
+# pin_liq leaves both selectors alone, since each already names its job.
+LIQ_UP = ('max(liq_up{job=~"$source"}) or '
+          'max(up{job=~"$source",job!="t0-liquidity-exporter"})')
 LIQ_NAME = re.compile(r"(?<![A-Za-z0-9_:])liq_[a-z0-9_]+")
 LIQ_PREFIX = re.compile(r"(?<![A-Za-z0-9_:])liq_")
 
@@ -79,7 +86,7 @@ def nid():
 # --------------------------------------------------------------------------
 
 def pin_liq(expr):
-    """Adds the exporter job matcher to every liq_ selector in `expr`.
+    """Adds the `source` job matcher to every liq_ selector in `expr`.
 
     Handles bare names (`liq_x` -> `liq_x{job="..."}`) and names that already
     carry matchers (`liq_x{a="b"}` -> `liq_x{job="...",a="b"}`). A selector
@@ -108,7 +115,7 @@ def pin_liq(expr):
 
 def unpinned_liq_selectors(expr):
     """Every liq_ occurrence in `expr` that is not a selector pinned to
-    exactly LIQ_JOB. A templated name such as `liq_$col` is never a valid
+    exactly LIQ_JOB_MATCHER. A templated name such as `liq_$col` is never a valid
     selector, so it is reported too: the check fails closed."""
     pinned = {match.start() for match in LIQ_NAME.finditer(expr)
               if _selector_is_pinned(expr, match.end())}
@@ -725,9 +732,12 @@ def pills(y):
 
     return [
         pill("", "The SPA header's connection light: is the bot process up "
-             "and answering /health? '—' means the exporter itself is not "
-             "reporting.",
-             "max(liq_up)", display="Bot",
+             "and answering? The exporter source reads liq_up, which is 0 "
+             "when the exporter cannot reach the bot's /health. The bot "
+             "never emits liq_up, so the bot source reads the scrape's own "
+             "up. '—' means the source is not reporting.",
+             LIQ_UP,
+             display="Bot",
              mappings=[{"type": "value", "options": {
                  "1": {"text": "Connected", "color": "green", "index": 0},
                  "0": {"text": "Disconnected", "color": "red", "index": 1}}}],
@@ -789,6 +799,26 @@ WINDOW_VAR = {
         {"selected": False, "text": "1Y", "value": "1y"},
         {"selected": False, "text": "All", "value": "all"},
     ],
+}
+
+# Which job's liq_* series the boards read. The exporter sidecar is the
+# default until Stage 4 of the migration flips it to the bot; the bot's job is
+# t0-liquidity in production and t0-liquidity-staging in staging, and `env`
+# already picks the project, so one regex covers both.
+SOURCE_VAR = {
+    "name": "source", "type": "custom", "label": "Source",
+    "description": "Which process serves the liq_* metrics: the exporter "
+                   "sidecar (the default for now) or the bot's own "
+                   "/metrics. Pick bot to compare the two.",
+    "query": "exporter : t0-liquidity-exporter, "
+             "bot : t0-liquidity|t0-liquidity-staging",
+    "includeAll": False, "multi": False, "hide": 0,
+    "current": {"selected": True, "text": "exporter",
+                "value": "t0-liquidity-exporter"},
+    "options": [{"selected": True, "text": "exporter",
+                 "value": "t0-liquidity-exporter"},
+                {"selected": False, "text": "bot",
+                 "value": "t0-liquidity|t0-liquidity-staging"}],
 }
 
 ENV_VAR = {
@@ -1134,7 +1164,7 @@ dashboards.append(make_dashboard(
     "compute start-iap-tunnel <vm> 8080 "
     "--local-host-port=localhost:8080 --zone europe-west3-b "
     "--project $env (VM name = project id)",
-    panels, tab_links("Dashboard"), [ENV_VAR]))
+    panels, tab_links("Dashboard"), [ENV_VAR, SOURCE_VAR]))
 
 # ==========================================================================
 # Tab 2: Orders — the SPA's Raindex Orders table (+ ops extras).
@@ -1188,7 +1218,7 @@ panels.append(stat(
 dashboards.append(make_dashboard(
     "t0-liquidity-orders", "Liquidity bot: Orders",
     "The SPA's Orders tab.",
-    panels, tab_links("Orders"), [ENV_VAR]))
+    panels, tab_links("Orders"), [ENV_VAR, SOURCE_VAR]))
 
 # ==========================================================================
 # Tab 3: PnL — tiles, per-asset table, the four charts in SPA order.
@@ -1360,7 +1390,7 @@ dashboards.append(make_dashboard(
     "t0-liquidity-pnl", "Liquidity bot: PnL",
     "The SPA's PnL tab, tiles, table and charts all driven by the range "
     "pill; closed-lot and cost-ledger drilldowns live in the SPA.",
-    panels, tab_links("PnL"), [ENV_VAR, WINDOW_VAR]))
+    panels, tab_links("PnL"), [ENV_VAR, SOURCE_VAR, WINDOW_VAR]))
 
 # ==========================================================================
 # Tab 4: Performance — SLO cards, stage charts, health tables + the
@@ -1691,7 +1721,7 @@ dashboards.append(make_dashboard(
     "t0-liquidity-performance", "Liquidity bot: Performance",
     "The SPA's Performance tab, plus the pre-exporter native bot metrics "
     "as collapsed rows at the bottom.",
-    panels, tab_links("Performance"), [ENV_VAR, STAGE_VAR]))
+    panels, tab_links("Performance"), [ENV_VAR, SOURCE_VAR, STAGE_VAR]))
 
 # ==========================================================================
 # Tab 5: Logs.
@@ -1817,7 +1847,7 @@ dashboards.append(make_dashboard(
     "The SPA's Logs tab: level/category/target/search-filterable "
     "structured log lines.",
     panels, tab_links("Logs"),
-    [ENV_VAR, LEVEL_VAR, CATEGORY_VAR, TARGET_VAR, SEARCH_VAR]))
+    [ENV_VAR, SOURCE_VAR, LEVEL_VAR, CATEGORY_VAR, TARGET_VAR, SEARCH_VAR]))
 
 # ==========================================================================
 # Emit.

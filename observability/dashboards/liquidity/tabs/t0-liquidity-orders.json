@@ -44,6 +44,33 @@
             "value": "t0-liquidity-staging"
           }
         ]
+      },
+      {
+        "name": "source",
+        "type": "custom",
+        "label": "Source",
+        "description": "Which process serves the liq_* metrics: the exporter sidecar (the default for now) or the bot's own /metrics. Pick bot to compare the two.",
+        "query": "exporter : t0-liquidity-exporter, bot : t0-liquidity|t0-liquidity-staging",
+        "includeAll": false,
+        "multi": false,
+        "hide": 0,
+        "current": {
+          "selected": true,
+          "text": "exporter",
+          "value": "t0-liquidity-exporter"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "exporter",
+            "value": "t0-liquidity-exporter"
+          },
+          {
+            "selected": false,
+            "text": "bot",
+            "value": "t0-liquidity|t0-liquidity-staging"
+          }
+        ]
       }
     ]
   },
@@ -127,7 +154,7 @@
       "id": 14,
       "type": "stat",
       "title": "",
-      "description": "The SPA header's connection light: is the bot process up and answering /health? '\u2014' means the exporter itself is not reporting.",
+      "description": "The SPA header's connection light: is the bot process up and answering? The exporter source reads liq_up, which is 0 when the exporter cannot reach the bot's /health. The bot never emits liq_up, so the bot source reads the scrape's own up. '\u2014' means the source is not reporting.",
       "datasource": {
         "type": "stackdriver",
         "uid": "cloudmon"
@@ -142,7 +169,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_up{job=\"t0-liquidity-exporter\"})",
+            "expr": "max(liq_up{job=~\"$source\"}) or max(up{job=~\"$source\",job!=\"t0-liquidity-exporter\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -244,7 +271,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max by (git_commit) (topk(1, label_replace(timestamp(liq_bot_info{job=\"t0-liquidity-exporter\"}), \"git_commit\", \"$1\", \"git_commit\", \"(.{7}).*\")))",
+            "expr": "max by (git_commit) (topk(1, label_replace(timestamp(liq_bot_info{job=~\"$source\"}), \"git_commit\", \"$1\", \"git_commit\", \"(.{7}).*\")))",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -331,7 +358,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "time() - max(liq_bot_start_timestamp_seconds{job=\"t0-liquidity-exporter\"})",
+            "expr": "time() - max(liq_bot_start_timestamp_seconds{job=~\"$source\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -419,7 +446,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "sum by (broker) (liq_settings_info{job=\"t0-liquidity-exporter\"})",
+            "expr": "sum by (broker) (liq_settings_info{job=~\"$source\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -506,7 +533,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_settings_equity_target{job=\"t0-liquidity-exporter\"})",
+            "expr": "max(liq_settings_equity_target{job=~\"$source\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -594,7 +621,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_settings_usdc_target{job=\"t0-liquidity-exporter\"})",
+            "expr": "max(liq_settings_usdc_target{job=~\"$source\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -682,7 +709,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_settings_execution_threshold_usd{job=\"t0-liquidity-exporter\"})",
+            "expr": "max(liq_settings_execution_threshold_usd{job=~\"$source\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1055,7 +1082,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_pending_orders_total{job=\"t0-liquidity-exporter\"}) or vector(0)",
+            "expr": "max(liq_pending_orders_total{job=~\"$source\"}) or vector(0)",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1137,7 +1164,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_raindex_orders_total{job=\"t0-liquidity-exporter\"})",
+            "expr": "max(liq_raindex_orders_total{job=~\"$source\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1219,7 +1246,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_raindex_orders_unavailable{job=\"t0-liquidity-exporter\"}) or vector(0)",
+            "expr": "max(liq_raindex_orders_unavailable{job=~\"$source\"}) or vector(0)",
             "step": "60s"
           },
           "timeSeriesList": {
