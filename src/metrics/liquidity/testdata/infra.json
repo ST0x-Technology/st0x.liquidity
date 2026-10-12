@@ -1,0 +1,48 @@
+{
+  "monitor": {
+    "enabledChains": [
+      "base",
+      "robinhood"
+    ],
+    "blockLag": [
+      {
+        "chain": "base",
+        "currentLagBlocks": 3,
+        "currentLagSampledAt": "2026-03-01T12:00:05Z",
+        "points": []
+      },
+      {
+        "chain": "robinhood",
+        "currentLagBlocks": null,
+        "currentLagSampledAt": null,
+        "points": []
+      }
+    ],
+    "poll": []
+  },
+  "dependencies": [
+    {
+      "dependency": "broker",
+      "operation": "get_order_status",
+      "calls": 30,
+      "errors": 0,
+      "latency": null,
+      "buckets": []
+    },
+    {
+      "dependency": "rpc",
+      "operation": "eth_getLogs",
+      "calls": 120,
+      "errors": 2,
+      "latency": {
+        "p50Ms": 95,
+        "p90Ms": 105,
+        "p95Ms": 115,
+        "p99Ms": 125,
+        "maxMs": 2300,
+        "sampleCount": 120
+      },
+      "buckets": []
+    }
+  ]
+}

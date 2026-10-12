@@ -1,0 +1,18 @@
+# Expected exporter output for reliability.json, written by
+# scripts/liq-parity/golden.py from t0.devops revision 226c029.
+liq_reliability_log_count_24h{level="error"} 3.0
+liq_reliability_log_count_24h{level="warning"} 5.0
+liq_log_target_count_24h{level="WARN",target="inventory"} 5.0
+liq_log_target_count_24h{level="ERROR",target="hedge"} 3.0
+liq_failure_event_count_24h{event_type="OffchainOrderEvent::Failed"} 2.0
+liq_failure_event_last_ts_seconds{event_type="OffchainOrderEvent::Failed"} 1772355600.0
+liq_failure_event_count_24h{event_type="UsdcRebalanceEvent::AttestationTimedOut"} 1.0
+liq_failure_event_last_ts_seconds{event_type="UsdcRebalanceEvent::AttestationTimedOut"} 1772359200.0
+liq_job_queue{job_type="PlaceHedge",state="pending"} 1.0
+liq_job_queue{job_type="PlaceHedge",state="running"} 0.0
+liq_job_queue{job_type="PlaceHedge",state="done"} 40.0
+liq_job_queue{job_type="PlaceHedge",state="failed"} 2.0
+liq_job_queue{job_type="PlaceHedge",state="awaiting_retry"} 1.0
+liq_job_queue{job_type="PlaceHedge",state="killed"} 0.0
+liq_job_queue{job_type="PlaceHedge",state="retried"} 3.0
+liq_job_queue_oldest_pending_ts_seconds{job_type="PlaceHedge"} 1772362800.0

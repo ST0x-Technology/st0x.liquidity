@@ -52,7 +52,7 @@ hedge_order_gate_reconciliation_timeout_secs = 10
 # t0.devops' pricing stack), an ID token minted per connect, no
 # [pricing] secret exists. The droplet's ws://st0x-pricing:8080 was a
 # droplet-local container; it never existed on this VM.
-ws_url = "wss://st0x-pricing-ccvtustewa-ey.a.run.app/ws"
+ws_url = "wss://t0-pricing-423050909479.europe-west3.run.app/ws"
 gcp_id_token = true
 # Broker identity (type, mode, account_id, and for the keyless variant
 # client_id and kms_key_version) now belongs in this section: it is names and
@@ -125,8 +125,8 @@ order_fill_poll_interval_secs = 5
 # Exactly one hedged chain is the primary: it must be active, it always
 # carries the rebalancing services, and it is the default --network for
 # operator commands. Each rebalancing chain polls its own wallet and
-# recovers its own transfers (Robinhood rebalances its own DNUT); fills
-# are hedged on every hedged chain.
+# recovers its own transfers (Robinhood rebalances its own DNUT, PLBY, GRND,
+# and WMT); fills are hedged on every hedged chain.
 primary = true
 # Alpaca's issuer wallet on this chain -- ERC-20 transfers for redemption go
 # here. Per chain: a redemption delivers tokens that exist on one chain, so
@@ -177,17 +177,19 @@ required_confirmations = 1
 # Reverting only this table to "prefunded" fails validate-config while the
 # token file enables Robinhood rebalancing.
 #
-# Neither state is neutral for DNUT. "paused" keeps Robinhood's vault in
-# the total but stops it redeeming, so sells into that vault drain the
-# broker's DNUT toward the hedge floor with no planner action: keep the
-# pause short and watch the broker's DNUT position. "disabled" drops the
-# vault from the total, so Base (target 0.4, no operational_limit) is far
-# over its band and redeems down to its target, several hundred DNUT, in
-# one operation. Restoring Base DNUT to 0.5 avoids that only before the
-# switch-on mints; after them Base still holds over 0.55 of Base + Alpaca.
-# So a generation that disables Robinhood DNUT also pauses Base DNUT, or
-# sets its target_share within 0.05 of Base / (Base + Alpaca) at live
-# balances, or the operator expects that redemption.
+# Neither state is neutral for a listing rebalanced on both chains (DNUT,
+# PLBY, and GRND). "paused" keeps Robinhood's vault in the total but stops it
+# redeeming, so sells into that vault drain the broker's position toward the
+# hedge floor with no planner action: keep the pause short and watch the
+# broker's position. "disabled" drops the vault from the total, so Base
+# (target 0.4, no operational_limit) is far over its band and redeems down to
+# its target in one operation (several hundred DNUT at the DNUT switch-on).
+# Restoring the Base target to 0.5 avoids that only before Robinhood mints;
+# after them Base can still sit over its band. So a generation that disables
+# one of these listings on Robinhood also pauses it on Base, or sets its Base
+# target_share within 0.05 of Base / (Base + Alpaca) at live balances, or
+# the operator expects that redemption. WMT has no Base listing, so neither
+# state moves Base WMT.
 
 [chains.robinhood]
 lifecycle = "active"
@@ -296,18 +298,20 @@ deviation = 0.05
 # that does not. Ethereum runs no orderbook. alpaca_floor only caps mints:
 # no mint takes the broker below a tenth of the equity's total. Nothing
 # redeems when the broker is under it, so a symbol rebalanced on two chains
-# needs targets whose upper bands leave the floor: DNUT's Base and Robinhood
-# rows in the token file both set target_share = 0.4, and 0.45 + 0.45 keeps
-# the broker at or above 0.1 only while Robinhood redeems as fast as it goes
-# over its band: 25 DNUT per operation (its operational_limit), one at a
-# time and at least cooldown_secs apart, about 300 an hour. Sustained sells
-# into the Robinhood vault hedge faster than that and take the broker below
-# 0.1, down to the hedge floor. The two DNUT rows also plan as one: while
-# Robinhood's DNUT poll is older than inventory_staleness_bound_secs or a
-# Robinhood DNUT transfer runs, Base DNUT neither mints nor redeems either.
-# equity_plan_declined_total has only a reason label, so watch the
-# "Declined equity plan" logs instead: symbol DNUT, chain robinhood, reason
-# chain_stale or chain_unpolled (inflight is logged per symbol, no chain).
+# needs targets whose upper bands leave the floor: DNUT, PLBY, and GRND set
+# target_share = 0.4 in both their Base and Robinhood rows, and 0.45 + 0.45
+# keeps the broker at or above 0.1 only while Robinhood redeems as fast as it
+# goes over its band: one operation at a time, at least cooldown_secs apart,
+# each capped by the listing's Robinhood operational_limit (25 DNUT, 4000
+# PLBY, 300 GRND). Sustained sells into the Robinhood vault hedge faster than
+# that and take the broker below 0.1, down to the hedge floor. WMT is listed
+# on Robinhood only, with target_share = 0.5. The two rows of a listing also
+# plan as one: while Robinhood's poll is older than
+# inventory_staleness_bound_secs or a Robinhood transfer for that symbol runs,
+# Base neither mints nor redeems it either. equity_plan_declined_total has
+# only a reason label, so watch the "Declined equity plan" logs instead: the
+# symbol, chain robinhood, reason chain_stale or chain_unpolled (inflight is
+# logged per symbol, no chain).
 # min_operation_usd sits two orders of magnitude above a Base mint's gas
 # while still letting the cheapest listings rebalance; cooldown_secs matches
 # the inventory staleness bound, so a limit-truncated transfer re-fires once
@@ -401,4 +405,4 @@ retired_symbols = []
 # [assets.equities.<SYM>]) come from t0.tokens' token file in the bucket.
 [registry]
 url = "gs://t0-artifacts-tokens/production/tokens.toml"
-generation = 1791378253362331
+generation = 1791818500338410

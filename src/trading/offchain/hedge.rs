@@ -26,7 +26,7 @@ use st0x_execution::{
     MarketOrder, MarketSession, Permanence, Positive, PostCloseGap, SupportedExecutor, Symbol, Usd,
 };
 
-use crate::alerts::Notifier;
+use crate::alerts::{AlertKind, Notifier};
 use crate::conductor::job::{
     BACKPRESSURE_RESCHEDULE_LIMIT, BackpressureOutcome, BackpressureStreak,
     DEFAULT_PERFORM_TIMEOUT, Job, JobQueue, Label, advance_backpressure, apply_backpressure_step,
@@ -384,11 +384,17 @@ pub(crate) async fn alert_dead_letter(
         return;
     }
     if reason == DeadLetterReason::ResidualAfterClose {
-        error!(target: "operational_alert", alert = true, %symbol, message,
+        error!(target: "operational_alert", alert = true,
+            kind = AlertKind::ResidualExposureAfterLatchedClose.as_str(), %symbol, detail = message,
             "Residual exposure remains after the latched close; reconciliation continues");
     }
 
-    match tokio::time::timeout(DEAD_LETTER_ALERT_TIMEOUT, notifier.notify(message)).await {
+    match tokio::time::timeout(
+        DEAD_LETTER_ALERT_TIMEOUT,
+        notifier.notify(reason.alert_kind(), message),
+    )
+    .await
+    {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
             alerted_dead_letters.lock().await.remove(&key);
@@ -2377,7 +2383,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::alerts::Notifier for FlakyNotifier {
-        async fn notify(&self, message: &str) -> Result<(), crate::alerts::NotifierError> {
+        async fn notify(
+            &self,
+            kind: crate::alerts::AlertKind,
+            message: &str,
+        ) -> Result<(), crate::alerts::NotifierError> {
+            crate::alerts::assert_kind_matches_extractor(kind, message);
             if self.failing.load(Ordering::SeqCst) {
                 return Err(crate::alerts::NotifierError::Simulated);
             }
@@ -2396,7 +2407,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::alerts::Notifier for PausingNotifier {
-        async fn notify(&self, _message: &str) -> Result<(), crate::alerts::NotifierError> {
+        async fn notify(
+            &self,
+            kind: crate::alerts::AlertKind,
+            message: &str,
+        ) -> Result<(), crate::alerts::NotifierError> {
+            crate::alerts::assert_kind_matches_extractor(kind, message);
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.started.notify_one();
             self.release.notified().await;
@@ -2411,7 +2427,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::alerts::Notifier for HangingNotifier {
-        async fn notify(&self, _message: &str) -> Result<(), crate::alerts::NotifierError> {
+        async fn notify(
+            &self,
+            kind: crate::alerts::AlertKind,
+            message: &str,
+        ) -> Result<(), crate::alerts::NotifierError> {
+            crate::alerts::assert_kind_matches_extractor(kind, message);
             self.calls.fetch_add(1, Ordering::SeqCst);
             std::future::pending().await
         }
@@ -3743,18 +3764,26 @@ mod tests {
         );
     }
 
+    /// A synthetic dead-letter page carrying the standing-delta phrase its
+    /// symbol-scoped reason pages under, told apart by `label`.
+    fn standing_delta_page(label: &str) -> String {
+        format!("{label}: the symbol carries a standing delta")
+    }
+
     #[tokio::test]
     async fn concurrent_dead_letter_pages_reserve_one_delivery_slot() {
         let notifier = PausingNotifier::default();
         let alerted = Mutex::new(HashSet::new());
         let symbol = Symbol::new("AAPL").unwrap();
         let reason = DeadLetterReason::SymbolScoped(SymbolScopedReason::LimitQuoteFetch);
+        let first = standing_delta_page("first");
+        let second = standing_delta_page("second");
 
         tokio::join!(
-            alert_dead_letter(&notifier, &alerted, &symbol, reason, "first"),
+            alert_dead_letter(&notifier, &alerted, &symbol, reason, &first),
             async {
                 notifier.started.notified().await;
-                alert_dead_letter(&notifier, &alerted, &symbol, reason, "second").await;
+                alert_dead_letter(&notifier, &alerted, &symbol, reason, &second).await;
                 notifier.release.notify_one();
             }
         );
@@ -3777,9 +3806,10 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let reason = DeadLetterReason::SymbolScoped(SymbolScopedReason::LimitQuoteFetch);
         let key = (symbol.clone(), reason);
+        let page = standing_delta_page("page");
 
         tokio::join!(
-            alert_dead_letter(&notifier, &alerted, &symbol, reason, "page"),
+            alert_dead_letter(&notifier, &alerted, &symbol, reason, &page),
             async {
                 notifier.started.notified().await;
                 assert!(
@@ -3802,9 +3832,10 @@ mod tests {
         let alerted = Mutex::new(HashSet::new());
         let symbol = Symbol::new("AAPL").unwrap();
         let reason = DeadLetterReason::SymbolScoped(SymbolScopedReason::LimitQuoteFetch);
+        let page = standing_delta_page("page");
 
         for _ in 0..2 {
-            alert_dead_letter(&notifier, &alerted, &symbol, reason, "page").await;
+            alert_dead_letter(&notifier, &alerted, &symbol, reason, &page).await;
         }
 
         assert_eq!(

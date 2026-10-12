@@ -1,0 +1,2163 @@
+{
+  "attributionMethod": "backend_position_fill_replay_fifo",
+  "asOfRowid": 42,
+  "warnings": [
+    "first",
+    "second"
+  ],
+  "availableRange": {
+    "firstAt": "2025-12-01T14:30:00Z",
+    "lastAt": "2026-03-05T15:00:00Z",
+    "firstDate": "2025-12-01",
+    "lastDate": "2026-03-05"
+  },
+  "sampleStats": {
+    "firstAt": "2026-02-20T14:30:00.25Z",
+    "lastAt": "2026-03-03T15:00:00+00:00",
+    "symbolCount": 2,
+    "onchainFillCount": 5,
+    "offchainFillCount": 4,
+    "totalFillCount": 9,
+    "symbols": []
+  },
+  "summary": {
+    "counterTradePnlUsd": "12.5",
+    "onchainNettingPnlUsd": "-3.25",
+    "directionalInventoryBaselinePnlUsd": "4",
+    "directionalImbalanceExcessPnlUsd": "-1.75",
+    "directionalExposurePnlUsd": "2.25",
+    "totalPnlUsd": "11.5",
+    "grossRealizedPnlUsd": "20",
+    "trackedCostsUsd": "14.25",
+    "trackedRevenueUsd": "n/a",
+    "netRealizedPnlUsd": "7.25",
+    "realizedPnlUsd": "11.5",
+    "matchedShares": "300",
+    "onchainNotionalUsd": "6000",
+    "offchainNotionalUsd": "5950.5",
+    "inventoryDriftShares": "-2",
+    "inventoryDriftUsd": "-30.5",
+    "openLongShares": "10",
+    "openShortShares": "0",
+    "unmatchedOffchainShares": "1.5",
+    "unmatchedOffchainNotionalUsd": "22.5",
+    "onchainFillCount": 5,
+    "offchainFillCount": 4,
+    "matchedLotCount": 3,
+    "openLotCount": 2,
+    "unmatchedOffchainFillCount": 1
+  },
+  "costs": {
+    "totalTrackedCostsUsd": "14.25",
+    "totalTrackedRevenueUsd": "1.5",
+    "counterTradeCostsUsd": "9",
+    "onchainNettingCostsUsd": "0",
+    "directionalExposureCostsUsd": "0",
+    "genericCostsUsd": "5.25",
+    "dividendRevenueUsd": "1.5",
+    "offchainExecutionFeesUsd": "2",
+    "tokenizationFeesUsd": "3.5",
+    "cctpFeesUsd": "0.75",
+    "conversionSlippageUsd": "0",
+    "oracleWriteCostUsd": "0",
+    "brokerFeesUsd": "2",
+    "regulatoryFeesUsd": "0.01",
+    "marginInterestUsd": "4",
+    "botGasUsd": "1.99",
+    "walletTransferFeesUsd": "0",
+    "unclassifiedCostsUsd": "2",
+    "costEntryCount": 7,
+    "missingCostObservationCount": 2,
+    "coverage": [
+      {
+        "source": "tokenization_fees",
+        "accountingBucket": "generic",
+        "effect": "cost",
+        "status": "included",
+        "amountUsd": "0",
+        "note": "fixture"
+      },
+      {
+        "source": "wallet_transfer_fees",
+        "accountingBucket": "generic",
+        "effect": "cost",
+        "status": "not_ingested",
+        "amountUsd": "0",
+        "note": "fixture"
+      }
+    ]
+  },
+  "capital": {
+    "averageDeployedCapitalUsd": "12500.5",
+    "annualizedReturnPct": null,
+    "coverageDays": 3,
+    "sampleDays": 3,
+    "firstSnapshotDay": "2026-03-01",
+    "lastSnapshotDay": "2026-03-03",
+    "excludedDays": []
+  },
+  "symbols": [
+    {
+      "symbol": "tAAPL",
+      "counterTradePnlUsd": "10",
+      "onchainNettingPnlUsd": "-1",
+      "directionalInventoryBaselinePnlUsd": "3",
+      "directionalImbalanceExcessPnlUsd": "-1.5",
+      "directionalExposurePnlUsd": "1.5",
+      "totalPnlUsd": "10.5",
+      "grossRealizedPnlUsd": "15",
+      "trackedCostsUsd": "6",
+      "trackedRevenueUsd": "1",
+      "netRealizedPnlUsd": "10",
+      "realizedPnlUsd": "10.5",
+      "matchedShares": "200",
+      "inventoryDriftShares": "-1",
+      "inventoryDriftUsd": "-15.25",
+      "openLongShares": "8",
+      "openShortShares": "0",
+      "unmatchedOffchainShares": "1.5",
+      "matchedLotCount": 2,
+      "onchainFillCount": 2,
+      "offchainFillCount": 2,
+      "unmatchedOffchainFillCount": 0
+    },
+    {
+      "symbol": "RKLB",
+      "counterTradePnlUsd": "2.5",
+      "onchainNettingPnlUsd": "-2.25",
+      "directionalInventoryBaselinePnlUsd": "1",
+      "directionalImbalanceExcessPnlUsd": "-0.25",
+      "directionalExposurePnlUsd": "0.75",
+      "totalPnlUsd": "1",
+      "grossRealizedPnlUsd": "5",
+      "trackedCostsUsd": "8.25",
+      "trackedRevenueUsd": "0.5",
+      "netRealizedPnlUsd": "-2.75",
+      "realizedPnlUsd": "1",
+      "matchedShares": "",
+      "inventoryDriftShares": "-1",
+      "inventoryDriftUsd": "-15.25",
+      "openLongShares": "2",
+      "openShortShares": "0",
+      "unmatchedOffchainShares": "0",
+      "matchedLotCount": 1,
+      "onchainFillCount": 1,
+      "offchainFillCount": 1,
+      "unmatchedOffchainFillCount": 0
+    }
+  ],
+  "symbolUniverse": [
+    "RKLB",
+    "tAAPL"
+  ],
+  "entries": [],
+  "costEntries": [],
+  "total": 3,
+  "hasMore": true,
+  "windows": [
+    {
+      "windowId": "2025-12-01",
+      "startAt": "2025-12-01T05:00:00.000Z",
+      "endAt": "2025-12-01T04:59:59.999Z",
+      "label": "2025-12-01",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "0.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "0.5"
+        },
+        {
+          "symbol": "RKLB",
+          "counterTradePnlUsd": "3",
+          "onchainNettingPnlUsd": "0",
+          "directionalInventoryBaselinePnlUsd": "0",
+          "directionalImbalanceExcessPnlUsd": "0",
+          "directionalExposurePnlUsd": "0",
+          "totalPnlUsd": "3"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-02",
+      "startAt": "2025-12-02T05:00:00.000Z",
+      "endAt": "2025-12-02T04:59:59.999Z",
+      "label": "2025-12-02",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "1.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "1.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-03",
+      "startAt": "2025-12-03T05:00:00.000Z",
+      "endAt": "2025-12-03T04:59:59.999Z",
+      "label": "2025-12-03",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "2.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "2.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-04",
+      "startAt": "2025-12-04T05:00:00.000Z",
+      "endAt": "2025-12-04T04:59:59.999Z",
+      "label": "2025-12-04",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "3.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "3.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-05",
+      "startAt": "2025-12-05T05:00:00.000Z",
+      "endAt": "2025-12-05T04:59:59.999Z",
+      "label": "2025-12-05",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "4.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "4.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-06",
+      "startAt": "2025-12-06T05:00:00.000Z",
+      "endAt": "2025-12-06T04:59:59.999Z",
+      "label": "2025-12-06",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "5.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "5.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-07",
+      "startAt": "2025-12-07T05:00:00.000Z",
+      "endAt": "2025-12-07T04:59:59.999Z",
+      "label": "2025-12-07",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "6.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "6.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-08",
+      "startAt": "2025-12-08T05:00:00.000Z",
+      "endAt": "2025-12-08T04:59:59.999Z",
+      "label": "2025-12-08",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "7.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "7.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-09",
+      "startAt": "2025-12-09T05:00:00.000Z",
+      "endAt": "2025-12-09T04:59:59.999Z",
+      "label": "2025-12-09",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "8.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "8.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-10",
+      "startAt": "2025-12-10T05:00:00.000Z",
+      "endAt": "2025-12-10T04:59:59.999Z",
+      "label": "2025-12-10",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "9.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "9.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-11",
+      "startAt": "2025-12-11T05:00:00.000Z",
+      "endAt": "2025-12-11T04:59:59.999Z",
+      "label": "2025-12-11",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "10.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "10.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-12",
+      "startAt": "2025-12-12T05:00:00.000Z",
+      "endAt": "2025-12-12T04:59:59.999Z",
+      "label": "2025-12-12",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "11.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "11.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-13",
+      "startAt": "2025-12-13T05:00:00.000Z",
+      "endAt": "2025-12-13T04:59:59.999Z",
+      "label": "2025-12-13",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "12.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "12.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-14",
+      "startAt": "2025-12-14T05:00:00.000Z",
+      "endAt": "2025-12-14T04:59:59.999Z",
+      "label": "2025-12-14",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "13.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "13.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-15",
+      "startAt": "2025-12-15T05:00:00.000Z",
+      "endAt": "2025-12-15T04:59:59.999Z",
+      "label": "2025-12-15",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "14.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "14.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-16",
+      "startAt": "2025-12-16T05:00:00.000Z",
+      "endAt": "2025-12-16T04:59:59.999Z",
+      "label": "2025-12-16",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "15.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "15.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-17",
+      "startAt": "2025-12-17T05:00:00.000Z",
+      "endAt": "2025-12-17T04:59:59.999Z",
+      "label": "2025-12-17",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "16.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "16.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-18",
+      "startAt": "2025-12-18T05:00:00.000Z",
+      "endAt": "2025-12-18T04:59:59.999Z",
+      "label": "2025-12-18",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "17.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "17.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-19",
+      "startAt": "2025-12-19T05:00:00.000Z",
+      "endAt": "2025-12-19T04:59:59.999Z",
+      "label": "2025-12-19",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "18.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "18.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-20",
+      "startAt": "2025-12-20T05:00:00.000Z",
+      "endAt": "2025-12-20T04:59:59.999Z",
+      "label": "2025-12-20",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "19.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "19.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-21",
+      "startAt": "2025-12-21T05:00:00.000Z",
+      "endAt": "2025-12-21T04:59:59.999Z",
+      "label": "2025-12-21",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "20.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "20.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-22",
+      "startAt": "2025-12-22T05:00:00.000Z",
+      "endAt": "2025-12-22T04:59:59.999Z",
+      "label": "2025-12-22",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "21.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "21.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-23",
+      "startAt": "2025-12-23T05:00:00.000Z",
+      "endAt": "2025-12-23T04:59:59.999Z",
+      "label": "2025-12-23",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "22.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "22.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-24",
+      "startAt": "2025-12-24T05:00:00.000Z",
+      "endAt": "2025-12-24T04:59:59.999Z",
+      "label": "2025-12-24",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "23.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "23.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-25",
+      "startAt": "2025-12-25T05:00:00.000Z",
+      "endAt": "2025-12-25T04:59:59.999Z",
+      "label": "2025-12-25",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "24.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "24.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-26",
+      "startAt": "2025-12-26T05:00:00.000Z",
+      "endAt": "2025-12-26T04:59:59.999Z",
+      "label": "2025-12-26",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "25.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "25.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-27",
+      "startAt": "2025-12-27T05:00:00.000Z",
+      "endAt": "2025-12-27T04:59:59.999Z",
+      "label": "2025-12-27",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "26.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "26.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-28",
+      "startAt": "2025-12-28T05:00:00.000Z",
+      "endAt": "2025-12-28T04:59:59.999Z",
+      "label": "2025-12-28",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "27.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "27.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-29",
+      "startAt": "2025-12-29T05:00:00.000Z",
+      "endAt": "2025-12-29T04:59:59.999Z",
+      "label": "2025-12-29",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "28.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "28.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-30",
+      "startAt": "2025-12-30T05:00:00.000Z",
+      "endAt": "2025-12-30T04:59:59.999Z",
+      "label": "2025-12-30",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "29.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "29.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2025-12-31",
+      "startAt": "2025-12-31T05:00:00.000Z",
+      "endAt": "2025-12-31T04:59:59.999Z",
+      "label": "2025-12-31",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "30.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "30.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-01",
+      "startAt": "2026-01-01T05:00:00.000Z",
+      "endAt": "2026-01-01T04:59:59.999Z",
+      "label": "2026-01-01",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "31.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "31.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-02",
+      "startAt": "2026-01-02T05:00:00.000Z",
+      "endAt": "2026-01-02T04:59:59.999Z",
+      "label": "2026-01-02",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "32.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "32.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-03",
+      "startAt": "2026-01-03T05:00:00.000Z",
+      "endAt": "2026-01-03T04:59:59.999Z",
+      "label": "2026-01-03",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "33.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "33.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-04",
+      "startAt": "2026-01-04T05:00:00.000Z",
+      "endAt": "2026-01-04T04:59:59.999Z",
+      "label": "2026-01-04",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "34.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "34.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-05",
+      "startAt": "2026-01-05T05:00:00.000Z",
+      "endAt": "2026-01-05T04:59:59.999Z",
+      "label": "2026-01-05",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "35.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "35.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-06",
+      "startAt": "2026-01-06T05:00:00.000Z",
+      "endAt": "2026-01-06T04:59:59.999Z",
+      "label": "2026-01-06",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "36.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "36.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-07",
+      "startAt": "2026-01-07T05:00:00.000Z",
+      "endAt": "2026-01-07T04:59:59.999Z",
+      "label": "2026-01-07",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "37.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "37.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-08",
+      "startAt": "2026-01-08T05:00:00.000Z",
+      "endAt": "2026-01-08T04:59:59.999Z",
+      "label": "2026-01-08",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "38.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "38.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-09",
+      "startAt": "2026-01-09T05:00:00.000Z",
+      "endAt": "2026-01-09T04:59:59.999Z",
+      "label": "2026-01-09",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "39.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "39.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-10",
+      "startAt": "2026-01-10T05:00:00.000Z",
+      "endAt": "2026-01-10T04:59:59.999Z",
+      "label": "2026-01-10",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "40.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "40.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-11",
+      "startAt": "2026-01-11T05:00:00.000Z",
+      "endAt": "2026-01-11T04:59:59.999Z",
+      "label": "2026-01-11",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "41.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "41.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-12",
+      "startAt": "2026-01-12T05:00:00.000Z",
+      "endAt": "2026-01-12T04:59:59.999Z",
+      "label": "2026-01-12",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "42.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "42.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-13",
+      "startAt": "2026-01-13T05:00:00.000Z",
+      "endAt": "2026-01-13T04:59:59.999Z",
+      "label": "2026-01-13",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "43.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "43.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-14",
+      "startAt": "2026-01-14T05:00:00.000Z",
+      "endAt": "2026-01-14T04:59:59.999Z",
+      "label": "2026-01-14",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "44.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "44.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-15",
+      "startAt": "2026-01-15T05:00:00.000Z",
+      "endAt": "2026-01-15T04:59:59.999Z",
+      "label": "2026-01-15",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "45.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "45.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-16",
+      "startAt": "2026-01-16T05:00:00.000Z",
+      "endAt": "2026-01-16T04:59:59.999Z",
+      "label": "2026-01-16",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "46.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "46.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-17",
+      "startAt": "2026-01-17T05:00:00.000Z",
+      "endAt": "2026-01-17T04:59:59.999Z",
+      "label": "2026-01-17",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "47.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "47.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-18",
+      "startAt": "2026-01-18T05:00:00.000Z",
+      "endAt": "2026-01-18T04:59:59.999Z",
+      "label": "2026-01-18",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "48.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "48.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-19",
+      "startAt": "2026-01-19T05:00:00.000Z",
+      "endAt": "2026-01-19T04:59:59.999Z",
+      "label": "2026-01-19",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "49.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "49.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-20",
+      "startAt": "2026-01-20T05:00:00.000Z",
+      "endAt": "2026-01-20T04:59:59.999Z",
+      "label": "2026-01-20",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "50.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "50.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-21",
+      "startAt": "2026-01-21T05:00:00.000Z",
+      "endAt": "2026-01-21T04:59:59.999Z",
+      "label": "2026-01-21",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "51.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "51.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-22",
+      "startAt": "2026-01-22T05:00:00.000Z",
+      "endAt": "2026-01-22T04:59:59.999Z",
+      "label": "2026-01-22",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "52.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "52.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-23",
+      "startAt": "2026-01-23T05:00:00.000Z",
+      "endAt": "2026-01-23T04:59:59.999Z",
+      "label": "2026-01-23",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "53.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "53.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-24",
+      "startAt": "2026-01-24T05:00:00.000Z",
+      "endAt": "2026-01-24T04:59:59.999Z",
+      "label": "2026-01-24",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "54.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "54.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-25",
+      "startAt": "2026-01-25T05:00:00.000Z",
+      "endAt": "2026-01-25T04:59:59.999Z",
+      "label": "2026-01-25",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "55.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "55.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-26",
+      "startAt": "2026-01-26T05:00:00.000Z",
+      "endAt": "2026-01-26T04:59:59.999Z",
+      "label": "2026-01-26",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "56.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "56.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-27",
+      "startAt": "2026-01-27T05:00:00.000Z",
+      "endAt": "2026-01-27T04:59:59.999Z",
+      "label": "2026-01-27",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "57.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "57.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-28",
+      "startAt": "2026-01-28T05:00:00.000Z",
+      "endAt": "2026-01-28T04:59:59.999Z",
+      "label": "2026-01-28",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "58.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "58.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-29",
+      "startAt": "2026-01-29T05:00:00.000Z",
+      "endAt": "2026-01-29T04:59:59.999Z",
+      "label": "2026-01-29",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "59.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "59.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-30",
+      "startAt": "2026-01-30T05:00:00.000Z",
+      "endAt": "2026-01-30T04:59:59.999Z",
+      "label": "2026-01-30",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "60.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "60.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-01-31",
+      "startAt": "2026-01-31T05:00:00.000Z",
+      "endAt": "2026-01-31T04:59:59.999Z",
+      "label": "2026-01-31",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "61.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "61.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-02-01",
+      "startAt": "2026-02-01T05:00:00.000Z",
+      "endAt": "2026-02-01T04:59:59.999Z",
+      "label": "2026-02-01",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "62.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "62.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-02-02",
+      "startAt": "2026-02-02T05:00:00.000Z",
+      "endAt": "2026-02-02T04:59:59.999Z",
+      "label": "2026-02-02",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "63.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "63.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-02-03",
+      "startAt": "2026-02-03T05:00:00.000Z",
+      "endAt": "2026-02-03T04:59:59.999Z",
+      "label": "2026-02-03",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "64.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "64.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-02-04",
+      "startAt": "2026-02-04T05:00:00.000Z",
+      "endAt": "2026-02-04T04:59:59.999Z",
+      "label": "2026-02-04",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "65.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "65.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-02-05",
+      "startAt": "2026-02-05T05:00:00.000Z",
+      "endAt": "2026-02-05T04:59:59.999Z",
+      "label": "2026-02-05",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "66.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "66.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-02-06",
+      "startAt": "2026-02-06T05:00:00.000Z",
+      "endAt": "2026-02-06T04:59:59.999Z",
+      "label": "2026-02-06",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "67.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "67.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-02-07",
+      "startAt": "2026-02-07T05:00:00.000Z",
+      "endAt": "2026-02-07T04:59:59.999Z",
+      "label": "2026-02-07",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "68.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "68.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-02-08",
+      "startAt": "2026-02-08T05:00:00.000Z",
+      "endAt": "2026-02-08T04:59:59.999Z",
+      "label": "2026-02-08",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "69.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "69.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-02-09",
+      "startAt": "2026-02-09T05:00:00.000Z",
+      "endAt": "2026-02-09T04:59:59.999Z",
+      "label": "2026-02-09",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "70.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "70.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-02-10",
+      "startAt": "2026-02-10T05:00:00.000Z",
+      "endAt": "2026-02-10T04:59:59.999Z",
+      "label": "2026-02-10",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "71.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "71.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-02-11",
+      "startAt": "2026-02-11T05:00:00.000Z",
+      "endAt": "2026-02-11T04:59:59.999Z",
+      "label": "2026-02-11",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "72.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "72.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-02-12",
+      "startAt": "2026-02-12T05:00:00.000Z",
+      "endAt": "2026-02-12T04:59:59.999Z",
+      "label": "2026-02-12",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "73.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "73.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-02-13",
+      "startAt": "2026-02-13T05:00:00.000Z",
+      "endAt": "2026-02-13T04:59:59.999Z",
+      "label": "2026-02-13",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "74.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "74.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-02-14",
+      "startAt": "2026-02-14T05:00:00.000Z",
+      "endAt": "2026-02-14T04:59:59.999Z",
+      "label": "2026-02-14",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "75.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "75.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-02-15",
+      "startAt": "2026-02-15T05:00:00.000Z",
+      "endAt": "2026-02-15T04:59:59.999Z",
+      "label": "2026-02-15",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "76.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "76.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-02-16",
+      "startAt": "2026-02-16T05:00:00.000Z",
+      "endAt": "2026-02-16T04:59:59.999Z",
+      "label": "2026-02-16",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "77.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "77.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-02-17",
+      "startAt": "2026-02-17T05:00:00.000Z",
+      "endAt": "2026-02-17T04:59:59.999Z",
+      "label": "2026-02-17",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "78.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "78.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-02-18",
+      "startAt": "2026-02-18T05:00:00.000Z",
+      "endAt": "2026-02-18T04:59:59.999Z",
+      "label": "2026-02-18",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "79.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "79.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-02-19",
+      "startAt": "2026-02-19T05:00:00.000Z",
+      "endAt": "2026-02-19T04:59:59.999Z",
+      "label": "2026-02-19",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "80.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "80.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-02-20",
+      "startAt": "2026-02-20T05:00:00.000Z",
+      "endAt": "2026-02-20T04:59:59.999Z",
+      "label": "2026-02-20",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "81.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "81.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-02-21",
+      "startAt": "2026-02-21T05:00:00.000Z",
+      "endAt": "2026-02-21T04:59:59.999Z",
+      "label": "2026-02-21",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "82.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "82.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-02-22",
+      "startAt": "2026-02-22T05:00:00.000Z",
+      "endAt": "2026-02-22T04:59:59.999Z",
+      "label": "2026-02-22",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "83.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "83.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-02-23",
+      "startAt": "2026-02-23T05:00:00.000Z",
+      "endAt": "2026-02-23T04:59:59.999Z",
+      "label": "2026-02-23",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "84.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "84.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-02-24",
+      "startAt": "2026-02-24T05:00:00.000Z",
+      "endAt": "2026-02-24T04:59:59.999Z",
+      "label": "2026-02-24",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "85.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "85.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-02-25",
+      "startAt": "2026-02-25T05:00:00.000Z",
+      "endAt": "2026-02-25T04:59:59.999Z",
+      "label": "2026-02-25",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "86.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "86.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-02-26",
+      "startAt": "2026-02-26T05:00:00.000Z",
+      "endAt": "2026-02-26T04:59:59.999Z",
+      "label": "2026-02-26",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "87.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "87.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-02-27",
+      "startAt": "2026-02-27T05:00:00.000Z",
+      "endAt": "2026-02-27T04:59:59.999Z",
+      "label": "2026-02-27",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "88.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "88.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-02-28",
+      "startAt": "2026-02-28T05:00:00.000Z",
+      "endAt": "2026-02-28T04:59:59.999Z",
+      "label": "2026-02-28",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "89.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "89.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-03-01",
+      "startAt": "2026-03-01T05:00:00.000Z",
+      "endAt": "2026-03-01T04:59:59.999Z",
+      "label": "2026-03-01",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "90.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "90.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-03-02",
+      "startAt": "2026-03-02T05:00:00.000Z",
+      "endAt": "2026-03-02T04:59:59.999Z",
+      "label": "2026-03-02",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "91.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "91.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-03-03",
+      "startAt": "2026-03-03T05:00:00.000Z",
+      "endAt": "2026-03-03T04:59:59.999Z",
+      "label": "2026-03-03",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "92.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "92.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-03-04",
+      "startAt": "2026-03-04T05:00:00.000Z",
+      "endAt": "2026-03-04T04:59:59.999Z",
+      "label": "2026-03-04",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "93.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "93.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-03-05",
+      "startAt": "2026-03-05T05:00:00.000Z",
+      "endAt": "2026-03-05T04:59:59.999Z",
+      "label": "2026-03-05",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tTSLA",
+          "counterTradePnlUsd": "94.5",
+          "onchainNettingPnlUsd": "0.25",
+          "directionalInventoryBaselinePnlUsd": "-0.5",
+          "directionalImbalanceExcessPnlUsd": "0.125",
+          "directionalExposurePnlUsd": "-0.375",
+          "totalPnlUsd": "94.5"
+        }
+      ]
+    }
+  ]
+}

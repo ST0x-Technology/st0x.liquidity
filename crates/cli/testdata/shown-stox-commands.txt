@@ -1,0 +1,3 @@
+# Every offline stox command the SPA shows; crates/cli parses each with st0x-cli.
+# Written by dashboard/src/lib/transfer-board.test.ts; do not edit by hand.
+stox transfer reconcile --kind usdc --id 00000000-0000-4000-8000-000000000001 --reason <funds-moved-manually|deposit-credited-offline>

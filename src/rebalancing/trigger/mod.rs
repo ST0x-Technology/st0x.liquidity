@@ -33,11 +33,11 @@ use uuid::Uuid;
 use rain_math_float::Float;
 use st0x_bridge::corridor::{UsdcCorridor, legacy_base_cctp};
 use st0x_config::{
-    AllocationCtx, ChainAssets, ChainEquityAsset, ExecutionThreshold, OperationMode,
-    RebalancingMode, TargetShare, UsdcCorridorCtx, UsdcCorridors,
+    AllocationCtx, ChainAssets, ChainEquityAsset, ExecutionThreshold, RebalancingMode, TargetShare,
+    UsdcCorridorCtx, UsdcCorridors,
 };
 #[cfg(test)]
-use st0x_config::{ChainCashAsset, ChainEquities};
+use st0x_config::{ChainCashAsset, ChainEquities, OperationMode};
 use st0x_event_sorcery::{
     AggregateError, EntityList, LifecycleError, Projection, ProjectionError, Reactor, SendError,
     Store, deps,
@@ -54,11 +54,12 @@ use st0x_wrapper::{Wrapper, WrapperError};
 
 use self::allocation::{
     ChainSlot, DeclineReason, EquityPlan, EquityPlanInput, Participation, PlannedDirection,
-    PlannedOperation, plan_equity_operation,
+    PlannedOperation, chain_bands, plan_equity_operation,
 };
 use self::freeze::FreezeStatusReader;
 use self::usdc::UsdcRebalanceOperation;
 use self::usdc_guard::{CashGuardClaim, ClaimRefusal};
+use crate::alerts::AlertKind;
 #[cfg(test)]
 use crate::alerts::LogNotifier;
 #[cfg(test)]
@@ -78,6 +79,7 @@ use crate::inventory::{
     PendingRequestOwnershipSnapshot, PollFreshness, PortfolioAsset, PortfolioLocation, TransferOp,
     Venue,
 };
+use crate::metrics::liquidity::bands::EquityBandPublisher;
 use crate::native_gas::{ConfiguredGasReadiness, GasReadinessFailure, TransferGasRoute};
 use crate::offchain::order::OffchainOrderId;
 use crate::position::{
@@ -982,6 +984,9 @@ pub(crate) struct RebalancingService {
     /// `set_last_price_reader`; without one no minimum can be valued and
     /// every plan declines.
     last_prices: RwLock<Option<Arc<dyn LastPriceReader>>>,
+    /// Publishes the planner's per-chain band verdicts as `liq_*` series,
+    /// once wired with [`Self::publish_equity_bands`].
+    equity_bands: std::sync::OnceLock<EquityBandPublisher>,
     pub(crate) equity_in_progress: Arc<std::sync::RwLock<HashMap<Symbol, equity::GuardState>>>,
     pub(crate) pending_mint_resumes: Arc<PendingMintResumes>,
     recovery_hold_alerts: RwLock<HashMap<(Symbol, Chain), RecoveryHoldAlert>>,
@@ -1091,7 +1096,7 @@ pub(crate) struct RebalancingService {
     corridor_not_served_alerted: Arc<RwLock<HashSet<UsdcRebalanceId>>>,
     /// Every-corridor latch pages (startup's and one per runtime transfer)
     /// until each is delivered.
-    pending_latch_pages: RwLock<VecDeque<String>>,
+    pending_latch_pages: RwLock<VecDeque<(AlertKind, String)>>,
     /// Transfers whose runtime every-corridor latch page was queued.
     latch_paged: RwLock<HashSet<UsdcRebalanceId>>,
     /// Transfers whose load-error page was queued.
@@ -1227,10 +1232,10 @@ enum RedemptionTimeoutCleanup {
         /// The send's newest signed candidate; `None` for a legacy send.
         newest_send: Option<PreparedTransaction>,
     },
-    /// The durable aggregate is `Reconciled`: an operator's `transfer reconcile`
-    /// (a separate-process CLI, or the in-process API via bare `send_command`)
-    /// wrote `OperatorReconciled` to the store, but the live reactor never
-    /// observed it. The sweep applies the reactor's terminal reconcile cleanup
+    /// The durable aggregate is `Reconciled`: an operator's reconcile wrote
+    /// `OperatorReconciled` through a standalone store with no reactor (the
+    /// API reconcile route or the separate-process CLI), so the live reactor
+    /// never observed it. The sweep applies the reactor's terminal reconcile cleanup
     /// so the guard, inflight, and reservation clear without a restart.
     Reconciled {
         tracking: RedemptionTracking,
@@ -1373,6 +1378,7 @@ impl RebalancingService {
             usdc_conversion_failed_at: RwLock::new(None),
             underfunded_alerts: crate::rebalancing::usdc::UnderfundedAlertLatch::default(),
             last_prices: RwLock::new(None),
+            equity_bands: std::sync::OnceLock::new(),
             equity_in_progress: Arc::new(std::sync::RwLock::new(HashMap::new())),
             pending_mint_resumes: Arc::default(),
             recovery_hold_alerts: RwLock::new(HashMap::new()),
@@ -1484,6 +1490,27 @@ impl RebalancingService {
     /// projection exists.
     pub(crate) async fn set_last_price_reader(&self, reader: Arc<dyn LastPriceReader>) {
         *self.last_prices.write().await = Some(reader);
+    }
+
+    /// Publishes each planned symbol's per-chain band verdict from now on.
+    pub(crate) fn publish_equity_bands(&self, publisher: EquityBandPublisher) {
+        if self.equity_bands.set(publisher).is_err() {
+            warn!(target: "rebalance", "Equity band publisher already wired; kept the first");
+        }
+    }
+
+    /// Records `symbol`'s band verdicts from the planner's input, or forgets
+    /// them when they cannot be computed.
+    fn record_equity_bands(&self, symbol: &Symbol, input: Option<&EquityPlanInput>) {
+        let Some(publisher) = self.equity_bands.get() else {
+            return;
+        };
+
+        let bands = input.map(chain_bands).transpose().unwrap_or_else(|error| {
+            warn!(target: "rebalance", %symbol, ?error, "Could not compute the equity band verdicts");
+            None
+        });
+        publisher.record(symbol, bands.flatten());
     }
 
     async fn equity_chain_gas_is_ready(&self, chain: Chain) -> bool {
@@ -1906,7 +1933,11 @@ impl RebalancingService {
                 first_seen,
                 self.pending_mint_resumes.get(&symbol, chain),
             );
-            let delivery = match self.notifier.notify(&message).await {
+            let delivery = match self
+                .notifier
+                .notify(AlertKind::RecoveryHoldsSymbol, &message)
+                .await
+            {
                 Ok(()) => RecoveryHoldAlertDelivery::Delivered { at: now },
                 Err(error) => {
                     warn!(target: "rebalance", %symbol, %chain, ?error,
@@ -1975,7 +2006,7 @@ impl RebalancingService {
                     .await
                     .contains(&id)
                 {
-                    match self.notifier.notify(&format!(
+                    match self.notifier.notify(AlertKind::TransferTimeoutUncertainOutcome, &format!(
                         "Mint request {id} for {} exceeded the transfer timeout with an uncertain \
                          provider outcome. Guard and inventory preserved. Operator reconciliation required.",
                         pending_tracking.symbol,
@@ -2433,7 +2464,7 @@ impl RebalancingService {
                     let already_alerted = self.post_burn_timeout_alerted.read().await.contains(&id);
 
                     if !already_alerted {
-                        match self.notifier.notify(&format!(
+                        match self.notifier.notify(AlertKind::TimedOutAfterCctpBurn, &format!(
                             "USDC transfer {id} timed out after CCTP burn on the {} corridor and is \
                              stalled. Guard preserved. Stage: {}. Elapsed: {elapsed:?}. Manual \
                              operator action required.",
@@ -2543,12 +2574,15 @@ impl RebalancingService {
         if !self.unconfirmed_burn_hold_alerted.read().await.contains(id) {
             match self
                 .notifier
-                .notify(&format!(
-                    "USDC transfer {id} on the {} corridor stopped in {state} with no \
+                .notify(
+                    AlertKind::UsdcHeldWithoutConfirmedBurn,
+                    &format!(
+                        "USDC transfer {id} on the {} corridor stopped in {state} with no \
                      confirmed CCTP burn; its funds are off Alpaca. Guard held. Elapsed: \
                      {elapsed:?}. {recovery}",
-                    tracking.corridor,
-                ))
+                        tracking.corridor,
+                    ),
+                )
                 .await
             {
                 Ok(()) => {
@@ -2602,7 +2636,11 @@ impl RebalancingService {
              (docs/cli-ops.md).{outbound}"
         );
 
-        if let Err(error) = self.notifier.notify(&message).await {
+        if let Err(error) = self
+            .notifier
+            .notify(AlertKind::UsdcCorridorMismatch, &message)
+            .await
+        {
             self.corridor_not_served_alerted.write().await.remove(id);
             warn!(
                 target: "rebalance",
@@ -2855,9 +2893,10 @@ impl RebalancingService {
         // Withdrawal-submission and send-to-issuer stages are never force-failed
         // on timeout, because their transaction may have landed, but they are
         // checked for a durable `Reconciled` on every tick. An operator's
-        // reconcile writes `OperatorReconciled` through bare `send_command`,
-        // which dispatches no reactor, so the live bot would otherwise never
-        // clear the guard, inflight, and reservation until a restart.
+        // reconcile writes `OperatorReconciled` through a standalone store
+        // with no reactor (the API reconcile route or the separate-process
+        // CLI), so the live bot would otherwise never clear the guard,
+        // inflight, and reservation until a restart.
         let submission_stage = matches!(
             tracking.stage,
             RedemptionTrackingStage::VaultWithdrawPending
@@ -3062,9 +3101,9 @@ impl RebalancingService {
 
         let chain = tracking.chain;
         let elapsed_secs = elapsed.as_secs();
-        let message = newest_send.map_or_else(
+        let (kind, message) = newest_send.map_or_else(
             || {
-                format!(
+                let message = format!(
                     "Equity redemption {id} on {chain} has a legacy pending send to the issuer \
                      with no recorded transaction after {elapsed_secs}s. The transfer keeps its \
                      guard and inflight, and recovery will not sign again. Find the previous \
@@ -3072,7 +3111,8 @@ impl RebalancingService {
                      docs/cli-ops.md: it says what to do whether or not the transfer landed, \
                      before you close it with `stox transfer reconcile --kind redemption --id \
                      {id}`."
-                )
+                );
+                (AlertKind::RedemptionLegacyPendingSend, message)
             },
             |send| {
                 let tx_hash = send.tx_hash();
@@ -3085,7 +3125,7 @@ impl RebalancingService {
                         )
                     },
                 );
-                format!(
+                let message = format!(
                     "Equity redemption {id} on {chain} has a signed redemption transfer to the \
                      issuer whose newest copy {tx_hash} (nonce {nonce}, {fees}) has not \
                      confirmed after {elapsed_secs}s. \
@@ -3102,11 +3142,12 @@ impl RebalancingService {
                      redemption naming that self-transfer (`stox transfer reconcile --kind \
                      redemption --id {id} --superseding-tx <cancel>`), which releases its \
                      reservation and the wallet's hold on its nonce."
-                )
+                );
+                (AlertKind::RedemptionSendTimedOut, message)
             },
         );
 
-        if let Err(error) = self.notifier().notify(&message).await {
+        if let Err(error) = self.notifier().notify(kind, &message).await {
             warn!(
                 target: "rebalance",
                 %id,
@@ -4949,14 +4990,53 @@ impl RebalancingService {
         self.inventory.read().await.is_restart_cash_tainted()
     }
 
-    /// Builds the planner's view of `symbol` -- one slot per hedged chain
-    /// that rebalances it, the broker balance, the floors, the cooldowns
-    /// and the last price -- and plans.
+    /// Builds the planner's input for `symbol` and plans.
     async fn plan_equity(
         &self,
         symbol: &Symbol,
         probes: &mut BTreeMap<Chain, ChainReadiness>,
     ) -> Result<EquityPlan, equity::EquityTriggerError> {
+        let input = match self.equity_plan_input(symbol).await {
+            Ok(Some(input)) => input,
+            Ok(None) => return Ok(EquityPlan::Decline(DeclineReason::PriceMissing)),
+            Err(error) => {
+                // The planner could not size the symbol, so its last bands
+                // no longer hold.
+                self.record_equity_bands(symbol, None);
+                return Err(error);
+            }
+        };
+        self.record_equity_bands(symbol, Some(&input));
+
+        self.plan_dispatchable_operation(input, probes).await
+    }
+
+    /// Publishes `symbol`'s band verdicts from its current balances when no
+    /// plan runs because its transfer is in progress. Shares in flight count
+    /// at the venue they leave until the transfer completes, so the verdict
+    /// that started the transfer stays; this only picks up fills and
+    /// provider polls of the amount in flight.
+    async fn refresh_equity_bands(&self, symbol: &Symbol) {
+        if self.equity_bands.get().is_none() {
+            return;
+        }
+
+        match self.equity_plan_input(symbol).await {
+            Ok(input) => self.record_equity_bands(symbol, input.as_ref()),
+            Err(error) => {
+                debug!(target: "rebalance", %symbol, ?error, "Could not read the equity band input");
+                self.record_equity_bands(symbol, None);
+            }
+        }
+    }
+
+    /// The planner's view of `symbol`: one slot per hedged chain that
+    /// rebalances it, the broker balance, the floors, the cooldowns and the
+    /// last price. `None` while no last-price reader is wired.
+    async fn equity_plan_input(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<Option<EquityPlanInput>, equity::EquityTriggerError> {
         let venues = self.inventory.read().await.equity_venues(symbol)?;
 
         let mut listing_chains = BTreeSet::new();
@@ -5032,26 +5112,22 @@ impl RebalancingService {
                 "No last-price reader is wired, so the minimum operation size cannot \
                  be valued"
             );
-            return Ok(EquityPlan::Decline(DeclineReason::PriceMissing));
+            return Ok(None);
         };
         let last_price = reader.last_price(symbol).await?;
         let cooldowns = self.equity_cooldowns(symbol, Utc::now()).await;
 
-        self.plan_dispatchable_operation(
-            EquityPlanInput {
-                symbol: symbol.clone(),
-                offchain: venues.offchain,
-                listing_chains,
-                onchain,
-                has_inflight: venues.has_inflight,
-                alpaca_floor: self.config.allocation.alpaca_floor,
-                hedge_floor: self.config.hedge_floor.for_symbol(symbol),
-                cooldowns,
-                last_price,
-            },
-            probes,
-        )
-        .await
+        Ok(Some(EquityPlanInput {
+            symbol: symbol.clone(),
+            offchain: venues.offchain,
+            listing_chains,
+            onchain,
+            has_inflight: venues.has_inflight,
+            alpaca_floor: self.config.allocation.alpaca_floor,
+            hedge_floor: self.config.hedge_floor.for_symbol(symbol),
+            cooldowns,
+            last_price,
+        }))
     }
 
     /// Plans with every chain assumed registered and gas-ready, then checks
@@ -5066,7 +5142,13 @@ impl RebalancingService {
         probes: &mut BTreeMap<Chain, ChainReadiness>,
     ) -> Result<EquityPlan, equity::EquityTriggerError> {
         loop {
-            let plan = plan_equity_operation(&input)?;
+            let plan = match plan_equity_operation(&input) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    self.record_equity_bands(&input.symbol, None);
+                    return Err(error.into());
+                }
+            };
             let EquityPlan::Operation(operation) = &plan else {
                 return Ok(plan);
             };
@@ -5255,6 +5337,9 @@ impl RebalancingService {
                 );
                 return Ok(None);
             }
+            // The bands just recorded stay: an input or planner error
+            // already cleared them, and a failed readiness probe of the
+            // chosen chain says nothing about where the chains sit.
             Err(error) => return Err(error),
         };
         match plan {
@@ -5738,6 +5823,7 @@ impl RebalancingService {
                 "Skipped equity trigger: unresolved snapshot divergence \
                  pending reconciliation"
             );
+            self.record_equity_bands(symbol, None);
             return Ok(());
         }
 
@@ -5752,6 +5838,7 @@ impl RebalancingService {
                 "Skipped equity trigger: balance is restart-tainted pending \
                  broker re-base"
             );
+            self.record_equity_bands(symbol, None);
             return Ok(());
         }
 
@@ -5786,11 +5873,16 @@ impl RebalancingService {
                     }
                 };
                 self.record_equity_decline(symbol, &reason, Some(staleness));
+                self.record_equity_bands(symbol, None);
                 return Ok(());
             }
         }
 
+        // A claimed guard plans below, and planning records the bands from
+        // the same input, so only a symbol whose transfer is in progress
+        // reads its balances just for the bands.
         let Some(guard) = self.try_claim_equity_guard_for_transfer(symbol) else {
+            self.refresh_equity_bands(symbol).await;
             debug!(target: "rebalance", %symbol, "Skipped equity trigger: already in progress");
             return Ok(());
         };
@@ -5850,6 +5942,7 @@ impl RebalancingService {
                     "Skipped equity trigger before dispatch: snapshot divergence \
                      detected during operation sizing"
                 );
+                self.record_equity_bands(symbol, None);
                 return Ok(false);
             }
 
@@ -5963,11 +6056,7 @@ impl RebalancingService {
             .chains
             .get(&usdc.corridor.chain())?
             .assets
-            .cash
-            .as_ref()?;
-        if cash.rebalancing != OperationMode::Enabled {
-            return None;
-        }
+            .rebalancing_cash()?;
 
         let usdc_limit = cash.operational_limit.map(Positive::inner);
         let reserved = self.config.cash_reserved.map(Positive::inner);
@@ -8551,9 +8640,16 @@ impl RebalancingService {
         // queued and retried by the sweep until delivered; a later runtime
         // latch queues its own transfer's page behind it.
         if unclassified {
-            self.pending_latch_pages.write().await.push_back(message);
+            self.pending_latch_pages
+                .write()
+                .await
+                .push_back((AlertKind::UsdcLatchedOnEveryCorridor, message));
             self.deliver_pending_latch_pages().await;
-        } else if let Err(error) = self.notifier.notify(&message).await {
+        } else if let Err(error) = self
+            .notifier
+            .notify(AlertKind::UsdcLatchedOnStartup, &message)
+            .await
+        {
             warn!(target: "rebalance", ?error, "Failed to deliver USDC startup-stranded alert");
         }
     }
@@ -14454,6 +14550,7 @@ mod tests {
             freshness,
         )
         .await;
+        let families = seed_equity_band(&trigger, &symbol);
 
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
 
@@ -14461,6 +14558,11 @@ mod tests {
             count_pending_equity_mint_jobs(&trigger).await,
             0,
             "a stale onchain poll must not size an equity operation"
+        );
+        assert_eq!(
+            published_aapl_base_verdict(families),
+            None,
+            "a stale chain must clear the symbol's bands"
         );
     }
 
@@ -14787,6 +14889,152 @@ mod tests {
         );
     }
 
+    /// Wires a band publisher into `trigger` that holds a below-band Base
+    /// verdict for `symbol`, as an earlier plan leaves it, and returns the
+    /// families it publishes into.
+    fn seed_equity_band(
+        trigger: &RebalancingService,
+        symbol: &Symbol,
+    ) -> &'static crate::metrics::liquidity::LiqFamilies {
+        let families = crate::metrics::liquidity::inventory::tests::leaked_families();
+        let publisher = EquityBandPublisher::new(families);
+        publisher.record(
+            symbol,
+            Some(vec![allocation::ChainBand {
+                chain: Chain::Base,
+                share: float!(0.1),
+                verdict: allocation::BandVerdict::Below,
+            }]),
+        );
+        trigger.publish_equity_bands(publisher);
+        families
+    }
+
+    /// The published Base band verdict of AAPL, or `None` when its bands are
+    /// cleared.
+    fn published_aapl_base_verdict(
+        families: &crate::metrics::liquidity::LiqFamilies,
+    ) -> Option<f64> {
+        crate::metrics::liquidity::inventory::tests::rendered_store(families)
+            .get(&crate::metrics::liquidity::tests::series(
+                "liq_equity_chain_verdict",
+                &[("chain", "base"), ("symbol", "AAPL")],
+            ))
+            .copied()
+    }
+
+    /// Each planned symbol publishes its chains' band verdicts, the same the
+    /// planner acts on: 50 of 100 sits within the default band.
+    #[tokio::test]
+    async fn planning_a_symbol_publishes_its_band_verdicts() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let families = crate::metrics::liquidity::inventory::tests::leaked_families();
+        trigger.publish_equity_bands(EquityBandPublisher::new(families));
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        let store = crate::metrics::liquidity::inventory::tests::rendered_store(families);
+        let labels = [("chain", "base"), ("symbol", "AAPL")];
+        assert_eq!(
+            store
+                .get(&crate::metrics::liquidity::tests::series(
+                    "liq_equity_chain_verdict",
+                    &labels
+                ))
+                .copied(),
+            Some(0.0)
+        );
+        assert_eq!(
+            store
+                .get(&crate::metrics::liquidity::tests::series(
+                    "liq_equity_chain_share",
+                    &labels
+                ))
+                .copied(),
+            Some(0.5)
+        );
+    }
+
+    /// While a symbol's own transfer holds its guard, every check stops at
+    /// "already in progress"; the bands are still read again from the
+    /// symbol's current balances, here replacing a seeded verdict.
+    #[tokio::test]
+    async fn a_symbol_in_progress_still_refreshes_its_bands() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let families = seed_equity_band(&trigger, &symbol);
+        let _held = trigger
+            .try_claim_equity_guard_for_transfer(&symbol)
+            .unwrap();
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert_eq!(published_aapl_base_verdict(families), Some(0.0));
+    }
+
+    /// A plan that cannot be built (here a wrapper ratio of 0) clears the
+    /// symbol's last published bands: they no longer describe the symbol.
+    #[tokio::test]
+    async fn a_plan_that_fails_clears_the_symbols_bands() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let trigger = make_trigger_with_inventory_registry_and_wrappers(
+            inventory,
+            &symbol,
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::with_ratio(U256::ZERO)) as Arc<dyn Wrapper>,
+            )]),
+            test_config(),
+        )
+        .await;
+        let families = seed_equity_band(&trigger, &symbol);
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap_err();
+
+        assert!(
+            crate::metrics::liquidity::inventory::tests::rendered_store(families)
+                .keys()
+                .all(|(name, _)| !name.starts_with("liq_equity_chain_")),
+            "the failed plan must clear the symbol's bands"
+        );
+    }
+
+    /// A failed readiness probe of the chain the planner chose (here an
+    /// uninitialized vault registry) keeps the bands planning recorded: an
+    /// out-of-band chain stays red instead of going grey.
+    #[tokio::test]
+    async fn a_failed_readiness_probe_keeps_the_symbols_bands() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(10), shares(90))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let families = crate::metrics::liquidity::inventory::tests::leaked_families();
+        trigger.publish_equity_bands(EquityBandPublisher::new(families));
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap_err();
+
+        assert_eq!(
+            crate::metrics::liquidity::inventory::tests::rendered_store(families)
+                .get(&crate::metrics::liquidity::tests::series(
+                    "liq_equity_chain_verdict",
+                    &[("chain", "base"), ("symbol", "AAPL")]
+                ))
+                .copied(),
+            Some(-1.0)
+        );
+    }
+
     #[tokio::test]
     async fn frozen_asset_skips_equity_trigger() {
         let symbol = Symbol::new("AAPL").unwrap();
@@ -14796,6 +15044,7 @@ mod tests {
         trigger
             .set_freeze_status_reader(Arc::new(StubFreezeReader::Frozen))
             .await;
+        let families = seed_equity_band(&trigger, &symbol);
 
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
 
@@ -14803,6 +15052,11 @@ mod tests {
             count_pending_equity_mint_jobs(&trigger).await,
             0,
             "A frozen asset must not dispatch an equity rebalancing job"
+        );
+        assert_eq!(
+            published_aapl_base_verdict(families),
+            Some(-1.0),
+            "a frozen asset must keep its last bands"
         );
     }
 
@@ -31480,7 +31734,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::alerts::Notifier for FlakyNotifier {
-        async fn notify(&self, message: &str) -> Result<(), crate::alerts::NotifierError> {
+        async fn notify(
+            &self,
+            kind: crate::alerts::AlertKind,
+            message: &str,
+        ) -> Result<(), crate::alerts::NotifierError> {
+            crate::alerts::assert_kind_matches_extractor(kind, message);
             let should_fail = self
                 .remaining_failures
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
@@ -38286,6 +38545,7 @@ mod tests {
         trigger
             .divergence_gate()
             .engage(InventoryScope::Hedging, &symbol);
+        let families = seed_equity_band(&trigger, &symbol);
 
         EquityRebalancingCheck {
             symbol: symbol.clone(),
@@ -38297,6 +38557,11 @@ mod tests {
             count_pending_equity_mint_jobs(&trigger).await,
             0,
             "a gated symbol must not dispatch an equity transfer"
+        );
+        assert_eq!(
+            published_aapl_base_verdict(families),
+            None,
+            "a gated symbol's balance is suspect, so its bands must clear"
         );
 
         trigger
@@ -38314,6 +38579,68 @@ mod tests {
             panic!("Expected exactly one mint job after release, got {dispatched:?}");
         };
         assert_eq!(job.symbol, symbol);
+    }
+
+    /// Prices every symbol at 100. On its second read, in the plan after the
+    /// reservation, it engages the symbol's divergence gate, as a poll can
+    /// between the two plans.
+    struct DivergingPrice {
+        gate: Arc<InventoryDivergenceGate>,
+        reads: std::sync::atomic::AtomicU32,
+    }
+
+    #[async_trait]
+    impl LastPriceReader for DivergingPrice {
+        async fn last_price(
+            &self,
+            symbol: &Symbol,
+        ) -> Result<Option<crate::position::PriceObservation>, ProjectionError<Position>> {
+            if self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                self.gate.engage(InventoryScope::Hedging, symbol);
+            }
+            Ok(Some(crate::position::PriceObservation {
+                price: float!(100),
+                observed_at: Utc::now(),
+            }))
+        }
+    }
+
+    /// A divergence that appears while the transfer is sized after the
+    /// reservation suppresses the dispatch and clears the bands the second
+    /// plan recorded: they come from the balance the gate now distrusts.
+    #[tokio::test]
+    async fn divergence_after_reservation_clears_the_symbols_bands() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(80))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let price = Arc::new(DivergingPrice {
+            gate: trigger.divergence_gate(),
+            reads: std::sync::atomic::AtomicU32::new(0),
+        });
+        trigger.set_last_price_reader(price.clone()).await;
+        let families = seed_equity_band(&trigger, &symbol);
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            price.reads.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the check must have planned again after the reservation"
+        );
+        assert!(trigger.divergence_gate().is_engaged(&symbol));
+        assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 0);
+        assert_eq!(
+            published_aapl_base_verdict(families),
+            None,
+            "the divergence after the reservation must clear the bands"
+        );
     }
 
     /// With rebalancing enabled, `OffchainEquityReconciled` reaches the view
@@ -40595,6 +40922,7 @@ mod tests {
 
         let reactor = make_trigger_with_inventory_and_registry(view, &symbol).await;
         let trigger = reactor.clone();
+        let families = seed_equity_band(&trigger, &symbol);
 
         EquityRebalancingCheck {
             symbol: symbol.clone(),
@@ -40606,6 +40934,11 @@ mod tests {
             count_pending_equity_mint_jobs(&trigger).await,
             0,
             "a restart-tainted symbol must not dispatch an equity transfer"
+        );
+        assert_eq!(
+            published_aapl_base_verdict(families),
+            None,
+            "a restart-tainted balance is suspect, so its bands must clear"
         );
 
         // The poller re-based the balance and resolved the taint.
@@ -43987,9 +44320,13 @@ mod tests {
 
     #[async_trait]
     impl crate::alerts::Notifier for YieldingNotifier {
-        async fn notify(&self, message: &str) -> Result<(), crate::alerts::NotifierError> {
+        async fn notify(
+            &self,
+            kind: crate::alerts::AlertKind,
+            message: &str,
+        ) -> Result<(), crate::alerts::NotifierError> {
             tokio::task::yield_now().await;
-            self.0.notify(message).await
+            self.0.notify(kind, message).await
         }
     }
 

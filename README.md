@@ -27,9 +27,9 @@ equities (wtDNUT, wtFGI) are ingested, validated against USDG and hedged, with
 Bebop's Robinhood hook mapped as the inventory adapter. The build values its gas
 (it pays gas in ETH), so `active` is reachable. Production runs it `active` and
 rebalances against Alpaca the listings the pinned token file enables there
-(DNUT); staging runs it as a prefunded hedge-only secondary with
-`rebalancing = "disabled"` on every asset. It cannot rebalance cash, because it
-has no CCTP domain.
+(DNUT, PLBY, GRND, and WMT); staging runs it as a prefunded hedge-only secondary
+with `rebalancing = "disabled"` on every asset. It cannot rebalance cash,
+because it has no CCTP domain.
 
 ## Features
 
@@ -52,17 +52,16 @@ has no CCTP domain.
   withdrawals from Raindex vaults, with a USDC-specific withdrawal shortcut
 - **Shared Operations Audit**: Every operator mutation request that reaches the
   service emits `st0x.operations.audit.v1` with stable principal, role, matched
-  route template, request UUID, bounded target/reason fields, outcome, and
-  timestamp. `target_id` is the path values followed by the identifiers the
-  typed request body and query declare, and `reason` is the typed body's reason;
-  an oversized value is refused with `400` before the handler runs.
-  Authentication precedes body capture, so in-service denials use
-  `not_identified`/`not_provided`; Cloud IAP edge rejections never reach the
-  application. The event is an ordinary stdout log line, which Docker's
-  `gcplogs` driver forwards to Cloud Logging as message text. VictoriaLogs
-  receives the compatible event only when `[telemetry]` configures the OTLP log
-  exporter. Responses echo the UUID in `x-request-id`, and the operator CLI
-  prints it when a write fails.
+  route template, request UUID, bounded target/reason fields, and outcome.
+  `target_id` is the path values followed by the identifiers the typed request
+  body and query declare, and `reason` is the typed body's reason; an oversized
+  value is refused with `400` before the handler runs. Authentication precedes
+  body capture, so in-service denials use `not_identified`/`not_provided`; Cloud
+  IAP edge rejections never reach the application. The event is an ordinary
+  stdout log line, which Docker's `gcplogs` driver forwards to Cloud Logging as
+  message text. VictoriaLogs receives the compatible event only when
+  `[telemetry]` configures the OTLP log exporter. Responses echo the UUID in
+  `x-request-id`, and the operator CLI prints it when a write fails.
 - **Public Incident Messaging**: The
   [`scripts/turnkey-message`](scripts/turnkey-message/README.md) utility
   prepares, signs, verifies, sends, and reads zero-value Base messages from an

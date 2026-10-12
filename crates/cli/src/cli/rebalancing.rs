@@ -2156,15 +2156,19 @@ pub(crate) async fn reconcile_equity_transfer_command<W: Write>(
                 );
             }
 
-            st0x_event_sorcery::send_command::<TokenizedEquityMint>(
-                pool,
-                &mint_id,
-                TokenizedEquityMintCommand::Reconcile {
-                    reason: reason.into(),
-                },
-                services,
-            )
-            .await?;
+            // A store, not `send_command`, so the view (which the bot's
+            // transfer line sweep reads) sees the reconcile.
+            let (store, _projection) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+                .build(services)
+                .await?;
+            store
+                .send(
+                    &mint_id,
+                    TokenizedEquityMintCommand::Reconcile {
+                        reason: reason.into(),
+                    },
+                )
+                .await?;
 
             writeln!(stdout, "Mint {id} reconciled")?;
         }
@@ -2219,16 +2223,18 @@ pub(crate) async fn reconcile_equity_transfer_command<W: Write>(
                 .reconcilable_signed_tx()
                 .map(PreparedTransaction::tx_hash);
 
-            st0x_event_sorcery::send_command::<EquityRedemption>(
-                pool,
-                &redemption_id,
-                EquityRedemptionCommand::Reconcile {
-                    reason: reason.into(),
-                    proven_withdrawal,
-                },
-                services,
-            )
-            .await?;
+            let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
+                .build(services)
+                .await?;
+            store
+                .send(
+                    &redemption_id,
+                    EquityRedemptionCommand::Reconcile {
+                        reason: reason.into(),
+                        proven_withdrawal,
+                    },
+                )
+                .await?;
 
             writeln!(
                 stdout,
@@ -6653,6 +6659,37 @@ mod tests {
             panic!("a reconciled mint must reach the Reconciled terminal, got: {entity:?}");
         };
         assert_eq!(reconcile_reason, "wrapped manually via wrap-equity");
+        assert_view_holds_the_last_event(&pool, TransferType::Mint, &id.to_string()).await;
+    }
+
+    /// The bot's transfer line sweep reads a transfer's view row and takes
+    /// its version as the sequence of the last event, so an offline
+    /// reconcile must move the view to the aggregate's last event.
+    async fn assert_view_holds_the_last_event(
+        pool: &SqlitePool,
+        transfer_type: TransferType,
+        id: &str,
+    ) {
+        let last: i64 =
+            sqlx::query_scalar("SELECT MAX(sequence) FROM events WHERE aggregate_id = ?")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let view_version = match transfer_type {
+            TransferType::Mint => {
+                "SELECT version FROM tokenized_equity_mint_view WHERE view_id = ?"
+            }
+            TransferType::Redemption => {
+                "SELECT version FROM equity_redemption_view WHERE view_id = ?"
+            }
+        };
+        let version: i64 = sqlx::query_scalar(view_version)
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(version, last);
     }
 
     #[tokio::test]
@@ -6930,6 +6967,7 @@ mod tests {
             matches!(entity, EquityRedemption::Reconciled { .. }),
             "a proven withdrawal reconciles, got: {entity:?}"
         );
+        assert_view_holds_the_last_event(&pool, TransferType::Redemption, &id.to_string()).await;
     }
 
     /// An adopted replacement moved the equity, so the CLI refuses to
@@ -7154,6 +7192,7 @@ mod tests {
             ),
             "a dead signed send must reconcile and name its nonce, got: {entity:?}"
         );
+        assert_view_holds_the_last_event(&pool, TransferType::Redemption, &id.to_string()).await;
     }
 
     /// A fee-replaced send to the issuer is checked on every signed candidate, since
@@ -7216,6 +7255,7 @@ mod tests {
             ),
             "the reconcile must name the newest candidate, got: {entity:?}"
         );
+        assert_view_holds_the_last_event(&pool, TransferType::Redemption, &id.to_string()).await;
     }
 
     #[tokio::test]
@@ -7256,6 +7296,7 @@ mod tests {
             panic!("a reconciled redemption must reach the Reconciled terminal, got: {entity:?}");
         };
         assert_eq!(reconcile_reason, "deposited manually via vault-deposit");
+        assert_view_holds_the_last_event(&pool, TransferType::Redemption, &id.to_string()).await;
 
         let output = String::from_utf8(stdout).unwrap();
         assert!(

@@ -3,8 +3,6 @@
 use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::LazyLock;
-use std::time::Duration;
 
 use alloy::primitives::{TxHash, U256};
 use axum::Json;
@@ -31,10 +29,8 @@ use st0x_dto::{
 };
 use st0x_event_sorcery::{
     AggregateError, EventSourced, LifecycleError, SendError, Store, StoreBuilder, load_entity,
-    send_command,
 };
 use st0x_evm::Chain;
-use st0x_execution::alpaca_broker_api::AccountActivitiesQuery;
 use st0x_execution::{AlpacaWalletError, Symbol};
 use st0x_finance::{FractionalShares, Positive};
 use st0x_float_serde::format_float;
@@ -43,9 +39,12 @@ use st0x_tokenization::IssuerRequestId;
 
 use crate::AppState;
 use crate::cctp_burn::{CctpBurnOperation, CctpSourceChain};
+use crate::dashboard::event_lines::{event_step, variant_fields};
+use crate::dashboard::order_loader::{
+    PendingOrderResponse, RaindexOrders, fetch_raindex_orders, load_pending_orders,
+};
 use crate::dashboard::pnl::{
-    PnlError, PnlQuery, PnlResponse, acquire_pnl_report_permit, build_pnl_report_with_permit,
-    validate_pnl_snapshot_rowid,
+    PnlError, PnlQuery, PnlReportDeps, PnlReportError, PnlResponse, run_pnl_report,
 };
 use crate::dashboard::transfer_loader::{
     InvalidTransferKind, TransferHistoryQuery, TransferKind, query_transfer_history,
@@ -89,6 +88,7 @@ use crate::rebalancing::usdc::{
     UsdcTransferError,
 };
 use crate::rebalancing::{RebalancingService, UsdcResumeError};
+use crate::startup::PROCESS_START;
 use crate::tokenized_equity_mint::{
     TokenizedEquityMint, TokenizedEquityMintCommand, TokenizedEquityMintError,
     TokenizedEquityMintEvent,
@@ -116,16 +116,13 @@ fn parse_transfer_kind_filter(value: &str) -> Result<Vec<TransferKind>, InvalidT
         .collect()
 }
 
-static STARTED_AT: LazyLock<DateTime<Utc>> = LazyLock::new(Utc::now);
-const DEFAULT_RAINDEX_ORDERS_PAGE_SIZE: u32 = 50;
-const MAX_RAINDEX_ORDERS_PAGE_SIZE: u32 = 100;
 /// Bounds the rows SQLite may need to sort and skip for one history request.
 const MAX_TRANSFER_HISTORY_OFFSET: usize = 10_000;
 
 /// Upper bound on ERROR/WARN log entries aggregated per reliability report.
 const MAX_RELIABILITY_LOG_ENTRIES: usize = 50_000;
 
-const GIT_COMMIT: &str = match option_env!("ST0X_GIT_COMMIT") {
+pub(crate) const GIT_COMMIT: &str = match option_env!("ST0X_GIT_COMMIT") {
     Some(val) => val,
     None => "dev",
 };
@@ -145,21 +142,6 @@ struct LogResponse {
     entries: Vec<serde_json::Value>,
     total: usize,
     has_more: bool,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PendingOrderResponse {
-    view_id: String,
-    status: String,
-    symbol: String,
-    direction: String,
-    shares: String,
-    executor: String,
-    placed_at: String,
-    submitted_at: Option<String>,
-    shares_filled: Option<String>,
-    avg_price: Option<String>,
 }
 
 /// Where the stranded equity physically sits for a failed transfer.
@@ -250,7 +232,7 @@ impl Serialize for ProtocolTrades<'_> {
 }
 
 async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthResponse>) {
-    let uptime = Utc::now() - *STARTED_AT;
+    let uptime = Utc::now() - DateTime::<Utc>::from(*PROCESS_START);
 
     // Gated on the startup barrier: every essential run loop has
     // acknowledged before this reports healthy, and the conductor
@@ -281,60 +263,41 @@ async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRespon
     )
 }
 
-/// Deadline for bringing the PnL ledger current on the `/pnl` request path.
-/// Catch-up work is proportional to the un-ingested backlog, not to the
-/// request, and concurrent requests serialize on the ledger's internal mutex
-/// before any admission control -- so past this deadline the request sheds
-/// with 503 instead of queueing behind ingestion. The boot-path catch-up
-/// stays unbounded: first-deploy backfill may legitimately exceed any
-/// request deadline. Cancellation is safe because each ingest batch commits
-/// its rows and checkpoint atomically; an elapsed deadline only rolls back
-/// the in-flight batch.
-const PNL_CATCH_UP_TIMEOUT: Duration = Duration::from_secs(10);
-
 async fn pnl(
     State(state): State<AppState>,
     Query(query): Query<PnlQuery>,
 ) -> Result<Json<PnlResponse>, (StatusCode, String)> {
-    let after = query
-        .activity_after()
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    let until = query
-        .activity_until()
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    query
-        .symbol_filter(&mut Vec::new())
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    let head = tokio::time::timeout(PNL_CATCH_UP_TIMEOUT, state.pnl_ledger.catch_up())
+    let BrokerCtx::AlpacaBrokerApi(broker) = &state.ctx.broker;
+    let deps = PnlReportDeps {
+        pool: &state.pool,
+        ledger: &state.pnl_ledger,
+        broker,
+    };
+
+    run_pnl_report(&deps, &query, &state.pnl_report_admission)
         .await
-        .map_err(|_elapsed| {
+        .map(Json)
+        .map_err(pnl_report_error_response)
+}
+
+fn pnl_report_error_response(error: PnlReportError) -> (StatusCode, String) {
+    match error {
+        PnlReportError::Report(error) => pnl_error_response(error),
+        PnlReportError::CatchUpTimeout => {
             warn!("PnL ledger catch-up exceeded its request deadline");
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "PnL ledger catch-up timed out".to_string(),
             )
-        })?
-        .map_err(|error| pnl_error_response(PnlError::Ledger(error)))?;
-    validate_pnl_snapshot_rowid(head, &query).map_err(pnl_error_response)?;
-    let permit =
-        acquire_pnl_report_permit(&state.pnl_report_admission).map_err(pnl_error_response)?;
-
-    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &state.ctx.broker;
-    let activities = alpaca_auth
-        .fetch_account_activities(&AccountActivitiesQuery::pnl(after, until))
-        .await
-        .map_err(|error| {
+        }
+        PnlReportError::Activities(error) => {
             error!(%error, "Failed to fetch Alpaca account activities for PnL");
             (
                 StatusCode::BAD_GATEWAY,
                 "Failed to fetch Alpaca account activities".to_string(),
             )
-        })?;
-
-    build_pnl_report_with_permit(&state.pool, &query, activities, Utc::now(), permit, head)
-        .await
-        .map(Json)
-        .map_err(pnl_error_response)
+        }
+    }
 }
 
 fn pnl_error_response(error: PnlError) -> (StatusCode, String) {
@@ -476,12 +439,12 @@ async fn logs(State(state): State<AppState>, Query(query): Query<LogsQuery>) -> 
     })
 }
 
-struct LogFilter {
-    search_lower: Option<String>,
-    levels: Option<Vec<String>>,
-    targets: Option<Vec<String>>,
-    since: Option<DateTime<Utc>>,
-    until: Option<DateTime<Utc>>,
+pub(crate) struct LogFilter {
+    pub(crate) search_lower: Option<String>,
+    pub(crate) levels: Option<Vec<String>>,
+    pub(crate) targets: Option<Vec<String>>,
+    pub(crate) since: Option<DateTime<Utc>>,
+    pub(crate) until: Option<DateTime<Utc>>,
 }
 
 /// Reads log entries from `log_dir` in newest-first order, applying filters.
@@ -502,137 +465,26 @@ fn read_matching_entries(
     offset: usize,
     limit: usize,
 ) -> (Vec<serde_json::Value>, usize, bool) {
-    use std::io::BufRead;
-
-    let Ok(dir) = std::fs::read_dir(log_dir) else {
-        return (Vec::new(), 0, false);
-    };
-
-    let mut log_files: Vec<_> = dir
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.starts_with("st0x-hedge.log"))
-        })
-        .collect();
-
-    // Sort by name then reverse so newest files are read first.
-    log_files.sort_by_key(std::fs::DirEntry::file_name);
-    log_files.reverse();
-
-    // Pre-compute level filter strings for fast raw-line matching.
-    // JSON format: `"level":"INFO"` — we match this substring directly.
-    let level_needles: Option<Vec<String>> = filter.levels.as_ref().map(|levels| {
-        levels
-            .iter()
-            .map(|lvl| format!("\"level\":\"{lvl}\""))
-            .collect()
-    });
-
-    let target_needles: Option<Vec<String>> = filter.targets.as_ref().map(|targets| {
-        targets
-            .iter()
-            .map(|tgt| format!("\"target\":\"{tgt}\""))
-            .collect()
-    });
-
+    let needles = LineNeedles::new(filter);
     let page_end = offset + limit;
     let mut total: usize = 0;
     let mut page_entries: Vec<serde_json::Value> = Vec::new();
 
+    // The endpoint reads what it can: an unreadable directory, file or line
+    // leaves those entries out of the page.
+    let Ok((log_files, _)) = matching_log_files(log_dir, filter) else {
+        return (Vec::new(), 0, false);
+    };
+
     for file_entry in &log_files {
-        // Date-based file skipping: the date suffix (e.g. "2026-04-27")
-        // lets us skip entire files outside the time window.
-        if let Some(since) = filter.since
-            && let Some(file_date) = extract_log_file_date(file_entry)
-        {
-            let file_end_of_day = file_date
-                .and_hms_opt(23, 59, 59)
-                .map(|ndt| DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
-
-            if let Some(eod) = file_end_of_day
-                && eod < since
-            {
-                continue;
-            }
-        }
-
-        if let Some(until) = filter.until
-            && let Some(file_date) = extract_log_file_date(file_entry)
-        {
-            let file_start_of_day = file_date
-                .and_hms_opt(0, 0, 0)
-                .map(|ndt| DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
-
-            if let Some(sod) = file_start_of_day
-                && sod > until
-            {
-                continue;
-            }
-        }
-
-        let Ok(file) = std::fs::File::open(file_entry.path()) else {
-            continue;
-        };
-        let reader = std::io::BufReader::new(file);
-
-        // Read lines into a vec for this file so we can reverse (newest last
-        // in file -> newest first for display). We only collect lines that
-        // pass the cheap string-level filters.
+        // Collect this file's matches so they can be reversed: the newest
+        // entry is last in the file and first on the page.
         let mut file_matches: Vec<serde_json::Value> = Vec::new();
-
-        for line_result in reader.lines() {
-            let Ok(line) = line_result else {
-                continue;
-            };
-
-            // Fast string-level filtering BEFORE JSON parsing.
-            if let Some(needles) = &level_needles
-                && !needles.iter().any(|needle| line.contains(needle))
-            {
-                continue;
-            }
-
-            if let Some(needles) = &target_needles
-                && !needles.iter().any(|needle| line.contains(needle))
-            {
-                continue;
-            }
-
-            if let Some(query) = &filter.search_lower
-                && !line.to_lowercase().contains(query.as_str())
-            {
-                continue;
-            }
-
-            // Expensive: parse JSON only for lines that passed string filters.
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-                continue;
-            };
-
-            // Time-range filter requires parsed timestamp.
-            if (filter.since.is_some() || filter.until.is_some())
-                && let Some(ts_str) = value["timestamp"].as_str()
-                && let Ok(ts) = DateTime::parse_from_rfc3339(ts_str)
-            {
-                let ts_utc = ts.with_timezone(&Utc);
-
-                if let Some(since) = filter.since
-                    && ts_utc < since
-                {
-                    continue;
-                }
-
-                if let Some(until) = filter.until
-                    && ts_utc > until
-                {
-                    continue;
-                }
-            }
-
+        let visited = visit_file_entries(&file_entry.path(), None, filter, &needles, |value| {
             file_matches.push(value);
+        });
+        if let Err(error) = visited {
+            debug!(%error, file = ?file_entry.path(), "Skipped unreadable log lines");
         }
 
         file_matches.reverse();
@@ -657,6 +509,249 @@ fn read_matching_entries(
     (page_entries, total, has_more)
 }
 
+/// A log file and its length in bytes when it was listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LogFileExtent {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) length: u64,
+}
+
+/// The log files in `log_dir` that `filter`'s dates can match, newest first,
+/// each with its length now.
+///
+/// A missing directory gives no files. A file whose length cannot be read is
+/// left out, and the first listing or length error is returned beside the
+/// files, so a caller can report what it could not list.
+pub(crate) fn log_file_extents(
+    log_dir: &str,
+    filter: &LogFilter,
+) -> (Vec<LogFileExtent>, Option<std::io::Error>) {
+    let (log_files, mut first_error) = match matching_log_files(log_dir, filter) {
+        Ok(listing) => listing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (Vec::new(), None),
+        Err(error) => return (Vec::new(), Some(error)),
+    };
+
+    let extents = log_files
+        .iter()
+        .filter_map(|file_entry| match file_entry.metadata() {
+            Ok(metadata) => Some(LogFileExtent {
+                path: file_entry.path(),
+                length: metadata.len(),
+            }),
+            Err(error) => {
+                first_error.get_or_insert(error);
+                None
+            }
+        })
+        .collect();
+
+    (extents, first_error)
+}
+
+/// Calls `visit` with every entry of `extents` that passes `filter`, in
+/// their order and in file order within a file, without holding them all.
+///
+/// Each file is read only up to its recorded length, so bytes appended after
+/// the listing are never read; a line that length cuts does not parse and is
+/// skipped. A file removed since the listing and a line that is not UTF-8 are
+/// skipped, as the endpoints skip them. Any other read error is returned once
+/// the files are read, so a caller that must not miss entries can retry.
+pub(crate) fn visit_extent_entries(
+    extents: &[LogFileExtent],
+    filter: &LogFilter,
+    mut visit: impl FnMut(serde_json::Value),
+) -> Result<(), std::io::Error> {
+    let needles = LineNeedles::new(filter);
+    let mut first_error = None;
+
+    for extent in extents {
+        if let Err(error) = visit_file_entries(
+            &extent.path,
+            Some(extent.length),
+            filter,
+            &needles,
+            &mut visit,
+        ) {
+            first_error.get_or_insert(error);
+        }
+    }
+
+    first_error.map_or(Ok(()), Err)
+}
+
+/// The level and target filters as raw-line substrings, so most lines are
+/// rejected before the JSON parse. JSON format: `"level":"INFO"`.
+struct LineNeedles {
+    levels: Option<Vec<String>>,
+    targets: Option<Vec<String>>,
+}
+
+impl LineNeedles {
+    fn new(filter: &LogFilter) -> Self {
+        Self {
+            levels: filter.levels.as_ref().map(|levels| {
+                levels
+                    .iter()
+                    .map(|lvl| format!("\"level\":\"{lvl}\""))
+                    .collect()
+            }),
+            targets: filter.targets.as_ref().map(|targets| {
+                targets
+                    .iter()
+                    .map(|tgt| format!("\"target\":\"{tgt}\""))
+                    .collect()
+            }),
+        }
+    }
+}
+
+/// The log files in `log_dir`, newest first, without the files whose date
+/// lies wholly outside the filter's `since`/`until` window.
+///
+/// An entry the listing fails to read is left out, and the first such error
+/// is returned beside the files.
+fn matching_log_files(
+    log_dir: &str,
+    filter: &LogFilter,
+) -> Result<(Vec<std::fs::DirEntry>, Option<std::io::Error>), std::io::Error> {
+    let mut listing_error = None;
+    let mut log_files: Vec<_> = std::fs::read_dir(log_dir)?
+        .filter_map(|entry| match entry {
+            Ok(entry) => Some(entry),
+            Err(error) => {
+                listing_error.get_or_insert(error);
+                None
+            }
+        })
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("st0x-hedge.log"))
+        })
+        .collect();
+
+    // Sort by name then reverse so newest files are read first.
+    log_files.sort_by_key(std::fs::DirEntry::file_name);
+    log_files.reverse();
+
+    log_files.retain(|file_entry| {
+        // Date-based file skipping: the date suffix (e.g. "2026-04-27")
+        // lets us skip entire files outside the time window.
+        if let Some(since) = filter.since
+            && let Some(file_date) = extract_log_file_date(file_entry)
+        {
+            let file_end_of_day = file_date
+                .and_hms_opt(23, 59, 59)
+                .map(|ndt| DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
+
+            if let Some(eod) = file_end_of_day
+                && eod < since
+            {
+                return false;
+            }
+        }
+
+        if let Some(until) = filter.until
+            && let Some(file_date) = extract_log_file_date(file_entry)
+        {
+            let file_start_of_day = file_date
+                .and_hms_opt(0, 0, 0)
+                .map(|ndt| DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
+
+            if let Some(sod) = file_start_of_day
+                && sod > until
+            {
+                return false;
+            }
+        }
+
+        true
+    });
+
+    Ok((log_files, listing_error))
+}
+
+/// Calls `visit` with each entry of one file that passes the filters, in
+/// file order, reading at most `length` bytes when it is given. A file
+/// removed since the listing and a line that is not UTF-8 are skipped. Any
+/// other read error stops reading the file and is returned, with the entries
+/// before it already visited: a persistent error such as reading a directory
+/// would otherwise repeat forever.
+fn visit_file_entries(
+    path: &std::path::Path,
+    length: Option<u64>,
+    filter: &LogFilter,
+    needles: &LineNeedles,
+    mut visit: impl FnMut(serde_json::Value),
+) -> Result<(), std::io::Error> {
+    use std::io::{BufRead, Read};
+
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let reader = std::io::BufReader::new(file.take(length.unwrap_or(u64::MAX)));
+
+    for line_result in reader.lines() {
+        let line = match line_result {
+            Ok(line) => line,
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => continue,
+            Err(error) => return Err(error),
+        };
+
+        // Fast string-level filtering BEFORE JSON parsing.
+        if let Some(needles) = &needles.levels
+            && !needles.iter().any(|needle| line.contains(needle))
+        {
+            continue;
+        }
+
+        if let Some(needles) = &needles.targets
+            && !needles.iter().any(|needle| line.contains(needle))
+        {
+            continue;
+        }
+
+        if let Some(query) = &filter.search_lower
+            && !line.to_lowercase().contains(query.as_str())
+        {
+            continue;
+        }
+
+        // Expensive: parse JSON only for lines that passed string filters.
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+
+        // Time-range filter requires parsed timestamp.
+        if (filter.since.is_some() || filter.until.is_some())
+            && let Some(ts_str) = value["timestamp"].as_str()
+            && let Ok(ts) = DateTime::parse_from_rfc3339(ts_str)
+        {
+            let ts_utc = ts.with_timezone(&Utc);
+
+            if let Some(since) = filter.since
+                && ts_utc < since
+            {
+                continue;
+            }
+
+            if let Some(until) = filter.until
+                && ts_utc > until
+            {
+                continue;
+            }
+        }
+
+        visit(value);
+    }
+
+    Ok(())
+}
+
 /// Extracts the date from a log filename like `st0x-hedge.log.2026-04-27`.
 fn extract_log_file_date(entry: &std::fs::DirEntry) -> Option<chrono::NaiveDate> {
     let name = entry.file_name();
@@ -667,51 +762,7 @@ fn extract_log_file_date(entry: &std::fs::DirEntry) -> Option<chrono::NaiveDate>
 
 /// Returns non-terminal offchain orders (Pending, Submitted, PartiallyFilled, Cancelling).
 async fn pending_orders(State(state): State<AppState>) -> Json<Vec<PendingOrderResponse>> {
-    let rows: Vec<(String, String, String)> = match sqlx::query_as(
-        "SELECT view_id, status, payload FROM offchain_order_view \
-         WHERE status IN ('Pending', 'Submitted', 'PartiallyFilled', 'Cancelling') \
-         ORDER BY rowid DESC LIMIT 100",
-    )
-    .fetch_all(&state.pool)
-    .await
-    {
-        Ok(rows) => rows,
-        Err(error) => {
-            tracing::warn!(target: "dashboard", %error, "Failed to load pending orders");
-            return Json(Vec::new());
-        }
-    };
-
-    let orders = rows
-        .into_iter()
-        .filter_map(|(view_id, status, payload_str)| {
-            parse_pending_order(view_id, status, &payload_str)
-        })
-        .collect();
-
-    Json(orders)
-}
-
-fn parse_pending_order(
-    view_id: String,
-    status: String,
-    payload_str: &str,
-) -> Option<PendingOrderResponse> {
-    let payload: serde_json::Value = serde_json::from_str(payload_str).ok()?;
-    let inner = payload.get("Live")?.get(&status)?;
-
-    Some(PendingOrderResponse {
-        view_id,
-        symbol: inner["symbol"].as_str()?.to_string(),
-        direction: inner["direction"].as_str()?.to_string(),
-        shares: inner["shares"].as_str().unwrap_or("0").to_string(),
-        executor: inner["executor"].as_str().unwrap_or("unknown").to_string(),
-        placed_at: inner["placed_at"].as_str().unwrap_or("").to_string(),
-        submitted_at: inner["submitted_at"].as_str().map(String::from),
-        shares_filled: inner["shares_filled"].as_str().map(String::from),
-        avg_price: inner["avg_price"].as_str().map(String::from),
-        status,
-    })
+    Json(load_pending_orders(&state.pool).await)
 }
 
 #[derive(Deserialize, Default)]
@@ -954,16 +1005,9 @@ async fn transfer_events(
     })))
 }
 
-fn event_step(event_type: &str) -> &str {
-    event_type.split("::").last().unwrap_or("Unknown")
-}
-
 fn event_payload_inner(step: &str, payload: &str, sequence: i64) -> serde_json::Value {
     match serde_json::from_str::<serde_json::Value>(payload) {
-        Ok(parsed) => parsed
-            .as_object()
-            .and_then(|obj| obj.get(step).cloned())
-            .unwrap_or(parsed),
+        Ok(parsed) => variant_fields(step, parsed),
 
         Err(error) => {
             warn!(
@@ -1264,63 +1308,15 @@ struct RaindexOrdersQuery {
 /// Proxies the bot's active Raindex orders from the st0x REST API.
 /// When `[rest_api]` is not configured, returns an unavailable indicator
 /// so the dashboard can show a friendly message instead of an error.
-#[allow(clippy::cognitive_complexity)]
 async fn raindex_orders(
     State(state): State<AppState>,
     Query(query): Query<RaindexOrdersQuery>,
 ) -> Json<serde_json::Value> {
     let RaindexOrdersQuery { page, page_size } = query;
-    let Some(rest_api) = &state.ctx.rest_api else {
-        return unavailable_json("REST API not configured (simulate mode)");
-    };
 
-    let owner = state.ctx.vault_owner();
-    let url = format!(
-        "{}/v1/orders/owner/{:#x}",
-        rest_api.url.trim_end_matches('/'),
-        owner
-    );
-
-    let page = page.unwrap_or(1).max(1);
-    let page_size = page_size
-        .unwrap_or(DEFAULT_RAINDEX_ORDERS_PAGE_SIZE)
-        .clamp(1, MAX_RAINDEX_ORDERS_PAGE_SIZE);
-
-    let mut request = rest_api
-        .http_client
-        .get(&url)
-        .query(&[("page", page), ("pageSize", page_size)]);
-
-    if let (Some(key_id), Some(key_secret)) = (&rest_api.key_id, &rest_api.key_secret) {
-        request = request.basic_auth(key_id, Some(key_secret));
-    }
-
-    let response = match request.send().await {
-        Ok(response) => response,
-        Err(error) => {
-            tracing::warn!(target: "dashboard", %error, %url, "Failed to reach st0x REST API");
-            return unavailable_json("REST API unreachable");
-        }
-    };
-
-    if !response.status().is_success() {
-        let status = response.status();
-        tracing::warn!(target: "dashboard", %status, %url, "st0x REST API returned error");
-        return unavailable_json("REST API returned an error");
-    }
-
-    match response.text().await {
-        Ok(body) => match serde_json::from_str(&body) {
-            Ok(value) => Json(value),
-            Err(error) => {
-                tracing::warn!(target: "dashboard", %error, "st0x REST API returned non-JSON body");
-                unavailable_json("REST API returned non-JSON")
-            }
-        },
-        Err(error) => {
-            tracing::warn!(target: "dashboard", %error, "Failed to read st0x REST API response body");
-            unavailable_json("Failed to read REST API response")
-        }
+    match fetch_raindex_orders(&state.ctx, page, page_size).await {
+        RaindexOrders::Available(body) => Json(body),
+        RaindexOrders::Unavailable { reason } => unavailable_json(reason),
     }
 }
 
@@ -3420,14 +3416,17 @@ async fn reconcile_equity_transfer(
                     }),
                 ));
             }
-            send_command::<TokenizedEquityMint>(
-                &state.pool,
-                &mint_id,
-                TokenizedEquityMintCommand::Reconcile { reason },
-                services,
-            )
-            .await
-            .map_err(ops_command_error)?;
+            // A standalone store, not `send_command`: its projection
+            // writes the view, which the transfer line sweep reads. It runs
+            // no reactor, so the conductor's trigger does not run.
+            let (store, _projection) = StoreBuilder::<TokenizedEquityMint>::new(state.pool.clone())
+                .build(services)
+                .await
+                .map_err(ops_store_error)?;
+            store
+                .send(&mint_id, TokenizedEquityMintCommand::Reconcile { reason })
+                .await
+                .map_err(ops_command_error)?;
         }
         TransferKind::EquityRedemption => {
             let redemption_id: RedemptionAggregateId = id.parse().map_err(|error| {
@@ -3469,17 +3468,21 @@ async fn reconcile_equity_transfer(
                 request.superseding_tx,
             )
             .await?;
-            send_command::<EquityRedemption>(
-                &state.pool,
-                &redemption_id,
-                EquityRedemptionCommand::Reconcile {
-                    reason,
-                    proven_withdrawal,
-                },
-                services,
-            )
-            .await
-            .map_err(ops_command_error)?;
+            // A standalone store, as for the mint above.
+            let (store, _projection) = StoreBuilder::<EquityRedemption>::new(state.pool.clone())
+                .build(services)
+                .await
+                .map_err(ops_store_error)?;
+            store
+                .send(
+                    &redemption_id,
+                    EquityRedemptionCommand::Reconcile {
+                        reason,
+                        proven_withdrawal,
+                    },
+                )
+                .await
+                .map_err(ops_command_error)?;
         }
         TransferKind::UsdcBridge => {
             return Err((
@@ -4916,6 +4919,7 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     use alloy::consensus::{SignableTransaction as _, TxEip1559, TxEnvelope};
     use alloy::eips::eip2718::{EIP1559_TX_TYPE_ID, Encodable2718 as _};
@@ -4967,10 +4971,15 @@ mod tests {
     use super::*;
     use crate::bindings::IRaindexV6::{SignedContextV1, TakeOrderConfigV4, TakeOrderV3};
     use crate::dashboard;
+    use crate::dashboard::pnl::{
+        PnlReportAdmission, acquire_pnl_report_permit, run_pnl_window_reports,
+    };
     use crate::equity_redemption::redemption_aggregate_id;
     use crate::inventory::{
         self, BroadcastingInventory, PortfolioAsset, PortfolioBalanceRow, PortfolioLocation,
     };
+    use crate::metrics::liquidity::pnl::PnlWindowKey;
+    use crate::metrics::liquidity::pnl_refresh::{LivePnlReports, PnlReports};
     use crate::offchain::order::{
         OffchainOrder, OffchainOrderEvent, OffchainOrderId, OrderPlacementResult,
     };
@@ -5112,6 +5121,50 @@ mod tests {
     }
 
     #[test]
+    fn pnl_catch_up_timeout_returns_service_unavailable() {
+        let (status, body) = pnl_report_error_response(PnlReportError::CatchUpTimeout);
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, "PnL ledger catch-up timed out");
+    }
+
+    #[test]
+    fn pnl_activities_failure_returns_bad_gateway() {
+        let parse_error = serde_json::from_str::<u64>("not json").unwrap_err();
+        let error = PnlReportError::Activities(Box::new(
+            st0x_execution::AlpacaBrokerApiError::JsonParse(parse_error),
+        ));
+
+        let (status, body) = pnl_report_error_response(error);
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body, "Failed to fetch Alpaca account activities");
+    }
+
+    #[tokio::test]
+    async fn pnl_route_returns_bad_gateway_when_alpaca_activities_are_unreachable() {
+        // A port that was just bound and released, so nothing listens on it
+        // and the activities fetch fails to connect.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.broker = crate::test_utils::mock_alpaca_broker_ctx(format!("http://127.0.0.1:{port}"));
+        let state = empty_app_state(ctx).await;
+
+        let response = build_app(state)
+            .oneshot(Request::builder().uri("/pnl").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            body_to_string(response).await,
+            "Failed to fetch Alpaca account activities"
+        );
+    }
+
+    #[test]
     fn stuck_mint_info_reports_accepted_provider_failure() {
         let mint_id = issuer_request_id("mint-1");
         let mint_accepted_payload = format!(
@@ -5144,28 +5197,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_pending_order_handles_cancelling_status() {
-        // The cancel-and-replace flow introduced the non-terminal `Cancelling`
-        // state; the /orders/pending endpoint must surface it like any other
-        // live order rather than dropping it on the floor.
-        let payload = r#"{"Live":{"Cancelling":{"symbol":"AAPL","direction":"Sell","shares":"1.5","executor":"DryRun","placed_at":"2026-01-01T00:00:00Z","submitted_at":"2026-01-01T00:00:01Z","shares_filled":"0.5","avg_price":"195.25"}}}"#;
-
-        let parsed = parse_pending_order("order-1".to_string(), "Cancelling".to_string(), payload)
-            .expect("Cancelling order should parse");
-
-        assert_eq!(parsed.view_id, "order-1");
-        assert_eq!(parsed.status, "Cancelling");
-        assert_eq!(parsed.symbol, "AAPL");
-        assert_eq!(parsed.direction, "Sell");
-        assert_eq!(parsed.shares, "1.5");
-        assert_eq!(parsed.executor, "DryRun");
-        assert_eq!(parsed.placed_at, "2026-01-01T00:00:00Z");
-        assert_eq!(parsed.submitted_at.as_deref(), Some("2026-01-01T00:00:01Z"));
-        assert_eq!(parsed.shares_filled.as_deref(), Some("0.5"));
-        assert_eq!(parsed.avg_price.as_deref(), Some("195.25"));
-    }
-
-    #[test]
     fn trade_response_preserves_each_protocol_wire_shape() {
         let trade = Trade {
             id: "adapter-fill".to_string(),
@@ -5174,6 +5205,7 @@ mod tests {
             direction: Direction::Buy,
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            price: Some(st0x_finance::Usd::new(float!(199.5))),
             outcome: TradeOutcome::Filled,
         };
 
@@ -5194,6 +5226,16 @@ mod tests {
             assert_eq!(wire["entries"][0]["venue"], expected_venue);
             assert_eq!(wire["entries"][0]["filledAt"], "2026-01-01T00:00:00Z");
             assert_eq!(wire["entries"][0]["outcome"]["status"], "filled");
+            match trade_protocol {
+                TradeProtocol::TerminalOutcomesV3 => {
+                    assert_eq!(wire["entries"][0]["price"], "199.5");
+                }
+                TradeProtocol::LegacyFills
+                | TradeProtocol::TerminalOutcomesV1
+                | TradeProtocol::TerminalOutcomesV2 => {
+                    assert_eq!(wire["entries"][0].get("price"), None);
+                }
+            }
             assert_eq!(wire["total"], 1);
             assert_eq!(wire["hasMore"], false);
         }
@@ -5398,6 +5440,78 @@ mod tests {
         assert_eq!(cancelled["outcome"]["filledShares"], "0");
         assert_eq!(cancelled["outcome"]["remainingShares"], "1");
         assert_eq!(cancelled["outcome"]["excessShares"], "0");
+    }
+
+    async fn insert_offchain_view_row(pool: &sqlx::SqlitePool, view_id: &str, payload: &str) {
+        sqlx::query("INSERT INTO offchain_order_view (view_id, version, payload) VALUES (?, 1, ?)")
+            .bind(view_id)
+            .bind(payload)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn trades_wire(state: AppState, trade_protocol: &str) -> serde_json::Value {
+        let response = build_app(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/trades?trade_protocol={trade_protocol}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_str(&body_to_string(response).await).unwrap()
+    }
+
+    #[tokio::test]
+    async fn trades_endpoint_serves_the_fill_price_on_v3_only() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let pool = state.pool.clone();
+        let filled_view_id = "00000000-0000-0000-0000-000000000150";
+        let filled_payload = r#"{"Live":{"Filled":{"symbol":"AAPL","shares":"2","direction":"Sell","executor":"AlpacaBrokerApi","executor_order_id":"broker-fill","price":"199.5","placed_at":"2026-01-01T00:00:00Z","submitted_at":"2026-01-01T00:00:00Z","filled_at":"2026-01-01T00:00:03Z"}}}"#;
+        insert_offchain_view_row(&pool, filled_view_id, filled_payload).await;
+        // A priced partial fill is retained, but a failed or cancelled
+        // counter-trade has no fill price of its own.
+        let failed_view_id = "00000000-0000-0000-0000-000000000151";
+        let failed_payload = r#"{"Live":{"Failed":{"symbol":"SPCX","shares":"1","direction":"Buy","executor":"AlpacaBrokerApi","retained_fill":{"Priced":{"shares_filled":"0.25","avg_price":"25","partially_filled_at":"2026-01-01T00:00:00Z"}},"executor_order_id":"broker-order","error":"asset is not tradable","placed_at":"2026-01-01T00:00:00Z","failed_at":"2026-01-01T00:00:01Z"}}}"#;
+        insert_offchain_view_row(&pool, failed_view_id, failed_payload).await;
+        let cancelled_view_id = "00000000-0000-0000-0000-000000000152";
+        let cancelled_payload = r#"{"Live":{"Cancelled":{"symbol":"MSFT","shares":"1","requested_shares":"1.5","filled_shares":"0","direction":"Sell","executor":"AlpacaBrokerApi","executor_order_id":"broker-cancel","reason":"MarketOpenReplacement","placed_at":"2026-01-01T00:00:01Z","cancelled_at":"2026-01-01T00:00:02Z"}}}"#;
+        insert_offchain_view_row(&pool, cancelled_view_id, cancelled_payload).await;
+
+        let v3 = trades_wire(state.clone(), "terminal_outcomes_v3").await;
+        let v3_entry = |id: &str| {
+            v3["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|trade| trade["id"] == id)
+                .unwrap_or_else(|| panic!("v3 clients should receive trade {id}"))
+        };
+        assert_eq!(v3_entry(filled_view_id)["price"], "199.5");
+        assert_eq!(
+            v3_entry(failed_view_id).get("price"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(
+            v3_entry(cancelled_view_id).get("price"),
+            Some(&serde_json::Value::Null)
+        );
+
+        for older_protocol in [
+            "terminal_outcomes_v2",
+            "terminal_outcomes_v1",
+            "legacy_fills",
+        ] {
+            let wire = trades_wire(state.clone(), older_protocol).await;
+            let entries = wire["entries"].as_array().unwrap();
+            assert!(
+                !entries.is_empty() && entries.iter().all(|trade| trade.get("price").is_none()),
+                "{older_protocol} keeps the wire shape its clients were built against"
+            );
+        }
     }
 
     #[tokio::test]
@@ -6247,6 +6361,186 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    /// The state and the Alpaca mock it reads, which serves until dropped.
+    async fn pnl_test_state() -> (AppState, AlpacaBrokerMock) {
+        let broker_mock = AlpacaBrokerMock::start()
+            .symbol_fill_prices(vec![])
+            .symbol_positions(vec![])
+            .call()
+            .await;
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.broker = crate::test_utils::mock_alpaca_broker_ctx(broker_mock.base_url());
+
+        (empty_app_state(ctx).await, broker_mock)
+    }
+
+    async fn shared_pnl_report(state: &AppState, query: &PnlQuery) -> PnlResponse {
+        let BrokerCtx::AlpacaBrokerApi(broker) = &state.ctx.broker;
+        let deps = PnlReportDeps {
+            pool: &state.pool,
+            ledger: &state.pnl_ledger,
+            broker,
+        };
+
+        run_pnl_report(&deps, query, &PnlReportAdmission::with_permits(1))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn pnl_route_returns_what_the_shared_report_path_builds() {
+        let (state, _broker_mock) = pnl_test_state().await;
+        seed_position_pnl_fill(&state.pool, &Symbol::new("RKLB").unwrap()).await;
+        let query = PnlQuery {
+            limit: Some(1),
+            from_date: Some("2026-03-01".to_string()),
+            to_date: Some("2026-03-09".to_string()),
+            ..PnlQuery::default()
+        };
+
+        let shared = serde_json::to_value(shared_pnl_report(&state, &query).await).unwrap();
+        let response = build_app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/pnl?limit=1&fromDate=2026-03-01&toDate=2026-03-09")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let routed: serde_json::Value =
+            serde_json::from_str(&body_to_string(response).await).unwrap();
+        assert_eq!(routed, shared);
+        assert_eq!(routed["summary"]["matchedLotCount"], serde_json::json!(1));
+    }
+
+    #[tokio::test]
+    async fn each_shared_report_sees_the_fills_recorded_before_it() {
+        let (state, _broker_mock) = pnl_test_state().await;
+        let query = PnlQuery {
+            limit: Some(1),
+            ..PnlQuery::default()
+        };
+
+        seed_position_pnl_fill(&state.pool, &Symbol::new("RKLB").unwrap()).await;
+        let first = shared_pnl_report(&state, &query).await;
+        seed_position_pnl_fill(&state.pool, &Symbol::new("TSLA").unwrap()).await;
+        let second = shared_pnl_report(&state, &query).await;
+
+        assert_eq!(first.summary.matched_lot_count, 1);
+        assert_eq!(second.summary.matched_lot_count, 2);
+    }
+
+    /// The metrics task's reports take none of the live permits, and on its
+    /// first cycle, with no range known before, its windows already end on
+    /// the last fill day of its own replay.
+    #[tokio::test]
+    async fn pnl_metrics_reports_run_while_live_requests_hold_every_permit() {
+        let (state, _broker_mock) = pnl_test_state().await;
+        seed_position_pnl_fill(&state.pool, &Symbol::new("RKLB").unwrap()).await;
+        let _live_permits = (0..crate::dashboard::pnl::MAX_CONCURRENT_PNL_REPORTS)
+            .map(|_| acquire_pnl_report_permit(&state.pnl_report_admission).unwrap())
+            .collect::<Vec<_>>();
+        let reports = LivePnlReports::new(&state.ctx, state.pool.clone(), state.pnl_ledger.clone());
+
+        let window_reports = reports.window_reports().await.unwrap();
+
+        let windows: Vec<PnlWindowKey> = window_reports.iter().map(|(window, _)| *window).collect();
+        assert_eq!(windows, PnlWindowKey::REFRESH_ORDER);
+        for (window, report) in window_reports {
+            let report = report.unwrap();
+            assert_eq!(report.summary.matched_lot_count, 1, "{window:?}");
+            assert_eq!(
+                report.available_range.last_date.as_deref(),
+                Some("2026-03-08"),
+                "{window:?}"
+            );
+        }
+
+        let response = build_app(state)
+            .oneshot(Request::builder().uri("/pnl").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The metrics task builds its six windows over one shared replay. Each
+    /// window's report must be byte for byte what `/pnl` answers for the
+    /// same dates. The windows have the shapes of `1d`, `1w`, `1m`, `ytd`,
+    /// `1y` and `all` ending the day after the fills, so `1d` has none. The
+    /// window picker gets the range of the shared replay itself.
+    #[tokio::test]
+    async fn pnl_window_reports_match_the_route_for_every_window() {
+        let (state, _broker_mock) = pnl_test_state().await;
+        seed_position_pnl_fill(&state.pool, &Symbol::new("RKLB").unwrap()).await;
+        seed_position_pnl_fill(&state.pool, &Symbol::new("TSLA").unwrap()).await;
+        let day = |text: &str| NaiveDate::parse_from_str(text, "%Y-%m-%d").unwrap();
+        let windows: Vec<(NaiveDate, NaiveDate)> = [
+            ("2026-03-09", "2026-03-09"),
+            ("2026-03-03", "2026-03-09"),
+            ("2026-02-07", "2026-03-09"),
+            ("2026-01-01", "2026-03-09"),
+            ("2025-03-10", "2026-03-09"),
+            ("2026-03-08", "2026-03-09"),
+        ]
+        .into_iter()
+        .map(|(from, to)| (day(from), day(to)))
+        .collect();
+        let BrokerCtx::AlpacaBrokerApi(broker) = &state.ctx.broker;
+        let deps = PnlReportDeps {
+            pool: &state.pool,
+            ledger: &state.pnl_ledger,
+            broker,
+        };
+        let base = PnlQuery {
+            limit: Some(1),
+            ..PnlQuery::default()
+        };
+        let mut seen_last_date = None;
+
+        let shared = run_pnl_window_reports(
+            &deps,
+            &base,
+            |range| {
+                seen_last_date.clone_from(&range.last_date);
+                windows
+                    .iter()
+                    .map(|(from, to)| ((*from, *to), *from, *to))
+                    .collect::<Vec<_>>()
+            },
+            &PnlReportAdmission::queued(1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(seen_last_date.as_deref(), Some("2026-03-08"));
+        assert_eq!(shared.len(), 6);
+        let mut lot_counts = Vec::new();
+        for ((from, to), report) in shared {
+            let report = report.unwrap();
+            lot_counts.push(report.summary.matched_lot_count);
+            let response = build_app(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/pnl?limit=1&fromDate={from}&toDate={to}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK, "{from}..{to}");
+            assert_eq!(
+                body_to_string(response).await,
+                serde_json::to_string(&report).unwrap(),
+                "{from}..{to}"
+            );
+        }
+        assert_eq!(lot_counts, [0, 2, 2, 2, 2, 2]);
     }
 
     /// End-to-end `/pnl` coverage for capital/return-on-capital figures: three
@@ -12944,6 +13238,33 @@ mod tests {
             matches!(entity, TokenizedEquityMint::Reconciled { .. }),
             "the mint must land in the Reconciled terminal, got {entity:?}",
         );
+        assert_view_holds_the_last_event(&state.pool, &id.to_string()).await;
+    }
+
+    /// The reconcile reached the transfer's projection, which the transfer
+    /// line sweep reads: its row holds the aggregate's last event.
+    async fn assert_view_holds_the_last_event(pool: &SqlitePool, id: &str) {
+        let last: i64 =
+            sqlx::query_scalar("SELECT MAX(sequence) FROM events WHERE aggregate_id = ?")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let loaded = crate::dashboard::transfer_loader::load_versioned_transfers(pool).await;
+        let row = loaded
+            .transfers
+            .iter()
+            .find(|row| match &row.transfer {
+                st0x_dto::TransferOperation::EquityMint(operation) => {
+                    operation.id.to_string() == id
+                }
+                st0x_dto::TransferOperation::EquityRedemption(operation) => {
+                    operation.id.to_string() == id
+                }
+                st0x_dto::TransferOperation::UsdcBridge(_) => false,
+            })
+            .expect("the reconciled transfer is in the sweep's window");
+        assert_eq!(i64::try_from(row.sequence).unwrap(), last);
     }
 
     #[tokio::test]
@@ -12978,6 +13299,7 @@ mod tests {
             matches!(entity, EquityRedemption::Reconciled { .. }),
             "the redemption must land in the Reconciled terminal, got {entity:?}",
         );
+        assert_view_holds_the_last_event(&state.pool, &id.to_string()).await;
     }
 
     #[tokio::test]

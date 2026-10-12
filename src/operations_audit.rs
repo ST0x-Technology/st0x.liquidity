@@ -9,7 +9,6 @@ use axum::http::request::Parts;
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use chrono::{SecondsFormat, Utc};
 use futures_util::FutureExt;
 use parking_lot::Mutex;
 use percent_encoding::percent_decode_str;
@@ -18,6 +17,7 @@ use tokio_util::task::TaskTracker;
 use tracing::{Level, error, info, warn};
 use uuid::Uuid;
 
+use crate::alerts::AlertKind;
 use crate::api::spawn_detached;
 
 const AUDIT_SCHEMA: &str = "st0x.operations.audit.v1";
@@ -148,7 +148,6 @@ impl OperationsAuditContext {
             },
             reason: mutable.reason.clone(),
             outcome: AuditOutcome::from_status(status),
-            timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         }
     }
 }
@@ -162,7 +161,6 @@ struct OperationsAuditEvent {
     target_id: String,
     reason: String,
     outcome: AuditOutcome,
-    timestamp: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,7 +243,6 @@ impl OperationsAuditRecorder for LogOperationsAuditRecorder {
                 target_id = event.target_id.as_str(),
                 reason = event.reason.as_str(),
                 outcome = event.outcome.as_str(),
-                timestamp = %event.timestamp,
                 "Operations audit event"
             ),
             AuditOutcome::Denied
@@ -261,7 +258,6 @@ impl OperationsAuditRecorder for LogOperationsAuditRecorder {
                 target_id = event.target_id.as_str(),
                 reason = event.reason.as_str(),
                 outcome = event.outcome.as_str(),
-                timestamp = %event.timestamp,
                 "Operations audit event"
             ),
         }
@@ -275,6 +271,7 @@ fn record_with(recorder: &dyn OperationsAuditRecorder, event: &OperationsAuditEv
         error!(
             target: "operational_alert",
             alert = true,
+            kind = AlertKind::OperationsAuditRecordingFailed.as_str(),
             audit_schema = AUDIT_SCHEMA,
             service = SERVICE,
             principal = event.principal.as_str(),
@@ -284,7 +281,6 @@ fn record_with(recorder: &dyn OperationsAuditRecorder, event: &OperationsAuditEv
             target_id = event.target_id.as_str(),
             reason = event.reason.as_str(),
             outcome = event.outcome.as_str(),
-            timestamp = %event.timestamp,
             %record_error,
             "Operations audit recording failed"
         );
@@ -332,6 +328,7 @@ pub(crate) async fn audit_request(
                     error!(
                         target: "operational_alert",
                         alert = true,
+                        kind = AlertKind::AuditedOperatorCommandPanicked.as_str(),
                         audit_schema = AUDIT_SCHEMA,
                         service = SERVICE,
                         role,
@@ -360,6 +357,7 @@ pub(crate) async fn audit_request(
         error!(
             target: "operational_alert",
             alert = true,
+            kind = AlertKind::AuditedOperatorCommandTaskFailed.as_str(),
             audit_schema = AUDIT_SCHEMA,
             service = SERVICE,
             role,
@@ -592,7 +590,6 @@ mod tests {
             target_id: "mint:mint-9".to_string(),
             reason: "incident 42".to_string(),
             outcome,
-            timestamp: "2026-01-01T00:00:00.000Z".to_string(),
         }
     }
 

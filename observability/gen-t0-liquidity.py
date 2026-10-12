@@ -6,18 +6,23 @@ Regenerate after edits:
 
     python3 observability/gen-t0-liquidity.py
 
+Check that the committed JSON matches the generator (CI runs this):
+
+    python3 observability/gen-t0-liquidity.py --check
+
 Data comes from the exporter sidecar on the liquidity VM
-(terraform/staging-liquidity/exporter/exporter.py):
+(terraform/liquidity-exporter/exporter.py in T0Trade/t0.devops) or, for the
+liq_* gauges, from the bot's own /metrics, as the `source` variable picks:
 
   cloudmon  liq_* gauges via Ops Agent scrape -> managed prometheus
-  cloudlog  logNames liquidity-trades / liquidity-transfers /
-            liquidity-botlogs via Cloud Logging entries.write
+  cloudlog  the exporter's logNames liquidity-trades / liquidity-transfers /
+            liquidity-botlogs (Cloud Logging entries.write), or the bot's
+            own log, liquidity-bot (its JSON stdout)
 
 Layout mirrors the SPA's tabs as rows, in tab order: header strip,
-Dashboard (inventory | trades | transfers, 14/10 split: the SPA's 11fr/9fr
-is 13/11, but Grafana's panel padding needs the extra unit to fit the USDC
-row's three panels; checked with no sideways scroll on a 1934px-wide
-viewport, and the fixed column widths do overflow near 1600px), Orders, PnL, Performance, Logs — then the pre-exporter
+Dashboard (inventory tables | trades over rebalances, a 13/11 split like
+the SPA's 11fr/9fr; checked with no sideways scroll on a 1934px-wide
+viewport), Orders, PnL, Performance, Logs — then the pre-exporter
 native-metric rows (t0-liquidity-native-rows.json), collapsed.
 
 Two Grafana-side patterns worth knowing before editing:
@@ -41,14 +46,48 @@ Two Grafana-side patterns worth knowing before editing:
     maxDataPoints itself (see latest_status_table).
 """
 
+import filecmp
 import json
 import os
+import re
+import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 NATIVE_ROWS = os.path.join(HERE, "t0-liquidity-native-rows.json")
 
+# The bot serves liq_* on its own /metrics too, so an unpinned liq_ selector
+# would sum the exporter and the bot together. Every liq_ selector on these
+# boards reads the one job the `source` variable picks (SOURCE_VAR). PromQL
+# anchors a regex matcher, so the bot's value never matches the exporter job.
+LIQ_JOB_MATCHER = 'job=~"$source"'
+# The exporter sidecar's scrape job, the `source` variable's exporter value.
+EXPORTER_JOB = "t0-liquidity-exporter"
+# The header's Bot light. The bot source has no liq_up and reads its scrape's
+# up. The exporter source never falls back to up: the exporter's own up says
+# nothing about the bot, so a stopped exporter shows no data, not red.
+# pin_liq leaves both selectors alone, since each already names its job.
+LIQ_UP = ('max(liq_up{job=~"$source"}) or '
+          f'max(up{{job=~"$source",job!="{EXPORTER_JOB}"}})')
+LIQ_NAME = re.compile(r"(?<![A-Za-z0-9_:])liq_[a-z0-9_]+")
+LIQ_PREFIX = re.compile(r"(?<![A-Za-z0-9_:])liq_")
+
 CM = {"type": "stackdriver", "uid": "cloudmon"}
 CL = {"type": "googlecloud-logging-datasource", "uid": "cloudlog"}
+
+# The log panels follow `source` too. A Cloud Logging query cannot pick its
+# log by a variable, so each panel queries both logs, as refIds
+# exporter-<name> and bot-<name>, and its first transformation keeps the
+# frame of the source picked (pick_source). check_log_sources fails on a
+# log panel that does not. The bot's log is its stdout, with every field of a
+# JSON line at jsonPayload.<field>; it holds lines only once the bot logs
+# JSON.
+SOURCES = ("exporter", "bot")
+BOT_LOG = 'logName="projects/$env/logs/liquidity-bot"'
+EXPORTER_LOGS = ("liquidity-trades", "liquidity-transfers", "liquidity-botlogs")
+# The bot writes no order lines, so Orders reads the exporter's log on
+# either source.
+EXPORTER_ONLY_LOG = "liquidity-orders"
 
 _id = [0]
 
@@ -62,7 +101,145 @@ def nid():
 # Target + panel helpers
 # --------------------------------------------------------------------------
 
-def promql(expr, legend=None, instant=False, ref="A", step="60s"):
+# Spans of a PromQL expression where a liq_ name is not a selector: string
+# literals ("...", '...', `...`) and the label lists of by, without, on,
+# ignoring, group_left and group_right.
+PROMQL_STRING = re.compile(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|`[^`]*`')
+PROMQL_LABEL_LIST = re.compile(
+    r"(?<![A-Za-z0-9_:])(?:by|without|on|ignoring|group_left|group_right)"
+    r"\s*(\([^()]*\))")
+
+
+def _not_selector_spans(expr):
+    strings = [found.span() for found in PROMQL_STRING.finditer(expr)]
+    in_string = lambda pos: any(start <= pos < end for start, end in strings)
+    lists = [found.span(1) for found in PROMQL_LABEL_LIST.finditer(expr)
+             if not in_string(found.start())]
+    return strings + lists
+
+
+def _liq_names(pattern, expr):
+    """`pattern`'s matches in `expr` outside the spans where a liq_ name is
+    not a selector."""
+    spans = _not_selector_spans(expr)
+    return [found for found in pattern.finditer(expr)
+            if not any(start <= found.start() < end for start, end in spans)]
+
+
+def _matchers_close(expr, open_pos):
+    """The index of the `}` closing the label matchers that open at
+    `open_pos`, skipping string literals, or -1."""
+    pos = open_pos + 1
+    while pos < len(expr):
+        literal = PROMQL_STRING.match(expr, pos)
+        if literal:
+            pos = literal.end()
+        elif expr[pos] == "}":
+            return pos
+        else:
+            pos += 1
+    return -1
+
+
+def pin_liq(expr):
+    """Adds the `source` job matcher to every liq_ selector in `expr`.
+
+    Handles bare names (`liq_x` -> `liq_x{job="..."}`) and names that already
+    carry matchers (`liq_x{a="b"}` -> `liq_x{job="...",a="b"}`). A selector
+    that already names a job is left for `unpinned_liq_selectors` to judge.
+    A liq_ name inside a string literal or a by/on/... label list is not a
+    selector and stays as it is.
+    """
+    out = []
+    pos = 0
+    for match in _liq_names(LIQ_NAME, expr):
+        if match.start() < pos:
+            continue
+        out.append(expr[pos:match.end()])
+        pos = match.end()
+        if not expr.startswith("{", pos):
+            out.append("{" + LIQ_JOB_MATCHER + "}")
+            continue
+        close = _matchers_close(expr, pos)
+        if close == -1:
+            raise SystemExit(f"unterminated label matcher in PromQL: {expr}")
+        matchers = expr[pos + 1:close].strip()
+        if re.search(r"(?<![A-Za-z0-9_])job\s*[=!]", matchers):
+            continue
+        pinned = LIQ_JOB_MATCHER + ("," + matchers if matchers else "")
+        out.append("{" + pinned + "}")
+        pos = close + 1
+    out.append(expr[pos:])
+    return "".join(out)
+
+
+def unpinned_liq_selectors(expr):
+    """Every liq_ occurrence in `expr` that is not a selector pinned to
+    exactly LIQ_JOB_MATCHER, outside string literals and label lists. A
+    templated name such as `liq_$col` is never a valid selector, so it is
+    reported too: the check fails closed. So is a nameless selector whose
+    `__name__` matcher can pick a liq_ series (see _name_matcher_selectors),
+    which pin_liq does not pin."""
+    pinned = {match.start() for match in _liq_names(LIQ_NAME, expr)
+              if _selector_is_pinned(expr, match.end())}
+    return [expr[found.start():found.start() + 40]
+            for found in _liq_names(LIQ_PREFIX, expr)
+            if found.start() not in pinned] + _name_matcher_selectors(expr)
+
+
+PROMQL_MATCHER = re.compile(
+    r"([A-Za-z_][A-Za-z0-9_]*)\s*(=~|!~|!=|=)\s*"
+    r"(\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'|`[^`]*`)")
+
+
+def _name_matcher_selectors(expr):
+    """Every nameless selector in `expr`, `{__name__=...}` or `{"name"}`,
+    that can read a liq_ series and is not pinned to exactly
+    LIQ_JOB_MATCHER. Its metric name is a string literal, which pin_liq
+    never touches. An equality matcher counts when its value names a liq_
+    metric; a regex or negative matcher always counts, since it can match a
+    liq_ name. A bare quoted string as the first item is Prometheus's
+    quoted metric name, `{__name__="name"}`, and counts when it names a
+    liq_ metric."""
+    strings = [found.span() for found in PROMQL_STRING.finditer(expr)]
+    found = []
+    for pos, char in enumerate(expr):
+        if char != "{" or any(start <= pos < end for start, end in strings):
+            continue
+        if pos and re.match(r"[A-Za-z0-9_:]", expr[pos - 1]):
+            continue
+        close = _matchers_close(expr, pos)
+        if close == -1:
+            continue
+        inner = expr[pos + 1:close]
+        matchers = PROMQL_MATCHER.findall(inner)
+        quoted_name = re.match(r"\s*(" + PROMQL_STRING.pattern + r")\s*(?:,|$)",
+                               inner)
+        reads_liq = any(
+            label == "__name__"
+            and (op != "=" or LIQ_PREFIX.match(value[1:-1]))
+            for label, op, value in matchers) or bool(
+                quoted_name and LIQ_PREFIX.match(quoted_name.group(1)[1:-1]))
+        jobs = [f"{label}{op}{value}" for label, op, value in matchers
+                if label == "job"]
+        if reads_liq and jobs != [LIQ_JOB_MATCHER]:
+            found.append(expr[pos:pos + 40])
+    return found
+
+
+def _selector_is_pinned(expr, name_end):
+    if not expr.startswith("{", name_end):
+        return False
+    close = _matchers_close(expr, name_end)
+    if close == -1:
+        return False
+    matchers = [part.strip() for part in expr[name_end + 1:close].split(",")]
+    jobs = [part for part in matchers if re.match(r"job\s*(=|!=|=~|!~)", part)]
+    return jobs == [LIQ_JOB_MATCHER]
+
+
+def promql(expr, instant=False, ref="A", step="60s"):
+    expr = pin_liq(expr)
     target = {
         "refId": ref,
         "datasource": CM,
@@ -73,11 +250,26 @@ def promql(expr, legend=None, instant=False, ref="A", step="60s"):
     }
     if instant:
         target["instant"] = True
-    if legend:
-        # NOTE: top-level, not inside promQLQuery — the stackdriver plugin
-        # only honors it there (see st0x-pricing.json).
-        target["legendFormat"] = legend
+    # NOTE: no legendFormat. Grafana 13.1.0's Cloud Monitoring query has no
+    # such field, and its PromQL path returns the frames with no alias or
+    # legend applied, so a legendFormat names nothing. A panel names its
+    # series with series_names instead (check_series_names).
     return target
+
+
+def series_names(names, colors=None):
+    """Field overrides that name each PromQL target's series: `names` maps
+    a refId to its display name, which may template a series label as
+    `${__field.labels.<label>}`. `colors` maps a refId to a fixed colour.
+    The colour goes in the same override: a byName matcher sees the
+    series' name from before the displayName override, not the new one."""
+    colors = colors or {}
+    return [{"matcher": {"id": "byFrameRefID", "options": ref},
+             "properties": [{"id": "displayName", "value": name}] + (
+                 [{"id": "color", "value": {"mode": "fixed",
+                                            "fixedColor": colors[ref]}}]
+                 if ref in colors else [])}
+            for ref, name in names.items()]
 
 
 def cloudlog(query, ref="A"):
@@ -85,8 +277,21 @@ def cloudlog(query, ref="A"):
             "queryText": query, "queryType": "logs"}
 
 
+def source_targets(name, exporter_query, bot_query):
+    """One log panel's two queries: the exporter's and the bot's."""
+    return [cloudlog(exporter_query, ref=f"exporter-{name}"),
+            cloudlog(bot_query, ref=f"bot-{name}")]
+
+
+def pick_source(name):
+    """Keeps only the frame of the source picked. Grafana interpolates
+    variables in transformation options, and refIds match exactly."""
+    return {"id": "filterByRefId",
+            "options": {"include": "${source:text}-" + name}}
+
+
 def stat(title, desc, expr, display=None, unit="short", decimals=None,
-         steps=None, mappings=None, w=3, h=3, x=0, y=0, legend=None,
+         steps=None, mappings=None, w=3, h=3, x=0, y=0,
          text_mode="value_and_name", color_mode="value", value_size=None):
     options_text = {}
     if value_size:
@@ -108,7 +313,7 @@ def stat(title, desc, expr, display=None, unit="short", decimals=None,
     return {
         "id": nid(), "type": "stat", "title": title, "description": desc,
         "datasource": CM,
-        "targets": [promql(expr, instant=True, legend=legend)],
+        "targets": [promql(expr, instant=True)],
         "transparent": True,
         "gridPos": {"h": h, "w": w, "x": x, "y": y},
         "fieldConfig": {"defaults": defaults, "overrides": []},
@@ -155,12 +360,13 @@ def timeseries(title, desc, targets, w=8, h=8, x=0, y=0, unit="short",
     }
 
 
-def bargauge(title, desc, expr, legend, unit="ms", w=8, h=8, x=0, y=0,
+def bargauge(title, desc, expr, name, unit="ms", w=8, h=8, x=0, y=0,
              steps=None, decimals=0):
+    """`name` names each bar, see series_names."""
     return {
         "id": nid(), "type": "bargauge", "title": title, "description": desc,
         "datasource": CM,
-        "targets": [promql(expr, legend=legend, instant=True)],
+        "targets": [promql(expr, instant=True)],
         "gridPos": {"h": h, "w": w, "x": x, "y": y},
         "fieldConfig": {
             "defaults": {
@@ -169,7 +375,7 @@ def bargauge(title, desc, expr, legend, unit="ms", w=8, h=8, x=0, y=0,
                                "steps": steps or [{"color": "blue", "value": None}]},
                 "mappings": [],
             },
-            "overrides": [],
+            "overrides": series_names({"A": name}),
         },
         "options": {
             "displayMode": "gradient", "orientation": "horizontal",
@@ -192,6 +398,9 @@ def or_chain(cols, row_label="symbol"):
     (instance, job, cluster...) so the table transformations see clean frames.
     """
     return " or ".join(
+        # name None: the expression already carries its own col label (a
+        # column per chain, see native_inventory).
+        expr if name is None else
         f'sum by ({row_label}, col) '
         f'(label_replace({expr}, "col", "{name}", "", ""))'
         for expr, name in cols
@@ -335,8 +544,12 @@ def cloudlog_table(title, desc, query, columns, w=12, h=9, x=0, y=0,
                    widths=None, mappings_by_field=None, time_from=None,
                    number_columns=None, time_columns=None, time_name="Time",
                    order_override=None, time_unit="time:MMM D, HH:mm:ss",
-                   hide_time=False, dedup_by=None):
+                   hide_time=False, dedup_by=None, source=None):
     """columns: list of (raw_field, display_name).
+
+    source: (name, bot_query) for a panel that follows `source`: `query`
+      is then the exporter's, and the panel keeps the picked source's frame
+      (pick_source). Without it the panel reads only `query`.
 
     number_columns: {display_name: decimals} — the payload ships decimal
       STRINGS; convertFieldType turns them numeric so decimals apply
@@ -400,10 +613,12 @@ def cloudlog_table(title, desc, query, columns, w=12, h=9, x=0, y=0,
     return {
         "id": nid(), "type": "table", "title": title, "description": desc,
         "datasource": CL,
-        "targets": [cloudlog(query)],
+        "targets": (source_targets(source[0], query, source[1]) if source
+                    else [cloudlog(query)]),
         **({"timeFrom": time_from} if time_from else {}),
         "gridPos": {"h": h, "w": w, "x": x, "y": y},
         "transformations": [
+            *([pick_source(source[0])] if source else []),
             # `labels` is a JSON object per row; extractFields lifts each
             # key into its own column, dotted names kept verbatim (it
             # only JSON-parses strings, an object goes straight to
@@ -474,39 +689,7 @@ SIDE_MAPPINGS = [
         "sell": {"text": "sell", "color": "red", "index": 1},
     }},
 ]
-LIGHT_MAPPINGS = [
-    {"type": "value", "options": {
-        "1": {"text": "●", "color": "green", "index": 0},
-        "0": {"text": "●", "color": "red", "index": 1},
-    }},
-    {"type": "special", "options": {"match": "null+nan",
-                                    "result": {"text": "○", "color": "text",
-                                               "index": 2}}},
-]
 
-USD = [{"id": "unit", "value": "currencyUSD"}, {"id": "decimals", "value": 2}]
-USD_SIGNED = USD + [
-    {"id": "custom.cellOptions", "value": {"type": "color-text"}},
-    {"id": "thresholds", "value": {"mode": "absolute", "steps": [
-        {"color": "red", "value": None}, {"color": "text", "value": -0.01},
-        {"color": "green", "value": 0.01}]}},
-]
-PCT = [
-    {"id": "unit", "value": "percentunit"}, {"id": "decimals", "value": 1},
-    # Inline bar plus percent, like the SPA's Ratio progress bar. The bar
-    # shares the cell with the percent text, so the column needs the width.
-    {"id": "custom.cellOptions", "value": {"type": "gauge", "mode": "basic",
-                                            "valueDisplayMode": "text"}},
-    {"id": "min", "value": 0}, {"id": "max", "value": 1},
-    {"id": "thresholds", "value": {"mode": "absolute", "steps": [
-        {"color": "blue", "value": None}]}},
-]
-LIGHT = [
-    {"id": "mappings", "value": LIGHT_MAPPINGS},
-    {"id": "custom.cellOptions", "value": {"type": "color-text"}},
-    {"id": "custom.align", "value": "center"},
-    {"id": "custom.width", "value": 40},
-]
 
 # ==========================================================================
 # Value mappings shared by the row tables — the SPA capitalizes and
@@ -561,10 +744,6 @@ STATUS_DOT_MAPPINGS = [
     }},
 ]
 
-# The SPA renders plain locale numbers (37,934.83) — no $ prefix, no SI
-# abbreviation — in the inventory tables. "locale" is Grafana's
-# toLocaleString unit; it never abbreviates.
-NUM = [{"id": "unit", "value": "locale"}, {"id": "decimals", "value": 2}]
 # The stackdriver plugin runs a range query even for an `instant` target, so
 # a latest-value panel on the 24h dashboard pulled every 60s point of the day
 # (27,092 points for the equity table) just to show the newest one. A 5m
@@ -577,26 +756,8 @@ LATEST_ONLY = {"timeFrom": "5m", "hideTimeOverride": False}
 LATEST_ONLY_HIDDEN = {"timeFrom": "5m", "hideTimeOverride": True}
 
 
-# The SPA packs the inventory columns tight (64px bars, short numbers), so the
-# whole table fits beside the trade list. Grafana's auto widths are about
-# twice that and push Ratio and Exposure off the right edge.
-def width(px):
-    return [{"id": "custom.width", "value": px}]
-
-
 # The SPA's timestamp style: "Jul 31, 13:31:50 UTC" (D7).
 TIME_FMT = [{"id": "unit", "value": "time:MMM D, HH:mm:ss [UTC]"}]
-# D5: narrow ratio-deviation column after "Ratio", in band widths
-# ((ratio - target) / deviation): outside +/-1 is colored, inside the band
-# renders in plain text.
-DELTA = [
-    {"id": "unit", "value": "short"}, {"id": "decimals", "value": 1},
-    {"id": "custom.cellOptions", "value": {"type": "color-text"}},
-    {"id": "custom.width", "value": 45},
-    {"id": "thresholds", "value": {"mode": "absolute", "steps": [
-        {"color": "red", "value": None}, {"color": "text", "value": -1},
-        {"color": "green", "value": 1}]}},
-]
 
 # ==========================================================================
 # The tab suite: five dashboards, one per SPA tab, cross-linked with a
@@ -604,27 +765,32 @@ DELTA = [
 # theme=light so the suite renders in the SPA's light look regardless of
 # the viewer's Grafana theme preference.
 # ==========================================================================
+# Each tab carries its own symbol in its label. Grafana's link buttons take
+# only seven built-in icons (external link, dashboard, question, info, bolt,
+# doc, cloud), too few to tell five tabs apart.
 TABS = [
-    ("Dashboard", "t0-liquidity"),
-    ("Orders", "t0-liquidity-orders"),
-    ("PnL", "t0-liquidity-pnl"),
-    ("Performance", "t0-liquidity-performance"),
-    ("Logs", "t0-liquidity-logs"),
+    ("Dashboard", "t0-liquidity", "📊"),
+    ("Orders", "t0-liquidity-orders", "📋"),
+    ("PnL", "t0-liquidity-pnl", "💵"),
+    ("Performance", "t0-liquidity-performance", "⚡"),
+    ("Logs", "t0-liquidity-logs", "📜"),
 ]
 
 
 def tab_links(active):
     links = []
-    for name, uid in TABS:
+    for name, uid, symbol in TABS:
         links.append({
             "type": "link",
-            "title": f"▸ {name}" if name == active else name,
+            # A no-break space: Grafana trims a plain one after the symbol.
+            "title": (f"▸ {symbol}\u00a0{name}" if name == active
+                      else f"{symbol}\u00a0{name}"),
             # autofitpanels stretches the board to the window height, like
             # the SPA's full-height layout. Only the Dashboard tab: the
             # other tabs hold too many panels to squeeze into one screen.
             "url": f"/d/{uid}/?theme=light"
                    + ("&autofitpanels" if uid == "t0-liquidity" else ""),
-            "icon": "dashboard", "targetBlank": False,
+            "targetBlank": False,
             "keepTime": True, "includeVars": True,
             "asDropdown": False, "tags": [], "tooltip": "",
         })
@@ -637,67 +803,88 @@ def tab_links(active):
     return links
 
 
-def pills(y):
-    """The SPA's header + settings bar as one thin pill row, repeated on
-    every tab like the SPA repeats its header. One grid row tall: a pill
-    with an empty title gets a hover-only header, so the value fills the
-    30px row instead of sitting under a title line.
+def panel_module(name):
+    """A liquidity-panels script to prepend to an afterRender. Its export
+    line is for the SPA test; afterRender is not a module."""
+    with open(os.path.join(HERE, "liquidity-panels", name)) as f:
+        return "".join(line for line in f if not line.startswith("export "))
 
-    The SPA has no Mode or CT-assets pill, so this row has neither. A stat cannot
-    join two series into one string, so the Equity and USDC pills show
-    the target only; the band is in their descriptions."""
-    def pill(title, desc, expr, display=None, unit="short", decimals=None,
-             mappings=None, legend=None, text_mode="value_and_name", x=0,
-             w=3):
-        return {**stat(title, desc, expr, display=display, unit=unit,
-                       decimals=decimals, mappings=mappings, legend=legend,
-                       text_mode=text_mode,
-                       color_mode="none" if not mappings else "value",
-                       w=w, h=1, x=x, y=y, value_size=14),
-                **LATEST_ONLY_HIDDEN}
 
-    return [
-        pill("", "The SPA header's connection light: is the bot process up "
-             "and answering /health? '—' means the exporter itself is not "
-             "reporting.",
-             "max(liq_up)", display="Bot",
-             mappings=[{"type": "value", "options": {
-                 "1": {"text": "Connected", "color": "green", "index": 0},
-                 "0": {"text": "Disconnected", "color": "red", "index": 1}}}],
-             x=0, w=3),
-        {**pill("", "Deployed commit, from /health, cut to 7 "
-                "characters like the SPA header. The stackdriver plugin "
-                "runs a range query even for an instant target, so over "
-                "the dashboard's 24h the previous commit is a second series "
-                "and its name drew over this one. PromQL also keeps a "
-                "stopped series for its 5m lookback, so topk on the sample "
-                "timestamp keeps only the commit with the newest sample, "
-                "over a 1m window.",
-                # max by drops every other label: this datasource ignores
-                # legendFormat, so the series name must be the commit alone.
-                'max by (git_commit) (topk(1, label_replace('
-                'timestamp(liq_bot_info), "git_commit", "$1", "git_commit", '
-                '"(.{7}).*")))',
-                legend="{{git_commit}}", text_mode="name", x=3, w=3),
-         "timeFrom": "1m"},
-        pill("", "Bot process uptime, from /health uptimeSeconds.",
-             "time() - max(liq_bot_start_timestamp_seconds)",
-             display="Uptime", unit="s", decimals=0, x=6, w=3),
-        pill("", "The SPA settings bar's Broker pill.",
-             "sum by (broker) (liq_settings_info)",
-             legend="{{broker}}", text_mode="name", x=9, w=3),
-        pill("", "Equity rebalance target. The SPA pill also shows the "
-             "band: target +/- liq_settings_equity_deviation.",
-             "max(liq_settings_equity_target)", display="Equity",
-             unit="percentunit", decimals=0, x=12, w=4),
-        pill("", "USDC rebalance target. The SPA pill also shows the "
-             "band: target +/- liq_settings_usdc_deviation.",
-             "max(liq_settings_usdc_target)", display="USDC",
-             unit="percentunit", decimals=0, x=16, w=4),
-        pill("", "Hedge execution threshold (settings bar 'Trigger').",
-             "max(liq_settings_execution_threshold_usd)", display="Trigger",
-             unit="currencyUSD", decimals=0, x=20, w=4),
-    ]
+def pills(y, w=24):
+    """The SPA's HeaderBar and SettingsBar as one Business Text row,
+    repeated on every tab like the SPA repeats its header: the settings
+    pills (broker, Equity and USDC targets with their bands, Trigger,
+    Reserve) and a Config button on the left; the CLI recovery guide
+    button, a UTC clock, the commit, uptime, and the connection badge on
+    the right. Config and the recovery guide open the SPA's dialogs.
+
+    Every series carries a `k` label naming it; liquidity-panels/header.js
+    reads the rows by `k` (liquidity-panels/header-rows.js). The commit and
+    info series are their sample timestamps, so the script can keep the
+    newest label set when a deploy or restart leaves the previous one in the
+    lookback window. The recovery guide is static data exported
+    from the SPA (liquidity-panels/recovery-guide.json) and prepended to
+    the script with client-env.js, which retargets its commands at the
+    board's environment.
+
+    w: the Dashboard tab narrows it to 23 to fit the detail panel beside
+    it (see detail_panel()).
+    """
+    def named(expr, name):
+        return f'label_replace({expr}, "k", "{name}", "", "")'
+
+    expr = " or ".join([
+        named(LIQ_UP, "up"),
+        named("time() - max(liq_bot_start_timestamp_seconds)", "uptime"),
+        named("max by (git_commit) (timestamp(liq_bot_info))", "commit"),
+        named("max by (broker, log_level, wallet_kind, wallet_address, orderbook, "
+              "turnkey_organization, server_port) (timestamp(liq_settings_info))",
+              "info"),
+        named("max(liq_settings_equity_target)", "equity_target"),
+        named("max(liq_settings_equity_deviation)", "equity_deviation"),
+        named("max(liq_settings_usdc_target)", "usdc_target"),
+        named("max(liq_settings_usdc_deviation)", "usdc_deviation"),
+        named("max(liq_settings_execution_threshold_usd)", "trigger"),
+        named("max(liq_settings_cash_reserved)", "cash_reserved"),
+        named("max(liq_settings_order_polling_seconds)", "order_polling"),
+        named("max(liq_settings_inventory_poll_seconds)", "inventory_polling"),
+        named("max(liq_settings_deployment_block)", "deployment_block"),
+    ])
+    with open(os.path.join(HERE, "liquidity-panels", "recovery-guide.json")) as f:
+        guide = json.load(f)
+    after_render = (f"const RECOVERY_GUIDE = {json.dumps(guide)};\n\n"
+                    + panel_module("client-env.js") + "\n"
+                    + panel_module("header-rows.js") + "\n"
+                    + panel_module("copy-command.js") + "\n"
+                    + panel_module("header.js"))
+    with open(os.path.join(HERE, "liquidity-panels", "header.css")) as f:
+        styles = f.read()
+    return [{
+        "id": nid(), "type": "marcusolsson-dynamictext-panel", "title": "",
+        "description": "The SPA header: settings pills, Config, the CLI "
+                       "recovery guide, the deployed commit, uptime, and "
+                       "whether the bot is up: the exporter's liq_up, or "
+                       "the bot scrape's up on the bot source.",
+        "datasource": CM,
+        "targets": [promql(expr, instant=True)],
+        "transparent": True,
+        "gridPos": {"h": 1, "w": w, "x": 0, "y": y},
+        "transformations": [
+            {"id": "labelsToFields", "options": {}},
+            {"id": "merge", "options": {}},
+        ],
+        "options": {
+            "renderMode": "allRows",
+            "editor": {"format": "auto", "language": "html"},
+            "content": "<div></div>",
+            "defaultContent": "No bot data.",
+            "helpers": "",
+            "afterRender": after_render,
+            "styles": styles,
+            "wrap": False,
+        },
+        **LATEST_ONLY_HIDDEN,
+    }]
 
 
 # The SPA's PnL range buttons (1W / 1M / YTD / 1Y / All). PnL is a windowed
@@ -722,6 +909,26 @@ WINDOW_VAR = {
         {"selected": False, "text": "1Y", "value": "1y"},
         {"selected": False, "text": "All", "value": "all"},
     ],
+}
+
+# Which job's liq_* series the boards read. The exporter sidecar is the
+# default until Stage 4 of the migration flips it to the bot; the bot's job is
+# t0-liquidity in production and t0-liquidity-staging in staging, and `env`
+# already picks the project, so one regex covers both.
+SOURCE_VAR = {
+    "name": "source", "type": "custom", "label": "Source",
+    "description": "Which process serves the liq_* metrics: the exporter "
+                   "sidecar (the default for now) or the bot's own "
+                   "/metrics. Pick bot to compare the two.",
+    "query": f"exporter : {EXPORTER_JOB}, "
+             "bot : t0-liquidity|t0-liquidity-staging",
+    "includeAll": False, "multi": False, "hide": 0,
+    "current": {"selected": True, "text": "exporter",
+                "value": EXPORTER_JOB},
+    "options": [{"selected": True, "text": "exporter",
+                 "value": EXPORTER_JOB},
+                {"selected": False, "text": "bot",
+                 "value": "t0-liquidity|t0-liquidity-staging"}],
 }
 
 ENV_VAR = {
@@ -766,143 +973,633 @@ def make_dashboard(uid, title, description, panels, links, variables):
 dashboards = []
 
 # ==========================================================================
-# Tab 1: Dashboard — the SPA's Inventory card (cash row + equity table)
-# on the left, Trade History / Cross-venue Transfers stacked right.
+# Tab 1: Dashboard: the SPA's Inventory card as Grafana tables (USD at
+# Alpaca, USD on each chain, equities) on the left, Trades / Rebalances
+# stacked right.
 # ==========================================================================
 panels = []
-panels += pills(0)
+panels += pills(0, w=23)
 
-def usdc(metric):
-    return f'label_replace({metric}, "row", "USDC", "", "")'
+def native_table(title, desc, expr, row_label, columns, w, h, x, y,
+                 first_col, sort_by=(), widths=None, bars=(),
+                 align="right", stretch=None, first_col_mappings=None):
+    """A Grafana table from one or-chain query pivoted on (row_label, col),
+    like matrix_table. columns: [(col, display name, [field override
+    properties])]; bars: columns drawn as HTML bars (see bar_cell);
+    sort_by: the default sort, a list of {displayName, desc}, first key
+    first."""
+    matrix_key = f"{row_label}\\col"
+    names = {col: name for col, name, _ in columns}
+    # Fixed widths, except one `stretch` column that takes the rest of the
+    # card, so the table ends at the card's edge.
+    widths = {col: px for col, px in (widths or {}).items() if col != stretch}
+    # A stretching column otherwise never goes under Grafana's 150px
+    # default, which overflows a card whose fixed columns leave less.
+    stretch_props = ([{"matcher": {"id": "byName", "options": names[stretch]},
+                       "properties": [{"id": "custom.minWidth", "value": 60}]}]
+                     if stretch else [])
+    overrides = [{"matcher": {"id": "byName", "options": names[col]},
+                  "properties": [*(props or []),
+                                 *([{"id": "custom.width", "value": widths[col]}]
+                                   if col in widths else [])]}
+                 for col, _, props in columns if props or col in widths]
+    return {
+        "id": nid(), "type": "table", "pluginVersion": "13.1.0",
+        "title": title, "description": desc,
+        "datasource": CM,
+        "targets": [promql(expr, instant=True)],
+        "gridPos": {"h": h, "w": w, "x": x, "y": y},
+        "transformations": [
+            {"id": "labelsToFields", "options": {}},
+            {"id": "merge", "options": {}},
+            {"id": "groupBy", "options": {"fields": {
+                row_label: {"operation": "groupby", "aggregations": []},
+                "col": {"operation": "groupby", "aggregations": []},
+                "Value": {"operation": "aggregate",
+                          "aggregations": ["lastNotNull"]},
+            }}},
+            {"id": "groupingToMatrix",
+             "options": {"columnField": "col", "rowField": row_label,
+                         "valueField": "Value (lastNotNull)",
+                         "emptyValue": "null"}},
+            {"id": "organize", "options": {
+                "excludeByName": {},
+                "indexByName": {name: index for index, name in enumerate(
+                    [matrix_key] + [col for col, _, _ in columns])},
+                "renameByName": {matrix_key: first_col, **names}}},
+            # Regex value mappings only read strings (see bar_cell).
+            *([{"id": "convertFieldType", "options": {"conversions": [
+                {"targetField": col, "destinationType": "string"}
+                for col in bars]}}] if bars else []),
+        ],
+        "fieldConfig": {
+            "defaults": {"unit": "locale", "decimals": 2,
+                         "custom": {"align": align, "filterable": True,
+                                    "cellOptions": {"type": "auto"}},
+                         "thresholds": {"mode": "absolute", "steps": [
+                             {"color": "red", "value": None}]},
+                         "mappings": []},
+            "overrides": [
+                {"matcher": {"id": "byName", "options": first_col},
+                 "properties": [{"id": "custom.align", "value": "left"},
+                                {"id": "custom.width",
+                                 "value": widths.get(row_label, 90)},
+                                *([{"id": "mappings",
+                                    "value": first_col_mappings}]
+                                  if first_col_mappings else [])]},
+                *overrides,
+                *stretch_props,
+            ],
+        },
+        "options": {"showHeader": True, "cellHeight": "md",
+                    **({"sortBy": list(sort_by)} if sort_by else {})},
+        **LATEST_ONLY,
+    }
 
 
-def usdc_group(title, desc, cols, w, x, overrides, show_asset=False,
-               latest=LATEST_ONLY):
-    """One slice of the SPA's USDC row. The SPA groups its right-hand
-    columns under "Alpaca" and "Wallets" header cells; a Grafana table has
-    no grouped headers, so each group is its own panel and the panel title
-    is the group header."""
-    panel = matrix_table(
-        title, desc, or_chain([(usdc(metric), name) for metric, name in cols],
-                              row_label="row"),
-        "row", w=w, h=4, x=x, y=1, first_col="Asset",
-        column_order=[name for _, name in cols], unit_overrides=overrides,
-        decimals=2)
-    if not show_asset:
-        panel["transformations"][-1]["options"]["excludeByName"]["row\\col"] = True
-    # Grafana gives a column without a width a 150px minimum, which made
-    # these narrow panels scroll; 40px lets an auto column take what is left.
-    panel["fieldConfig"]["defaults"]["custom"]["minWidth"] = 40
-    return {**panel, **latest}
+
+# Added to a banded percent before its sign, so an out-of-band 0% is -0.0001
+# and not -0, which Grafana writes as "0" (in band). The bar cell's regex
+# keeps one decimal, so the offset never shows.
+BAND_SIGN_OFFSET = 0.0001
 
 
-panels.append(usdc_group(
-    "Inventory",
-    "The SPA's USDC row: Raindex + Alpaca Total + Inflight = Total; Ratio "
-    "= Raindex/(Raindex+Alpaca Total); Δ = deviation from the target ratio "
-    "in band widths, colored outside +/-1, where the SPA colors its bar.",
-    [("liq_usdc_onchain_available", "Raindex"),
-     ("liq_usdc_inflight_total", "Inflight"),
-     ("liq_usdc_alpaca_total", "Alpaca Total"),
-     ("liq_usdc_total", "Total"),
-     ("liq_usdc_ratio", "Ratio"),
-     ("liq_usdc_ratio_deviation and liq_usdc_total > 0", "Δ")],
-    w=7, x=0, show_asset=True,
-    # 90px fits a six-figure balance ("104,302.08"); Ratio gives up the
-    # width, since its bar is redrawn in part 2 anyway.
-    overrides={"Asset": width(50), "Inflight": NUM + width(80),
-               **{c: NUM + width(90) for c in
-                  ["Raindex", "Alpaca Total", "Total"]},
-               "Ratio": PCT + width(75), "Δ": DELTA}))
-panels.append(usdc_group(
-    "Alpaca",
-    "Rebalanceable = max(0, withdrawable − reserve). Counter-tradeable "
-    "deliberately equals Alpaca Total (reserve NOT subtracted, same as the "
-    "SPA).",
-    [("liq_usdc_alpaca_usdc", "USDC"),
-     ("liq_usdc_rebalanceable", "Rebalanceable"),
-     ("liq_usdc_alpaca_total", "Counter-tradeable")],
-    w=4, x=7, overrides={"USDC": NUM + width(90),
-                         "Rebalanceable": NUM + width(105),
-                         # No width: it takes the rest of the panel.
-                         "Counter-tradeable": NUM}))
-panels.append(usdc_group(
-    "Wallets",
-    "USDC seen in the bot's Ethereum and Base wallets: sanity checks, not "
-    "part of Total.",
-    [("liq_usdc_inflight_ethereum_wallet", "Eth"),
-     ("liq_usdc_inflight_base_wallet", "Base")],
-    w=3, x=11, overrides={"Eth": NUM + width(80), "Base": NUM},
-    # Three units are too narrow for the title and the badge: Grafana drops
-    # the title, so this panel hides the badge like the header pills.
-    latest=LATEST_ONLY_HIDDEN))
+# A ratio outside [0, 1], from a negative balance say, is no share a bar can
+# draw: every bar encoding sends it to OUT_OF_RANGE instead. That value
+# matches none of the bar cell's percent patterns, so the cell writes
+# "out of range" for it (see bar_cell).
+OUT_OF_RANGE = 2000
 
-equity_expr = or_chain([
-    ("liq_asset_counter_trading", "CT"),
-    ("liq_asset_rebalancing", "Rebal"),
-    ("liq_asset_extended_hours", "Ext"),
-    ("liq_equity_onchain_available", "Raindex"),
-    ("liq_equity_inflight_total", "Inflight"),
-    ("liq_equity_offchain_available", "Alpaca"),
-    ("liq_equity_total", "Total"),
-    ("liq_equity_ratio", "Ratio"),
-    ("liq_equity_ratio_deviation and liq_equity_total > 0", "Δ"),
-    # The exporter emits Exposure only for a priced symbol. NaN for the rest
-    # keeps the column in the matrix when no symbol has a price, and NaN hits
-    # the "—" mapping like the SPA's dash.
-    ("liq_equity_exposure_usd or (liq_equity_total * NaN)", "Exposure"),
-    ("liq_equity_unwrapped", "Unwrapped"),
-    ("liq_equity_wrapped", "Wrapped"),
-])
-panels.append({**matrix_table(
-    "",
-    "The SPA inventory equity table: CT / Rebal / Ext status lights from "
-    "settings; Raindex / Inflight / Alpaca / Total share balances; Ratio = "
-    "onchain/(onchain+offchain); Δ = deviation from the target ratio in "
-    "band widths, colored outside +/-1; Exposure = net × last price. "
-    "Unwrapped/Wrapped are wallet-observed and not part of Total. Sorted "
-    "CT-first (desc) so counter-tradeable assets float to the top, like "
-    "the SPA.",
-    equity_expr, "symbol", w=14, h=24, x=0, y=5,
-    first_col="Asset",
-    column_order=["CT", "Rebal", "Ext", "Raindex", "Inflight", "Alpaca",
-                  "Total", "Ratio", "Δ", "Exposure", "Unwrapped", "Wrapped"],
-    unit_overrides={
-        "Asset": width(60),
-        "CT": LIGHT, "Rebal": LIGHT, "Ext": LIGHT,
-        **{c: NUM + width(70) for c in ["Raindex", "Inflight", "Alpaca",
-                                        "Total", "Wrapped"]},
-        "Unwrapped": NUM + width(80),
-        # Wider than the USDC row's: the gauge draws its bar in what the
-        # percent text leaves, and the SPA's bar is 64px.
-        "Ratio": PCT + width(140), "Δ": DELTA,
-        # The SPA prints "—" when the pricing service has no live price.
-        "Exposure": USD_SIGNED + width(80) + [{"id": "mappings", "value": [
-            {"type": "special", "options": {"match": "null+nan", "result": {
-                "text": "—", "color": "text", "index": 0}}}]}],
-    },
-    sort_by={"displayName": "CT", "desc": True},
-    decimals=2,
-), **LATEST_ONLY})
 
-def latest_status_table(title, desc, log, fields, shown, w, h, x, y,
-                        body_regex=None, number_columns=None, time_columns=(),
-                        overrides=(), sort_by=None):
+def in_range(ratio, encoded):
+    """`encoded` where `ratio` is in [0, 1], else OUT_OF_RANGE. A NaN ratio
+    stays NaN, which the bar cell leaves empty. The sentinel is built with
+    clamp, not `* 0`: clamp maps +Inf and -Inf (a share of a zero total) to
+    0 and keeps NaN, where `Inf * 0` is NaN and would show as no vault."""
+    bounded = f"((({ratio}) >= 0) <= 1)"
+    return (f"((({encoded}) and {bounded}) "
+            f"or ((clamp(({ratio}), 0, 0) + {OUT_OF_RANGE}) "
+            f"unless {bounded}))")
+
+
+def banded_pct(expr, inside):
+    """pct_bar's sign encoding: the percent rounded to 0.1, negative when
+    `inside` (a 0/1 PromQL bool) says it is outside the band."""
+    return in_range(expr, f"(round(100 * ({expr}), 0.1) + {BAND_SIGN_OFFSET}) "
+                          f"* (2 * {inside} - 1)")
+
+
+# Added to a percent the board cannot judge against a band, so the bar cell
+# draws it grey. A percent is at most 100, so a judged value never has four
+# integer digits and an unjudged one always does.
+UNJUDGED_OFFSET = 1000
+
+
+def unjudged_pct(expr):
+    """A percent with no band verdict: grey in a banded bar cell."""
+    return in_range(expr, f"round(100 * ({expr}), 0.1) + {UNJUDGED_OFFSET} "
+                          f"+ {BAND_SIGN_OFFSET}")
+
+
+def pct_bar(expr, band=None):
+    """A percent for an HTML bar cell (see BAR_CELL): the value as a percent
+    rounded to 0.1, negative when it is outside the rebalance band. A table
+    cell can only style its own value, so the band verdict travels in the
+    sign. band: (target metric, deviation metric), or None for a neutral
+    share."""
+    if not band:
+        return in_range(expr, f"round(100 * ({expr}), 0.1)")
+    target, deviation = band
+    inside = (f"(abs(({expr}) - scalar(max({target}))) "
+              f"<= bool scalar(max({deviation})))")
+    return banded_pct(expr, inside)
+
+
+def bar_html(fill, text):
+    # One div: Grafana's sanitizer drops position, top, left and
+    # line-height, so the fill is a hard-stop gradient behind the text.
+    return ('<div style="height:20px;border-radius:4px;font-weight:600;'
+            f'text-align:center;background:linear-gradient(90deg, {fill} '
+            f'{text}%, rgba(128,128,128,0.15) {text}%)">{text}%</div>')
+
+
+# A percent drawn as the custom card's bar: the fill as wide as the percent
+# and the percent written inside it. Grafana's gauge cell puts the number
+# beside its bar, so this is a Markdown + HTML cell: the value turns into a
+# string and a regex mapping writes the HTML, its capture group the percent.
+# Negative means outside the band (see pct_bar): red, else green. With
+# `unjudged`, a value from 1000 to 1100 is a percent plus UNJUDGED_OFFSET
+# (see unjudged_pct): grey, its percent read after the offset. The patterns
+# take percents from 0 to 100 only, so OUT_OF_RANGE, or any value a broken
+# encoding makes, is written "out of range", never as a coloured bar.
+GREY_FILL = "rgba(148,163,184,0.45)"
+PCT_PATTERN = r"(100|[1-9]?\d(?:\.[1-9])?)(?:\.\d*|(?<=\.\d)\d*)?"
+UNJUDGED_PATTERN = r"^(?=1(?:0\d\d|100)(?!\d))10*(\d+(?:\.[1-9])?).*$"
+OUT_OF_RANGE_HTML = ('<div style="height:20px;border-radius:4px;'
+                     f'text-align:center;background:{GREY_FILL}">'
+                     'out of range</div>')
+
+
+def bar_cell(neutral=False, unjudged=False):
+    # No value (a chain without a vault) shows nothing.
+    mappings = [{"type": "regex", "options": {"pattern": "^(null|NaN)?$",
+                 "result": {"text": " ", "index": 0}}}]
+    mappings.append({"type": "regex", "options": {
+        "pattern": f"^{OUT_OF_RANGE}$",
+        "result": {"text": OUT_OF_RANGE_HTML, "index": len(mappings)}}})
+    mappings += ([] if not unjudged else [
+        {"type": "regex", "options": {"pattern": UNJUDGED_PATTERN, "result": {
+            "text": bar_html(GREY_FILL, "$1"), "index": len(mappings)}}}])
+    # The percent keeps at most one decimal, which drops pct_bar's offset
+    # and any float noise from the rounding.
+    mappings += ([] if neutral else [
+        {"type": "regex", "options": {"pattern": f"^-{PCT_PATTERN}$", "result": {
+            "text": bar_html("rgba(239,68,68,0.6)", "$1"), "index": len(mappings)}}}])
+    mappings.append({"type": "regex", "options": {
+        "pattern": f"^{PCT_PATTERN}$" if not neutral else "^(.*)$", "result": {
+        "text": bar_html(GREY_FILL if neutral else "rgba(34,197,94,0.6)", "$1"),
+        "index": len(mappings)}}})
+    mappings += ([] if neutral else [
+        {"type": "regex", "options": {"pattern": "^.*$", "result": {
+            "text": OUT_OF_RANGE_HTML, "index": len(mappings)}}}])
+    # The cell is an encoded string, so sorting or filtering it would order
+    # the encodings, not the percents.
+    return [{"id": "mappings", "value": mappings},
+            {"id": "custom.cellOptions", "value": {"type": "markdown"}},
+            {"id": "custom.align", "value": "center"},
+            {"id": "custom.filterable", "value": False}]
+
+# CT, Rebal and Ext as one column of three dots. Grafana renders no column
+# under 50px, so three one-dot columns took 150px. The query packs the flags
+# into one number, CT x 100 + Rebal x 10 + Ext, with each digit 1 off, 2 on
+# or 3 not set (never 0, so the number never loses a leading digit), and one
+# regex mapping per combination draws the dots as HTML.
+def flag_digit(metric):
+    return (f"(max by (symbol) ({metric}) + 1 "
+            "or (max by (symbol) (liq_equity_total) * 0 + 3))")
+
+
+FLAGS_EXPR = (f"{flag_digit('liq_asset_counter_trading')} * 100 + "
+              f"{flag_digit('liq_asset_rebalancing')} * 10 + "
+              f"{flag_digit('liq_asset_extended_hours')}")
+FLAG_DOT = {"2": '<span style="color:#22c55e">●</span>',
+            "1": '<span style="color:#ef4444">●</span>',
+            "3": '<span style="color:#6b7280">○</span>'}
+FLAGS_CELL = [
+    {"id": "mappings", "value": [
+        {"type": "regex", "options": {"pattern": f"^{a}{b}{c}$", "result": {
+            "text": "&nbsp;".join(FLAG_DOT[d] for d in (a, b, c)),
+            "index": index}}}
+        for index, (a, b, c) in enumerate(
+            (a, b, c) for a in "123" for b in "123" for c in "123")]},
+    {"id": "custom.cellOptions", "value": {"type": "markdown"}},
+    {"id": "custom.align", "value": "center"},
+    {"id": "custom.filterable", "value": False},
+]
+
+# Unpriced symbols arrive as NaN (see native_inventory) and read as a dash.
+NO_PRICE = {"id": "mappings", "value": [{"type": "special", "options": {
+    "match": "null+nan", "result": {"text": "—", "color": "#6b7280",
+                                    "index": 0}}}]}
+
+# Display names for the chains the bot knows (config keys). A chain not
+# listed here still gets its row and column, under its raw key.
+CHAIN_NAMES = {"base": "Base", "robinhood": "Robinhood", "hyperevm": "HyperEVM",
+               "ethereum": "Ethereum"}
+# The Equities table's chain column headers: a short one where the full name
+# would widen the column past its numbers.
+EQUITY_CHAIN_HEADERS = {**CHAIN_NAMES, "robinhood": "RH"}
+# The Equities card's inner width on the reference 1934px viewport, about
+# 950px (913px of fixed columns, before Robinhood, left Ratio under its
+# 50px), less Ratio's minimum width. check_equity_widths holds the fixed
+# columns to it with the EQUITY_MAX_CHAIN_COLUMNS widest chain columns
+# showing. A third chain column (HyperEVM beside Base and RH) does not fit:
+# every chain column is at its 74px balance floor, so a shorter header saves
+# nothing, and the table scrolls sideways until other columns are narrowed.
+EQUITY_FIXED_PX_MAX = 950 - 60
+EQUITY_MAX_CHAIN_COLUMNS = 2
+# A balance column filtered by its distinct values filters nothing useful,
+# and its filter icon costs the header about 20px.
+NOT_FILTERABLE = {"id": "custom.filterable", "value": False}
+
+
+# The Equities Ratio is Base vault / (Base vault + Alpaca), both available,
+# against the default Base target. The planner instead sizes each chain's
+# share of the total over the chains whose listing rebalances, in underlying
+# shares, against that listing's own target. The board can see the other
+# chains only on the bot source, so it judges a symbol only there: rebalanced
+# on Base, with a balance, the default target set, its Base vault read, and no
+# vault row on any other chain, empty or not (a multi-chain listing such as
+# DNUT sets its own target_share). Every other symbol is grey, no verdict.
+# The verdict can still differ from the bot's for a Base-only listing with
+# its own target_share, while a wrapper ratio is not 1, or while a transfer is
+# in flight.
+EQUITY_JUDGED = (
+    '(liq_equity_total > 0) '
+    'and on (symbol) (max by (symbol) (liq_asset_rebalancing) == 1) '
+    'and on () count(liq_settings_equity_target) '
+    'and on (symbol) max by (symbol) '
+    '(liq_equity_chain_available{chain="base"}) '
+    'unless on (symbol) max by (symbol) '
+    '(liq_equity_chain_available{chain!="base"})')
+EQUITY_RATIO = (
+    f'({pct_bar("liq_equity_ratio", ("liq_settings_equity_target", "liq_settings_equity_deviation"))}'
+    f' and on (symbol) ({EQUITY_JUDGED})) '
+    f'or ({unjudged_pct("liq_equity_ratio")} unless on (symbol) ({EQUITY_JUDGED}))')
+
+
+def native_inventory(w, x, y, heights):
+    """The Inventory card as three Grafana tables: USD at Alpaca, USD on each
+    chain, and the equities."""
+    alpaca_h, chains_h, equity_h = heights
+    usd = lambda metric, row: (f'label_replace({metric}, "venue", "{row}", '
+                               '"", "")')
+    alpaca = or_chain([
+        (usd("liq_usdc_alpaca_total", "Alpaca"), "cash"),
+        (usd("liq_usdc_alpaca_usdc", "Alpaca"), "usdc"),
+        # The reserve setting, else gross minus available cash, else Alpaca
+        # total minus available (0 when the bot ships no gross figure), as
+        # the custom card computed it.
+        (usd("(liq_settings_cash_reserved or (liq_usdc_offchain_gross "
+             "- liq_usdc_offchain_available) or (liq_usdc_alpaca_total "
+             "- liq_usdc_offchain_available))", "Alpaca"), "reserve"),
+        (usd("liq_usdc_rebalanceable", "Alpaca"), "rebalanceable"),
+        (usd("liq_usdc_offchain_inflight", "Alpaca"), "inflight"),
+        (usd(pct_bar("liq_usdc_alpaca_total / liq_usdc_total"), "Alpaca"),
+         "share"),
+        (usd("liq_usdc_total", "Alpaca"), "total"),
+    ], row_label="venue")
+    # One row per chain from the bot's per-chain series, else (the exporter
+    # source, which has none) the single Base row from the unlabelled ones.
+    # The fallback is per source, not per row: while the bot publishes
+    # liq_usdc_chain_available, a chain without a labelled value shows none,
+    # so a chain without a corridor has no target and no ratio, and a ratio
+    # the bot leaves out is not filled from the unlabelled one. Each side is
+    # reduced to just the venue label so `or` can tell they are the same row.
+    def per_chain(labelled, base):
+        return (f'max by (venue) (label_replace({labelled}, "venue", "$1", '
+                f'"chain", "(.*)")) or (max by (venue) (label_replace({base}, '
+                '"venue", "base", "", "")) unless on () '
+                'count(liq_usdc_chain_available))')
+    ratio = per_chain("liq_usdc_chain_ratio", "liq_usdc_ratio")
+    target = per_chain("liq_usdc_corridor_target", "liq_settings_usdc_target")
+    deviation = per_chain("liq_usdc_corridor_deviation",
+                          "liq_settings_usdc_deviation")
+    inside = (f"(abs(({ratio}) - ({target})) <= bool ({deviation}))")
+    # A chain's band counts only while USDC rebalancing runs on its corridor.
+    # The bot publishes liq_usdc_corridor_active. A bot build from before that
+    # flag (only staging builds of this stack) publishes each corridor's table
+    # and the single USDC band. It sets that band only for one active corridor
+    # or the primary chain's, so the fallback below needs the band: with
+    # several active corridors and none on the primary chain it greys every
+    # row. The exporter has neither and cannot tell which chain its single
+    # band is for: it is judged as the Base row while that band is set. The
+    # bot sets that band only from corridors the USDC trigger can act on (the
+    # USDC mode and that chain's cash rebalancing enabled), so while it can
+    # act on none the row shows no ratio, target or band instead of grey. On
+    # the bot source a chain with no corridor table shows no ratio, and one
+    # whose corridor is off is grey, no verdict.
+    active = ('max by (venue) (label_replace(liq_usdc_corridor_active == 1, '
+              '"venue", "$1", "chain", "(.*)")) '
+              'or (max by (venue) (label_replace(liq_usdc_corridor_target * 0 '
+              '+ 1, "venue", "$1", "chain", "(.*)")) and on () '
+              'count(liq_settings_usdc_target) unless on () '
+              'count(liq_usdc_corridor_active)) '
+              'or (max by (venue) (label_replace(liq_settings_usdc_target * 0 '
+              '+ 1, "venue", "base", "", "")) unless on () '
+              'count(liq_usdc_corridor_target))')
+    judged_ratio = (f"(({banded_pct(ratio, inside)}) and on (venue) ({active})) "
+                    f"or ({unjudged_pct(ratio)} and on (venue) ({target}) "
+                    f"unless on (venue) ({active}))")
+    chains = or_chain([
+        (per_chain("liq_usdc_chain_available", "liq_usdc_onchain_available"),
+         "vault"),
+        (per_chain("liq_usdc_chain_inflight", "liq_usdc_onchain_inflight"),
+         "inflight"),
+        ('max by (venue) (label_replace(liq_usdc_inflight_base_wallet, '
+         '"venue", "base", "", "")) or max by (venue) (label_replace('
+         'liq_usdc_inflight_ethereum_wallet, "venue", "ethereum", "", ""))',
+         "wallet"),
+        # pct_bar's sign encoding, with each chain's own band, while the
+        # corridor runs.
+        (judged_ratio, "ratio"),
+        (target, "target"),
+        (deviation, "deviation"),
+    ], row_label="venue")
+    equity = or_chain([
+        (FLAGS_EXPR, "flags"),
+        # A column per chain (col onchain_<chain>) from the per-chain metric,
+        # else (the exporter source) the onchain total as the Base column.
+        ('max by (symbol, col) (label_replace(liq_equity_chain_available, '
+         '"col", "onchain_$1", "chain", "(.*)")) or (max by (symbol, col) '
+         '(label_replace(liq_equity_onchain_available, "col", "onchain_base", '
+         '"", "")) unless on () count(liq_equity_chain_available))', None),
+        ("liq_equity_inflight_total", "inflight"),
+        ("liq_equity_offchain_available", "alpaca"),
+        ("liq_equity_total", "total"),
+        # Priced symbols only: the last price from the pricing feed. The NaN
+        # fallback keeps the column on the board for unpriced symbols (a
+        # dash, see NO_PRICE), where Grafana would drop a column that has no
+        # values at all.
+        ("(liq_equity_total * on (symbol) group_left "
+         "max by (symbol) (liq_position_last_price_usd)) "
+         "or (liq_equity_total * NaN)", "total_usd"),
+        (EQUITY_RATIO, "ratio"),
+        ("liq_equity_exposure_usd or (liq_equity_total * NaN)", "exposure"),
+        ("liq_equity_unwrapped", "unwrapped"),
+        ("liq_equity_wrapped", "wrapped"),
+        # The SPA lists counter-trading assets first: the hidden sort key, 1
+        # for counter trading, else 0, unset included.
+        ("max by (symbol) (liq_asset_counter_trading) "
+         "or (max by (symbol) (liq_equity_total) * 0)", "counter_trading"),
+    ])
+    pct = [{"id": "unit", "value": "percentunit"}, {"id": "decimals", "value": 0}]
+    return [
+        native_table(
+            "USD · Alpaca",
+            "Alpaca's cash: no rebalance target, so it shows its share of "
+            "the USD total. The USD total is Alpaca, the primary chain's "
+            "vault and the cash in flight; other chains' vaults are not in "
+            "it. Rebalanceable = max(0, withdrawable - reserve).",
+            alpaca, "venue",
+            [("cash", "Cash", None), ("usdc", "USDC", None),
+             ("reserve", "Reserve", None),
+             ("rebalanceable", "Rebalanceable", None),
+             ("inflight", "In flight", None),
+             ("share", "Share of total", bar_cell(neutral=True)),
+             ("total", "USD total", None)],
+            w, alpaca_h, x, y, first_col="Venue", bars=("share",),
+            stretch="share",
+            widths={"venue": 80, "cash": 110, "usdc": 140, "reserve": 95,
+                    "rebalanceable": 140, "inflight": 95, "share": 180,
+                    "total": 120}),
+        native_table(
+            "USD · Onchain",
+            "Each chain's vault and the ratio the bot rebalances on, vault "
+            "/ (vault + Alpaca cash), against the chain's band. It is not a "
+            "share of all USD: other chains are not in it. On the bot source "
+            "the ratio is grey while USDC rebalancing is off on that corridor; "
+            "the exporter source judges its one band as Base's, and shows no "
+            "ratio, target or band while USDC rebalancing is off on every "
+            "corridor. "
+            "Ethereum is the hub wallet Alpaca deposits to and withdraws "
+            "from, with no band.", chains, "venue",
+            [("vault", "Vault", None), ("inflight", "In flight", None),
+             ("wallet", "Wallet", None),
+             ("ratio", "Ratio", bar_cell(unjudged=True)),
+             ("target", "Target", pct), ("deviation", "±", pct)],
+            w, chains_h, x, y + alpaca_h, first_col="Chain",
+            first_col_mappings=[{"type": "value", "options": {
+                key: {"text": name if key != "ethereum" else "Ethereum (hub)",
+                      "index": index}
+                for index, (key, name) in enumerate(CHAIN_NAMES.items())}}],
+            bars=("ratio",), stretch="ratio",
+            widths={"venue": 125, "vault": 110, "inflight": 95, "wallet": 85,
+                    "target": 85, "deviation": 60},
+            ),
+        native_table(
+            "Equities",
+            "Flags: counter trading, rebalancing and extended hours, green "
+            "when on, red when off, hollow grey when not set. "
+            "Share balances per venue, one column per chain (RH is "
+            "Robinhood). Counter-trading assets come first. Total and "
+            "Total USD count only the primary chain (Base) with Alpaca and "
+            "the shares in flight: a wrapped share on another chain is "
+            "worth that chain's underlying, so the chains are not added "
+            "together. Ratio = Base vault available / (Base vault available "
+            "+ Alpaca available), green inside the default Base band and "
+            "red outside it. It is grey, with no verdict, where that is not "
+            "the bot's own band: a symbol not rebalanced on Base, with no "
+            "balance, with a vault on another chain, or with no default "
+            "target, and "
+            "every symbol on the exporter source, which cannot see the "
+            "other chains. A click on Ratio sorts by its encoded text, not by "
+            "percent. Exposure = net x live price, empty without a "
+            "price.", equity, "symbol",
+            [("flags", "Flags", FLAGS_CELL),
+             *[(f"onchain_{key}", name, [NOT_FILTERABLE])
+               for key, name in EQUITY_CHAIN_HEADERS.items()
+               if key != "ethereum"],
+             ("inflight", "Inflight", [NOT_FILTERABLE]),
+             ("alpaca", "Alpaca", [NOT_FILTERABLE]),
+             ("total", "Total", [NOT_FILTERABLE]),
+             ("total_usd", "Total USD", [
+                 {"id": "unit", "value": "currencyUSD"},
+                 {"id": "decimals", "value": 0}, NO_PRICE, NOT_FILTERABLE]),
+             ("ratio", "Ratio", bar_cell(unjudged=True)),
+             ("exposure", "Exposure", [
+                 {"id": "unit", "value": "currencyUSD"}, NO_PRICE,
+                 NOT_FILTERABLE,
+                 {"id": "thresholds", "value": {"mode": "absolute", "steps": [
+                     {"color": "red", "value": None},
+                     {"color": "text", "value": -0.005},
+                     {"color": "green", "value": 0.005}]}},
+                 {"id": "custom.cellOptions", "value": {"type": "color-text"}}]),
+             # Left-aligned like the SPA's table, except the wrap columns.
+             ("unwrapped", "Unwrapped", [{"id": "custom.align", "value": "right"},
+                                         NOT_FILTERABLE]),
+             ("wrapped", "Wrapped", [{"id": "custom.align", "value": "right"},
+                                     NOT_FILTERABLE]),
+             ("counter_trading", "Counter trading", [HIDDEN_COLUMN])],
+            w, equity_h, x, y + alpaca_h + chains_h, first_col="Asset",
+            # Asset's width fits its header's text plus the filter icon
+            # (measured). The balance columns have no filter icon, so each
+            # fits its header's text (the measured width less the icon) or
+            # a balance, Total's 74px, whichever is wider. A column under
+            # Grafana's 50px minimum renders at the minimum and would leave
+            # the stretching Ratio column too wide by the difference.
+            widths={"symbol": 96, "flags": 64,
+                    # One per chain; only chains with balances show up.
+                    **{f"onchain_{key}": 74 for key in CHAIN_NAMES},
+                    "inflight": 74, "alpaca": 74, "total": 74,
+                    "total_usd": 80, "ratio": 158, "exposure": 88,
+                    "unwrapped": 98, "wrapped": 82},
+            bars=("ratio", "flags"), align="left", stretch="ratio",
+            sort_by=[{"displayName": "Counter trading", "desc": True},
+                     {"displayName": "Asset", "desc": False}]),
+    ]
+
+
+# A table column kept for sorting but not drawn. Grafana 13.1.0's table
+# hides a field only on custom.hideFrom.viz. It rewrites the older
+# custom.hidden to that only when it migrates a panel saved by another
+# version, and these tables save 13.1.0, so custom.hidden would draw the
+# column (check_no_custom_hidden). A sort still sees a hidden field.
+HIDDEN_COLUMN = {"id": "custom.hideFrom",
+                 "value": {"viz": True, "legend": False, "tooltip": False}}
+
+
+# The inventory tables (8 + 9 + 35 rows) beside Trades stacked on
+# Rebalances (25 + 26). Change these heights only after checking a new set on
+# a preview board (observability/README.md says why and how).
+TRADES_H, TRANSFERS_H = 25, 26
+# USD · Alpaca gets 8 so its one row shows under the column headers: at 6 the
+# fit left it a header and a scrollbar on windows under ~1600px tall.
+panels += native_inventory(w=13, x=0, y=1, heights=(8, 9, 35))
+
+# A row's detail dialog is the hidden `detail` variable: a table row's link
+# sets it to the row's id, the detail panel picks that id out of the Trades
+# and Rebalances tables' own results (it runs no query of its own) and
+# opens the dialog, and closing the dialog clears the variable again.
+# Do not add $detail to its A and B: they are the tables' results, not
+# queries.
+#
+# The id is read by the field NAME. The groupBy key keeps the raw field name
+# (jsonPayload.id); organize's rename only set its display name, and the Id
+# column's override replaces that with a blank header. ${__url.params:...}
+# already starts with "?", so the URL appends straight to it.
+DETAIL_URL = ('/d/${__dashboard.uid}/${__url.params:exclude:var-detail}'
+              '&var-detail=${__data.fields["jsonPayload.id"]}')
+
+
+DETAIL_VAR = {"type": "textbox", "name": "detail", "hide": 2, "query": "",
+              "current": {"text": "", "value": ""}, "options": []}
+
+
+def detail_panel(x, y, trades_id, transfers_id):
+    """The SPA's trade and transfer detail dialogs, opened from a row of the
+    Trades or Rebalances table (see DETAIL_URL).
+
+    The panel itself draws nothing; it takes the header row's last column so
+    the tab's panel heights stay as they are. It reads the Trades and
+    Rebalances tables' own results (the newest 500 entries of each log)
+    through the Dashboard datasource, so the board scans each log once per
+    refresh, and not per click: a query filtered on one id still scans the
+    whole window (about 13s for 30 days), so a click only picks the id out
+    of data the browser already has and the dialog opens at once. The
+    Dashboard datasource keeps each table's refIds, so the script picks the
+    picked source's frames by name (<source>-trades, <source>-transfers).
+    On the bot source it also reads the newest 500 liq_event lines, the
+    event timeline. The queries do not use
+    `$detail`, so a click does not re-run them; the script reads `${detail}`,
+    which makes Grafana redraw the panel when the variable changes.
+    liquidity-panels/detail.js builds the dialog. renderMode "data" hands
+    the script both frames, where "allRows" would draw a frame picker.
+    MODE_LABELS (how each recovery command runs) is prepended from
+    recovery-guide.json, like the header's guide, the client prefix from
+    client-env.js, the per-row command builders from recovery-commands.js,
+    the status-history order from status-history.js, the bot-line
+    helpers from log-lines.js, and the commands' Copy buttons from
+    copy-command.js.
+    """
+    with open(os.path.join(HERE, "liquidity-panels", "recovery-guide.json")) as f:
+        mode_labels = json.load(f)["modeLabels"]
+    commands = "".join(panel_module(module) + "\n" for module in (
+        "client-env.js", "recovery-commands.js", "status-history.js",
+        "log-lines.js", "copy-command.js"))
+    with open(os.path.join(HERE, "liquidity-panels", "detail.js")) as f:
+        after_render = (f"const MODE_LABELS = {json.dumps(mode_labels)};\n\n"
+                        + commands + "\n" + f.read())
+    with open(os.path.join(HERE, "liquidity-panels", "detail.css")) as f:
+        styles = f.read()
+    return {
+        "id": nid(), "type": "marcusolsson-dynamictext-panel", "title": "",
+        "description": "The detail dialog of a Trades or Rebalances row: "
+                       "open it from the row's ⓘ.",
+        "datasource": {"type": "datasource", "uid": "-- Mixed --"},
+        "timeFrom": "30d", "hideTimeOverride": True,
+        "maxDataPoints": 500,
+        "targets": [
+            *({"refId": ref, "panelId": panel_id, "withTransforms": False,
+               "datasource": {"type": "datasource", "uid": "-- Dashboard --"}}
+              for ref, panel_id in (("A", trades_id), ("B", transfers_id))),
+            # Only the bot logs its events. On the exporter source the
+            # script ignores this frame.
+            cloudlog(f'{BOT_LOG} jsonPayload.target="liq_event"',
+                     ref="bot-events"),
+        ],
+        "transparent": True,
+        "gridPos": {"h": 1, "w": 1, "x": x, "y": y},
+        "options": {
+            "renderMode": "data",
+            "editor": {"format": "auto", "language": "html"},
+            "content": "<div></div>",
+            "defaultContent": "<div></div>",
+            "helpers": "",
+            "afterRender": after_render,
+            "styles": styles,
+            "wrap": False,
+        },
+    }
+
+
+def latest_status_table(title, desc, logs, fields, shown, w, h, x, y,
+                        body_regex=None, bot_label_regex=None,
+                        number_columns=None, time_columns=(), overrides=(),
+                        sort_by=None):
     """A Cloud Logging table with one row per entity at its latest status,
-    like the SPA's Trade History and Cross-venue Transfers cards.
+    like the SPA's Trade History and Cross-venue Transfers cards (here
+    Trades and Rebalances).
 
     The exporter writes one log entry per status change (insertId
     `<id>:<status>`), so the raw feed holds several rows per trade or
     transfer. The plugin returns entries newest first, so groupBy on
-    jsonPayload.id with `first` keeps each entity's latest status.
+    jsonPayload.id with `first` keeps each entity's entry with the highest
+    timestamp. That is usually the latest status, but a status's timestamp
+    can be earlier than the one before it: a USDC bridge stamps
+    WithdrawalComplete with confirmed_at and the BridgingSubmitting after it
+    with the older initiated_at, so such a row can show withdrawing. The
+    detail dialog orders a bridge's statuses by its lifecycle instead.
+    The bot writes a line per transfer status change and per terminal
+    trade status (again on a venue correction), with the same field names,
+    so the same grouping applies; its line times follow commit order.
 
+    The id stays as the first column, an ⓘ that opens the row's detail
+    dialog (see DETAIL_URL).
+
+    logs: (name, exporter query, bot query); the panel follows `source`
+      (pick_source), and the detail panel finds its frames by refId.
     fields: {payload leaf: column name}; the entry's own timestamp is
-      always kept, as fields["timestamp"].
+      always kept, as fields["timestamp"]. A leaf only one source writes
+      (the bot's usd) is a column on that source only.
     shown: column names in display order.
     body_regex: an extra extractFields over the entry's JSON body, with
       named groups as new columns. Grafana only treats the pattern as a
       regex when it is wrapped in slashes; without them it silently
-      returns the whole body as one "NewField" column.
+      returns the whole body as one "NewField" column. The exporter's body
+      is its JSON payload; a bot line's body is its message.
+    bot_label_regex: the same columns for the bot's frame, from its labels
+      as one JSON string.
     number_columns: {column: decimals}; the payload ships decimal strings.
     time_columns: string RFC3339 columns to turn into real time fields.
     sort_by: newest-first column; defaults to the entry timestamp.
@@ -920,6 +1617,9 @@ def latest_status_table(title, desc, log, fields, shown, w, h, x, y,
            for name in time_columns])
     return {
         "id": nid(), "type": "table", "title": title, "description": desc,
+        # Without a version Grafana runs the table panel's old-version
+        # migration on load, which can drop field overrides.
+        "pluginVersion": "13.1.0",
         "datasource": CL,
         "timeFrom": "30d",
         # The plugin takes the row limit from maxDataPoints, which Grafana
@@ -927,9 +1627,10 @@ def latest_status_table(title, desc, log, fields, shown, w, h, x, y,
         # 500 newest entries load in about 1.5s and still leave well over
         # the SPA's 100 rows after grouping by id.
         "maxDataPoints": 500,
-        "targets": [cloudlog(log)],
+        "targets": source_targets(*logs),
         "gridPos": {"h": h, "w": w, "x": x, "y": y},
         "transformations": [
+            pick_source(logs[0]),
             # `labels` is a JSON object per row; extractFields lifts each
             # key into its own column, dotted names kept verbatim.
             {"id": "extractFields",
@@ -940,6 +1641,20 @@ def latest_status_table(title, desc, log, fields, shown, w, h, x, y,
                             "regExp": f"/{body_regex}/",
                             "replace": False, "keepTime": False}}]
               if body_regex else []),
+            # The regexp extractor reads only strings, so the bot's labels
+            # become their JSON text first. `filter` applies a step to the
+            # bot's frame alone.
+            *([{"id": step, "filter": {"id": "byRefId",
+                                       "options": f"bot-{logs[0]}"},
+                "options": options}
+               for step, options in (
+                   ("convertFieldType", {"conversions": [
+                       {"targetField": "labels",
+                        "destinationType": "string"}]}),
+                   ("extractFields", {"source": "labels", "format": "regexp",
+                                      "regExp": f"/{bot_label_regex}/",
+                                      "replace": False, "keepTime": False}))]
+              if bot_label_regex else []),
             {"id": "filterFieldsByName",
              "options": {"include": {"names": list(raw) + body_columns}}},
             # convertFieldType matches Field.name, which organize's rename
@@ -955,9 +1670,10 @@ def latest_status_table(title, desc, log, fields, shown, w, h, x, y,
                    for name in shown},
             }}},
             {"id": "organize",
-             "options": {"excludeByName": {"Id": True},
-                         "indexByName": {f"{name} (first)": index
-                                         for index, name in enumerate(shown)},
+             "options": {"excludeByName": {},
+                         "indexByName": {"Id": 0, **{
+                             f"{name} (first)": index + 1
+                             for index, name in enumerate(shown)}},
                          "renameByName": {f"{name} (first)": name
                                           for name in shown}}},
             {"id": "sortBy", "options": {"fields": {}, "sort": [
@@ -973,14 +1689,31 @@ def latest_status_table(title, desc, log, fields, shown, w, h, x, y,
                 *[{"matcher": {"id": "byName", "options": name},
                    "properties": TIME_FMT}
                   for name in [fields["timestamp"], *time_columns]],
+                # The ⓘ is the link's title: a data-links cell draws the
+                # title in place of the value. A value mapping would do the
+                # same, but it would also turn ${__data.fields[...]} into
+                # the ⓘ, since data links read a field's display text.
+                {"matcher": {"id": "byName", "options": "Id"},
+                 "properties": [
+                     {"id": "displayName", "value": " "},
+                     # Grafana's minimum column width; see native_inventory.
+                     {"id": "custom.width", "value": 50},
+                     {"id": "custom.align", "value": "center"},
+                     {"id": "custom.filterable", "value": False},
+                     {"id": "custom.cellOptions", "value": {"type": "data-links"}},
+                     {"id": "links", "value": [{
+                         "title": "ⓘ", "url": DETAIL_URL,
+                         "targetBlank": False, "oneClick": True}]}]},
                 *overrides,
             ],
         },
-        "options": {"showHeader": True, "cellHeight": "sm"},
+        # Medium rows: small ones read crowded, large ones waste the card.
+        "options": {"showHeader": True, "cellHeight": "md"},
     }
 
 
 def column(name, px, mappings=None, color_text=False):
+    # px None: the column stretches over the rest of the card.
     properties = [{"id": "custom.width", "value": px}] if px else []
     if mappings:
         properties.append({"id": "mappings", "value": mappings})
@@ -991,64 +1724,91 @@ def column(name, px, mappings=None, color_text=False):
             "properties": properties}
 
 
+TRANSFER_TYPES = "alpaca_to_base|base_to_alpaca|equity_mint|equity_redemption"
+
+
+def usd_column(px):
+    """The bot's `usd` in dollars, blank when the line has no value."""
+    return {"matcher": {"id": "byName", "options": "USD"},
+            "properties": [{"id": "custom.width", "value": px},
+                           {"id": "unit", "value": "currencyUSD"},
+                           {"id": "decimals", "value": 2}]}
+
+
 panels.append(latest_status_table(
-    "Trade History",
+    "Trades",
     "Direct Raindex fills, fills routed through supported adapters such as "
     "Bebop, and the corresponding Alpaca hedge trades placed to offset "
-    "exposure. One row per trade at its latest status. Built from the "
-    "newest 500 status entries, so a busy period can push older rows out "
-    "of the 30-day window.",
-    'logName="projects/$env/logs/liquidity-trades"',
-    fields={"timestamp": "Time", "symbol": "Asset", "venue": "Venue",
-            "direction": "Side", "shares": "Size", "status": "Status"},
-    shown=["Time", "Asset", "Venue", "Side", "Size", "Status"],
-    w=10, h=14, x=14, y=1,
-    number_columns={"Size": 3},
+    "exposure. One row per trade at its latest status; its ⓘ "
+    "opens the details. Built from the newest 500 status entries, so a "
+    "busy period can push older rows out of the 30-day window. USD, "
+    "shares times the fill price, is on the bot source only. There, Last "
+    "updated is when the bot logged the terminal status, which is later "
+    "than the fill for a fill it caught up on; the dialog shows the fill "
+    "time.",
+    ("trades", 'logName="projects/$env/logs/liquidity-trades"',
+     f'{BOT_LOG} jsonPayload.target="liq_trade"'),
+    # One timestamp, first: when the row last changed status.
+    fields={"timestamp": "Last updated", "symbol": "Asset", "venue": "Venue",
+            "direction": "Side", "shares": "Size", "usd": "USD",
+            "status": "Status"},
+    shown=["Last updated", "Asset", "Venue", "Side", "Size", "USD", "Status"],
+    w=11, h=TRADES_H, x=13, y=1,
+    number_columns={"Size": 3, "USD": 2},
     overrides=[
-        # No width on the last column: it takes what is left, so the
-        # table fills the card like the SPA's.
-        column("Time", 170), column("Asset", 80),
-        column("Venue", 110, VENUE_MAPPINGS, color_text=True),
-        column("Side", 70, SIDE_MAPPINGS, color_text=True),
-        column("Size", 110),
+        column("Last updated", 185), column("Asset", 85),
+        column("Venue", 115, VENUE_MAPPINGS, color_text=True),
+        column("Side", 75, SIDE_MAPPINGS, color_text=True),
+        column("Size", 100), usd_column(110),
         column("Status", None, STATUS_CAP_MAPPINGS, color_text=True),
     ],
 ))
 
 panels.append(latest_status_table(
-    "Cross-venue Transfers",
+    "Rebalances",
     "Asset movements between venues to rebalance inventory: equity mints "
     "(Alpaca to onchain), redemptions (onchain to Alpaca), and USDC bridges "
-    "(Base/Ethereum via CCTP). One row per transfer at its latest status. "
+    "(Base/Ethereum via CCTP). One row per transfer at its latest status; "
+    "its ⓘ opens the details. "
     "A USDC bridge can show the previous status for a while: the exporter "
     "stamps each status with the transfer's updatedAt, which is not always "
     "later than the one before (bridging starts from initiated_at). "
     "Built from the newest 500 status entries, so a busy period can push "
-    "older rows out of the 30-day window.",
-    'logName="projects/$env/logs/liquidity-transfers"',
-    fields={"timestamp": "Updated", "started_at": "Started", "symbol": "Asset",
-            "amount": "Amount", "status": "Status"},
-    shown=["Started", "Type", "Asset", "Amount", "Status", "Updated"],
+    "older rows out of the 30-day window. USD, an equity transfer at its "
+    "mark when the status changed or a bridge's amount, is on the bot "
+    "source only.",
+    ("transfers", 'logName="projects/$env/logs/liquidity-transfers"',
+     f'{BOT_LOG} jsonPayload.target="liq_transfer"'),
+    # One timestamp, first: when the row last changed status. The start
+    # time is in the row's detail dialog.
+    fields={"timestamp": "Last updated", "symbol": "Asset",
+            "amount": "Amount", "usd": "USD", "status": "Status"},
+    shown=["Last updated", "Type", "Asset", "Amount", "USD", "Status"],
     # Type reads the direction for a USDC bridge and the kind for an equity
     # transfer, like the SPA's transferTypeLabel. A bridge's kind is
     # usdc_bridge and an equity transfer's direction is "", so each row can
-    # match only one alternative, whatever the body's key order.
-    body_regex='"(?:direction|kind)":"(?<Type>alpaca_to_base|base_to_alpaca'
-               '|equity_mint|equity_redemption)"',
-    w=10, h=14, x=14, y=15,
-    number_columns={"Amount": 3},
-    time_columns=["Started"],
+    # match only one alternative, whatever the key order.
+    body_regex='"(?:direction|kind)":"(?<Type>' + TRANSFER_TYPES + ')"',
+    # The same in the bot's labels. Their JSON text escapes the quotes if
+    # the plugin ships them as a string, hence the optional backslashes.
+    bot_label_regex=(r'"jsonPayload\.(?:direction|kind)\\?":\\?"(?<Type>'
+                     + TRANSFER_TYPES + ')'),
+    w=11, h=TRANSFERS_H, x=13, y=1 + TRADES_H,
+    number_columns={"Amount": 3, "USD": 2},
     overrides=[
-        column("Started", 135), column("Type", 125, TYPE_MAPPINGS),
+        column("Last updated", 185), column("Type", 165, TYPE_MAPPINGS),
         # A USDC bridge carries no symbol; the SPA's Asset column reads
         # "USDC" for it.
-        column("Asset", 60, [{"type": "special", "options": {
+        column("Asset", 80, [{"type": "special", "options": {
             "match": "empty", "result": {"text": "USDC", "index": 0}}}]),
-        column("Amount", 85),
-        column("Status", 110, STATUS_DOT_MAPPINGS, color_text=True),
-        column("Updated", None),
+        column("Amount", 115), usd_column(110),
+        column("Status", None, STATUS_DOT_MAPPINGS, color_text=True),
     ],
 ))
+panels.append(detail_panel(
+    x=23, y=0,
+    trades_id=next(p["id"] for p in panels if p.get("title") == "Trades"),
+    transfers_id=next(p["id"] for p in panels if p.get("title") == "Rebalances")))
 
 
 dashboards.append(make_dashboard(
@@ -1067,7 +1827,7 @@ dashboards.append(make_dashboard(
     "compute start-iap-tunnel <vm> 8080 "
     "--local-host-port=localhost:8080 --zone europe-west3-b "
     "--project $env (VM name = project id)",
-    panels, tab_links("Dashboard"), [ENV_VAR]))
+    panels, tab_links("Dashboard"), [ENV_VAR, SOURCE_VAR, DETAIL_VAR]))
 
 # ==========================================================================
 # Tab 2: Orders — the SPA's Raindex Orders table (+ ops extras).
@@ -1121,7 +1881,7 @@ panels.append(stat(
 dashboards.append(make_dashboard(
     "t0-liquidity-orders", "Liquidity bot: Orders",
     "The SPA's Orders tab.",
-    panels, tab_links("Orders"), [ENV_VAR]))
+    panels, tab_links("Orders"), [ENV_VAR, SOURCE_VAR]))
 
 # ==========================================================================
 # Tab 3: PnL — tiles, per-asset table, the four charts in SPA order.
@@ -1134,8 +1894,7 @@ dashboards.append(make_dashboard(
 # audit's fallback ("keep currencyUSD on tiles, full locale in tables") was
 # only needed because no unit did both — this one does, so it's used on
 # both the tiles below and the Per Asset PnL table's dollar columns
-# (PNL_TABLE_USD_SIGNED further down); do NOT touch the shared USD_SIGNED
-# constant (line ~344) — Tab 1 owns it (its Exposure column).
+# (PNL_TABLE_USD_SIGNED further down).
 PNL_TILE_USD = "currency:financial:$"
 PNL_TABLE_USD_SIGNED = [
     {"id": "unit", "value": PNL_TILE_USD}, {"id": "decimals", "value": 2},
@@ -1207,7 +1966,7 @@ pnl_cols = [
     ("Total", "total"),
 ]
 # P5: the SPA's Volume column, in shares rather than USD, so it gets its own
-# override rather than joining unit_overrides' USD_SIGNED sweep below. The
+# override rather than joining unit_overrides' PNL_TABLE_USD_SIGNED sweep below. The
 # SPA places it right after Net; decimals=4 matches its "20.0723 sh"
 # precision. It counts a matched lot on both legs, so the exporter serves
 # 2 x matchedShares (verified against the entries page: their shares sum
@@ -1293,7 +2052,7 @@ dashboards.append(make_dashboard(
     "t0-liquidity-pnl", "Liquidity bot: PnL",
     "The SPA's PnL tab, tiles, table and charts all driven by the range "
     "pill; closed-lot and cost-ledger drilldowns live in the SPA.",
-    panels, tab_links("PnL"), [ENV_VAR, WINDOW_VAR]))
+    panels, tab_links("PnL"), [ENV_VAR, SOURCE_VAR, WINDOW_VAR]))
 
 # ==========================================================================
 # Tab 4: Performance — SLO cards, stage charts, health tables + the
@@ -1344,6 +2103,12 @@ panels.append(stat(
     steps=[{"color": "green", "value": None}, {"color": "yellow", "value": 30},
            {"color": "red", "value": 300}],
     w=4, h=4, x=20, y=2, text_mode="value"))
+
+# Sentinels of the "sampled ago" stat: distinct negative values, since real
+# ages are clamped at 0. The order of the query's `or` branches sets which
+# state shows, not the values.
+LAG_PAUSED = -2
+LAG_NEVER_SAMPLED = -1
 
 # F1: the SPA's secondary context line per SLO card (e.g. "p50 118ms · 42
 # fills") as a thin strip of small stats directly under the card row —
@@ -1412,9 +2177,29 @@ panels.append(stat(
         "0": {"text": "all hedged", "color": "green", "index": 0}}}],
     w=3, h=1, x=17, y=6, value_size=10))
 panels.append(stat(
-    "", "SPA secondary line: age of the current block-lag sample.",
-    "time() - max(liq_block_lag_sampled_ts_seconds)",
-    display="sampled ago", unit="s", decimals=0, color_mode="none",
+    "", "SPA secondary line: age of the oldest hedged chain's block-lag "
+    "sample, so one stale chain shows behind a fresh one. A chain whose "
+    "latest sample has a time but no lag has no cutoff block, and the "
+    "stat reads \"ingestion paused\" (the SPA's warning). A chain with "
+    "neither series has no checkpointed sample yet and reads \"no "
+    "checkpoint yet\" (the SPA's 'no checkpointed samples yet'). Paused "
+    "wins over an age, and an age wins over no checkpoint, so a stale "
+    "chain still shows next to a new one. An age over 300 s is orange "
+    "(the SPA's stale monitor).",
+    "min(0 * (liq_block_lag_sampled_ts_seconds "
+    f"unless on(chain) liq_block_lag_blocks) - {-LAG_PAUSED}) "
+    "or max(clamp_min(time() - (liq_block_lag_sampled_ts_seconds "
+    "and on(chain) liq_block_lag_blocks), 0)) "
+    "or min(0 * (liq_poll_cycles_24h "
+    "unless on(chain) liq_block_lag_sampled_ts_seconds) "
+    f"- {-LAG_NEVER_SAMPLED})",
+    display="sampled ago", unit="s", decimals=0,
+    steps=[{"color": "text", "value": None}, {"color": "orange", "value": 300}],
+    mappings=[{"type": "value", "options": {
+        str(LAG_PAUSED): {"text": "ingestion paused", "color": "orange",
+                          "index": 0},
+        str(LAG_NEVER_SAMPLED): {"text": "no checkpoint yet",
+                                 "color": "text", "index": 1}}}],
     w=2, h=1, x=20, y=6, value_size=10))
 panels.append(stat(
     "", "SPA secondary line: order-fill monitor poll ticks skipped "
@@ -1427,7 +2212,7 @@ panels.append(bargauge(
     "Hedge cycle stages (p95, 24h)",
     "The SPA waterfall's aggregate form: p95 per stage. Per-cycle "
     "waterfalls live in the SPA.",
-    'max by (stage) (liq_hedge_latency_ms{quantile="p95"})', "{{stage}}",
+    'max by (stage) (liq_hedge_latency_ms{quantile="p95"})', "${__field.labels.stage}",
     w=8, h=8, x=0, y=7,
     steps=[{"color": "green", "value": None}, {"color": "yellow", "value": 30000},
            {"color": "red", "value": 120000}]))
@@ -1435,18 +2220,12 @@ panels.append(timeseries(
     "Latency percentiles over time — $stage",
     "p50/p90/p99 of the selected hedge stage, from the exporter's rolling "
     "24h summary scraped once a minute.",
-    [promql('max(liq_hedge_latency_ms{stage="$stage",quantile="p50"})', legend="p50", ref="A"),
-     promql('max(liq_hedge_latency_ms{stage="$stage",quantile="p90"})', legend="p90", ref="B"),
-     promql('max(liq_hedge_latency_ms{stage="$stage",quantile="p99"})', legend="p99", ref="C")],
+    [promql('max(liq_hedge_latency_ms{stage="$stage",quantile="p50"})', ref="A"),
+     promql('max(liq_hedge_latency_ms{stage="$stage",quantile="p90"})', ref="B"),
+     promql('max(liq_hedge_latency_ms{stage="$stage",quantile="p99"})', ref="C")],
     w=8, h=8, x=8, y=7, unit="ms",
-    overrides=[
-        {"matcher": {"id": "byName", "options": "p50"},
-         "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]},
-        {"matcher": {"id": "byName", "options": "p90"},
-         "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "yellow"}}]},
-        {"matcher": {"id": "byName", "options": "p99"},
-         "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]},
-    ]))
+    overrides=series_names({"A": "p50", "B": "p90", "C": "p99"},
+                           colors={"A": "green", "B": "yellow", "C": "red"})))
 errors_by_module = matrix_table(
     "Errors & warnings by module (24h)",
     "The SPA's per-target error/warning counts. The Logs tab has the "
@@ -1471,13 +2250,15 @@ errors_by_module = matrix_table(
     decimals=0)
 # F4: data link on the Module column -> Logs board, pre-filtered via the
 # `target` textbox var there (labels.target=~"${target}"), keeping the
-# current time range. Added by mutating the returned panel, not by
+# current time range, environment and source. Added by mutating the returned panel, not by
 # changing the shared matrix_table() helper.
 errors_by_module["fieldConfig"]["overrides"].append({
     "matcher": {"id": "byName", "options": "Module"},
     "properties": [{"id": "links", "value": [{
         "title": "View in Logs tab",
         "url": "/d/t0-liquidity-logs/?${__url_time_range}"
+               "&var-env=${env:percentencode}"
+               "&var-source=${source:percentencode}"
                "&var-target=${__value.text}&theme=light",
         "targetBlank": False,
     }]}],
@@ -1488,12 +2269,12 @@ panels.append(bargauge(
     "USDC rebalance stages (p95, 30d)",
     "Stage timings for USDC rebalances. From the server's stageSummary; "
     "per-operation waterfalls live in the SPA.",
-    'max by (stage) (liq_rebalance_stage_ms{kind="usdc",quantile="p95"})', "{{stage}}",
+    'max by (stage) (liq_rebalance_stage_ms{kind="usdc",quantile="p95"})', "${__field.labels.stage}",
     w=8, h=7, x=0, y=15))
 panels.append(bargauge(
     "Equity rebalance stages (p95, 30d)",
     "Stage timings for equity mints/redemptions.",
-    'max by (stage) (liq_rebalance_stage_ms{kind="equity",quantile="p95"})', "{{stage}}",
+    'max by (stage) (liq_rebalance_stage_ms{kind="equity",quantile="p95"})', "${__field.labels.stage}",
     w=8, h=7, x=8, y=15))
 panels.append(matrix_table(
     "Dependency health (24h)",
@@ -1534,21 +2315,18 @@ panels.append(timeseries(
     "scrape time', so the line only accrues from whenever this panel "
     "started being scraped forward — a short/flat history here does not "
     "mean attestations were fast, it means the metric is young.",
-    [promql('max(liq_attestation_last_ms{kind="usdc"})', legend="usdc", ref="A"),
-     promql('max(liq_attestation_last_ms{kind="equity"})', legend="equity", ref="B")],
+    [promql('max(liq_attestation_last_ms{kind="usdc"})', ref="A"),
+     promql('max(liq_attestation_last_ms{kind="equity"})', ref="B")],
     w=24, h=6, x=0, y=22, unit="ms",
-    overrides=[
-        {"matcher": {"id": "byName", "options": "usdc"},
-         "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]},
-        {"matcher": {"id": "byName", "options": "equity"},
-         "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "purple"}}]},
-    ]))
+    overrides=series_names({"A": "usdc", "B": "equity"},
+                           colors={"A": "blue", "B": "purple"})))
 
 panels.append(timeseries(
     "Block lag over time",
     "The ingestion-health chart: how far fill detection trails the chain.",
-    [promql("max(liq_block_lag_blocks)", legend="blocks behind")],
-    w=8, h=6, x=0, y=28, decimals=0, fill=15))
+    [promql("max(liq_block_lag_blocks)")],
+    w=8, h=6, x=0, y=28, decimals=0, fill=15,
+    overrides=series_names({"A": "blocks behind"})))
 panels.append(stat(
     "Poll cycles (24h)", "Order-fill monitor poll cycles.",
     "max(liq_poll_cycles_24h)", decimals=0, color_mode="none",
@@ -1566,7 +2344,7 @@ panels.append(stat(
 panels.append(bargauge(
     "Poll duration percentiles",
     "The monitor's own cycle duration.",
-    "max by (quantile) (liq_poll_duration_ms)", "{{quantile}}",
+    "max by (quantile) (liq_poll_duration_ms)", "${__field.labels.quantile}",
     w=7, h=6, x=17, y=28))
 panels.append(matrix_table(
     "Job queues",
@@ -1624,7 +2402,7 @@ dashboards.append(make_dashboard(
     "t0-liquidity-performance", "Liquidity bot: Performance",
     "The SPA's Performance tab, plus the pre-exporter native bot metrics "
     "as collapsed rows at the bottom.",
-    panels, tab_links("Performance"), [ENV_VAR, STAGE_VAR]))
+    panels, tab_links("Performance"), [ENV_VAR, SOURCE_VAR, STAGE_VAR]))
 
 # ==========================================================================
 # Tab 5: Logs.
@@ -1633,20 +2411,28 @@ panels = []
 panels += pills(0)
 panels.append(cloudlog_table(
     "Log History",
-    "The bot's structured log lines, re-emitted by the exporter with real "
-    "severity and target (the raw container stream is all-INFO). Filter "
-    "with the level/category/target/search variables above. ⚠️ Only the "
-    "newest matching entries, about the panel's pixel width of them. "
-    "Narrow the filters, or use the SPA for deep digs. DEBUG/TRACE are "
-    "not shipped.",
+    "The bot's structured log lines: on the exporter source as the "
+    "exporter re-emits them, on the bot source the bot's own JSON lines. "
+    "Filter with the level/category/target/search variables above. ⚠️ "
+    "Only the newest matching entries, about the panel's pixel width of "
+    "them. Narrow the filters, or use the SPA for deep digs. DEBUG/TRACE "
+    "are not shown.",
     'logName="projects/$env/logs/liquidity-botlogs" '
     'labels.level=~"^(${level:pipe})$" labels.target=~"${target}" '
     'labels.target=~"^(${category:pipe})$" '
     'jsonPayload.message=~"${search}"',
     # The message is the log-lines frame's `body`; level/target are
-    # leaves in `labels` like every other payload field.
+    # leaves in `labels` like every other payload field. The bot's lines
+    # have the same names, so one set of columns serves both sources.
     columns=[("jsonPayload.level", "Level"), ("jsonPayload.target", "Target"),
              ("body", "Message")],
+    # The level filter also keeps out the bot's DEBUG and TRACE lines,
+    # which its stdout holds and the exporter never shipped.
+    source=("logs",
+            f'{BOT_LOG} jsonPayload.level=~"^(${{level:pipe}})$" '
+            'jsonPayload.target=~"${target}" '
+            'jsonPayload.target=~"^(${category:pipe})$" '
+            'jsonPayload.message=~"${search}"'),
     w=24, h=19, x=0, y=2,
     widths={"Time": 170, "Level": 70, "Target": 220},
     mappings_by_field={"Level": [
@@ -1750,12 +2536,240 @@ dashboards.append(make_dashboard(
     "The SPA's Logs tab: level/category/target/search-filterable "
     "structured log lines.",
     panels, tab_links("Logs"),
-    [ENV_VAR, LEVEL_VAR, CATEGORY_VAR, TARGET_VAR, SEARCH_VAR]))
+    [ENV_VAR, SOURCE_VAR, LEVEL_VAR, CATEGORY_VAR, TARGET_VAR, SEARCH_VAR]))
 
 # ==========================================================================
 # Emit.
 # ==========================================================================
-for board in dashboards:
+def board_exprs(node):
+    """Every PromQL `expr` string in a board, wherever it is nested."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "expr" and isinstance(value, str):
+                yield value
+            else:
+                yield from board_exprs(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from board_exprs(value)
+
+
+def check_liq_pinned(boards):
+    failures = [(board["uid"], expr, unpinned)
+                for board in boards
+                for expr in board_exprs(board)
+                for unpinned in [unpinned_liq_selectors(expr)]
+                if unpinned]
+    for uid, expr, unpinned in failures:
+        print(f"{uid}: unpinned liq_ selector {unpinned} in: {expr}",
+              file=sys.stderr)
+    if failures:
+        raise SystemExit(
+            f"{len(failures)} PromQL expressions read liq_* without "
+            f"{LIQ_JOB_MATCHER}")
+
+
+def board_panels(node):
+    """Every panel in a board, rows' collapsed panels included."""
+    for panel in node.get("panels", []):
+        yield panel
+        yield from board_panels(panel)
+
+
+def log_source_problems(panel):
+    """Why a panel's Cloud Logging queries do not follow `source`, if they
+    do not. Allowed: a pair exporter-<name> and bot-<name> under
+    pick_source(<name>); the detail script's bot-events, which it reads on
+    the bot source only; and the exporter-only Orders log."""
+    targets = [target for target in panel.get("targets", [])
+               if target.get("datasource", panel.get("datasource")) == CL]
+    names = {}
+    problems = []
+    for target in targets:
+        source, _, name = target.get("refId", "").partition("-")
+        query = target.get("queryText", "")
+        if source not in SOURCES:
+            if f"logs/{EXPORTER_ONLY_LOG}" not in query:
+                problems.append(f"refId {target.get('refId')} is not "
+                                "exporter-<name> or bot-<name>")
+            continue
+        names.setdefault(name, set()).add(source)
+        reads_bot = query.startswith(BOT_LOG)
+        reads_exporter = any(f"logs/{log}\"" in query
+                             for log in EXPORTER_LOGS)
+        if (source == "bot") != reads_bot or (source == "bot") == reads_exporter:
+            problems.append(f"{target['refId']} reads the wrong log: {query}")
+    for name, sources in names.items():
+        if sources == set(SOURCES):
+            if (panel.get("transformations") or [None])[0] != pick_source(name):
+                problems.append(f"{name} does not start with pick_source")
+        elif not (sources == {"bot"} and name == "events"
+                  and panel["type"] == "marcusolsson-dynamictext-panel"):
+            problems.append(f"{name} has only {sorted(sources)}")
+    return problems
+
+
+def check_log_sources(boards):
+    failures = [(board["uid"], panel.get("title"), problem)
+                for board in boards
+                for panel in board_panels(board)
+                for problem in log_source_problems(panel)]
+    for uid, title, problem in failures:
+        print(f"{uid}: panel {title!r}: {problem}", file=sys.stderr)
+    if failures:
+        raise SystemExit(f"{len(failures)} log queries do not follow source")
+
+
+def series_name_problems(panel):
+    """Why a panel's PromQL series would show unnamed: a PromQL target
+    with a legendFormat, which the Cloud Monitoring datasource ignores
+    (see promql), or a timeseries or bargauge target whose refId no
+    byFrameRefID override names (see series_names)."""
+    targets = [target for target in panel.get("targets", [])
+               if target.get("queryType") == "promQL"]
+    problems = [f"target {target.get('refId')}: legendFormat"
+                for target in targets
+                if "legendFormat" in target
+                or "legendFormat" in target.get("promQLQuery", {})]
+    if panel.get("type") in ("timeseries", "bargauge"):
+        named = {override["matcher"]["options"]
+                 for override in panel.get("fieldConfig", {})
+                 .get("overrides", [])
+                 if override["matcher"]["id"] == "byFrameRefID"
+                 and any(prop["id"] == "displayName"
+                         for prop in override["properties"])}
+        problems += [f"target {target.get('refId')}: no displayName override"
+                     for target in targets if target.get("refId") not in named]
+    return problems
+
+
+def check_series_names(boards):
+    """Every PromQL series is named by a field override Grafana applies,
+    not by a legendFormat it ignores."""
+    failures = [(board["uid"], panel.get("title"), problem)
+                for board in boards
+                for panel in board_panels(board)
+                for problem in series_name_problems(panel)]
+    for uid, title, problem in failures:
+        print(f"{uid}: panel {title!r} {problem}", file=sys.stderr)
+    if failures:
+        raise SystemExit(f"{len(failures)} PromQL series are not named by "
+                         "a byFrameRefID displayName override")
+    stray = series_name_problems({
+        "type": "timeseries", "targets": [promql("up", ref="B")],
+        "fieldConfig": {"overrides": series_names({"A": "up"})}})
+    legend = series_name_problems({"targets": [
+        {**promql("up"), "legendFormat": "up"},
+        {**promql("up", ref="B"), "promQLQuery": {"legendFormat": "up"}}]})
+    if len(stray) != 1 or len(legend) != 2:
+        raise SystemExit(f"series_name_problems misses a case: {stray} "
+                         f"{legend}")
+
+
+def panel_link_urls(node):
+    """Every data link url in a panel's field config, wherever it is nested."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "url" and isinstance(value, str):
+                yield value
+            else:
+                yield from panel_link_urls(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from panel_link_urls(value)
+
+
+def check_links_keep_env(boards):
+    """A data link to another board keeps the board's env and source, so the
+    target board reads the same project and job. A link that copies every
+    URL parameter (__url.params) keeps them already."""
+    failures = [(board["uid"], panel.get("title"), url)
+                for board in boards
+                for panel in board_panels(board)
+                for url in panel_link_urls(panel.get("fieldConfig", {}))
+                if url.startswith("/d/") and "__url.params" not in url
+                and not ("var-env=" in url and "var-source=" in url)]
+    for uid, title, url in failures:
+        print(f"{uid}: panel {title!r}: link drops env or source: {url}",
+              file=sys.stderr)
+    if failures:
+        raise SystemExit(f"{len(failures)} data links drop env or source")
+
+
+def table_columns(panel):
+    """The column names a table panel's sortBy can name: organize's ordered
+    fields under their new names, and the fields its overrides match by
+    name."""
+    organized = set()
+    for transform in panel.get("transformations", []):
+        if transform["id"] == "organize":
+            renames = transform["options"].get("renameByName", {})
+            organized |= {renames.get(name, name) for name in
+                          transform["options"].get("indexByName", {})}
+            organized |= set(renames.values())
+    matched = {override["matcher"]["options"]
+               for override in panel["fieldConfig"]["overrides"]
+               if override["matcher"]["id"] == "byName"}
+    return organized | matched
+
+
+def check_table_sorts(boards):
+    """Every default sort key of a table names one of its columns, so the
+    default order is not silently dropped."""
+    failures = [(board["uid"], panel.get("title"), key["displayName"])
+                for board in boards
+                for panel in board_panels(board) if panel["type"] == "table"
+                for key in panel.get("options", {}).get("sortBy", [])
+                if key["displayName"] not in table_columns(panel)]
+    for uid, title, name in failures:
+        print(f"{uid}: panel {title!r} sorts by a missing column {name!r}",
+              file=sys.stderr)
+    if failures:
+        raise SystemExit(f"{len(failures)} tables sort by a missing column")
+
+
+def check_equity_widths(boards):
+    """Every Equities column but Ratio has a fixed width, and with the
+    EQUITY_MAX_CHAIN_COLUMNS widest chain columns showing the fixed columns
+    leave the stretching Ratio column room (EQUITY_FIXED_PX_MAX). The budget
+    covers at most that many chain columns, not every chain at once."""
+    equities = next(panel for board in boards for panel in board_panels(board)
+                    if panel.get("title") == "Equities")
+    chains = {name for key, name in EQUITY_CHAIN_HEADERS.items()
+              if key != "ethereum"}
+    others = {"Asset", "Flags", "Inflight", "Alpaca", "Total", "Total USD",
+              "Exposure", "Unwrapped", "Wrapped"}
+    widths = {override["matcher"]["options"]: prop["value"]
+              for override in equities["fieldConfig"]["overrides"]
+              for prop in override["properties"] if prop["id"] == "custom.width"}
+    missing = (chains | others) - widths.keys()
+    if missing:
+        raise SystemExit(f"Equities columns have no width: {sorted(missing)}")
+    widest_chains = sorted((widths[name] for name in chains),
+                           reverse=True)[:EQUITY_MAX_CHAIN_COLUMNS]
+    fixed = sum(widths[name] for name in others) + sum(widest_chains)
+    if fixed > EQUITY_FIXED_PX_MAX:
+        raise SystemExit(f"Equities fixed columns take {fixed}px with "
+                         f"{EQUITY_MAX_CHAIN_COLUMNS} chain columns, over "
+                         f"{EQUITY_FIXED_PX_MAX}px")
+
+
+def check_after_render_scripts(boards):
+    """An afterRender script is not a module, so an export line left in it
+    (see panel_module) breaks the whole panel."""
+    failures = [(board["uid"], panel.get("title"))
+                for board in boards
+                for panel in board_panels(board)
+                if any(line.startswith("export ") for line in panel.get(
+                    "options", {}).get("afterRender", "").splitlines())]
+    for uid, title in failures:
+        print(f"{uid}: panel {title!r}: afterRender has an export line",
+              file=sys.stderr)
+    if failures:
+        raise SystemExit(f"{len(failures)} afterRender scripts export")
+
+
+def board_path(root, board):
     # A board's directory IS its Grafana folder (the provider builds folders
     # from the directory tree). The main board sits in dashboards/liquidity/,
     # so that folder lists one Liquidity bot entry; the four tab boards are
@@ -1764,8 +2778,241 @@ for board in dashboards:
     # board between folders.
     subdir = ("liquidity" if board["uid"] == "t0-liquidity"
               else os.path.join("liquidity", "tabs"))
-    path = os.path.join(HERE, "dashboards", subdir, board["uid"] + ".json")
-    with open(path, "w") as f:
-        json.dump(board, f, indent=2, sort_keys=False)
-        f.write("\n")
-    print(f"wrote {path}: {len(board['panels'])} panels")
+    return os.path.join(root, "dashboards", subdir, board["uid"] + ".json")
+
+
+def write_boards(root, boards, quiet=False):
+    for board in boards:
+        path = board_path(root, board)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(board, f, indent=2, sort_keys=False)
+            f.write("\n")
+        if not quiet:
+            print(f"wrote {path}: {len(board['panels'])} panels")
+
+
+def check_committed(boards):
+    with tempfile.TemporaryDirectory() as scratch:
+        write_boards(scratch, boards, quiet=True)
+        drifted = [board_path(HERE, board) for board in boards
+                   if not os.path.exists(board_path(HERE, board))
+                   or not filecmp.cmp(board_path(scratch, board),
+                                      board_path(HERE, board), shallow=False)]
+    for path in drifted:
+        print(f"{path} differs from the generator output", file=sys.stderr)
+    if drifted:
+        raise SystemExit(
+            "committed boards are stale: run python3 "
+            "observability/gen-t0-liquidity.py and commit the result")
+    print(f"{len(boards)} boards match the generator")
+
+
+def check_pin_liq():
+    """pin_liq pins bare and labelled liq_ selectors, and leaves string
+    literals and by/on/... label lists alone. CI runs this on --check."""
+    pin = "{" + LIQ_JOB_MATCHER
+    cases = {
+        "liq_a": f"liq_a{pin}}}",
+        'liq_a{chain="base"}': f'liq_a{pin},chain="base"}}',
+        'liq_a{chain="}liq_b"} + liq_c':
+            f'liq_a{pin},chain="}}liq_b"}} + liq_c{pin}}}',
+        'label_replace(liq_a, "k", "liq_b", "", "")':
+            f'label_replace(liq_a{pin}}}, "k", "liq_b", "", "")',
+        "'liq_a' + `liq_b`": "'liq_a' + `liq_b`",
+        "max by (liq_x) (liq_a)": f"max by (liq_x) (liq_a{pin}}})",
+        "sum without(liq_x)(liq_a)": f"sum without(liq_x)(liq_a{pin}}})",
+        "liq_a * on (symbol, liq_x) group_left (liq_y) liq_b":
+            f"liq_a{pin}}} * on (symbol, liq_x) group_left (liq_y) liq_b{pin}}}",
+        "liq_a / ignoring(liq_x) group_right(liq_y) liq_b":
+            f"liq_a{pin}}} / ignoring(liq_x) group_right(liq_y) liq_b{pin}}}",
+        'label_replace(liq_a, "k", "by (liq_b)", "", "")':
+            f'label_replace(liq_a{pin}}}, "k", "by (liq_b)", "", "")',
+    }
+    wrong = {expr: (pin_liq(expr), want) for expr, want in cases.items()
+             if pin_liq(expr) != want}
+    still_unpinned = {expr: unpinned_liq_selectors(pin_liq(expr))
+                      for expr in cases
+                      if unpinned_liq_selectors(pin_liq(expr))}
+    if unpinned_liq_selectors("liq_a") != ["liq_a"]:
+        still_unpinned["bare liq_a not reported"] = unpinned_liq_selectors("liq_a")
+    # A metric name in a __name__ matcher is a string literal that pin_liq
+    # leaves alone, so the check reports the selector instead.
+    for expr in ('{__name__="liq_equity_total"}',
+                 'count({__name__=~"liq_.*"})',
+                 'sum({__name__!="up"})',
+                 '{__name__="liq_a",job="other"}',
+                 'sum({"liq_equity_total"})', "{'liq_a', chain=\"base\"}",
+                 '{ `liq_a` }', '{"liq_a",job="other"}'):
+        if not unpinned_liq_selectors(pin_liq(expr)):
+            still_unpinned[f"{expr} not reported"] = []
+    for expr in ('{__name__="liq_a",' + LIQ_JOB_MATCHER + "}",
+                 '{"liq_a",' + LIQ_JOB_MATCHER + "}", '{"up"}',
+                 '{__name__="up"}', 'label_replace(up, "k", "{v}", "", "")'):
+        if unpinned_liq_selectors(pin_liq(expr)):
+            still_unpinned[expr] = unpinned_liq_selectors(pin_liq(expr))
+    if wrong or still_unpinned:
+        raise SystemExit(f"pin_liq pins the wrong names: {wrong} "
+                         f"{still_unpinned}")
+
+
+def bar_cell_shows(cell, value):
+    """(fill, percent) that a bar cell's first matching regex mapping draws
+    for `value` as Grafana passes it, the number's string form. A cell with
+    no percent gives its text in place of the percent."""
+    mappings = next(o["value"] for o in cell if o["id"] == "mappings")
+    for mapping in mappings:
+        match = re.fullmatch(mapping["options"]["pattern"], value)
+        if match:
+            html = match.expand(mapping["options"]["result"]["text"]
+                                .replace("$1", r"\1"))
+            fill = re.search(r"90deg, (rgba\([^)]*\))", html)
+            text = (re.search(r">([^<]*)%</div>", html)
+                    or re.search(r">([^<]*)</div>", html))
+            return (fill.group(1) if fill else None,
+                    text.group(1) if text else None)
+    return None
+
+
+def check_bar_cells():
+    """The banded and unjudged encodings draw the colour and percent they
+    mean, for values with and without float noise, and anything outside
+    them reads "out of range". CI runs this on --check."""
+    green, red = "rgba(34,197,94,0.6)", "rgba(239,68,68,0.6)"
+    out_of_range = (None, "out of range")
+    cell = bar_cell(unjudged=True)
+    cases = {
+        "45.5001": (green, "45.5"), "100.0001": (green, "100"),
+        "0.0001": (green, "0"), "45.5000999999999": (green, "45.5"),
+        "-45.5001": (red, "45.5"), "-0.0001": (red, "0"),
+        "-100.0001": (red, "100"),
+        "1045.5001": (GREY_FILL, "45.5"), "1000.0001": (GREY_FILL, "0"),
+        "1100.0001": (GREY_FILL, "100"), "1005.0001": (GREY_FILL, "5"),
+        "1010.0001": (GREY_FILL, "10"), "1000.5001": (GREY_FILL, "0.5"),
+        "1045.5000999999999": (GREY_FILL, "45.5"),
+        # A negative or above-one ratio: the encodings send it to
+        # OUT_OF_RANGE, and what an encoding without that guard made of it
+        # (an unjudged -10% was 990.0001, a judged -10% inside the band
+        # -9.9999) never draws a percent bar the encoding did not mean.
+        str(OUT_OF_RANGE): out_of_range, "990.0001": out_of_range,
+        "-110.0001": out_of_range, "110.0001": out_of_range,
+        "1200.0001": out_of_range, "1990.0001": out_of_range,
+        "-990.0001": out_of_range,
+        # Trailing digits count only after a dot, so a whole number above
+        # 100 is not read as a percent ("1001" is the unjudged 1% here; a
+        # banded cell reads it as out of range, checked below).
+        "5001": out_of_range, "990": out_of_range, "-1001": out_of_range,
+    }
+    wrong = {value: (bar_cell_shows(cell, value), want)
+             for value, want in cases.items()
+             if bar_cell_shows(cell, value) != want}
+    # Cells without the unjudged mapping keep their two colours.
+    if bar_cell_shows(bar_cell(), "100.0001") != (green, "100"):
+        wrong["banded 100.0001"] = bar_cell_shows(bar_cell(), "100.0001")
+    if bar_cell_shows(bar_cell(), "1045.5001") != out_of_range:
+        wrong["banded 1045.5001"] = bar_cell_shows(bar_cell(), "1045.5001")
+    if bar_cell_shows(bar_cell(), "1001") != out_of_range:
+        wrong["banded 1001"] = bar_cell_shows(bar_cell(), "1001")
+    for neutral_value, want in {"45.5": (GREY_FILL, "45.5"),
+                                str(OUT_OF_RANGE): out_of_range}.items():
+        if bar_cell_shows(bar_cell(neutral=True), neutral_value) != want:
+            wrong[f"neutral {neutral_value}"] = bar_cell_shows(
+                bar_cell(neutral=True), neutral_value)
+    # Every encoding guards its ratio with in_range, so a ratio outside
+    # [0, 1] reaches the cell as OUT_OF_RANGE.
+    bounded = "(((ratio) >= 0) <= 1)"
+    guarded = (f") and {bounded}) or ((clamp((ratio), 0, 0) + "
+               f"{OUT_OF_RANGE}) unless {bounded}))")
+    for name, encoded in {
+            "banded_pct": banded_pct("ratio", "inside"),
+            "unjudged_pct": unjudged_pct("ratio"),
+            "pct_bar": pct_bar("ratio"),
+            "pct_bar banded": pct_bar("ratio", ("target", "deviation"))}.items():
+        if not encoded.endswith(guarded):
+            wrong[f"{name} out of range"] = encoded
+    if wrong:
+        raise SystemExit(f"bar cell mappings draw the wrong bar: {wrong}")
+
+
+def check_no_custom_hidden(boards):
+    """No table saved as 13.1.0 hides a column with custom.hidden, which
+    that version draws (see HIDDEN_COLUMN)."""
+    failures = [(board["uid"], panel.get("title"))
+                for board in boards
+                for panel in board_panels(board)
+                if panel["type"] == "table"
+                and panel.get("pluginVersion") == "13.1.0"
+                and any(prop["id"] == "custom.hidden"
+                        for override in panel.get("fieldConfig", {})
+                        .get("overrides", [])
+                        for prop in override["properties"])]
+    for uid, title in failures:
+        print(f"{uid}: panel {title!r} hides a column with custom.hidden; "
+              "use custom.hideFrom", file=sys.stderr)
+    if failures:
+        raise SystemExit(f"{len(failures)} tables use custom.hidden")
+
+
+def check_lag_age_states(boards):
+    """The "sampled ago" stat maps each sentinel its expression can give to
+    its state and builds the paused branch from a sample time without a
+    lag. Paused wins over an age and an age wins over no checkpoint, so a
+    stale chain still shows next to a new one. The ages sit under `max`, so
+    with two valid chains (say 30s and 600s old) the stat shows 600s, and
+    an age over 300 s is orange.
+    CI runs this on --check."""
+    panels = [panel for board in boards for panel in board_panels(board)
+              if panel.get("fieldConfig", {}).get("defaults", {})
+              .get("displayName") == "sampled ago"]
+    if len(panels) != 1:
+        raise SystemExit(f"expected one 'sampled ago' stat, found {len(panels)}")
+    panel = panels[0]
+    expr = panel["targets"][0]["promQLQuery"]["expr"]
+    texts = {key: result["text"]
+             for mapping in panel["fieldConfig"]["defaults"]["mappings"]
+             if mapping["type"] == "value"
+             for key, result in mapping["options"].items()}
+    want = {str(LAG_PAUSED): "ingestion paused",
+            str(LAG_NEVER_SAMPLED): "no checkpoint yet"}
+    problems = [f"{key} maps to {texts.get(key)!r}, not {text!r}"
+                for key, text in want.items() if texts.get(key) != text]
+    paused, sep, rest = expr.partition(") or max(")
+    ages, sep2, no_checkpoint = rest.partition(") or min(")
+    if not sep or not sep2 or not paused.startswith("min("):
+        problems.append("want min(<paused>) or max(<ages>) or min(<no checkpoint>)")
+    for part, branch in (
+            (paused, f"liq_block_lag_blocks{{{LIQ_JOB_MATCHER}}}) - {-LAG_PAUSED}"),
+            (paused, "unless on(chain) liq_block_lag_blocks"),
+            (no_checkpoint, f"liq_block_lag_sampled_ts_seconds{{{LIQ_JOB_MATCHER}}}) "
+                            f"- {-LAG_NEVER_SAMPLED}"),
+            (no_checkpoint, "unless on(chain) liq_block_lag_sampled_ts_seconds"),
+            (ages, "clamp_min("), (ages, "and on(chain) liq_block_lag_blocks")):
+        if branch not in part:
+            problems.append(f"branch {branch!r} is not where it belongs")
+    if "clamp_min(" in paused or "clamp_min(" in no_checkpoint:
+        problems.append("ages must not sit under a sentinel's min")
+    steps = panel["fieldConfig"]["defaults"]["thresholds"]["steps"]
+    if {"color": "orange", "value": 300} not in steps:
+        problems.append("an age over 300 s must turn orange")
+    if LAG_PAUSED >= LAG_NEVER_SAMPLED or LAG_NEVER_SAMPLED >= 0:
+        problems.append("paused must sort below no checkpoint, below 0")
+    if problems:
+        raise SystemExit(f"'sampled ago' stat: {problems} in {expr}")
+
+check_pin_liq()
+check_bar_cells()
+check_lag_age_states(dashboards)
+check_liq_pinned(dashboards)
+check_log_sources(dashboards)
+check_series_names(dashboards)
+check_links_keep_env(dashboards)
+check_table_sorts(dashboards)
+check_equity_widths(dashboards)
+check_no_custom_hidden(dashboards)
+check_after_render_scripts(dashboards)
+if sys.argv[1:] == ["--check"]:
+    check_committed(dashboards)
+elif sys.argv[1:]:
+    raise SystemExit(f"usage: {sys.argv[0]} [--check]")
+else:
+    write_boards(HERE, dashboards)
