@@ -42,7 +42,8 @@ Body (amounts are base-10 strings in the token's smallest unit):
 ```
 
 The response carries `requestId`, `steps[]`, `fees`, `details` and `protocol`.
-The client reads:
+Its amounts are base-10 strings too; one that is empty or holds anything but
+ASCII digits does not decode. The client reads:
 
 - `details.currencyIn` / `details.currencyOut`: chain id, token, `amount`, and
   on the output `minimumAmount`, the least the solver may pay before it refunds.

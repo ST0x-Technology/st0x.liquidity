@@ -1060,7 +1060,8 @@ fn check_deposit(
     Ok(RelayOrderId(call.id))
 }
 
-/// Relay writes amounts as base-10 strings.
+/// Relay writes amounts as base-10 strings. Only ASCII digits pass: ruint
+/// reads `""` as zero and skips `_`.
 mod decimal {
     use alloy::primitives::U256;
     use serde::{Deserialize, Deserializer, de::Error};
@@ -1069,6 +1070,13 @@ mod decimal {
         deserializer: D,
     ) -> Result<U256, D::Error> {
         let text = String::deserialize(deserializer)?;
+
+        if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(D::Error::custom(format_args!(
+                "amount {text:?} is not a base-10 integer"
+            )));
+        }
+
         U256::from_str_radix(&text, 10).map_err(D::Error::custom)
     }
 }
