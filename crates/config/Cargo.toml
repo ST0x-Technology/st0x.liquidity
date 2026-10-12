@@ -33,7 +33,7 @@ rain-math-float.workspace = true
 reqwest.workspace = true
 serde = { workspace = true, features = ["derive"] }
 sqlx.workspace = true
-st0x-bridge = { workspace = true, features = ["cctp"] }
+st0x-bridge = { workspace = true, features = ["cctp", "relay"] }
 st0x-evm.workspace = true
 st0x-execution.workspace = true
 st0x-finance.workspace = true

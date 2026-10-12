@@ -2476,8 +2476,9 @@ max_refund_retries = 3          # Alpaca-to-chain re-quotes after a refund
 max_deposit_revert_redrives = 5 # reverted deposits before the transfer holds
 ```
 
-There is no Relay API key: quotes and status reads use Relay's unauthenticated
-limits.
+The Relay API key is a secret: `[relay] api_key` in the secrets file. Relay
+refuses every quote without one, so a Relay corridor with no key fails at config
+load; without a Relay corridor the key is optional.
 
 The hub (the Ethereum wallet), the CCTP domains and the USDC addresses are
 pinned in code per chain, never configured.
@@ -2682,20 +2683,21 @@ _Configuration management_:
 - `st0x`-kind binaries use `--config` + `--secrets` flags; `plain`-kind units
   invoke their package binary with declared `args`
 - The secrets file carries only actual secrets: per-chain `rpc_url` entries, the
-  `[rest_api]` key pair, the `[issuance]` `api_key`, and (legacy Alpaca only)
-  the `[broker]` `api_key`/`api_secret` pair under its `type` tag. Everything
-  else that once lived there is identity, not credentials, and belongs in the
-  plaintext config: the broker `type`, `mode`, `account_id` and (keyless
-  variant) `client_id`/`kms_key_version` in the config `[broker]` section, and
-  the issuance `base_url` in the config `[issuance]` section. (Migration note,
-  one release: the deprecated secrets-file copies of these identity fields are
-  still accepted with a warning, because deployed secret versions carry them; a
-  field set differently in both files is refused at startup rather than silently
-  resolved. The keyless alpaca-broker-api-kms `[broker]` table migrates
-  all-or-nothing: while it remains in the secrets file its fields stay required
-  there, and the migration step is to delete the whole table once the config
-  carries the identity. The shims and this tolerance are removed next release,
-  together with the `[alerts]` shims described under Operational Alerting.)
+  `[rest_api]` key pair, the `[issuance]` `api_key`, the `[relay]` `api_key`,
+  and (legacy Alpaca only) the `[broker]` `api_key`/`api_secret` pair under its
+  `type` tag. Everything else that once lived there is identity, not
+  credentials, and belongs in the plaintext config: the broker `type`, `mode`,
+  `account_id` and (keyless variant) `client_id`/`kms_key_version` in the config
+  `[broker]` section, and the issuance `base_url` in the config `[issuance]`
+  section. (Migration note, one release: the deprecated secrets-file copies of
+  these identity fields are still accepted with a warning, because deployed
+  secret versions carry them; a field set differently in both files is refused
+  at startup rather than silently resolved. The keyless alpaca-broker-api-kms
+  `[broker]` table migrates all-or-nothing: while it remains in the secrets file
+  its fields stay required there, and the migration step is to delete the whole
+  table once the config carries the identity. The shims and this tolerance are
+  removed next release, together with the `[alerts]` shims described under
+  Operational Alerting.)
 
 _Infrastructure_:
 

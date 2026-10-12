@@ -9,7 +9,7 @@ use tracing::info;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCorridor, CctpCtx, CctpError};
 use st0x_bridge::corridor::{HopKind, UsdcCorridor};
-use st0x_bridge::relay::{RelayBridge, RelayBridgeError, RelayClient, RelayCtx, RelayError};
+use st0x_bridge::relay::{RelayBridge, RelayBridgeError, RelayClient, RelayCtx};
 use st0x_config::{ChainEquityAsset, OnchainWalletCtx, RelayHopCtx};
 use st0x_event_sorcery::Store;
 use st0x_evm::{Chain, Wallet};
@@ -35,8 +35,6 @@ pub(crate) enum SpawnRebalancerError {
     Cctp(#[from] Box<CctpError>),
     #[error("failed to create the Relay bridge: {0}")]
     RelayBridge(#[from] Box<RelayBridgeError>),
-    #[error("failed to create the Relay API client: {0}")]
-    RelayClient(#[from] Box<RelayError>),
     #[error("the {corridor} corridor has no Relay bounds or chain confirmations")]
     RelayHopUnconfigured { corridor: UsdcCorridor },
     #[error(transparent)]
@@ -155,12 +153,13 @@ impl ChainWallets<Arc<dyn Wallet<Provider = RootProvider>>> {
     }
 }
 
-/// What a Relay corridor's hop is built from: the corridor's bounds and the
-/// confirmations its chain requires.
-#[derive(Debug, Clone, Copy)]
+/// What a Relay corridor's hop is built from: the corridor's bounds, the
+/// confirmations its chain requires, and the API client holding the key.
+#[derive(Debug, Clone)]
 pub(crate) struct RelayHopSetup {
     pub(crate) bounds: RelayHopCtx,
     pub(crate) chain_confirmations: u64,
+    pub(crate) client: RelayClient,
 }
 
 /// External service clients for rebalancing operations: the Alpaca broker
@@ -339,7 +338,7 @@ impl<Signer: Wallet + Clone + 'static> RebalancerServices<Signer> {
     }
 
     /// The Relay hop between `chain` and the hub, on the shared Ethereum
-    /// wallet. Quotes run on Relay's unauthenticated limits.
+    /// wallet.
     fn relay_hop(
         &self,
         corridor: UsdcCorridor,
@@ -364,9 +363,12 @@ impl<Signer: Wallet + Clone + 'static> RebalancerServices<Signer> {
             chain_confirmations: setup.chain_confirmations,
         })
         .map_err(Box::new)?;
-        let client = RelayClient::new(None).map_err(Box::new)?;
-
-        Ok(RelayHop::new(bridge, client, setup.bounds, hub_wallet))
+        Ok(RelayHop::new(
+            bridge,
+            setup.client.clone(),
+            setup.bounds,
+            hub_wallet,
+        ))
     }
 }
 
@@ -417,7 +419,7 @@ mod tests {
     use crate::rebalancing::RebalancingServiceConfig;
     use crate::rebalancing::usdc::{UsdcRecheckError, UsdcSettlementParams, UsdcTransferError};
     use crate::telemetry::TelemetrySender;
-    use crate::test_utils::spawn_anvil;
+    use crate::test_utils::{relay_test_client, spawn_anvil};
     use crate::usdc_rebalance::{
         RebalanceDirection, UsdcRebalanceCommand, UsdcRebalanceId, record_swap_pair_for_test,
     };
@@ -654,6 +656,7 @@ mod tests {
                     max_deposit_revert_redrives: 5,
                 },
                 chain_confirmations: 1,
+                client: relay_test_client("http://relay.invalid".to_owned()),
             },
         )])
     }

@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use st0x_bridge::cctp::{CctpCorridor, CorridorStableNotUsdc, cctp_domain};
 use st0x_bridge::corridor::{HopKind, UsdcCorridor};
+use st0x_bridge::relay::RelayApiKey;
 use st0x_evm::Chain;
 #[cfg(any(test, feature = "test-support"))]
 use st0x_evm::{USDC_BASE, USDC_ETHEREUM};
@@ -129,6 +130,13 @@ pub enum RebalancingCtxError {
     },
     #[error("[rebalancing.usdc.corridors.{chain}.relay] {key} must be non-zero")]
     RelayZeroSetting { chain: Chain, key: &'static str },
+    #[error(
+        "[rebalancing.usdc.corridors.{chain}] hop = \"relay\" needs [relay] api_key in the \
+         secrets file: Relay refuses every quote without one"
+    )]
+    RelayApiKeyMissing { chain: Chain },
+    #[error("[relay] api_key in the secrets file must be non-empty printable ASCII")]
+    RelayApiKeyInvalid,
     #[error("[rebalancing.usdc.corridors.{chain}] hop = \"cctp\": {source}")]
     CctpHopStableNotUsdc {
         chain: Chain,
@@ -248,6 +256,14 @@ pub struct RelayHopConfig {
     pub fill_timeout_secs: u64,
     pub max_refund_retries: u32,
     pub max_deposit_revert_redrives: u32,
+}
+
+/// The `[relay]` table of the secrets file: the Relay API key every Relay
+/// corridor quotes with.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RelaySecrets {
+    api_key: String,
 }
 
 /// A validated Relay hop's bounds.
@@ -376,6 +392,8 @@ pub struct UsdcCorridors {
     by_chain: BTreeMap<Chain, UsdcCorridorCtx>,
     /// The bounds of each Relay corridor, by its chain.
     relay_hops: BTreeMap<Chain, RelayHopCtx>,
+    /// Present whenever `relay_hops` is non-empty.
+    relay_api_key: Option<RelayApiKey>,
     served: BTreeSet<UsdcCorridor>,
     conversion_failure_cooldown: Duration,
 }
@@ -411,6 +429,38 @@ impl UsdcCorridors {
     /// Every Relay corridor's bounds, by chain.
     pub const fn relay_hops(&self) -> &BTreeMap<Chain, RelayHopCtx> {
         &self.relay_hops
+    }
+
+    /// The Relay API key from the secrets file. Never logged.
+    pub const fn relay_api_key(&self) -> Option<&RelayApiKey> {
+        self.relay_api_key.as_ref()
+    }
+
+    /// Takes the secrets file's `[relay]` table. A Relay corridor without
+    /// it is refused; a key with no Relay corridor is kept, so the shared
+    /// secrets file can carry it before any environment configures one.
+    pub(crate) fn with_relay_secrets(
+        mut self,
+        secrets: Option<RelaySecrets>,
+    ) -> Result<Self, RebalancingCtxError> {
+        let api_key = secrets
+            .map(|RelaySecrets { api_key }| {
+                if api_key.is_empty() || !api_key.bytes().all(|byte| byte.is_ascii_graphic()) {
+                    return Err(RebalancingCtxError::RelayApiKeyInvalid);
+                }
+
+                Ok(RelayApiKey::from(api_key))
+            })
+            .transpose()?;
+
+        if api_key.is_none()
+            && let Some(chain) = self.relay_hops.keys().next()
+        {
+            return Err(RebalancingCtxError::RelayApiKeyMissing { chain: *chain });
+        }
+
+        self.relay_api_key = api_key;
+        Ok(self)
     }
 
     /// How long a failed pre-withdrawal USD->USDC conversion holds
@@ -487,6 +537,7 @@ impl UsdcCorridors {
             mode: OperationMode::Disabled,
             by_chain: BTreeMap::new(),
             relay_hops: BTreeMap::new(),
+            relay_api_key: None,
             served: BTreeSet::from([UsdcCorridor::BASE_CCTP]),
             conversion_failure_cooldown: Duration::from_secs(
                 default_usdc_conversion_failure_cooldown_secs(),
@@ -509,6 +560,7 @@ impl UsdcCorridors {
             mode,
             by_chain,
             relay_hops: BTreeMap::new(),
+            relay_api_key: None,
             served,
             conversion_failure_cooldown: Duration::from_secs(
                 default_usdc_conversion_failure_cooldown_secs(),
@@ -520,6 +572,13 @@ impl UsdcCorridors {
     #[must_use]
     pub fn with_relay_hop(mut self, chain: Chain, relay: RelayHopCtx) -> Self {
         self.relay_hops.insert(chain, relay);
+        self
+    }
+
+    /// The same corridors with `api_key` as the Relay API key.
+    #[must_use]
+    pub fn with_relay_api_key(mut self, api_key: RelayApiKey) -> Self {
+        self.relay_api_key = Some(api_key);
         self
     }
 
@@ -588,6 +647,7 @@ impl UsdcRebalancing {
             mode: self.mode,
             by_chain,
             relay_hops,
+            relay_api_key: None,
             served,
             conversion_failure_cooldown: Duration::from_secs(self.conversion_failure_cooldown_secs),
         })
@@ -2188,6 +2248,80 @@ mod tests {
             "got {error:?}"
         );
         assert!(error.to_string().contains("RAI-2986"), "got {error}");
+    }
+
+    fn robinhood_relay_corridors() -> UsdcCorridors {
+        UsdcCorridors::base_cctp_disabled().with_relay_hop(
+            Chain::Robinhood,
+            RelayHopCtx {
+                slippage_bps: 30,
+                max_quote_loss_bps: 50,
+                min_transfer: Usdc::new(float!(500)),
+                max_transfer: Usdc::new(float!(50000)),
+                quote_max_age: Duration::from_secs(60),
+                fill_timeout: Duration::from_secs(1800),
+                max_refund_retries: 3,
+                max_deposit_revert_redrives: 5,
+            },
+        )
+    }
+
+    fn relay_secrets(api_key: &str) -> RelaySecrets {
+        RelaySecrets {
+            api_key: api_key.to_owned(),
+        }
+    }
+
+    #[test]
+    fn relay_corridor_without_api_key_is_refused() {
+        let error = robinhood_relay_corridors()
+            .with_relay_secrets(None)
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                RebalancingCtxError::RelayApiKeyMissing {
+                    chain: Chain::Robinhood
+                }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn relay_corridor_takes_the_api_key() {
+        robinhood_relay_corridors()
+            .with_relay_secrets(Some(relay_secrets("relay-key")))
+            .unwrap()
+            .relay_api_key()
+            .unwrap();
+    }
+
+    #[test]
+    fn relay_api_key_is_optional_without_a_relay_corridor() {
+        let corridors = UsdcCorridors::base_cctp_disabled();
+
+        corridors.clone().with_relay_secrets(None).unwrap();
+        corridors
+            .with_relay_secrets(Some(relay_secrets("relay-key")))
+            .unwrap()
+            .relay_api_key()
+            .unwrap();
+    }
+
+    #[test]
+    fn blank_or_unprintable_relay_api_key_is_refused() {
+        for api_key in ["", "relay key", "relay\nkey"] {
+            let error = UsdcCorridors::base_cctp_disabled()
+                .with_relay_secrets(Some(relay_secrets(api_key)))
+                .unwrap_err();
+
+            assert!(
+                matches!(error, RebalancingCtxError::RelayApiKeyInvalid),
+                "{api_key:?}: got {error:?}"
+            );
+        }
     }
 
     #[test]
