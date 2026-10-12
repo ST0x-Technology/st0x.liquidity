@@ -4681,11 +4681,14 @@ mod tests {
     use super::*;
     use crate::bindings::IRaindexV6::{SignedContextV1, TakeOrderConfigV4, TakeOrderV3};
     use crate::dashboard;
-    use crate::dashboard::pnl::{PnlReportAdmission, acquire_pnl_report_permit};
+    use crate::dashboard::pnl::{
+        PnlReportAdmission, acquire_pnl_report_permit, run_pnl_window_reports,
+    };
     use crate::equity_redemption::redemption_aggregate_id;
     use crate::inventory::{
         self, BroadcastingInventory, PortfolioAsset, PortfolioBalanceRow, PortfolioLocation,
     };
+    use crate::metrics::liquidity::pnl::PnlWindowKey;
     use crate::metrics::liquidity::pnl_refresh::{LivePnlReports, PnlReports};
     use crate::offchain::order::{
         OffchainOrder, OffchainOrderEvent, OffchainOrderId, OrderPlacementResult,
@@ -6136,28 +6139,112 @@ mod tests {
         assert_eq!(second.summary.matched_lot_count, 2);
     }
 
+    /// The metrics task's reports take none of the live permits, and on its
+    /// first cycle, with no range known before, its windows already end on
+    /// the last fill day of its own replay.
     #[tokio::test]
     async fn pnl_metrics_reports_run_while_live_requests_hold_every_permit() {
         let (state, _broker_mock) = pnl_test_state().await;
+        seed_position_pnl_fill(&state.pool, &Symbol::new("RKLB").unwrap()).await;
         let _live_permits = (0..crate::dashboard::pnl::MAX_CONCURRENT_PNL_REPORTS)
             .map(|_| acquire_pnl_report_permit(&state.pnl_report_admission).unwrap())
             .collect::<Vec<_>>();
         let reports = LivePnlReports::new(&state.ctx, state.pool.clone(), state.pnl_ledger.clone());
 
-        let report = reports
-            .report(PnlQuery {
-                limit: Some(1),
-                ..PnlQuery::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(report.summary.matched_lot_count, 0);
+        let window_reports = reports.window_reports().await.unwrap();
+
+        let windows: Vec<PnlWindowKey> = window_reports.iter().map(|(window, _)| *window).collect();
+        assert_eq!(windows, PnlWindowKey::REFRESH_ORDER);
+        for (window, report) in window_reports {
+            let report = report.unwrap();
+            assert_eq!(report.summary.matched_lot_count, 1, "{window:?}");
+            assert_eq!(
+                report.available_range.last_date.as_deref(),
+                Some("2026-03-08"),
+                "{window:?}"
+            );
+        }
 
         let response = build_app(state)
             .oneshot(Request::builder().uri("/pnl").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The metrics task builds its six windows over one shared replay. Each
+    /// window's report must be byte for byte what `/pnl` answers for the
+    /// same dates. The windows have the shapes of `1d`, `1w`, `1m`, `ytd`,
+    /// `1y` and `all` ending the day after the fills, so `1d` has none. The
+    /// window picker gets the range of the shared replay itself.
+    #[tokio::test]
+    async fn pnl_window_reports_match_the_route_for_every_window() {
+        let (state, _broker_mock) = pnl_test_state().await;
+        seed_position_pnl_fill(&state.pool, &Symbol::new("RKLB").unwrap()).await;
+        seed_position_pnl_fill(&state.pool, &Symbol::new("TSLA").unwrap()).await;
+        let day = |text: &str| NaiveDate::parse_from_str(text, "%Y-%m-%d").unwrap();
+        let windows: Vec<(NaiveDate, NaiveDate)> = [
+            ("2026-03-09", "2026-03-09"),
+            ("2026-03-03", "2026-03-09"),
+            ("2026-02-07", "2026-03-09"),
+            ("2026-01-01", "2026-03-09"),
+            ("2025-03-10", "2026-03-09"),
+            ("2026-03-08", "2026-03-09"),
+        ]
+        .into_iter()
+        .map(|(from, to)| (day(from), day(to)))
+        .collect();
+        let BrokerCtx::AlpacaBrokerApi(broker) = &state.ctx.broker;
+        let deps = PnlReportDeps {
+            pool: &state.pool,
+            ledger: &state.pnl_ledger,
+            broker,
+        };
+        let base = PnlQuery {
+            limit: Some(1),
+            ..PnlQuery::default()
+        };
+        let mut seen_last_date = None;
+
+        let shared = run_pnl_window_reports(
+            &deps,
+            &base,
+            |range| {
+                seen_last_date.clone_from(&range.last_date);
+                windows
+                    .iter()
+                    .map(|(from, to)| ((*from, *to), *from, *to))
+                    .collect::<Vec<_>>()
+            },
+            &PnlReportAdmission::queued(1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(seen_last_date.as_deref(), Some("2026-03-08"));
+        assert_eq!(shared.len(), 6);
+        let mut lot_counts = Vec::new();
+        for ((from, to), report) in shared {
+            let report = report.unwrap();
+            lot_counts.push(report.summary.matched_lot_count);
+            let response = build_app(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/pnl?limit=1&fromDate={from}&toDate={to}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK, "{from}..{to}");
+            assert_eq!(
+                body_to_string(response).await,
+                serde_json::to_string(&report).unwrap(),
+                "{from}..{to}"
+            );
+        }
+        assert_eq!(lot_counts, [0, 2, 2, 2, 2, 2]);
     }
 
     /// End-to-end `/pnl` coverage for capital/return-on-capital figures: three

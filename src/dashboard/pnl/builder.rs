@@ -20,7 +20,7 @@ use super::replay::{
     parse_onchain_fill, reset_symbol_costs, summary_from_entries, summary_to_dto,
     with_direct_symbol_costs, with_replay_exposure,
 };
-use super::response::{PnlCapitalSummary, PnlCostEntry, PnlResponse};
+use super::response::{PnlAvailableRange, PnlCapitalSummary, PnlCostEntry, PnlEntry, PnlResponse};
 use super::samples::{build_available_range, build_sample_stats, parse_position_view};
 use super::sessions::{
     date_key, et_day_key, matches_cost_date_filter, matches_cost_symbol_filter, matches_date_filter,
@@ -160,8 +160,35 @@ fn warn_on_fills_without_wrapper_ratio(
     ));
 }
 
-/// Builds the `/pnl` response from already-loaded rows and returns net realized
-/// PnL bucketed by ET accounting day for the aligned capital calculation.
+/// The part of a report that does not read its date window: the
+/// symbol-filtered position rows, the range of days with fills, and the FIFO
+/// replay of every row at or below the watermark. Every window over the same
+/// rows and symbol filter shares one; [`summarize_pnl_window`] turns it into
+/// one window's response.
+pub(crate) struct PnlReplay {
+    /// The symbol-filtered rows, which a window's sample stats and
+    /// wrapper-ratio warning read.
+    event_rows: Vec<PositionLedgerRow>,
+    position_symbols: Vec<Symbol>,
+    /// The range of days with fills at the replay's watermark, which the
+    /// windows of one shared replay take their dates from.
+    pub(crate) available_range: PnlAvailableRange,
+    /// What `position_view` and the available range warned, in that order.
+    range_warnings: Vec<String>,
+    /// What the replay, the book finalization and the replay diagnostics
+    /// warned, in that order.
+    replay_warnings: Vec<String>,
+    /// Every matched lot of the replay, before any date filter.
+    entries: Vec<PnlEntry>,
+    full_total: SummaryAcc,
+    replay_symbols: Vec<(Symbol, SummaryAcc)>,
+    book_symbols: Vec<Symbol>,
+}
+
+/// [`replay_pnl_rows`] and then [`summarize_pnl_window`] over
+/// already-loaded rows, the two steps every report takes, for tests that
+/// build one window's response at once.
+#[cfg(test)]
 pub(crate) fn build_pnl_response_from_rows(
     event_rows: Vec<PositionLedgerRow>,
     position_rows: &[PositionViewRow],
@@ -170,9 +197,30 @@ pub(crate) fn build_pnl_response_from_rows(
     alpaca_activities: &[AccountActivity],
     query: &PnlQuery,
     symbols: &BTreeSet<String>,
-    mut warnings: Vec<String>,
+    warnings: Vec<String>,
 ) -> Result<(PnlResponse, BTreeMap<NaiveDate, Float>), PnlError> {
-    let event_rows = if symbols.is_empty() {
+    let replay = replay_pnl_rows(event_rows, position_rows, symbols)?;
+
+    summarize_pnl_window(
+        &replay,
+        cost_rows,
+        bot_gas_rows,
+        alpaca_activities,
+        query,
+        symbols,
+        warnings,
+    )
+}
+
+/// The window-independent half of every report. Nothing
+/// here reads the query: the replay runs over every row at or below the
+/// watermark, and a window only filters its matched lots afterwards.
+pub(crate) fn replay_pnl_rows(
+    event_rows: Vec<PositionLedgerRow>,
+    position_rows: &[PositionViewRow],
+    symbols: &BTreeSet<String>,
+) -> Result<PnlReplay, PnlError> {
+    let event_rows: Vec<PositionLedgerRow> = if symbols.is_empty() {
         event_rows
     } else {
         event_rows
@@ -180,16 +228,17 @@ pub(crate) fn build_pnl_response_from_rows(
             .filter(|row| symbols.contains(row.symbol()))
             .collect()
     };
-    warn_on_fills_without_wrapper_ratio(&event_rows, query, &mut warnings);
-    let (position_nets, position_symbols) = parse_position_view(position_rows, &mut warnings)?;
-    let available_range = build_available_range(&event_rows, &mut warnings);
-    let sample_stats = build_sample_stats(&event_rows, query, &mut warnings);
+    let mut range_warnings = Vec::new();
+    let (position_nets, position_symbols) =
+        parse_position_view(position_rows, &mut range_warnings)?;
+    let available_range = build_available_range(&event_rows, &mut range_warnings);
+    let mut warnings = Vec::new();
     let mut books: HashMap<Symbol, SymbolBook> = HashMap::new();
     let mut entries = Vec::new();
     let mut unmatched_offchain_allocations = Vec::new();
     let mut position_replay_deltas = Vec::new();
 
-    for row in ordered_position_events(event_rows)? {
+    for row in ordered_position_events(&event_rows)? {
         if !is_safe_symbol(row.symbol()) {
             warnings.push(format!(
                 "Skipped unsafe position event symbol in backend PnL response: {}",
@@ -207,7 +256,7 @@ pub(crate) fn build_pnl_response_from_rows(
         };
 
         let book = books.entry(symbol).or_default();
-        match &row {
+        match row {
             PositionLedgerRow::OnchainFill(fill_row) => {
                 let fill = parse_onchain_fill(fill_row)?;
                 apply_onchain_fill(book, &fill, &mut entries, &mut warnings)?;
@@ -235,28 +284,65 @@ pub(crate) fn build_pnl_response_from_rows(
     let mut replay_symbols = Vec::new();
     let mut book_symbols: Vec<_> = books.keys().cloned().collect();
     book_symbols.sort();
-    for symbol in book_symbols {
-        if let Some(book) = books.get_mut(&symbol) {
+    for symbol in &book_symbols {
+        if let Some(book) = books.get_mut(symbol) {
             finalize_book(
-                &symbol,
+                symbol,
                 book,
                 &position_nets,
                 &mut warnings,
                 &mut position_replay_deltas,
             )?;
             add_summary(&mut full_total, &book.summary)?;
-            replay_symbols.push((symbol, book.summary.clone()));
+            replay_symbols.push((symbol.clone(), book.summary.clone()));
         }
     }
+    // The formatting notes it dedupes against come only from the
+    // diagnostics, so a window's own warnings never change what it adds.
     append_replay_diagnostics(
         &mut warnings,
         &unmatched_offchain_allocations,
         &position_replay_deltas,
     )?;
 
-    let mut filtered_entries: Vec<_> = entries
-        .into_iter()
+    Ok(PnlReplay {
+        event_rows,
+        position_symbols,
+        available_range,
+        range_warnings,
+        replay_warnings: warnings,
+        entries,
+        full_total,
+        replay_symbols,
+        book_symbols,
+    })
+}
+
+/// One window's response from a shared [`PnlReplay`]: the window's warnings
+/// and sample stats, its matched lots, costs and day buckets. `symbols` must
+/// be the filter the replay was built with. Returns net realized PnL by ET
+/// accounting day for the aligned capital calculation.
+pub(crate) fn summarize_pnl_window(
+    replay: &PnlReplay,
+    cost_rows: &[CostLedgerRow],
+    bot_gas_rows: &[BotGasCostRow],
+    alpaca_activities: &[AccountActivity],
+    query: &PnlQuery,
+    symbols: &BTreeSet<String>,
+    mut warnings: Vec<String>,
+) -> Result<(PnlResponse, BTreeMap<NaiveDate, Float>), PnlError> {
+    // The same warning order as a single replay: wrapper ratios, position
+    // view and range, sample stats, then the replay's own.
+    warn_on_fills_without_wrapper_ratio(&replay.event_rows, query, &mut warnings);
+    warnings.extend(replay.range_warnings.iter().cloned());
+    let sample_stats = build_sample_stats(&replay.event_rows, query, &mut warnings);
+    warnings.extend(replay.replay_warnings.iter().cloned());
+
+    let mut filtered_entries: Vec<_> = replay
+        .entries
+        .iter()
         .filter(|entry| matches_date_filter(entry, query))
+        .cloned()
         .collect();
     filtered_entries.sort_by(|left, right| {
         right
@@ -329,20 +415,20 @@ pub(crate) fn build_pnl_response_from_rows(
         *running = (*running + amount)?;
     }
     let filtered = summary_from_entries(&filtered_entries)?;
-    let replay_summary = summary_to_dto(&full_total)?;
+    let replay_summary = summary_to_dto(&replay.full_total)?;
     let (summary, _net_realized_pnl_usd) = with_costs(
         with_replay_exposure(filtered.summary, replay_summary),
         &cost_summary,
     )?;
     let symbols_with_exposure =
-        merge_symbol_replay_exposure(filtered.symbols, replay_symbols.into_iter())?;
+        merge_symbol_replay_exposure(filtered.symbols, replay.replay_symbols.iter().cloned())?;
     let symbols_with_costs = with_direct_symbol_costs(
         reset_symbol_costs(symbols_with_exposure),
         &filtered_cost_entries,
     )?;
 
-    let mut symbol_universe: BTreeSet<Symbol> = position_symbols.into_iter().collect();
-    symbol_universe.extend(books.keys().cloned());
+    let mut symbol_universe: BTreeSet<Symbol> = replay.position_symbols.iter().cloned().collect();
+    symbol_universe.extend(replay.book_symbols.iter().cloned());
     symbol_universe.extend(symbols_with_costs.iter().map(|row| row.symbol.clone()));
     let symbol_universe: Vec<_> = symbol_universe.into_iter().collect();
 
@@ -357,7 +443,7 @@ pub(crate) fn build_pnl_response_from_rows(
             attribution_method: ATTRIBUTION_METHOD,
             as_of_rowid: query.as_of_rowid.unwrap_or(0),
             warnings,
-            available_range,
+            available_range: replay.available_range.clone(),
             sample_stats,
             summary,
             costs: cost_summary,
