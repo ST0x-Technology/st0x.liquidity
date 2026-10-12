@@ -212,8 +212,9 @@
     {
       "id": 2,
       "type": "table",
-      "title": "Inventory",
-      "description": "The SPA's USDC row: Raindex + Alpaca Total + Inflight = Total; Ratio = Raindex/(Raindex+Alpaca Total); \u0394 = deviation from the target ratio in band widths, colored outside +/-1, where the SPA colors its bar.",
+      "pluginVersion": "13.1.0",
+      "title": "USD \u00b7 Alpaca",
+      "description": "Alpaca's cash: no rebalance target, so it shows its share of the USD total. The USD total is Alpaca, the primary chain's vault and the cash in flight; other chains' vaults are not in it. Rebalanceable = max(0, withdrawable - reserve).",
       "datasource": {
         "type": "stackdriver",
         "uid": "cloudmon"
@@ -228,7 +229,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "sum by (row, col) (label_replace(label_replace(liq_usdc_onchain_available{job=~\"$source\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Raindex\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_inflight_total{job=~\"$source\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Inflight\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_alpaca_total{job=~\"$source\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Alpaca Total\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_total{job=~\"$source\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Total\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_ratio{job=~\"$source\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Ratio\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_ratio_deviation{job=~\"$source\"} and liq_usdc_total{job=~\"$source\"} > 0, \"row\", \"USDC\", \"\", \"\"), \"col\", \"\u0394\", \"\", \"\"))",
+            "expr": "sum by (venue, col) (label_replace(label_replace(liq_usdc_alpaca_total{job=~\"$source\"}, \"venue\", \"Alpaca\", \"\", \"\"), \"col\", \"cash\", \"\", \"\")) or sum by (venue, col) (label_replace(label_replace(liq_usdc_alpaca_usdc{job=~\"$source\"}, \"venue\", \"Alpaca\", \"\", \"\"), \"col\", \"usdc\", \"\", \"\")) or sum by (venue, col) (label_replace(label_replace((liq_settings_cash_reserved{job=~\"$source\"} or (liq_usdc_offchain_gross{job=~\"$source\"} - liq_usdc_offchain_available{job=~\"$source\"}) or (liq_usdc_alpaca_total{job=~\"$source\"} - liq_usdc_offchain_available{job=~\"$source\"})), \"venue\", \"Alpaca\", \"\", \"\"), \"col\", \"reserve\", \"\", \"\")) or sum by (venue, col) (label_replace(label_replace(liq_usdc_rebalanceable{job=~\"$source\"}, \"venue\", \"Alpaca\", \"\", \"\"), \"col\", \"rebalanceable\", \"\", \"\")) or sum by (venue, col) (label_replace(label_replace(liq_usdc_offchain_inflight{job=~\"$source\"}, \"venue\", \"Alpaca\", \"\", \"\"), \"col\", \"inflight\", \"\", \"\")) or sum by (venue, col) (label_replace(label_replace(round(100 * (liq_usdc_alpaca_total{job=~\"$source\"} / liq_usdc_total{job=~\"$source\"}), 0.1), \"venue\", \"Alpaca\", \"\", \"\"), \"col\", \"share\", \"\", \"\")) or sum by (venue, col) (label_replace(label_replace(liq_usdc_total{job=~\"$source\"}, \"venue\", \"Alpaca\", \"\", \"\"), \"col\", \"total\", \"\", \"\"))",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -241,8 +242,8 @@
         }
       ],
       "gridPos": {
-        "h": 4,
-        "w": 7,
+        "h": 8,
+        "w": 13,
         "x": 0,
         "y": 1
       },
@@ -259,7 +260,7 @@
           "id": "groupBy",
           "options": {
             "fields": {
-              "row": {
+              "venue": {
                 "operation": "groupby",
                 "aggregations": []
               },
@@ -280,7 +281,7 @@
           "id": "groupingToMatrix",
           "options": {
             "columnField": "col",
-            "rowField": "row",
+            "rowField": "venue",
             "valueField": "Value (lastNotNull)",
             "emptyValue": "null"
           }
@@ -289,38 +290,56 @@
           "id": "organize",
           "options": {
             "excludeByName": {},
-            "renameByName": {
-              "row\\col": "Asset"
-            },
             "indexByName": {
-              "row\\col": 0,
-              "Raindex": 1,
-              "Inflight": 2,
-              "Alpaca Total": 3,
-              "Total": 4,
-              "Ratio": 5,
-              "\u0394": 6
+              "venue\\col": 0,
+              "cash": 1,
+              "usdc": 2,
+              "reserve": 3,
+              "rebalanceable": 4,
+              "inflight": 5,
+              "share": 6,
+              "total": 7
+            },
+            "renameByName": {
+              "venue\\col": "Venue",
+              "cash": "Cash",
+              "usdc": "USDC",
+              "reserve": "Reserve",
+              "rebalanceable": "Rebalanceable",
+              "inflight": "In flight",
+              "share": "Share of total",
+              "total": "USD total"
             }
+          }
+        },
+        {
+          "id": "convertFieldType",
+          "options": {
+            "conversions": [
+              {
+                "targetField": "share",
+                "destinationType": "string"
+              }
+            ]
           }
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "short",
+          "unit": "locale",
           "decimals": 2,
           "custom": {
-            "align": "auto",
-            "filterable": false,
+            "align": "right",
+            "filterable": true,
             "cellOptions": {
               "type": "auto"
-            },
-            "minWidth": 40
+            }
           },
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "text",
+                "color": "red",
                 "value": null
               }
             ]
@@ -331,28 +350,12 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "Asset"
+              "options": "Venue"
             },
             "properties": [
               {
-                "id": "custom.width",
-                "value": 50
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Inflight"
-            },
-            "properties": [
-              {
-                "id": "unit",
-                "value": "locale"
-              },
-              {
-                "id": "decimals",
-                "value": 2
+                "id": "custom.align",
+                "value": "left"
               },
               {
                 "id": "custom.width",
@@ -363,284 +366,15 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "Raindex"
+              "options": "Cash"
             },
             "properties": [
               {
-                "id": "unit",
-                "value": "locale"
-              },
-              {
-                "id": "decimals",
-                "value": 2
-              },
-              {
                 "id": "custom.width",
-                "value": 90
+                "value": 110
               }
             ]
           },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Alpaca Total"
-            },
-            "properties": [
-              {
-                "id": "unit",
-                "value": "locale"
-              },
-              {
-                "id": "decimals",
-                "value": 2
-              },
-              {
-                "id": "custom.width",
-                "value": 90
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Total"
-            },
-            "properties": [
-              {
-                "id": "unit",
-                "value": "locale"
-              },
-              {
-                "id": "decimals",
-                "value": 2
-              },
-              {
-                "id": "custom.width",
-                "value": 90
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Ratio"
-            },
-            "properties": [
-              {
-                "id": "unit",
-                "value": "percentunit"
-              },
-              {
-                "id": "decimals",
-                "value": 1
-              },
-              {
-                "id": "custom.cellOptions",
-                "value": {
-                  "type": "gauge",
-                  "mode": "basic",
-                  "valueDisplayMode": "text"
-                }
-              },
-              {
-                "id": "min",
-                "value": 0
-              },
-              {
-                "id": "max",
-                "value": 1
-              },
-              {
-                "id": "thresholds",
-                "value": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "blue",
-                      "value": null
-                    }
-                  ]
-                }
-              },
-              {
-                "id": "custom.width",
-                "value": 75
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "\u0394"
-            },
-            "properties": [
-              {
-                "id": "unit",
-                "value": "short"
-              },
-              {
-                "id": "decimals",
-                "value": 1
-              },
-              {
-                "id": "custom.cellOptions",
-                "value": {
-                  "type": "color-text"
-                }
-              },
-              {
-                "id": "custom.width",
-                "value": 45
-              },
-              {
-                "id": "thresholds",
-                "value": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "red",
-                      "value": null
-                    },
-                    {
-                      "color": "text",
-                      "value": -1
-                    },
-                    {
-                      "color": "green",
-                      "value": 1
-                    }
-                  ]
-                }
-              }
-            ]
-          }
-        ]
-      },
-      "options": {
-        "showHeader": true,
-        "cellHeight": "sm"
-      },
-      "timeFrom": "5m",
-      "hideTimeOverride": false
-    },
-    {
-      "id": 3,
-      "type": "table",
-      "title": "Alpaca",
-      "description": "Rebalanceable = max(0, withdrawable \u2212 reserve). Counter-tradeable deliberately equals Alpaca Total (reserve NOT subtracted, same as the SPA).",
-      "datasource": {
-        "type": "stackdriver",
-        "uid": "cloudmon"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "stackdriver",
-            "uid": "cloudmon"
-          },
-          "queryType": "promQL",
-          "promQLQuery": {
-            "projectName": "$env",
-            "expr": "sum by (row, col) (label_replace(label_replace(liq_usdc_alpaca_usdc{job=~\"$source\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"USDC\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_rebalanceable{job=~\"$source\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Rebalanceable\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_alpaca_total{job=~\"$source\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Counter-tradeable\", \"\", \"\"))",
-            "step": "60s"
-          },
-          "timeSeriesList": {
-            "projectName": "",
-            "filters": [],
-            "view": "FULL",
-            "groupBys": []
-          },
-          "instant": true
-        }
-      ],
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 7,
-        "y": 1
-      },
-      "transformations": [
-        {
-          "id": "labelsToFields",
-          "options": {}
-        },
-        {
-          "id": "merge",
-          "options": {}
-        },
-        {
-          "id": "groupBy",
-          "options": {
-            "fields": {
-              "row": {
-                "operation": "groupby",
-                "aggregations": []
-              },
-              "col": {
-                "operation": "groupby",
-                "aggregations": []
-              },
-              "Value": {
-                "operation": "aggregate",
-                "aggregations": [
-                  "lastNotNull"
-                ]
-              }
-            }
-          }
-        },
-        {
-          "id": "groupingToMatrix",
-          "options": {
-            "columnField": "col",
-            "rowField": "row",
-            "valueField": "Value (lastNotNull)",
-            "emptyValue": "null"
-          }
-        },
-        {
-          "id": "organize",
-          "options": {
-            "excludeByName": {
-              "row\\col": true
-            },
-            "renameByName": {
-              "row\\col": "Asset"
-            },
-            "indexByName": {
-              "row\\col": 0,
-              "USDC": 1,
-              "Rebalanceable": 2,
-              "Counter-tradeable": 3
-            }
-          }
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "decimals": 2,
-          "custom": {
-            "align": "auto",
-            "filterable": false,
-            "cellOptions": {
-              "type": "auto"
-            },
-            "minWidth": 40
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "text",
-                "value": null
-              }
-            ]
-          },
-          "mappings": []
-        },
-        "overrides": [
           {
             "matcher": {
               "id": "byName",
@@ -648,16 +382,20 @@
             },
             "properties": [
               {
-                "id": "unit",
-                "value": "locale"
-              },
-              {
-                "id": "decimals",
-                "value": 2
-              },
+                "id": "custom.width",
+                "value": 140
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Reserve"
+            },
+            "properties": [
               {
                 "id": "custom.width",
-                "value": 90
+                "value": 95
               }
             ]
           },
@@ -668,32 +406,91 @@
             },
             "properties": [
               {
-                "id": "unit",
-                "value": "locale"
-              },
-              {
-                "id": "decimals",
-                "value": 2
-              },
-              {
                 "id": "custom.width",
-                "value": 105
+                "value": 140
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "Counter-tradeable"
+              "options": "In flight"
             },
             "properties": [
               {
-                "id": "unit",
-                "value": "locale"
+                "id": "custom.width",
+                "value": 95
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Share of total"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^(null|NaN)?$",
+                      "result": {
+                        "text": " ",
+                        "index": 0
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^(.*)$",
+                      "result": {
+                        "text": "<div style=\"height:20px;border-radius:4px;font-weight:600;text-align:center;background:linear-gradient(90deg, rgba(148,163,184,0.45) $1%, rgba(128,128,128,0.15) $1%)\">$1%</div>",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
               },
               {
-                "id": "decimals",
-                "value": 2
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "markdown"
+                }
+              },
+              {
+                "id": "custom.align",
+                "value": "center"
+              },
+              {
+                "id": "custom.filterable",
+                "value": false
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "USD total"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 120
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Share of total"
+            },
+            "properties": [
+              {
+                "id": "custom.minWidth",
+                "value": 60
               }
             ]
           }
@@ -701,16 +498,17 @@
       },
       "options": {
         "showHeader": true,
-        "cellHeight": "sm"
+        "cellHeight": "md"
       },
       "timeFrom": "5m",
       "hideTimeOverride": false
     },
     {
-      "id": 4,
+      "id": 3,
       "type": "table",
-      "title": "Wallets",
-      "description": "USDC seen in the bot's Ethereum and Base wallets: sanity checks, not part of Total.",
+      "pluginVersion": "13.1.0",
+      "title": "USD \u00b7 Onchain",
+      "description": "Each chain's vault and the ratio the bot rebalances on, vault / (vault + Alpaca cash), against the chain's band. It is not a share of all USD: other chains are not in it. Ethereum is the hub wallet Alpaca deposits to and withdraws from, with no band.",
       "datasource": {
         "type": "stackdriver",
         "uid": "cloudmon"
@@ -725,7 +523,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "sum by (row, col) (label_replace(label_replace(liq_usdc_inflight_ethereum_wallet{job=~\"$source\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Eth\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_inflight_base_wallet{job=~\"$source\"}, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Base\", \"\", \"\"))",
+            "expr": "sum by (venue, col) (label_replace(max by (venue) (label_replace(liq_usdc_chain_available{job=~\"$source\"}, \"venue\", \"$1\", \"chain\", \"(.*)\")) or (max by (venue) (label_replace(liq_usdc_onchain_available{job=~\"$source\"}, \"venue\", \"base\", \"\", \"\")) unless on () count(liq_usdc_chain_available{job=~\"$source\"})), \"col\", \"vault\", \"\", \"\")) or sum by (venue, col) (label_replace(max by (venue) (label_replace(liq_usdc_chain_inflight{job=~\"$source\"}, \"venue\", \"$1\", \"chain\", \"(.*)\")) or (max by (venue) (label_replace(liq_usdc_onchain_inflight{job=~\"$source\"}, \"venue\", \"base\", \"\", \"\")) unless on () count(liq_usdc_chain_available{job=~\"$source\"})), \"col\", \"inflight\", \"\", \"\")) or sum by (venue, col) (label_replace(max by (venue) (label_replace(liq_usdc_inflight_base_wallet{job=~\"$source\"}, \"venue\", \"base\", \"\", \"\")) or max by (venue) (label_replace(liq_usdc_inflight_ethereum_wallet{job=~\"$source\"}, \"venue\", \"ethereum\", \"\", \"\")), \"col\", \"wallet\", \"\", \"\")) or sum by (venue, col) (label_replace((round(100 * (max by (venue) (label_replace(liq_usdc_chain_ratio{job=~\"$source\"}, \"venue\", \"$1\", \"chain\", \"(.*)\")) or (max by (venue) (label_replace(liq_usdc_ratio{job=~\"$source\"}, \"venue\", \"base\", \"\", \"\")) unless on () count(liq_usdc_chain_available{job=~\"$source\"}))), 0.1) + 0.0001) * (2 * (abs((max by (venue) (label_replace(liq_usdc_chain_ratio{job=~\"$source\"}, \"venue\", \"$1\", \"chain\", \"(.*)\")) or (max by (venue) (label_replace(liq_usdc_ratio{job=~\"$source\"}, \"venue\", \"base\", \"\", \"\")) unless on () count(liq_usdc_chain_available{job=~\"$source\"}))) - (max by (venue) (label_replace(liq_usdc_corridor_target{job=~\"$source\"}, \"venue\", \"$1\", \"chain\", \"(.*)\")) or (max by (venue) (label_replace(liq_settings_usdc_target{job=~\"$source\"}, \"venue\", \"base\", \"\", \"\")) unless on () count(liq_usdc_chain_available{job=~\"$source\"})))) <= bool (max by (venue) (label_replace(liq_usdc_corridor_deviation{job=~\"$source\"}, \"venue\", \"$1\", \"chain\", \"(.*)\")) or (max by (venue) (label_replace(liq_settings_usdc_deviation{job=~\"$source\"}, \"venue\", \"base\", \"\", \"\")) unless on () count(liq_usdc_chain_available{job=~\"$source\"})))) - 1), \"col\", \"ratio\", \"\", \"\")) or sum by (venue, col) (label_replace(max by (venue) (label_replace(liq_usdc_corridor_target{job=~\"$source\"}, \"venue\", \"$1\", \"chain\", \"(.*)\")) or (max by (venue) (label_replace(liq_settings_usdc_target{job=~\"$source\"}, \"venue\", \"base\", \"\", \"\")) unless on () count(liq_usdc_chain_available{job=~\"$source\"})), \"col\", \"target\", \"\", \"\")) or sum by (venue, col) (label_replace(max by (venue) (label_replace(liq_usdc_corridor_deviation{job=~\"$source\"}, \"venue\", \"$1\", \"chain\", \"(.*)\")) or (max by (venue) (label_replace(liq_settings_usdc_deviation{job=~\"$source\"}, \"venue\", \"base\", \"\", \"\")) unless on () count(liq_usdc_chain_available{job=~\"$source\"})), \"col\", \"deviation\", \"\", \"\"))",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -738,10 +536,10 @@
         }
       ],
       "gridPos": {
-        "h": 4,
-        "w": 3,
-        "x": 11,
-        "y": 1
+        "h": 9,
+        "w": 13,
+        "x": 0,
+        "y": 9
       },
       "transformations": [
         {
@@ -756,7 +554,7 @@
           "id": "groupBy",
           "options": {
             "fields": {
-              "row": {
+              "venue": {
                 "operation": "groupby",
                 "aggregations": []
               },
@@ -777,7 +575,7 @@
           "id": "groupingToMatrix",
           "options": {
             "columnField": "col",
-            "rowField": "row",
+            "rowField": "venue",
             "valueField": "Value (lastNotNull)",
             "emptyValue": "null"
           }
@@ -785,37 +583,55 @@
         {
           "id": "organize",
           "options": {
-            "excludeByName": {
-              "row\\col": true
+            "excludeByName": {},
+            "indexByName": {
+              "venue\\col": 0,
+              "vault": 1,
+              "inflight": 2,
+              "wallet": 3,
+              "ratio": 4,
+              "target": 5,
+              "deviation": 6
             },
             "renameByName": {
-              "row\\col": "Asset"
-            },
-            "indexByName": {
-              "row\\col": 0,
-              "Eth": 1,
-              "Base": 2
+              "venue\\col": "Chain",
+              "vault": "Vault",
+              "inflight": "In flight",
+              "wallet": "Wallet",
+              "ratio": "Ratio",
+              "target": "Target",
+              "deviation": "\u00b1"
             }
+          }
+        },
+        {
+          "id": "convertFieldType",
+          "options": {
+            "conversions": [
+              {
+                "targetField": "ratio",
+                "destinationType": "string"
+              }
+            ]
           }
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "short",
+          "unit": "locale",
           "decimals": 2,
           "custom": {
-            "align": "auto",
-            "filterable": false,
+            "align": "right",
+            "filterable": true,
             "cellOptions": {
               "type": "auto"
-            },
-            "minWidth": 40
+            }
           },
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "text",
+                "color": "red",
                 "value": null
               }
             ]
@@ -826,36 +642,187 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "Eth"
+              "options": "Chain"
             },
             "properties": [
               {
-                "id": "unit",
-                "value": "locale"
-              },
-              {
-                "id": "decimals",
-                "value": 2
+                "id": "custom.align",
+                "value": "left"
               },
               {
                 "id": "custom.width",
-                "value": 80
+                "value": 125
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "base": {
+                        "text": "Base",
+                        "index": 0
+                      },
+                      "robinhood": {
+                        "text": "Robinhood",
+                        "index": 1
+                      },
+                      "hyperevm": {
+                        "text": "HyperEVM",
+                        "index": 2
+                      },
+                      "ethereum": {
+                        "text": "Ethereum (hub)",
+                        "index": 3
+                      }
+                    }
+                  }
+                ]
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "Base"
+              "options": "Vault"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 110
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "In flight"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 95
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Wallet"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 85
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Ratio"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^(null|NaN)?$",
+                      "result": {
+                        "text": " ",
+                        "index": 0
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^-(\\d+(?:\\.[1-9])?).*$",
+                      "result": {
+                        "text": "<div style=\"height:20px;border-radius:4px;font-weight:600;text-align:center;background:linear-gradient(90deg, rgba(239,68,68,0.6) $1%, rgba(128,128,128,0.15) $1%)\">$1%</div>",
+                        "index": 1
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^(\\d+(?:\\.[1-9])?).*$",
+                      "result": {
+                        "text": "<div style=\"height:20px;border-radius:4px;font-weight:600;text-align:center;background:linear-gradient(90deg, rgba(34,197,94,0.6) $1%, rgba(128,128,128,0.15) $1%)\">$1%</div>",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "markdown"
+                }
+              },
+              {
+                "id": "custom.align",
+                "value": "center"
+              },
+              {
+                "id": "custom.filterable",
+                "value": false
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Target"
             },
             "properties": [
               {
                 "id": "unit",
-                "value": "locale"
+                "value": "percentunit"
               },
               {
                 "id": "decimals",
-                "value": 2
+                "value": 0
+              },
+              {
+                "id": "custom.width",
+                "value": 85
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "\u00b1"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.width",
+                "value": 60
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Ratio"
+            },
+            "properties": [
+              {
+                "id": "custom.minWidth",
+                "value": 60
               }
             ]
           }
@@ -863,16 +830,17 @@
       },
       "options": {
         "showHeader": true,
-        "cellHeight": "sm"
+        "cellHeight": "md"
       },
       "timeFrom": "5m",
-      "hideTimeOverride": true
+      "hideTimeOverride": false
     },
     {
-      "id": 5,
+      "id": 4,
       "type": "table",
-      "title": "",
-      "description": "The SPA inventory equity table: CT / Rebal / Ext status lights from settings; Raindex / Inflight / Alpaca / Total share balances; Ratio = onchain/(onchain+offchain); \u0394 = deviation from the target ratio in band widths, colored outside +/-1; Exposure = net \u00d7 last price. Unwrapped/Wrapped are wallet-observed and not part of Total. Sorted CT-first (desc) so counter-tradeable assets float to the top, like the SPA.",
+      "pluginVersion": "13.1.0",
+      "title": "Equities",
+      "description": "Flags: counter trading, rebalancing and extended hours, green when on, red when off, hollow grey when not set. Share balances per venue, one column per chain. Total and Total USD count only the primary chain (Base) with Alpaca and the shares in flight: a wrapped share on another chain is worth that chain's underlying, so the chains are not added together. Ratio = Base vault available / (Base vault available + Alpaca available), green inside the default Base band and red outside it. It is grey, with no verdict, where that is not the bot's own band: a symbol not rebalanced on Base, with no balance, with a vault on another chain, or with no default target, and every symbol on the exporter source, which cannot see the other chains. A click on Ratio sorts by its encoded text, not by percent. Exposure = net x live price, empty without a price.",
       "datasource": {
         "type": "stackdriver",
         "uid": "cloudmon"
@@ -887,7 +855,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "sum by (symbol, col) (label_replace(liq_asset_counter_trading{job=~\"$source\"}, \"col\", \"CT\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_asset_rebalancing{job=~\"$source\"}, \"col\", \"Rebal\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_asset_extended_hours{job=~\"$source\"}, \"col\", \"Ext\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_onchain_available{job=~\"$source\"}, \"col\", \"Raindex\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_inflight_total{job=~\"$source\"}, \"col\", \"Inflight\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_offchain_available{job=~\"$source\"}, \"col\", \"Alpaca\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_total{job=~\"$source\"}, \"col\", \"Total\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_ratio{job=~\"$source\"}, \"col\", \"Ratio\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_ratio_deviation{job=~\"$source\"} and liq_equity_total{job=~\"$source\"} > 0, \"col\", \"\u0394\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_exposure_usd{job=~\"$source\"} or (liq_equity_total{job=~\"$source\"} * NaN), \"col\", \"Exposure\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_unwrapped{job=~\"$source\"}, \"col\", \"Unwrapped\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_wrapped{job=~\"$source\"}, \"col\", \"Wrapped\", \"\", \"\"))",
+            "expr": "sum by (symbol, col) (label_replace((max by (symbol) (liq_asset_counter_trading{job=~\"$source\"}) + 1 or (max by (symbol) (liq_equity_total{job=~\"$source\"}) * 0 + 3)) * 100 + (max by (symbol) (liq_asset_rebalancing{job=~\"$source\"}) + 1 or (max by (symbol) (liq_equity_total{job=~\"$source\"}) * 0 + 3)) * 10 + (max by (symbol) (liq_asset_extended_hours{job=~\"$source\"}) + 1 or (max by (symbol) (liq_equity_total{job=~\"$source\"}) * 0 + 3)), \"col\", \"flags\", \"\", \"\")) or max by (symbol, col) (label_replace(liq_equity_chain_available{job=~\"$source\"}, \"col\", \"onchain_$1\", \"chain\", \"(.*)\")) or (max by (symbol, col) (label_replace(liq_equity_onchain_available{job=~\"$source\"}, \"col\", \"onchain_base\", \"\", \"\")) unless on () count(liq_equity_chain_available{job=~\"$source\"})) or sum by (symbol, col) (label_replace(liq_equity_inflight_total{job=~\"$source\"}, \"col\", \"inflight\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_offchain_available{job=~\"$source\"}, \"col\", \"alpaca\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_total{job=~\"$source\"}, \"col\", \"total\", \"\", \"\")) or sum by (symbol, col) (label_replace((liq_equity_total{job=~\"$source\"} * on (symbol) group_left max by (symbol) (liq_position_last_price_usd{job=~\"$source\"})) or (liq_equity_total{job=~\"$source\"} * NaN), \"col\", \"total_usd\", \"\", \"\")) or sum by (symbol, col) (label_replace(((round(100 * (liq_equity_ratio{job=~\"$source\"}), 0.1) + 0.0001) * (2 * (abs((liq_equity_ratio{job=~\"$source\"}) - scalar(max(liq_settings_equity_target{job=~\"$source\"}))) <= bool scalar(max(liq_settings_equity_deviation{job=~\"$source\"}))) - 1) and on (symbol) ((liq_equity_total{job=~\"$source\"} > 0) and on (symbol) (max by (symbol) (liq_asset_rebalancing{job=~\"$source\"}) == 1) and on () count(liq_settings_equity_target{job=~\"$source\"}) and on (symbol) max by (symbol) (liq_equity_chain_available{job=~\"$source\",chain=\"base\"}) unless on (symbol) max by (symbol) (liq_equity_chain_available{job=~\"$source\",chain!=\"base\"}))) or (round(100 * (liq_equity_ratio{job=~\"$source\"}), 0.1) + 1000 + 0.0001 unless on (symbol) ((liq_equity_total{job=~\"$source\"} > 0) and on (symbol) (max by (symbol) (liq_asset_rebalancing{job=~\"$source\"}) == 1) and on () count(liq_settings_equity_target{job=~\"$source\"}) and on (symbol) max by (symbol) (liq_equity_chain_available{job=~\"$source\",chain=\"base\"}) unless on (symbol) max by (symbol) (liq_equity_chain_available{job=~\"$source\",chain!=\"base\"}))), \"col\", \"ratio\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_exposure_usd{job=~\"$source\"} or (liq_equity_total{job=~\"$source\"} * NaN), \"col\", \"exposure\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_unwrapped{job=~\"$source\"}, \"col\", \"unwrapped\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_wrapped{job=~\"$source\"}, \"col\", \"wrapped\", \"\", \"\"))",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -900,10 +868,10 @@
         }
       ],
       "gridPos": {
-        "h": 24,
-        "w": 14,
+        "h": 35,
+        "w": 13,
         "x": 0,
-        "y": 5
+        "y": 18
       },
       "transformations": [
         {
@@ -948,34 +916,61 @@
           "id": "organize",
           "options": {
             "excludeByName": {},
-            "renameByName": {
-              "symbol\\col": "Asset"
-            },
             "indexByName": {
               "symbol\\col": 0,
-              "CT": 1,
-              "Rebal": 2,
-              "Ext": 3,
-              "Raindex": 4,
-              "Inflight": 5,
-              "Alpaca": 6,
-              "Total": 7,
-              "Ratio": 8,
-              "\u0394": 9,
-              "Exposure": 10,
-              "Unwrapped": 11,
-              "Wrapped": 12
+              "flags": 1,
+              "onchain_base": 2,
+              "onchain_robinhood": 3,
+              "onchain_hyperevm": 4,
+              "inflight": 5,
+              "alpaca": 6,
+              "total": 7,
+              "total_usd": 8,
+              "ratio": 9,
+              "exposure": 10,
+              "unwrapped": 11,
+              "wrapped": 12
+            },
+            "renameByName": {
+              "symbol\\col": "Asset",
+              "flags": "Flags",
+              "onchain_base": "Base",
+              "onchain_robinhood": "Robinhood",
+              "onchain_hyperevm": "HyperEVM",
+              "inflight": "Inflight",
+              "alpaca": "Alpaca",
+              "total": "Total",
+              "total_usd": "Total USD",
+              "ratio": "Ratio",
+              "exposure": "Exposure",
+              "unwrapped": "Unwrapped",
+              "wrapped": "Wrapped"
             }
+          }
+        },
+        {
+          "id": "convertFieldType",
+          "options": {
+            "conversions": [
+              {
+                "targetField": "ratio",
+                "destinationType": "string"
+              },
+              {
+                "targetField": "flags",
+                "destinationType": "string"
+              }
+            ]
           }
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "short",
+          "unit": "locale",
           "decimals": 2,
           "custom": {
-            "align": "auto",
-            "filterable": false,
+            "align": "left",
+            "filterable": true,
             "cellOptions": {
               "type": "auto"
             }
@@ -984,7 +979,7 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "text",
+                "color": "red",
                 "value": null
               }
             ]
@@ -999,43 +994,291 @@
             },
             "properties": [
               {
+                "id": "custom.align",
+                "value": "left"
+              },
+              {
                 "id": "custom.width",
-                "value": 60
+                "value": 96
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "CT"
+              "options": "Flags"
             },
             "properties": [
               {
                 "id": "mappings",
                 "value": [
                   {
-                    "type": "value",
+                    "type": "regex",
                     "options": {
-                      "1": {
-                        "text": "\u25cf",
-                        "color": "green",
+                      "pattern": "^111$",
+                      "result": {
+                        "text": "<span style=\"color:#ef4444\">\u25cf</span>&nbsp;<span style=\"color:#ef4444\">\u25cf</span>&nbsp;<span style=\"color:#ef4444\">\u25cf</span>",
                         "index": 0
-                      },
-                      "0": {
-                        "text": "\u25cf",
-                        "color": "red",
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^112$",
+                      "result": {
+                        "text": "<span style=\"color:#ef4444\">\u25cf</span>&nbsp;<span style=\"color:#ef4444\">\u25cf</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>",
                         "index": 1
                       }
                     }
                   },
                   {
-                    "type": "special",
+                    "type": "regex",
                     "options": {
-                      "match": "null+nan",
+                      "pattern": "^113$",
                       "result": {
-                        "text": "\u25cb",
-                        "color": "text",
+                        "text": "<span style=\"color:#ef4444\">\u25cf</span>&nbsp;<span style=\"color:#ef4444\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>",
                         "index": 2
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^121$",
+                      "result": {
+                        "text": "<span style=\"color:#ef4444\">\u25cf</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#ef4444\">\u25cf</span>",
+                        "index": 3
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^122$",
+                      "result": {
+                        "text": "<span style=\"color:#ef4444\">\u25cf</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>",
+                        "index": 4
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^123$",
+                      "result": {
+                        "text": "<span style=\"color:#ef4444\">\u25cf</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>",
+                        "index": 5
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^131$",
+                      "result": {
+                        "text": "<span style=\"color:#ef4444\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#ef4444\">\u25cf</span>",
+                        "index": 6
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^132$",
+                      "result": {
+                        "text": "<span style=\"color:#ef4444\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>",
+                        "index": 7
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^133$",
+                      "result": {
+                        "text": "<span style=\"color:#ef4444\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>",
+                        "index": 8
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^211$",
+                      "result": {
+                        "text": "<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#ef4444\">\u25cf</span>&nbsp;<span style=\"color:#ef4444\">\u25cf</span>",
+                        "index": 9
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^212$",
+                      "result": {
+                        "text": "<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#ef4444\">\u25cf</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>",
+                        "index": 10
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^213$",
+                      "result": {
+                        "text": "<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#ef4444\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>",
+                        "index": 11
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^221$",
+                      "result": {
+                        "text": "<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#ef4444\">\u25cf</span>",
+                        "index": 12
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^222$",
+                      "result": {
+                        "text": "<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>",
+                        "index": 13
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^223$",
+                      "result": {
+                        "text": "<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>",
+                        "index": 14
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^231$",
+                      "result": {
+                        "text": "<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#ef4444\">\u25cf</span>",
+                        "index": 15
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^232$",
+                      "result": {
+                        "text": "<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>",
+                        "index": 16
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^233$",
+                      "result": {
+                        "text": "<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>",
+                        "index": 17
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^311$",
+                      "result": {
+                        "text": "<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#ef4444\">\u25cf</span>&nbsp;<span style=\"color:#ef4444\">\u25cf</span>",
+                        "index": 18
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^312$",
+                      "result": {
+                        "text": "<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#ef4444\">\u25cf</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>",
+                        "index": 19
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^313$",
+                      "result": {
+                        "text": "<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#ef4444\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>",
+                        "index": 20
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^321$",
+                      "result": {
+                        "text": "<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#ef4444\">\u25cf</span>",
+                        "index": 21
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^322$",
+                      "result": {
+                        "text": "<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>",
+                        "index": 22
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^323$",
+                      "result": {
+                        "text": "<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>",
+                        "index": 23
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^331$",
+                      "result": {
+                        "text": "<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#ef4444\">\u25cf</span>",
+                        "index": 24
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^332$",
+                      "result": {
+                        "text": "<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>",
+                        "index": 25
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^333$",
+                      "result": {
+                        "text": "<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>",
+                        "index": 26
                       }
                     }
                   }
@@ -1044,7 +1287,7 @@
               {
                 "id": "custom.cellOptions",
                 "value": {
-                  "type": "color-text"
+                  "type": "markdown"
                 }
               },
               {
@@ -1052,134 +1295,48 @@
                 "value": "center"
               },
               {
+                "id": "custom.filterable",
+                "value": false
+              },
+              {
                 "id": "custom.width",
-                "value": 40
+                "value": 64
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "Rebal"
+              "options": "Base"
             },
             "properties": [
               {
-                "id": "mappings",
-                "value": [
-                  {
-                    "type": "value",
-                    "options": {
-                      "1": {
-                        "text": "\u25cf",
-                        "color": "green",
-                        "index": 0
-                      },
-                      "0": {
-                        "text": "\u25cf",
-                        "color": "red",
-                        "index": 1
-                      }
-                    }
-                  },
-                  {
-                    "type": "special",
-                    "options": {
-                      "match": "null+nan",
-                      "result": {
-                        "text": "\u25cb",
-                        "color": "text",
-                        "index": 2
-                      }
-                    }
-                  }
-                ]
-              },
-              {
-                "id": "custom.cellOptions",
-                "value": {
-                  "type": "color-text"
-                }
-              },
-              {
-                "id": "custom.align",
-                "value": "center"
-              },
-              {
                 "id": "custom.width",
-                "value": 40
+                "value": 92
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "Ext"
+              "options": "Robinhood"
             },
             "properties": [
               {
-                "id": "mappings",
-                "value": [
-                  {
-                    "type": "value",
-                    "options": {
-                      "1": {
-                        "text": "\u25cf",
-                        "color": "green",
-                        "index": 0
-                      },
-                      "0": {
-                        "text": "\u25cf",
-                        "color": "red",
-                        "index": 1
-                      }
-                    }
-                  },
-                  {
-                    "type": "special",
-                    "options": {
-                      "match": "null+nan",
-                      "result": {
-                        "text": "\u25cb",
-                        "color": "text",
-                        "index": 2
-                      }
-                    }
-                  }
-                ]
-              },
-              {
-                "id": "custom.cellOptions",
-                "value": {
-                  "type": "color-text"
-                }
-              },
-              {
-                "id": "custom.align",
-                "value": "center"
-              },
-              {
                 "id": "custom.width",
-                "value": 40
+                "value": 92
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "Raindex"
+              "options": "HyperEVM"
             },
             "properties": [
               {
-                "id": "unit",
-                "value": "locale"
-              },
-              {
-                "id": "decimals",
-                "value": 2
-              },
-              {
                 "id": "custom.width",
-                "value": 70
+                "value": 92
               }
             ]
           },
@@ -1190,16 +1347,8 @@
             },
             "properties": [
               {
-                "id": "unit",
-                "value": "locale"
-              },
-              {
-                "id": "decimals",
-                "value": 2
-              },
-              {
                 "id": "custom.width",
-                "value": 70
+                "value": 86
               }
             ]
           },
@@ -1210,16 +1359,8 @@
             },
             "properties": [
               {
-                "id": "unit",
-                "value": "locale"
-              },
-              {
-                "id": "decimals",
-                "value": 2
-              },
-              {
                 "id": "custom.width",
-                "value": 70
+                "value": 86
               }
             ]
           },
@@ -1230,56 +1371,44 @@
             },
             "properties": [
               {
-                "id": "unit",
-                "value": "locale"
-              },
-              {
-                "id": "decimals",
-                "value": 2
-              },
-              {
                 "id": "custom.width",
-                "value": 70
+                "value": 74
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "Wrapped"
+              "options": "Total USD"
             },
             "properties": [
               {
                 "id": "unit",
-                "value": "locale"
+                "value": "currencyUSD"
               },
               {
                 "id": "decimals",
-                "value": 2
+                "value": 0
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "null+nan",
+                      "result": {
+                        "text": "\u2014",
+                        "color": "#6b7280",
+                        "index": 0
+                      }
+                    }
+                  }
+                ]
               },
               {
                 "id": "custom.width",
-                "value": 70
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Unwrapped"
-            },
-            "properties": [
-              {
-                "id": "unit",
-                "value": "locale"
-              },
-              {
-                "id": "decimals",
-                "value": 2
-              },
-              {
-                "id": "custom.width",
-                "value": 80
+                "value": 100
               }
             ]
           },
@@ -1290,90 +1419,63 @@
             },
             "properties": [
               {
-                "id": "unit",
-                "value": "percentunit"
-              },
-              {
-                "id": "decimals",
-                "value": 1
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^(null|NaN)?$",
+                      "result": {
+                        "text": " ",
+                        "index": 0
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^(?=\\d{4})10*(\\d+(?:\\.[1-9])?).*$",
+                      "result": {
+                        "text": "<div style=\"height:20px;border-radius:4px;font-weight:600;text-align:center;background:linear-gradient(90deg, rgba(148,163,184,0.45) $1%, rgba(128,128,128,0.15) $1%)\">$1%</div>",
+                        "index": 1
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^-(\\d+(?:\\.[1-9])?).*$",
+                      "result": {
+                        "text": "<div style=\"height:20px;border-radius:4px;font-weight:600;text-align:center;background:linear-gradient(90deg, rgba(239,68,68,0.6) $1%, rgba(128,128,128,0.15) $1%)\">$1%</div>",
+                        "index": 2
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^(\\d+(?:\\.[1-9])?).*$",
+                      "result": {
+                        "text": "<div style=\"height:20px;border-radius:4px;font-weight:600;text-align:center;background:linear-gradient(90deg, rgba(34,197,94,0.6) $1%, rgba(128,128,128,0.15) $1%)\">$1%</div>",
+                        "index": 3
+                      }
+                    }
+                  }
+                ]
               },
               {
                 "id": "custom.cellOptions",
                 "value": {
-                  "type": "gauge",
-                  "mode": "basic",
-                  "valueDisplayMode": "text"
+                  "type": "markdown"
                 }
               },
               {
-                "id": "min",
-                "value": 0
+                "id": "custom.align",
+                "value": "center"
               },
               {
-                "id": "max",
-                "value": 1
-              },
-              {
-                "id": "thresholds",
-                "value": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "blue",
-                      "value": null
-                    }
-                  ]
-                }
-              },
-              {
-                "id": "custom.width",
-                "value": 140
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "\u0394"
-            },
-            "properties": [
-              {
-                "id": "unit",
-                "value": "short"
-              },
-              {
-                "id": "decimals",
-                "value": 1
-              },
-              {
-                "id": "custom.cellOptions",
-                "value": {
-                  "type": "color-text"
-                }
-              },
-              {
-                "id": "custom.width",
-                "value": 45
-              },
-              {
-                "id": "thresholds",
-                "value": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "red",
-                      "value": null
-                    },
-                    {
-                      "color": "text",
-                      "value": -1
-                    },
-                    {
-                      "color": "green",
-                      "value": 1
-                    }
-                  ]
-                }
+                "id": "custom.filterable",
+                "value": false
               }
             ]
           },
@@ -1388,14 +1490,20 @@
                 "value": "currencyUSD"
               },
               {
-                "id": "decimals",
-                "value": 2
-              },
-              {
-                "id": "custom.cellOptions",
-                "value": {
-                  "type": "color-text"
-                }
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "null+nan",
+                      "result": {
+                        "text": "\u2014",
+                        "color": "#6b7280",
+                        "index": 0
+                      }
+                    }
+                  }
+                ]
               },
               {
                 "id": "thresholds",
@@ -1408,34 +1516,68 @@
                     },
                     {
                       "color": "text",
-                      "value": -0.01
+                      "value": -0.005
                     },
                     {
                       "color": "green",
-                      "value": 0.01
+                      "value": 0.005
                     }
                   ]
                 }
               },
               {
-                "id": "custom.width",
-                "value": 80
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
               },
               {
-                "id": "mappings",
-                "value": [
-                  {
-                    "type": "special",
-                    "options": {
-                      "match": "null+nan",
-                      "result": {
-                        "text": "\u2014",
-                        "color": "text",
-                        "index": 0
-                      }
-                    }
-                  }
-                ]
+                "id": "custom.width",
+                "value": 95
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Unwrapped"
+            },
+            "properties": [
+              {
+                "id": "custom.align",
+                "value": "right"
+              },
+              {
+                "id": "custom.width",
+                "value": 118
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Wrapped"
+            },
+            "properties": [
+              {
+                "id": "custom.align",
+                "value": "right"
+              },
+              {
+                "id": "custom.width",
+                "value": 102
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Ratio"
+            },
+            "properties": [
+              {
+                "id": "custom.minWidth",
+                "value": 60
               }
             ]
           }
@@ -1443,11 +1585,11 @@
       },
       "options": {
         "showHeader": true,
-        "cellHeight": "sm",
+        "cellHeight": "md",
         "sortBy": [
           {
-            "displayName": "CT",
-            "desc": true
+            "displayName": "Asset",
+            "desc": false
           }
         ]
       },
@@ -1455,7 +1597,7 @@
       "hideTimeOverride": false
     },
     {
-      "id": 6,
+      "id": 5,
       "type": "table",
       "title": "Trade History",
       "description": "Direct Raindex fills, fills routed through supported adapters such as Bebop, and the corresponding Alpaca hedge trades placed to offset exposure. One row per trade at its latest status. Built from the newest 500 status entries, so a busy period can push older rows out of the 30-day window.",
@@ -1478,9 +1620,9 @@
         }
       ],
       "gridPos": {
-        "h": 14,
-        "w": 10,
-        "x": 14,
+        "h": 25,
+        "w": 11,
+        "x": 13,
         "y": 1
       },
       "transformations": [
@@ -1890,7 +2032,7 @@
       }
     },
     {
-      "id": 7,
+      "id": 6,
       "type": "table",
       "title": "Cross-venue Transfers",
       "description": "Asset movements between venues to rebalance inventory: equity mints (Alpaca to onchain), redemptions (onchain to Alpaca), and USDC bridges (Base/Ethereum via CCTP). One row per transfer at its latest status. A USDC bridge can show the previous status for a while: the exporter stamps each status with the transfer's updatedAt, which is not always later than the one before (bridging starts from initiated_at). Built from the newest 500 status entries, so a busy period can push older rows out of the 30-day window.",
@@ -1913,10 +2055,10 @@
         }
       ],
       "gridPos": {
-        "h": 14,
-        "w": 10,
-        "x": 14,
-        "y": 15
+        "h": 26,
+        "w": 11,
+        "x": 13,
+        "y": 26
       },
       "transformations": [
         {
