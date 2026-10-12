@@ -4789,6 +4789,7 @@ mod tests {
     use crate::inventory::{
         self, BroadcastingInventory, PortfolioAsset, PortfolioBalanceRow, PortfolioLocation,
     };
+    use crate::metrics::liquidity::pnl_refresh::{LivePnlReports, PnlReports};
     use crate::offchain::order::{
         OffchainOrder, OffchainOrderEvent, OffchainOrderId, OrderPlacementResult,
     };
@@ -6131,6 +6132,30 @@ mod tests {
 
         assert_eq!(first.summary.matched_lot_count, 1);
         assert_eq!(second.summary.matched_lot_count, 2);
+    }
+
+    #[tokio::test]
+    async fn pnl_metrics_reports_run_while_live_requests_hold_every_permit() {
+        let (state, _broker_mock) = pnl_test_state().await;
+        let _live_permits = (0..crate::dashboard::pnl::MAX_CONCURRENT_PNL_REPORTS)
+            .map(|_| acquire_pnl_report_permit(&state.pnl_report_admission).unwrap())
+            .collect::<Vec<_>>();
+        let reports = LivePnlReports::new(&state.ctx, state.pool.clone(), state.pnl_ledger.clone());
+
+        let report = reports
+            .report(PnlQuery {
+                limit: Some(1),
+                ..PnlQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.summary.matched_lot_count, 0);
+
+        let response = build_app(state)
+            .oneshot(Request::builder().uri("/pnl").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     /// End-to-end `/pnl` coverage for capital/return-on-capital figures: three

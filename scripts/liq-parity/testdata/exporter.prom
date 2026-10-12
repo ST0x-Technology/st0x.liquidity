@@ -8,5 +8,5 @@ liq_asset_rebalancing{symbol="TSLA"} 0.0
 liq_asset_flags{counter_trading="enabled",extended_hours="true",rebalancing="true",symbol="AAPL"} 1.0
 liq_equity_total{symbol="AAPL"} 5.0
 liq_equity_ratio_deviation{symbol="AAPL"} 0.25
-liq_pnl_summary_usd{stream="total",window="1d"} 5.0
-liq_pending_orders_total 3.0
+liq_future_usd{stream="total",window="1d"} 5.0
+liq_future_total 3.0

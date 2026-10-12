@@ -1845,6 +1845,34 @@ Every fifth cycle the task publishes `rebalances` over the last 30 days:
 window. A collector that fails or takes longer than 30 seconds keeps its last
 family.
 
+Every 5 minutes a task publishes the `liq_pnl_*` series of six windows, each
+labelled `window`: `1d`, `1w`, `1m`, `ytd`, `1y` and `all`. Each window is one
+`GET /pnl` report built by the same code path as the endpoint, with its own
+ledger catch-up first. Every window ends on the last day with fills
+(`availableRange.lastDate`); the starts are that day, 6 days, 30 days and 364
+days before it, January 1 of its year, and the first day with fills, and no
+start is before the first day with fills. The windows run one at a time inside a
+120-second budget, `1w` first. The task has its own report admission of one, so
+it never takes one of the two live `/pnl` permits.
+
+- Each window is its own family (`collector="pnl_<window>"`). A window whose
+  report fails, times out, or does not fit the budget keeps its last samples,
+  and its collector time stops advancing. The exporter dropped such a window
+  until its next cycle; this is a deliberate difference.
+- Summary, cost, capital, per-symbol and sample series copy `/pnl`'s fields. A
+  decimal that does not parse, and a capital figure that is not computed, leave
+  their series absent. Per-symbol rows whose symbols strip to the same label
+  (`tAAPL` and `wtAAPL`) are all left out, with an error log, rather than one
+  replacing the other; the exporter wrote both lines.
+- `liq_pnl_day_*{day}` come from the report's day buckets. A day sums its
+  symbols after the prefix rule, so `tAAPL` and `wtAAPL` add up. The running
+  totals run over every bucket, and only the last 90 buckets are published, so
+  the last bucket's running total equals the window total. A symbol stays in the
+  running totals after its last day. A day component that does not parse leaves
+  out the day value it adds up and every later running total that includes it,
+  and logs an error. The exporter counted such a component as 0 (a deliberate
+  difference: a 0 would read as a real day).
+
 **Exception to financial-integrity rules.** Some ported series reproduce the
 exporter's published sentinels: a ratio with a zero denominator is published as
 0, and a missing balance component counts as 0. These follow the exporter's

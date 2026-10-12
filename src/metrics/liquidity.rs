@@ -27,9 +27,13 @@ use tracing::{debug, error, warn};
 
 use st0x_float_serde::format_float;
 
+use self::pnl::PnlWindowKey;
+
 pub(crate) mod inventory;
 pub(crate) mod log_counts;
 pub(crate) mod performance;
+pub(crate) mod pnl;
+pub(crate) mod pnl_refresh;
 pub(crate) mod prices;
 pub(crate) mod refresh;
 pub(crate) mod settings;
@@ -104,6 +108,31 @@ pub(crate) enum LiqMetric {
     DependencyLatencyMs,
     RebalanceStageMs,
     AttestationLastMs,
+    PnlSummaryUsd,
+    PnlSummaryShares,
+    PnlSummaryCount,
+    PnlCostUsd,
+    PnlRevenueUsd,
+    PnlCostEntries,
+    PnlCostMissingObservations,
+    PnlCostCoverage,
+    PnlCapitalAvgDeployedUsd,
+    PnlCapitalAnnualizedReturnPct,
+    PnlCapitalCoverageDays,
+    PnlCapitalSampleDays,
+    PnlSymbolUsd,
+    PnlSymbolShares,
+    PnlSymbolLots,
+    PnlSymbolVolumeShares,
+    PnlSampleTotalFills,
+    PnlSampleSymbols,
+    PnlSampleFirstTsSeconds,
+    PnlSampleLastTsSeconds,
+    PnlWarnings,
+    PnlDayUsd,
+    PnlDayCumUsd,
+    PnlDayStreamUsd,
+    PnlDayCumStreamUsd,
     CollectorLastSuccessTsSeconds,
 }
 
@@ -111,7 +140,7 @@ impl LiqMetric {
     /// Every variant, for the catalog tests. A new variant needs an entry
     /// here and its name in the catalog test.
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 63] = [
+    pub(crate) const ALL: [Self; 88] = [
         Self::BotInfo,
         Self::BotStartTimestampSeconds,
         Self::SettingsInfo,
@@ -174,6 +203,31 @@ impl LiqMetric {
         Self::DependencyLatencyMs,
         Self::RebalanceStageMs,
         Self::AttestationLastMs,
+        Self::PnlSummaryUsd,
+        Self::PnlSummaryShares,
+        Self::PnlSummaryCount,
+        Self::PnlCostUsd,
+        Self::PnlRevenueUsd,
+        Self::PnlCostEntries,
+        Self::PnlCostMissingObservations,
+        Self::PnlCostCoverage,
+        Self::PnlCapitalAvgDeployedUsd,
+        Self::PnlCapitalAnnualizedReturnPct,
+        Self::PnlCapitalCoverageDays,
+        Self::PnlCapitalSampleDays,
+        Self::PnlSymbolUsd,
+        Self::PnlSymbolShares,
+        Self::PnlSymbolLots,
+        Self::PnlSymbolVolumeShares,
+        Self::PnlSampleTotalFills,
+        Self::PnlSampleSymbols,
+        Self::PnlSampleFirstTsSeconds,
+        Self::PnlSampleLastTsSeconds,
+        Self::PnlWarnings,
+        Self::PnlDayUsd,
+        Self::PnlDayCumUsd,
+        Self::PnlDayStreamUsd,
+        Self::PnlDayCumStreamUsd,
         Self::CollectorLastSuccessTsSeconds,
     ];
 
@@ -241,6 +295,31 @@ impl LiqMetric {
             Self::DependencyLatencyMs => "liq_dependency_latency_ms",
             Self::RebalanceStageMs => "liq_rebalance_stage_ms",
             Self::AttestationLastMs => "liq_attestation_last_ms",
+            Self::PnlSummaryUsd => "liq_pnl_summary_usd",
+            Self::PnlSummaryShares => "liq_pnl_summary_shares",
+            Self::PnlSummaryCount => "liq_pnl_summary_count",
+            Self::PnlCostUsd => "liq_pnl_cost_usd",
+            Self::PnlRevenueUsd => "liq_pnl_revenue_usd",
+            Self::PnlCostEntries => "liq_pnl_cost_entries",
+            Self::PnlCostMissingObservations => "liq_pnl_cost_missing_observations",
+            Self::PnlCostCoverage => "liq_pnl_cost_coverage",
+            Self::PnlCapitalAvgDeployedUsd => "liq_pnl_capital_avg_deployed_usd",
+            Self::PnlCapitalAnnualizedReturnPct => "liq_pnl_capital_annualized_return_pct",
+            Self::PnlCapitalCoverageDays => "liq_pnl_capital_coverage_days",
+            Self::PnlCapitalSampleDays => "liq_pnl_capital_sample_days",
+            Self::PnlSymbolUsd => "liq_pnl_symbol_usd",
+            Self::PnlSymbolShares => "liq_pnl_symbol_shares",
+            Self::PnlSymbolLots => "liq_pnl_symbol_lots",
+            Self::PnlSymbolVolumeShares => "liq_pnl_symbol_volume_shares",
+            Self::PnlSampleTotalFills => "liq_pnl_sample_total_fills",
+            Self::PnlSampleSymbols => "liq_pnl_sample_symbols",
+            Self::PnlSampleFirstTsSeconds => "liq_pnl_sample_first_ts_seconds",
+            Self::PnlSampleLastTsSeconds => "liq_pnl_sample_last_ts_seconds",
+            Self::PnlWarnings => "liq_pnl_warnings",
+            Self::PnlDayUsd => "liq_pnl_day_usd",
+            Self::PnlDayCumUsd => "liq_pnl_day_cum_usd",
+            Self::PnlDayStreamUsd => "liq_pnl_day_stream_usd",
+            Self::PnlDayCumStreamUsd => "liq_pnl_day_cum_stream_usd",
             Self::CollectorLastSuccessTsSeconds => "liq_collector_last_success_ts_seconds",
         }
     }
@@ -384,6 +463,47 @@ impl LiqMetric {
             Self::AttestationLastMs => {
                 "Duration of the latest CCTP attestation in the last 30 days"
             }
+            Self::PnlSummaryUsd => {
+                "Window PnL in USD by stream; absent when the report's decimal does not parse"
+            }
+            Self::PnlSummaryShares => "Window share totals by kind",
+            Self::PnlSummaryCount => "Window fill and lot counts by kind",
+            Self::PnlCostUsd => "Window tracked costs in USD by category",
+            Self::PnlRevenueUsd => "Window tracked revenue in USD by category",
+            Self::PnlCostEntries => "Cost entries in the window",
+            Self::PnlCostMissingObservations => "Cost observations missing from the window",
+            Self::PnlCostCoverage => {
+                "Always 1; one series per cost source with its coverage status"
+            }
+            Self::PnlCapitalAvgDeployedUsd => {
+                "Average deployed capital in USD; absent when not computed"
+            }
+            Self::PnlCapitalAnnualizedReturnPct => {
+                "Annualized return on capital in percent; absent when not computed"
+            }
+            Self::PnlCapitalCoverageDays => {
+                "Days of the window the capital snapshots cover; absent when not computed"
+            }
+            Self::PnlCapitalSampleDays => "Snapshot days sampled for the capital figures",
+            Self::PnlSymbolUsd => "Per-symbol window PnL in USD by column",
+            Self::PnlSymbolShares => "Per-symbol window shares by kind",
+            Self::PnlSymbolLots => "Per-symbol matched lots in the window",
+            Self::PnlSymbolVolumeShares => "Per-symbol matched shares counted once per leg",
+            Self::PnlSampleTotalFills => "Fills in the window",
+            Self::PnlSampleSymbols => "Symbols with fills in the window",
+            Self::PnlSampleFirstTsSeconds => {
+                "Unix time of the window's first fill; absent without fills"
+            }
+            Self::PnlSampleLastTsSeconds => {
+                "Unix time of the window's last fill; absent without fills"
+            }
+            Self::PnlWarnings => "Warnings the window's report carried",
+            Self::PnlDayUsd => "Per-symbol PnL in USD of each of the window's last 90 day buckets",
+            Self::PnlDayCumUsd => "Per-symbol running PnL in USD through each day bucket",
+            Self::PnlDayStreamUsd => "PnL in USD of each day bucket by chart stream",
+            Self::PnlDayCumStreamUsd => {
+                "Running PnL in USD through each day bucket by chart stream"
+            }
             Self::CollectorLastSuccessTsSeconds => {
                 "Unix time each liq_ collector last published its family"
             }
@@ -440,6 +560,26 @@ impl LiqMetric {
             Self::DependencyLatencyMs => &["dependency", "operation", "quantile"],
             Self::RebalanceStageMs => &["kind", "quantile", "stage"],
             Self::AttestationLastMs => &["kind"],
+            Self::PnlSummaryUsd => &["stream", "window"],
+            Self::PnlSummaryShares | Self::PnlSummaryCount => &["kind", "window"],
+            Self::PnlCostUsd | Self::PnlRevenueUsd => &["category", "window"],
+            Self::PnlCostEntries
+            | Self::PnlCostMissingObservations
+            | Self::PnlCapitalAvgDeployedUsd
+            | Self::PnlCapitalAnnualizedReturnPct
+            | Self::PnlCapitalCoverageDays
+            | Self::PnlCapitalSampleDays
+            | Self::PnlSampleTotalFills
+            | Self::PnlSampleSymbols
+            | Self::PnlSampleFirstTsSeconds
+            | Self::PnlSampleLastTsSeconds
+            | Self::PnlWarnings => &["window"],
+            Self::PnlCostCoverage => &["source", "status", "window"],
+            Self::PnlSymbolUsd => &["col", "symbol", "window"],
+            Self::PnlSymbolShares => &["kind", "symbol", "window"],
+            Self::PnlSymbolLots | Self::PnlSymbolVolumeShares => &["symbol", "window"],
+            Self::PnlDayUsd | Self::PnlDayCumUsd => &["day", "symbol", "window"],
+            Self::PnlDayStreamUsd | Self::PnlDayCumStreamUsd => &["day", "stream", "window"],
             Self::CollectorLastSuccessTsSeconds => &["collector"],
             Self::BotStartTimestampSeconds
             | Self::SettingsEquityTarget
@@ -468,7 +608,9 @@ impl LiqMetric {
     }
 
     /// The one family allowed to publish this name. `None` means the store
-    /// itself writes it during render.
+    /// itself writes it during render, or the name carries a `window` label
+    /// and each [`LiqFamily::Pnl`] family publishes its own window (see
+    /// [`Self::per_pnl_window`]).
     const fn family(self) -> Option<LiqFamily> {
         match self {
             Self::BotInfo | Self::BotStartTimestampSeconds => Some(LiqFamily::Health),
@@ -530,8 +672,39 @@ impl LiqMetric {
             | Self::DependencyErrors24h
             | Self::DependencyLatencyMs => Some(LiqFamily::Infra),
             Self::RebalanceStageMs | Self::AttestationLastMs => Some(LiqFamily::Rebalances),
-            Self::CollectorLastSuccessTsSeconds => None,
+            Self::PnlSummaryUsd
+            | Self::PnlSummaryShares
+            | Self::PnlSummaryCount
+            | Self::PnlCostUsd
+            | Self::PnlRevenueUsd
+            | Self::PnlCostEntries
+            | Self::PnlCostMissingObservations
+            | Self::PnlCostCoverage
+            | Self::PnlCapitalAvgDeployedUsd
+            | Self::PnlCapitalAnnualizedReturnPct
+            | Self::PnlCapitalCoverageDays
+            | Self::PnlCapitalSampleDays
+            | Self::PnlSymbolUsd
+            | Self::PnlSymbolShares
+            | Self::PnlSymbolLots
+            | Self::PnlSymbolVolumeShares
+            | Self::PnlSampleTotalFills
+            | Self::PnlSampleSymbols
+            | Self::PnlSampleFirstTsSeconds
+            | Self::PnlSampleLastTsSeconds
+            | Self::PnlWarnings
+            | Self::PnlDayUsd
+            | Self::PnlDayCumUsd
+            | Self::PnlDayStreamUsd
+            | Self::PnlDayCumStreamUsd
+            | Self::CollectorLastSuccessTsSeconds => None,
         }
+    }
+
+    /// True for the names every [`LiqFamily::Pnl`] family publishes, each
+    /// for its own `window` label value.
+    fn per_pnl_window(self) -> bool {
+        self.label_keys().contains(&"window")
     }
 }
 
@@ -546,6 +719,9 @@ pub(crate) enum LiqFamily {
     Reliability,
     Infra,
     Rebalances,
+    /// One PnL window. Each window is replaced on its own, so a window whose
+    /// report failed keeps its last samples while the others refresh.
+    Pnl(PnlWindowKey),
 }
 
 impl LiqFamily {
@@ -560,6 +736,26 @@ impl LiqFamily {
             Self::Reliability => "reliability",
             Self::Infra => "infra",
             Self::Rebalances => "rebalances",
+            Self::Pnl(window) => window.collector(),
+        }
+    }
+
+    /// Whether this family may publish `sample`: a name it owns, and for a
+    /// PnL window only samples labelled with that window.
+    fn owns(self, sample: &LiqSample) -> bool {
+        match self {
+            Self::Pnl(window) => {
+                sample.metric.per_pnl_window()
+                    && sample.labels.value("window") == Some(window.label())
+            }
+            Self::Health
+            | Self::Settings
+            | Self::Inventory
+            | Self::Prices
+            | Self::Latencies
+            | Self::Reliability
+            | Self::Infra
+            | Self::Rebalances => sample.metric.family() == Some(self),
         }
     }
 }
@@ -612,6 +808,16 @@ pub(crate) enum LiqSampleError {
 /// Label pairs sorted by key, like the exporter writes them.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct LabelSet(Vec<(&'static str, String)>);
+
+impl LabelSet {
+    fn value(&self, key: &str) -> Option<&str> {
+        let Self(labels) = self;
+        labels
+            .iter()
+            .find(|(label, _)| *label == key)
+            .map(|(_, value)| value.as_str())
+    }
+}
 
 /// The family store `/metrics` renders after the recorder output.
 #[derive(Default)]
@@ -726,7 +932,7 @@ fn owned_unique_samples(family: LiqFamily, samples: Vec<LiqSample>) -> Arc<[LiqS
     samples
         .into_iter()
         .filter(|sample| {
-            if sample.metric.family() != Some(family) {
+            if !family.owns(sample) {
                 error!(
                     metric = sample.metric.name(),
                     ?family,
@@ -860,6 +1066,18 @@ pub(crate) enum LiqValueError {
     NonFinite(f64),
     #[error("integer {0} has no exact f64 representation")]
     Inexact(u64),
+    #[error("{value:?} is not a decimal")]
+    Decimal {
+        value: String,
+        #[source]
+        source: FloatError,
+    },
+    #[error("{value:?} is not an RFC 3339 timestamp")]
+    Timestamp {
+        value: String,
+        #[source]
+        source: chrono::ParseError,
+    },
 }
 
 /// Every `liq_*` name is a gauge: snapshots, rolling windows that go down,
@@ -1163,6 +1381,31 @@ pub(crate) mod tests {
                 "liq_dependency_latency_ms",
                 "liq_rebalance_stage_ms",
                 "liq_attestation_last_ms",
+                "liq_pnl_summary_usd",
+                "liq_pnl_summary_shares",
+                "liq_pnl_summary_count",
+                "liq_pnl_cost_usd",
+                "liq_pnl_revenue_usd",
+                "liq_pnl_cost_entries",
+                "liq_pnl_cost_missing_observations",
+                "liq_pnl_cost_coverage",
+                "liq_pnl_capital_avg_deployed_usd",
+                "liq_pnl_capital_annualized_return_pct",
+                "liq_pnl_capital_coverage_days",
+                "liq_pnl_capital_sample_days",
+                "liq_pnl_symbol_usd",
+                "liq_pnl_symbol_shares",
+                "liq_pnl_symbol_lots",
+                "liq_pnl_symbol_volume_shares",
+                "liq_pnl_sample_total_fills",
+                "liq_pnl_sample_symbols",
+                "liq_pnl_sample_first_ts_seconds",
+                "liq_pnl_sample_last_ts_seconds",
+                "liq_pnl_warnings",
+                "liq_pnl_day_usd",
+                "liq_pnl_day_cum_usd",
+                "liq_pnl_day_stream_usd",
+                "liq_pnl_day_cum_stream_usd",
                 "liq_collector_last_success_ts_seconds",
             ]
         );
@@ -1189,6 +1432,42 @@ pub(crate) mod tests {
                 "rebalances",
             ]
         );
+        assert_eq!(
+            [
+                PnlWindowKey::OneDay,
+                PnlWindowKey::OneWeek,
+                PnlWindowKey::OneMonth,
+                PnlWindowKey::YearToDate,
+                PnlWindowKey::OneYear,
+                PnlWindowKey::All,
+            ]
+            .map(|window| LiqFamily::Pnl(window).collector()),
+            ["pnl_1d", "pnl_1w", "pnl_1m", "pnl_ytd", "pnl_1y", "pnl_all"]
+        );
+    }
+
+    /// Every `liq_pnl_*` name is published per window and no other name is,
+    /// so the PnL names are exactly the ones a window family owns.
+    #[test]
+    fn only_the_pnl_names_are_published_per_window() {
+        let per_window: Vec<&str> = LiqMetric::ALL
+            .into_iter()
+            .filter(|metric| metric.per_pnl_window())
+            .map(LiqMetric::name)
+            .collect();
+        let pnl: Vec<&str> = LiqMetric::ALL
+            .into_iter()
+            .map(LiqMetric::name)
+            .filter(|name| name.starts_with("liq_pnl_"))
+            .collect();
+
+        assert_eq!(per_window.len(), 25);
+        assert_eq!(per_window, pnl);
+        for metric in LiqMetric::ALL {
+            if metric.per_pnl_window() {
+                assert_eq!(metric.family(), None, "{}", metric.name());
+            }
+        }
     }
 
     #[test]

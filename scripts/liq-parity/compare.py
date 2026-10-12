@@ -113,6 +113,36 @@ PORTED = {
     "liq_attestation_last_ms",
 }
 
+# Every PnL series: one family per window, `window` label on each.
+PNL_NAMES = {
+    "liq_pnl_summary_usd",
+    "liq_pnl_summary_shares",
+    "liq_pnl_summary_count",
+    "liq_pnl_cost_usd",
+    "liq_pnl_revenue_usd",
+    "liq_pnl_cost_entries",
+    "liq_pnl_cost_missing_observations",
+    "liq_pnl_cost_coverage",
+    "liq_pnl_capital_avg_deployed_usd",
+    "liq_pnl_capital_annualized_return_pct",
+    "liq_pnl_capital_coverage_days",
+    "liq_pnl_capital_sample_days",
+    "liq_pnl_symbol_usd",
+    "liq_pnl_symbol_shares",
+    "liq_pnl_symbol_lots",
+    "liq_pnl_symbol_volume_shares",
+    "liq_pnl_sample_total_fills",
+    "liq_pnl_sample_symbols",
+    "liq_pnl_sample_first_ts_seconds",
+    "liq_pnl_sample_last_ts_seconds",
+    "liq_pnl_warnings",
+    "liq_pnl_day_usd",
+    "liq_pnl_day_cum_usd",
+    "liq_pnl_day_stream_usd",
+    "liq_pnl_day_cum_stream_usd",
+}
+PORTED |= PNL_NAMES
+
 # Names only the bot publishes.
 BOT_ONLY = {
     "liq_collector_last_success_ts_seconds",
@@ -177,8 +207,12 @@ ALWAYS_PRESENT = {
 
 # Documented differences. ("absolute", tolerance): values may differ by up to
 # the tolerance. "values": keys are compared, values are not. "ignore": the
-# name is not compared at all. The item that ports a name adds its entry, with
-# the evidence for it.
+# name is not compared at all. "kept_window": a series of a `window` the
+# exporter has no series of at all is not reported as extra in the bot.
+# "kept_window_bot_absent": as "kept_window", and a series the exporter has
+# and the bot lacks is not reported either, while the bot publishes that name
+# for the same window; values are still compared where both have the series. The item that ports a name adds its entry, with the
+# evidence for it.
 KNOWN_DIFFS = {
     # The exporter derives the start from integer uptime at poll time.
     "liq_bot_start_timestamp_seconds": ("absolute", 2.0),
@@ -219,6 +253,27 @@ KNOWN_DIFFS = {
     "liq_reliability_log_count_24h": "values",
     "liq_log_target_count_24h": "ignore",
 }
+# A PnL window whose report failed or did not fit the cycle budget keeps its
+# last value in the bot, with a stalled liq_collector_last_success_ts_seconds
+# {collector="pnl_<window>"}. The exporter drops that window from its pnl
+# family until its next cycle (exporter.py collect_pnl: a failed or skipped
+# window adds no samples before set_family). A deliberate difference.
+KNOWN_DIFFS.update({name: "kept_window" for name in PNL_NAMES})
+# A day component of /pnl that does not parse: the exporter counts it as 0
+# (t0.devops 8dca7be exporter.py pnl_day_samples, `dec(row.get(field)) or
+# Decimal(0)` and `dec(row.get("totalPnlUsd")) or Decimal(0)`), so it still
+# publishes that day's value and every running total after it. The bot leaves
+# those series out and logs an error (src/metrics/liquidity/pnl.rs
+# day_component; every_window_matches_the_exporter_golden pins the two series
+# the fixture's bad component feeds). So a day series can be missing from the
+# bot only. The values both sides publish are still compared.
+PNL_DAY_NAMES = {
+    "liq_pnl_day_usd",
+    "liq_pnl_day_cum_usd",
+    "liq_pnl_day_stream_usd",
+    "liq_pnl_day_cum_stream_usd",
+}
+KNOWN_DIFFS.update({name: "kept_window_bot_absent" for name in PNL_DAY_NAMES})
 
 # (bot type, exporter type) that --known-diffs accepts for every name. The
 # bot publishes every liq_* name as a gauge; the exporter is untyped.
@@ -364,11 +419,32 @@ def compare_pair(bot_text, exporter_text, drop_list, known_diffs, bot_names):
     exporter = {key: value for key, value in exporter.items()
                 if key[0] not in not_ported}
 
+    def window(key):
+        return dict(key[1]).get("window")
+
+    windowed = {"kept_window", "kept_window_bot_absent"}
+    exporter_windows = {window(key) for key in exporter
+                        if known.get(key[0]) in windowed}
+
+    def kept_window(key):
+        return known.get(key[0]) in windowed and window(key) not in exporter_windows
+
+    # A bot_absent name excuses a missing series only while the bot still
+    # publishes that name for the window: a bad day component leaves out
+    # single series, so a whole name missing from a window is a finding.
+    bot_absent_windows = {(key[0], window(key)) for key in bot
+                          if known.get(key[0]) == "kept_window_bot_absent"}
+
+    def excused_absence(key):
+        return (known.get(key[0]) == "kept_window_bot_absent"
+                and (key[0], window(key)) in bot_absent_windows)
+
     findings = type_findings(bot_text, exporter_text, dropped, known_diffs)
     for key in exporter.keys() - bot.keys():
-        findings[key] = f"missing from bot: {format_series(key)}"
+        if not excused_absence(key):
+            findings[key] = f"missing from bot: {format_series(key)}"
     for key in bot.keys() - exporter.keys():
-        if key[0] not in BOT_ONLY:
+        if key[0] not in BOT_ONLY and not kept_window(key):
             findings[key] = f"extra in bot: {format_series(key)}"
     for key in bot.keys() & exporter.keys():
         if values_differ(bot[key], exporter[key], known.get(key[0])):
