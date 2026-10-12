@@ -1126,7 +1126,9 @@ mod tests {
     use crate::rebalancing::usdc::{MarketMakingUsdcEndpoints, UsdcSettlementParams};
     use crate::telemetry::TelemetrySender;
     use crate::telemetry::broker::InstrumentedAlpacaBroker;
-    use crate::test_utils::{TestAnvilInstance, anvil_wallet, setup_test_db, spawn_anvil};
+    use crate::test_utils::{
+        TestAnvilInstance, anvil_wallet, relay_test_client, setup_test_db, spawn_anvil,
+    };
     use crate::usdc_rebalance::TransferRef;
 
     type TestWallet = Arc<dyn Wallet<Provider = RootProvider>>;
@@ -1231,9 +1233,7 @@ mod tests {
         })
         .unwrap()
         .with_local_contracts(contracts, contracts);
-        let client = RelayClient::new(None)
-            .unwrap()
-            .with_api_base(relay_api.base_url());
+        let client = relay_test_client(relay_api.base_url());
         let (broker, alpaca_wallet) = alpaca_services(server).await;
         let raindex = Arc::new(RaindexService::new(
             chain_wallet.clone(),
