@@ -64,7 +64,9 @@ Statuses: `waiting` (no deposit seen; the body is only `status` and
 `refund`, `failure`. `inTxHashes[]` are the deposits, `txHashes[]` the fills or
 refunds, `failReason` and `refundFailReason` a code or `"N/A"`. Both hash fields
 are arrays; the client keeps every entry, as `IntentStatusReport::deposit_txs`
-and `IntentStatusReport::txs`, whatever the status.
+and `IntentStatusReport::txs`, whatever the status. It keeps `refundFailReason`
+as `IntentStatusReport::refund_fail_reason` whatever the status too: a refund
+that did not complete may need Relay's manual review.
 
 A `failure` with `TRANSACTION_NOT_INCLUDED` that still lists a tx is
 `IntentStatus::NotIncluded` (not terminal): that tx may confirm later. With no

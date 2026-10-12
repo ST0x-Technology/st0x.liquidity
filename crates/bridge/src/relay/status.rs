@@ -14,6 +14,9 @@ pub struct IntentStatusReport {
     /// the refunds on `Refund`, the tx that may still confirm on
     /// `NotIncluded`, and any tx Relay lists on the others.
     pub txs: Vec<TxHash>,
+    /// Relay's `refundFailReason`, kept whatever the status: a refund that did
+    /// not complete may need Relay's manual review.
+    pub refund_fail_reason: Option<FailReason>,
 }
 
 /// Relay's status of a request. Only `Success`, `Refund`, `RefundFailed` and
@@ -150,7 +153,7 @@ impl From<StatusResponse> for IntentStatusReport {
             "delayed" => IntentStatus::InFlight(InFlightStage::Delayed),
             "success" if response.tx_hashes.is_empty() => IntentStatus::Filling,
             "success" => IntentStatus::Success,
-            "refund" => match refund_fail_reason {
+            "refund" => match refund_fail_reason.clone() {
                 Some(refund_fail_reason) => IntentStatus::RefundFailed {
                     reason,
                     refund_fail_reason,
@@ -172,6 +175,7 @@ impl From<StatusResponse> for IntentStatusReport {
             status,
             deposit_txs: response.in_tx_hashes,
             txs: response.tx_hashes,
+            refund_fail_reason,
         }
     }
 }
@@ -197,6 +201,7 @@ mod tests {
                 status: IntentStatus::Waiting,
                 deposit_txs: vec![],
                 txs: vec![],
+                refund_fail_reason: None,
             }
         );
         assert!(!report.status.is_terminal());
@@ -214,6 +219,7 @@ mod tests {
                     "0xeeee66456ace7aae93e6ed814d32a3748a5fc86d7101a259a4f62a44822c819d"
                 )],
                 txs: vec![],
+                refund_fail_reason: None,
             }
         );
         assert!(!report.status.is_terminal());
@@ -364,6 +370,7 @@ mod tests {
                     b256!("0x0000000000000000000000000000000000000000000000000000000000000003"),
                     b256!("0x0000000000000000000000000000000000000000000000000000000000000004"),
                 ],
+                refund_fail_reason: None,
             }
         );
     }
@@ -405,6 +412,33 @@ mod tests {
                 txs: vec![b256!(
                     "0x0000000000000000000000000000000000000000000000000000000000000005"
                 )],
+                refund_fail_reason: None,
+            }
+        );
+    }
+
+    #[test]
+    fn failure_keeps_the_refund_fail_reason() {
+        let report = report(
+            &json!({
+                "status": "failure",
+                "failReason": "SLIPPAGE",
+                "refundFailReason": "REFUND_RECIPIENT_IS_VASP",
+            })
+            .to_string(),
+        );
+
+        assert_eq!(
+            report,
+            IntentStatusReport {
+                status: IntentStatus::Failure {
+                    reason: Some(FailReason::Slippage),
+                },
+                deposit_txs: vec![],
+                txs: vec![],
+                refund_fail_reason: Some(FailReason::Unknown(
+                    "REFUND_RECIPIENT_IS_VASP".to_owned()
+                )),
             }
         );
     }
