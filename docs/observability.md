@@ -114,3 +114,67 @@ reads `job="t0-liquidity-exporter"`. `observability/gen-t0-liquidity.py` adds
 the matcher and fails if any `liq_` selector is left unpinned.
 `python3 observability/gen-t0-liquidity.py --check` (run in CI) fails when the
 committed board JSON differs from the generator output.
+
+### Checking parity on a live environment
+
+Run this after each release that ports names, while the exporter sidecar still
+runs next to the bot. Run it from a local checkout of this repository: the VMs
+have no checkout, and both endpoints listen only on the VM itself, so each
+snapshot is read over the IAP SSH access described in `docs/cli-ops.md`.
+
+1. Check out the commit the VM runs. `compare.py`'s list of ported names must
+   match the deployed release: a newer checkout reports names the release does
+   not publish yet as missing. The commit is the `git_commit` label of
+   `liq_bot_info` in the bot's `/metrics`.
+2. Set `VM` and `PROJECT` to the staging or production values from
+   `docs/cli-ops.md`, then run the whole block from the repository root. It
+   takes three snapshot pairs about two minutes apart into a new directory, and
+   compares them only after all three succeed. Each pair is one SSH command that
+   reads both bodies back to back:
+
+   ```bash
+   (
+     set -euo pipefail
+     dir=$(mktemp -d)
+     echo "snapshots in $dir"
+     for i in 1 2 3; do
+       gcloud compute ssh "$VM" --project "$PROJECT" --zone europe-west3-b \
+         --tunnel-through-iap --command \
+         'curl -fsS --max-time 10 localhost:8001/metrics &&
+          echo "# ---- exporter ----" &&
+          curl -fsS --max-time 10 localhost:9101/metrics' > "$dir/pair-$i.prom"
+       sed '/^# ---- exporter ----$/,$d' "$dir/pair-$i.prom" > "$dir/bot-$i.prom"
+       sed '1,/^# ---- exporter ----$/d' "$dir/pair-$i.prom" > "$dir/exporter-$i.prom"
+       if [ "$i" -lt 3 ]; then sleep 120; fi
+     done
+     status=0
+     python3 -I scripts/liq-parity/compare.py --drop-list --known-diffs \
+       "$dir/bot-1.prom" "$dir/exporter-1.prom" \
+       "$dir/bot-2.prom" "$dir/exporter-2.prom" \
+       "$dir/bot-3.prom" "$dir/exporter-3.prom" || status=$?
+     echo "compare.py exit status: $status"
+   )
+   ```
+
+   `curl -f` fails on an HTTP error and `--max-time` fails a request that
+   stalls. The `&&` chain makes the SSH command fail with it, so a dead or hung
+   endpoint stops the block before the comparison. A fresh directory per run
+   means a failed run can never compare the files of an earlier one.
+3. If the block ends without a `compare.py exit status:` line, the capture
+   failed (expired `gcloud` credentials, wrong VM or project, missing IAP
+   access, or a dead endpoint); fix that and run it again. Otherwise read that
+   status. `0` means no series disagreed in all three pairs. `1` lists the
+   series that disagree in every pair: each one is a bug in the port or a
+   difference missing from `KNOWN_DIFFS`. `compare.py` also compares the
+   `# TYPE` of each name both sides publish. The exporter writes no `# TYPE`
+   lines, so the bot's `gauge` against the exporter's untyped is expected for
+   every `liq_*` name, and `--known-diffs` accepts it. Any other `type differs:`
+   line (for example a bot `counter`) is a bug in the port. `2` means a snapshot
+   is unusable, and `compare.py` prints the file and the reason. For
+   `no ported liq_* series`, the wrong endpoint was read or a target was
+   degraded; check the endpoint and run it again. For any other reason
+   (`not UTF-8 text`, `not a Prometheus text body`, `repeated series`,
+   `repeated label name`, or `repeated TYPE`) in a `bot-N.prom` file, report it
+   as a bug in the port, because a rerun gives the same result.
+
+The block only reads, so it is safe to rerun.
