@@ -94,6 +94,7 @@ pub use registry_boot::report_boot as report_registry_boot;
 pub use st0x_config::{
     ExtraLayer, FileLogGuard, TelemetryError, TelemetryGuard, mk_env_filter, setup_tracing,
 };
+pub use startup::PROCESS_START;
 pub use tls::install_tls_crypto_provider;
 
 #[cfg(any(test, feature = "test-support"))]

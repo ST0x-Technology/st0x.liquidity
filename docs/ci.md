@@ -68,3 +68,11 @@ cannot satisfy pull request branch protection.
 Use a pull request event for merge-blocking validation. Reserve
 `workflow_dispatch` for manual runs whose result does not need to become a pull
 request status check.
+
+## Board check
+
+The `backend build` job also runs
+`python3 observability/gen-t0-liquidity.py --check` in the `ci-backend` shell,
+and `nix run .#ci` runs it too. It fails when the committed liquidity board JSON
+differs from the generator output, or when a `liq_` selector is not pinned to
+the exporter job.

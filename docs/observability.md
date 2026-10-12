@@ -104,3 +104,13 @@ changes land. A refused token file does not alert: whoever publishes it checks
 also covers startup failure, alerts through
 `liquidity-token-file-fallback-production` in
 `observability/alerting/liquidity.rules.yml`.
+
+## Metrics
+
+### Board pins
+
+Until consumers move to the bot, every `liq_` selector on the liquidity boards
+reads `job="t0-liquidity-exporter"`. `observability/gen-t0-liquidity.py` adds
+the matcher and fails if any `liq_` selector is left unpinned.
+`python3 observability/gen-t0-liquidity.py --check` (run in CI) fails when the
+committed board JSON differs from the generator output.

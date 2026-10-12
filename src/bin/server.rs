@@ -1,13 +1,15 @@
 use clap::Parser;
+use std::sync::LazyLock;
 
 use st0x_config::{Ctx, Env, TokenSource, claim_boot_tokens};
 use st0x_hedge::{
-    apalis_board_tracing_layer, install_tls_crypto_provider, report_registry_boot,
+    PROCESS_START, apalis_board_tracing_layer, install_tls_crypto_provider, report_registry_boot,
     run_server_bot_session, setup_tracing,
 };
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    LazyLock::force(&PROCESS_START);
     install_tls_crypto_provider();
 
     let Env {

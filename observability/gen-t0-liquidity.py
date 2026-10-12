@@ -6,6 +6,10 @@ Regenerate after edits:
 
     python3 observability/gen-t0-liquidity.py
 
+Check that the committed JSON matches the generator (CI runs this):
+
+    python3 observability/gen-t0-liquidity.py --check
+
 Data comes from the exporter sidecar on the liquidity VM
 (terraform/staging-liquidity/exporter/exporter.py):
 
@@ -41,11 +45,23 @@ Two Grafana-side patterns worth knowing before editing:
     maxDataPoints itself (see latest_status_table).
 """
 
+import filecmp
 import json
 import os
+import re
+import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 NATIVE_ROWS = os.path.join(HERE, "t0-liquidity-native-rows.json")
+
+# The bot serves liq_* on its own /metrics too, so an unpinned liq_ selector
+# would sum the exporter and the bot together. Every liq_ selector on these
+# boards reads the exporter's job until the board learns a source switch.
+LIQ_JOB = "t0-liquidity-exporter"
+LIQ_JOB_MATCHER = f'job="{LIQ_JOB}"'
+LIQ_NAME = re.compile(r"(?<![A-Za-z0-9_:])liq_[a-z0-9_]+")
+LIQ_PREFIX = re.compile(r"(?<![A-Za-z0-9_:])liq_")
 
 CM = {"type": "stackdriver", "uid": "cloudmon"}
 CL = {"type": "googlecloud-logging-datasource", "uid": "cloudlog"}
@@ -62,7 +78,58 @@ def nid():
 # Target + panel helpers
 # --------------------------------------------------------------------------
 
+def pin_liq(expr):
+    """Adds the exporter job matcher to every liq_ selector in `expr`.
+
+    Handles bare names (`liq_x` -> `liq_x{job="..."}`) and names that already
+    carry matchers (`liq_x{a="b"}` -> `liq_x{job="...",a="b"}`). A selector
+    that already names a job is left for `unpinned_liq_selectors` to judge.
+    """
+    out = []
+    pos = 0
+    for match in LIQ_NAME.finditer(expr):
+        out.append(expr[pos:match.end()])
+        pos = match.end()
+        if not expr.startswith("{", pos):
+            out.append("{" + LIQ_JOB_MATCHER + "}")
+            continue
+        close = expr.find("}", pos)
+        if close == -1:
+            raise SystemExit(f"unterminated label matcher in PromQL: {expr}")
+        matchers = expr[pos + 1:close].strip()
+        if re.search(r"(?<![A-Za-z0-9_])job\s*[=!]", matchers):
+            continue
+        pinned = LIQ_JOB_MATCHER + ("," + matchers if matchers else "")
+        out.append("{" + pinned + "}")
+        pos = close + 1
+    out.append(expr[pos:])
+    return "".join(out)
+
+
+def unpinned_liq_selectors(expr):
+    """Every liq_ occurrence in `expr` that is not a selector pinned to
+    exactly LIQ_JOB. A templated name such as `liq_$col` is never a valid
+    selector, so it is reported too: the check fails closed."""
+    pinned = {match.start() for match in LIQ_NAME.finditer(expr)
+              if _selector_is_pinned(expr, match.end())}
+    return [expr[found.start():found.start() + 40]
+            for found in LIQ_PREFIX.finditer(expr)
+            if found.start() not in pinned]
+
+
+def _selector_is_pinned(expr, name_end):
+    if not expr.startswith("{", name_end):
+        return False
+    close = expr.find("}", name_end)
+    if close == -1:
+        return False
+    matchers = [part.strip() for part in expr[name_end + 1:close].split(",")]
+    jobs = [part for part in matchers if re.match(r"job\s*(=|!=|=~|!~)", part)]
+    return jobs == [LIQ_JOB_MATCHER]
+
+
 def promql(expr, legend=None, instant=False, ref="A", step="60s"):
+    expr = pin_liq(expr)
     target = {
         "refId": ref,
         "datasource": CM,
@@ -1755,7 +1822,35 @@ dashboards.append(make_dashboard(
 # ==========================================================================
 # Emit.
 # ==========================================================================
-for board in dashboards:
+def board_exprs(node):
+    """Every PromQL `expr` string in a board, wherever it is nested."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "expr" and isinstance(value, str):
+                yield value
+            else:
+                yield from board_exprs(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from board_exprs(value)
+
+
+def check_liq_pinned(boards):
+    failures = [(board["uid"], expr, unpinned)
+                for board in boards
+                for expr in board_exprs(board)
+                for unpinned in [unpinned_liq_selectors(expr)]
+                if unpinned]
+    for uid, expr, unpinned in failures:
+        print(f"{uid}: unpinned liq_ selector {unpinned} in: {expr}",
+              file=sys.stderr)
+    if failures:
+        raise SystemExit(
+            f"{len(failures)} PromQL expressions read liq_* without "
+            f"{LIQ_JOB_MATCHER}")
+
+
+def board_path(root, board):
     # A board's directory IS its Grafana folder (the provider builds folders
     # from the directory tree). The main board sits in dashboards/liquidity/,
     # so that folder lists one Liquidity bot entry; the four tab boards are
@@ -1764,8 +1859,40 @@ for board in dashboards:
     # board between folders.
     subdir = ("liquidity" if board["uid"] == "t0-liquidity"
               else os.path.join("liquidity", "tabs"))
-    path = os.path.join(HERE, "dashboards", subdir, board["uid"] + ".json")
-    with open(path, "w") as f:
-        json.dump(board, f, indent=2, sort_keys=False)
-        f.write("\n")
-    print(f"wrote {path}: {len(board['panels'])} panels")
+    return os.path.join(root, "dashboards", subdir, board["uid"] + ".json")
+
+
+def write_boards(root, boards, quiet=False):
+    for board in boards:
+        path = board_path(root, board)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(board, f, indent=2, sort_keys=False)
+            f.write("\n")
+        if not quiet:
+            print(f"wrote {path}: {len(board['panels'])} panels")
+
+
+def check_committed(boards):
+    with tempfile.TemporaryDirectory() as scratch:
+        write_boards(scratch, boards, quiet=True)
+        drifted = [board_path(HERE, board) for board in boards
+                   if not os.path.exists(board_path(HERE, board))
+                   or not filecmp.cmp(board_path(scratch, board),
+                                      board_path(HERE, board), shallow=False)]
+    for path in drifted:
+        print(f"{path} differs from the generator output", file=sys.stderr)
+    if drifted:
+        raise SystemExit(
+            "committed boards are stale: run python3 "
+            "observability/gen-t0-liquidity.py and commit the result")
+    print(f"{len(boards)} boards match the generator")
+
+
+check_liq_pinned(dashboards)
+if sys.argv[1:] == ["--check"]:
+    check_committed(dashboards)
+elif sys.argv[1:]:
+    raise SystemExit(f"usage: {sys.argv[0]} [--check]")
+else:
+    write_boards(HERE, dashboards)

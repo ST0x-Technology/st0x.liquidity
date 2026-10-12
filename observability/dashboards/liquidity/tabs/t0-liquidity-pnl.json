@@ -189,7 +189,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_up)",
+            "expr": "max(liq_up{job=\"t0-liquidity-exporter\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -291,7 +291,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max by (git_commit) (topk(1, label_replace(timestamp(liq_bot_info), \"git_commit\", \"$1\", \"git_commit\", \"(.{7}).*\")))",
+            "expr": "max by (git_commit) (topk(1, label_replace(timestamp(liq_bot_info{job=\"t0-liquidity-exporter\"}), \"git_commit\", \"$1\", \"git_commit\", \"(.{7}).*\")))",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -378,7 +378,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "time() - max(liq_bot_start_timestamp_seconds)",
+            "expr": "time() - max(liq_bot_start_timestamp_seconds{job=\"t0-liquidity-exporter\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -466,7 +466,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "sum by (broker) (liq_settings_info)",
+            "expr": "sum by (broker) (liq_settings_info{job=\"t0-liquidity-exporter\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -553,7 +553,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_settings_equity_target)",
+            "expr": "max(liq_settings_equity_target{job=\"t0-liquidity-exporter\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -641,7 +641,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_settings_usdc_target)",
+            "expr": "max(liq_settings_usdc_target{job=\"t0-liquidity-exporter\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -729,7 +729,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_settings_execution_threshold_usd)",
+            "expr": "max(liq_settings_execution_threshold_usd{job=\"t0-liquidity-exporter\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -817,7 +817,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_pnl_summary_usd{stream=\"net_realized\",window=\"$window\"})",
+            "expr": "max(liq_pnl_summary_usd{job=\"t0-liquidity-exporter\",stream=\"net_realized\",window=\"$window\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -911,7 +911,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_pnl_summary_usd{stream=\"gross_realized\",window=\"$window\"})",
+            "expr": "max(liq_pnl_summary_usd{job=\"t0-liquidity-exporter\",stream=\"gross_realized\",window=\"$window\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1005,7 +1005,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_pnl_summary_usd{stream=\"tracked_costs\",window=\"$window\"})",
+            "expr": "max(liq_pnl_summary_usd{job=\"t0-liquidity-exporter\",stream=\"tracked_costs\",window=\"$window\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1091,7 +1091,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_pnl_summary_usd{stream=\"tracked_revenue\",window=\"$window\"})",
+            "expr": "max(liq_pnl_summary_usd{job=\"t0-liquidity-exporter\",stream=\"tracked_revenue\",window=\"$window\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1185,7 +1185,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_pnl_summary_usd{stream=\"counter_trade\",window=\"$window\"})",
+            "expr": "max(liq_pnl_summary_usd{job=\"t0-liquidity-exporter\",stream=\"counter_trade\",window=\"$window\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1279,7 +1279,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_pnl_summary_usd{stream=\"onchain_netting\",window=\"$window\"})",
+            "expr": "max(liq_pnl_summary_usd{job=\"t0-liquidity-exporter\",stream=\"onchain_netting\",window=\"$window\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1373,7 +1373,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_pnl_summary_usd{stream=\"directional_imbalance_excess\",window=\"$window\"})",
+            "expr": "max(liq_pnl_summary_usd{job=\"t0-liquidity-exporter\",stream=\"directional_imbalance_excess\",window=\"$window\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1467,7 +1467,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_pnl_summary_usd{stream=\"directional_inventory_baseline\",window=\"$window\"})",
+            "expr": "max(liq_pnl_summary_usd{job=\"t0-liquidity-exporter\",stream=\"directional_inventory_baseline\",window=\"$window\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1561,7 +1561,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_pnl_summary_usd{stream=\"directional_exposure\",window=\"$window\"})",
+            "expr": "max(liq_pnl_summary_usd{job=\"t0-liquidity-exporter\",stream=\"directional_exposure\",window=\"$window\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1655,7 +1655,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_pnl_summary_usd{stream=\"total\",window=\"$window\"})",
+            "expr": "max(liq_pnl_summary_usd{job=\"t0-liquidity-exporter\",stream=\"total\",window=\"$window\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1749,7 +1749,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_pnl_summary_shares{kind=\"inventory_drift\",window=\"$window\"})",
+            "expr": "max(liq_pnl_summary_shares{job=\"t0-liquidity-exporter\",kind=\"inventory_drift\",window=\"$window\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1831,7 +1831,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_pnl_sample_total_fills{window=\"$window\"})",
+            "expr": "max(liq_pnl_sample_total_fills{job=\"t0-liquidity-exporter\",window=\"$window\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1913,7 +1913,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_pnl_capital_avg_deployed_usd{window=\"$window\"})",
+            "expr": "max(liq_pnl_capital_avg_deployed_usd{job=\"t0-liquidity-exporter\",window=\"$window\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1995,7 +1995,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_pnl_capital_annualized_return_pct{window=\"$window\"})",
+            "expr": "max(liq_pnl_capital_annualized_return_pct{job=\"t0-liquidity-exporter\",window=\"$window\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -2085,7 +2085,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_pnl_capital_coverage_days{window=\"$window\"})",
+            "expr": "max(liq_pnl_capital_coverage_days{job=\"t0-liquidity-exporter\",window=\"$window\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -2167,7 +2167,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "sum by (symbol, col) (label_replace(liq_pnl_symbol_usd{col=\"gross_realized\",window=\"$window\"}, \"col\", \"Gross\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_usd{col=\"tracked_costs\",window=\"$window\"}, \"col\", \"Costs\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_usd{col=\"tracked_revenue\",window=\"$window\"}, \"col\", \"Revenue\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_usd{col=\"net_realized\",window=\"$window\"}, \"col\", \"Net\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_usd{col=\"counter_trade\",window=\"$window\"}, \"col\", \"Counter\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_usd{col=\"onchain_netting\",window=\"$window\"}, \"col\", \"On-chain\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_usd{col=\"directional_imbalance_excess\",window=\"$window\"}, \"col\", \"Directional\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_usd{col=\"directional_inventory_baseline\",window=\"$window\"}, \"col\", \"Baseline Drift\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_usd{col=\"total\",window=\"$window\"}, \"col\", \"Total\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_lots{window=\"$window\"}, \"col\", \"Lots\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_volume_shares{window=\"$window\"}, \"col\", \"Volume\", \"\", \"\"))",
+            "expr": "sum by (symbol, col) (label_replace(liq_pnl_symbol_usd{job=\"t0-liquidity-exporter\",col=\"gross_realized\",window=\"$window\"}, \"col\", \"Gross\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_usd{job=\"t0-liquidity-exporter\",col=\"tracked_costs\",window=\"$window\"}, \"col\", \"Costs\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_usd{job=\"t0-liquidity-exporter\",col=\"tracked_revenue\",window=\"$window\"}, \"col\", \"Revenue\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_usd{job=\"t0-liquidity-exporter\",col=\"net_realized\",window=\"$window\"}, \"col\", \"Net\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_usd{job=\"t0-liquidity-exporter\",col=\"counter_trade\",window=\"$window\"}, \"col\", \"Counter\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_usd{job=\"t0-liquidity-exporter\",col=\"onchain_netting\",window=\"$window\"}, \"col\", \"On-chain\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_usd{job=\"t0-liquidity-exporter\",col=\"directional_imbalance_excess\",window=\"$window\"}, \"col\", \"Directional\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_usd{job=\"t0-liquidity-exporter\",col=\"directional_inventory_baseline\",window=\"$window\"}, \"col\", \"Baseline Drift\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_usd{job=\"t0-liquidity-exporter\",col=\"total\",window=\"$window\"}, \"col\", \"Total\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_lots{job=\"t0-liquidity-exporter\",window=\"$window\"}, \"col\", \"Lots\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_pnl_symbol_volume_shares{job=\"t0-liquidity-exporter\",window=\"$window\"}, \"col\", \"Volume\", \"\", \"\"))",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -2697,7 +2697,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "sum by (day, symbol) (liq_pnl_day_usd{window=\"$window\"})",
+            "expr": "sum by (day, symbol) (liq_pnl_day_usd{job=\"t0-liquidity-exporter\",window=\"$window\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -2844,7 +2844,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "sum by (day, stream) (liq_pnl_day_stream_usd{window=\"$window\"})",
+            "expr": "sum by (day, stream) (liq_pnl_day_stream_usd{job=\"t0-liquidity-exporter\",window=\"$window\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -3052,7 +3052,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "sum by (day, symbol) (liq_pnl_day_cum_usd{window=\"$window\"})",
+            "expr": "sum by (day, symbol) (liq_pnl_day_cum_usd{job=\"t0-liquidity-exporter\",window=\"$window\"})",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -3199,7 +3199,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "sum by (day, stream) (liq_pnl_day_cum_stream_usd{window=\"$window\"})",
+            "expr": "sum by (day, stream) (liq_pnl_day_cum_stream_usd{job=\"t0-liquidity-exporter\",window=\"$window\"})",
             "step": "60s"
           },
           "timeSeriesList": {

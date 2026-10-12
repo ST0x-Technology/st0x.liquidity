@@ -128,6 +128,15 @@ jobs:
           workspaces: ". -> target/test"
           save-if: ${{ env.UNTRUSTED_PR != 'true' }}
 
+      # The board JSON must match its generator, with every liq_ selector
+      # pinned to the exporter job.
+      - name: Board generator check
+        run: |
+          nix develop .#ci-backend -c bash -c "
+            set -euxo pipefail
+            python3 observability/gen-t0-liquidity.py --check
+          "
+
       # Build the test binaries once into a nextest archive shared by all four
       # partitions, and run clippy and rustdoc here since this is the single
       # full compile.
