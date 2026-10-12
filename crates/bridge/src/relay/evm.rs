@@ -2163,6 +2163,34 @@ mod tests {
         );
     }
 
+    /// The wallet signs each step with no native value, so a step asking for
+    /// some is not the transaction Relay quoted.
+    #[tokio::test]
+    async fn step_sending_native_value_is_refused_at_signing() {
+        let harness = Harness::new().await;
+        let mut approve = quote(&harness.chain, B256::random(), true);
+        approve.approve.as_mut().unwrap().value = U256::from(1);
+        let mut deposit = quote(&harness.chain, B256::random(), true);
+        deposit.deposit.value = U256::from(1);
+
+        for (step, quote) in [(QuoteStep::Approve, approve), (QuoteStep::Deposit, deposit)] {
+            let error = harness
+                .bridge
+                .prepare_deposit(HopDirection::ToHub, &quote)
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(
+                    error,
+                    RelayBridgeError::Quote(QuoteMismatch::StepValue { step: refused, value })
+                        if refused == step && value == U256::from(1)
+                ),
+                "{step:?}: {error:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn fill_with_trailing_order_id_settles() {
         let harness = Harness::new().await;
