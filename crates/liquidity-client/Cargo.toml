@@ -21,9 +21,7 @@ st0x-alpaca = { workspace = true, features = [
   "issuer",
   "tokenization",
 ] }
-st0x-alpaca-gateway-api = { git = "https://github.com/ST0x-Technology/st0x.alpaca", rev = "0ca02fd33e4ba4ba3aa0fb86c1a59ed11b822c50", features = [
-  "client",
-] }
+st0x-alpaca-gateway-api = { workspace = true, features = ["client"] }
 thiserror.workspace = true
 tokio.workspace = true
 url.workspace = true
@@ -33,6 +31,7 @@ uuid.workspace = true
 httpmock.workspace = true
 serial_test.workspace = true
 temp-env.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

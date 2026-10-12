@@ -33,6 +33,12 @@ pub use st0x_alpaca::tokenization::{
     TokenizationRequestIdError,
 };
 
+/// The payload of [`AlpacaTokenizationError::Gateway`] and the verdict its
+/// `permanence()` returns, so a caller can classify a gateway hop without
+/// depending on `st0x-alpaca`. Renamed because `st0x-execution` exports its
+/// own `Permanence`.
+pub use st0x_alpaca::{GatewayHopError, Permanence as AlpacaPermanence};
+
 #[cfg(any(test, feature = "test-support"))]
 pub use st0x_alpaca::tokenization::{issuer_request_id, tokenization_request_id};
 

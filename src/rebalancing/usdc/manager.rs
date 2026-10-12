@@ -34,8 +34,7 @@ use st0x_execution::alpaca_broker_api::CryptoOrderResponse;
 use st0x_execution::{
     AlpacaAmount, AlpacaBrokerApiError, AlpacaTransferId, AlpacaWalletError, AlpacaWalletService,
     ClientOrderId, ConversionDirection, ConversionOrder, CryptoOrderOutcome, Network, Positive,
-    TokenSymbol, Transfer, TransferStatus, immediate_error_polling_config,
-    poll_deposit_by_tx_hash_with, poll_transfer_until_complete_with,
+    TokenSymbol, Transfer, TransferStatus,
 };
 use st0x_finance::{HasZero, Usd, Usdc};
 use st0x_float_macro::float;
@@ -3106,13 +3105,10 @@ impl<
         transfer_id: &AlpacaTransferId,
         initiated_at: DateTime<Utc>,
     ) -> Result<TxHash, UsdcTransferError> {
-        let polling = immediate_error_polling_config();
-        let transfer = match poll_transfer_until_complete_with(
-            self.alpaca_wallet.as_ref(),
-            transfer_id,
-            &polling,
-        )
-        .await
+        let transfer = match self
+            .alpaca_wallet
+            .poll_transfer_until_complete(transfer_id)
+            .await
         {
             Ok(transfer) => transfer,
             Err(error) => {
@@ -6555,44 +6551,40 @@ impl<
     ) -> Result<(), UsdcTransferError> {
         info!(target: "rebalance", %send_tx, "Polling Alpaca for deposit detection");
 
-        let polling = immediate_error_polling_config();
-        let transfer =
-            match poll_deposit_by_tx_hash_with(self.alpaca_wallet.as_ref(), &send_tx, &polling)
-                .await
-            {
-                Ok(transfer) => transfer,
-                Err(error) => {
-                    // Classify BEFORE emitting FailDeposit (RAI-1494): a broker
-                    // rate-limit (429) is not a determinate "deposit failed"
-                    // signal, only a transient throttle on the polling request
-                    // itself. Leave the aggregate in DepositInitiated so the
-                    // job's backpressure reschedule can re-poll the same send_tx
-                    // once the delay elapses, mirroring
-                    // `poll_and_confirm_withdrawal`'s conservative fail-closed
-                    // pattern for indeterminate poll errors.
-                    if error.backpressure().is_some() {
-                        warn!(
-                            target: "rebalance",
-                            %error,
-                            "Alpaca deposit polling hit broker rate-limiting; keeping \
-                             DepositInitiated state for delayed reschedule (will re-poll \
-                             the same send_tx)"
-                        );
-                        return Err(UsdcTransferError::AlpacaWallet(error));
-                    }
-
-                    warn!(target: "rebalance", "Alpaca deposit polling failed: {error}");
-                    self.cqrs
-                        .send(
-                            id,
-                            UsdcRebalanceCommand::FailDeposit {
-                                reason: format!("Deposit polling failed: {error}"),
-                            },
-                        )
-                        .await?;
+        let transfer = match self.alpaca_wallet.poll_deposit_by_tx_hash(&send_tx).await {
+            Ok(transfer) => transfer,
+            Err(error) => {
+                // Classify BEFORE emitting FailDeposit (RAI-1494): a broker
+                // rate-limit (429) is not a determinate "deposit failed"
+                // signal, only a transient throttle on the polling request
+                // itself. Leave the aggregate in DepositInitiated so the
+                // job's backpressure reschedule can re-poll the same send_tx
+                // once the delay elapses, mirroring
+                // `poll_and_confirm_withdrawal`'s conservative fail-closed
+                // pattern for indeterminate poll errors.
+                if error.backpressure().is_some() {
+                    warn!(
+                        target: "rebalance",
+                        %error,
+                        "Alpaca deposit polling hit broker rate-limiting; keeping \
+                         DepositInitiated state for delayed reschedule (will re-poll \
+                         the same send_tx)"
+                    );
                     return Err(UsdcTransferError::AlpacaWallet(error));
                 }
-            };
+
+                warn!(target: "rebalance", "Alpaca deposit polling failed: {error}");
+                self.cqrs
+                    .send(
+                        id,
+                        UsdcRebalanceCommand::FailDeposit {
+                            reason: format!("Deposit polling failed: {error}"),
+                        },
+                    )
+                    .await?;
+                return Err(UsdcTransferError::AlpacaWallet(error));
+            }
+        };
 
         if transfer.status != TransferStatus::Complete {
             let status = format!("{:?}", transfer.status);
@@ -12161,12 +12153,27 @@ mod tests {
         Arc<Store<UsdcRebalance>>,
         TestAnvilInstance,
     ) {
+        make_resume_test_manager_with_wallet(server, create_test_wallet_service(server)).await
+    }
+
+    /// [`make_resume_test_manager`] with the given Alpaca wallet service, so a
+    /// test can bound the wallet poll's deadline and retry budget.
+    async fn make_resume_test_manager_with_wallet(
+        server: &MockServer,
+        alpaca_wallet: AlpacaWalletService,
+    ) -> (
+        CrossVenueCashTransfer<
+            RawPrivateKeyWallet<impl alloy::providers::Provider + Clone + use<>>,
+        >,
+        Arc<Store<UsdcRebalance>>,
+        TestAnvilInstance,
+    ) {
         let (anvil, endpoint, private_key) = setup_anvil();
         let alpaca_broker = InstrumentedAlpacaBroker::new(
             create_test_broker_service(server).await,
             TelemetrySender::disabled(),
         );
-        let alpaca_wallet = Arc::new(create_test_wallet_service(server));
+        let alpaca_wallet = Arc::new(alpaca_wallet);
         let wallet = create_test_wallet(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
         let cqrs = create_test_store_instance().await;
@@ -14843,11 +14850,17 @@ mod tests {
     /// the same `send_tx`. Sibling of
     /// `resume_base_to_alpaca_from_deposit_initiated_polls_and_converts`
     /// (the happy path), with the transfers-poll mocked to 429 instead of a
-    /// successful `COMPLETE` transfer.
+    /// successful `COMPLETE` transfer. The shared poll retries a 429, so the
+    /// short poll wallet bounds its retry budget, and the 429 carries no
+    /// `Retry-After` so the retries run out before the poll deadline.
     #[tokio::test]
     async fn resume_base_to_alpaca_from_deposit_initiated_429_keeps_deposit_initiated_state() {
         let server = MockServer::start();
-        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+        let (manager, cqrs, _anvil) = make_resume_test_manager_with_wallet(
+            &server,
+            create_short_poll_wallet_service(&server),
+        )
+        .await;
 
         let id = UsdcRebalanceId(Uuid::new_v4());
         let amount = usdc("100");
@@ -14868,7 +14881,6 @@ mod tests {
                 .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers");
             then.status(429)
                 .header("content-type", "application/json")
-                .header("Retry-After", "5")
                 .json_body(json!({ "message": "rate limited" }));
         });
 
@@ -14894,6 +14906,93 @@ mod tests {
             "a classified 429 must leave the aggregate in DepositInitiated (not \
              DepositFailed) so a backpressure reschedule can re-poll the same send_tx; \
              got: {final_state:?}"
+        );
+    }
+
+    /// A 503 on the deposit lookup is Transient, so the shared deposit poll
+    /// looks the deposit up again by its retry rule instead of handing the
+    /// error back: the next lookup finds the COMPLETE transfer, and the
+    /// rebalance confirms the deposit and converts without recording
+    /// `FailDeposit`. The manager runs the default `PollingConfig`, the one
+    /// production builds through `AlpacaWalletService::new`, so a retry
+    /// budget that rules out this retry on the production path fails here;
+    /// the one retry waits a single `min_retry_delay`. Sibling of
+    /// `resume_base_to_alpaca_from_deposit_initiated_429_keeps_deposit_initiated_state`.
+    #[tokio::test]
+    async fn resume_base_to_alpaca_retries_transient_deposit_lookup_failure() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        let amount_received = usdc("99.99");
+        let (_burn_tx, mint_tx) =
+            advance_to_bridged_base_to_alpaca(&cqrs, &id, amount, amount_received).await;
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::InitiateDeposit {
+                deposit: TransferRef::OnchainTx(mint_tx),
+            },
+        )
+        .await
+        .unwrap();
+
+        let lookup_attempt = Arc::new(AtomicUsize::new(0));
+        let responder_attempt = Arc::clone(&lookup_attempt);
+        let transfers_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers");
+            then.respond_with(move |_request: &HttpMockRequest| {
+                let (status, body) = if responder_attempt.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (503, json!({ "message": "service unavailable" }))
+                } else {
+                    (
+                        200,
+                        json!([{
+                            "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                            "direction": "INCOMING",
+                            "amount": "99.99",
+                            "usd_value": "99.99",
+                            "chain": "ethereum",
+                            "asset": "USDC",
+                            "from_address": "0x0000000000000000000000000000000000000001",
+                            "to_address": "0x1111111111111111111111111111111111111111",
+                            "status": "COMPLETE",
+                            "tx_hash": format!("{mint_tx:#x}"),
+                            "created_at": "2024-01-01T00:00:00Z",
+                            "network_fee": "0.5",
+                            "fees": "0"
+                        }]),
+                    )
+                };
+
+                HttpMockResponse::builder()
+                    .status(status)
+                    .header("content-type", "application/json")
+                    .body(serde_json::to_string(&body).unwrap())
+                    .build()
+            });
+        });
+        let _conversion_mock =
+            create_conversion_order_mock(&server, ConversionDirection::UsdcToUsd, "99.99");
+        let _get_order_mock = create_get_order_mock(
+            &server,
+            "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "filled",
+            "99.99",
+        );
+
+        manager
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
+            .await
+            .unwrap();
+
+        transfers_mock.assert_calls(2);
+        let final_state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(final_state, UsdcRebalance::ConversionComplete { .. }),
+            "a transient 503 on the deposit lookup must be retried by the poll, not \
+             recorded as a failed deposit; got: {final_state:?}"
         );
     }
 

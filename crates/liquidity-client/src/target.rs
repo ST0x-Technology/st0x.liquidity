@@ -67,10 +67,33 @@ pub struct Target {
     pub auth: Auth,
     /// Optional T0 Cloud Logging console URL, printed alongside API errors.
     pub logging_url: Option<String>,
-    /// Overall per-request timeout for the HTTP client.
+    /// Overall per request timeout for the HTTP client and the Google token
+    /// exchange. The Alpaca target fixes it, since only the token exchange
+    /// uses it there.
     pub request_timeout: Duration,
-    /// TCP connect timeout for the HTTP client.
+    /// TCP connect timeout for the HTTP client and the Google token exchange.
+    /// The Alpaca target fixes it, since only the token exchange uses it
+    /// there.
     pub connect_timeout: Duration,
+}
+
+/// Bounds of the Google token exchange for the Alpaca gateway target: the only
+/// request on that path that a target's timeouts bound, since each gateway
+/// call is bounded by its operation's deadline. The S01 operator client's sign
+/// in in st0x.issuance uses the same bounds.
+const ALPACA_TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const ALPACA_TOKEN_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What a target fronts, which decides the rule its URL follows and where its
+/// HTTP timeouts come from.
+#[derive(Clone, Copy)]
+enum Service {
+    /// The liquidity API: any https base URL, and the timeouts
+    /// `<PREFIX>_REQUEST_TIMEOUT_SECS` and `<PREFIX>_CONNECT_TIMEOUT_SECS` set.
+    Liquidity,
+    /// The Alpaca gateway: a bare https origin, and the fixed token exchange
+    /// bounds.
+    AlpacaGateway,
 }
 
 fn required(variable: &str, hint: &str) -> Result<String> {
@@ -113,27 +136,32 @@ pub fn resolve(env: Env) -> Result<Target> {
     resolve_with_prefix(
         env.prefix(),
         "to the IAP-fronted liquidity API base URL for this environment",
-        false,
+        Service::Liquidity,
     )
 }
 
 /// Resolves the T0 Alpaca gateway target without consulting liquidity target
-/// variables.
+/// variables. It reads no timeout variables: gateway calls are bounded by each
+/// operation's deadline, and the token exchange by fixed bounds.
 pub fn resolve_alpaca(env: Env) -> Result<Target> {
     resolve_with_prefix(
         env.alpaca_prefix(),
         "to the IAP-fronted T0 Alpaca gateway origin for this environment",
-        true,
+        Service::AlpacaGateway,
     )
 }
 
-fn resolve_with_prefix(prefix: &str, url_hint: &str, origin_only: bool) -> Result<Target> {
+fn resolve_with_prefix(prefix: &str, url_hint: &str, service: Service) -> Result<Target> {
     let raw_url = required(&format!("{prefix}_URL"), url_hint)?;
     let base_url = parse_base_url(prefix, &raw_url)?;
-    if origin_only
-        && (base_url.path() != "/" || base_url.query().is_some() || base_url.fragment().is_some())
-    {
-        anyhow::bail!("{prefix}_URL must be a bare https origin, got: {raw_url}");
+    match service {
+        Service::Liquidity => {}
+        Service::AlpacaGateway => {
+            if base_url.path() != "/" || base_url.query().is_some() || base_url.fragment().is_some()
+            {
+                anyhow::bail!("{prefix}_URL must be a bare https origin, got: {raw_url}");
+            }
+        }
     }
     let auth = Auth::OauthDesktop {
         client_id: required(
@@ -146,16 +174,21 @@ fn resolve_with_prefix(prefix: &str, url_hint: &str, origin_only: bool) -> Resul
         )?,
     };
     let logging_url = std::env::var(format!("{prefix}_LOGGING_URL")).ok();
-    let request_timeout = required_timeout(
-        prefix,
-        "REQUEST_TIMEOUT_SECS",
-        "to the overall per-request timeout in seconds",
-    )?;
-    let connect_timeout = required_timeout(
-        prefix,
-        "CONNECT_TIMEOUT_SECS",
-        "to the TCP connect timeout in seconds",
-    )?;
+    let (request_timeout, connect_timeout) = match service {
+        Service::Liquidity => (
+            required_timeout(
+                prefix,
+                "REQUEST_TIMEOUT_SECS",
+                "to the overall per-request timeout in seconds",
+            )?,
+            required_timeout(
+                prefix,
+                "CONNECT_TIMEOUT_SECS",
+                "to the TCP connect timeout in seconds",
+            )?,
+        ),
+        Service::AlpacaGateway => (ALPACA_TOKEN_REQUEST_TIMEOUT, ALPACA_TOKEN_CONNECT_TIMEOUT),
+    };
     Ok(Target {
         base_url,
         auth,
@@ -168,6 +201,8 @@ fn resolve_with_prefix(prefix: &str, url_hint: &str, origin_only: bool) -> Resul
 #[cfg(test)]
 mod tests {
     //! Tests for URL and timeout validation and target resolution.
+    use std::time::Duration;
+
     use serial_test::serial;
 
     use super::{Env, parse_base_url, parse_timeout_secs, resolve, resolve_alpaca};
@@ -331,14 +366,68 @@ mod tests {
                 ("T0_ALPACA_STAGING_URL", Some("https://alpaca.example.com")),
                 ("T0_ALPACA_STAGING_CLIENT_ID", Some("alpaca-client")),
                 ("T0_ALPACA_STAGING_CLIENT_SECRET", Some("alpaca-secret")),
-                ("T0_ALPACA_STAGING_REQUEST_TIMEOUT_SECS", Some("30")),
-                ("T0_ALPACA_STAGING_CONNECT_TIMEOUT_SECS", Some("10")),
+                ("T0_ALPACA_STAGING_REQUEST_TIMEOUT_SECS", None),
+                ("T0_ALPACA_STAGING_CONNECT_TIMEOUT_SECS", None),
             ],
             || {
                 let target = resolve_alpaca(Env::Staging).unwrap();
                 assert_eq!(target.base_url.as_str(), "https://alpaca.example.com/");
+                assert_eq!(target.request_timeout, Duration::from_secs(30));
+                assert_eq!(target.connect_timeout, Duration::from_secs(10));
                 assert_eq!(Env::Staging.alpaca_cache_slug(), "alpaca-staging");
                 assert_ne!(Env::Staging.alpaca_cache_slug(), Env::Staging.cache_slug());
+            },
+        );
+    }
+
+    /// The Alpaca gateway target takes only a bare origin: a path, query, or
+    /// fragment would change every gateway route the client builds. The
+    /// liquidity target keeps a path.
+    #[test]
+    #[serial]
+    fn alpaca_target_refuses_a_url_that_is_not_a_bare_origin() {
+        for url in [
+            "https://alpaca.example.com/gateway",
+            "https://alpaca.example.com/?tier=write",
+            "https://alpaca.example.com/#write",
+        ] {
+            temp_env::with_vars(
+                [
+                    ("T0_ALPACA_STAGING_URL", Some(url)),
+                    ("T0_ALPACA_STAGING_CLIENT_ID", Some("alpaca-client")),
+                    ("T0_ALPACA_STAGING_CLIENT_SECRET", Some("alpaca-secret")),
+                ],
+                || {
+                    let error = resolve_alpaca(Env::Staging)
+                        .err()
+                        .map(|error| error.to_string());
+                    assert!(
+                        error
+                            .as_deref()
+                            .is_some_and(|error| error.contains("must be a bare https origin")),
+                        "{url}: {error:?}"
+                    );
+                },
+            );
+        }
+
+        temp_env::with_vars(
+            [
+                (
+                    "T0_LIQUIDITY_STAGING_URL",
+                    Some("https://liquidity.example.com/api"),
+                ),
+                ("T0_LIQUIDITY_STAGING_CLIENT_ID", Some("cid")),
+                ("T0_LIQUIDITY_STAGING_CLIENT_SECRET", Some("secret")),
+                ("T0_LIQUIDITY_STAGING_REQUEST_TIMEOUT_SECS", Some("30")),
+                ("T0_LIQUIDITY_STAGING_CONNECT_TIMEOUT_SECS", Some("10")),
+            ],
+            || {
+                let target = resolve(Env::Staging).unwrap();
+                assert_eq!(
+                    target.base_url.as_str(),
+                    "https://liquidity.example.com/api"
+                );
             },
         );
     }

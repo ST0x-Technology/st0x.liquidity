@@ -500,6 +500,19 @@ recovery cannot replace a finite dead letter with a fresh zero-streak chain.
 Once the broker order is reconciled to a terminal aggregate state, it naturally
 falls out of submitted-order recovery and the marker becomes inert.
 
+**A 429 inside a shared poll is retried by the poll before the job sees it.**
+The wallet, tokenization, and conversion polls at the pinned `st0x.alpaca` rev
+read again after every `Transient` read error, 429 included, waiting the longer
+of their backoff (or interval) and `Retry-After`. The job running the poll keeps
+its `Running` row through that wait, so the "true retry" deposit poll and
+withdrawal poll sub steps below reschedule only a 429 the poll gave up on: one
+that outlives the wallet poll's `PollingConfig::max_retries` budget surfaces
+typed and reschedules. A 429 whose wait reaches the poll deadline currently
+surfaces as the poll's timeout (`TransferTimeout`, `DepositTimeout`, or
+`PollTimeout`), which is not backpressure, so the deposit path records
+`FailDeposit`. A `st0x.alpaca` change that returns the rate limit error at the
+deadline instead is pending a pin bump.
+
 **Quarantined: USDC conversion order placement is not rescheduled at all.**
 `TransferUsdcToHedging`/`TransferUsdcToMarketMaking` are "true retry" jobs for
 their deposit-poll and withdrawal-poll sub-steps, but the conversion placement
@@ -567,12 +580,13 @@ same `find_backpressure`/`decide_backpressure` building blocks: on a classified
 429 within a small bounded attempt budget (`BACKPRESSURE_RETRY_MAX_ATTEMPTS`),
 it sleeps for the classified delay and retries in place; otherwise
 (non-backpressure error, or budget exhausted) it propagates to the CLI's
-existing `anyhow` error path unchanged. Wired into `cli/trading.rs`
-(market/limit order placement, order-status), `cli/alpaca_wallet.rs` (deposit
-address lookup, whitelist reads), and `cli/rebalancing.rs` (`transfer-usdc`).
-Not wired into `cli/repair.rs` (its commands never call the broker --
-`RepairOrderPlacer` always errors by design) or `transfer-equity` (same
-stringified-error gap as
+existing `anyhow` error path unchanged. A 429 that a shared poll absorbs (see
+above) never reaches this wrapper; it sees one only once the poll gives up on
+it. Wired into `cli/trading.rs` (market/limit order placement, order-status),
+`cli/alpaca_wallet.rs` (deposit address lookup, whitelist reads), and
+`cli/rebalancing.rs` (`transfer-usdc`). Not wired into `cli/repair.rs` (its
+commands never call the broker -- `RepairOrderPlacer` always errors by design)
+or `transfer-equity` (same stringified-error gap as
 `TransferEquityToMarketMaking`/`TransferEquityToHedging` above).
 
 **`ExecutorMaintenance` (`src/conductor/monitor/executor_maintenance.rs`) needs

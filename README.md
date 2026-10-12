@@ -569,10 +569,11 @@ Workspace crates:
 - **`st0x-dto`** (`crates/dto/`) - Dashboard DTOs and TypeScript binding
   generation
 - **`st0x-execution`** (`crates/execution/`) - `Executor` trait and
-  Liquidity-specific hedge policy over the released `st0x-alpaca` broker and
-  wallet clients
+  Liquidity-specific hedge policy over the `st0x-alpaca` broker and wallet
+  clients, pinned by git rev (see `docs/alpaca.md`)
 - **`st0x-tokenization`** (`crates/tokenization/`) - `Tokenizer` trait and
-  onchain mint/redemption handling over the released `st0x-alpaca` client
+  onchain mint/redemption handling over the `st0x-alpaca` client from the same
+  git rev pin
 - **`st0x-bridge`** (`crates/bridge/`) - Cross-chain bridge abstractions and
   CCTP implementation
 - **`st0x-raindex`** (`crates/raindex/`) - `Raindex` trait and shared domain
@@ -589,6 +590,9 @@ External crates:
   from [st0x.finance](https://github.com/ST0x-Technology/st0x.finance)
 - **`st0x-event-sorcery`** comes from the separate
   [event-sorcery](https://github.com/ST0x-Technology/event-sorcery) repository
+- **`st0x-alpaca`** and **`st0x-alpaca-gateway-api`** come from
+  [st0x.alpaca](https://github.com/ST0x-Technology/st0x.alpaca), pinned by git
+  rev (see `docs/alpaca.md`)
 
 ### Infrastructure
 

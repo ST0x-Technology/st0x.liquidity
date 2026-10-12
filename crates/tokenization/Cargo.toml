@@ -22,7 +22,6 @@ reqwest.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-tokio.workspace = true
 
 st0x-evm.workspace = true
 st0x-execution.workspace = true
