@@ -132,3 +132,4 @@ decision.
 | [0023](0023-record-capital-cctp-burns-by-client-operation-id.md)         | Record each capital CCTP burn in an aggregate keyed by a client operation id         | Proposed               |
 | [0024](0024-hold-usdc-checks-until-a-vault-read-at-the-deposit-block.md) | Hold USDC checks after a vault deposit until a vault read at the deposit block       | Proposed               |
 | [0025](0025-never-reuse-event-rowids.md)                                 | Never reuse event rowids                                                             | Proposed               |
+| [0026](0026-liq-metrics-family-store-and-untyped-exposition.md)          | Publish `liq_*` from a family store, typed as gauges                                 | Proposed               |
