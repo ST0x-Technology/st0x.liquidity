@@ -22,7 +22,8 @@ pub use status::{FailReason, InFlightStage, IntentStatus, IntentStatusReport};
 use std::time::Duration;
 
 use backon::Retryable;
-use reqwest::header::RETRY_AFTER;
+use reqwest::header::{HeaderValue, InvalidHeaderValue, RETRY_AFTER};
+use reqwest::redirect::Policy;
 use reqwest::{Response, StatusCode};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -60,7 +61,8 @@ impl std::fmt::Debug for RelayApiKey {
 pub struct RelayClient {
     http_client: reqwest::Client,
     api_base: String,
-    api_key: Option<RelayApiKey>,
+    /// Marked sensitive, so the client's Debug output never shows it.
+    api_key: Option<HeaderValue>,
     retry_delay: Duration,
 }
 
@@ -72,8 +74,18 @@ impl RelayClient {
             warn!(target: "bridge", "No Relay API key: requests use unauthenticated rate limits");
         }
 
+        let api_key = api_key
+            .map(|RelayApiKey(key)| {
+                let mut value = HeaderValue::try_from(key).map_err(RelayError::ApiKeyHeader)?;
+                value.set_sensitive(true);
+                Ok::<_, RelayError>(value)
+            })
+            .transpose()?;
+
+        // A redirect would carry `x-api-key` to whatever host it names.
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
+            .redirect(Policy::none())
             .build()
             .map_err(RelayError::Transport)?;
 
@@ -162,7 +174,7 @@ impl RelayClient {
 
     fn authenticated(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.api_key {
-            Some(RelayApiKey(key)) => request.header("x-api-key", key),
+            Some(key) => request.header("x-api-key", key.clone()),
             None => request,
         }
     }
@@ -213,6 +225,8 @@ pub enum RelayError {
     },
     #[error("Relay quote does not match the request: {0}")]
     QuoteMismatch(#[from] QuoteMismatch),
+    #[error("Relay API key is not a valid header value")]
+    ApiKeyHeader(#[source] InvalidHeaderValue),
 }
 
 impl RelayError {
@@ -223,7 +237,10 @@ impl RelayError {
             Self::Transport(_) => true,
             Self::HttpStatus { status, .. } => *status >= 500,
             Self::QuoteRefused { code } => code.is_transient(),
-            Self::Decode { .. } | Self::RateLimited { .. } | Self::QuoteMismatch(_) => false,
+            Self::Decode { .. }
+            | Self::RateLimited { .. }
+            | Self::QuoteMismatch(_)
+            | Self::ApiKeyHeader(_) => false,
         }
     }
 }
@@ -639,5 +656,16 @@ mod tests {
         let key = RelayApiKey::from("secret-key".to_owned());
 
         assert_eq!(format!("{key:?}"), "RelayApiKey(..)");
+
+        let client = RelayClient::new(Some(key)).unwrap();
+
+        assert!(!format!("{client:?}").contains("secret-key"), "{client:?}");
+    }
+
+    #[test]
+    fn api_key_that_is_not_a_header_value_is_refused() {
+        let error = RelayClient::new(Some(RelayApiKey::from("bad\nkey".to_owned()))).unwrap_err();
+
+        assert!(matches!(error, RelayError::ApiKeyHeader(_)), "{error:?}");
     }
 }
