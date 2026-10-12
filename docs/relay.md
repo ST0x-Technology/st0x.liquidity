@@ -172,8 +172,10 @@ slippage floor rounds down: Relay rounds its own `minimumAmount` down (999303522
 at 50 bps is 994307004.39, and Relay quotes 994307004), so a floor rounded up
 would refuse an honest quote.
 
-- `expected_out >= amount_in * (10000 - max_loss) / 10000`, else
-  `QuoteLossExceedsBound`;
+- `minimum_out >= amount_in * (10000 - max_loss) / 10000`, else
+  `QuoteLossExceedsBound`: a fill only guarantees `minimum_out`, so the loss
+  bound covers fees and slippage together, and with
+  `minimum_out <= expected_out` it bounds the expected output too;
 - `minimum_out >= expected_out * (10000 - slippage) / 10000`, else
   `QuoteFloorBelowBound`: Relay's floor is not looser than the slippage we sent,
   which `QuoteAmounts` carries from the request;

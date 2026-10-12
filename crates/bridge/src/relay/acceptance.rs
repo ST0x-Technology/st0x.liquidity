@@ -61,7 +61,8 @@ pub struct BasisPointsOutOfRange {
 /// What a quote must clear before we deposit against it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QuoteBounds {
-    /// Most of the input the expected output may lose, fees included.
+    /// Most of the input the quote's guaranteed output (its minimum) may lose,
+    /// fees and slippage included.
     pub max_loss: BasisPoints,
     /// The smallest amount the next leg accepts (an Alpaca deposit minimum),
     /// in the destination stable's smallest unit.
@@ -98,10 +99,12 @@ impl QuoteAmounts {
             });
         }
 
+        // A fill only guarantees the minimum, so the loss bound applies to it;
+        // with the minimum at most the expected output, it also bounds that.
         let loss_bound = bounds.max_loss.keep(amount_in, Rounding::Up)?;
-        if expected_out < loss_bound {
+        if minimum_out < loss_bound {
             return Err(QuoteAcceptanceError::QuoteLossExceedsBound {
-                expected: expected_out,
+                minimum: minimum_out,
                 bound: loss_bound,
             });
         }
@@ -129,8 +132,8 @@ impl QuoteAmounts {
 pub enum QuoteAcceptanceError {
     #[error("quote minimum {minimum} is above its expected output {expected}")]
     MinimumAboveExpected { minimum: U256, expected: U256 },
-    #[error("expected output {expected} is below the loss bound {bound}")]
-    QuoteLossExceedsBound { expected: U256, bound: U256 },
+    #[error("quote minimum {minimum} is below the loss bound {bound}")]
+    QuoteLossExceedsBound { minimum: U256, bound: U256 },
     #[error("Relay's minimum {minimum} is below our slippage floor {floor}")]
     QuoteFloorBelowBound { minimum: U256, floor: U256 },
     #[error("quote minimum {minimum} is below the next leg's minimum {downstream_minimum}")]
@@ -182,7 +185,7 @@ mod tests {
 
     #[test]
     fn funded_quote_is_accepted_within_its_bounds() {
-        funded_amounts().accept(&bounds(500, 1_000_000)).unwrap();
+        funded_amounts().accept(&bounds(600, 1_000_000)).unwrap();
     }
 
     /// The fixed relayer fee is 4.7% of a 5 dollar transfer.
@@ -193,7 +196,7 @@ mod tests {
         assert_eq!(
             error,
             QuoteAcceptanceError::QuoteLossExceedsBound {
-                expected: U256::from(4_763_755),
+                minimum: U256::from(4_749_464),
                 bound: U256::from(4_975_000),
             }
         );
@@ -207,13 +210,12 @@ mod tests {
             .accept(&bounds(475, 1_000_000))
             .unwrap_err();
 
-        assert!(
-            matches!(
-                error,
-                QuoteAcceptanceError::QuoteLossExceedsBound { bound, .. }
-                    if bound == U256::from(4_762_500)
-            ),
-            "{error:?}"
+        assert_eq!(
+            error,
+            QuoteAcceptanceError::QuoteLossExceedsBound {
+                minimum: U256::from(4_749_464),
+                bound: U256::from(4_762_500),
+            }
         );
     }
 
@@ -226,7 +228,7 @@ mod tests {
         };
 
         assert_eq!(
-            amounts.accept(&bounds(500, 1_000_000)).unwrap_err(),
+            amounts.accept(&bounds(600, 1_000_000)).unwrap_err(),
             QuoteAcceptanceError::QuoteFloorBelowBound {
                 minimum: U256::from(4_749_464),
                 floor: U256::from(4_758_991),
@@ -242,14 +244,14 @@ mod tests {
             minimum_out: U256::from(4_749_463),
             ..funded_amounts()
         };
-        at_floor.accept(&bounds(500, 0)).unwrap();
+        at_floor.accept(&bounds(600, 0)).unwrap();
 
         let below_floor = QuoteAmounts {
             minimum_out: U256::from(4_749_462),
             ..funded_amounts()
         };
         assert_eq!(
-            below_floor.accept(&bounds(500, 0)).unwrap_err(),
+            below_floor.accept(&bounds(600, 0)).unwrap_err(),
             QuoteAcceptanceError::QuoteFloorBelowBound {
                 minimum: U256::from(4_749_462),
                 floor: U256::from(4_749_463),
@@ -257,20 +259,20 @@ mod tests {
         );
     }
 
-    /// 475 bps off 5,001,318 is 4,763,755.395: the loss bound rounds up past
-    /// the expected output.
+    /// 475 bps off 4,986,314 is 4,749,464.085: the loss bound rounds up past
+    /// the minimum.
     #[test]
     fn loss_bound_rounds_up() {
         let amounts = QuoteAmounts {
-            amount_in: U256::from(5_001_318),
+            amount_in: U256::from(4_986_314),
             ..funded_amounts()
         };
 
         assert_eq!(
             amounts.accept(&bounds(475, 0)).unwrap_err(),
             QuoteAcceptanceError::QuoteLossExceedsBound {
-                expected: U256::from(4_763_755),
-                bound: U256::from(4_763_756),
+                minimum: U256::from(4_749_464),
+                bound: U256::from(4_749_465),
             }
         );
     }
@@ -278,7 +280,7 @@ mod tests {
     #[test]
     fn minimum_below_the_downstream_minimum_is_refused() {
         let error = funded_amounts()
-            .accept(&bounds(500, 5_000_000))
+            .accept(&bounds(600, 5_000_000))
             .unwrap_err();
 
         assert_eq!(
@@ -298,7 +300,7 @@ mod tests {
         };
 
         assert_eq!(
-            amounts.accept(&bounds(500, 0)).unwrap_err(),
+            amounts.accept(&bounds(600, 0)).unwrap_err(),
             QuoteAcceptanceError::MinimumAboveExpected {
                 minimum: U256::from(4_763_756),
                 expected: U256::from(4_763_755),
@@ -372,7 +374,7 @@ mod tests {
                 prop_assert!(minimum_out <= expected_out);
                 let scale = U512::from(10_000);
                 prop_assert!(
-                    U512::from(expected_out) >= widened_product(amount_in, max_loss).div_ceil(scale)
+                    U512::from(minimum_out) >= widened_product(amount_in, max_loss).div_ceil(scale)
                 );
                 prop_assert!(
                     U512::from(minimum_out) >= widened_product(expected_out, slippage) / scale
@@ -381,6 +383,8 @@ mod tests {
             }
         }
 
+        /// The minimum loses at most `max_loss`; the expected output sits
+        /// above it by at most the slippage, rounded down so the floor holds.
         #[test]
         fn quotes_within_bounds_are_accepted(
             amount_in in any::<u64>(),
@@ -390,10 +394,11 @@ mod tests {
             slippage_share in 0..=10_000_u16,
         ) {
             let loss = u16::try_from(u32::from(max_loss) * u32::from(loss_share) / 10_000).unwrap();
-            let slip =
-                u16::try_from(u32::from(slippage) * u32::from(slippage_share) / 10_000).unwrap();
-            let expected_out = bps(loss).keep(U256::from(amount_in), Rounding::Up).unwrap();
-            let minimum_out = bps(slip).keep(expected_out, Rounding::Down).unwrap();
+            let slip = u16::try_from(u32::from(slippage) * u32::from(slippage_share) / 10_000)
+                .unwrap()
+                .min(9_999);
+            let minimum_out = bps(loss).keep(U256::from(amount_in), Rounding::Up).unwrap();
+            let expected_out = minimum_out * U256::from(10_000) / U256::from(10_000 - slip);
 
             let amounts = QuoteAmounts {
                 amount_in: U256::from(amount_in),

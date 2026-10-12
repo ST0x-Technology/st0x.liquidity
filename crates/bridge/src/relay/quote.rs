@@ -1294,11 +1294,12 @@ pub(super) mod tests {
     }
 
     /// Relay rounds its `minimumAmount` down, so each live quote must clear
-    /// the slippage floor it was requested at.
+    /// the slippage floor it was requested at. The funded 5 dollar quote's
+    /// minimum loses 501 bps to the fixed relayer fee and slippage.
     #[test]
     fn every_live_quote_is_accepted_at_its_own_slippage() {
         let bounds = QuoteBounds {
-            max_loss: BasisPoints::new(500).unwrap(),
+            max_loss: BasisPoints::new(600).unwrap(),
             downstream_minimum: U256::ZERO,
         };
 
