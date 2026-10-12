@@ -384,7 +384,7 @@ async fn run_bot_session_inner(
         projection_maintenance: projection_maintenance.clone(),
         pnl_report_admission: dashboard::pnl::pnl_report_admission(),
         pnl_ledger: pnl_ledger.clone(),
-        metrics_handle,
+        metrics_handle: metrics_handle.clone(),
         health: health.clone(),
         detached_tasks: detached_tasks.clone(),
     };
@@ -403,6 +403,7 @@ async fn run_bot_session_inner(
     );
     let auxiliary_supervisor = spawn_auxiliary_supervisor(
         equity_price_task,
+        metrics_handle,
         metrics::liquidity::refresh::LiqStateRefresh {
             inventory: inventory.clone(),
             equity_prices: equity_prices.clone(),
@@ -749,13 +750,21 @@ fn spawn_server_supervisor(
 }
 
 /// The supervisor for tasks that must never stop trading: the dashboard
-/// price feed (when pricing is configured) and the `liq_*` refresh.
+/// price feed (when pricing is configured), the metrics recorder upkeep and
+/// the `liq_*` refresh.
 fn spawn_auxiliary_supervisor(
     equity_price_task: Option<startup::StartupTask<dashboard::equity_price::EquityPriceMonitor>>,
+    metrics_handle: PrometheusHandle,
     liq_state_refresh: metrics::liquidity::refresh::LiqStateRefresh,
 ) -> SupervisorHandle {
-    let builder =
-        non_escalating_supervisor_builder().with_task("liq-state-refresh", liq_state_refresh);
+    let builder = non_escalating_supervisor_builder()
+        .with_task(
+            "metrics-recorder-upkeep",
+            metrics::RecorderUpkeep {
+                handle: metrics_handle,
+            },
+        )
+        .with_task("liq-state-refresh", liq_state_refresh);
 
     match equity_price_task {
         Some(task) => builder.with_task("dashboard-equity-prices", task),

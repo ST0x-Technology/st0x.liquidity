@@ -62,7 +62,7 @@ impl BlockLagSample {
     /// permanent floor of the finality lag instead of zero. Saturates at zero:
     /// a load-balanced RPC can briefly report a cutoff block behind the
     /// checkpoint, which is staleness noise, not negative lag.
-    fn lag_blocks(&self) -> Option<u64> {
+    pub(crate) fn lag_blocks(&self) -> Option<u64> {
         self.cutoff_block
             .zip(self.last_processed_block)
             .map(|(cutoff_block, checkpoint)| cutoff_block.saturating_sub(checkpoint))
@@ -283,13 +283,17 @@ impl TelemetrySender {
         Self { connected: None }
     }
 
-    /// Emit one sample, never blocking the caller.
+    /// Emit one sample, never blocking the caller. The call is counted in
+    /// the native metrics first, whatever happens to the sample.
     pub(crate) fn record(&self, sample: DependencyCallSample) {
+        record_dependency_call_metrics(&sample);
+
         let Some(connected) = &self.connected else {
             return;
         };
 
         if connected.channel.try_send(sample).is_err() {
+            metrics::counter!("telemetry_samples_dropped_total").increment(1);
             let count = connected.dropped.fetch_add(1, Ordering::Relaxed) + 1;
             if count == 1 || count.is_multiple_of(DROP_LOG_EVERY) {
                 warn!(
@@ -307,6 +311,29 @@ impl TelemetrySender {
             .as_ref()
             .map_or(0, |connected| connected.dropped.load(Ordering::Relaxed))
     }
+}
+
+fn record_dependency_call_metrics(sample: &DependencyCallSample) {
+    let dependency = sample.dependency.as_str();
+    // The same outcome strings the writer stores.
+    let outcome = match sample.error {
+        Some(_) => "error",
+        None => "ok",
+    };
+
+    metrics::counter!(
+        "dependency_calls_total",
+        "dependency" => dependency,
+        "operation" => sample.operation.clone(),
+        "outcome" => outcome,
+    )
+    .increment(1);
+    metrics::histogram!(
+        "dependency_call_duration_seconds",
+        "dependency" => dependency,
+        "operation" => sample.operation.clone(),
+    )
+    .record(sample.duration);
 }
 
 /// Redact credential-bearing parts of any URL embedded in a dependency error
@@ -495,6 +522,7 @@ mod tests {
     use alloy::primitives::address;
     use chrono::TimeZone;
 
+    use crate::metrics::liquidity::tests::{parse_exposition, series};
     use crate::test_utils::{pool_migrated_up_to, setup_test_db};
 
     use super::*;
@@ -911,6 +939,61 @@ mod tests {
             scrub_secrets("https://eth-mainnet.example.com"),
             "https://eth-mainnet.example.com"
         );
+    }
+
+    /// Every call is counted, even when the sender is disabled or the
+    /// channel is closed, so the native counters do not depend on the
+    /// writer.
+    #[test]
+    fn record_counts_every_call_in_the_native_metrics() {
+        let recorder = crate::metrics::local_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || {
+            let disabled = TelemetrySender::disabled();
+            disabled.record(call_sample(0, Dependency::Rpc, None));
+            disabled.record(call_sample(0, Dependency::Rpc, Some("boom")));
+
+            let (sender, receiver) = TelemetrySender::channel();
+            drop(receiver);
+            sender.record(call_sample(0, Dependency::Broker, None));
+        });
+
+        let rendered = parse_exposition(&handle.render());
+        let rpc = [("dependency", "rpc"), ("operation", "eth_blockNumber")];
+        let calls = |dependency: &str, outcome: &str| {
+            rendered
+                .get(&series(
+                    "dependency_calls_total",
+                    &[
+                        ("dependency", dependency),
+                        ("operation", "eth_blockNumber"),
+                        ("outcome", outcome),
+                    ],
+                ))
+                .copied()
+        };
+        assert_eq!(calls("rpc", "ok"), Some(1.0));
+        assert_eq!(calls("rpc", "error"), Some(1.0));
+        assert_eq!(calls("broker", "ok"), Some(1.0));
+        assert_eq!(calls("broker", "error"), None);
+        assert_eq!(
+            rendered.get(&series("telemetry_samples_dropped_total", &[])),
+            Some(&1.0)
+        );
+        assert_eq!(
+            rendered.get(&series("dependency_call_duration_seconds_count", &rpc)),
+            Some(&2.0)
+        );
+        let bucket = |le: &str| {
+            let mut labels = rpc.to_vec();
+            labels.push(("le", le));
+            rendered
+                .get(&series("dependency_call_duration_seconds_bucket", &labels))
+                .copied()
+        };
+        assert_eq!(bucket("0.025"), Some(0.0));
+        assert_eq!(bucket("0.05"), Some(2.0));
     }
 
     #[tokio::test]

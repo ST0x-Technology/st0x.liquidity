@@ -7,10 +7,77 @@
 //! set, and the contract needs whole families replaced at once.
 
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
-use metrics_exporter_prometheus::{BuildError, PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::{BuildError, Matcher, PrometheusBuilder, PrometheusHandle};
+use task_supervisor::{SupervisedTask, TaskResult};
+use tokio::time::MissedTickBehavior;
+use tracing::info;
 
 pub(crate) mod liquidity;
+
+/// Bucket bounds, in seconds, for the duration histograms that render as
+/// Prometheus histograms. Without explicit buckets the recorder renders a
+/// histogram as a summary, which `histogram_quantile` cannot aggregate across
+/// label sets or time.
+const DURATION_BUCKETS: [f64; 13] = [
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+];
+
+/// Duration histograms rendered with [`DURATION_BUCKETS`].
+const BUCKETED_HISTOGRAMS: [&str; 2] = [
+    "dependency_call_duration_seconds",
+    "order_fill_poll_duration_seconds",
+];
+
+fn builder() -> Result<PrometheusBuilder, BuildError> {
+    // Kept as a function so tests build a local recorder with the same
+    // buckets the process-global one has.
+    BUCKETED_HISTOGRAMS
+        .into_iter()
+        .try_fold(PrometheusBuilder::new(), |builder, name| {
+            builder.set_buckets_for_metric(Matcher::Full(name.to_string()), &DURATION_BUCKETS)
+        })
+}
+
+/// How often [`RecorderUpkeep`] drains the recorder's histogram buffers.
+/// Each histogram sample stays buffered until a render or an upkeep, so
+/// without this the buffers grow with every call while nothing scrapes.
+const RECORDER_UPKEEP_PERIOD: Duration = Duration::from_secs(5);
+
+/// What [`RecorderUpkeep`] runs each period, so a test can count the calls
+/// that a render would otherwise make invisible.
+pub(crate) trait Upkeep {
+    fn run_upkeep(&self);
+}
+
+impl Upkeep for PrometheusHandle {
+    fn run_upkeep(&self) {
+        Self::run_upkeep(self);
+    }
+}
+
+/// Runs the recorder upkeep that `install_recorder` does not start: the
+/// HTTP-listener install path would, but this process serves `/metrics`
+/// itself.
+#[derive(Clone)]
+pub(crate) struct RecorderUpkeep<U = PrometheusHandle> {
+    pub(crate) handle: U,
+}
+
+impl<U: Upkeep + Clone + Send + Sync + 'static> SupervisedTask for RecorderUpkeep<U> {
+    async fn run(&mut self) -> TaskResult {
+        info!(period = ?RECORDER_UPKEEP_PERIOD, "Metrics recorder upkeep started");
+
+        let mut interval = tokio::time::interval(RECORDER_UPKEEP_PERIOD);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+            self.handle.run_upkeep();
+        }
+    }
+}
 
 static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 static INIT: Mutex<()> = Mutex::new(());
@@ -25,7 +92,7 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
     if let Some(handle) = HANDLE.get() {
         return Ok(handle.clone());
     }
-    let handle = PrometheusBuilder::new().install_recorder()?;
+    let handle = builder()?.install_recorder()?;
 
     metrics::describe_counter!(
         "hedge_trades_total",
@@ -154,6 +221,44 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
         "Nonzero equity balances captured with a missing or stale USD mark, by symbol and reason"
     );
     metrics::describe_counter!(
+        "dependency_calls_total",
+        "External dependency calls, by dependency, operation and outcome (ok/error); counted \
+         before the telemetry channel, so a full channel does not hide calls"
+    );
+    metrics::describe_histogram!(
+        "dependency_call_duration_seconds",
+        metrics::Unit::Seconds,
+        "External dependency call duration, by dependency and operation"
+    );
+    metrics::describe_counter!(
+        "telemetry_samples_dropped_total",
+        "Dependency call samples dropped because the telemetry channel was full or closed"
+    );
+    metrics::describe_counter!(
+        "order_fill_poll_cycles_total",
+        "Order-fill poll cycles, by chain and outcome (ok/paused/error); paused is a cycle that \
+         succeeds but ingests nothing because the cutoff block is unknown or behind the checkpoint"
+    );
+    metrics::describe_counter!(
+        "order_fill_poll_skipped_ticks_total",
+        "Order-fill poll ticks dropped because the previous cycle overran, by chain"
+    );
+    metrics::describe_histogram!(
+        "order_fill_poll_duration_seconds",
+        metrics::Unit::Seconds,
+        "Order-fill poll cycle duration, by chain"
+    );
+    metrics::describe_gauge!(
+        "order_fill_block_lag_blocks",
+        "Ingestion cutoff block minus the last processed block at the latest poll that knew \
+         both, by chain"
+    );
+    metrics::describe_gauge!(
+        "order_fill_block_lag_sampled_timestamp_seconds",
+        "Time of the poll that last set order_fill_block_lag_blocks, by chain; it stops \
+         advancing while the lag is unknown"
+    );
+    metrics::describe_counter!(
         "bot_gas_redrive_total",
         "Bot-gas receipt-cost enqueue failures redriven instead of failing the triggering \
          job, by job"
@@ -161,6 +266,13 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
 
     let _ = HANDLE.set(handle.clone());
     Ok(handle)
+}
+
+/// A recorder configured like the global one, for tests that install it
+/// locally with `metrics::with_local_recorder`.
+#[cfg(test)]
+pub(crate) fn local_recorder() -> metrics_exporter_prometheus::PrometheusRecorder {
+    builder().unwrap().build_recorder()
 }
 
 pub(crate) async fn endpoint(
@@ -178,6 +290,8 @@ fn render_body(handle: &PrometheusHandle, families: &liquidity::LiqFamilies) -> 
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::SystemTime;
 
     use super::*;
@@ -187,6 +301,30 @@ mod tests {
     // These tests install the process-global Prometheus recorder. nextest runs
     // each test in its own process, so the install-once recorder is fresh per
     // test and they do not contend over global state.
+
+    #[derive(Clone, Default)]
+    struct CountingUpkeep(Arc<AtomicUsize>);
+
+    impl Upkeep for CountingUpkeep {
+        fn run_upkeep(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recorder_upkeep_runs_once_per_period_and_never_returns() {
+        let upkeep = CountingUpkeep::default();
+        let calls = Arc::clone(&upkeep.0);
+        let mut task = RecorderUpkeep { handle: upkeep };
+        let running = tokio::spawn(async move { task.run().await });
+
+        // Ticks fire at 0, 5 and 10 seconds; stop halfway to the next one.
+        tokio::time::sleep(RECORDER_UPKEEP_PERIOD * 2 + RECORDER_UPKEEP_PERIOD / 2).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(!running.is_finished(), "the upkeep loop never returns");
+        running.abort();
+    }
 
     #[test]
     fn setup_is_idempotent_across_calls() {
