@@ -506,9 +506,10 @@ async fn run_bot_session_inner(
                 .await
             }
             StartupOutcome::ShutdownSignal => {
-                shutdown_auxiliary_supervisor(&auxiliary_supervisor);
-                drain_for_shutdown_signal(
+                drain_session(
+                    ShutdownTrigger::Signal,
                     &server_supervisor,
+                    &auxiliary_supervisor,
                     bot_task,
                     &detached_tasks,
                     shutdown_token,
@@ -818,12 +819,59 @@ where
         result = server_supervisor.wait() => ShutdownTrigger::ServerExit(result),
         result = &mut bot_task => ShutdownTrigger::BotExit(result),
     };
-    shutdown_auxiliary_supervisor(&auxiliary_supervisor);
 
+    drain_session(
+        trigger,
+        &server_supervisor,
+        &auxiliary_supervisor,
+        bot_task,
+        detached_tasks,
+        shutdown_token,
+        drain_timeout,
+    )
+    .await
+}
+
+/// Stops the auxiliary supervisor and drains the session for whatever ended
+/// it, waiting for the auxiliary supervisor beside the other drains.
+async fn drain_session(
+    trigger: ShutdownTrigger,
+    server_supervisor: &SupervisorHandle,
+    auxiliary_supervisor: &SupervisorHandle,
+    bot_task: JoinHandle<anyhow::Result<()>>,
+    detached_tasks: &TaskTracker,
+    shutdown_token: CancellationToken,
+    drain_timeout: Duration,
+) -> anyhow::Result<()> {
+    shutdown_auxiliary_supervisor(auxiliary_supervisor);
+    let (drained, ()) = tokio::join!(
+        drain_after_trigger(
+            trigger,
+            server_supervisor,
+            bot_task,
+            detached_tasks,
+            shutdown_token,
+            drain_timeout,
+        ),
+        drain_auxiliary_supervisor(auxiliary_supervisor, drain_timeout),
+    );
+    drained
+}
+
+/// Drains the bot, the server supervisor and the detached request tasks for
+/// whatever ended the session.
+async fn drain_after_trigger(
+    trigger: ShutdownTrigger,
+    server_supervisor: &SupervisorHandle,
+    bot_task: JoinHandle<anyhow::Result<()>>,
+    detached_tasks: &TaskTracker,
+    shutdown_token: CancellationToken,
+    drain_timeout: Duration,
+) -> anyhow::Result<()> {
     match trigger {
         ShutdownTrigger::Signal => {
             drain_for_shutdown_signal(
-                &server_supervisor,
+                server_supervisor,
                 bot_task,
                 detached_tasks,
                 shutdown_token,
@@ -843,7 +891,7 @@ where
             check_server_result(result)
         }
         ShutdownTrigger::BotExit(result) => {
-            shutdown_supervisor(&server_supervisor);
+            shutdown_supervisor(server_supervisor);
             drain_detached_tasks(detached_tasks, drain_timeout).await;
             check_bot_result(result)
         }
@@ -866,6 +914,26 @@ async fn drain_for_shutdown_signal(
         drain_detached_tasks(detached_tasks, drain_timeout),
     );
     bot_drained
+}
+
+/// Waits up to `timeout` for the auxiliary supervisor, already told to stop,
+/// to handle the stop: it aborts its tasks (the `liq_*` refreshes and the
+/// price feed) and ends. It does not wait for an aborted task to finish
+/// unwinding, nor for a P&L replay on a blocking thread. Bounded, so a stuck
+/// supervisor cannot hold the shutdown.
+async fn drain_auxiliary_supervisor(handle: &SupervisorHandle, timeout: Duration) {
+    match tokio::time::timeout(timeout, handle.wait()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            warn!(target: "shutdown", %error, "Auxiliary supervisor stopped with an error");
+        }
+        Err(_elapsed) => {
+            warn!(
+                target: "shutdown",
+                "Auxiliary supervisor did not stop before the drain timeout"
+            );
+        }
+    }
 }
 
 /// Closes the detached request tracker and waits up to `timeout` for its work
@@ -1067,6 +1135,7 @@ async fn run_conductor_session(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
+    use futures_util::FutureExt as _;
     use std::io;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -1512,9 +1581,65 @@ mod tests {
         let auxiliary_post_wait =
             tokio::time::timeout(Duration::from_secs(1), auxiliary_handle_for_assert.wait()).await;
         assert!(
-            auxiliary_post_wait.is_ok(),
-            "auxiliary supervisor should stop during signal-triggered shutdown"
+            matches!(auxiliary_post_wait, Ok(Ok(()))),
+            "auxiliary supervisor should stop during signal-triggered shutdown: \
+             {auxiliary_post_wait:?}"
         );
+    }
+
+    /// A bot task that has already finished, so awaiting it does not yield.
+    async fn finished_bot_task() -> JoinHandle<anyhow::Result<()>> {
+        let bot_task = tokio::spawn(async { Ok(()) });
+        while !bot_task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        bot_task
+    }
+
+    /// Every trigger drains through `drain_session`, which returns only once
+    /// the auxiliary supervisor has handled the stop. With a finished bot
+    /// task and no detached tasks, the auxiliary wait is the only point that
+    /// yields, so a single poll of its handle tells whether it was awaited.
+    #[tokio::test]
+    async fn every_shutdown_trigger_waits_for_the_auxiliary_supervisor() {
+        for name in ["signal", "server exit", "bot exit"] {
+            let trigger = match name {
+                "signal" => ShutdownTrigger::Signal,
+                "server exit" => ShutdownTrigger::ServerExit(Ok(())),
+                "bot exit" => ShutdownTrigger::BotExit(Ok(Ok(()))),
+                other => panic!("no trigger named {other}"),
+            };
+            let auxiliary_supervisor = pending_test_supervisor();
+
+            drain_session(
+                trigger,
+                &SupervisorBuilder::default().build().run(),
+                &auxiliary_supervisor,
+                finished_bot_task().await,
+                &TaskTracker::new(),
+                CancellationToken::new(),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                matches!(auxiliary_supervisor.wait().now_or_never(), Some(Ok(()))),
+                "{name}: the auxiliary supervisor must have stopped before the drain returned"
+            );
+        }
+    }
+
+    /// A supervisor that does not stop cannot hold the shutdown past its
+    /// drain timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_auxiliary_supervisor_cannot_hold_the_shutdown() {
+        let stuck = pending_test_supervisor();
+        let wait = drain_auxiliary_supervisor(&stuck, Duration::from_secs(5));
+
+        tokio::time::timeout(Duration::from_secs(6), wait)
+            .await
+            .expect("the drain must give up after its timeout");
     }
 
     #[tokio::test]
