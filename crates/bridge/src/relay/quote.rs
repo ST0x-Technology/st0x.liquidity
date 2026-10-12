@@ -1351,7 +1351,7 @@ pub fn quote_body_for_test(
     payment["minimumAmount"] = json!(quote.minimum_out.to_string());
     order["output"]["deadline"] = json!(quote.deadline);
 
-    let RelayOrderId(order_id) = derive_order_id(&serde_json::from_value(order.clone())?)?;
+    let order_id = eip712_order(&serde_json::from_value(order.clone())?)?.eip712_hash_struct();
     body["protocol"]["v2"]["orderId"] = json!(order_id);
     body["protocol"]["v2"]["paymentDetails"]["amount"] = json!(amount);
 
