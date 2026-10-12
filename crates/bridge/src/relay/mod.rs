@@ -780,9 +780,8 @@ mod tests {
         );
     }
 
-    /// Only `waiting` may omit `txHashes`: a `TRANSACTION_NOT_INCLUDED`
-    /// failure without the field may still list a tx that confirms later, so
-    /// it must not read as a terminal failure with no tx.
+    /// A `TRANSACTION_NOT_INCLUDED` failure without `txHashes` may still have
+    /// a tx that confirms later, so it must not read as a terminal failure.
     #[tokio::test]
     async fn failure_without_tx_hashes_is_a_decode_error() {
         let server = MockServer::start();

@@ -124,9 +124,10 @@ impl FailReason {
     }
 }
 
-/// A status body read into its report. Only `success`, `refund` and
-/// `failure` read `txHashes`, so a body of theirs that omits it does not
-/// decode: a missing list must not pass for an empty one.
+/// A status body read into its report. Where the status hangs on `txHashes`
+/// (`success`, `refund` with no refund fail reason, a `TRANSACTION_NOT_INCLUDED`
+/// failure), a body that omits it does not decode: a missing list must not
+/// pass for an empty one.
 #[derive(Debug)]
 pub(super) struct StatusResponse(pub(super) IntentStatusReport);
 
@@ -140,7 +141,7 @@ impl<'de> Deserialize<'de> for StatusResponse {
 }
 
 /// Wire shape. A never-deposited request carries only `status` and
-/// `quoteCreatedAt`.
+/// `quoteCreatedAt`, so `txHashes` is optional and checked per status.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WireStatus {
@@ -168,15 +169,15 @@ impl TryFrom<WireStatus> for IntentStatusReport {
             .as_deref()
             .and_then(FailReason::parse);
 
-        let txs = match response.tx_hashes {
-            Some(txs) => txs,
-            None if matches!(response.status.as_str(), "success" | "refund" | "failure") => {
-                return Err(MissingTxHashes {
-                    status: response.status,
-                });
-            }
-            None => vec![],
+        // Only these arms read the tx list, so only they refuse a missing one.
+        let has_txs = |tx_hashes: Option<&Vec<TxHash>>, status: &str| {
+            tx_hashes
+                .map(|txs| !txs.is_empty())
+                .ok_or_else(|| MissingTxHashes {
+                    status: status.to_owned(),
+                })
         };
+        let listed = response.tx_hashes.as_ref();
 
         let status = match response.status.as_str() {
             "waiting" => IntentStatus::Waiting,
@@ -184,27 +185,30 @@ impl TryFrom<WireStatus> for IntentStatusReport {
             "pending" => IntentStatus::InFlight(InFlightStage::Pending),
             "submitted" => IntentStatus::InFlight(InFlightStage::Submitted),
             "delayed" => IntentStatus::InFlight(InFlightStage::Delayed),
-            "success" if txs.is_empty() => IntentStatus::Filling,
-            "success" => IntentStatus::Success,
+            "success" if has_txs(listed, "success")? => IntentStatus::Success,
+            "success" => IntentStatus::Filling,
             "refund" => match refund_fail_reason.clone() {
                 Some(refund_fail_reason) => IntentStatus::RefundFailed {
                     reason,
                     refund_fail_reason,
                 },
-                None if txs.is_empty() => IntentStatus::Refunding { reason },
-                None => IntentStatus::Refund { reason },
+                None if has_txs(listed, "refund")? => IntentStatus::Refund { reason },
+                None => IntentStatus::Refunding { reason },
             },
-            "failure" if reason == Some(FailReason::TransactionNotIncluded) && !txs.is_empty() => {
+            "failure"
+                if reason == Some(FailReason::TransactionNotIncluded)
+                    && has_txs(listed, "failure")? =>
+            {
                 IntentStatus::NotIncluded
             }
             "failure" => IntentStatus::Failure { reason },
-            _ => IntentStatus::Unknown(response.status),
+            _ => IntentStatus::Unknown(response.status.clone()),
         };
 
         Ok(Self {
             status,
             deposit_txs: response.in_tx_hashes,
-            txs,
+            txs: response.tx_hashes.unwrap_or_default(),
             refund_fail_reason,
         })
     }
@@ -462,7 +466,6 @@ mod tests {
         let report = report(
             &json!({
                 "status": "failure",
-                "txHashes": [],
                 "failReason": "SLIPPAGE",
                 "refundFailReason": "REFUND_RECIPIENT_IS_VASP",
             })
@@ -505,6 +508,28 @@ mod tests {
                 "0x0000000000000000000000000000000000000000000000000000000000000007"
             )]
         );
+    }
+
+    #[test]
+    fn status_that_hangs_on_its_txs_does_not_decode_without_tx_hashes() {
+        for (body, status) in [
+            (json!({"status": "success", "failReason": "N/A"}), "success"),
+            (
+                json!({"status": "refund", "failReason": "SLIPPAGE"}),
+                "refund",
+            ),
+            (
+                json!({"status": "failure", "failReason": "TRANSACTION_NOT_INCLUDED"}),
+                "failure",
+            ),
+        ] {
+            let error = serde_json::from_value::<StatusResponse>(body).unwrap_err();
+
+            assert_eq!(
+                error.to_string(),
+                format!("Relay status {status} omits txHashes")
+            );
+        }
     }
 
     /// Only the statuses whose outcome hangs on the tx list need `txHashes`.
