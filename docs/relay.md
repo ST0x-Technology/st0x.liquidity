@@ -143,6 +143,8 @@ before it sends anything, then refuses a quote unless:
   amount;
 - the relayer fee is in the origin stable and the gas fee is on the origin
   chain;
+- `protocol.v2.orderData.version` is `v1`, the only order shape the id
+  derivation hashes;
 - `protocol.v2.orderData.inputs[]` has exactly one input, whose `payment` is the
   requested amount of the origin stable on the origin chain, and
   `orderData.fees` is empty;

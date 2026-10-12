@@ -21,6 +21,9 @@ sol! {
     function depositErc20(address depositor, address token, uint256 amount, bytes32 id) external;
 }
 
+/// The only `orderData.version` whose shape [`derive_order_id`] hashes.
+const ORDER_VERSION: &str = "v1";
+
 /// Relay's v1 order as its settlement SDK hashes it: `getOrderId` is the
 /// EIP-712 struct hash of `Order`, with every EVM address as 20 raw bytes.
 mod order_eip712 {
@@ -286,6 +289,8 @@ pub enum QuoteMismatch {
         destination: &'static str,
         actual: String,
     },
+    #[error("order version is {actual}, expected {ORDER_VERSION}")]
+    OrderVersion { actual: String },
     #[error("order has {count} inputs, expected one")]
     InputCount { count: usize },
     #[error("order carries {count} fees, expected none")]
@@ -735,9 +740,16 @@ fn check_fees(fees: &RawFees, origin: Chain) -> Result<(), QuoteMismatch> {
     Ok(())
 }
 
-/// The order takes exactly one input, the requested amount of the origin
-/// stable on the origin chain, and carries no extra fee.
+/// The order is the v1 shape [`derive_order_id`] hashes, takes exactly one
+/// input, the requested amount of the origin stable on the origin chain, and
+/// carries no extra fee.
 fn check_order_input(order: &RawOrderData, request: &QuoteRequest) -> Result<(), QuoteMismatch> {
+    if order.version != ORDER_VERSION {
+        return Err(QuoteMismatch::OrderVersion {
+            actual: order.version.clone(),
+        });
+    }
+
     let [input] = order.inputs.as_slice() else {
         return Err(QuoteMismatch::InputCount {
             count: order.inputs.len(),
@@ -1230,6 +1242,18 @@ pub(super) mod tests {
                     ))
                         && derived != quoted
             ),
+            "{error:?}"
+        );
+    }
+
+    /// The version check runs before the order id is derived, so only it can
+    /// refuse this quote.
+    #[test]
+    fn order_of_another_version_is_refused() {
+        let error = refusal(|body| body["protocol"]["v2"]["orderData"]["version"] = json!("v2"));
+
+        assert!(
+            matches!(&error, QuoteMismatch::OrderVersion { actual } if actual == "v2"),
             "{error:?}"
         );
     }
