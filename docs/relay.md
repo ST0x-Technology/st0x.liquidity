@@ -219,7 +219,8 @@ would refuse an honest quote.
 
 Both fills paid exactly the quoted expected amount, in 32 and 59 s. The fill and
 refund txs and the deposit receipts are pinned in
-`crates/bridge/relay-fixtures/` (`fill_*`, `refund_*`, `deposit_receipt_*`).
+`crates/bridge/relay-fixtures/` (`fill_*`, `refund_*`, `deposit_receipt_*`). The
+test ran from a throwaway wallet funded for it, not a bot signer.
 
 ## RelayBridge
 

@@ -217,6 +217,7 @@ mod tests {
 
     use super::*;
 
+    /// The funded test's throwaway wallet, not a bot signer.
     const FUNDED_WALLET: Address = address!("0xe385C5EE42d7B81A6a51E759FaaFca6159Fd04B6");
 
     const SOLVER: Address = address!("0xf70da97812cb96acdf810712aa562db8dfa3dbef");
