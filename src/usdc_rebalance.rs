@@ -3142,6 +3142,15 @@ fn recorded_burn_tx(event: &UsdcRebalanceEvent) -> Option<TxHash> {
         | SwapApprovePrepared { .. }
         | SwapDepositPrepared { .. }
         | SwapDeposited { .. }
+        | SwapRequoted { .. }
+        | SwapDepositReverted { .. }
+        | RelayFillVerified { .. }
+        | SwapRefunded { .. }
+        | SwapEscrowUnresolved { .. }
+        | SwapFailed { .. }
+        | RedepositStarted { .. }
+        | RedepositSubmitted { .. }
+        | ReturnedToSource { .. }
         | BridgingCompletionRecovered { .. }
         | DepositInitiated { .. }
         | DepositConfirmed { .. }
