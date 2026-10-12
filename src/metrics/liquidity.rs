@@ -31,6 +31,7 @@ use self::pnl::PnlWindowKey;
 
 pub(crate) mod inventory;
 pub(crate) mod log_counts;
+pub(crate) mod orders;
 pub(crate) mod performance;
 pub(crate) mod pnl;
 pub(crate) mod pnl_refresh;
@@ -133,6 +134,11 @@ pub(crate) enum LiqMetric {
     PnlDayCumUsd,
     PnlDayStreamUsd,
     PnlDayCumStreamUsd,
+    PendingOrders,
+    PendingOrdersTotal,
+    PendingOrdersUncappedTotal,
+    RaindexOrdersTotal,
+    RaindexOrdersUnavailable,
     CollectorLastSuccessTsSeconds,
 }
 
@@ -140,7 +146,7 @@ impl LiqMetric {
     /// Every variant, for the catalog tests. A new variant needs an entry
     /// here and its name in the catalog test.
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 88] = [
+    pub(crate) const ALL: [Self; 93] = [
         Self::BotInfo,
         Self::BotStartTimestampSeconds,
         Self::SettingsInfo,
@@ -228,6 +234,11 @@ impl LiqMetric {
         Self::PnlDayCumUsd,
         Self::PnlDayStreamUsd,
         Self::PnlDayCumStreamUsd,
+        Self::PendingOrders,
+        Self::PendingOrdersTotal,
+        Self::PendingOrdersUncappedTotal,
+        Self::RaindexOrdersTotal,
+        Self::RaindexOrdersUnavailable,
         Self::CollectorLastSuccessTsSeconds,
     ];
 
@@ -320,6 +331,11 @@ impl LiqMetric {
             Self::PnlDayCumUsd => "liq_pnl_day_cum_usd",
             Self::PnlDayStreamUsd => "liq_pnl_day_stream_usd",
             Self::PnlDayCumStreamUsd => "liq_pnl_day_cum_stream_usd",
+            Self::PendingOrders => "liq_pending_orders",
+            Self::PendingOrdersTotal => "liq_pending_orders_total",
+            Self::PendingOrdersUncappedTotal => "liq_pending_orders_uncapped_total",
+            Self::RaindexOrdersTotal => "liq_raindex_orders_total",
+            Self::RaindexOrdersUnavailable => "liq_raindex_orders_unavailable",
             Self::CollectorLastSuccessTsSeconds => "liq_collector_last_success_ts_seconds",
         }
     }
@@ -504,6 +520,21 @@ impl LiqMetric {
             Self::PnlDayCumStreamUsd => {
                 "Running PnL in USD through each day bucket by chart stream"
             }
+            Self::PendingOrders => {
+                "Pending broker orders by status among the newest 100 rows that parse; absent at 0"
+            }
+            Self::PendingOrdersTotal => {
+                "Pending broker orders among the newest 100 rows, without unparseable ones"
+            }
+            Self::PendingOrdersUncappedTotal => {
+                "Every non-terminal broker order row, uncapped; absent when the count fails"
+            }
+            Self::RaindexOrdersTotal => {
+                "Active Raindex orders the st0x REST API reports; absent while unavailable"
+            }
+            Self::RaindexOrdersUnavailable => {
+                "1 with the reason while the Raindex orders are unavailable, else 0 with an empty reason"
+            }
             Self::CollectorLastSuccessTsSeconds => {
                 "Unix time each liq_ collector last published its family"
             }
@@ -580,6 +611,8 @@ impl LiqMetric {
             Self::PnlSymbolLots | Self::PnlSymbolVolumeShares => &["symbol", "window"],
             Self::PnlDayUsd | Self::PnlDayCumUsd => &["day", "symbol", "window"],
             Self::PnlDayStreamUsd | Self::PnlDayCumStreamUsd => &["day", "stream", "window"],
+            Self::PendingOrders => &["status"],
+            Self::RaindexOrdersUnavailable => &["reason"],
             Self::CollectorLastSuccessTsSeconds => &["collector"],
             Self::BotStartTimestampSeconds
             | Self::SettingsEquityTarget
@@ -603,7 +636,10 @@ impl LiqMetric {
             | Self::UsdcInflightBaseWallet
             | Self::UsdcTotal
             | Self::UsdcRatio
-            | Self::UsdcRebalanceable => &[],
+            | Self::UsdcRebalanceable
+            | Self::PendingOrdersTotal
+            | Self::PendingOrdersUncappedTotal
+            | Self::RaindexOrdersTotal => &[],
         }
     }
 
@@ -672,6 +708,10 @@ impl LiqMetric {
             | Self::DependencyErrors24h
             | Self::DependencyLatencyMs => Some(LiqFamily::Infra),
             Self::RebalanceStageMs | Self::AttestationLastMs => Some(LiqFamily::Rebalances),
+            Self::PendingOrders | Self::PendingOrdersTotal | Self::PendingOrdersUncappedTotal => {
+                Some(LiqFamily::PendingOrders)
+            }
+            Self::RaindexOrdersTotal | Self::RaindexOrdersUnavailable => Some(LiqFamily::Raindex),
             Self::PnlSummaryUsd
             | Self::PnlSummaryShares
             | Self::PnlSummaryCount
@@ -719,6 +759,8 @@ pub(crate) enum LiqFamily {
     Reliability,
     Infra,
     Rebalances,
+    PendingOrders,
+    Raindex,
     /// One PnL window. Each window is replaced on its own, so a window whose
     /// report failed keeps its last samples while the others refresh.
     Pnl(PnlWindowKey),
@@ -736,6 +778,8 @@ impl LiqFamily {
             Self::Reliability => "reliability",
             Self::Infra => "infra",
             Self::Rebalances => "rebalances",
+            Self::PendingOrders => "pending_orders",
+            Self::Raindex => "raindex",
             Self::Pnl(window) => window.collector(),
         }
     }
@@ -755,7 +799,9 @@ impl LiqFamily {
             | Self::Latencies
             | Self::Reliability
             | Self::Infra
-            | Self::Rebalances => sample.metric.family() == Some(self),
+            | Self::Rebalances
+            | Self::PendingOrders
+            | Self::Raindex => sample.metric.family() == Some(self),
         }
     }
 }
@@ -1406,6 +1452,11 @@ pub(crate) mod tests {
                 "liq_pnl_day_cum_usd",
                 "liq_pnl_day_stream_usd",
                 "liq_pnl_day_cum_stream_usd",
+                "liq_pending_orders",
+                "liq_pending_orders_total",
+                "liq_pending_orders_uncapped_total",
+                "liq_raindex_orders_total",
+                "liq_raindex_orders_unavailable",
                 "liq_collector_last_success_ts_seconds",
             ]
         );
@@ -1419,6 +1470,8 @@ pub(crate) mod tests {
                 LiqFamily::Reliability,
                 LiqFamily::Infra,
                 LiqFamily::Rebalances,
+                LiqFamily::PendingOrders,
+                LiqFamily::Raindex,
             ]
             .map(LiqFamily::collector),
             [
@@ -1430,6 +1483,8 @@ pub(crate) mod tests {
                 "reliability",
                 "infra",
                 "rebalances",
+                "pending_orders",
+                "raindex",
             ]
         );
         assert_eq!(

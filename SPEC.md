@@ -1845,6 +1845,20 @@ Every fifth cycle the task publishes `rebalances` over the last 30 days:
 window. A collector that fails or takes longer than 30 seconds keeps its last
 family.
 
+Every 60 seconds a task publishes the order series. `liq_pending_orders_total`
+and `liq_pending_orders{status}` count what `GET /orders/pending` returns, from
+the same loader: the newest 100 live broker order rows, without the ones whose
+payload does not parse (a malformed row still takes one of the 100). A read that
+fails keeps the last series and their collector time, and logs an error: the
+endpoint answers no orders then, but a 0 here would read as a fresh count. A
+status with no order has no series. `liq_pending_orders_uncapped_total` counts
+every live broker order row, with no limit and no payload check; it is absent
+when the count fails. `liq_raindex_orders_total` and
+`liq_raindex_orders_unavailable{reason}` come from the same fetch
+`GET /orders/raindex` proxies (page 1, 50 orders): the upstream
+`pagination.totalOrders` and `{reason=""} 0` while available, and
+`{reason="<why>"} 1` with no total while not.
+
 Every 5 minutes a task publishes the `liq_pnl_*` series of six windows, each
 labelled `window`: `1d`, `1w`, `1m`, `ytd`, `1y` and `all`. Each window is one
 `GET /pnl` report built by the same code path as the endpoint, with its own

@@ -99,6 +99,26 @@ def run_pnl_window_all(exporter, fixture):
         exporter.pnl_samples(fixture, "all") + exporter.pnl_day_samples(fixture, "all"))
 
 
+class NoCloudLogging:
+    """collect_orders also ships the Raindex orders as log rows."""
+
+    def write_entries(self, log_name, entries):
+        pass
+
+
+def run_orders(exporter, fixture):
+    """/orders/pending and /orders/raindex answer from the fixture."""
+    def bot_get(path, params=None, timeout=15):
+        if path == "/orders/pending":
+            return fixture["pending"]
+        if path == "/orders/raindex":
+            return fixture["raindex"]
+        raise RuntimeError(f"unexpected bot read {path}")
+
+    exporter.bot_get = bot_get
+    exporter.collect_orders(NoCloudLogging())
+
+
 # case name -> how the fixture reaches the exporter
 CASES = {
     "settings": run_state,
@@ -112,6 +132,9 @@ CASES = {
     # PnL windows and day buckets
     "pnl": run_pnl,
     "pnl-days": run_pnl_window_all,
+    # pending and Raindex orders
+    "orders": run_orders,
+    "orders-unavailable": run_orders,
 }
 
 

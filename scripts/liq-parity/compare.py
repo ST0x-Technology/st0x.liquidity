@@ -143,6 +143,14 @@ PNL_NAMES = {
 }
 PORTED |= PNL_NAMES
 
+# Pending broker orders and the Raindex order total.
+PORTED |= {
+    "liq_pending_orders",
+    "liq_pending_orders_total",
+    "liq_raindex_orders_total",
+    "liq_raindex_orders_unavailable",
+}
+
 # Names only the bot publishes.
 BOT_ONLY = {
     "liq_collector_last_success_ts_seconds",
@@ -152,6 +160,7 @@ BOT_ONLY = {
     "liq_usdc_chain_available",
     "liq_usdc_chain_inflight",
     "liq_usdc_chain_ratio",
+    "liq_pending_orders_uncapped_total",
 }
 
 # Exporter names that are not ported, because nothing reads them or the bot
