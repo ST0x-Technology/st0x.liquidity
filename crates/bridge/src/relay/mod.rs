@@ -227,6 +227,8 @@ pub enum RelayError {
     QuoteMismatch(#[from] QuoteMismatch),
     #[error("Relay API key is not a valid header value")]
     ApiKeyHeader(#[source] InvalidHeaderValue),
+    #[error("Relay requires an API key for quotes, and none is configured")]
+    NoApiKey,
 }
 
 impl RelayError {
@@ -240,7 +242,8 @@ impl RelayError {
             Self::Decode { .. }
             | Self::RateLimited { .. }
             | Self::QuoteMismatch(_)
-            | Self::ApiKeyHeader(_) => false,
+            | Self::ApiKeyHeader(_)
+            | Self::NoApiKey => false,
         }
     }
 }
@@ -423,6 +426,24 @@ mod tests {
             ),
             "{error:?}"
         );
+        assert_eq!(mock.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn quote_without_an_api_key_is_refused_before_any_request() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/quote/v2");
+            then.status(401)
+                .json_body(json!({"message": "Unauthorized", "errorCode": "UNAUTHORIZED_QUOTE"}));
+        });
+
+        let error = client(&server, None)
+            .quote(&funded_request())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, RelayError::NoApiKey), "{error:?}");
         assert_eq!(mock.calls(), 0);
     }
 
