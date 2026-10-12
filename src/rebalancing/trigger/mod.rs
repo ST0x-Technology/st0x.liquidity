@@ -33,11 +33,11 @@ use uuid::Uuid;
 use rain_math_float::Float;
 use st0x_bridge::corridor::{UsdcCorridor, legacy_base_cctp};
 use st0x_config::{
-    AllocationCtx, ChainAssets, ChainEquityAsset, ExecutionThreshold, OperationMode,
-    RebalancingMode, TargetShare, UsdcCorridorCtx, UsdcCorridors,
+    AllocationCtx, ChainAssets, ChainEquityAsset, ExecutionThreshold, RebalancingMode, TargetShare,
+    UsdcCorridorCtx, UsdcCorridors,
 };
 #[cfg(test)]
-use st0x_config::{ChainCashAsset, ChainEquities};
+use st0x_config::{ChainCashAsset, ChainEquities, OperationMode};
 use st0x_event_sorcery::{
     AggregateError, EntityList, LifecycleError, Projection, ProjectionError, Reactor, SendError,
     Store, deps,
@@ -5977,11 +5977,7 @@ impl RebalancingService {
             .chains
             .get(&usdc.corridor.chain())?
             .assets
-            .cash
-            .as_ref()?;
-        if cash.rebalancing != OperationMode::Enabled {
-            return None;
-        }
+            .rebalancing_cash()?;
 
         let usdc_limit = cash.operational_limit.map(Positive::inner);
         let reserved = self.config.cash_reserved.map(Positive::inner);

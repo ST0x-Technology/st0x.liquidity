@@ -1130,6 +1130,31 @@ def native_inventory(w, x, y, heights):
     deviation = per_chain("liq_usdc_corridor_deviation",
                           "liq_settings_usdc_deviation")
     inside = (f"(abs(({ratio}) - ({target})) <= bool ({deviation}))")
+    # A chain's band counts only while USDC rebalancing runs on its corridor.
+    # The bot publishes liq_usdc_corridor_active. A bot build from before that
+    # flag (only staging builds of this stack) publishes each corridor's table
+    # and the single USDC band. It sets that band only for one active corridor
+    # or the primary chain's, so the fallback below needs the band: with
+    # several active corridors and none on the primary chain it greys every
+    # row. The exporter has neither and cannot tell which chain its single
+    # band is for: it is judged as the Base row while that band is set. The
+    # bot sets that band only from corridors the USDC trigger can act on (the
+    # USDC mode and that chain's cash rebalancing enabled), so while it can
+    # act on none the row shows no ratio, target or band instead of grey. On
+    # the bot source a chain with no corridor table shows no ratio, and one
+    # whose corridor is off is grey, no verdict.
+    active = ('max by (venue) (label_replace(liq_usdc_corridor_active == 1, '
+              '"venue", "$1", "chain", "(.*)")) '
+              'or (max by (venue) (label_replace(liq_usdc_corridor_target * 0 '
+              '+ 1, "venue", "$1", "chain", "(.*)")) and on () '
+              'count(liq_settings_usdc_target) unless on () '
+              'count(liq_usdc_corridor_active)) '
+              'or (max by (venue) (label_replace(liq_settings_usdc_target * 0 '
+              '+ 1, "venue", "base", "", "")) unless on () '
+              'count(liq_usdc_corridor_target))')
+    judged_ratio = (f"(({banded_pct(ratio, inside)}) and on (venue) ({active})) "
+                    f"or ({unjudged_pct(ratio)} and on (venue) ({target}) "
+                    f"unless on (venue) ({active}))")
     chains = or_chain([
         (per_chain("liq_usdc_chain_available", "liq_usdc_onchain_available"),
          "vault"),
@@ -1139,8 +1164,9 @@ def native_inventory(w, x, y, heights):
          '"venue", "base", "", "")) or max by (venue) (label_replace('
          'liq_usdc_inflight_ethereum_wallet, "venue", "ethereum", "", ""))',
          "wallet"),
-        # pct_bar's sign encoding, with each chain's own band.
-        (banded_pct(ratio, inside), "ratio"),
+        # pct_bar's sign encoding, with each chain's own band, while the
+        # corridor runs.
+        (judged_ratio, "ratio"),
         (target, "target"),
         (deviation, "deviation"),
     ], row_label="venue")
@@ -1191,11 +1217,16 @@ def native_inventory(w, x, y, heights):
             "USD · Onchain",
             "Each chain's vault and the ratio the bot rebalances on, vault "
             "/ (vault + Alpaca cash), against the chain's band. It is not a "
-            "share of all USD: other chains are not in it. Ethereum is the "
-            "hub wallet Alpaca deposits to and withdraws from, with no band.", chains, "venue",
+            "share of all USD: other chains are not in it. On the bot source "
+            "the ratio is grey while USDC rebalancing is off on that corridor; "
+            "the exporter source judges its one band as Base's, and shows no "
+            "ratio, target or band while USDC rebalancing is off on every "
+            "corridor. "
+            "Ethereum is the hub wallet Alpaca deposits to and withdraws "
+            "from, with no band.", chains, "venue",
             [("vault", "Vault", None), ("inflight", "In flight", None),
              ("wallet", "Wallet", None),
-             ("ratio", "Ratio", bar_cell()),
+             ("ratio", "Ratio", bar_cell(unjudged=True)),
              ("target", "Target", pct), ("deviation", "±", pct)],
             w, chains_h, x, y + alpaca_h, first_col="Chain",
             first_col_mappings=[{"type": "value", "options": {

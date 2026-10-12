@@ -64,6 +64,7 @@ pub(crate) enum LiqMetric {
     AssetRebalancing,
     UsdcCorridorTarget,
     UsdcCorridorDeviation,
+    UsdcCorridorActive,
     EquityOnchainAvailable,
     EquityOffchainAvailable,
     EquityInflightTotal,
@@ -147,7 +148,7 @@ impl LiqMetric {
     /// Every variant, for the catalog tests. A new variant needs an entry
     /// here and its name in the catalog test.
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 94] = [
+    pub(crate) const ALL: [Self; 95] = [
         Self::BotInfo,
         Self::BotStartTimestampSeconds,
         Self::SettingsInfo,
@@ -165,6 +166,7 @@ impl LiqMetric {
         Self::AssetRebalancing,
         Self::UsdcCorridorTarget,
         Self::UsdcCorridorDeviation,
+        Self::UsdcCorridorActive,
         Self::EquityOnchainAvailable,
         Self::EquityOffchainAvailable,
         Self::EquityInflightTotal,
@@ -263,6 +265,7 @@ impl LiqMetric {
             Self::AssetRebalancing => "liq_asset_rebalancing",
             Self::UsdcCorridorTarget => "liq_usdc_corridor_target",
             Self::UsdcCorridorDeviation => "liq_usdc_corridor_deviation",
+            Self::UsdcCorridorActive => "liq_usdc_corridor_active",
             Self::EquityOnchainAvailable => "liq_equity_onchain_available",
             Self::EquityOffchainAvailable => "liq_equity_offchain_available",
             Self::EquityInflightTotal => "liq_equity_inflight_total",
@@ -380,6 +383,7 @@ impl LiqMetric {
             Self::UsdcCorridorDeviation => {
                 "Rebalancing band half-width of each configured USDC corridor"
             }
+            Self::UsdcCorridorActive => "1 while config lets the USDC trigger act on it, else 0",
             Self::EquityOnchainAvailable => "Primary chain vault shares available",
             Self::EquityOffchainAvailable => "Broker shares available",
             Self::EquityInflightTotal => "Primary chain vault plus broker shares in flight",
@@ -576,6 +580,7 @@ impl LiqMetric {
             Self::EquityChainAvailable | Self::EquityChainInflight => &["chain", "symbol"],
             Self::UsdcCorridorTarget
             | Self::UsdcCorridorDeviation
+            | Self::UsdcCorridorActive
             | Self::UsdcChainAvailable
             | Self::UsdcChainInflight
             | Self::UsdcChainRatio
@@ -668,7 +673,8 @@ impl LiqMetric {
             | Self::AssetExtendedHours
             | Self::AssetRebalancing
             | Self::UsdcCorridorTarget
-            | Self::UsdcCorridorDeviation => Some(LiqFamily::Settings),
+            | Self::UsdcCorridorDeviation
+            | Self::UsdcCorridorActive => Some(LiqFamily::Settings),
             Self::EquityOnchainAvailable
             | Self::EquityOffchainAvailable
             | Self::EquityInflightTotal
@@ -1387,6 +1393,7 @@ pub(crate) mod tests {
                 "liq_asset_rebalancing",
                 "liq_usdc_corridor_target",
                 "liq_usdc_corridor_deviation",
+                "liq_usdc_corridor_active",
                 "liq_equity_onchain_available",
                 "liq_equity_offchain_available",
                 "liq_equity_inflight_total",
