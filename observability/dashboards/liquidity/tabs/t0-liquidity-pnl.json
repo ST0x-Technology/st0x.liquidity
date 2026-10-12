@@ -193,7 +193,7 @@
   ],
   "panels": [
     {
-      "id": 12,
+      "id": 13,
       "type": "marcusolsson-dynamictext-panel",
       "title": "",
       "description": "The SPA header: settings pills, Config, the CLI recovery guide, the deployed commit, uptime, and whether the bot is up: the exporter's liq_up, or the bot scrape's up on the bot source.",
@@ -257,7 +257,7 @@
       "hideTimeOverride": true
     },
     {
-      "id": 13,
+      "id": 14,
       "type": "stat",
       "title": "",
       "description": "Gross minus costs plus revenues. (SPA PnL tile, computed by the bot's replay \u2014 5-min refresh cadence.)",
@@ -351,7 +351,7 @@
       }
     },
     {
-      "id": 14,
+      "id": 15,
       "type": "stat",
       "title": "",
       "description": "Closed-lot fill replay before costs. (SPA PnL tile, computed by the bot's replay \u2014 5-min refresh cadence.)",
@@ -445,7 +445,7 @@
       }
     },
     {
-      "id": 15,
+      "id": 16,
       "type": "stat",
       "title": "",
       "description": "Cost/revenue ledger entries. (SPA PnL tile, computed by the bot's replay \u2014 5-min refresh cadence.)",
@@ -531,7 +531,7 @@
       }
     },
     {
-      "id": 16,
+      "id": 17,
       "type": "stat",
       "title": "",
       "description": "Dividends and broker ledger credits. (SPA PnL tile, computed by the bot's replay \u2014 5-min refresh cadence.)",
@@ -625,7 +625,7 @@
       }
     },
     {
-      "id": 17,
+      "id": 18,
       "type": "stat",
       "title": "",
       "description": "Broker hedge stream. (SPA PnL tile, computed by the bot's replay \u2014 5-min refresh cadence.)",
@@ -719,7 +719,7 @@
       }
     },
     {
-      "id": 18,
+      "id": 19,
       "type": "stat",
       "title": "",
       "description": "Users passively crossed open inventory. (SPA PnL tile, computed by the bot's replay \u2014 5-min refresh cadence.)",
@@ -813,7 +813,7 @@
       }
     },
     {
-      "id": 19,
+      "id": 20,
       "type": "stat",
       "title": "",
       "description": "Closed delayed or offchain-origin exposure. (SPA PnL tile, computed by the bot's replay \u2014 5-min refresh cadence.)",
@@ -907,7 +907,7 @@
       }
     },
     {
-      "id": 20,
+      "id": 21,
       "type": "stat",
       "title": "",
       "description": "Requires historical snapshots. (SPA PnL tile, computed by the bot's replay \u2014 5-min refresh cadence.)",
@@ -1001,7 +1001,7 @@
       }
     },
     {
-      "id": 21,
+      "id": 22,
       "type": "stat",
       "title": "",
       "description": "All directional streams together. (SPA PnL tile, computed by the bot's replay \u2014 5-min refresh cadence.)",
@@ -1095,7 +1095,7 @@
       }
     },
     {
-      "id": 22,
+      "id": 23,
       "type": "stat",
       "title": "",
       "description": "Every stream summed. (SPA PnL tile, computed by the bot's replay \u2014 5-min refresh cadence.)",
@@ -1189,7 +1189,7 @@
       }
     },
     {
-      "id": 23,
+      "id": 24,
       "type": "stat",
       "title": "",
       "description": "Open replay inventory in shares (the SPA's muted tile).",
@@ -1271,7 +1271,7 @@
       }
     },
     {
-      "id": 24,
+      "id": 25,
       "type": "stat",
       "title": "",
       "description": "Total fills in the PnL database sample.",
@@ -1353,7 +1353,7 @@
       }
     },
     {
-      "id": 25,
+      "id": 26,
       "type": "stat",
       "title": "",
       "description": "Average deployed capital from daily snapshots \u2014 computed by the bot, never rendered by the SPA.",
@@ -1435,7 +1435,7 @@
       }
     },
     {
-      "id": 26,
+      "id": 27,
       "type": "stat",
       "title": "",
       "description": "Annualized return on that capital \u2014 computed by the bot, never rendered by the SPA.",
@@ -1525,7 +1525,7 @@
       }
     },
     {
-      "id": 27,
+      "id": 28,
       "type": "stat",
       "title": "",
       "description": "Days of snapshot coverage behind the capital figures.",
@@ -1607,7 +1607,7 @@
       }
     },
     {
-      "id": 28,
+      "id": 29,
       "type": "table",
       "title": "Per Asset PnL",
       "description": "The SPA's Per Asset PnL table (closed-lot replay per symbol; Lots = matched lot count; Volume = both legs of the matched shares, without the SPA's USD sub-line).",
@@ -2137,7 +2137,7 @@
       }
     },
     {
-      "id": 29,
+      "id": 30,
       "type": "barchart",
       "title": "PnL by Asset per Time Unit",
       "description": "One bar per calendar day, split by asset and stacked, straight from the bot's daily PnL buckets. A day with no closed lot for an asset is a zero, as in the SPA.",
@@ -2284,7 +2284,7 @@
       }
     },
     {
-      "id": 30,
+      "id": 31,
       "type": "barchart",
       "title": "PnL by PnL-Stream per Time Unit",
       "description": "The same days split by PnL stream, the SPA's four component streams only, since directional_exposure and total are tile-only aggregates there and stacking them beside their own components double-counts.",
@@ -2492,7 +2492,7 @@
       }
     },
     {
-      "id": 31,
+      "id": 32,
       "type": "barchart",
       "title": "Cumulative PnL by Asset",
       "description": "Running total per asset through the selected range. Unstacked: the SPA draws one independent line per asset here, not a stack. The last day's bars sum to the Total PnL tile above.",
@@ -2639,7 +2639,7 @@
       }
     },
     {
-      "id": 32,
+      "id": 33,
       "type": "barchart",
       "title": "Cumulative PnL by PnL-Stream",
       "description": "Running total per stream, unstacked like the SPA's lines. Grafana has no categorical-axis line chart, so these are bars over the same day buckets: the numbers are the SPA's, the shape is not.",
