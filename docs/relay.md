@@ -274,10 +274,10 @@ kept), decodes each log, and returns our deposits for any of a set of order ids,
 with the last block it scanned. A deposit is ours only when our wallet sent its
 tx to the depository, which pulls the stable from the sender: the event's `from`
 is the caller-supplied depositor, which anyone can set to our wallet.
-`confirm_deposit` checks the same. A kept log whose block is not the canonical
-one at its height (a lagging node serving a reorged-out block) fails the scan
-with the retryable `NotCanonical`, so the caller's cursor does not move past it.
-The scan stops at the newest block with the origin chain's confirmations,
+`confirm_deposit` checks the same. A log any read returns whose block is not the
+canonical one at its height (a lagging node serving a reorged-out block) fails
+the scan with `NotCanonical` (retry), so the caller's cursor does not move past
+it. The scan stops at the newest block with the origin chain's confirmations,
 counting the inclusion block (`RelayCtx` takes each end's count, at least 1): a
 lagging load-balanced node may not have indexed the newest blocks, and a deposit
 there is not confirmed yet. Orders stay fillable for about a week

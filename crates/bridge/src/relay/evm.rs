@@ -123,7 +123,7 @@ pub enum RelayBridgeError {
         confirmations: u64,
         required: u64,
     },
-    #[error("receipt of tx {tx} is not from the canonical block at height {block}")]
+    #[error("tx {tx} is not from the canonical block at height {block}")]
     NotCanonical { tx: TxHash, block: u64 },
     #[error("deposit {tx} reverted")]
     DepositReverted { tx: TxHash },
@@ -864,8 +864,9 @@ impl<W: Wallet> RelayEnd<W> {
 
     /// Our deposits for `order_ids` in blocks `start..=end`. A load-balanced
     /// node may lag and answer a range empty, so the chunk is read
-    /// `SCAN_ATTEMPTS` times and a deposit any read returns is kept. A kept
-    /// log from a reorged-out block fails the chunk, to be scanned again.
+    /// `SCAN_ATTEMPTS` times and a deposit any read returns is kept. A log
+    /// from a reorged-out block in any read fails the chunk, to be scanned
+    /// again.
     async fn read_chunk(
         &self,
         order_ids: &[RelayOrderId],
