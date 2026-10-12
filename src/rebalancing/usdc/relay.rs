@@ -801,7 +801,7 @@ where
         let preflight = self
             .accepted_quote(id, usdc_to_u256(amount)?, HopDirection::FromHub)
             .await?;
-        info!(target: "rebalance", %id, %amount, request_id = %preflight.request_id, "Relay pre-flight quote from the hub accepted");
+        info!(target: "rebalance", %id, %amount, request_id = %preflight.request_id(), "Relay pre-flight quote from the hub accepted");
 
         let converted = self.execute_usd_to_usdc_conversion(id, amount).await?;
         let transfer = self.initiate_alpaca_withdrawal(id, converted).await?;
@@ -6627,7 +6627,10 @@ mod tests {
         let PreparedSwap::Deposit(pair) = transfer
             .hop
             .bridge
-            .prepare_deposit(HopDirection::FromHub, &relay_quote(&quote, true).unwrap())
+            .prepare_deposit(
+                HopDirection::FromHub,
+                &relay_quote(&id, &quote, true, &transfer.hop.bounds).unwrap(),
+            )
             .await
             .unwrap()
         else {
