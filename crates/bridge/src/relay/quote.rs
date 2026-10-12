@@ -3,7 +3,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::primitives::{Address, B256, Bytes, U256, address};
 use alloy::sol;
 use alloy::sol_types::{SolCall, SolStruct};
 use serde::de::IgnoredAny;
@@ -12,6 +12,14 @@ use serde::{Deserialize, Serialize};
 use st0x_evm::Chain;
 
 use super::acceptance::{BasisPoints, QuoteAmounts};
+
+/// The solver every live quote names, on both directions. The order lets it
+/// settle through a refund with a minimum of 0, so a quote naming any other
+/// solver is refused; a solver rotation at Relay needs a release.
+const RELAY_SOLVER: Address = address!("0xf70da97812cb96acdf810712aa562db8dfa3dbef");
+
+/// Relay's name for the chain [`RELAY_SOLVER`] is paid on.
+const RELAY_SOLVER_CHAIN: &str = "base";
 
 sol! {
     function approve(address spender, uint256 amount) external returns (bool);
@@ -572,6 +580,7 @@ impl QuoteResponse {
         )?;
 
         check_fees(&self.fees, origin)?;
+        check_solver(&self.protocol.v2.order_data)?;
         check_order_input(&self.protocol.v2.order_data, request)?;
         check_output_payment(&self.details, &self.protocol.v2.order_data, request)?;
         check_refunds(&self.protocol.v2.order_data, request)?;
@@ -733,6 +742,20 @@ fn check_fees(fees: &RawFees, origin: Chain) -> Result<(), QuoteMismatch> {
         return Err(QuoteMismatch::GasFeeChain {
             expected: origin.chain_id(),
             actual: fees.gas.currency.chain_id,
+        });
+    }
+
+    Ok(())
+}
+
+fn check_solver(order: &RawOrderData) -> Result<(), QuoteMismatch> {
+    check_address(QuoteField::Solver, RELAY_SOLVER, order.solver)?;
+
+    if order.solver_chain_id != RELAY_SOLVER_CHAIN {
+        return Err(QuoteMismatch::ChainMismatch {
+            field: QuoteField::SolverChain,
+            expected: RELAY_SOLVER_CHAIN,
+            actual: order.solver_chain_id.clone(),
         });
     }
 
@@ -1215,7 +1238,7 @@ pub(super) mod tests {
 
     #[test]
     fn order_data_the_order_id_does_not_commit_to_is_refused() {
-        let error = refusal(|body| body["protocol"]["v2"]["orderData"]["solver"] = json!(OTHER));
+        let error = refusal(|body| body["protocol"]["v2"]["orderData"]["salt"] = json!("0x1"));
 
         assert!(
             matches!(

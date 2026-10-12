@@ -129,6 +129,10 @@ before it sends anything, then refuses a quote unless:
   amount;
 - the relayer fee is in the origin stable and the gas fee is on the origin
   chain;
+- `protocol.v2.orderData.solver` is `0xf70d...dbef` with `solverChainId`
+  `"base"`, the solver of every live quote: each refund option has a
+  `minimumAmount` of 0, so another solver could settle the order through an
+  empty refund. A solver rotation at Relay needs a release;
 - `protocol.v2.orderData.inputs[]` has exactly one input, whose `payment` is the
   requested amount of the origin stable on the origin chain, and
   `orderData.fees` is empty;
