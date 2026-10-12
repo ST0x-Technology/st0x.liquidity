@@ -27,9 +27,9 @@ equities (wtDNUT, wtFGI) are ingested, validated against USDG and hedged, with
 Bebop's Robinhood hook mapped as the inventory adapter. The build values its gas
 (it pays gas in ETH), so `active` is reachable. Production runs it `active` and
 rebalances against Alpaca the listings the pinned token file enables there
-(DNUT); staging runs it as a prefunded hedge-only secondary with
-`rebalancing = "disabled"` on every asset. It cannot rebalance cash, because it
-has no CCTP domain.
+(DNUT, PLBY, GRND, and WMT); staging runs it as a prefunded hedge-only secondary
+with `rebalancing = "disabled"` on every asset. It cannot rebalance cash,
+because it has no CCTP domain.
 
 ## Features
 
