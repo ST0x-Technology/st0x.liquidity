@@ -96,6 +96,8 @@ PORTED = {
     "liq_hedge_latency_ms_samples",
     "liq_open_exposure_fill_count",
     "liq_open_exposure_oldest_ts_seconds",
+    "liq_reliability_log_count_24h",
+    "liq_log_target_count_24h",
     "liq_failure_event_count_24h",
     "liq_job_queue",
     "liq_block_lag_blocks",
@@ -196,10 +198,26 @@ KNOWN_DIFFS = {
     "liq_dependency_calls_24h": "ignore",
     "liq_dependency_errors_24h": "ignore",
     "liq_dependency_latency_ms": "ignore",
-    # The endpoint the exporter reads truncates at 50,000 entries and counts
-    # an exact window; the bot counts every entry in one-minute buckets.
+    # The exporter reads /performance/reliability, which scans the log files
+    # for an exact [now - 24h, now] interval and stops at 50,000 entries
+    # (MAX_RELIABILITY_LOG_ENTRIES in src/api.rs, logEntriesTruncated in the
+    # response). The bot counts the same events as they are written, in
+    # one-minute buckets and without a cap (src/metrics/liquidity/
+    # log_counts.rs; the_boundary_minute_counts_or_leaves_as_a_whole pins
+    # the bucket rule). It also counts only its own process live: lines an
+    # operator's st0x-cli run appends to the same files are read by the
+    # endpoint but reach the bot only through the seed at its next restart.
+    # The bot also counts an event the lossy non-blocking file writer then
+    # drops when its queue is full or the disk write fails; the endpoint
+    # never sees that line. So the counts differ by the events of the first
+    # minute of the window, by every entry past the cap while the endpoint
+    # is truncated, by CLI lines, and by lines the file writer dropped. The two level rows exist on both sides, so their keys are
+    # still compared; the bot leaves them out only until its background seed
+    # finishes, about one refresh after a start, so a comparison right after
+    # a restart reports them missing. A target whose only events are of those kinds has
+    # a row on one side only, so the per-target name is not compared.
     "liq_reliability_log_count_24h": "values",
-    "liq_log_target_count_24h": "values",
+    "liq_log_target_count_24h": "ignore",
 }
 
 # (bot type, exporter type) that --known-diffs accepts for every name. The

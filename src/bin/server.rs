@@ -3,8 +3,8 @@ use std::sync::LazyLock;
 
 use st0x_config::{Ctx, Env, TokenSource, claim_boot_tokens};
 use st0x_hedge::{
-    PROCESS_START, apalis_board_tracing_layer, install_tls_crypto_provider, report_registry_boot,
-    run_server_bot_session, setup_tracing,
+    PROCESS_START, activate_log_counts, apalis_board_tracing_layer, install_tls_crypto_provider,
+    report_registry_boot, run_server_bot_session, setup_tracing,
 };
 
 #[tokio::main]
@@ -27,6 +27,9 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     let log_level: tracing::Level = (&ctx.log_level).into();
+    // Activated before the subscriber exists, so every file event of this
+    // process is counted live and the seed takes only earlier entries.
+    let log_sink = ctx.file_logging.as_ref().map(|_| activate_log_counts());
 
     let (file_log_guard, telemetry_guard) = if let Some(ref telemetry) = ctx.telemetry {
         match telemetry.setup(
@@ -34,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
             ctx.log_format,
             ctx.file_logging.as_ref(),
             Some(apalis_board_tracing_layer(log_level)),
+            log_sink.clone(),
         ) {
             Ok((file_guard, tele_guard)) => (file_guard, Some(tele_guard)),
             Err(error) => {
@@ -43,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
                     ctx.log_format,
                     ctx.file_logging.as_ref(),
                     Some(apalis_board_tracing_layer(log_level)),
+                    log_sink,
                 );
                 (file_guard, None)
             }
@@ -53,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
             ctx.log_format,
             ctx.file_logging.as_ref(),
             Some(apalis_board_tracing_layer(log_level)),
+            log_sink,
         );
         (file_guard, None)
     };

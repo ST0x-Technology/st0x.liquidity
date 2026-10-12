@@ -259,6 +259,11 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
         "Time of the poll that last set order_fill_block_lag_blocks, by chain; it stops \
          advancing while the lag is unknown"
     );
+    metrics::describe_counter!(
+        "log_events_total",
+        "Error and warning events the file log wrote, by level and target; counted only with \
+         file logging, from the recorder's install onwards"
+    );
     metrics::describe_histogram!(
         "metrics_refresh_duration_seconds",
         metrics::Unit::Seconds,

@@ -90,6 +90,7 @@ mod vault_registry;
 mod view_rebuild;
 mod wrapped_equity_recovery;
 
+pub use metrics::liquidity::log_counts::activate_log_counts;
 pub use registry_boot::report_boot as report_registry_boot;
 pub use st0x_config::{
     ExtraLayer, FileLogGuard, TelemetryError, TelemetryGuard, mk_env_filter, setup_tracing,
@@ -410,11 +411,11 @@ async fn run_bot_session_inner(
             pool: pools.cqrs.clone(),
             families: &metrics::liquidity::LIQ_FAMILIES,
         },
-        metrics::liquidity::refresh::LiqPerformanceRefresh {
-            pool: pools.cqrs.clone(),
-            chains: ctx.chains.clone(),
-            families: &metrics::liquidity::LIQ_FAMILIES,
-        },
+        metrics::liquidity::refresh::LiqPerformanceRefresh::new(
+            &ctx,
+            pools.cqrs.clone(),
+            &metrics::liquidity::LIQ_FAMILIES,
+        ),
     );
     let mut bot_task = tokio::spawn(Box::pin(run_conductor_session(
         ctx.clone(),

@@ -10,9 +10,10 @@ use task_supervisor::{SupervisedTask, TaskResult};
 use tokio::time::{Instant, MissedTickBehavior, timeout};
 use tracing::{info, warn};
 
-use st0x_config::ChainRegistry;
+use st0x_config::{ChainRegistry, Ctx};
 use st0x_dto::InfraReport;
 
+use super::log_counts::{LogCounts, LogWindow, active_log_counts};
 use super::performance::{infra_samples, latency_samples, rebalance_samples, reliability_samples};
 use super::prices::{load_positions, price_samples};
 use super::{LiqFamilies, LiqFamily, LiqSample};
@@ -108,6 +109,51 @@ pub(crate) struct LiqPerformanceRefresh {
     pub(crate) pool: SqlitePool,
     pub(crate) chains: ChainRegistry,
     pub(crate) families: &'static LiqFamilies,
+    /// `None` without file logging: the log levels then read 0, as the
+    /// endpoint reports.
+    pub(crate) log_counts: Option<LogCountSource>,
+}
+
+/// The process's log counter and the directory its one-time seed reads.
+#[derive(Clone)]
+pub(crate) struct LogCountSource {
+    pub(crate) counts: Arc<LogCounts>,
+    pub(crate) log_dir: String,
+}
+
+impl LiqPerformanceRefresh {
+    /// Counts logs only when this process activated the counter and has a
+    /// log directory to seed from.
+    pub(crate) fn new(ctx: &Ctx, pool: SqlitePool, families: &'static LiqFamilies) -> Self {
+        let log_counts =
+            active_log_counts()
+                .zip(ctx.file_logging.as_ref())
+                .map(|(counts, file_logging)| LogCountSource {
+                    counts,
+                    log_dir: file_logging.directory().to_string(),
+                });
+
+        Self {
+            pool,
+            chains: ctx.chains.clone(),
+            families,
+            log_counts,
+        }
+    }
+
+    /// The log counts for the reliability family. `None` until the
+    /// one-time seed from the files is done: counts without the previous
+    /// process's events would read low, so the log names stay absent.
+    fn log_window(&self) -> Option<LogWindow> {
+        let Some(source) = &self.log_counts else {
+            return Some(LogWindow::default());
+        };
+
+        source
+            .counts
+            .seeded_or_start(&source.log_dir)
+            .then(|| source.counts.window(Utc::now()))
+    }
 }
 
 impl LiqPerformanceRefresh {
@@ -124,12 +170,17 @@ impl LiqPerformanceRefresh {
         })
         .await;
 
+        let logs = self.log_window();
         self.collect(LiqFamily::Reliability, async {
             let (failure_events, job_queues) = tokio::try_join!(
                 load_failure_events(&self.pool, &day),
                 load_job_queue_health(&self.pool),
             )?;
-            Ok(reliability_samples(&failure_events, &job_queues))
+            Ok(reliability_samples(
+                logs.as_ref(),
+                &failure_events,
+                &job_queues,
+            ))
         })
         .await;
 
@@ -249,6 +300,7 @@ mod tests {
             pool,
             chains: create_test_ctx_with_order_owner(Address::ZERO).chains,
             families,
+            log_counts: None,
         }
     }
 
@@ -294,6 +346,63 @@ mod tests {
             Some(&0.0)
         );
         assert_eq!(rendered.get(&series("liq_block_lag_blocks", &base)), None);
+    }
+
+    /// The log names wait for the background seed, so a restart does not
+    /// reset the 24-hour log counts; the rest of the family does not wait.
+    #[tokio::test]
+    async fn the_reliability_family_counts_the_seeded_log_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let earlier = (now - chrono::Duration::minutes(5)).to_rfc3339();
+        std::fs::write(
+            dir.path().join("st0x-hedge.log"),
+            format!("{{\"timestamp\":\"{earlier}\",\"level\":\"ERROR\",\"target\":\"hedge\"}}\n"),
+        )
+        .unwrap();
+        let families = leaked_families();
+        let mut task = performance(families, setup_test_db().await);
+        task.log_counts = Some(LogCountSource {
+            counts: Arc::new(LogCounts::new(now)),
+            log_dir: dir.path().to_str().unwrap().to_string(),
+        });
+
+        task.refresh_once(0).await;
+        assert_eq!(
+            rendered_store(families).get(&series(
+                "liq_reliability_log_count_24h",
+                &[("level", "error")]
+            )),
+            None,
+            "absent until the seed is done"
+        );
+        assert!(collector(families, "reliability").is_some());
+
+        let counts = task.log_counts.as_ref().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !counts.counts.seeded_or_start(&counts.log_dir) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        task.refresh_once(1).await;
+
+        let rendered = rendered_store(families);
+        assert_eq!(
+            rendered.get(&series(
+                "liq_reliability_log_count_24h",
+                &[("level", "error")]
+            )),
+            Some(&1.0)
+        );
+        assert_eq!(
+            rendered.get(&series(
+                "liq_log_target_count_24h",
+                &[("level", "ERROR"), ("target", "hedge")]
+            )),
+            Some(&1.0)
+        );
     }
 
     #[tokio::test]

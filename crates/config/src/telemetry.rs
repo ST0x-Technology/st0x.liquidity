@@ -23,10 +23,11 @@ use opentelemetry_sdk::logs::{
 };
 use opentelemetry_sdk::trace::{BatchConfigBuilder, BatchSpanProcessor, SdkTracerProvider};
 use serde::Deserialize;
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tracing_appender::rolling::{InitError, RollingFileAppender, Rotation};
-use tracing_subscriber::layer::{Layer, SubscriberExt};
+use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 use tracing_subscriber::{EnvFilter, Registry};
 use url::Url;
 
@@ -178,6 +179,7 @@ impl TelemetryCtx {
         log_format: LogFormat,
         file_logging: Option<&FileLogging>,
         extra_layer: Option<ExtraLayer>,
+        log_sink: Option<Arc<dyn LogEventSink>>,
     ) -> Result<(Option<FileLogGuard>, TelemetryGuard), TelemetryError> {
         let http_client =
             std::thread::spawn(|| reqwest::blocking::Client::builder().gzip(true).build())
@@ -266,13 +268,15 @@ impl TelemetryCtx {
         let file_guard = if let Some((file_appender, file_level)) = file_appender {
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
             let file_layer = file_fmt_layer(non_blocking, file_level);
+            let count_layer = log_sink.map(|sink| log_count_layer(sink, file_level));
 
             let subscriber = Registry::default()
                 .with(extra_layer)
                 .with(fmt_layer)
                 .with(telemetry_layer)
                 .with(otel_log_layer)
-                .with(file_layer);
+                .with(file_layer)
+                .with(count_layer);
 
             tracing::subscriber::set_global_default(subscriber)?;
 
@@ -370,11 +374,16 @@ pub struct FileLogGuard {
 pub type ExtraLayer =
     Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync + 'static>;
 
+/// Installs the global subscriber.
+///
+/// `log_sink` receives every event the file log writes and is attached only when a file layer is built, so it counts
+/// exactly what `/logs` and `/performance/reliability` can read back.
 pub fn setup_tracing(
     log_level: &LogLevel,
     log_format: LogFormat,
     file_logging: Option<&FileLogging>,
     extra_layer: Option<ExtraLayer>,
+    log_sink: Option<Arc<dyn LogEventSink>>,
 ) -> Option<FileLogGuard> {
     let level: tracing::Level = log_level.into();
     let env_filter = mk_env_filter(level);
@@ -398,14 +407,17 @@ pub fn setup_tracing(
 
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
-    let file_layer = file_fmt_layer(non_blocking, file_logging.level().into());
+    let file_level = file_logging.level().into();
+    let file_layer = file_fmt_layer(non_blocking, file_level);
+    let count_layer = log_sink.map(|sink| log_count_layer(sink, file_level));
 
     let fmt_layer = console_fmt_layer(log_format, env_filter, ConsoleTextStyle::Compact);
 
     let subscriber = Registry::default()
         .with(extra_layer)
         .with(fmt_layer)
-        .with(file_layer);
+        .with(file_layer)
+        .with(count_layer);
 
     if tracing::subscriber::set_global_default(subscriber).is_err() {
         eprintln!("Failed to set global subscriber (already set)");
@@ -427,6 +439,40 @@ where
         .json()
         .with_writer(writer)
         .with_filter(mk_crate_filter(level))
+        .boxed()
+}
+
+/// Receives the level and target of every event the file log writes. The
+/// caller owns what it does with them; it must not log, because it runs
+/// inside the subscriber.
+pub trait LogEventSink: Send + Sync {
+    fn record(&self, level: tracing::Level, target: &str);
+}
+
+/// Forwards each event it sees to a [`LogEventSink`].
+struct LogCountLayer {
+    sink: Arc<dyn LogEventSink>,
+}
+
+impl<S: tracing::Subscriber> Layer<S> for LogCountLayer {
+    fn on_event(&self, event: &tracing::Event<'_>, _context: Context<'_, S>) {
+        let metadata = event.metadata();
+        self.sink.record(*metadata.level(), metadata.target());
+    }
+}
+
+/// The counting layer behind the file layer's own filter, so the sink sees
+/// the events the file log writes and no others: in particular no dependency
+/// TRACE callsite is enabled for it.
+fn log_count_layer<S>(
+    sink: Arc<dyn LogEventSink>,
+    file_level: tracing::Level,
+) -> Box<dyn Layer<S> + Send + Sync>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    LogCountLayer { sink }
+        .with_filter(mk_crate_filter(file_level))
         .boxed()
 }
 
@@ -661,12 +707,41 @@ mod tests {
         let file_logging =
             FileLogging::new(uncreatable_dir.to_str().unwrap().to_owned(), LogLevel::Info);
 
-        let file_guard = setup_tracing(&LogLevel::Info, LogFormat::Text, Some(&file_logging), None);
+        let file_guard = setup_tracing(
+            &LogLevel::Info,
+            LogFormat::Text,
+            Some(&file_logging),
+            None,
+            None,
+        );
 
         assert!(
             file_guard.is_none(),
             "an invalid log dir must degrade to console-only logging, not return a file guard"
         );
+    }
+
+    /// A log directory that cannot be created leaves the process console
+    /// only, so nothing is counted: the endpoint has no files to read either.
+    #[test]
+    fn setup_tracing_attaches_no_counter_without_a_file_layer() {
+        let file = NamedTempFile::new().unwrap();
+        let uncreatable_dir = file.path().join("nested");
+        let file_logging =
+            FileLogging::new(uncreatable_dir.to_str().unwrap().to_owned(), LogLevel::Info);
+        let sink = Arc::new(RecordingSink::default());
+
+        let file_guard = setup_tracing(
+            &LogLevel::Info,
+            LogFormat::Text,
+            Some(&file_logging),
+            None,
+            Some(sink.clone()),
+        );
+        tracing::error!(target: "hedge", "not written to a file");
+
+        assert!(file_guard.is_none());
+        assert_eq!(*sink.0.lock(), []);
     }
 
     #[test]
@@ -729,6 +804,46 @@ mod tests {
         assert_eq!(&*environment.as_str(), "staging");
     }
 
+    #[derive(Default)]
+    struct RecordingSink(parking_lot::Mutex<Vec<(tracing::Level, String)>>);
+
+    impl LogEventSink for RecordingSink {
+        fn record(&self, level: tracing::Level, target: &str) {
+            self.0.lock().push((level, target.to_string()));
+        }
+    }
+
+    /// The sink sees what the file layer writes at its level and nothing a
+    /// dependency logs below WARN.
+    #[test]
+    fn the_log_count_layer_sees_only_what_the_file_layer_writes() {
+        let sink = Arc::new(RecordingSink::default());
+        let file = SharedWriter::default();
+        let subscriber = Registry::default()
+            .with(file_fmt_layer(file.clone(), tracing::Level::INFO))
+            .with(log_count_layer(sink.clone(), tracing::Level::INFO));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::trace!(target: "hyper", "dependency detail");
+            tracing::info!(target: "hyper", "dependency info");
+            tracing::warn!(target: "hyper", "dependency warning");
+            tracing::debug!(target: "hedge", "below the file level");
+            tracing::info!(target: "hedge", "hedge info");
+            tracing::error!(target: "hedge", "hedge error");
+        });
+
+        assert_eq!(
+            *sink.0.lock(),
+            [
+                (tracing::Level::WARN, "hyper".to_string()),
+                (tracing::Level::INFO, "hedge".to_string()),
+                (tracing::Level::ERROR, "hedge".to_string()),
+            ]
+        );
+        let file = String::from_utf8(file.0.lock().clone()).unwrap();
+        assert_eq!(file.lines().count(), 3, "{file}");
+    }
+
     #[test]
     fn stdout_trace_and_file_info_filters_are_independent() {
         let stdout = SharedWriter::default();
@@ -777,6 +892,7 @@ mod tests {
                 tracing::Level::INFO,
                 LogFormat::Text,
                 Some(&file_logging),
+                None,
                 None,
             )
             .unwrap();

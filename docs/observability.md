@@ -150,6 +150,7 @@ sample time, so only `outcome="paused"` shows that stall.
 | `order_fill_block_lag_blocks`                    | gauge     | `chain`                              | each poll that knows the cutoff block and the checkpoint |
 | `order_fill_block_lag_sampled_timestamp_seconds` | gauge     | `chain`                              | same, set to the poll's sample time                      |
 | `metrics_refresh_duration_seconds`               | histogram | `collector`                          | each performance collector run, failed or not            |
+| `log_events_total`                               | counter   | `level`, `target`                    | each error and warning the file log writes               |
 
 ### Catalog
 
@@ -202,6 +203,8 @@ sample time, so only `outcome="paused"` shows that stall.
 | `liq_hedge_latency_ms_samples`          | `stage`                                                                                                                    | `latencies`   | samples behind each stage                                                                          |
 | `liq_open_exposure_fill_count`          | `symbol`                                                                                                                   | `latencies`   | fills after the symbol's latest hedge placement                                                    |
 | `liq_open_exposure_oldest_ts_seconds`   | `symbol`                                                                                                                   | `latencies`   | block time of the oldest unhedged fill                                                             |
+| `liq_reliability_log_count_24h`         | `level`                                                                                                                    | `reliability` | errors and warnings in 24 h; both rows once seeded after a start, 0 without file logging           |
+| `liq_log_target_count_24h`              | `level`, `target`                                                                                                          | `reliability` | per target with events in 24 h; one-minute buckets, no entry cap                                   |
 | `liq_failure_event_count_24h`           | `event_type`                                                                                                               | `reliability` | lifecycle failure events in 24 h                                                                   |
 | `liq_job_queue`                         | `job_type`, `state`                                                                                                        | `reliability` | queue counts now, not windowed                                                                     |
 | `liq_block_lag_blocks`                  | `chain`                                                                                                                    | `infra`       | latest sampled lag of each hedged chain; absent until known                                        |

@@ -15,6 +15,7 @@ async fn main() -> anyhow::Result<()> {
         ctx.log_format,
         ctx.file_logging.as_ref(),
         None,
+        None,
     );
 
     // Surface the notices parsing collected, now that a subscriber exists.

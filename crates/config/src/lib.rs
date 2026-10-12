@@ -56,8 +56,8 @@ pub use rebalancing::{
 };
 pub use registry::{RegistryLive, RegistrySource, TokenFile};
 pub use telemetry::{
-    ExtraLayer, FileLogGuard, FileLogging, TelemetryConfig, TelemetryCtx, TelemetryError,
-    TelemetryGuard, mk_env_filter, setup_tracing,
+    ExtraLayer, FileLogGuard, FileLogging, LogEventSink, TelemetryConfig, TelemetryCtx,
+    TelemetryError, TelemetryGuard, mk_env_filter, setup_tracing,
 };
 pub use threshold::{ExecutionThreshold, InvalidThresholdError};
 pub use trading_schedule::{
