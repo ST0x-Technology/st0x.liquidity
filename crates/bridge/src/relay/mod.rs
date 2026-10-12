@@ -431,6 +431,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn redirect_is_not_followed() {
+        let elsewhere = MockServer::start();
+        let leaked = elsewhere.mock(|when, then| {
+            when.any_request();
+            then.status(200)
+                .body(include_str!("../../relay-fixtures/status_waiting.json"));
+        });
+
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/intents/status/v3");
+            then.status(307)
+                .header("Location", elsewhere.url("/intents/status/v3"));
+        });
+
+        let error = client(&server, Some(RelayApiKey::from("secret-key".to_owned())))
+            .status(REQUEST_ID)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                RelayError::HttpStatus {
+                    endpoint: RelayEndpoint::Status,
+                    status: 307
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(leaked.calls(), 0, "the API key never leaves api_base");
+    }
+
+    #[tokio::test]
     async fn rate_limit_carries_retry_after() {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
