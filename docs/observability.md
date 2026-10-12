@@ -29,9 +29,32 @@ The message and every event field are top-level keys, so once a log shipper
 parses the line the text is at `message` (where the `operational_alerts`
 extractors read it) and each field is under its own name. Do not give an event a
 field named `message`, `timestamp`, `level`, `target`, `span` or `spans`: it
-would collide with those keys. This covers the dependencies too: `st0x-alpaca`
-v0.2.1 logs `Tokenization request failed` with a `message` field that holds the
-Alpaca error body. ST0x-Technology/st0x.alpaca#11 renames it to `error_body`.
+would collide with those keys. A test in `crates/config/src/telemetry.rs`
+(`no_tracing_event_records_a_reserved_console_key`) scans every `trace!`,
+`debug!`, `info!`, `warn!`, `error!` and `event!` call under `src/` and
+`crates/`, in its `(`, `[` and `{` forms, for these names. It does not see
+fields that another macro passes through, such as OpenTelemetry's `otel_warn!`.
+This rule covers the dependencies too: `st0x-alpaca` v0.2.1 logs
+`Tokenization
+request failed` with a `message` field that holds the Alpaca error
+body. ST0x-Technology/st0x.alpaca#11 renames it to `error_body`.
+
+Where `[telemetry]` is set (e2e, local), OpenTelemetry's own internal logs
+(targets starting with `opentelemetry`, for example
+`BatchLogProcessor.LogsDropped`) record `message` as a field next to an empty
+format string, so the console writes them as their own flat line with one
+`message`, the real text, and no span context, and the rolling file writes them
+with one `fields.message`. An export error records no `message`, so its line's
+`message` is its name and its error. Only the SDK objects that
+`TelemetryCtx::setup` builds write these logs, and the server calls it only when
+the config has a `[telemetry]` section. `config/staging/st0x-hedge.toml` and
+`config/prod/st0x-hedge.toml` have none, so no `opentelemetry*` line reaches the
+staging or production console or rolling files, and this handling does not
+change them. The duplicate-`message` handling is a workaround for opentelemetry
+before 0.32: 0.32 (open-telemetry/opentelemetry-rust#3317) stops adding the
+empty format string, so after that bump only the `<name>: <error>` fallback for
+export errors is still needed.
+
 The rolling file layer is not flattened. It keeps the message under `fields`:
 the dashboard's log panel (`dashboard/src/lib/components/log-panel.svelte`) and
 the t0.devops liquidity exporter (`ship_botlogs`, which feeds the
