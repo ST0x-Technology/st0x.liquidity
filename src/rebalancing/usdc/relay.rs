@@ -1301,9 +1301,9 @@ mod tests {
                 error,
                 UsdcTransferError::SwapQuoteOutOfBounds {
                     id: ref refused,
-                    source: QuoteAcceptanceError::QuoteLossExceedsBound { expected, bound },
+                    source: QuoteAcceptanceError::QuoteLossExceedsBound { minimum, bound },
                 } if *refused == id
-                    && expected == U256::from(99_000_000)
+                    && minimum == U256::from(99_000_000)
                     && bound == U256::from(99_500_000)
             ),
             "{error:?}"

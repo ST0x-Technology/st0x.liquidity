@@ -1522,13 +1522,13 @@ pub(super) mod tests {
         };
 
         assert_eq!(
-            recorded.clone().accept(&bounds(500)).unwrap(),
-            quote.accept(&bounds(500)).unwrap()
+            recorded.clone().accept(&bounds(600)).unwrap(),
+            quote.accept(&bounds(600)).unwrap()
         );
         assert_eq!(
             recorded.accept(&bounds(50)).unwrap_err(),
             QuoteAcceptanceError::QuoteLossExceedsBound {
-                expected: U256::from(4_763_755),
+                minimum: U256::from(4_749_464),
                 bound: U256::from(4_975_000),
             }
         );
