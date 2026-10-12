@@ -1485,7 +1485,9 @@ fn quote_refused(error: &UsdcTransferError) -> bool {
             RelayError::Transport(_)
             | RelayError::Decode { .. }
             | RelayError::RateLimited { .. }
-            | RelayError::HttpStatus { .. } => false,
+            | RelayError::HttpStatus { .. }
+            | RelayError::ApiKeyHeader(_)
+            | RelayError::NoApiKey => false,
         },
         _ => false,
     }
