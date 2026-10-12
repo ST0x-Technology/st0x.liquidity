@@ -58,7 +58,9 @@ Codes: `AMOUNT_TOO_LOW`, `AMOUNT_TOO_HIGH`, `INSUFFICIENT_LIQUIDITY`,
 `NO_SWAP_ROUTES_FOUND` (seen live, not in the docs), `SWAP_IMPACT_TOO_HIGH`, and
 the transient `PRICE_FETCH_FAILED`, `SERVICE_UNAVAILABLE`, `REQUEST_TIMED_OUT`,
 `RPC_HTTP_ERROR`. The client maps them to `RelayError::QuoteRefused { code }`
-and retries only the transient ones, twice, within one call.
+and retries only the transient ones, twice, within one call. A code the client
+does not know is `QuoteErrorCode::Unknown` and not retried, except on a 5xx:
+there it is `RelayError::HttpStatus` and retried like a bare server error.
 
 ### `GET /intents/status/v3?requestId=`
 

@@ -326,7 +326,8 @@ struct ErrorBody {
 /// Maps a response to its body or to the error it carries: 429 to
 /// [`RelayError::RateLimited`], 401 and 403 to [`RelayError::Unauthorized`]
 /// whatever the body says, a quote `errorCode` to
-/// [`RelayError::QuoteRefused`], any other failure to its HTTP status.
+/// [`RelayError::QuoteRefused`] (an unknown one on a 5xx stays a server
+/// error), any other failure to its HTTP status.
 async fn read_json<Body: DeserializeOwned>(
     response: Response,
     endpoint: RelayEndpoint,
@@ -364,10 +365,17 @@ async fn read_json<Body: DeserializeOwned>(
         .ok()
         .and_then(|body| body.error_code);
 
-    match (endpoint, code) {
-        (RelayEndpoint::Quote, Some(code)) => Err(RelayError::QuoteRefused {
-            code: QuoteErrorCode::parse(&code),
-        }),
+    match (endpoint, code.as_deref().map(QuoteErrorCode::parse)) {
+        // A code this build does not know says nothing more than the 5xx
+        // carrying it, so it is retried like a bare one.
+        (RelayEndpoint::Quote, Some(QuoteErrorCode::Unknown(code))) if status.is_server_error() => {
+            warn!(target: "bridge", %code, %status, "Unknown Relay quote code on a server error");
+            Err(RelayError::HttpStatus {
+                endpoint,
+                status: status.as_u16(),
+            })
+        }
+        (RelayEndpoint::Quote, Some(code)) => Err(RelayError::QuoteRefused { code }),
         (RelayEndpoint::Quote | RelayEndpoint::Status, _) => Err(RelayError::HttpStatus {
             endpoint,
             status: status.as_u16(),
@@ -693,6 +701,33 @@ mod tests {
                 error,
                 RelayError::QuoteRefused {
                     code: QuoteErrorCode::ServiceUnavailable
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(mock.calls(), 1 + TRANSIENT_RETRIES);
+    }
+
+    #[tokio::test]
+    async fn unknown_quote_code_on_a_server_error_is_retried() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/quote/v2");
+            then.status(503)
+                .json_body(json!({"message": "new", "errorCode": "BRAND_NEW_CODE"}));
+        });
+
+        let error = client(&server, Some(api_key()))
+            .quote(&funded_request())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                RelayError::HttpStatus {
+                    endpoint: RelayEndpoint::Quote,
+                    status: 503
                 }
             ),
             "{error:?}"
