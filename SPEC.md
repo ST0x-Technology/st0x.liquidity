@@ -1764,6 +1764,23 @@ lists. An optional setting that is not configured has no series.
 `liq_asset_extended_hours` is absent while counter trading is disabled.
 `liq_settings_info{trading_mode}` is always empty, as it was in the exporter.
 
+Inventory is published each time the inventory write lock is released, from a
+copy of the balances taken while the lock is held. Each copy is numbered in
+write order, and the store ignores a copy older than the one it holds, so a slow
+publisher never puts older balances back. Publishing starts once boot has
+restored the inventory from its snapshots: before that the view is empty, and
+its series would read as zero balances. If boot fails to read a snapshot, the
+inventory series stay unpublished until the next start and an error is logged.
+
+- `liq_equity_*{symbol}` and the unlabelled `liq_usdc_*` series keep the
+  exporter's meaning: the onchain values are the primary chain's vault only,
+  `liq_equity_total` excludes wallet tokens, and `liq_usdc_alpaca_total` is the
+  gross broker cash once read and the available broker cash until then.
+- `liq_usdc_rebalanceable` is withdrawable cash minus the reserve, never below
+  0. The reserve is the configured cash reserve, else the gross broker cash
+  minus the available broker cash once the gross is read, else 0. It is absent
+  until withdrawable cash is read.
+
 **Exception to financial-integrity rules.** Some ported series reproduce the
 exporter's published sentinels: a ratio with a zero denominator is published as
 0, and a missing balance component counts as 0. These follow the exporter's

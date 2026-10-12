@@ -41,7 +41,7 @@ class CompareTest(unittest.TestCase):
             'missing from bot: liq_asset_rebalancing{symbol="TSLA"}\n'
             "value differs: liq_settings_usdc_target bot=0.45 exporter=0.4\n"
             "not yet ported (exporter-only names, ignored): "
-            "liq_block_lag_blocks, liq_equity_total\n"
+            "liq_block_lag_blocks, liq_hedge_latency_ms_samples\n"
             "3 finding(s)\n"
         ))
 
@@ -56,14 +56,16 @@ class CompareTest(unittest.TestCase):
             "type differs: liq_asset_rebalancing bot=gauge exporter=untyped\n"
             "type differs: liq_bot_info bot=gauge exporter=untyped\n"
             "type differs: liq_bot_start_timestamp_seconds bot=gauge exporter=untyped\n"
+            "type differs: liq_equity_total bot=gauge exporter=untyped\n"
             "type differs: liq_settings_equity_target bot=gauge exporter=untyped\n"
             "type differs: liq_settings_usdc_target bot=gauge exporter=untyped\n"
             "value differs: liq_bot_start_timestamp_seconds "
             "bot=1700000000.0 exporter=1700000001.9\n"
             "value differs: liq_settings_usdc_target bot=0.45 exporter=0.4\n"
             "not yet ported (exporter-only names, ignored): "
-            "liq_asset_flags, liq_block_lag_blocks, liq_equity_total, liq_up\n"
-            "9 finding(s)\n"
+            "liq_asset_flags, liq_block_lag_blocks, liq_equity_ratio_deviation, "
+            "liq_hedge_latency_ms_samples, liq_up\n"
+            "10 finding(s)\n"
         ))
 
     def test_known_diffs_accept_only_a_bot_gauge_against_an_untyped_exporter(self):
@@ -223,6 +225,46 @@ class CompareTest(unittest.TestCase):
 
         self.assertEqual(findings, [
             "value differs: liq_settings_usdc_target bot=0.45 exporter=0.4",
+        ])
+
+    def test_a_partly_filled_snapshot_is_unusable(self):
+        full = "liq_bot_info{git_commit=\"a\"} 1\nliq_usdc_total 5\n"
+        partial = "liq_bot_info{git_commit=\"a\"} 1\n"
+
+        self.assertEqual(
+            compare.unusable_snapshots(
+                ["bot1", "exp1", "bot2", "exp2"], [full, full, full, partial]),
+            ["exp2: partial snapshot, missing liq_usdc_total"])
+
+    def test_a_legitimately_absent_series_does_not_make_a_snapshot_unusable(self):
+        read = "liq_bot_info{git_commit=\"a\"} 1\nliq_usdc_offchain_gross 7\n"
+        not_read = "liq_bot_info{git_commit=\"a\"} 1\n"
+
+        self.assertEqual(
+            compare.unusable_snapshots(
+                ["bot1", "exp1", "bot2", "exp2"], [read, read, not_read, not_read]),
+            [])
+
+    def test_a_bot_name_published_in_one_pair_is_compared_in_every_pair(self):
+        exporter = "liq_bot_info{git_commit=\"a\"} 1\nliq_job_queue{state=\"x\"} 2\n"
+        with_name = exporter
+        without_name = "liq_bot_info{git_commit=\"a\"} 1\n"
+
+        findings, not_ported = compare.compare(
+            [(with_name, exporter), (without_name, exporter)], True, True)
+
+        self.assertEqual(findings, ["unlisted bot name: liq_job_queue"])
+        self.assertEqual(not_ported, [])
+
+    def test_a_bot_name_outside_the_lists_is_a_finding(self):
+        bot = "liq_bot_info{git_commit=\"a\"} 1\nliq_made_up 1\n"
+        exporter = "liq_bot_info{git_commit=\"a\"} 1\n"
+
+        findings, _ = compare.compare([(bot, exporter)], True, True)
+
+        self.assertEqual(findings, [
+            "unlisted bot name: liq_made_up",
+            "extra in bot: liq_made_up",
         ])
 
     def test_a_repeated_series_makes_the_snapshot_unusable(self):

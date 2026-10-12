@@ -703,13 +703,21 @@ async fn finish_startup_recovery(deps: StartupRecoveryDeps<'_>) -> anyhow::Resul
     // post-restart poll may emit no events (unchanged values are
     // deduplicated), leaving the view empty and potentially causing
     // incorrect rebalancing.
-    restore_inventory_at_boot(
+    let hydration = restore_inventory_at_boot(
         deps.pool,
         deps.inventory,
         deps.rebalancing_service,
         deps.position_projection,
     )
     .await?;
+    match hydration {
+        Hydration::Complete => deps.inventory.start_publishing_liq_metrics().await,
+        // A partly restored view would publish missing balances as zero.
+        Hydration::Incomplete => error!(
+            "Inventory hydration was incomplete; the liq_ inventory series stay \
+             unpublished until the next start"
+        ),
+    }
     deps.rebalancing_service
         .enqueue_recovery_for_current_wallet_balances()
         .await;
@@ -2030,53 +2038,69 @@ pub(crate) async fn restore_inventory_at_boot(
     inventory: &Arc<BroadcastingInventory>,
     rebalancing_service: &Arc<RebalancingService>,
     position_projection: &Projection<Position>,
-) -> Result<(), ProjectionError<Position>> {
+) -> Result<Hydration, ProjectionError<Position>> {
     inventory
         .write_without_broadcast()
         .await
         .set_pending_offchain_orders(HashMap::new());
 
-    hydrate_inventory_from_snapshot(pool, inventory).await;
+    let hydration = hydrate_inventory_from_snapshot(pool, inventory).await;
 
     rebalancing_service
         .recover_pending_offchain_orders(position_projection)
         .await?;
 
-    Ok(())
+    Ok(hydration)
+}
+
+/// Whether boot read every persisted inventory snapshot. Boot goes on
+/// either way; only the `liq_*` inventory series wait for a complete read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Hydration {
+    Complete,
+    Incomplete,
 }
 
 async fn hydrate_inventory_from_snapshot(
     pool: &SqlitePool,
     inventory: &Arc<BroadcastingInventory>,
-) {
+) -> Hydration {
     let ids = match load_all_ids::<InventorySnapshot>(pool).await {
         Ok(ids) => ids,
         Err(error) => {
             warn!(?error, "Failed to load InventorySnapshot IDs for hydration");
-            return;
+            return Hydration::Incomplete;
         }
     };
 
+    let mut hydration = Hydration::Complete;
     for id in &ids {
-        hydrate_single_snapshot(pool, inventory, id).await;
+        if hydrate_single_snapshot(pool, inventory, id).await == Hydration::Incomplete {
+            hydration = Hydration::Incomplete;
+        }
     }
+    hydration
 }
 
 async fn hydrate_single_snapshot(
     pool: &SqlitePool,
     inventory: &Arc<BroadcastingInventory>,
     id: &crate::inventory::snapshot::InventorySnapshotId,
-) {
-    let Ok(Some(snapshot)) = load_entity::<InventorySnapshot>(pool, id).await else {
-        return;
+) -> Hydration {
+    let snapshot = match load_entity::<InventorySnapshot>(pool, id).await {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return Hydration::Complete,
+        Err(error) => {
+            warn!(%id, ?error, "Failed to load InventorySnapshot for hydration");
+            return Hydration::Incomplete;
+        }
     };
 
     let event_count = snapshot.hydrate_inventory(inventory).await;
-    if event_count == 0 {
-        return;
+    if event_count > 0 {
+        info!(%id, event_count, "Hydrated InventoryView from persisted snapshot");
     }
-
-    info!(%id, event_count, "Hydrated InventoryView from persisted snapshot");
+    Hydration::Complete
 }
 
 struct RebalancingInfrastructure {
@@ -8899,6 +8923,29 @@ mod tests {
         assert!(
             message.contains("OPERATOR_ROLE preflight failed on robinhood"),
             "the failure must name the chain, got: {message}"
+        );
+    }
+
+    /// The `liq_*` inventory series start only after a complete read, so
+    /// the hydration outcome must report a failed read.
+    #[tokio::test]
+    async fn hydration_reports_whether_every_snapshot_was_read() {
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default(),
+            event_sender,
+        ));
+
+        let pool = setup_test_db().await;
+        assert_eq!(
+            hydrate_inventory_from_snapshot(&pool, &inventory).await,
+            Hydration::Complete
+        );
+
+        pool.close().await;
+        assert_eq!(
+            hydrate_inventory_from_snapshot(&pool, &inventory).await,
+            Hydration::Incomplete
         );
     }
 
