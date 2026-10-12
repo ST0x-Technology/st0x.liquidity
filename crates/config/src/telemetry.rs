@@ -496,8 +496,7 @@ fn mk_crate_filter(level: tracing::Level) -> EnvFilter {
     /// level. Keep in sync with
     /// `grep -rhoE 'target: "[a-z_]+"' src/ crates/` (plus `cqrs` from the
     /// external st0x-event-sorcery crate).
-    const DOMAIN_TARGETS: [&str; 21] = [
-        "api",
+    const DOMAIN_TARGETS: [&str; 19] = [
         "backfill",
         "bridge",
         "broker",
@@ -507,7 +506,6 @@ fn mk_crate_filter(level: tracing::Level) -> EnvFilter {
         "evm",
         "gas",
         "hedge",
-        "iap",
         "inventory",
         "market_data",
         "operational_alert",
@@ -548,13 +546,12 @@ mod tests {
     #[test]
     fn crate_filter_enables_every_domain_target_in_use() {
         // A `target: "..."` overrides the module path, so a target absent
-        // from this list is silently dropped at every level. The list mirrors
-        // workspace domain targets except `operations_audit`, whose mandatory
-        // INFO floor is asserted separately below.
+        // from DOMAIN_TARGETS is silently dropped at every level. This
+        // list mirrors `grep -rhoE 'target: "[a-z_]+"' src/ crates/` in
+        // the workspace; extend both when introducing a new target.
         let filter = mk_crate_filter(tracing::Level::TRACE).to_string();
 
         for target in [
-            "api",
             "backfill",
             "bridge",
             "broker",
@@ -567,7 +564,6 @@ mod tests {
             "evm",
             "gas",
             "hedge",
-            "iap",
             "inventory",
             "market_data",
             "orderbook",

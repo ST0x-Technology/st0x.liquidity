@@ -1,15 +1,18 @@
 # st0x liquidity bot runtime config for PRODUCTION: the deployed source of
 # truth since 2026-09-07 (moved here from t0.devops terraform/production-
 # liquidity/st0x-hedge.toml; the stack there keeps only the secret and its
-# grants). Production deploys only from a manual `workflow_dispatch` of
-# .github/workflows/production-release.yml; neither a merge nor a version tag
-# deploys by itself. Leaving its `version` input empty publishes this file from
-# master onto the live image digests. Supplying a version tag publishes that
-# tag's images and config for a new release, re-deploy, or rollback. In either
-# mode the workflow validates the config inside the exact bot image it rolls,
-# then deploys only after an approver activates the app-deploy PAM grant in the
-# GCP console. Non-secret settings only; secrets come from Secret Manager env
-# injection.
+# grants). A merge touching this file deploys nothing. Production rolls only
+# through a manual production-release run (.github/workflows/
+# production-release.yml): version = vX.Y.Z ships this file together with
+# that tag's binary (an older tag rolls both back), and an empty version is a
+# config-only release of this file onto the live images. That release takes
+# the file from the branch the run is started from, so start it from master;
+# any other branch publishes that branch's unreviewed copy. The
+# workflow validates the file inside the exact bot image it will run on
+# (validate-config), publishes it as a version of the liquidity-runtime-config
+# secret, then rolls the plane only after an approver activates the
+# app-deploy PAM grant. Non-secret settings only; secrets come from Secret
+# Manager env injection.
 #
 # The VM (t0.devops terraform/production-liquidity) fetches exactly the
 # CONFIG_VERSION that images.env names, never `latest`; the release

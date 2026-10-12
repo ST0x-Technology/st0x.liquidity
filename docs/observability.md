@@ -48,37 +48,22 @@ trace!(target: "wallet", asset_count, "Listed wallet assets");
 info!(%symbol, %shares, "Hedging trade");
 ```
 
-### Configured domain targets
+### Existing targets
 
 | Target              | Subsystem                                                |
 | ------------------- | -------------------------------------------------------- |
-| `api`               | HTTP API request handling                                |
-| `backfill`          | Historical data recovery                                 |
-| `bridge`            | Cross-chain bridge processing                            |
-| `broker`            | Offchain broker integration                              |
-| `cqrs`              | Aggregate commands and events                            |
-| `dashboard`         | Dashboard data and updates                               |
-| `equity`            | Equity position and transfer processing                  |
-| `evm`               | EVM RPC and contract interactions                        |
-| `gas`               | Wallet gas monitoring                                    |
-| `hedge`             | Hedging and position management                          |
-| `iap`               | IAP authentication and key verification                  |
-| `inventory`         | Inventory accounting                                     |
-| `market_data`       | Market data ingestion                                    |
+| `hedge`             | Hedging / position management                            |
 | `operational_alert` | Operator alerts (ERROR events the log pipeline pages on) |
+| `operations_audit`  | Versioned mutation audit events (mandatory INFO floor)   |
 | `orderbook`         | Onchain orderbook interactions                           |
-| `rebalance`         | Portfolio rebalancing                                    |
-| `reliability`       | Reliability and health signals                           |
-| `shutdown`          | Process shutdown                                         |
+| `rebalancing`       | Portfolio rebalancing                                    |
 | `startup`           | Application initialization                               |
 | `tokenization`      | Tokenized equity minting                                 |
-| `wallet`            | Alpaca and onchain wallet operations                     |
-| `operations_audit`  | Versioned mutation audit events (mandatory INFO floor)   |
+| `wallet`            | Alpaca wallet / onchain wallet                           |
 
-This table mirrors `DOMAIN_TARGETS` in `crates/config/src/telemetry.rs`, plus
-the deliberate `operations_audit` exception. Add a new configured domain target
-to both places so the default `EnvFilter` captures it. The audit target instead
-has dedicated console and default sink filters that enforce its INFO floor.
+When adding a new subsystem, pick a short, descriptive target name and add it to
+this table AND to `DOMAIN_TARGETS` in `crates/config/src/telemetry.rs`, so the
+default `EnvFilter` captures it.
 
 When overriding filtering with `RUST_LOG`, always keep a bare level segment
 (e.g. `RUST_LOG=warn,hedge=trace`): the bare level is what admits targets you
