@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use alloy::consensus::Transaction as _;
-use alloy::primitives::{Address, Bytes, TxHash, U256};
+use alloy::primitives::{Address, B256, Bytes, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, Log, Transaction, TransactionReceipt};
 use alloy::sol_types::{SolCall, SolEvent};
@@ -129,7 +129,7 @@ pub enum RelayBridgeError {
     DepositReverted { tx: TxHash },
     #[error("deposit {tx} emitted no deposit for order {order_id} from our wallet")]
     DepositUnverified { tx: TxHash, order_id: RelayOrderId },
-    #[error("deposit log for order {order_id} carries no tx hash or block")]
+    #[error("deposit log for order {order_id} carries no tx hash, block or block hash")]
     DepositLogIncomplete { order_id: RelayOrderId },
     #[error("deposit log names tx {tx}, whose receipt the node does not have yet")]
     DepositReceiptMissing { tx: TxHash },
@@ -768,6 +768,20 @@ impl<W: Wallet> RelayEnd<W> {
             });
         }
 
+        self.ensure_canonical(tx, block, block_hash).await?;
+
+        Ok(receipt)
+    }
+
+    /// Refuses `tx` as seen in `block_hash` unless that is the canonical
+    /// block at height `block`: a lagging node can serve data from a block a
+    /// reorg removed.
+    async fn ensure_canonical(
+        &self,
+        tx: TxHash,
+        block: u64,
+        block_hash: B256,
+    ) -> Result<(), RelayBridgeError> {
         let canonical = self
             .wallet
             .provider()
@@ -780,12 +794,12 @@ impl<W: Wallet> RelayEnd<W> {
                 %tx,
                 block,
                 %block_hash,
-                "Relay receipt is not from the canonical block at its height"
+                "Relay tx is not from the canonical block at its height"
             );
             return Err(RelayBridgeError::NotCanonical { tx, block });
         }
 
-        Ok(receipt)
+        Ok(())
     }
 
     /// The event's `from` is the caller-supplied depositor, so anyone can
@@ -850,7 +864,8 @@ impl<W: Wallet> RelayEnd<W> {
 
     /// Our deposits for `order_ids` in blocks `start..=end`. A load-balanced
     /// node may lag and answer a range empty, so the chunk is read
-    /// `SCAN_ATTEMPTS` times and a deposit any read returns is kept.
+    /// `SCAN_ATTEMPTS` times and a deposit any read returns is kept. A kept
+    /// log from a reorged-out block fails the chunk, to be scanned again.
     async fn read_chunk(
         &self,
         order_ids: &[RelayOrderId],
@@ -870,10 +885,10 @@ impl<W: Wallet> RelayEnd<W> {
             let logs = self.wallet.provider().get_logs(&filter).await?;
 
             for log in &logs {
-                if let Some(deposit) = self.candidate(log, order_ids)?
-                    && !candidates.contains(&deposit)
+                if let Some(candidate) = self.candidate(log, order_ids)?
+                    && !candidates.contains(&candidate)
                 {
-                    candidates.push(deposit);
+                    candidates.push(candidate);
                 }
             }
 
@@ -884,7 +899,7 @@ impl<W: Wallet> RelayEnd<W> {
 
         let mut deposits = Vec::with_capacity(candidates.len());
 
-        for deposit in candidates {
+        for (deposit, block_hash) in candidates {
             let receipt = self
                 .wallet
                 .provider()
@@ -903,6 +918,9 @@ impl<W: Wallet> RelayEnd<W> {
                 continue;
             }
 
+            self.ensure_canonical(deposit.tx, deposit.block, block_hash)
+                .await?;
+
             deposits.push(deposit);
         }
 
@@ -910,13 +928,14 @@ impl<W: Wallet> RelayEnd<W> {
         Ok(deposits)
     }
 
-    /// The deposit `log` records, when it names our wallet and stable and one
-    /// of `order_ids`; who sent it is checked after.
+    /// The deposit `log` records and the hash of its block, when it names our
+    /// wallet and stable and one of `order_ids`; who sent it and whether its
+    /// block is canonical are checked after.
     fn candidate(
         &self,
         log: &Log,
         order_ids: &[RelayOrderId],
-    ) -> Result<Option<SwapDeposit<RelayOrderId>>, RelayBridgeError> {
+    ) -> Result<Option<(SwapDeposit<RelayOrderId>, B256)>, RelayBridgeError> {
         let Some(event) = deposit_event(log, self.depository) else {
             return Ok(None);
         };
@@ -926,16 +945,20 @@ impl<W: Wallet> RelayEnd<W> {
             return Ok(None);
         }
 
-        let (Some(tx), Some(block)) = (log.transaction_hash, log.block_number) else {
+        let (Some(tx), Some(block), Some(block_hash)) =
+            (log.transaction_hash, log.block_number, log.block_hash)
+        else {
             return Err(RelayBridgeError::DepositLogIncomplete { order_id });
         };
 
-        Ok(Some(SwapDeposit {
+        let deposit = SwapDeposit {
             tx,
             order_id,
             amount: event.amount,
             block,
-        }))
+        };
+
+        Ok(Some((deposit, block_hash)))
     }
 
     /// Requires `found` to have this chain's confirmations, then checks it
@@ -1055,7 +1078,7 @@ mod tests {
 
     use alloy::consensus::TxEnvelope;
     use alloy::eips::Decodable2718;
-    use alloy::primitives::{B256, Signature};
+    use alloy::primitives::Signature;
     use alloy::providers::{DynProvider, ProviderBuilder, RootProvider};
     use alloy::transports::TransportResult;
 
