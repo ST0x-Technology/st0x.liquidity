@@ -109,6 +109,7 @@ st0x-finance = { git = "https://github.com/ST0x-Technology/st0x.finance", tag = 
 st0x-float-macro = { git = "https://github.com/ST0x-Technology/st0x.finance", tag = "v0.3.0", version = "0.3.0" }
 st0x-float-serde = { git = "https://github.com/ST0x-Technology/st0x.finance", tag = "v0.3.0", version = "0.3.0" }
 st0x-hedge = { path = ".", default-features = false }
+st0x-liquidity-client = { path = "crates/liquidity-client" }
 st0x-raindex = { path = "crates/raindex" }
 st0x-registry = { path = "crates/registry" }
 st0x-tokenization = { path = "crates/tokenization" }
@@ -309,9 +310,7 @@ st0x-event-sorcery = { workspace = true, features = ["test-support"] }
 st0x-evm = { workspace = true, features = ["mock", "test-support"] }
 st0x-execution = { workspace = true, features = ["mock", "test-support"] }
 st0x-hedge = { workspace = true, features = ["test-support", "mock"] }
-st0x-liquidity-client = { path = "crates/liquidity-client", features = [
-  "test-support",
-] }
+st0x-liquidity-client = { workspace = true, features = ["test-support"] }
 st0x-tokenization = { workspace = true, features = ["test-support", "mock"] }
 st0x-wrapper = { workspace = true, features = ["mock"] }
 temp-env.workspace = true

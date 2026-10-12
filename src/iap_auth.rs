@@ -443,7 +443,8 @@ pub(crate) mod test_support {
         exp: u64,
     }
 
-    /// A fixed P256 keypair standing in for Google's signing key.
+    /// A P-256 keypair standing in for Google's: the JWK halves that go in the
+    /// mocked key set, and the PEM that signs test tokens.
     pub(crate) struct TestKey {
         pub(crate) signing_pem: Vec<u8>,
         pub(crate) x: String,
@@ -451,6 +452,8 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn test_key() -> TestKey {
+        // Fixed bytes rather than a random key: a test that generates its own
+        // key can pass while the code under test ignores the key entirely.
         let signing = SigningKey::from_bytes(&[7u8; 32].into()).expect("valid P-256 scalar");
         let public = signing.verifying_key().to_encoded_point(false);
 
@@ -521,11 +524,7 @@ pub(crate) mod test_support {
         server
     }
 
-    pub(crate) fn verifier(audience: &str, jwks: &MockServer) -> Arc<IapVerifier> {
-        role_verifier(audience, "test", jwks)
-    }
-
-    pub(crate) fn role_verifier(
+    pub(crate) fn verifier(
         audience: &str,
         role: &'static str,
         jwks: &MockServer,
@@ -571,13 +570,14 @@ mod tests {
             .expect("router responds")
             .status()
     }
+
     #[tokio::test]
     async fn accepts_a_current_assertion_for_this_audience() {
         let key = test_key();
         let jwks = jwks_server(&key);
 
         let status = call(
-            verifier(READ_AUDIENCE, &jwks),
+            verifier(READ_AUDIENCE, "test", &jwks),
             Some(&token(&key, READ_AUDIENCE, IAP_ISSUER, 300)),
         )
         .await;
@@ -595,7 +595,7 @@ mod tests {
         let jwks = jwks_server(&key);
 
         let status = call(
-            verifier(WRITE_AUDIENCE, &jwks),
+            verifier(WRITE_AUDIENCE, "test", &jwks),
             Some(&token(&key, READ_AUDIENCE, IAP_ISSUER, 300)),
         )
         .await;
@@ -611,7 +611,7 @@ mod tests {
         let jwks = jwks_server(&key);
 
         assert_eq!(
-            call(verifier(READ_AUDIENCE, &jwks), None).await,
+            call(verifier(READ_AUDIENCE, "test", &jwks), None).await,
             StatusCode::UNAUTHORIZED
         );
     }
@@ -622,7 +622,7 @@ mod tests {
         let jwks = jwks_server(&key);
 
         let status = call(
-            verifier(READ_AUDIENCE, &jwks),
+            verifier(READ_AUDIENCE, "test", &jwks),
             Some(&token(&key, READ_AUDIENCE, IAP_ISSUER, -3600)),
         )
         .await;
@@ -638,7 +638,7 @@ mod tests {
         let jwks = jwks_server(&key);
 
         let status = call(
-            verifier(READ_AUDIENCE, &jwks),
+            verifier(READ_AUDIENCE, "test", &jwks),
             Some(&token(
                 &key,
                 READ_AUDIENCE,
@@ -668,7 +668,7 @@ mod tests {
         };
 
         let status = call(
-            verifier(READ_AUDIENCE, &jwks),
+            verifier(READ_AUDIENCE, "test", &jwks),
             Some(&token(&impostor, READ_AUDIENCE, IAP_ISSUER, 300)),
         )
         .await;
@@ -688,7 +688,7 @@ mod tests {
         });
 
         let status = call(
-            verifier(READ_AUDIENCE, &unreachable),
+            verifier(READ_AUDIENCE, "test", &unreachable),
             Some(&token(&key, READ_AUDIENCE, IAP_ISSUER, 300)),
         )
         .await;
@@ -723,7 +723,7 @@ mod tests {
             then.status(500);
         });
 
-        let iap = verifier(READ_AUDIENCE, &unreachable);
+        let iap = verifier(READ_AUDIENCE, "test", &unreachable);
         seed_stale_cache(&iap, &key).await;
 
         let status = call(
@@ -750,7 +750,7 @@ mod tests {
             then.status(500);
         });
 
-        let iap = verifier(READ_AUDIENCE, &unreachable);
+        let iap = verifier(READ_AUDIENCE, "test", &unreachable);
         seed_stale_cache(&iap, &key).await;
 
         for _ in 0..3 {
