@@ -41,11 +41,12 @@ into the board JSON. The plugin is installed on the box by `T0Trade/t0.devops`
 (`GF_INSTALL_PLUGINS`); the PR check's throwaway Grafana does not have it, so it
 loads these panels as "Panel plugin not found" and still passes.
 
-The recovery commands in the header's guide (`recovery-guide.json`) are a copy
-of the SPA's (`dashboard/src/lib/transfer.ts`), in the operations client form
-for the environment the board shows. `dashboard/src/lib/transfer-board.test.ts`
-fails when the copy drifts, so change the SPA and the copy together. It runs in
-the dashboard build of CI.
+The recovery commands in the header's guide (`recovery-guide.json`) and in the
+row dialog (`recovery-commands.js`) are copies of the SPA's
+(`dashboard/src/lib/transfer.ts`), in the operations client form for the
+environment the board shows. `dashboard/src/lib/transfer-board.test.ts` fails
+when a copy drifts, so change the SPA and the copies together. It runs in the
+dashboard build of CI.
 
 The Dashboard tab's inventory is three Grafana tables, for their column filters:
 USD at Alpaca, USD on each chain, and Equities. Per-chain rows (USD · Onchain)
