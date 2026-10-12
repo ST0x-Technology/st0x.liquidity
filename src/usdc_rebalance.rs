@@ -7486,6 +7486,7 @@ mod tests {
                 refund_tx: TxHash::repeat_byte(0xe1),
                 side,
                 amount_refunded: Usdc::new(float!(99)),
+                short_of_floor: None,
                 refunded_at: Utc::now(),
             }],
         ]
@@ -7579,6 +7580,7 @@ mod tests {
                 refund_tx: TxHash::repeat_byte(0xe1),
                 side: RefundSide::Origin,
                 amount_refunded: Usdc::new(float!(99)),
+                short_of_floor: None,
                 refunded_at: Utc::now(),
             }],
         ]
@@ -8070,6 +8072,7 @@ mod tests {
                 refund_tx: TxHash::repeat_byte(0xe2),
                 side: RefundSide::Origin,
                 amount_refunded: Usdc::new(float!(98)),
+                short_of_floor: None,
                 refunded_at: Utc::now(),
             }],
         ]

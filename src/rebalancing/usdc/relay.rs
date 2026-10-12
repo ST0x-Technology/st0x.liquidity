@@ -6249,6 +6249,63 @@ mod tests {
         assert!(state.is_reconcilable_failure());
     }
 
+    /// A refund at the hub below its refund floor is never quoted again, on
+    /// resume as on adoption: it pages and holds at `SwapRefunded`, guard
+    /// held, for `transfer reconcile`.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn short_refund_toward_chain_holds_without_requoting() {
+        let anvil = spawn_anvil(Anvil::new());
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let quote = mock_quote_unavailable(&relay_api);
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let contracts = RelayEndContracts {
+            stable: Address::repeat_byte(0x51),
+            depository: Address::repeat_byte(0x52),
+        };
+        let transfer = relay_transfer_with_bounds(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet,
+            contracts,
+            store.clone(),
+            RelayHopCtx {
+                min_transfer: Usdc::new(float!(10)),
+                ..relay_bounds()
+            },
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited_toward_chain(&store, &id, TOWARD_CHAIN_ORDER_ID).await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::RecordSwapRefund {
+                    refund_tx: TxHash::repeat_byte(0xe1),
+                    side: RefundSide::Origin,
+                    amount_refunded: U256::from(99_000_000_u64),
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer
+            .resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
+            .await
+            .unwrap();
+
+        quote.assert_calls(0);
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "SwapRefunded");
+        assert!(state.holds_rebalance_guard());
+        assert!(state.is_reconcilable_failure());
+        assert!(logs_contain("refund floor"));
+    }
+
     /// After `max_refund_retries` re-quotes that followed a refund, the next
     /// refund at the hub holds at `SwapRefunded` instead of quoting again.
     #[tokio::test]
