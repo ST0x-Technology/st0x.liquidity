@@ -4108,9 +4108,7 @@ mod tests {
             })
             .unwrap()
             .with_local_contracts(self.hub_contracts, self.chain_contracts);
-            let client = RelayClient::new(None)
-                .unwrap()
-                .with_api_base(relay_api.base_url());
+            let client = relay_test_client(relay_api.base_url());
             let (broker, alpaca_wallet) = alpaca_services(server).await;
             let raindex = Arc::new(RaindexService::new(
                 chain_wallet.clone(),
