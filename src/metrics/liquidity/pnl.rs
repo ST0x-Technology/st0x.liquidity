@@ -45,7 +45,8 @@ pub(crate) enum PnlWindowKey {
 
 impl PnlWindowKey {
     /// The order a refresh cycle runs the windows in: the board's default
-    /// window first.
+    /// window first. Each cycle starts one entry later and wraps around, so
+    /// the windows a slow cycle skips change from cycle to cycle.
     pub(crate) const REFRESH_ORDER: [Self; 6] = [
         Self::OneWeek,
         Self::OneDay,
