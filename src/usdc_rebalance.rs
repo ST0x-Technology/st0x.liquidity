@@ -3663,7 +3663,8 @@ impl EventSourced for UsdcRebalance {
     // `SwapDeposited`, `SwapRefunded` and `SwapEscrowUnresolved`; older
     // snapshots read it as 0.
     // v17: `reverted_quotes` on the swap states, `quote` and
-    // `refund_requotes` on `SwapFailed`, and `SwapCompletionRecovered`.
+    // `refund_requotes` on `SwapFailed`, and `SwapCompletionRecovered`, whose
+    // refund carries `short_of_floor`.
     const SCHEMA_VERSION: u64 = 17;
 
     fn originate(event: &Self::Event) -> Option<Self> {
