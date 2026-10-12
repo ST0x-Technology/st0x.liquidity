@@ -234,6 +234,11 @@ pub enum RelayError {
     ApiKeyHeader(#[source] InvalidHeaderValue),
     #[error("Relay requires an API key for quotes, and none is configured")]
     NoApiKey,
+    #[error("Relay {endpoint:?} refused the API key: HTTP {status}")]
+    Unauthorized {
+        endpoint: RelayEndpoint,
+        status: u16,
+    },
 }
 
 impl RelayError {
@@ -248,7 +253,8 @@ impl RelayError {
             | Self::RateLimited { .. }
             | Self::QuoteMismatch(_)
             | Self::ApiKeyHeader(_)
-            | Self::NoApiKey => false,
+            | Self::NoApiKey
+            | Self::Unauthorized { .. } => false,
         }
     }
 }
@@ -555,6 +561,48 @@ mod tests {
             matches!(error, RelayError::RateLimited { retry_after: None }),
             "{error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn rejected_api_key_is_unauthorized_not_a_quote_refusal() {
+        let server = MockServer::start();
+        let quote = server.mock(|when, then| {
+            when.method(POST).path("/quote/v2");
+            then.status(401)
+                .json_body(json!({"message": "Unauthorized", "errorCode": "UNAUTHORIZED_QUOTE"}));
+        });
+        let status = server.mock(|when, then| {
+            when.method(GET).path("/intents/status/v3");
+            then.status(403).json_body(json!({"message": "Forbidden"}));
+        });
+
+        let client = client(&server, Some(api_key()));
+
+        let error = client.quote(&funded_request()).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                RelayError::Unauthorized {
+                    endpoint: RelayEndpoint::Quote,
+                    status: 401
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(quote.calls(), 1, "a rejected key is not retried");
+
+        let error = client.status(REQUEST_ID).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                RelayError::Unauthorized {
+                    endpoint: RelayEndpoint::Status,
+                    status: 403
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(status.calls(), 1, "a rejected key is not retried");
     }
 
     #[tokio::test]
