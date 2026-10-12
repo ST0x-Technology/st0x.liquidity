@@ -6692,6 +6692,7 @@ impl UsdcRebalance {
                 refund_tx,
                 side,
                 amount_refunded,
+                short_of_floor: None,
                 refund_requotes: base.refund_requotes,
                 initiated_at: base.initiated_at,
                 refunded_at: recovered_at,
@@ -8708,6 +8709,7 @@ mod tests {
                         refund_tx: TxHash::repeat_byte(0xe1),
                         side,
                         amount_refunded: Usdc::new(float!(99)),
+                        short_of_floor: None,
                         refunded_at: Utc::now(),
                     }],
                 ]

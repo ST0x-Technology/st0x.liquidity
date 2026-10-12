@@ -8706,6 +8706,69 @@ mod tests {
         ));
     }
 
+    /// A late refund below its refund floor, adopted on recheck, holds for
+    /// the operator: the recheck pages it, and a resume, as the startup
+    /// re-arm runs, neither redeposits nor releases it.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn short_late_refund_adopted_on_recheck_stays_held() {
+        let rig = RelayRig::deploy().await;
+        let order_id = B256::repeat_byte(0x0d);
+        let refund_tx = rig.refund_on_chain(U256::from(1), order_id).await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_status(
+            &relay_api,
+            json!({"status": "refund", "txHashes": [refund_tx], "failReason": "DEPOSITED_AMOUNT_TOO_LOW_TO_FILL"}),
+        );
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited(&store, &id).await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailSwap {
+                    reason: "Relay reported Failure".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(60), transfer.recheck_deposit(&id, None))
+                .await
+                .expect("the recheck ends")
+                .unwrap();
+        assert_eq!(outcome, RecheckOutcome::Recovered);
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the resume ends")
+        .unwrap();
+
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::SwapRefunded {
+                    side: RefundSide::Origin,
+                    short_of_floor: Some(_),
+                    ..
+                }
+            ),
+            "{state:?}"
+        );
+        assert!(state.holds_rebalance_guard());
+        assert_eq!(state.is_resumable_mid_flight_data(), None);
+        assert_eq!(rig.vault_usdg().await, U256::ZERO);
+        assert!(logs_contain("refund floor"));
+    }
+
     /// A payment Relay names that the chain contradicts (here a fill below
     /// the quote's floor) is not taken for no payment on recheck: it pages
     /// and the recheck fails with the unverified payment, changing nothing.
