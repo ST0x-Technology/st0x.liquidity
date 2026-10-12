@@ -1232,11 +1232,12 @@ mod tests {
         }
     }
 
-    /// `quote` accepted within bounds loose enough for its 4.7% relayer fee.
+    /// `quote` accepted within bounds loose enough for its 4.7% relayer fee
+    /// plus slippage.
     fn accepted(quote: RelayQuote) -> AcceptedRelayQuote {
         quote
             .accept(&QuoteBounds {
-                max_loss: BasisPoints::new(500).unwrap(),
+                max_loss: BasisPoints::new(600).unwrap(),
                 downstream_minimum: U256::ZERO,
             })
             .unwrap()

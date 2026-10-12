@@ -1447,7 +1447,7 @@ pub(super) mod tests {
         assert_eq!(
             error,
             QuoteAcceptanceError::QuoteLossExceedsBound {
-                expected: U256::from(4_763_755),
+                minimum: U256::from(4_749_464),
                 bound: U256::from(4_975_000),
             }
         );
