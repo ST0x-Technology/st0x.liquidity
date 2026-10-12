@@ -7,7 +7,7 @@
 //! downtime. A persisted checkpoint records the last block that was fully
 //! enqueued.
 
-use alloy::primitives::TxHash;
+use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
@@ -17,8 +17,8 @@ use itertools::Itertools;
 use metrics::counter;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use std::collections::HashMap;
-use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 use std::iter::from_fn;
 use std::time::Duration;
 use tracing::{debug, error, info, trace, warn};
@@ -28,6 +28,7 @@ use st0x_evm::{Chain, Evm};
 use st0x_execution::Executor;
 
 use super::OnChainError;
+use crate::alerts::AlertKind;
 use crate::bindings::IRaindexInventory::{OperatorDeposit, OperatorWithdraw};
 use crate::bindings::IRaindexV6::{ClearV3, TakeOrderV3};
 use crate::conductor::job::{BackpressureStreak, Job, Label};
@@ -394,36 +395,150 @@ pub(crate) async fn save_backfill_checkpoint(
     Ok(())
 }
 
-/// A settlement tx's `OperatorDeposit` bucket: either exactly one deposit, or
-/// `Ambiguous` because a second same-tx deposit landed. `deposit4`/`withdraw4`
-/// are independent `RaindexInventory` calls with no atomic "settle" entrypoint
-/// pairing them, so once a tx has more than one deposit there is no reliable
-/// way to know which one a same-tx withdraw actually belongs to. Rather than
-/// silently overwriting (and mis-hedging) a real amount, the whole tx is
-/// quarantined: no `InventoryTrade` is ever built from an `Ambiguous` bucket.
-pub(crate) enum DepositBucket {
-    Single(OperatorDeposit),
-    Ambiguous,
+/// One `OperatorDeposit` or `OperatorWithdraw` a venue emitted on the shared
+/// inventory, with the log that places it in its tx.
+#[derive(Debug, Clone)]
+pub(crate) enum InventoryLeg {
+    Deposit(OperatorDeposit, Box<Log>),
+    Withdraw(OperatorWithdraw, Box<Log>),
 }
 
-/// A settlement tx's `OperatorWithdraw` bucket, symmetric to [`DepositBucket`].
-/// A tx with two `OperatorWithdraw`s is exactly as ambiguous as one with two
-/// `OperatorDeposit`s -- the single deposit could belong to either withdraw --
-/// so it is quarantined the same way. Carries the triggering `Log` alongside
-/// `Single` so the pairing pass can build `EmittedOnChain` metadata without a
-/// second lookup.
-pub(crate) enum WithdrawBucket {
-    Single(OperatorWithdraw, Box<Log>),
-    Ambiguous,
+impl InventoryLeg {
+    fn operator(&self) -> Address {
+        match self {
+            Self::Deposit(deposit, _) => deposit.operator,
+            Self::Withdraw(withdraw, _) => withdraw.operator,
+        }
+    }
+
+    const fn is_deposit(&self) -> bool {
+        match self {
+            Self::Deposit(..) => true,
+            Self::Withdraw(..) => false,
+        }
+    }
+
+    fn log(&self) -> &Log {
+        match self {
+            Self::Deposit(_, log) | Self::Withdraw(_, log) => log,
+        }
+    }
+
+    fn token(&self) -> Address {
+        match self {
+            Self::Deposit(deposit, _) => deposit.token,
+            Self::Withdraw(withdraw, _) => withdraw.token,
+        }
+    }
+
+    fn amount(&self) -> U256 {
+        match self {
+            Self::Deposit(deposit, _) => deposit.amount,
+            Self::Withdraw(withdraw, _) => withdraw.amount,
+        }
+    }
 }
 
-/// Splits a batch's raw inventory logs into per-tx `OperatorDeposit` and
-/// `OperatorWithdraw` buckets keyed by settlement tx, so the pairing pass
-/// ([`pair_inventory_settlements`]) can match each tx's deposit to its
-/// withdraw without an extra RPC round-trip. Drops the bot's own rebalancing
-/// legs (treasury moves, not venue fills), `removed: true` logs (reorg), and
-/// undecodable logs; quarantines any tx that emits multiple deposits or
-/// multiple withdraws.
+impl fmt::Display for InventoryLeg {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (kind, vault_id) = match self {
+            Self::Deposit(deposit, _) => ("deposit", deposit.vaultId),
+            Self::Withdraw(withdraw, _) => ("withdraw", withdraw.vaultId),
+        };
+        write!(
+            formatter,
+            "{kind} operator={} token={} vault_id={vault_id} amount={} log_index={:?}",
+            self.operator(),
+            self.token(),
+            self.amount(),
+            self.log().log_index,
+        )
+    }
+}
+
+/// Why a tx's inventory legs could not be paired into settlements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuarantineReason {
+    /// A leg has no log index, or two legs share one, so log order is unproven.
+    UnorderedLegs,
+    /// One operator emitted more deposits than withdraws, or the reverse.
+    UnequalLegCounts { operator: Address },
+    /// One operator emitted two legs of the same kind in a row.
+    ConsecutiveSameKind { operator: Address },
+    /// In a tx with several settlements, a pair does not have exactly one leg
+    /// in the chain's settlement stable.
+    InvalidPairTokens { operator: Address },
+}
+
+impl QuarantineReason {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::UnorderedLegs => "unordered_legs",
+            Self::UnequalLegCounts { .. } => "unequal_leg_counts",
+            Self::ConsecutiveSameKind { .. } => "consecutive_same_kind",
+            Self::InvalidPairTokens { .. } => "invalid_pair_tokens",
+        }
+    }
+}
+
+impl fmt::Display for QuarantineReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnorderedLegs => {
+                write!(formatter, "a leg has no log index, or two legs share one")
+            }
+            Self::UnequalLegCounts { operator } => write!(
+                formatter,
+                "operator {operator} emitted unequal numbers of deposits and withdraws"
+            ),
+            Self::ConsecutiveSameKind { operator } => write!(
+                formatter,
+                "operator {operator} emitted two legs of the same kind in a row"
+            ),
+            Self::InvalidPairTokens { operator } => write!(
+                formatter,
+                "a pair from operator {operator} does not have exactly one settlement-stable leg"
+            ),
+        }
+    }
+}
+
+/// The trades paired from a batch of inventory legs, and the reason each
+/// quarantined tx was held back.
+pub(crate) struct PairedSettlements {
+    pub(crate) trades: Vec<(InventoryTrade, Log)>,
+    pub(crate) quarantined: Vec<QuarantineReason>,
+}
+
+/// A token's net raw change in the vault across a quarantined tx's legs.
+#[derive(Debug, PartialEq, Eq)]
+enum NetVaultChange {
+    /// More was deposited than withdrawn, by this amount.
+    In(U256),
+    /// More was withdrawn than deposited, by this amount.
+    Out(U256),
+}
+
+impl std::fmt::Display for NetVaultChange {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::In(amount) => write!(formatter, "+{amount}"),
+            Self::Out(amount) => write!(formatter, "-{amount}"),
+        }
+    }
+}
+
+enum TxPairing<'legs> {
+    Paired(Vec<(InventoryTrade, Log)>),
+    Unpaired(&'legs InventoryLeg),
+    Quarantined(QuarantineReason),
+}
+
+/// Splits a batch's raw inventory logs into per-tx legs, so the pairing pass
+/// ([`pair_inventory_settlements`]) can pair each tx's settlements without an
+/// extra RPC round-trip. Drops the bot's own rebalancing legs (treasury
+/// moves, not venue fills), `removed: true` logs (reorg), and undecodable
+/// logs.
 ///
 /// `pub(crate)`: also reused by `OnchainTrade::try_from_tx_hash` (the manual
 /// `process-tx` recovery path) so both ingestion paths pair
@@ -431,237 +546,94 @@ pub(crate) enum WithdrawBucket {
 pub(crate) fn bucket_inventory_logs(
     inv_logs: Vec<Log>,
     bot_operator: BotOperator,
-) -> (
-    HashMap<TxHash, DepositBucket>,
-    HashMap<TxHash, WithdrawBucket>,
-) {
+) -> HashMap<TxHash, Vec<InventoryLeg>> {
     let BotOperator(bot_operator) = bot_operator;
-    let mut deposits_by_tx: HashMap<TxHash, DepositBucket> = HashMap::new();
-    let mut withdraws_by_tx: HashMap<TxHash, WithdrawBucket> = HashMap::new();
+    let mut legs_by_tx: HashMap<TxHash, Vec<InventoryLeg>> = HashMap::new();
+
     for log in inv_logs {
         let Some(topic0) = log.topic0().copied() else {
             continue;
         };
-        if topic0 == OperatorDeposit::SIGNATURE_HASH {
-            // Callers cap `to_block` at the ingestion cutoff block, so a
-            // `removed: true` OperatorDeposit here implies a reorg -- mirror
-            // the same guard applied to ClearV3/TakeOrderV3/OperatorWithdraw
-            // logs below rather than bucketing a vanished event.
-            if log.removed {
-                warn!(
-                    target: "inventory",
-                    tx_hash = ?log.transaction_hash,
-                    log_index = ?log.log_index,
-                    block_number = ?log.block_number,
-                    "Backfill returned `removed: true` for an OperatorDeposit log; \
-                     reorg detected, skipping",
-                );
-                continue;
-            }
-
-            let (Ok(decoded), Some(tx_hash)) =
-                (log.log_decode::<OperatorDeposit>(), log.transaction_hash)
-            else {
-                warn!(
-                    target: "inventory",
-                    "Skipping OperatorDeposit that failed to decode / had no tx hash",
-                );
-                continue;
-            };
-            let deposit = decoded.data().clone();
-
-            // The bot's own rebalancing also calls deposit4/withdraw4 on the
-            // inventory, emitting OperatorDeposit/OperatorWithdraw whose
-            // operator is the bot's signing wallet. Those are treasury moves, not
-            // venue fills to hedge -- drop them before bucketing/pairing.
-            if deposit.operator == bot_operator {
-                debug!(
-                    target: "inventory",
-                    ?tx_hash,
-                    "Skipping inventory event emitted by the bot's own rebalancing",
-                );
-                continue;
-            }
-
-            match deposits_by_tx.entry(tx_hash) {
-                Entry::Vacant(entry) => {
-                    entry.insert(DepositBucket::Single(deposit));
-                }
-                Entry::Occupied(mut entry) => {
-                    // deposit4/withdraw4 are independent contract calls with no
-                    // atomic settle entrypoint pairing them, so a second same-tx
-                    // deposit means this settlement cannot be safely paired 1:1.
-                    // Quarantine the whole tx (fail closed) instead of silently
-                    // overwriting a real amount and mis-hedging.
-                    error!(
-                        target: "inventory",
-                        ?tx_hash,
-                        "Multiple OperatorDeposits in one tx; settlement is ambiguous \
-                         and cannot be safely paired, quarantining the whole tx",
-                    );
-                    counter!("inventory_ambiguous_settlement_total").increment(1);
-                    entry.insert(DepositBucket::Ambiguous);
-                }
-            }
-        } else if topic0 == OperatorWithdraw::SIGNATURE_HASH {
-            // Mirror the deposit branch's reorg guard: callers cap `to_block`
-            // at the ingestion cutoff block, so `removed: true` here implies a
-            // reorg rather than a routine result.
-            if log.removed {
-                warn!(
-                    target: "inventory",
-                    tx_hash = ?log.transaction_hash,
-                    log_index = ?log.log_index,
-                    block_number = ?log.block_number,
-                    "Backfill returned `removed: true` for an OperatorWithdraw log; \
-                     reorg detected, skipping",
-                );
-                continue;
-            }
-
-            let (Ok(decoded), Some(tx_hash)) =
-                (log.log_decode::<OperatorWithdraw>(), log.transaction_hash)
-            else {
-                warn!(
-                    target: "inventory",
-                    "Skipping OperatorWithdraw that failed to decode / had no tx hash",
-                );
-                continue;
-            };
-            let withdraw = decoded.data().clone();
-
-            // Skip the bot's own rebalancing withdraws (see the deposit branch);
-            // a lone rebalance withdraw would otherwise fire the "no paired
-            // deposit" warn on every routine rebalance.
-            if withdraw.operator == bot_operator {
-                debug!(
-                    target: "inventory",
-                    ?tx_hash,
-                    "Skipping inventory event emitted by the bot's own rebalancing",
-                );
-                continue;
-            }
-
-            match withdraws_by_tx.entry(tx_hash) {
-                Entry::Vacant(entry) => {
-                    entry.insert(WithdrawBucket::Single(withdraw, Box::new(log)));
-                }
-                Entry::Occupied(mut entry) => {
-                    // Symmetric to the deposit branch: a second same-tx
-                    // withdraw is exactly as ambiguous as a second deposit --
-                    // the single deposit could fund either withdraw -- so
-                    // quarantine the whole tx (fail closed) rather than
-                    // arbitrarily pairing the first one encountered.
-                    error!(
-                        target: "inventory",
-                        ?tx_hash,
-                        "Multiple OperatorWithdraws in one tx; settlement is ambiguous \
-                         and cannot be safely paired, quarantining the whole tx",
-                    );
-                    counter!("inventory_ambiguous_settlement_total").increment(1);
-                    entry.insert(WithdrawBucket::Ambiguous);
-                }
-            }
+        let is_deposit = topic0 == OperatorDeposit::SIGNATURE_HASH;
+        if !is_deposit && topic0 != OperatorWithdraw::SIGNATURE_HASH {
+            continue;
         }
+
+        // Callers cap `to_block` at the ingestion cutoff block, so a
+        // `removed: true` leg here implies a reorg -- mirror the guard applied
+        // to ClearV3/TakeOrderV3 logs rather than pairing a vanished event.
+        if log.removed {
+            warn!(
+                target: "inventory",
+                tx_hash = ?log.transaction_hash,
+                log_index = ?log.log_index,
+                block_number = ?log.block_number,
+                is_deposit,
+                "Backfill returned `removed: true` for an inventory log; reorg detected, skipping",
+            );
+            continue;
+        }
+
+        let Some(tx_hash) = log.transaction_hash else {
+            warn!(target: "inventory", is_deposit, "Skipping inventory log with no tx hash");
+            continue;
+        };
+
+        let leg = if is_deposit {
+            let Ok(decoded) = log.log_decode::<OperatorDeposit>() else {
+                warn!(target: "inventory", ?tx_hash, "Skipping OperatorDeposit that failed to decode");
+                continue;
+            };
+            InventoryLeg::Deposit(decoded.data().clone(), Box::new(log))
+        } else {
+            let Ok(decoded) = log.log_decode::<OperatorWithdraw>() else {
+                warn!(target: "inventory", ?tx_hash, "Skipping OperatorWithdraw that failed to decode");
+                continue;
+            };
+            InventoryLeg::Withdraw(decoded.data().clone(), Box::new(log))
+        };
+
+        // The bot's own rebalancing also calls deposit4/withdraw4 on the
+        // inventory, emitting legs whose operator is the bot's signing wallet.
+        // Those are treasury moves, not venue fills to hedge.
+        if leg.operator() == bot_operator {
+            debug!(
+                target: "inventory",
+                ?tx_hash,
+                "Skipping inventory event emitted by the bot's own rebalancing",
+            );
+            continue;
+        }
+
+        legs_by_tx.entry(tx_hash).or_default().push(leg);
     }
 
-    (deposits_by_tx, withdraws_by_tx)
+    legs_by_tx
 }
 
-/// Pairs bucketed deposits and withdraws into `InventoryTrade` events, one
-/// per tx that has EXACTLY one deposit and exactly one withdraw. Any other
-/// combination (an ambiguous bucket on either side, or a leg with no
-/// counterpart at all) is quarantined -- fail closed, zero `InventoryTrade`s
-/// built for that tx -- since `deposit4`/`withdraw4` are independent calls
-/// with no atomic settlement id linking them.
+/// Pairs each tx's inventory legs into `InventoryTrade` events under the
+/// rules in SPEC.md ("InventoryTrade: a third fill source"). A tx whose legs
+/// cannot be paired is quarantined whole -- zero `InventoryTrade`s from any of
+/// its legs -- and raises an operational alert listing every leg.
 ///
 /// `pub(crate)`: shared by both the batch backfill path
 /// ([`enqueue_batch_events`]) and `OnchainTrade::try_from_tx_hash` (the
-/// manual `process-tx` recovery path) so a multi-leg settlement is
+/// manual `process-tx` recovery path) so a settlement is paired or
 /// quarantined identically regardless of which path discovers it.
 pub(crate) fn pair_inventory_settlements(
-    deposits_by_tx: HashMap<TxHash, DepositBucket>,
-    withdraws_by_tx: HashMap<TxHash, WithdrawBucket>,
-) -> Vec<(RaindexTradeEvent, Log)> {
-    let mut buckets_by_tx: HashMap<TxHash, (Option<DepositBucket>, Option<WithdrawBucket>)> =
-        HashMap::new();
-    for (tx_hash, deposit_bucket) in deposits_by_tx {
-        buckets_by_tx.entry(tx_hash).or_default().0 = Some(deposit_bucket);
-    }
-    for (tx_hash, withdraw_bucket) in withdraws_by_tx {
-        buckets_by_tx.entry(tx_hash).or_default().1 = Some(withdraw_bucket);
-    }
+    legs_by_tx: HashMap<TxHash, Vec<InventoryLeg>>,
+    chain: Chain,
+) -> PairedSettlements {
+    let settlement_stable = chain.settlement_stable().address;
+    let mut paired = PairedSettlements {
+        trades: Vec::new(),
+        quarantined: Vec::new(),
+    };
 
-    // A plain loop rather than a `filter_map`: every non-pairing arm below has
-    // to log and increment a counter, and burying those side effects inside a
-    // transform hides the quarantine logic that is the whole point of this
-    // function.
-    let mut paired = Vec::new();
-    for (tx_hash, (deposit_bucket, withdraw_bucket)) in buckets_by_tx {
-        match (deposit_bucket, withdraw_bucket) {
-            (Some(DepositBucket::Single(deposit)), Some(WithdrawBucket::Single(withdraw, log)))
-                if deposit.operator == withdraw.operator =>
-            {
-                let inv = InventoryTrade { deposit, withdraw };
-                paired.push((RaindexTradeEvent::InventoryTrade(Box::new(inv)), *log));
-            }
-            (Some(DepositBucket::Single(deposit)), Some(WithdrawBucket::Single(withdraw, _))) => {
-                // The single deposit and single withdraw in this tx were emitted
-                // by different OPERATOR_ROLE holders, so they are not the two
-                // legs of the same settlement -- pairing them would fabricate a
-                // vault delta between two unrelated actions and produce a wrong
-                // hedge. Quarantine, same fail-closed treatment as a multi-leg
-                // ambiguous tx.
-                error!(
-                    target: "inventory",
-                    ?tx_hash,
-                    deposit_operator = ?deposit.operator,
-                    withdraw_operator = ?withdraw.operator,
-                    "Settlement quarantined: OperatorDeposit and OperatorWithdraw in this \
-                     tx were emitted by different operators and cannot be safely paired; \
-                     no hedge emitted",
-                );
-                counter!("inventory_ambiguous_settlement_total").increment(1);
-            }
-            (Some(DepositBucket::Ambiguous), Some(WithdrawBucket::Ambiguous)) => {
-                error!(
-                    target: "inventory",
-                    ?tx_hash,
-                    "Settlement quarantined: both OperatorDeposit and OperatorWithdraw \
-                     are ambiguous (multiple of each) in this tx; no hedge emitted",
-                );
-            }
-            (Some(DepositBucket::Ambiguous), Some(WithdrawBucket::Single(..))) => {
-                error!(
-                    target: "inventory",
-                    ?tx_hash,
-                    "Settlement quarantined: ambiguous multi-deposit tx; no hedge emitted",
-                );
-            }
-            (Some(DepositBucket::Ambiguous), None) => {
-                error!(
-                    target: "inventory",
-                    ?tx_hash,
-                    "Settlement quarantined: ambiguous multi-deposit tx never claimed by \
-                     an OperatorWithdraw; no hedge emitted",
-                );
-            }
-            (Some(DepositBucket::Single(_)), Some(WithdrawBucket::Ambiguous)) => {
-                error!(
-                    target: "inventory",
-                    ?tx_hash,
-                    "Settlement quarantined: ambiguous multi-withdraw tx; no hedge emitted",
-                );
-            }
-            (None, Some(WithdrawBucket::Ambiguous)) => {
-                error!(
-                    target: "inventory",
-                    ?tx_hash,
-                    "Settlement quarantined: ambiguous multi-withdraw tx with no \
-                     OperatorDeposit; no hedge emitted",
-                );
-            }
-            (Some(DepositBucket::Single(deposit)), None) => {
+    for (tx_hash, legs) in legs_by_tx {
+        match pair_tx_legs(&legs, settlement_stable) {
+            TxPairing::Paired(trades) => paired.trades.extend(trades),
+            TxPairing::Unpaired(InventoryLeg::Deposit(deposit, _)) => {
                 warn!(
                     target: "inventory",
                     ?tx_hash,
@@ -672,7 +644,7 @@ pub(crate) fn pair_inventory_settlements(
                 );
                 counter!("inventory_unpaired_settlement_total", "leg" => "deposit").increment(1);
             }
-            (None, Some(WithdrawBucket::Single(withdraw, _))) => {
+            TxPairing::Unpaired(InventoryLeg::Withdraw(withdraw, _)) => {
                 warn!(
                     target: "inventory",
                     ?tx_hash,
@@ -683,11 +655,156 @@ pub(crate) fn pair_inventory_settlements(
                 );
                 counter!("inventory_unpaired_settlement_total", "leg" => "withdraw").increment(1);
             }
-            (None, None) => {}
+            TxPairing::Quarantined(reason) => {
+                let legs_summary = legs.iter().join("; ");
+                let net_vault_change = net_vault_change_by_token(&legs).map_or_else(
+                    || "a per-token sum overflows U256".to_owned(),
+                    |changes| {
+                        changes
+                            .iter()
+                            .map(|(token, change)| format!("{token}: {change}"))
+                            .join(", ")
+                    },
+                );
+                error!(
+                    target: "operational_alert",
+                    alert = true,
+                    kind = AlertKind::InventorySettlementQuarantined.as_str(),
+                    %chain,
+                    ?tx_hash,
+                    %reason,
+                    legs = %legs_summary,
+                    %net_vault_change,
+                    "Inventory settlement quarantined: the inventory legs of this tx cannot be \
+                     paired into settlements, so none of them is hedged or recorded in the \
+                     position; cover the net vault change by hand",
+                );
+                counter!("inventory_ambiguous_settlement_total", "reason" => reason.label())
+                    .increment(1);
+                paired.quarantined.push(reason);
+            }
         }
     }
 
     paired
+}
+
+/// Pairs one tx's legs. Each consecutive deposit and withdraw of one operator
+/// is a settlement; see [`pair_inventory_settlements`] for the rules.
+fn pair_tx_legs(legs: &[InventoryLeg], settlement_stable: Address) -> TxPairing<'_> {
+    if let [only_leg] = legs {
+        return TxPairing::Unpaired(only_leg);
+    }
+
+    let mut seen_log_indices = HashSet::new();
+    let ordered = legs.iter().all(|leg| {
+        leg.log()
+            .log_index
+            .is_some_and(|log_index| seen_log_indices.insert(log_index))
+    });
+    if !ordered {
+        return TxPairing::Quarantined(QuarantineReason::UnorderedLegs);
+    }
+
+    let mut trades = Vec::new();
+    for (operator, operator_legs) in legs
+        .iter()
+        .into_group_map_by(|leg| leg.operator())
+        .into_iter()
+        .sorted_by_key(|(operator, _)| *operator)
+    {
+        match pair_operator_legs(operator, operator_legs) {
+            Ok(operator_trades) => trades.extend(operator_trades),
+            Err(reason) => return TxPairing::Quarantined(reason),
+        }
+    }
+
+    // Every pair of a multi-pair tx must hold one settlement-stable leg: then
+    // each other token's legs are emitted unchanged, so the recorded fills
+    // sum to the tx's net vault change whichever legs were paired together.
+    if trades.len() > 1
+        && let Some((trade, _)) = trades.iter().find(|(trade, _)| {
+            (trade.deposit.token == settlement_stable)
+                == (trade.withdraw.token == settlement_stable)
+        })
+    {
+        return TxPairing::Quarantined(QuarantineReason::InvalidPairTokens {
+            operator: trade.deposit.operator,
+        });
+    }
+
+    trades.sort_by_key(|(_, log)| log.log_index);
+    TxPairing::Paired(trades)
+}
+
+/// Pairs one operator's legs, which must strictly alternate between deposit
+/// and withdraw and come out even. Settlements by one operator in one tx are
+/// assumed not to nest, so each settlement's two legs are adjacent.
+fn pair_operator_legs(
+    operator: Address,
+    mut legs: Vec<&InventoryLeg>,
+) -> Result<Vec<(InventoryTrade, Log)>, QuarantineReason> {
+    legs.sort_by_key(|leg| leg.log().log_index);
+
+    if legs
+        .iter()
+        .tuple_windows()
+        .any(|(earlier, later)| earlier.is_deposit() == later.is_deposit())
+    {
+        return Err(QuarantineReason::ConsecutiveSameKind { operator });
+    }
+
+    if !legs.len().is_multiple_of(2) {
+        return Err(QuarantineReason::UnequalLegCounts { operator });
+    }
+
+    legs.into_iter()
+        .tuples()
+        .map(|pair| match pair {
+            (InventoryLeg::Deposit(deposit, _), InventoryLeg::Withdraw(withdraw, log))
+            | (InventoryLeg::Withdraw(withdraw, log), InventoryLeg::Deposit(deposit, _)) => Ok((
+                InventoryTrade {
+                    deposit: deposit.clone(),
+                    withdraw: withdraw.clone(),
+                },
+                log.as_ref().clone(),
+            )),
+            (InventoryLeg::Deposit(..), InventoryLeg::Deposit(..))
+            | (InventoryLeg::Withdraw(..), InventoryLeg::Withdraw(..)) => {
+                Err(QuarantineReason::ConsecutiveSameKind { operator })
+            }
+        })
+        .collect()
+}
+
+/// Nets a quarantined tx's legs per token, omitting a token whose deposits
+/// and withdraws cancel out, or `None` if a sum overflows `U256` (the legs
+/// themselves are logged alongside).
+fn net_vault_change_by_token(legs: &[InventoryLeg]) -> Option<BTreeMap<Address, NetVaultChange>> {
+    let totals = legs.iter().try_fold(
+        BTreeMap::<Address, (U256, U256)>::new(),
+        |mut totals, leg| {
+            let (deposited, withdrawn) = totals.entry(leg.token()).or_default();
+            match leg {
+                InventoryLeg::Deposit(..) => *deposited = deposited.checked_add(leg.amount())?,
+                InventoryLeg::Withdraw(..) => *withdrawn = withdrawn.checked_add(leg.amount())?,
+            }
+            Some(totals)
+        },
+    )?;
+    Some(
+        totals
+            .into_iter()
+            .filter_map(|(token, (deposited, withdrawn))| {
+                let change = match deposited.cmp(&withdrawn) {
+                    std::cmp::Ordering::Greater => NetVaultChange::In(deposited - withdrawn),
+                    std::cmp::Ordering::Less => NetVaultChange::Out(withdrawn - deposited),
+                    std::cmp::Ordering::Equal => return None,
+                };
+                Some((token, change))
+            })
+            .collect(),
+    )
 }
 
 #[tracing::instrument(
@@ -718,7 +835,7 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
         .event_signature(TakeOrderV3::SIGNATURE_HASH);
 
     // Inventory events: OperatorDeposit + OperatorWithdraw are emitted as a
-    // pair per settlement tx that routes through the shared inventory (Bebop
+    // pair per settlement that routes through the shared inventory (Bebop
     // adapter, univ4 hook, or any future venue). The pair -- one deposit +
     // one withdraw, one side equity + one side USDC -- is the trade to hedge.
     let inventory_filter = Filter::new()
@@ -782,8 +899,11 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
 
     // Bucket inventory logs by tx so deposits and withdraws can be paired
     // (or quarantined) per settlement without an extra RPC round-trip.
-    let (deposits_by_tx, withdraws_by_tx) = bucket_inventory_logs(inv_logs, bot_operator);
-    let inventory_trade_events = pair_inventory_settlements(deposits_by_tx, withdraws_by_tx);
+    let inventory_trade_events =
+        pair_inventory_settlements(bucket_inventory_logs(inv_logs, bot_operator), evm_ctx.chain)
+            .trades
+            .into_iter()
+            .map(|(trade, log)| (RaindexTradeEvent::InventoryTrade(Box::new(trade)), log));
 
     let trade_events = clear_logs
         .into_iter()
@@ -4005,6 +4125,421 @@ mod tests {
                 assert_eq!(inventory_trade.withdraw.amount, uint!(2_000_000_U256));
             }
             other => panic!("expected InventoryTrade event, got {other:?}"),
+        }
+    }
+
+    const BEBOP_OPERATOR: Address = address!("0x000000000000000000000000000000000000b0b0");
+    const EQUITY: Address = address!("0x000000000000000000000000000000000000e001");
+    const DOUBLE_SETTLEMENT_TX: TxHash =
+        fixed_bytes!("0xd5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5");
+
+    /// One leg on the test harness's inventory, in `DOUBLE_SETTLEMENT_TX`.
+    fn settlement_leg(
+        is_deposit: bool,
+        operator: Address,
+        token: Address,
+        amount: U256,
+        log_index: u64,
+    ) -> Log {
+        let inventory = inventory_test_evm_ctx().inventory_address();
+        if is_deposit {
+            operator_deposit_log(
+                inventory,
+                operator,
+                token,
+                amount,
+                1_000,
+                DOUBLE_SETTLEMENT_TX,
+                log_index,
+            )
+        } else {
+            operator_withdraw_log(
+                inventory,
+                operator,
+                token,
+                amount,
+                1_000,
+                DOUBLE_SETTLEMENT_TX,
+                log_index,
+            )
+        }
+    }
+
+    /// Two Bebop settlements in one tx, each withdrawing USDC from the vault
+    /// and depositing the equity.
+    fn double_settlement_legs() -> Vec<Log> {
+        let usdc = inventory_test_evm_ctx().chain.settlement_stable().address;
+        vec![
+            settlement_leg(false, BEBOP_OPERATOR, usdc, uint!(200_000_000_U256), 10),
+            settlement_leg(
+                true,
+                BEBOP_OPERATOR,
+                EQUITY,
+                U256::from(2_000_000_000_000_000_000_u64),
+                12,
+            ),
+            settlement_leg(false, BEBOP_OPERATOR, usdc, uint!(300_000_000_U256), 20),
+            settlement_leg(
+                true,
+                BEBOP_OPERATOR,
+                EQUITY,
+                U256::from(3_000_000_000_000_000_000_u64),
+                22,
+            ),
+        ]
+    }
+
+    fn pair_logs(logs: Vec<Log>) -> PairedSettlements {
+        pair_inventory_settlements(
+            bucket_inventory_logs(logs, BotOperator(TEST_BOT_OPERATOR)),
+            inventory_test_evm_ctx().chain,
+        )
+    }
+
+    /// `(withdraw token, withdraw amount, deposit token, deposit amount, log index)`
+    /// of each paired trade, in log order.
+    fn trade_legs(paired: &PairedSettlements) -> Vec<(Address, U256, Address, U256, Option<u64>)> {
+        paired
+            .trades
+            .iter()
+            .map(|(trade, log)| {
+                (
+                    trade.withdraw.token,
+                    trade.withdraw.amount,
+                    trade.deposit.token,
+                    trade.deposit.amount,
+                    log.log_index,
+                )
+            })
+            .sorted_by_key(|legs| legs.4)
+            .collect()
+    }
+
+    #[test]
+    fn a_double_bebop_settlement_pairs_into_one_trade_per_leg() {
+        let usdc = inventory_test_evm_ctx().chain.settlement_stable().address;
+
+        let paired = pair_logs(double_settlement_legs());
+
+        assert_eq!(
+            trade_legs(&paired),
+            vec![
+                (
+                    usdc,
+                    uint!(200_000_000_U256),
+                    EQUITY,
+                    U256::from(2_000_000_000_000_000_000_u64),
+                    Some(10)
+                ),
+                (
+                    usdc,
+                    uint!(300_000_000_U256),
+                    EQUITY,
+                    U256::from(3_000_000_000_000_000_000_u64),
+                    Some(20)
+                ),
+            ]
+        );
+        assert!(paired.quarantined.is_empty());
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_double_bebop_settlement_enqueues_two_jobs_without_an_alert() {
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
+        let evm_ctx = inventory_test_evm_ctx();
+
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::json!([])); // clear events
+        push_tip_response(&asserter);
+        asserter.push_success(&serde_json::json!([])); // take events
+        push_tip_response(&asserter);
+        asserter.push_success(&serde_json::json!(double_settlement_legs())); // inventory
+        push_tip_response(&asserter);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let enqueued = enqueue_batch_events(
+            &provider,
+            &evm_ctx,
+            BotOperator(TEST_BOT_OPERATOR),
+            900,
+            1_100,
+            test_retry_strategy(),
+            job_queue,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            enqueued, 2,
+            "each Bebop settlement of the tx is its own trade"
+        );
+        assert_eq!(job_count(&apalis_pool).await, 2);
+        assert!(!logs_contain("Inventory settlement quarantined"));
+    }
+
+    #[test]
+    fn deposit_first_settlements_pair_and_are_keyed_by_each_withdraw() {
+        let usdc = inventory_test_evm_ctx().chain.settlement_stable().address;
+        let operator = address!("0x00000000000000000000000000000000000000a4");
+
+        let paired = pair_logs(vec![
+            settlement_leg(true, operator, EQUITY, uint!(2_U256), 10),
+            settlement_leg(false, operator, usdc, uint!(200_U256), 11),
+            settlement_leg(true, operator, EQUITY, uint!(3_U256), 12),
+            settlement_leg(false, operator, usdc, uint!(300_U256), 13),
+        ]);
+
+        assert_eq!(
+            trade_legs(&paired),
+            vec![
+                (usdc, uint!(200_U256), EQUITY, uint!(2_U256), Some(11)),
+                (usdc, uint!(300_U256), EQUITY, uint!(3_U256), Some(13)),
+            ]
+        );
+    }
+
+    #[test]
+    fn settlements_from_two_operators_in_one_tx_pair_per_operator() {
+        let usdc = inventory_test_evm_ctx().chain.settlement_stable().address;
+        let univ4 = address!("0x00000000000000000000000000000000000000a5");
+
+        let paired = pair_logs(vec![
+            settlement_leg(false, BEBOP_OPERATOR, usdc, uint!(100_U256), 1),
+            settlement_leg(true, univ4, EQUITY, uint!(5_U256), 2),
+            settlement_leg(true, BEBOP_OPERATOR, EQUITY, uint!(1_U256), 3),
+            settlement_leg(false, univ4, usdc, uint!(500_U256), 4),
+        ]);
+
+        assert_eq!(
+            trade_legs(&paired),
+            vec![
+                (usdc, uint!(100_U256), EQUITY, uint!(1_U256), Some(1)),
+                (usdc, uint!(500_U256), EQUITY, uint!(5_U256), Some(4)),
+            ]
+        );
+        assert!(paired.quarantined.is_empty());
+    }
+
+    #[test]
+    fn net_vault_change_is_signed_per_token_and_omits_tokens_that_cancel() {
+        let usdc = inventory_test_evm_ctx().chain.settlement_stable().address;
+        let other = address!("0x00000000000000000000000000000000000000a6");
+        let legs = bucket_inventory_logs(
+            vec![
+                settlement_leg(false, BEBOP_OPERATOR, usdc, uint!(100_U256), 1),
+                settlement_leg(true, BEBOP_OPERATOR, usdc, uint!(30_U256), 2),
+                settlement_leg(true, BEBOP_OPERATOR, EQUITY, uint!(5_U256), 3),
+                settlement_leg(true, BEBOP_OPERATOR, other, uint!(7_U256), 4),
+                settlement_leg(false, BEBOP_OPERATOR, other, uint!(7_U256), 5),
+            ],
+            BotOperator(TEST_BOT_OPERATOR),
+        )
+        .into_values()
+        .next()
+        .unwrap();
+
+        assert_eq!(
+            net_vault_change_by_token(&legs),
+            Some(BTreeMap::from([
+                (usdc, NetVaultChange::Out(uint!(70_U256))),
+                (EQUITY, NetVaultChange::In(uint!(5_U256))),
+            ]))
+        );
+        assert_eq!(NetVaultChange::Out(uint!(70_U256)).to_string(), "-70");
+        assert_eq!(NetVaultChange::In(uint!(5_U256)).to_string(), "+5");
+    }
+
+    /// Each shape below cannot be paired with certainty, so no leg of the tx
+    /// is hedged, one alert names the tx, and the counter rises once.
+    #[test]
+    #[tracing_test::traced_test]
+    fn unpairable_txs_are_quarantined_whole_with_one_alert() {
+        let usdc = inventory_test_evm_ctx().chain.settlement_stable().address;
+        let other = address!("0x00000000000000000000000000000000000000a6");
+        let metrics_handle = crate::metrics::setup().expect("install test metrics recorder");
+
+        let cases = vec![
+            (
+                "withdraw, withdraw, deposit, deposit",
+                vec![
+                    settlement_leg(false, BEBOP_OPERATOR, usdc, uint!(100_U256), 1),
+                    settlement_leg(false, BEBOP_OPERATOR, usdc, uint!(200_U256), 2),
+                    settlement_leg(true, BEBOP_OPERATOR, EQUITY, uint!(1_U256), 3),
+                    settlement_leg(true, BEBOP_OPERATOR, EQUITY, uint!(2_U256), 4),
+                ],
+                QuarantineReason::ConsecutiveSameKind {
+                    operator: BEBOP_OPERATOR,
+                },
+            ),
+            (
+                "withdraw, deposit, withdraw",
+                vec![
+                    settlement_leg(false, BEBOP_OPERATOR, usdc, uint!(100_U256), 1),
+                    settlement_leg(true, BEBOP_OPERATOR, EQUITY, uint!(1_U256), 2),
+                    settlement_leg(false, BEBOP_OPERATOR, usdc, uint!(200_U256), 3),
+                ],
+                QuarantineReason::UnequalLegCounts {
+                    operator: BEBOP_OPERATOR,
+                },
+            ),
+            (
+                "a complete pair plus a lone leg from another operator",
+                vec![
+                    settlement_leg(false, BEBOP_OPERATOR, usdc, uint!(100_U256), 1),
+                    settlement_leg(true, BEBOP_OPERATOR, EQUITY, uint!(1_U256), 2),
+                    settlement_leg(true, other, EQUITY, uint!(9_U256), 3),
+                ],
+                QuarantineReason::UnequalLegCounts { operator: other },
+            ),
+            (
+                "a USDC pair beside an equity pair",
+                vec![
+                    settlement_leg(false, BEBOP_OPERATOR, usdc, uint!(100_U256), 1),
+                    settlement_leg(true, BEBOP_OPERATOR, usdc, uint!(100_U256), 2),
+                    settlement_leg(false, BEBOP_OPERATOR, EQUITY, uint!(1_U256), 3),
+                    settlement_leg(true, BEBOP_OPERATOR, EQUITY, uint!(1_U256), 4),
+                ],
+                QuarantineReason::InvalidPairTokens {
+                    operator: BEBOP_OPERATOR,
+                },
+            ),
+        ];
+
+        for (shape, legs, expected) in cases {
+            let paired = pair_logs(legs);
+
+            assert!(paired.trades.is_empty(), "{shape}: no leg may be hedged");
+            assert_eq!(paired.quarantined, vec![expected], "{shape}");
+        }
+
+        assert!(logs_contain("operational_alert"));
+        assert!(logs_contain("Inventory settlement quarantined"));
+        assert!(logs_contain(&format!("{DOUBLE_SETTLEMENT_TX:?}")));
+        let rendered = metrics_handle.render();
+        for line in [
+            "inventory_ambiguous_settlement_total{reason=\"consecutive_same_kind\"} 1",
+            "inventory_ambiguous_settlement_total{reason=\"unequal_leg_counts\"} 2",
+            "inventory_ambiguous_settlement_total{reason=\"invalid_pair_tokens\"} 1",
+        ] {
+            assert!(rendered.contains(line), "missing {line:?} in:\n{rendered}");
+        }
+    }
+
+    /// A tx with one pair keeps today's path whatever its tokens: the
+    /// accountant, not pairing, skips a pair the bot cannot hedge.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_single_pair_is_emitted_without_the_token_check() {
+        let usdc = inventory_test_evm_ctx().chain.settlement_stable().address;
+        let weth = address!("0x4200000000000000000000000000000000000006");
+
+        for (deposit_token, withdraw_token) in [(usdc, usdc), (EQUITY, weth)] {
+            let paired = pair_logs(vec![
+                settlement_leg(false, BEBOP_OPERATOR, withdraw_token, uint!(100_U256), 1),
+                settlement_leg(true, BEBOP_OPERATOR, deposit_token, uint!(1_U256), 2),
+            ]);
+
+            assert_eq!(paired.trades.len(), 1);
+            assert!(paired.quarantined.is_empty());
+        }
+        assert!(!logs_contain("Inventory settlement quarantined"));
+    }
+
+    #[test]
+    fn a_multi_leg_tx_without_a_distinct_log_index_on_every_leg_is_quarantined() {
+        let usdc = inventory_test_evm_ctx().chain.settlement_stable().address;
+        let mut missing_index = double_settlement_legs();
+        missing_index[1].log_index = None;
+        let mut repeated_index = double_settlement_legs();
+        repeated_index[2].log_index = Some(10);
+
+        for legs in [missing_index, repeated_index] {
+            let paired = pair_logs(legs);
+
+            assert!(paired.trades.is_empty());
+            assert_eq!(paired.quarantined, vec![QuarantineReason::UnorderedLegs]);
+        }
+
+        let lone_leg_without_index = {
+            let mut leg = settlement_leg(false, BEBOP_OPERATOR, usdc, uint!(1_U256), 0);
+            leg.log_index = None;
+            leg
+        };
+        let paired = pair_logs(vec![lone_leg_without_index]);
+        assert!(paired.trades.is_empty());
+        assert!(
+            paired.quarantined.is_empty(),
+            "a lone leg stays unpaired, not quarantined"
+        );
+    }
+
+    fn arbitrary_leg() -> impl Strategy<Value = (bool, bool, bool, u64)> {
+        (any::<bool>(), any::<bool>(), any::<bool>(), 1_u64..1_000)
+    }
+
+    proptest! {
+        /// A paired tx uses every leg once, joins legs of one operator only,
+        /// and in a multi-pair tx records equity legs that sum to the tx's equity
+        /// vault change, whichever legs were joined.
+        #[test]
+        fn pairing_uses_every_leg_once_and_preserves_net_quantity(
+            legs in prop::collection::vec(arbitrary_leg(), 0..8)
+        ) {
+            let usdc = inventory_test_evm_ctx().chain.settlement_stable().address;
+            let operators = [BEBOP_OPERATOR, address!("0x00000000000000000000000000000000000000a7")];
+            let logs: Vec<Log> = legs
+                .iter()
+                .enumerate()
+                .map(|(position, (is_deposit, second_operator, is_usdc, amount))| {
+                    settlement_leg(
+                        *is_deposit,
+                        operators[usize::from(*second_operator)],
+                        if *is_usdc { usdc } else { EQUITY },
+                        U256::from(*amount),
+                        u64::try_from(position).unwrap(),
+                    )
+                })
+                .collect();
+
+            let paired = pair_logs(logs.clone());
+
+            if !paired.quarantined.is_empty() || logs.len() < 2 {
+                prop_assert!(paired.trades.is_empty());
+                return Ok(());
+            }
+
+            prop_assert_eq!(paired.trades.len() * 2, logs.len(), "every leg is used once");
+            for (trade, _) in &paired.trades {
+                prop_assert_eq!(trade.deposit.operator, trade.withdraw.operator);
+            }
+
+            if paired.trades.len() > 1 {
+                let net_equity = |deposits: bool| -> U256 {
+                    legs.iter()
+                        .filter(|(is_deposit, _, is_usdc, _)| *is_deposit == deposits && !*is_usdc)
+                        .map(|(_, _, _, amount)| U256::from(*amount))
+                        .sum()
+                };
+                let recorded_equity = |deposits: bool| -> U256 {
+                    paired
+                        .trades
+                        .iter()
+                        .filter_map(|(trade, _)| {
+                            if deposits && trade.deposit.token == EQUITY {
+                                Some(trade.deposit.amount)
+                            } else if !deposits && trade.withdraw.token == EQUITY {
+                                Some(trade.withdraw.amount)
+                            } else {
+                                None
+                            }
+                        })
+                        .sum()
+                };
+                prop_assert_eq!(recorded_equity(true), net_equity(true));
+                prop_assert_eq!(recorded_equity(false), net_equity(false));
+            }
         }
     }
 }

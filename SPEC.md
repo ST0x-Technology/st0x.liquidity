@@ -668,22 +668,52 @@ hedged for free without adapter-specific integration work.
 
 Pairing rules:
 
-- `OperatorDeposit`s are bucketed by settlement tx; each `OperatorWithdraw` is
-  matched against its same-tx bucket.
 - A leg whose `operator` is the bot's own signing wallet is the bot's own
   rebalancing (`deposit4`/`withdraw4`), not a venue fill, and is filtered out
   before pairing.
 - `deposit4`/`withdraw4` are independent contract calls with no atomic settle
-  entrypoint linking a deposit to its withdraw. A tx with more than one
-  `OperatorDeposit` cannot be safely paired, so the whole tx is quarantined
-  (fail closed) rather than risk overwriting a real amount and mis-hedging. An
-  unpaired leg (a deposit or withdraw with no counterpart in the batch) is
-  likewise dropped.
-- Both quarantine cases emit no `InventoryTrade` and increment
-  `inventory_ambiguous_settlement_total` / `inventory_unpaired_settlement_total`
-  (labeled by leg) so a dropped settlement is observable, not silent.
-- The manual `process-tx` recovery CLI command supports `InventoryTrade`
-  settlements too, using the same pairing rules.
+  entrypoint linking a deposit to its withdraw, so pairing relies on log order.
+  A tx whose only leg is one deposit or one withdraw is unpaired: it is dropped,
+  logged, and counted in `inventory_unpaired_settlement_total` (labeled by leg).
+- A tx with two or more legs needs a distinct log index on every leg. Its legs
+  are grouped by `operator` and sorted by log index. A group pairs when its
+  deposits and withdraws strictly alternate and are equal in number; each
+  consecutive two legs are one settlement and become one `InventoryTrade`,
+  identified by its withdraw's log index. Venues differ in leg order (Bebop
+  withdraws first, the Uniswap v4 hook deposits first), and either order pairs.
+- A tx that yields more than one pair also needs every pair to have exactly one
+  leg in the chain's settlement stable and the other in a different token. A tx
+  with one pair skips this check; the accountant skips a non-hedgeable pair as
+  `NonHedgeablePair`.
+- If any group fails to pair (unequal counts, two legs of one kind in a row,
+  missing or repeated log indices) or a checked pair fails the token check, the
+  whole tx is quarantined (fail closed): no `InventoryTrade` from any group. A
+  quarantine logs one `operational_alert` line ("Inventory settlement
+  quarantined") with every leg and the signed net raw vault change per token
+  (`+` into the vault, `-` out of it), and increments
+  `inventory_ambiguous_settlement_total` once, labeled by reason.
+- Pairing assumes one operator's settlements in a tx do not nest. A nested
+  settlement whose legs alternate with the outer one (W1 D2 W2 D1) is accepted
+  and mispaired. Because every pair in a multi-pair tx has exactly one
+  settlement-stable leg, each token's recorded fill quantities still sum to its
+  net vault change; only the per-fill price is misattributed. That price becomes
+  the position's last price and can delay hedging a residual below a dollar
+  value execution threshold.
+- The manual `process-tx` recovery command applies the same pairing rules and
+  processes every fill in the tx in log order: every `ClearV3`/`TakeOrderV3`
+  that converts, and every paired `InventoryTrade`. An inventory pair whose
+  conversion fails with an error the fill worker skips per fill is recorded in
+  `skipped_fills` and reported, unless an earlier run already accounted that
+  fill, and the other fills proceed. A quarantined settlement is reported as
+  `SettlementQuarantined` beside the other fills. A hedge that stops on a typed
+  rejection after its fill is settled is that fill's `HedgeRejected` report, and
+  the next fill runs. The report means the hedge needs reconciliation, not that
+  none was placed: a post-placement rejection (an order this run placed came
+  back filled without a price, or still pending) names that order, which the
+  operator checks at the broker before hedging by hand. Any other error, a
+  conversion error the fill worker does not skip included, stops the run at that
+  fill: the failure names its log index and carries the reports of the fills
+  before it, which stay accounted, and a rerun resumes after them.
 
 RUNBOOK: the persisted backfill checkpoint predates inventory ingestion, so
 resuming from it silently skips any inventory fills mined before this code's
@@ -7478,14 +7508,15 @@ effect rather than a generic intent:
   `fail-pending-offchain-order` command. `fail` would be the wrong verb here:
   the Position itself never fails -- only its orphaned order does; `--reason`
   required.
-- `process-tx` -- account an onchain fill the bot never recorded, given its
-  transaction hash: it witnesses the fill into the `OnChainTrade` log,
-  acknowledges it on the `Position`, and places the opposite-side hedge, running
-  the same `witness -> enrich -> acknowledge -> mark -> settle` exactly-once
-  sequence as the automated pipeline (see ADR 0005 and ADR 0010). Unlike the two
-  commands above it belongs to no object group -- there is no stuck aggregate to
-  recover, only a missing fill to backfill. Its accounting, execution paths, and
-  hedge placement rules are in the `process-tx` standing rule below.
+- `process-tx` -- account the onchain fills the bot never recorded, given their
+  transaction hash, and report each fill of the transaction: it witnesses each
+  fill into the `OnChainTrade` log, acknowledges it on the `Position`, and
+  places the opposite-side hedge, running the same
+  `witness -> enrich -> acknowledge -> mark -> settle` exactly-once sequence as
+  the automated pipeline (see ADR 0005 and ADR 0010). Unlike the two commands
+  above it belongs to no object group -- there is no stuck aggregate to recover,
+  only a missing fill to backfill. Its accounting, execution paths, and hedge
+  placement rules are in the `process-tx` standing rule below.
 
 **Standing rules:**
 
@@ -7840,13 +7871,20 @@ effect rather than a generic intent:
   broker placement against the trading loop through the shared counter trade
   submission lock (ADR 0014), so it does **not** require stopping the bot. It
   gates on full startup readiness (503 until then), selects the hedged chain
-  from the `chain` query (defaulting to the primary), returns the decoded fill
-  alongside its outcome, and runs the accounting and placement on a detached
-  task so a client disconnect cannot strand a placed order before its Submitted
-  event persists. Graceful shutdown stops the server and waits for that task, up
-  to the drain timeout; a request that still reaches the handler after the drain
-  began is refused with 503, and a task still running at the timeout is dropped
-  when the process exits.
+  from the `chain` query (defaulting to the primary), answers
+  `{"fills": [{log_index, fill, outcome}, ...]}` with one report per fill of the
+  transaction, and runs the accounting and placement on a detached task so a
+  client disconnect cannot strand a placed order before its Submitted event
+  persists. A run that stops at a fill answers with an error body that adds
+  `stopped_at_log_index` and the `completed` reports. A report that cannot be
+  formatted is named in the error, and the other reports are still returned, so
+  a request whose fills all ran answers 500 with them under `completed`. A hedge
+  that needs reconciliation is a `hedge_rejected` report in a success response
+  (200, CLI exit 0), so a caller checks each report's outcome, not only the
+  status, to find fills that still need an operator. Graceful shutdown stops the
+  server and waits for that task, up to the drain timeout; a request that still
+  reaches the handler after the drain began is refused with 503, and a task
+  still running at the timeout is dropped when the process exits.
 
   The claim, placement, and settlement behavior lives in the shared process-tx
   placement path used by both the CLI and the REST route; only the admission

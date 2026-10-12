@@ -11,8 +11,12 @@
 use alloy::primitives::TxHash;
 use chrono::Utc;
 use sqlx::SqlitePool;
+use tracing::{error, info};
 
 use st0x_evm::Chain;
+
+use crate::onchain::OnChainError;
+use crate::onchain::trade::TradeValidationError;
 
 /// Why the accountant skipped a fill instead of hedging it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +49,7 @@ pub(crate) enum SkipReason {
 }
 
 impl SkipReason {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::UnpriceableFill => "unpriceable_fill",
             Self::NonHedgeablePair => "non_hedgeable_pair",
@@ -56,6 +60,123 @@ impl SkipReason {
             Self::TradingDisabled => "trading_disabled",
             Self::ZeroUnderlyingAmount => "zero_underlying_amount",
         }
+    }
+}
+
+/// A fill whose decode failed with an error that is skipped per fill rather
+/// than propagated, so one anomalous fill cannot stop the others.
+#[derive(Debug)]
+pub(crate) struct FillSkip {
+    pub(crate) reason: SkipReason,
+    pub(crate) detail: String,
+    summary: &'static str,
+}
+
+impl FillSkip {
+    /// The skip for a fill whose decode failed with `error`, or `None` for a
+    /// real bug or a node fault, which must propagate. Shared by the fill
+    /// worker and `process-tx`, so both skip exactly the same fills.
+    pub(crate) fn classify(error: &OnChainError) -> Option<Self> {
+        let OnChainError::Validation(error) = error else {
+            return None;
+        };
+
+        if let TradeValidationError::InvalidSymbolConfiguration(input, output) = error {
+            return Some(Self {
+                reason: SkipReason::NonHedgeablePair,
+                detail: format!("input {input}, output {output}"),
+                summary: "Skipping event with non-hedgeable token pair",
+            });
+        }
+
+        per_fill_skip(error).map(|(reason, summary)| Self {
+            reason,
+            detail: error.to_string(),
+            summary,
+        })
+    }
+
+    /// A non-hedgeable pair is routine and logs at `info`; every other skip
+    /// leaves a fill unhedged and logs at `error`.
+    pub(crate) fn log(&self, event_type: &str, tx_hash: TxHash, log_index: u64) {
+        match self.reason {
+            SkipReason::NonHedgeablePair => info!(
+                target: "hedge",
+                event_type,
+                ?tx_hash,
+                log_index,
+                detail = %self.detail,
+                "{}",
+                self.summary,
+            ),
+            SkipReason::UnpriceableFill
+            | SkipReason::UnintrospectableToken
+            | SkipReason::InvalidInventoryAmount
+            | SkipReason::UnrecognizedInventoryToken
+            | SkipReason::UnrepresentableCashAmount
+            | SkipReason::TradingDisabled
+            | SkipReason::ZeroUnderlyingAmount => error!(
+                target: "hedge",
+                event_type,
+                ?tx_hash,
+                log_index,
+                detail = %self.detail,
+                "{}; it is left unhedged and must be reconciled manually",
+                self.summary,
+            ),
+        }
+    }
+}
+
+/// The validation rejections skipped per fill instead of propagated: the
+/// reason recorded for reconciliation and the log line's summary.
+/// `InventoryTrade` legs come from any `OPERATOR_ROLE` holder on the shared
+/// inventory, not the bot's own trusted order config, so a
+/// non-standard token, a spoofed address or a malformed amount there must not
+/// trip the conductor-wide fail-stop; an unpriceable fill is anomalous,
+/// possibly adversarial, and gets the same treatment, as does a cash leg the
+/// internal amount cannot hold, which is a legitimate on-chain transfer on a
+/// stable with more than six decimals. Everything else is a real bug or a
+/// node fault and propagates.
+fn per_fill_skip(error: &TradeValidationError) -> Option<(SkipReason, &'static str)> {
+    use TradeValidationError::*;
+
+    match error {
+        NonPositivePrice(_) => Some((
+            SkipReason::UnpriceableFill,
+            "Skipping unpriceable on-chain fill",
+        )),
+        TokenIntrospectionFailed { .. } => Some((
+            SkipReason::UnintrospectableToken,
+            "Skipping InventoryTrade fill with an unintrospectable token",
+        )),
+        UnrecognizedInventoryToken { .. } => Some((
+            SkipReason::UnrecognizedInventoryToken,
+            "Skipping InventoryTrade fill with an unrecognized token address",
+        )),
+        InvalidInventoryAmount(_) => Some((
+            SkipReason::InvalidInventoryAmount,
+            "Skipping InventoryTrade fill with an unconvertible amount",
+        )),
+        CashPrecisionLoss { .. } => Some((
+            SkipReason::UnrepresentableCashAmount,
+            "Skipping fill whose cash leg the internal amount cannot hold",
+        )),
+        NoTxHash
+        | NoLogIndex
+        | NoBlockNumber
+        | IntConversion(_)
+        | InvalidIndex(_)
+        | NoInputAtIndex(_)
+        | NoOutputAtIndex(_)
+        | InvalidSymbolConfiguration(..)
+        | TransactionNotFound(_)
+        | NodeReceiptMissing { .. }
+        | AfterClearMissingFromReceipt { .. }
+        | NegativeShares(_)
+        | NegativeUsdc(_)
+        | Float(_)
+        | NotTokenizedEquity { .. } => None,
     }
 }
 

@@ -164,6 +164,7 @@ alert_kinds! {
         AuditedOperatorCommandPanicked => "Audited operator command panicked",
         AuditedOperatorCommandTaskFailed => "Audited operator command task failed",
         OperationsAuditRecordingFailed => "Operations audit recording failed",
+        InventorySettlementQuarantined => "Inventory settlement quarantined",
     }
 }
 

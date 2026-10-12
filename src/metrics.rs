@@ -223,8 +223,8 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
     );
     metrics::describe_counter!(
         "inventory_ambiguous_settlement_total",
-        "Inventory settlements quarantined because a tx emitted multiple \
-         OperatorDeposits or multiple OperatorWithdraws and could not be safely paired"
+        "Txs whose inventory OperatorDeposit/OperatorWithdraw legs could not be paired into \
+         settlements and were quarantined unhedged, by reason"
     );
     metrics::describe_counter!(
         "inventory_unpaired_settlement_total",

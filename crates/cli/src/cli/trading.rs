@@ -7,7 +7,7 @@ use reqwest::StatusCode;
 use sqlx::SqlitePool;
 use std::io::Write;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use uuid::Uuid;
 
 use st0x_config::{BrokerCtx, Ctx, HedgedChain};
@@ -19,13 +19,12 @@ use st0x_execution::{
     OrderPlacement, OrderState, Positive, Symbol, TimeInForce, TryIntoExecutor,
 };
 use st0x_float_serde::format_float_with_fallback;
-use st0x_hedge::operator::OperatorError;
 use st0x_hedge::operator::offchain::order::{
     BrokerOrderPlacement, OrderPlacementResult, OrderPlacer,
 };
 use st0x_hedge::operator::process_tx::{
-    PlacedHedgeDisposition, ProcessTxChainContext, ProcessTxOutcome, ProcessTxReport,
-    ProcessTxStores, process_tx,
+    PlacedHedgeDisposition, ProcessTxChainContext, ProcessTxFailure, ProcessTxOutcome,
+    ProcessTxReport, ProcessTxStores, process_tx,
 };
 use st0x_registry::SymbolCache;
 
@@ -687,24 +686,34 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
     )
     .await;
 
-    let report = match result {
-        Ok(report) => report,
-        Err(failure) => {
-            let chain = trading_chain.chain;
-            match &failure {
-                OperatorError::Rejected(reason) => {
-                    warn!(%tx_hash, %chain, %reason, "process-tx rejected");
-                }
-                other => error!(%tx_hash, %chain, error = %other, "process-tx failed"),
+    let ProcessTxFailure {
+        completed,
+        stopped_at,
+        error,
+    } = match result {
+        Ok(reports) => {
+            for report in &reports {
+                render_process_tx_report(tx_hash, report, stdout)?;
             }
-            writeln!(
-                stdout,
-                "❌ Failed to process transaction {tx_hash}: {failure}"
-            )?;
-            return Err(failure.into());
+            return Ok(());
         }
+        Err(failure) => failure,
     };
-    render_process_tx_report(tx_hash, &report, stdout)
+    error!(%tx_hash, chain = %trading_chain.chain, %error, "process-tx failed");
+    for report in &completed {
+        render_process_tx_report(tx_hash, report, stdout)?;
+    }
+    match stopped_at {
+        Some(log_index) => writeln!(
+            stdout,
+            "❌ Failed to process the fill at log index {log_index} of transaction {tx_hash}: {error}. The fills above are done; a rerun resumes after them."
+        )?,
+        None => writeln!(
+            stdout,
+            "❌ Failed to process transaction {tx_hash}: {error}"
+        )?,
+    }
+    Err(error.into())
 }
 
 /// Renders the decoded fill identity before its process-tx outcome.
@@ -713,6 +722,9 @@ fn render_process_tx_report<W: Write>(
     report: &ProcessTxReport,
     stdout: &mut W,
 ) -> anyhow::Result<()> {
+    if let (None, Some(log_index)) = (&report.fill, report.log_index) {
+        writeln!(stdout, "Fill at log index {log_index}:")?;
+    }
     if let Some(fill) = &report.fill {
         writeln!(stdout, "✅ Found opposite-side trade opportunity:")?;
         writeln!(stdout, "   Transaction: {}", fill.tx_hash)?;
@@ -781,6 +793,18 @@ fn render_process_tx_outcome<W: Write>(
                 "The fill was excluded from hedging while trading was disabled and is recorded in skipped_fills. The pipeline will not hedge it: {detail}"
             )?;
         }
+        ProcessTxOutcome::FillSkipped { reason, detail } => {
+            writeln!(
+                stdout,
+                "The fill was recorded in skipped_fills as {reason} and is not hedged, as the fill worker would skip it. Reconcile it by hand: {detail}"
+            )?;
+        }
+        ProcessTxOutcome::SettlementQuarantined { reason } => {
+            writeln!(
+                stdout,
+                "The inventory legs of this transaction cannot be paired into settlements ({reason}), so none of them was accounted or hedged. Cover the net vault change by hand; the operational alert lists every leg."
+            )?;
+        }
         ProcessTxOutcome::SkippedZeroUnderlying {
             symbol,
             chain,
@@ -795,6 +819,12 @@ fn render_process_tx_outcome<W: Write>(
             writeln!(
                 stdout,
                 "Placement for {symbol} was rejected by the position's current state (a pending order, an equity transfer, or a changed net). Settled the fill."
+            )?;
+        }
+        ProcessTxOutcome::HedgeRejected { reason } => {
+            writeln!(
+                stdout,
+                "Accounted and settled the fill, but its hedge needs reconciliation: {reason}. Check any order named here at the broker before hedging by hand; it may already cover the fill."
             )?;
         }
         ProcessTxOutcome::PreflightDeferred { symbol, reason } => {
@@ -1054,6 +1084,7 @@ mod tests {
         SupportedExecutor, Usd,
     };
     use st0x_hedge::operator::offchain::order::OffchainOrderId;
+    use st0x_hedge::operator::process_tx::QuarantineReason;
     use st0x_hedge::operator::test_utils::{
         mock_alpaca_broker_ctx, try_positive_shares, try_process_tx_fill_fixture, try_setup_test_db,
     };
@@ -2879,6 +2910,17 @@ mod tests {
         );
     }
 
+    fn report(
+        fill: Option<st0x_hedge::operator::process_tx::ProcessTxFill>,
+        outcome: ProcessTxOutcome,
+    ) -> ProcessTxReport {
+        ProcessTxReport {
+            log_index: None,
+            fill,
+            outcome,
+        }
+    }
+
     /// Every process-tx outcome must render the decoded fill, when present,
     /// followed by actionable operator guidance.
     #[test]
@@ -2899,95 +2941,83 @@ mod tests {
 
         let mut cases: Vec<(ProcessTxReport, String)> = vec![
             (
-                ProcessTxReport {
-                    fill: None,
-                    outcome: ProcessTxOutcome::NoTradeableEvents,
-                },
+                report(None, ProcessTxOutcome::NoTradeableEvents),
                 format!(
                     "No tradeable events found in transaction {tx_hash}\nThis transaction may not contain orderbook events matching the configured order hash.\n"
                 ),
             ),
             (
-                ProcessTxReport {
-                    fill: None,
-                    outcome: ProcessTxOutcome::TransactionNotFound {
+                report(
+                    None,
+                    ProcessTxOutcome::TransactionNotFound {
                         tx_hash: not_found,
                         chain: st0x_evm::Chain::Ethereum,
                     },
-                },
+                ),
                 format!("Transaction {not_found} not found on ethereum\n"),
             ),
             (
-                ProcessTxReport {
-                    fill: Some(fill()),
-                    outcome: ProcessTxOutcome::AlreadyAccounted,
-                },
+                report(Some(fill()), ProcessTxOutcome::AlreadyAccounted),
                 format!(
                     "{fill_summary}Fill is already fully accounted. Nothing to do; the periodic position check hedges any unhedged exposure while trading is enabled for the symbol.\n"
                 ),
             ),
             (
-                ProcessTxReport {
-                    fill: Some(fill()),
-                    outcome: ProcessTxOutcome::PendingHedgeInFlight,
-                },
+                report(Some(fill()), ProcessTxOutcome::PendingHedgeInFlight),
                 format!(
                     "{fill_summary}An existing pending hedge is in flight; settled the fill without placing a new hedge.\n"
                 ),
             ),
             (
-                ProcessTxReport {
-                    fill: Some(fill()),
-                    outcome: ProcessTxOutcome::BelowExecutionThreshold,
-                },
+                report(Some(fill()), ProcessTxOutcome::BelowExecutionThreshold),
                 format!(
                     "{fill_summary}Trade accumulated but the position is not ready for execution yet (below the execution threshold, no price yet for a dollar value threshold, or held by an equity transfer).\n"
                 ),
             ),
             (
-                ProcessTxReport {
-                    fill: Some(fill()),
-                    outcome: ProcessTxOutcome::ExcludedFromHedging {
+                report(
+                    Some(fill()),
+                    ProcessTxOutcome::ExcludedFromHedging {
                         symbol: symbol(),
                         chain: st0x_evm::Chain::Base,
                         detail: "cover by SELL".to_string(),
                     },
-                },
+                ),
                 format!(
                     "{fill_summary}Trading is disabled for {} on base: the fill is not counter traded and was recorded in skipped_fills: cover by SELL\n",
                     symbol()
                 ),
             ),
             (
-                ProcessTxReport {
-                    fill: Some(fill()),
-                    outcome: ProcessTxOutcome::AlreadyExcluded {
+                report(
+                    Some(fill()),
+                    ProcessTxOutcome::AlreadyExcluded {
                         detail: "cover by SELL".to_string(),
                     },
-                },
+                ),
                 format!(
                     "{fill_summary}The fill was excluded from hedging while trading was disabled and is recorded in skipped_fills. The pipeline will not hedge it: cover by SELL\n"
                 ),
             ),
             (
-                ProcessTxReport {
-                    fill: None,
-                    outcome: ProcessTxOutcome::SkippedZeroUnderlying {
+                report(
+                    None,
+                    ProcessTxOutcome::SkippedZeroUnderlying {
                         symbol: symbol(),
                         chain: st0x_evm::Chain::Base,
                         detail: "converts to zero underlying shares".to_string(),
                     },
-                },
+                ),
                 format!(
                     "The fill on base converts to zero {} shares at its fill-block wrapper ratio, so it was recorded in skipped_fills and is not hedged. Reconcile it by hand: converts to zero underlying shares\n",
                     symbol()
                 ),
             ),
             (
-                ProcessTxReport {
-                    fill: Some(fill()),
-                    outcome: ProcessTxOutcome::PlacementRejected { symbol: symbol() },
-                },
+                report(
+                    Some(fill()),
+                    ProcessTxOutcome::PlacementRejected { symbol: symbol() },
+                ),
                 format!(
                     "{fill_summary}Placement for {} was rejected by the position's current state (a pending order, an equity transfer, or a changed net). Settled the fill.\n",
                     symbol()
@@ -3013,28 +3043,28 @@ mod tests {
                 symbol()
             );
             cases.push((
-                ProcessTxReport {
-                    fill: Some(fill()),
-                    outcome: ProcessTxOutcome::HedgePlaced {
+                report(
+                    Some(fill()),
+                    ProcessTxOutcome::HedgePlaced {
                         symbol: symbol(),
                         offchain_order_id: order_id,
                         shares,
                         direction: Direction::Buy,
                         disposition,
                     },
-                },
+                ),
                 expected,
             ));
         }
 
         cases.push((
-            ProcessTxReport {
-                fill: Some(fill()),
-                outcome: ProcessTxOutcome::PreflightDeferred {
+            report(
+                Some(fill()),
+                ProcessTxOutcome::PreflightDeferred {
                     symbol: symbol(),
                     reason: "fractional order notional is below the $1 minimum".to_owned(),
                 },
-            },
+            ),
             format!(
                 "{fill_summary}Trade accumulated but the placement preflight deferred the hedge for {}: fractional order notional is below the $1 minimum. Settled the fill.\n",
                 symbol()
@@ -3042,10 +3072,10 @@ mod tests {
         ));
 
         cases.push((
-            ProcessTxReport {
-                fill: Some(fill()),
-                outcome: ProcessTxOutcome::HedgePlacementCleared { symbol: symbol() },
-            },
+            report(
+                Some(fill()),
+                ProcessTxOutcome::HedgePlacementCleared { symbol: symbol() },
+            ),
             format!(
                 "{fill_summary}No hedge placed for {}: broker placement failed or the order vanished. The pending order was cleared so the normal pipeline can re-hedge.\n",
                 symbol()
@@ -3053,10 +3083,10 @@ mod tests {
         ));
 
         cases.push((
-            ProcessTxReport {
-                fill: Some(fill()),
-                outcome: ProcessTxOutcome::HedgePlacementDeferred { symbol: symbol() },
-            },
+            report(
+                Some(fill()),
+                ProcessTxOutcome::HedgePlacementDeferred { symbol: symbol() },
+            ),
             format!(
                 "{fill_summary}No hedge placed for {}: broker admission deferred the placement, so no order was left pending and the fill settled. The standing CheckPositions pipeline will hedge the exposure again once admission permits.\n",
                 symbol()
@@ -3065,13 +3095,13 @@ mod tests {
 
         let pending_deferred_order_id = OffchainOrderId::new();
         cases.push((
-            ProcessTxReport {
-                fill: Some(fill()),
-                outcome: ProcessTxOutcome::PendingHedgeDeferred {
+            report(
+                Some(fill()),
+                ProcessTxOutcome::PendingHedgeDeferred {
                     symbol: symbol(),
                     offchain_order_id: pending_deferred_order_id,
                 },
-            },
+            ),
             format!(
                 "{fill_summary}No hedge placed for {}: the live pipeline is already holding a deferred pending hedge (order {pending_deferred_order_id}) for its own retry, so the fill was settled against that retained intent. The live pipeline still owns retrying it once admission permits.\n",
                 symbol()
@@ -3086,6 +3116,56 @@ mod tests {
                 expected,
                 "unexpected output for {report:?}"
             );
+        }
+    }
+
+    /// The skip, quarantine and refused-hedge outcomes render their guidance.
+    #[test]
+    fn render_process_tx_report_covers_the_skip_quarantine_and_refusal_outcomes() {
+        let tx_hash = TxHash::repeat_byte(0x11);
+        let mut cases: Vec<(ProcessTxReport, String)> = Vec::new();
+
+        cases.push((
+            ProcessTxReport {
+                log_index: Some(7),
+                fill: None,
+                outcome: ProcessTxOutcome::FillSkipped {
+                    reason: "unpriceable_fill",
+                    detail: "non-positive price".to_string(),
+                },
+            },
+            "Fill at log index 7:\nThe fill was recorded in skipped_fills as unpriceable_fill and is not hedged, as the fill worker would skip it. Reconcile it by hand: non-positive price\n".to_string(),
+        ));
+
+        cases.push((
+            ProcessTxReport {
+                log_index: None,
+                fill: None,
+                outcome: ProcessTxOutcome::SettlementQuarantined {
+                    reason: QuarantineReason::UnorderedLegs,
+                },
+            },
+            "The inventory legs of this transaction cannot be paired into settlements (a leg has no log index, or two legs share one), so none of them was accounted or hedged. Cover the net vault change by hand; the operational alert lists every leg.\n".to_string(),
+        ));
+
+        cases.push((
+            ProcessTxReport {
+                log_index: None,
+                fill: None,
+                outcome: ProcessTxOutcome::HedgeRejected {
+                    reason: st0x_hedge::operator::RejectionReason::PositionNotFound {
+                        symbol: Symbol::new("AAPL").unwrap(),
+                    },
+                },
+            },
+            "Accounted and settled the fill, but its hedge needs reconciliation: position AAPL not found. Check any order named here at the broker before hedging by hand; it may already cover the fill.\n"
+                .to_string(),
+        ));
+
+        for (report, expected) in cases {
+            let mut buf = Vec::new();
+            render_process_tx_report(tx_hash, &report, &mut buf).expect("render must succeed");
+            assert_eq!(String::from_utf8(buf).unwrap(), expected);
         }
     }
 }

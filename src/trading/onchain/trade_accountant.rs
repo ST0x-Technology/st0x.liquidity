@@ -12,7 +12,7 @@ use alloy::rpc::types::Log;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 use st0x_config::{Ctx, HedgedChain};
 use st0x_event_sorcery::{SendError, Store};
@@ -24,7 +24,7 @@ use st0x_registry::{SymbolCache, get_symbol_lock};
 use st0x_wrapper::RatioError;
 
 use super::inclusion::EmittedOnChain;
-use super::skipped_fill::{SkipReason, record_skipped_fill};
+use super::skipped_fill::{FillSkip, SkipReason, record_skipped_fill};
 use crate::alerts::{AlertKind, Notifier};
 use crate::conductor::job::{
     BACKPRESSURE_RESCHEDULE_LIMIT, BackpressureOutcome, BackpressureStreak, Job, JobQueue, Label,
@@ -37,7 +37,7 @@ use crate::conductor::{
     skip_zero_underlying_fill, witness_onchain_fill,
 };
 use crate::offchain::order::PlaceOffchainOrderError;
-use crate::onchain::trade::{RaindexTradeEvent, TradeValidationError};
+use crate::onchain::trade::RaindexTradeEvent;
 use crate::onchain::{OnChainError, OnchainTrade};
 use crate::onchain_trade::OnChainTrade;
 use crate::vault_registry::VaultRegistry;
@@ -150,49 +150,21 @@ where
 
         let onchain_trade = match trade_result {
             Ok(trade) => trade,
-            Err(OnChainError::Validation(TradeValidationError::InvalidSymbolConfiguration(
-                input,
-                output,
-            ))) => {
-                info!(
-                    target: "hedge",
-                    event_type = trade_event.event.kind(),
-                    tx_hash = ?trade_event.tx_hash,
-                    log_index = trade_event.log_index,
-                    input,
-                    output,
-                    "Skipping event with non-hedgeable token pair"
-                );
-                persist_skipped_fill(
-                    &ctx.pool,
-                    trade_event,
-                    SkipReason::NonHedgeablePair,
-                    &format!("input {input}, output {output}"),
-                )
-                .await;
-                return Ok(());
-            }
-            Err(OnChainError::Validation(error)) => {
-                let Some((reason, summary)) = per_fill_skip(&error) else {
-                    return Err(OnChainError::Validation(error).into());
+            Err(error) => {
+                // Skip THIS fill only -- propagating the error would exhaust
+                // the worker retries and trip the conductor-wide fail-stop,
+                // letting one fill take the whole bot down.
+                let Some(skip) = FillSkip::classify(&error) else {
+                    return Err(error.into());
                 };
-
-                // Surface it loudly and skip THIS fill only -- propagating the
-                // error would exhaust the worker retries and trip the
-                // conductor-wide fail-stop, letting one fill take the whole
-                // bot down.
-                error!(
-                    target: "hedge",
-                    event_type = trade_event.event.kind(),
-                    tx_hash = ?trade_event.tx_hash,
-                    log_index = trade_event.log_index,
-                    %error,
-                    "{summary}; it is left unhedged and must be reconciled manually"
+                skip.log(
+                    trade_event.event.kind(),
+                    trade_event.tx_hash,
+                    trade_event.log_index,
                 );
-                persist_skipped_fill(&ctx.pool, trade_event, reason, &error.to_string()).await;
+                persist_skipped_fill(&ctx.pool, trade_event, skip.reason, &skip.detail).await;
                 return Ok(());
             }
-            Err(error) => return Err(error.into()),
         };
 
         let Some(mut trade) = onchain_trade else {
@@ -400,58 +372,6 @@ impl AccountForDexTrade {
         }
 
         Ok(())
-    }
-}
-
-/// The validation rejections the accountant skips per fill instead of
-/// propagating: the reason recorded for reconciliation and the log line's
-/// summary. `InventoryTrade` legs come from any `OPERATOR_ROLE` holder on the
-/// shared inventory, not the bot's own trusted order config, so a
-/// non-standard token, a spoofed address or a malformed amount there must not
-/// trip the conductor-wide fail-stop; an unpriceable fill is anomalous,
-/// possibly adversarial, and gets the same treatment, as does a cash leg the
-/// internal amount cannot hold, which is a legitimate on-chain transfer on a
-/// stable with more than six decimals. Everything else is a real bug or a
-/// node fault and propagates.
-fn per_fill_skip(error: &TradeValidationError) -> Option<(SkipReason, &'static str)> {
-    use TradeValidationError::*;
-
-    match error {
-        NonPositivePrice(_) => Some((
-            SkipReason::UnpriceableFill,
-            "Skipping unpriceable on-chain fill",
-        )),
-        TokenIntrospectionFailed { .. } => Some((
-            SkipReason::UnintrospectableToken,
-            "Skipping InventoryTrade fill with an unintrospectable token",
-        )),
-        UnrecognizedInventoryToken { .. } => Some((
-            SkipReason::UnrecognizedInventoryToken,
-            "Skipping InventoryTrade fill with an unrecognized token address",
-        )),
-        InvalidInventoryAmount(_) => Some((
-            SkipReason::InvalidInventoryAmount,
-            "Skipping InventoryTrade fill with an unconvertible amount",
-        )),
-        CashPrecisionLoss { .. } => Some((
-            SkipReason::UnrepresentableCashAmount,
-            "Skipping fill whose cash leg the internal amount cannot hold",
-        )),
-        NoTxHash
-        | NoLogIndex
-        | NoBlockNumber
-        | IntConversion(_)
-        | InvalidIndex(_)
-        | NoInputAtIndex(_)
-        | NoOutputAtIndex(_)
-        | InvalidSymbolConfiguration(..)
-        | TransactionNotFound(_)
-        | NodeReceiptMissing { .. }
-        | AfterClearMissingFromReceipt { .. }
-        | NegativeShares(_)
-        | NegativeUsdc(_)
-        | Float(_)
-        | NotTokenizedEquity { .. } => None,
     }
 }
 
@@ -2380,9 +2300,9 @@ mod tests {
     fn an_unrepresentable_cash_leg_is_skipped_per_fill() {
         let error = Usdc::from_token_amount(float!(100.0000001), 18).unwrap_err();
 
-        let (reason, _) = per_fill_skip(&error).unwrap();
+        let skip = FillSkip::classify(&OnChainError::Validation(error)).unwrap();
 
-        assert_eq!(reason, SkipReason::UnrepresentableCashAmount);
+        assert_eq!(skip.reason, SkipReason::UnrepresentableCashAmount);
     }
 
     /// A hedgeable `InventoryTrade` (real USDC leg + real equity leg, from
