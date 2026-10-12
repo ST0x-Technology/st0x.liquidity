@@ -580,14 +580,17 @@ impl QuoteResponse {
 
         let (approve, deposit) = split_steps(self.steps)?;
 
-        let approve = approve
-            .map(|approve| {
-                check_approve(&approve, origin, origin_stable, depository, request.amount)?;
-                Ok::<_, QuoteMismatch>(approve)
-            })
-            .transpose()?;
-
-        let order_id = check_deposit(&deposit, request, origin_stable, depository)?;
+        let order_id = check_steps(
+            approve.as_ref(),
+            &deposit,
+            &StepTerms {
+                chain_id: origin.chain_id(),
+                stable: origin_stable,
+                depository,
+                depositor: request.user,
+                amount: request.amount,
+            },
+        )?;
 
         let quoted = RelayOrderId(self.protocol.v2.order_id);
         if quoted != order_id {
@@ -989,17 +992,44 @@ fn split_steps(
     Ok((approve, deposit))
 }
 
+/// What a quote's approve and deposit steps must say: sent on `chain_id`,
+/// with no native value, the approve to `stable` allowing `depository`
+/// exactly `amount`, and the deposit to `depository` crediting `depositor`
+/// that `amount` of `stable`.
+pub(super) struct StepTerms {
+    pub(super) chain_id: u64,
+    pub(super) stable: Address,
+    pub(super) depository: Address,
+    pub(super) depositor: Address,
+    pub(super) amount: U256,
+}
+
+/// The one check of a quote's steps, run when the quote is parsed and again
+/// before its steps are signed. Returns the order id the deposit calldata
+/// names.
+pub(super) fn check_steps(
+    approve: Option<&StepTransaction>,
+    deposit: &StepTransaction,
+    terms: &StepTerms,
+) -> Result<RelayOrderId, QuoteMismatch> {
+    if let Some(approve) = approve {
+        check_approve(approve, terms)?;
+    }
+
+    check_deposit(deposit, terms)
+}
+
 fn check_step_envelope(
     step: QuoteStep,
     transaction: &StepTransaction,
-    origin: Chain,
+    chain_id: u64,
     target_field: QuoteField,
     expected_target: Address,
 ) -> Result<(), QuoteMismatch> {
-    if transaction.chain_id != origin.chain_id() {
+    if transaction.chain_id != chain_id {
         return Err(QuoteMismatch::StepChain {
             step,
-            expected: origin.chain_id(),
+            expected: chain_id,
             actual: transaction.chain_id,
         });
     }
@@ -1016,19 +1046,13 @@ fn check_step_envelope(
     Ok(())
 }
 
-fn check_approve(
-    approve: &StepTransaction,
-    origin: Chain,
-    origin_stable: Address,
-    depository: Address,
-    amount: U256,
-) -> Result<(), QuoteMismatch> {
+fn check_approve(approve: &StepTransaction, terms: &StepTerms) -> Result<(), QuoteMismatch> {
     check_step_envelope(
         QuoteStep::Approve,
         approve,
-        origin,
+        terms.chain_id,
         QuoteField::ApproveTarget,
-        origin_stable,
+        terms.stable,
     )?;
 
     let call =
@@ -1037,22 +1061,20 @@ fn check_approve(
             source,
         })?;
 
-    check_address(QuoteField::ApproveSpender, depository, call.spender)?;
-    check_amount(QuoteField::ApproveAmount, amount, call.amount)
+    check_address(QuoteField::ApproveSpender, terms.depository, call.spender)?;
+    check_amount(QuoteField::ApproveAmount, terms.amount, call.amount)
 }
 
 fn check_deposit(
     deposit: &StepTransaction,
-    request: &QuoteRequest,
-    origin_stable: Address,
-    depository: Address,
+    terms: &StepTerms,
 ) -> Result<RelayOrderId, QuoteMismatch> {
     check_step_envelope(
         QuoteStep::Deposit,
         deposit,
-        request.origin,
+        terms.chain_id,
         QuoteField::DepositTarget,
-        depository,
+        terms.depository,
     )?;
 
     let call = depositErc20Call::abi_decode(&deposit.data).map_err(|source| {
@@ -1062,9 +1084,9 @@ fn check_deposit(
         }
     })?;
 
-    check_address(QuoteField::Depositor, request.user, call.depositor)?;
-    check_address(QuoteField::DepositToken, origin_stable, call.token)?;
-    check_amount(QuoteField::DepositAmount, request.amount, call.amount)?;
+    check_address(QuoteField::Depositor, terms.depositor, call.depositor)?;
+    check_address(QuoteField::DepositToken, terms.stable, call.token)?;
+    check_amount(QuoteField::DepositAmount, terms.amount, call.amount)?;
 
     Ok(RelayOrderId(call.id))
 }

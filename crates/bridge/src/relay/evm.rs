@@ -17,8 +17,8 @@ use st0x_evm::{Chain, EvmError, IERC20, PreparedTransaction, Wallet};
 use super::proof::{
     PaymentTerms, RelayErc20Deposit, UnverifiedReason, check_payment, deposit_event,
 };
-use super::quote::depositErc20Call;
-use super::{QuoteField, QuoteMismatch, QuoteStep, RelayOrderId, RelayQuote, StepTransaction};
+use super::quote::{StepTerms, check_steps};
+use super::{QuoteMismatch, RelayOrderId, RelayQuote};
 use crate::{
     DepositScan, HopDirection, PreparedSwap, PreparedSwapDeposit, SwapBridge, SwapDeposit,
     SwapPayment, SwapSide,
@@ -98,21 +98,7 @@ pub enum RelayBridgeError {
     HubAsCorridorChain,
     #[error("{chain} needs at least one confirmation, or a deposit scan reads the raw head")]
     ZeroConfirmations { chain: Chain },
-    #[error("{step:?} step targets chain {step_chain}, the wallet is on chain {wallet_chain}")]
-    StepChain {
-        step: QuoteStep,
-        step_chain: u64,
-        wallet_chain: u64,
-    },
-    #[error("{step:?} step calls {actual}, expected {expected}")]
-    StepTarget {
-        step: QuoteStep,
-        expected: Address,
-        actual: Address,
-    },
-    #[error("deposit credits depositor {actual}, the signing wallet is {expected}")]
-    Depositor { expected: Address, actual: Address },
-    /// A step's calldata does not match the quote it is signed for.
+    /// A step does not match the quote or the end it is signed on.
     #[error(transparent)]
     Quote(#[from] QuoteMismatch),
     #[error("prepared approve has nonce {approve}, the deposit {deposit}: not consecutive")]
@@ -471,11 +457,7 @@ impl<W: Wallet> RelayEnd<W> {
     async fn prepare_deposit(&self, quote: &RelayQuote) -> Result<PreparedSwap, RelayBridgeError> {
         let wallet_chain = self.wallet.provider().get_chain_id().await?;
 
-        self.check_step(QuoteStep::Deposit, &quote.deposit, wallet_chain)?;
-        if let Some(step) = &quote.approve {
-            self.check_step(QuoteStep::Approve, step, wallet_chain)?;
-        }
-        self.check_calldata(quote)?;
+        self.check_steps(quote, wallet_chain)?;
 
         let approve = match &quote.approve {
             Some(step) => Some(step.data.clone()),
@@ -549,80 +531,27 @@ impl<W: Wallet> RelayEnd<W> {
         }))
     }
 
-    /// The step must be for this wallet's chain and call this end's contract.
-    fn check_step(
-        &self,
-        step: QuoteStep,
-        transaction: &StepTransaction,
-        wallet_chain: u64,
-    ) -> Result<(), RelayBridgeError> {
-        if transaction.chain_id != wallet_chain {
-            return Err(RelayBridgeError::StepChain {
-                step,
-                step_chain: transaction.chain_id,
-                wallet_chain,
-            });
-        }
+    /// [`check_steps`] again, against this end: the steps must be for this
+    /// wallet's chain, call this end's stable and depository with no native
+    /// value, and move the quoted amount from our wallet for the quote's order.
+    fn check_steps(&self, quote: &RelayQuote, wallet_chain: u64) -> Result<(), QuoteMismatch> {
+        let calldata = check_steps(
+            quote.approve.as_ref(),
+            &quote.deposit,
+            &StepTerms {
+                chain_id: wallet_chain,
+                stable: self.stable,
+                depository: self.depository,
+                depositor: self.wallet.address(),
+                amount: quote.amounts.amount_in,
+            },
+        )?;
 
-        let expected = match step {
-            QuoteStep::Approve => self.stable,
-            QuoteStep::Deposit => self.depository,
-        };
-
-        if transaction.to != expected {
-            return Err(RelayBridgeError::StepTarget {
-                step,
-                expected,
-                actual: transaction.to,
-            });
-        }
-
-        Ok(())
-    }
-
-    /// The quote's fields are public, so a quote need not come from
-    /// `RelayClient::quote`'s checks: before signing, the approve must allow
-    /// this end's depository exactly the quoted amount, and the deposit must
-    /// credit our wallet that amount of this end's stable for the quote's order.
-    fn check_calldata(&self, quote: &RelayQuote) -> Result<(), RelayBridgeError> {
-        let amount = quote.amounts.amount_in;
-
-        if let Some(step) = &quote.approve {
-            let approve = IERC20::approveCall::abi_decode(&step.data).map_err(|source| {
-                QuoteMismatch::StepCalldata {
-                    step: QuoteStep::Approve,
-                    source,
-                }
-            })?;
-
-            check_address(QuoteField::ApproveSpender, self.depository, approve.spender)?;
-            check_amount(QuoteField::ApproveAmount, amount, approve.amount)?;
-        }
-
-        let deposit = depositErc20Call::abi_decode(&quote.deposit.data).map_err(|source| {
-            QuoteMismatch::StepCalldata {
-                step: QuoteStep::Deposit,
-                source,
-            }
-        })?;
-
-        if deposit.depositor != self.wallet.address() {
-            return Err(RelayBridgeError::Depositor {
-                expected: self.wallet.address(),
-                actual: deposit.depositor,
-            });
-        }
-
-        check_address(QuoteField::DepositToken, self.stable, deposit.token)?;
-        check_amount(QuoteField::DepositAmount, amount, deposit.amount)?;
-
-        let calldata = RelayOrderId(deposit.id);
         if calldata != quote.order_id {
             return Err(QuoteMismatch::OrderIdMismatch {
                 quoted: quote.order_id,
                 calldata,
-            }
-            .into());
+            });
         }
 
         Ok(())
@@ -982,34 +911,6 @@ impl<W: Wallet> RelayEnd<W> {
     }
 }
 
-fn check_address(
-    field: QuoteField,
-    expected: Address,
-    actual: Address,
-) -> Result<(), QuoteMismatch> {
-    if actual == expected {
-        return Ok(());
-    }
-
-    Err(QuoteMismatch::AddressMismatch {
-        field,
-        expected,
-        actual,
-    })
-}
-
-fn check_amount(field: QuoteField, expected: U256, actual: U256) -> Result<(), QuoteMismatch> {
-    if actual == expected {
-        return Ok(());
-    }
-
-    Err(QuoteMismatch::AmountMismatch {
-        field,
-        expected,
-        actual,
-    })
-}
-
 /// The approve must sit at the nonce right before its deposit.
 fn check_pair_nonces(
     approve: &PreparedTransaction,
@@ -1086,8 +987,12 @@ mod tests {
     use st0x_evm::Evm;
     use st0x_evm::local::RawPrivateKeyWallet;
 
+    use super::super::quote::depositErc20Call;
     use super::super::test_chain::RelayChain;
-    use super::super::{BasisPoints, QuoteAmounts, QuoteFees, RelayRequestId};
+    use super::super::{
+        BasisPoints, QuoteAmounts, QuoteFees, QuoteField, QuoteStep, RelayRequestId,
+        StepTransaction,
+    };
     use super::*;
 
     type TestWallet = RawPrivateKeyWallet<DynProvider>;
@@ -1979,7 +1884,11 @@ mod tests {
         assert!(
             matches!(
                 error,
-                RelayBridgeError::Depositor { actual, .. } if actual == other
+                RelayBridgeError::Quote(QuoteMismatch::AddressMismatch {
+                    field: QuoteField::Depositor,
+                    actual,
+                    ..
+                }) if actual == other
             ),
             "{error:?}"
         );
@@ -2131,8 +2040,11 @@ mod tests {
         assert!(
             matches!(
                 error,
-                RelayBridgeError::StepTarget { step: QuoteStep::Deposit, actual, .. }
-                    if actual == harness.hub.depository
+                RelayBridgeError::Quote(QuoteMismatch::AddressMismatch {
+                    field: QuoteField::DepositTarget,
+                    actual,
+                    ..
+                }) if actual == harness.hub.depository
             ),
             "{error:?}"
         );
@@ -2153,11 +2065,11 @@ mod tests {
         assert!(
             matches!(
                 error,
-                RelayBridgeError::StepChain {
+                RelayBridgeError::Quote(QuoteMismatch::StepChain {
                     step: QuoteStep::Deposit,
-                    step_chain: 31_337,
-                    wallet_chain: 31_338,
-                }
+                    expected: 31_338,
+                    actual: 31_337,
+                })
             ),
             "{error:?}"
         );

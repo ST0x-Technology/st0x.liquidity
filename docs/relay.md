@@ -234,14 +234,12 @@ broadcasting them, at consecutive nonces, and returns both
 `PreparedTransaction`s (`PreparedSwap::Deposit`) for the caller to persist. When
 the persist fails, `discard_prepared` releases both nonces, the deposit's first;
 after a restart, `restore_prepared` reserves a persisted swap's nonces, and the
-caller restores every persisted swap before any other send from that wallet. It
-refuses a step for another chain than the wallet's, a step that calls another
-contract than the origin's stable (approve) or depository (deposit), and a
-deposit that credits another depositor than the signing wallet. `RelayQuote`'s
-fields are public, so it checks the calldata again before signing
-(`RelayBridgeError::Quote`): the approve allows the depository exactly
-`amount_in`, and the deposit is `amount_in` of the origin stable for the quote's
-order id.
+caller restores every persisted swap before any other send from that wallet.
+Before signing it runs the quote's step check again, against its own end
+(`RelayBridgeError::Quote`): each step is on the wallet's chain and sends no
+native value (the wallet signs none), the approve calls the stable and allows
+the depository exactly `amount_in`, and the deposit calls the depository and
+credits the signing wallet `amount_in` of the stable for the quote's order id.
 
 - The approve is estimated and padded as usual. With no approve step in the
   quote, the bridge reads the allowance and signs its own exact
