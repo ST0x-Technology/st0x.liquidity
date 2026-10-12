@@ -23,8 +23,9 @@ use tracing::{error, info, warn};
 use st0x_bridge::cctp::{AttestationResponse, CctpError, UsdcTransferStatus};
 use st0x_bridge::corridor::{HopKind, UsdcCorridor};
 use st0x_bridge::relay::{
-    BasisPoints, QuoteAmounts, QuoteBounds, QuoteFees, QuoteRequest, RelayBridge, RelayBridgeError,
-    RelayClient, RelayOrderId, RelayQuote, RelayRequestId, StepTransaction,
+    AcceptedRelayQuote, BasisPoints, QuoteAcceptanceError, QuoteAmounts, QuoteBounds, QuoteFees,
+    QuoteRequest, RecordedRelayQuote, RelayBridge, RelayBridgeError, RelayClient, RelayOrderId,
+    RelayRequestId, StepTransaction,
 };
 use st0x_bridge::{BridgeDirection, HopDirection, PreparedSwap, PreparedSwapDeposit, SwapBridge};
 use st0x_config::RelayHopCtx;
@@ -181,7 +182,7 @@ impl<Signer: Wallet> RelayHop<Signer> {
 
         // After a split the allowance may already cover the deposit: the
         // bridge reads it and signs an approve only when it falls short.
-        let relay_quote = relay_quote(quote, split_approves.is_empty())?;
+        let relay_quote = relay_quote(id, quote, split_approves.is_empty(), &self.bounds)?;
         let prepared = self.sign_before(id, relay_quote, deadline).await?;
 
         match prepared {
@@ -211,7 +212,7 @@ impl<Signer: Wallet> RelayHop<Signer> {
     async fn sign_before(
         self: &Arc<Self>,
         id: &UsdcRebalanceId,
-        quote: RelayQuote,
+        quote: AcceptedRelayQuote,
         deadline: Instant,
     ) -> Result<PreparedSwap, UsdcTransferError> {
         let hop = Arc::clone(self);
@@ -512,7 +513,7 @@ where
 
         let amount_u256 = usdc_to_u256(amount)?;
         let preflight = self.accepted_quote(id, amount_u256).await?;
-        info!(target: "rebalance", %id, %amount, request_id = %preflight.request_id, "Relay pre-flight quote accepted");
+        info!(target: "rebalance", %id, %amount, request_id = %preflight.request_id(), "Relay pre-flight quote accepted");
 
         self.withdraw_from_vault(id, amount, amount_u256).await?;
         self.quote_swap_after_withdrawal(id, amount).await
@@ -568,10 +569,9 @@ where
         &self,
         id: &UsdcRebalanceId,
         amount_in: U256,
-    ) -> Result<RelayQuote, UsdcTransferError> {
+    ) -> Result<AcceptedRelayQuote, UsdcTransferError> {
         let RelayHopCtx {
             slippage_bps,
-            max_quote_loss_bps,
             fill_timeout,
             ..
         } = self.hop.bounds;
@@ -588,20 +588,7 @@ where
         };
         let quote = self.hop.client.quote(&request).await.map_err(Box::new)?;
 
-        // The chain-to-Alpaca leg after the hop is the Alpaca deposit, which
-        // sets no minimum; the trigger's `min_transfer` sizes against it.
-        let bounds = QuoteBounds {
-            max_loss: basis_points(max_quote_loss_bps)?,
-            downstream_minimum: U256::ZERO,
-        };
-        quote.amounts.accept(&bounds).map_err(|source| {
-            UsdcTransferError::SwapQuoteOutOfBounds {
-                id: id.clone(),
-                source,
-            }
-        })?;
-
-        Ok(quote)
+        accept_quote(id, &self.hop.bounds, |bounds| quote.accept(bounds))
     }
 
     /// Signs and persists the pair, or picks up the one already persisted,
@@ -821,23 +808,44 @@ fn quote_expired(
         || stale_at.is_none_or(|stale_at| now >= stale_at)
 }
 
+/// Accepts a quote within the corridor's bounds. The chain-to-Alpaca leg
+/// after the hop is the Alpaca deposit, which sets no minimum; the trigger's
+/// `min_transfer` sizes against it.
+fn accept_quote(
+    id: &UsdcRebalanceId,
+    ctx: &RelayHopCtx,
+    accept: impl FnOnce(&QuoteBounds) -> Result<AcceptedRelayQuote, QuoteAcceptanceError>,
+) -> Result<AcceptedRelayQuote, UsdcTransferError> {
+    let bounds = QuoteBounds {
+        max_loss: basis_points(ctx.max_quote_loss_bps)?,
+        downstream_minimum: U256::ZERO,
+    };
+
+    accept(&bounds).map_err(|source| UsdcTransferError::SwapQuoteOutOfBounds {
+        id: id.clone(),
+        source,
+    })
+}
+
 /// The persisted form of an accepted quote.
-fn swap_quote(quote: &RelayQuote, slippage_bps: u16, origin_from_block: u64) -> SwapQuote {
-    let RelayRequestId(request_id) = quote.request_id;
-    let RelayOrderId(order_id) = quote.order_id;
+fn swap_quote(quote: &AcceptedRelayQuote, slippage_bps: u16, origin_from_block: u64) -> SwapQuote {
+    let RelayRequestId(request_id) = quote.request_id();
+    let RelayOrderId(order_id) = quote.order_id();
+    let amounts = quote.amounts();
+    let fees = quote.fees();
 
     SwapQuote {
         request_id,
         order_id,
-        amount_in: quote.amounts.amount_in,
-        expected_out: quote.amounts.expected_out,
-        minimum_out: quote.amounts.minimum_out,
+        amount_in: amounts.amount_in,
+        expected_out: amounts.expected_out,
+        minimum_out: amounts.minimum_out,
         slippage_bps,
-        relayer_fee: quote.fees.relayer,
-        gas_fee: quote.fees.gas,
-        deadline: DateTime::<Utc>::from(quote.deadline),
-        approve: quote.approve.as_ref().map(swap_step),
-        deposit: swap_step(&quote.deposit),
+        relayer_fee: fees.relayer,
+        gas_fee: fees.gas,
+        deadline: DateTime::<Utc>::from(quote.deadline()),
+        approve: quote.approve().map(swap_step),
+        deposit: swap_step(quote.deposit()),
         origin_from_block,
     }
 }
@@ -861,9 +869,14 @@ fn step_transaction(step: &SwapStep) -> StepTransaction {
 }
 
 /// The quote a persisted `SwapQuote` was recorded from, without its approve
-/// when `with_approve` is false.
-fn relay_quote(quote: &SwapQuote, with_approve: bool) -> Result<RelayQuote, UsdcTransferError> {
-    Ok(RelayQuote {
+/// when `with_approve` is false, accepted again within the corridor's bounds.
+fn relay_quote(
+    id: &UsdcRebalanceId,
+    quote: &SwapQuote,
+    with_approve: bool,
+    ctx: &RelayHopCtx,
+) -> Result<AcceptedRelayQuote, UsdcTransferError> {
+    let recorded = RecordedRelayQuote {
         request_id: RelayRequestId(quote.request_id),
         order_id: RelayOrderId(quote.order_id),
         amounts: QuoteAmounts {
@@ -883,7 +896,9 @@ fn relay_quote(quote: &SwapQuote, with_approve: bool) -> Result<RelayQuote, Usdc
             .filter(|_| with_approve)
             .map(step_transaction),
         deposit: step_transaction(&quote.deposit),
-    })
+    };
+
+    accept_quote(id, ctx, |bounds| recorded.accept(bounds))
 }
 
 fn basis_points(bps: u16) -> Result<BasisPoints, UsdcTransferError> {
@@ -1266,6 +1281,33 @@ mod tests {
             },
             BotGasReceiptCostEnqueuer::Disabled,
         )
+    }
+
+    /// A recorded quote is accepted again before it is signed, so one the
+    /// corridor's bounds refuse is not signed.
+    #[test]
+    fn recorded_quote_outside_the_bounds_is_not_signed() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount_in = U256::from(AMOUNT_IN);
+        let mut quote =
+            crate::usdc_rebalance::swap_quote_for_test(amount_in, B256::repeat_byte(0x0e));
+        quote.expected_out = U256::from(99_000_000);
+        quote.minimum_out = U256::from(99_000_000);
+
+        let error = relay_quote(&id, &quote, true, &relay_bounds()).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                UsdcTransferError::SwapQuoteOutOfBounds {
+                    id: ref refused,
+                    source: QuoteAcceptanceError::QuoteLossExceedsBound { expected, bound },
+                } if *refused == id
+                    && expected == U256::from(99_000_000)
+                    && bound == U256::from(99_500_000)
+            ),
+            "{error:?}"
+        );
     }
 
     /// A refused pre-flight quote ends the attempt before anything is
@@ -2282,7 +2324,10 @@ mod tests {
         let PreparedSwap::Deposit(pair) = transfer
             .hop
             .bridge
-            .prepare_deposit(TO_HUB, &relay_quote(&quote, true).unwrap())
+            .prepare_deposit(
+                TO_HUB,
+                &relay_quote(&unpersisted, &quote, true, &transfer.hop.bounds).unwrap(),
+            )
             .await
             .unwrap()
         else {
