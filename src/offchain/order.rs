@@ -748,10 +748,14 @@ async fn cancel_order_events(
 ) -> Result<Vec<OffchainOrderEvent>, OffchainOrderError> {
     match entity {
         OffchainOrder::Submitted {
-            executor_order_id, ..
+            symbol,
+            executor_order_id,
+            ..
         }
         | OffchainOrder::PartiallyFilled {
-            executor_order_id, ..
+            symbol,
+            executor_order_id,
+            ..
         } => {
             let mut events = Vec::new();
             let local_filled = match entity {
@@ -759,7 +763,8 @@ async fn cancel_order_events(
                 _ => None,
             };
             let pre_cancel_events =
-                reconcile_pre_cancel(services, executor_order_id, local_filled, reason).await?;
+                reconcile_pre_cancel(services, symbol, executor_order_id, local_filled, reason)
+                    .await?;
             let cancel_short_circuit = pre_cancel_events.iter().any(|event| {
                 matches!(
                     event,
@@ -1177,14 +1182,25 @@ impl EventSourced for OffchainOrder {
 
             OffchainOrderCommand::CompleteFill { price, filled_at } => match self {
                 Self::Submitted {
-                    symbol, placed_at, ..
+                    symbol,
+                    executor_order_id,
+                    placed_at,
+                    ..
                 }
                 | Self::PartiallyFilled {
-                    symbol, placed_at, ..
+                    symbol,
+                    executor_order_id,
+                    placed_at,
+                    ..
                 }
                 | Self::Cancelling {
-                    symbol, placed_at, ..
+                    symbol,
+                    executor_order_id,
+                    placed_at,
+                    ..
                 } => {
+                    log_non_positive_fill_price(symbol, executor_order_id, price);
+
                     // Wall-clock placement-to-fill latency. A negative delta can
                     // only come from clock skew (never a real latency), so
                     // `to_std()` rejects it and the sample is skipped rather than
@@ -1994,7 +2010,12 @@ impl OffchainOrder {
                 direction,
                 executor,
                 filled_at,
-                Some(price),
+                // The dashboard rejects a trade whose price is not positive,
+                // and one such row fails the whole `/trades` response and
+                // WebSocket snapshot, so such a fill is shown without a price.
+                // The order keeps the reported price, and the command that
+                // records the fill logs it once at ERROR.
+                Positive::new(price).is_ok().then_some(price),
                 TradeOutcome::Filled,
             ),
             Self::Failed {
@@ -2448,6 +2469,22 @@ fn broker_fill_exceeds_local(
         })
 }
 
+/// Logs at ERROR when the broker reports a fill price that is not positive.
+/// Every path that emits `OffchainOrderEvent::Filled` calls this first. The
+/// fill is still recorded at the price the broker reported, so the order and
+/// the position keep the broker's figure. The dashboard shows such a fill
+/// without a price.
+fn log_non_positive_fill_price(symbol: &Symbol, executor_order_id: &ExecutorOrderId, price: Usd) {
+    if Positive::new(price).is_err() {
+        tracing::error!(
+            %symbol,
+            %executor_order_id,
+            %price,
+            "Broker fill price is not positive; recording the fill at the reported price"
+        );
+    }
+}
+
 /// Queries the broker for the current state of an order before cancellation
 /// and emits the appropriate partial-fill / fill events so the local
 /// aggregate is reconciled with the broker before the terminal Cancelled
@@ -2459,6 +2496,7 @@ fn broker_fill_exceeds_local(
 /// and not attempt the DELETE (the broker already filled).
 async fn reconcile_pre_cancel(
     services: &dyn OrderPlacer,
+    symbol: &Symbol,
     executor_order_id: &ExecutorOrderId,
     local_filled: Option<FractionalShares>,
     cancellation_reason: CancellationReason,
@@ -2508,6 +2546,7 @@ async fn reconcile_pre_cancel(
                 %executor_order_id,
                 "Broker reports order fully Filled at cancel time; reconciling without DELETE"
             );
+            log_non_positive_fill_price(symbol, executor_order_id, price);
             Ok(vec![OffchainOrderEvent::Filled {
                 price,
                 filled_at: executed_at,
@@ -4132,6 +4171,90 @@ mod tests {
 
         assert_eq!(trade.outcome, TradeOutcome::Filled);
         assert_eq!(trade.price, Some(Usd::new(float!(199.5))));
+    }
+
+    /// The dashboard rejects a non-positive price, and one such row would
+    /// fail the whole `/trades` response, so the trade is shown without it.
+    #[test]
+    fn a_fill_at_a_price_that_is_not_positive_is_shown_without_a_price() {
+        let filled_at = "2026-01-05T14:30:00Z".parse::<DateTime<Utc>>().unwrap();
+
+        for price in [float!(0), float!(-1.5)] {
+            let order = OffchainOrder::Filled {
+                symbol: Symbol::new("AAPL").unwrap(),
+                shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
+                direction: Direction::Sell,
+                executor: SupportedExecutor::AlpacaBrokerApi,
+                executor_order_id: ExecutorOrderId::new("filled-order"),
+                price: Usd::new(price),
+                placed_at: filled_at,
+                submitted_at: filled_at,
+                filled_at,
+            };
+
+            let trade = order.try_into_trade(&OffchainOrderId::new()).unwrap();
+
+            assert_eq!(trade.outcome, TradeOutcome::Filled);
+            assert_eq!(trade.price, None, "price {price:?}");
+        }
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_fill_at_price_zero_logs_one_error_and_reads_stay_silent() {
+        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let id = OffchainOrderId::new();
+
+        place_and_submit(&store, &id).await;
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::CompleteFill {
+                    price: Usd::new(float!(0)),
+                    filled_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let order = store.load(&id).await.unwrap().unwrap();
+        let OffchainOrder::Filled { price, .. } = &order else {
+            panic!("Expected Filled state, got {order:?}");
+        };
+        assert_eq!(*price, Usd::new(float!(0)));
+
+        let trade = order.try_into_trade(&id).unwrap();
+        assert_eq!(trade.price, None);
+        store
+            .load(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .try_into_trade(&id)
+            .unwrap();
+
+        logs_assert(|lines| {
+            let errors: Vec<_> = lines
+                .iter()
+                .filter(|line| line.contains("Broker fill price is not positive"))
+                .collect();
+            match errors.as_slice() {
+                [line] => {
+                    for expected in [
+                        "ERROR",
+                        "symbol=AAPL",
+                        "executor_order_id=TEST-ACCEPT",
+                        "price=0",
+                    ] {
+                        if !line.contains(expected) {
+                            return Err(format!("missing {expected} in {line}"));
+                        }
+                    }
+                    Ok(())
+                }
+                other => Err(format!("expected one ERROR line, got {other:?}")),
+            }
+        });
     }
 
     #[test]
@@ -7914,6 +8037,103 @@ mod tests {
             matches!(inner, OffchainOrder::Filled { .. }),
             "Cancel-then-broker-Filled must short-circuit to Filled, got: {inner:?}"
         );
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn cancel_against_a_broker_fill_at_price_zero_logs_one_error() {
+        fn filled_at_zero_placer() -> Arc<dyn OrderPlacer> {
+            struct Placer;
+
+            #[async_trait]
+            impl OrderPlacer for Placer {
+                async fn place_market_order(
+                    &self,
+                    _order: MarketOrder,
+                ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+                {
+                    unimplemented!()
+                }
+
+                async fn place_limit_order(
+                    &self,
+                    _order: LimitOrder,
+                ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+                {
+                    unimplemented!()
+                }
+
+                async fn cancel_order(
+                    &self,
+                    _executor_order_id: &ExecutorOrderId,
+                ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+                {
+                    panic!("cancel_order must not be called when broker reports Filled");
+                }
+
+                async fn get_order_status(
+                    &self,
+                    executor_order_id: &ExecutorOrderId,
+                ) -> Result<st0x_execution::OrderState, Box<dyn std::error::Error + Send + Sync>>
+                {
+                    Ok(st0x_execution::OrderState::Filled {
+                        order_id: executor_order_id.clone(),
+                        shares_filled: st0x_execution::Positive::new(
+                            st0x_execution::FractionalShares::new(float!(2)),
+                        )
+                        .unwrap(),
+                        price: Usd::new(float!(0)),
+                        executed_at: Utc::now(),
+                    })
+                }
+            }
+
+            Arc::new(Placer)
+        }
+
+        let store = TestStore::<OffchainOrder>::new(filled_at_zero_placer());
+        let id = OffchainOrderId::new();
+        place_and_submit(&store, &id).await;
+
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::CancelOrder {
+                    reason: CancellationReason::MarketOpenReplacement,
+                },
+            )
+            .await
+            .unwrap();
+
+        let order = store.load(&id).await.unwrap().unwrap();
+        let OffchainOrder::Filled { price, .. } = &order else {
+            panic!("Expected Filled state, got {order:?}");
+        };
+        assert_eq!(*price, Usd::new(float!(0)));
+        assert_eq!(order.try_into_trade(&id).unwrap().price, None);
+
+        logs_assert(|lines| {
+            let errors: Vec<_> = lines
+                .iter()
+                .filter(|line| line.contains("Broker fill price is not positive"))
+                .collect();
+            match errors.as_slice() {
+                [line] => {
+                    for expected in [
+                        "ERROR",
+                        "symbol=AAPL",
+                        "executor_order_id=TEST-ACCEPT",
+                        "price=0",
+                    ] {
+                        if !line.contains(expected) {
+                            return Err(format!("missing {expected} in {line}"));
+                        }
+                    }
+                    Ok(())
+                }
+                other => Err(format!("expected one ERROR line, got {other:?}")),
+            }
+        });
     }
 
     #[tokio::test]
