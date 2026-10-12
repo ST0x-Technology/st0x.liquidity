@@ -69,6 +69,7 @@ assets = [
   "PLBY",
   "TR",
   "WEN",
+  "WMT",
 ]
 
 [[pricing.trading_schedule.scopes]]
