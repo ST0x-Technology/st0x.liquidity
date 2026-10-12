@@ -93,8 +93,8 @@ forced refund, not in the docs).
 ### Rate limits
 
 Documented per key: `/quote` 50 per minute, other endpoints 200 per minute.
-Unauthenticated limits are not documented; the funded test hit none. A 429 maps
-to `RelayError::RateLimited { retry_after }` from the `Retry-After` header
+Without a key only `status` runs; its limits are not documented. A 429 maps to
+`RelayError::RateLimited { retry_after }` from the `Retry-After` header
 (seconds) and is never retried inside the client: the caller backs off.
 
 ## Traps

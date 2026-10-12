@@ -87,7 +87,7 @@ pub enum InFlightStage {
     Delayed,
 }
 
-/// Relay's `failReason`.
+/// Relay's `failReason` or `refundFailReason`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FailReason {
     Slippage,
@@ -291,9 +291,14 @@ mod tests {
         );
 
         assert_eq!(
-            report.status,
-            IntentStatus::Refunding {
-                reason: Some(FailReason::Slippage),
+            report,
+            IntentStatusReport {
+                status: IntentStatus::Refunding {
+                    reason: Some(FailReason::Slippage),
+                },
+                deposit_txs: vec![],
+                txs: vec![],
+                refund_fail_reason: None,
             }
         );
         assert!(!report.status.is_terminal());
@@ -314,17 +319,18 @@ mod tests {
         );
 
         assert_eq!(
-            report.status,
-            IntentStatus::RefundFailed {
-                reason: Some(FailReason::Slippage),
-                refund_fail_reason: FailReason::BlockedWallet,
+            report,
+            IntentStatusReport {
+                status: IntentStatus::RefundFailed {
+                    reason: Some(FailReason::Slippage),
+                    refund_fail_reason: FailReason::BlockedWallet,
+                },
+                deposit_txs: vec![],
+                txs: vec![b256!(
+                    "0xf27f49b3e941788a37775b874e1a91a711c26578c041921a24efd96cd14cea8d"
+                )],
+                refund_fail_reason: Some(FailReason::BlockedWallet),
             }
-        );
-        assert_eq!(
-            report.txs,
-            vec![b256!(
-                "0xf27f49b3e941788a37775b874e1a91a711c26578c041921a24efd96cd14cea8d"
-            )]
         );
         assert!(report.status.is_terminal());
     }
