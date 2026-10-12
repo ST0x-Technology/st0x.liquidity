@@ -1185,6 +1185,55 @@ mod tests {
         RawPrivateKeyWallet::new(&chain.wallet_key(), provider, 1).unwrap()
     }
 
+    /// A lagging node that still serves logs from blocks a reorg removed.
+    struct StaleLogs {
+        inner: DynProvider,
+    }
+
+    #[async_trait]
+    impl Provider for StaleLogs {
+        fn root(&self) -> &RootProvider {
+            self.inner.root()
+        }
+
+        async fn get_logs(&self, filter: &Filter) -> TransportResult<Vec<Log>> {
+            let mut logs = self.inner.get_logs(filter).await?;
+
+            for log in &mut logs {
+                log.block_hash = Some(B256::repeat_byte(0xee));
+            }
+
+            Ok(logs)
+        }
+    }
+
+    /// Our wallet on `chain`, behind a node whose logs name reorged-out blocks.
+    fn stale_logs_wallet(chain: &RelayChain) -> TestWallet {
+        let inner = ProviderBuilder::new()
+            .connect_http(chain.endpoint().parse().unwrap())
+            .erased();
+        let provider = StaleLogs { inner }.erased();
+
+        RawPrivateKeyWallet::new(&chain.wallet_key(), provider, 1).unwrap()
+    }
+
+    /// A bridge that scans the corridor chain through `chain_wallet`.
+    fn scan_bridge(
+        harness: &Harness,
+        chain_wallet: TestWallet,
+    ) -> RelayBridge<TestWallet, TestWallet> {
+        RelayBridge::try_from_ctx(RelayCtx {
+            chain: Chain::Robinhood,
+            ethereum_wallet: wallet(&harness.hub),
+            chain_wallet,
+            ethereum_confirmations: CONFIRMATIONS,
+            chain_confirmations: CONFIRMATIONS,
+        })
+        .unwrap()
+        .with_local_contracts(contracts(&harness.hub), contracts(&harness.chain))
+        .without_scan_backoff()
+    }
+
     /// A wallet on an endpoint nothing listens on, for checks that never
     /// reach the chain.
     fn offline_wallet() -> TestWallet {
@@ -2657,16 +2706,7 @@ mod tests {
             .await
             .unwrap();
         let deposit = harness.deposit_to_hub(B256::random()).await;
-        let bridge = RelayBridge::try_from_ctx(RelayCtx {
-            chain: Chain::Robinhood,
-            ethereum_wallet: wallet(&harness.hub),
-            chain_wallet: lagging_wallet(&harness.chain, 1),
-            ethereum_confirmations: CONFIRMATIONS,
-            chain_confirmations: CONFIRMATIONS,
-        })
-        .unwrap()
-        .with_local_contracts(contracts(&harness.hub), contracts(&harness.chain))
-        .without_scan_backoff();
+        let bridge = scan_bridge(&harness, lagging_wallet(&harness.chain, 1));
 
         let scan = bridge
             .find_recent_deposits(HopDirection::ToHub, &[deposit.order_id], from_block)
@@ -2674,6 +2714,32 @@ mod tests {
             .unwrap();
 
         assert_eq!(scan.deposits, vec![deposit]);
+    }
+
+    #[tokio::test]
+    async fn deposit_scan_refuses_a_deposit_log_from_a_reorged_out_block() {
+        let harness = Harness::new().await;
+        let from_block = harness
+            .bridge
+            .origin_block(HopDirection::ToHub)
+            .await
+            .unwrap();
+        let deposit = harness.deposit_to_hub(B256::random()).await;
+        let bridge = scan_bridge(&harness, stale_logs_wallet(&harness.chain));
+
+        let error = bridge
+            .find_recent_deposits(HopDirection::ToHub, &[deposit.order_id], from_block)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                RelayBridgeError::NotCanonical { tx, block }
+                    if tx == deposit.tx && block == deposit.block
+            ),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]
