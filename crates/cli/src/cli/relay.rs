@@ -7,7 +7,7 @@ use std::io::Write;
 use st0x_bridge::relay::{IntentStatusReport, RelayClient, RelayRequestId};
 
 /// Prints Relay's status of `request_id`: the parsed status, whether it is
-/// terminal, and every deposit and payment tx Relay lists. A status is not
+/// terminal, Relay's refund fail reason, and every deposit and payment tx Relay lists. A status is not
 /// proof of a payment; the bot adopts one only once it proves on chain.
 pub(super) async fn relay_status_command<Writer: Write>(
     stdout: &mut Writer,
@@ -18,6 +18,7 @@ pub(super) async fn relay_status_command<Writer: Write>(
         status,
         deposit_txs,
         txs,
+        refund_fail_reason,
     } = client.status(request_id).await?;
 
     writeln!(stdout, "Relay request {request_id}")?;
@@ -27,6 +28,12 @@ pub(super) async fn relay_status_command<Writer: Write>(
         "   Terminal: {}",
         if status.is_terminal() { "yes" } else { "no" }
     )?;
+    match refund_fail_reason {
+        Some(refund_fail_reason) => {
+            writeln!(stdout, "   Refund fail reason: {refund_fail_reason:?}")?;
+        }
+        None => writeln!(stdout, "   Refund fail reason: none")?,
+    }
     writeln!(stdout, "   Deposit txs: {}", tx_list(&deposit_txs))?;
     writeln!(stdout, "   Fill or refund txs: {}", tx_list(&txs))?;
     writeln!(
@@ -93,6 +100,7 @@ mod tests {
                 "Relay request {request_id}\n   \
                  Status: Refund {{ reason: Some(DepositedAmountTooLowToFill) }}\n   \
                  Terminal: yes\n   \
+                 Refund fail reason: none\n   \
                  Deposit txs: {deposit}\n   \
                  Fill or refund txs: {refund}\n   \
                  A status is not proof: the bot adopts a payment only once it proves on \
@@ -128,8 +136,52 @@ mod tests {
                 "Relay request {}\n   \
                  Status: Waiting\n   \
                  Terminal: no\n   \
+                 Refund fail reason: none\n   \
                  Deposit txs: none\n   \
                  Fill or refund txs: none\n   \
+                 A status is not proof: the bot adopts a payment only once it proves on \
+                 chain.\n",
+                B256::ZERO
+            )
+        );
+    }
+
+    /// A refund Relay could not pay prints Relay's refund fail reason.
+    #[tokio::test]
+    async fn relay_status_prints_the_refund_fail_reason() {
+        let server = MockServer::start();
+        let refund = TxHash::repeat_byte(0xe1);
+        let status = server.mock(|when, then| {
+            when.method(GET)
+                .path("/intents/status/v3")
+                .query_param("requestId", B256::ZERO.to_string());
+            then.status(200).json_body(json!({
+                "status": "refund",
+                "failReason": "N/A",
+                "refundFailReason": "BLOCKED_WALLET",
+                "inTxHashes": [],
+                "txHashes": [refund],
+            }));
+        });
+        let client = RelayClient::new(None)
+            .unwrap()
+            .with_api_base(server.base_url());
+
+        let mut stdout = Vec::new();
+        relay_status_command(&mut stdout, &client, RelayRequestId(B256::ZERO))
+            .await
+            .unwrap();
+
+        status.assert();
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            format!(
+                "Relay request {}\n   \
+                 Status: RefundFailed {{ reason: None, refund_fail_reason: BlockedWallet }}\n   \
+                 Terminal: yes\n   \
+                 Refund fail reason: BlockedWallet\n   \
+                 Deposit txs: none\n   \
+                 Fill or refund txs: {refund}\n   \
                  A status is not proof: the bot adopts a payment only once it proves on \
                  chain.\n",
                 B256::ZERO
