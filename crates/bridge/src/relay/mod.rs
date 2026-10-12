@@ -324,7 +324,8 @@ struct ErrorBody {
 }
 
 /// Maps a response to its body or to the error it carries: 429 to
-/// [`RelayError::RateLimited`], a quote `errorCode` to
+/// [`RelayError::RateLimited`], 401 and 403 to [`RelayError::Unauthorized`]
+/// whatever the body says, a quote `errorCode` to
 /// [`RelayError::QuoteRefused`], any other failure to its HTTP status.
 async fn read_json<Body: DeserializeOwned>(
     response: Response,
@@ -341,6 +342,15 @@ async fn read_json<Body: DeserializeOwned>(
             .map(Duration::from_secs);
 
         return Err(RelayError::RateLimited { retry_after });
+    }
+
+    // Relay answers a rejected key with an `errorCode` too, which must not
+    // pass for a refusal of this one quote.
+    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+        return Err(RelayError::Unauthorized {
+            endpoint,
+            status: status.as_u16(),
+        });
     }
 
     let bytes = response.bytes().await.map_err(RelayError::Transport)?;
