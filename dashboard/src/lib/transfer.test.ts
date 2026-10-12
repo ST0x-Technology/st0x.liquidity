@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import {
   kindLabel,
@@ -15,6 +16,7 @@ import {
   recoveryModeLabel,
   recoveryModeColor,
   transferWarningText,
+  forClientEnv,
   RECOVERY_GUIDE
 } from './transfer'
 
@@ -274,8 +276,11 @@ describe('stuckReasonLabel', () => {
   })
 })
 
-const PROD = { simulateSourceId: null, backendPort: null }
-const SIM = { simulateSourceId: 'sim-1', backendPort: '8123' }
+const PROD = { simulateSourceId: null, backendPort: null, clientEnv: 'production' } as const
+const STAGING = { simulateSourceId: null, backendPort: null, clientEnv: 'staging' } as const
+const UNKNOWN_HOST = { simulateSourceId: null, backendPort: null, clientEnv: null } as const
+const SIM = { simulateSourceId: 'sim-1', backendPort: '8123', clientEnv: 'production' } as const
+const CLIENT = 'st0x-liquidity-client --env production'
 const SIM_PREFIX =
   'nix develop --command cargo run -p st0x-cli --features mock -- --config /tmp/st0x-simulate-failures-8123.config.toml --secrets /tmp/st0x-simulate-failures-8123.secrets.toml'
 
@@ -294,11 +299,26 @@ describe('transferRecoveryCommands', () => {
       status: 'wrapping'
     })
     expect(commands.map((entry) => entry.label)).toEqual(['Recheck', 'Resume (all equity)', 'Fail'])
-    expect(commandFor(commands, 'Recheck')).toBe('stox transfer recheck --kind mint --id ISS001')
-    expect(commandFor(commands, 'Resume (all equity)')).toBe('stox transfer resume --kind equity')
+    expect(commandFor(commands, 'Recheck')).toBe(`${CLIENT} debug recheck mint ISS001`)
+    expect(commandFor(commands, 'Resume (all equity)')).toBe(`${CLIENT} debug resume`)
     expect(commandFor(commands, 'Fail')).toBe(
-      'stox transfer fail --kind mint --id ISS001 -r "<reason>"'
+      `${CLIENT} debug fail-equity-transfer mint ISS001 --reason "<reason>"`
     )
+  })
+
+  it('says a reconciled redemption stays in flight until the next restart', () => {
+    const reconcileText = (kind: 'equity_mint' | 'equity_redemption') =>
+      transferRecoveryCommands({ deployment: PROD, kind, id: 'X1', status: 'failed' }).find(
+        (entry) => entry.label === 'Reconcile'
+      )?.description ?? ''
+    // Startup seeds a DetectionFailed or RedemptionRejected redemption's
+    // stranded amount into inflight; reconcile clears it on the next start.
+    expect(
+      reconcileText('equity_redemption').includes(
+        'If the bot started after this redemption failed at detection or was rejected'
+      )
+    ).toBe(true)
+    expect(reconcileText('equity_mint').includes('stays in flight')).toBe(false)
   })
 
   it('shows recheck + reconcile (not resume/fail) for a failed equity mint', () => {
@@ -310,7 +330,7 @@ describe('transferRecoveryCommands', () => {
     })
     expect(commands.map((entry) => entry.label)).toEqual(['Recheck', 'Reconcile'])
     expect(commandFor(commands, 'Reconcile')).toBe(
-      'stox transfer reconcile --kind mint --id ISS001 -r "<reason>"'
+      `${CLIENT} debug reconcile-equity mint ISS001 --reason "<reason>"`
     )
   })
 
@@ -321,38 +341,94 @@ describe('transferRecoveryCommands', () => {
       id: 'RED001',
       status: 'sending'
     })
-    expect(commandFor(commands, 'Recheck')).toBe(
-      'stox transfer recheck --kind redemption --id RED001'
-    )
+    expect(commandFor(commands, 'Recheck')).toBe(`${CLIENT} debug recheck redemption RED001`)
     expect(commandFor(commands, 'Fail')).toBe(
-      'stox transfer fail --kind redemption --id RED001 -r "<reason>"'
+      `${CLIENT} debug fail-equity-transfer redemption RED001 --reason "<reason>"`
     )
   })
 
-  it('marks recheck as requires-bot and fail/reconcile as direct-db', () => {
-    const commands = transferRecoveryCommands({
-      deployment: PROD,
+  it('targets the deployment environment with the client', () => {
+    const transfer = transferRecoveryCommands({
+      deployment: STAGING,
+      kind: 'equity_mint',
+      id: 'ISS001',
+      status: 'wrapping'
+    })
+    const trade = tradeRecoveryCommands({ deployment: STAGING, symbol: 'MSTR' })
+    expect(commandFor(transfer, 'Recheck')).toBe(
+      'st0x-liquidity-client --env staging debug recheck mint ISS001'
+    )
+    expect(commandFor(trade, 'Rebuild view')).toBe(
+      'st0x-liquidity-client --env staging debug view rebuild position --id MSTR'
+    )
+  })
+
+  it('shows an environment placeholder when the host is unknown', () => {
+    const trade = tradeRecoveryCommands({ deployment: UNKNOWN_HOST, symbol: 'MSTR' })
+    expect(commandFor(trade, 'Rebuild view')).toBe(
+      'st0x-liquidity-client --env <production|staging> debug view rebuild position --id MSTR'
+    )
+  })
+
+  it('marks every production command requires-bot, since the client calls the bot', () => {
+    const commands = [
+      ...transferRecoveryCommands({
+        deployment: PROD,
+        kind: 'equity_mint',
+        id: 'ISS001',
+        status: 'wrapping'
+      }),
+      ...transferRecoveryCommands({
+        deployment: PROD,
+        kind: 'equity_mint',
+        id: 'ISS001',
+        status: 'failed'
+      }),
+      ...tradeRecoveryCommands({ deployment: PROD, symbol: 'MSTR' })
+    ]
+    expect(commands.every((entry) => entry.mode === 'requires-bot')).toBe(true)
+  })
+
+  it('marks the mock cli fail and usdc resume as requires-bot and reconcile as direct-db', () => {
+    // The stox CLI's equity `transfer fail` and `transfer resume --kind usdc`
+    // POST to the running bot, so stopping the bot first would break them.
+    const modeFor = (commands: { label: string; mode: string }[], label: string) =>
+      commands.find((entry) => entry.label === label)?.mode
+    const inFlight = transferRecoveryCommands({
+      deployment: SIM,
+      kind: 'equity_mint',
+      id: 'ISS001',
+      status: 'wrapping'
+    })
+    const failed = transferRecoveryCommands({
+      deployment: SIM,
       kind: 'equity_mint',
       id: 'ISS001',
       status: 'failed'
     })
-    const modeFor = (label: string) => commands.find((entry) => entry.label === label)?.mode
-    expect(modeFor('Recheck')).toBe('requires-bot')
-    expect(modeFor('Reconcile')).toBe('direct-db')
+    const bridging = transferRecoveryCommands({
+      deployment: SIM,
+      kind: 'usdc_bridge',
+      id: 'BRIDGE001',
+      status: 'bridging'
+    })
+    expect(modeFor(inFlight, 'Fail')).toBe('requires-bot')
+    expect(modeFor(failed, 'Reconcile')).toBe('direct-db')
+    expect(modeFor(bridging, 'Resume')).toBe('requires-bot')
   })
 
-  it('shows only resume for a post-burn in-flight usdc bridge, placeholder direction when unknown', () => {
+  it('fills a placeholder direction on resume when the bridge direction is unknown', () => {
     const commands = transferRecoveryCommands({
       deployment: PROD,
       kind: 'usdc_bridge',
       id: 'BRIDGE001',
       status: 'bridging'
     })
-    expect(commands.map((entry) => entry.label)).toEqual(['Resume'])
+    expect(commands.map((entry) => entry.label)).toEqual(['Resume', 'Fail (pre-burn)'])
     expect(commandFor(commands, 'Resume')).toBe(
-      'stox transfer resume --kind usdc --id BRIDGE001 --direction <to-raindex|to-alpaca>'
+      `${CLIENT} debug resume-usdc <alpaca-to-base|base-to-alpaca> BRIDGE001`
     )
-    expect(commands.find((entry) => entry.label === 'Resume')?.mode).toBe('direct-db-live-rpc')
+    expect(commands.find((entry) => entry.label === 'Resume')?.mode).toBe('requires-bot')
   })
 
   it('offers resume for the depositing (post-burn) usdc bridge status', () => {
@@ -365,37 +441,203 @@ describe('transferRecoveryCommands', () => {
     expect(commands.map((entry) => entry.label)).toEqual(['Resume'])
   })
 
-  it('offers fail-usdc-transfer (not resume) for a pre-burn in-flight usdc bridge', () => {
-    // converting/withdrawing precede the CCTP burn: nothing has left the source
-    // venue, so the safe in-flight action is to terminalize, not resume.
-    for (const status of ['converting', 'withdrawing']) {
-      const commands = transferRecoveryCommands({
+  it('offers only resume for a converting usdc bridge', () => {
+    // converting comes after the deposit, where the bot always refuses
+    // fail-usdc-transfer, so resume is the only command that can work.
+    const commands = transferRecoveryCommands({
+      deployment: PROD,
+      kind: 'usdc_bridge',
+      id: 'BRIDGE001',
+      status: 'converting',
+      direction: 'base_to_alpaca'
+    })
+    expect(commands.map((entry) => entry.label)).toEqual(['Resume'])
+    expect(commandFor(commands, 'Resume')).toBe(
+      `${CLIENT} debug resume-usdc base-to-alpaca BRIDGE001`
+    )
+    // Base to Alpaca resumes a conversion from its stored order.
+    expect(commands[0]?.description.includes('cannot re-drive')).toBe(false)
+  })
+
+  it('gives both outcomes of an Alpaca to Base converting resume', () => {
+    // The status covers Converting, which resume_alpaca_to_base can only fail
+    // (no stored broker order id), and ConversionComplete, which it continues
+    // with the withdrawal. Moving USDC by hand first would double the funds leg.
+    const resumeText = (direction: 'alpaca_to_base' | null) =>
+      transferRecoveryCommands({
         deployment: PROD,
         kind: 'usdc_bridge',
         id: 'BRIDGE001',
-        status,
-        direction: 'alpaca_to_base'
-      })
-      expect(commands.map((entry) => entry.label)).toEqual(['Fail (pre-burn)'])
-      expect(commandFor(commands, 'Fail (pre-burn)')).toBe(
-        'stox fail-usdc-transfer --id BRIDGE001 -r "<reason>"'
+        status: 'converting',
+        direction
+      }).find((entry) => entry.label === 'Resume')?.description ?? ''
+    for (const direction of ['alpaca_to_base', null] as const) {
+      const text = resumeText(direction)
+      expect(text.includes('this resume continues with the Alpaca withdrawal')).toBe(true)
+      expect(text.includes('cannot re-drive the USD to USDC conversion')).toBe(true)
+      expect(text.includes('fails the transfer (ConversionFailed) and releases the guard')).toBe(
+        true
       )
-      expect(commands.find((entry) => entry.label === 'Fail (pre-burn)')?.mode).toBe('direct-db')
+      // After ConversionCancelNotSettled or ConversionOrderNotFound the order
+      // can still fill, and the resume does not ask Alpaca, so check it first.
+      const check = text.indexOf('no USD to USDC order for this transfer is still open')
+      expect(check).toBeGreaterThan(-1)
+      expect(check).toBeLessThan(text.indexOf('Do not move USDC by hand before you run the resume'))
+      // Settling at Alpaca fits only a ConversionFailed end; a later failure
+      // (say an Alpaca to Base BridgingFailed) has funds off Alpaca.
+      expect(
+        text.includes('If it ends in ConversionFailed, settle any converted USDC by hand at Alpaca')
+      ).toBe(true)
+      expect(text.includes('reconcile-usdc does not apply')).toBe(true)
+      expect(text.includes('A later failure has its own recovery')).toBe(true)
     }
   })
 
-  it('translates the DTO direction to the CLI flag vocabulary on the usdc resume command', () => {
-    // The DTO names the venue flow (alpaca_to_base) while the CLI names the
-    // Raindex-relative leg (to-raindex); the command must carry the CLI value.
-    const toRaindex = transferRecoveryCommands({
+  const bridgeLabels = (status: string, direction: 'alpaca_to_base' | 'base_to_alpaca' | null) =>
+    transferRecoveryCommands({
+      deployment: PROD,
+      kind: 'usdc_bridge',
+      id: 'BRIDGE001',
+      status,
+      direction
+    })
+
+  it('offers fail-usdc-transfer only where the running bot can accept it', () => {
+    // Alpaca to Base: WithdrawalComplete (withdrawing) and a BridgingSubmitting
+    // with no recorded burn (bridging). Base to Alpaca: an unrecorded
+    // WithdrawalSubmitting (withdrawing) only.
+    const labels = (status: string, direction: 'alpaca_to_base' | 'base_to_alpaca' | null) =>
+      bridgeLabels(status, direction).map((entry) => entry.label)
+    expect(labels('withdrawing', 'alpaca_to_base')).toEqual(['Resume', 'Fail (pre-burn)'])
+    expect(labels('bridging', 'alpaca_to_base')).toEqual(['Resume', 'Fail (pre-burn)'])
+    expect(labels('converting', 'alpaca_to_base')).toEqual(['Resume'])
+    expect(labels('withdrawing', 'base_to_alpaca')).toEqual(['Resume', 'Fail (pre-burn)'])
+    expect(labels('bridging', 'base_to_alpaca')).toEqual(['Resume'])
+    expect(labels('depositing', 'base_to_alpaca')).toEqual(['Resume'])
+    expect(labels('bridging', null)).toEqual(['Resume', 'Fail (pre-burn)'])
+  })
+
+  it('gives the pre-fail check that applies to the bridge direction', () => {
+    const failText = (status: string, direction: 'alpaca_to_base' | 'base_to_alpaca' | null) =>
+      bridgeLabels(status, direction).find((entry) => entry.label === 'Fail (pre-burn)')
+        ?.description ?? ''
+    expect(commandFor(bridgeLabels('withdrawing', 'alpaca_to_base'), 'Fail (pre-burn)')).toBe(
+      `${CLIENT} debug fail-usdc-transfer BRIDGE001 --reason "<reason>"`
+    )
+    const toBase = failText('withdrawing', 'alpaca_to_base')
+    expect(toBase.startsWith('Check the transfer first.')).toBe(true)
+    // The checks and the nonce close live in one place, the runbook, so the
+    // dialog gates the fail on them instead of keeping a second copy. The
+    // Alpaca to Base burn runs on Ethereum, and a nonce is per chain.
+    expect(
+      toBase.includes(
+        'do not fail the transfer until you have done every check and the nonce close on Ethereum in docs/cli-ops.md, "Clearing a pre-burn guard latch", with the bot stopped'
+      )
+    ).toBe(true)
+    expect(
+      toBase.includes('If a burn landed or you are not certain, run resume-usdc instead')
+    ).toBe(true)
+    // A restart sends the burn of a completed withdrawal, so the fail is the
+    // offline command, before the start.
+    expect(
+      toBase.includes(
+        'fail it with the offline stox fail-usdc-transfer before you start the bot again'
+      )
+    ).toBe(true)
+    expect(toBase.includes('the guard stays held until you settle them with reconcile-usdc')).toBe(
+      true
+    )
+    expect(toBase.includes('OperatorWithdraw')).toBe(false)
+
+    // A Base to Alpaca transfer's checks and nonce close run on Base.
+    const toAlpaca = failText('withdrawing', 'base_to_alpaca')
+    expect(toAlpaca.includes('only while the vault withdrawal is unrecorded')).toBe(true)
+    // The runbook below this stack has no full withdrawal procedure, so the
+    // dialog keeps it: both withdrawal events, the cash vault, the pending and
+    // queued checks, the nonce close and the recheck.
+    expect(toAlpaca.includes('OperatorWithdraw')).toBe(true)
+    expect(toAlpaca.includes('no WithdrawV2 on the orderbook either')).toBe(true)
+    expect(toAlpaca.includes('cash vault_id in the bot config')).toBe(true)
+    expect(
+      toAlpaca.includes('pending nonce equals latest nonce on more than one RPC provider')
+    ).toBe(true)
+    // A queued send waits behind a nonce gap; only empty nonces are filled,
+    // and only after the kept-send check.
+    const fill = toAlpaca.indexOf('fill each empty nonce below it')
+    expect(fill).toBeGreaterThan(-1)
+    expect(toAlpaca.indexOf('signed and keeps holds that nonce')).toBeGreaterThan(fill)
+    const close = toAlpaca.indexOf('close the nonce before you fail the transfer')
+    expect(close).toBeGreaterThan(-1)
+    expect(toAlpaca.indexOf('check the withdrawal logs again')).toBeGreaterThan(close)
+    expect(
+      toAlpaca.includes(
+        'If a withdrawal mined instead, a transaction is pending or queued, or you cannot tell, start the bot and run resume-usdc'
+      )
+    ).toBe(true)
+    // Resume adopts only the full amount; anything else ends in
+    // WithdrawalFailed with the USDC in the wallet.
+    expect(toAlpaca.includes('any other amount ends the transfer in WithdrawalFailed')).toBe(true)
+    // The unrecorded withdrawal can be failed through the live route too.
+    expect(
+      toAlpaca.includes(
+        'Otherwise run the offline stox fail-usdc-transfer, or this command after you restart the bot'
+      )
+    ).toBe(true)
+    // Once recorded, the burn checks apply, with the runbook as the source.
+    expect(toAlpaca.includes('"Clearing a pre-burn guard latch"')).toBe(true)
+    // A late burn is finished with the bot stopped, for the amount the mint
+    // printed.
+    expect(toAlpaca.includes('Keep the bot stopped until that USDC is at Alpaca')).toBe(true)
+    expect(toAlpaca.includes('pending, queued and kept-send checks on Ethereum')).toBe(true)
+    expect(toAlpaca.includes('divided by 1,000,000 (it prints USDC base units)')).toBe(true)
+    // A burn found by the recheck of a confirmed withdrawal is resumed,
+    // never failed.
+    expect(
+      toAlpaca.includes(
+        'If a burn landed, something is pending or queued, or you are not certain, start the bot and run resume-usdc, and do not fail the transfer'
+      )
+    ).toBe(true)
+    // Its withdrawal checks and nonce close run on Base; only a late burn's
+    // mint and deposit are on Ethereum.
+    expect(toAlpaca.includes('to itself on Ethereum')).toBe(false)
+
+    const unknown = failText('withdrawing', null)
+    expect(unknown.includes('nonce close on Ethereum')).toBe(true)
+    expect(unknown.includes('nonce close on Base')).toBe(true)
+    expect(unknown.includes('no reconcile is needed')).toBe(false)
+  })
+
+  it('points a Base to Alpaca bridge stuck at bridging to the offline fail path', () => {
+    const resumeText = (status: string, direction: 'alpaca_to_base' | 'base_to_alpaca' | null) =>
+      bridgeLabels(status, direction).find((entry) => entry.label === 'Resume')?.description ?? ''
+    // The running bot refuses fail-usdc-transfer once the vault withdrawal
+    // confirmed, so the dialog offers no Fail there and the resume says where to go.
+    expect(bridgeLabels('bridging', 'base_to_alpaca').map((entry) => entry.label)).toEqual([
+      'Resume'
+    ])
+    expect(
+      resumeText('bridging', 'base_to_alpaca').includes('CLI recovery guide for the offline path')
+    ).toBe(true)
+    for (const [status, direction] of [
+      ['withdrawing', 'base_to_alpaca'],
+      ['depositing', 'base_to_alpaca'],
+      ['bridging', 'alpaca_to_base'],
+      ['bridging', null]
+    ] as const) {
+      expect(resumeText(status, direction).includes('offline path')).toBe(false)
+    }
+  })
+
+  it('fills the bridge direction on the usdc resume command for the client', () => {
+    const toBase = transferRecoveryCommands({
       deployment: PROD,
       kind: 'usdc_bridge',
       id: 'BRIDGE001',
       status: 'bridging',
       direction: 'alpaca_to_base'
     })
-    expect(commandFor(toRaindex, 'Resume')).toBe(
-      'stox transfer resume --kind usdc --id BRIDGE001 --direction to-raindex'
+    expect(commandFor(toBase, 'Resume')).toBe(
+      `${CLIENT} debug resume-usdc alpaca-to-base BRIDGE001`
     )
 
     const toAlpaca = transferRecoveryCommands({
@@ -406,7 +648,33 @@ describe('transferRecoveryCommands', () => {
       direction: 'base_to_alpaca'
     })
     expect(commandFor(toAlpaca, 'Resume')).toBe(
-      'stox transfer resume --kind usdc --id BRIDGE002 --direction to-alpaca'
+      `${CLIENT} debug resume-usdc base-to-alpaca BRIDGE002`
+    )
+  })
+
+  it('translates the DTO direction to the mock CLI flag vocabulary on the usdc resume command', () => {
+    // The DTO names the venue flow (alpaca_to_base) while the mock CLI names the
+    // Raindex-relative leg (to-raindex); the command must carry the CLI value.
+    const toRaindex = transferRecoveryCommands({
+      deployment: SIM,
+      kind: 'usdc_bridge',
+      id: 'BRIDGE001',
+      status: 'bridging',
+      direction: 'alpaca_to_base'
+    })
+    expect(commandFor(toRaindex, 'Resume')).toBe(
+      `${SIM_PREFIX} transfer resume --kind usdc --id BRIDGE001 --direction to-raindex`
+    )
+
+    const toAlpaca = transferRecoveryCommands({
+      deployment: SIM,
+      kind: 'usdc_bridge',
+      id: 'BRIDGE002',
+      status: 'bridging',
+      direction: 'base_to_alpaca'
+    })
+    expect(commandFor(toAlpaca, 'Resume')).toBe(
+      `${SIM_PREFIX} transfer resume --kind usdc --id BRIDGE002 --direction to-alpaca`
     )
   })
 
@@ -423,12 +691,77 @@ describe('transferRecoveryCommands', () => {
         status,
         postBurn: true
       })
-      expect(commands.map((entry) => entry.label)).toEqual(['Reconcile'])
-      expect(commandFor(commands, 'Reconcile')).toBe(
-        'stox transfer reconcile --kind usdc --id BRIDGE001 -r "<reason>"'
+      expect(commands.map((entry) => entry.label)).toEqual([
+        'Resume',
+        'Reconcile',
+        'Reconcile (offline)'
+      ])
+      // The normal path for a post-burn Base to Alpaca failure is a resume,
+      // so it is a row the operator can copy, not only prose.
+      expect(commandFor(commands, 'Resume')).toBe(
+        `${CLIENT} debug resume-usdc base-to-alpaca BRIDGE001`
       )
-      expect(commands.find((entry) => entry.label === 'Reconcile')?.mode).toBe('direct-db')
+      expect(commands.find((entry) => entry.label === 'Resume')?.mode).toBe('requires-bot')
+      // A deposit or conversion failure is enqueued but never moves on a
+      // resume, so the row sends those to Reconcile.
+      expect(
+        commands
+          .find((entry) => entry.label === 'Resume')
+          ?.description.includes('not a deposit or conversion failure')
+      ).toBe(true)
+      expect(commandFor(commands, 'Reconcile')).toBe(
+        `${CLIENT} debug reconcile-usdc BRIDGE001 --reason <funds-moved-manually|deposit-credited-offline>`
+      )
+      expect(commands.find((entry) => entry.label === 'Reconcile')?.mode).toBe('requires-bot')
+      // A post-burn Base to Alpaca failure is settled with the bot stopped,
+      // where the client cannot reach it, so the offline form is offered too.
+      expect(commandFor(commands, 'Reconcile (offline)')).toBe(
+        'stox transfer reconcile --kind usdc --id BRIDGE001 --reason <funds-moved-manually|deposit-credited-offline>'
+      )
+      expect(commands.find((entry) => entry.label === 'Reconcile (offline)')?.mode).toBe(
+        'direct-db'
+      )
     }
+  })
+
+  it('offers no offline reconcile for an Alpaca to Base failure, which nothing re-runs', () => {
+    const commands = transferRecoveryCommands({
+      deployment: PROD,
+      kind: 'usdc_bridge',
+      id: 'BRIDGE001',
+      status: 'failed',
+      direction: 'alpaca_to_base',
+      postBurn: true
+    })
+    expect(commands.map((entry) => entry.label)).toEqual(['Reconcile'])
+  })
+
+  it('asks to stop the Base to Alpaca recovery before a post-burn bridge is settled by hand', () => {
+    const reconcileText = (direction: 'alpaca_to_base' | 'base_to_alpaca' | null) =>
+      transferRecoveryCommands({
+        deployment: PROD,
+        kind: 'usdc_bridge',
+        id: 'BRIDGE001',
+        status: 'failed',
+        direction,
+        postBurn: true
+      }).find((entry) => entry.label === 'Reconcile')?.description ?? ''
+    // The bot re-runs a post-burn Base to Alpaca failure at every start and
+    // can send the USDC itself, so a hand settlement runs with the bot stopped
+    // and ends with the offline reconcile.
+    for (const direction of ['base_to_alpaca', null] as const) {
+      const text = reconcileText(direction)
+      expect(text.includes('re-runs its')).toBe(true)
+      // The bot finishes it on a resume unless the mint is unresolvable or
+      // funds were moved by hand.
+      expect(text.includes('keep the bot running and run resume-usdc base-to-alpaca')).toBe(true)
+      // One copy of the steps, in the runbook; the dialog points to it.
+      expect(text.includes('do not mint, send or reconcile it with the bot running')).toBe(true)
+      expect(
+        text.includes('docs/cli-ops.md, "Settling a post-burn Base to Alpaca failure by hand"')
+      ).toBe(true)
+    }
+    expect(reconcileText('alpaca_to_base').includes('re-runs its recovery')).toBe(false)
   })
 
   it('shows no per-object command for a pre-burn failed usdc bridge', () => {
@@ -469,7 +802,7 @@ describe('transferRecoveryCommands', () => {
     })
     expect(commands.map((entry) => entry.label)).toEqual(['Recheck', 'Reconcile'])
     expect(commandFor(commands, 'Reconcile')).toBe(
-      'stox transfer reconcile --kind mint --id ISS001 -r "<reason>"'
+      `${CLIENT} debug reconcile-equity mint ISS001 --reason "<reason>"`
     )
   })
 
@@ -536,7 +869,7 @@ describe('transferRecoveryCommands', () => {
   it('returns no commands in a simulation build with an unknown backend port', () => {
     expect(
       transferRecoveryCommands({
-        deployment: { simulateSourceId: 'sim-1', backendPort: null },
+        deployment: { simulateSourceId: 'sim-1', backendPort: null, clientEnv: 'production' },
         kind: 'equity_mint',
         id: 'ISS001',
         status: 'wrapping'
@@ -562,9 +895,14 @@ describe('tradeRecoveryCommands', () => {
     ])
     expect(commands.every((entry) => !entry.command.includes('process-tx'))).toBe(true)
     expect(commandFor(commands, 'Release hedge')).toBe(
-      'stox position release-hedge -s MSTR -o <order-id> -r "<reason>"'
+      `${CLIENT} debug position release-hedge MSTR --order-id <order-id> --reason "<reason>"`
     )
-    expect(commandFor(commands, 'Rebuild view')).toBe('stox view rebuild -a position --id MSTR')
+    expect(commandFor(commands, 'Set position')).toBe(
+      `${CLIENT} debug position set MSTR --target-net <N> [--price-usdc <USDC_PER_SHARE>] --reason "<reason>"`
+    )
+    expect(commandFor(commands, 'Rebuild view')).toBe(
+      `${CLIENT} debug view rebuild position --id MSTR`
+    )
   })
 
   it('uses the mock cli prefix in a simulation build', () => {
@@ -579,10 +917,23 @@ describe('tradeRecoveryCommands', () => {
 
   it('returns no commands for a trade in a simulation build with an unknown backend port', () => {
     const commands = tradeRecoveryCommands({
-      deployment: { simulateSourceId: 'sim-1', backendPort: null },
+      deployment: { simulateSourceId: 'sim-1', backendPort: null, clientEnv: 'production' },
       symbol: 'MSTR'
     })
     expect(commands).toEqual([])
+  })
+})
+
+describe('forClientEnv', () => {
+  it('retargets a guide command at staging and leaves production as is', () => {
+    const command = `${CLIENT} debug resume`
+    expect(forClientEnv(command, 'staging')).toBe(
+      'st0x-liquidity-client --env staging debug resume'
+    )
+    expect(forClientEnv(command, 'production')).toBe(command)
+    expect(forClientEnv(command, null)).toBe(
+      'st0x-liquidity-client --env <production|staging> debug resume'
+    )
   })
 })
 
@@ -597,51 +948,78 @@ describe('RECOVERY_GUIDE', () => {
     ])
 
     const allCommands = RECOVERY_GUIDE.flatMap((group) => group.commands)
-    expect(allCommands.some((entry) => entry.command.startsWith('stox transfer recheck'))).toBe(
-      true
-    )
-    expect(allCommands.some((entry) => entry.command.startsWith('stox cctp complete-mint'))).toBe(
-      true
-    )
-    expect(allCommands.some((entry) => entry.command.startsWith('stox fail-usdc-transfer'))).toBe(
-      true
-    )
+    const has = (prefix: string) =>
+      allCommands.some((entry) => entry.command.startsWith(`${CLIENT} ${prefix}`))
+    expect(has('debug recheck')).toBe(true)
+    expect(has('debug cctp complete-mint')).toBe(true)
+    expect(has('debug fail-usdc-transfer')).toBe(true)
+    expect(has('debug reconcile-usdc')).toBe(true)
+    expect(has('debug reconcile-equity')).toBe(true)
     expect(allCommands.every((entry) => !entry.command.includes('recheck-transfer'))).toBe(true)
   })
 
-  it('labels each guide command with the SPEC execution mode', () => {
-    const modeOf = (prefix: string): string | undefined =>
-      RECOVERY_GUIDE.flatMap((group) => group.commands).find((entry) =>
-        entry.command.startsWith(prefix)
-      )?.mode
+  it('uses the operations client for every guide command, so each requires the bot', () => {
+    const allCommands = RECOVERY_GUIDE.flatMap((group) => group.commands)
+    expect(allCommands.every((entry) => entry.command.startsWith(`${CLIENT} `))).toBe(true)
+    expect(allCommands.every((entry) => entry.mode === 'requires-bot')).toBe(true)
+  })
 
-    // requires-bot: only recheck and equity resume dispatch through the bot.
-    expect(modeOf('stox transfer recheck')).toBe('requires-bot')
-    expect(modeOf('stox transfer resume --kind equity')).toBe('requires-bot')
-    // live-rpc-only: cctp touches no DB state.
-    expect(modeOf('stox cctp complete-mint')).toBe('live-rpc-only')
-    // direct-db-live-rpc: usdc resume and process-tx drive on-chain from the CLI.
-    expect(modeOf('stox transfer resume --kind usdc')).toBe('direct-db-live-rpc')
-    expect(modeOf('stox process-tx')).toBe('direct-db-live-rpc')
-    // direct-db: pure local CQRS mutations.
-    expect(modeOf('stox transfer fail')).toBe('direct-db')
-    expect(modeOf('stox fail-usdc-transfer')).toBe('direct-db')
-    expect(modeOf('stox transfer reconcile')).toBe('direct-db')
-    expect(modeOf('stox position release-hedge')).toBe('direct-db')
-    expect(modeOf('stox position set')).toBe('direct-db')
-    expect(modeOf('stox view rebuild')).toBe('direct-db')
+  it('offers recheck only for the USDC deposit failures the bot rechecks', () => {
+    const recheck = RECOVERY_GUIDE.flatMap((group) => group.commands).find((entry) =>
+      entry.command.startsWith(`${CLIENT} debug recheck`)
+    )
+    // The bot refuses an Alpaca to Base deposit and one with no onchain deposit
+    // transaction, so the guide sends those to manual settlement instead.
+    expect(recheck?.appliesTo.includes('failed Base to Alpaca USDC deposit with an onchain')).toBe(
+      true
+    )
+    expect(recheck?.appliesTo.includes('Alpaca to Base deposit needs manual settlement')).toBe(true)
+  })
+
+  it('asks for the Alpaca order check before a guide resume at converting', () => {
+    const resume = RECOVERY_GUIDE.flatMap((group) => group.commands).find((entry) =>
+      entry.command.startsWith(`${CLIENT} debug resume-usdc`)
+    )
+    // The same check as the converting note in the transfer dialog.
+    expect(
+      resume?.whenToUse.includes(
+        'first confirm at Alpaca that no USD to USDC order for the transfer is still open'
+      )
+    ).toBe(true)
+  })
+})
+
+describe('RECOVERY_GUIDE follow-up steps', () => {
+  const guideEntry = (prefix: string) =>
+    RECOVERY_GUIDE.flatMap((group) => group.commands).find((entry) =>
+      entry.command.startsWith(`${CLIENT} ${prefix}`)
+    )
+
+  it('gives complete-mint its next step', () => {
+    expect(
+      guideEntry('debug cctp complete-mint')?.description.includes(
+        'run resume-usdc afterwards while the bridge is not terminal. Run reconcile-usdc only after a terminal failure whose funds leg is done and verified'
+      )
+    ).toBe(true)
+  })
+
+  it('gives the reconcile entries the same notes as their rows', () => {
+    expect(
+      guideEntry('debug reconcile-usdc')?.description.includes(
+        're-runs its recovery at every start'
+      )
+    ).toBe(true)
+    expect(
+      guideEntry('debug reconcile-equity')?.description.includes(
+        'For a redemption that failed at detection or was rejected before the bot started'
+      )
+    ).toBe(true)
   })
 })
 
 describe('recoveryModeLabel', () => {
-  it('renders a distinct badge for each of the four execution modes', () => {
+  it('renders a distinct badge for each execution mode', () => {
     expect(recoveryModeLabel('requires-bot')).toBe('REST — requires the running bot')
-    expect(recoveryModeLabel('live-rpc-only')).toBe(
-      'live RPC — ensure the bot is not driving this same on-chain action'
-    )
-    expect(recoveryModeLabel('direct-db-live-rpc')).toBe(
-      'direct DB + live RPC — stop the bot / ensure it is not driving this id'
-    )
     expect(recoveryModeLabel('direct-db')).toBe(
       'direct DB — stop the bot / ensure it is not driving this id'
     )
@@ -649,16 +1027,26 @@ describe('recoveryModeLabel', () => {
 })
 
 describe('recoveryModeColor', () => {
-  it('gives live-rpc-only its own sky tone, distinct from the bot-stop red', () => {
-    // live-rpc-only writes no DB state and is safe while the bot runs, so it must
-    // not share the red of the direct-db modes that require stopping the bot.
-    const liveRpc = recoveryModeColor('live-rpc-only')
-    expect(liveRpc.text).toBe('text-sky-500')
-    expect(liveRpc.badge).toContain('text-sky-500')
-
+  it('gives requires-bot amber and direct-db the bot-stop red', () => {
     expect(recoveryModeColor('requires-bot').text).toBe('text-amber-500')
-
     expect(recoveryModeColor('direct-db').text).toBe('text-destructive')
-    expect(recoveryModeColor('direct-db-live-rpc').text).toBe('text-destructive')
+  })
+})
+
+describe('runbook headings the recovery text names', () => {
+  it('exist in docs/cli-ops.md', () => {
+    // The fail gates send operators to these sections by name, so a renamed
+    // heading must fail here instead of leaving every gate pointing nowhere.
+    const runbook = readFileSync(new URL('../../../docs/cli-ops.md', import.meta.url), 'utf8')
+    const headings = runbook
+      .split('\n')
+      .filter((line) => line.startsWith('#'))
+      .map((line) => line.replace(/^#+\s*/, ''))
+    for (const heading of [
+      'Clearing a pre-burn guard latch',
+      'Settling a post-burn Base to Alpaca failure by hand'
+    ]) {
+      expect(headings).toContain(heading)
+    }
   })
 })

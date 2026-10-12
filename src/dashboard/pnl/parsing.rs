@@ -41,12 +41,13 @@ pub(crate) fn parse_ledger_decimal(
 /// Sorts the ledger rows into replay order: execution timestamp first, event
 /// rowid as the deterministic tie-breaker. Timestamps are always present on
 /// ledger rows (typed at ingestion); an unparseable one means a corrupt row
-/// and fails the report with its provenance.
+/// and fails the report with its provenance. Borrows the rows so a caller
+/// that keeps them (the shared replay does) does not copy the ledger.
 pub(crate) fn ordered_position_events(
-    rows: Vec<PositionLedgerRow>,
-) -> Result<Vec<PositionLedgerRow>, PnlError> {
+    rows: &[PositionLedgerRow],
+) -> Result<Vec<&PositionLedgerRow>, PnlError> {
     let mut sortable: Vec<_> = rows
-        .into_iter()
+        .iter()
         .map(|row| {
             let timestamp_ms = parse_timestamp(row.replay_timestamp())
                 .map(|parsed| parsed.timestamp_millis())

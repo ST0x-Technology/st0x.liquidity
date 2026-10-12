@@ -70,7 +70,7 @@ use st0x_tokenization::AlpacaTokenizationService;
 use st0x_tokenization::Tokenizer;
 use st0x_wrapper::{UnderlyingPerWrapped, Wrapper, WrapperError, WrapperService};
 
-use crate::alerts::{LogNotifier, Notifier};
+use crate::alerts::{AlertKind, LogNotifier, Notifier};
 use crate::bindings::IERC4626;
 use crate::bot_gas::{
     BotGasCostLedger, BotGasReceiptCost, BotGasReceiptCostEnqueuer, RecordBotGasReceiptCostCtx,
@@ -80,7 +80,9 @@ use crate::cctp_burn::{
     CctpBurnOperation, RestoredCctpBurns, bot_cctp_bridge, restore_pending_cctp_burns,
 };
 use crate::conductor::exit::{ConductorExit, ConductorExitError, MonitorTaskError};
-use crate::conductor::job::{BACKPRESSURE_RESCHEDULE_LIMIT, BackpressureStreak};
+use crate::conductor::job::{
+    BACKPRESSURE_RESCHEDULE_LIMIT, BackpressureStreak, terminal_failure_kind,
+};
 use crate::conductor::monitor::order_fills::{CutoffProbe, probe_cutoff_block_support};
 use crate::dashboard::equity_price::{EquityPriceStore, MarkListener};
 use crate::dashboard::pnl::{LedgerHead, PnlLedger, PnlLedgerReactor};
@@ -92,6 +94,7 @@ use crate::equity_redemption::{
 use crate::inventory::{
     BroadcastingInventory, EquityWalletPolling, InventorySnapshot, PollFreshness,
 };
+use crate::metrics::liquidity::bands::EquityBandPublisher;
 use crate::mint_authorization::{
     ConfiguredMintAuthorizer, MintAuthorizationService, VaultModeReader,
 };
@@ -251,6 +254,7 @@ async fn setup_apalis_queues(
     apalis_pool: &apalis_sqlite::SqlitePool,
     event_sender: broadcast::Sender<Statement>,
     chains: &st0x_config::ChainRegistry,
+    equity_prices: EquityPriceStore,
 ) -> anyhow::Result<(
     DexTradeAccountingJobQueue,
     BackfillQueues,
@@ -273,7 +277,7 @@ async fn setup_apalis_queues(
     Ok((
         DexTradeAccountingJobQueue::new(apalis_pool),
         BackfillQueues::new(apalis_pool, chains),
-        DashboardTradeDelivery::new(apalis_pool, pool, event_sender),
+        DashboardTradeDelivery::new(apalis_pool, pool, event_sender, equity_prices),
         RebalancingSchedulers::new(apalis_pool),
     ))
 }
@@ -1102,8 +1106,14 @@ impl Conductor {
         // serializes its broker submission against live hedging (ADR 0014).
         let counter_trade_submission_lock = Arc::new(Mutex::new(()));
 
-        let (job_queue, backfill_queues, dashboard_delivery, schedulers) =
-            setup_apalis_queues(&pool, &apalis_pool, event_sender, &ctx.chains).await?;
+        let (job_queue, backfill_queues, dashboard_delivery, schedulers) = setup_apalis_queues(
+            &pool,
+            &apalis_pool,
+            event_sender,
+            &ctx.chains,
+            equity_prices.clone(),
+        )
+        .await?;
 
         let onchain_trade =
             setup_onchain_trade_store(&pool, dashboard_delivery.broadcaster.clone()).await?;
@@ -1340,6 +1350,7 @@ impl Conductor {
             .dashboard_trade_delivery_queue(dashboard_delivery.queue)
             .dashboard_trade_delivery_ctx(dashboard_delivery.ctx)
             .dashboard_trade_handoff_monitor(dashboard_delivery.handoff_monitor)
+            .transfer_line_sweep(dashboard_delivery.line_sweep)
             .hedge_queue(hedge_queue)
             .poll_status_queue(poll_status_queue)
             .reconcile_queue(reconcile_queue)
@@ -1499,10 +1510,11 @@ impl Conductor {
         // page an operator with a stale SLA.
         let alert =
             format!("st0x-hedge: {worker}: {context}: {source}; process will exit for restart");
+        let kind = terminal_failure_kind(&alert);
 
         match tokio::time::timeout(
             TERMINAL_FAILURE_ALERT_TIMEOUT,
-            self.worker_failure_notifier.notify(&alert),
+            self.worker_failure_notifier.notify(kind, &alert),
         )
         .await
         {
@@ -1626,12 +1638,15 @@ async fn setup_pnl_ledger(
                 "PnL ledger failed to catch up at startup; starting without it"
             );
             if let Err(alert_error) = notifier
-                .notify(&format!(
-                    "PnL ledger failed to catch up at startup ({error}). The bot started \
+                .notify(
+                    AlertKind::PnlLedgerCatchUpFailed,
+                    &format!(
+                        "PnL ledger failed to catch up at startup ({error}). The bot started \
                      without it and keeps hedging; /pnl fails until ingestion recovers. \
                      Watch pnl_ledger_catch_up_failures_total and \
                      pnl_ledger_checkpoint_lag_events."
-                ))
+                    ),
+                )
                 .await
             {
                 warn!(
@@ -2025,6 +2040,10 @@ async fn compact_inventory_snapshot_events(pool: &SqlitePool) -> Result<u64, sql
 /// straddled the restart, whose hydrated Hedging balances are therefore
 /// ambiguous): cleared with the gate on entry, seeded with the gate below.
 /// See `InventoryView::set_pending_offchain_orders`.
+///
+/// Last, the seam starts the `liq_*` inventory series, but only after a
+/// complete hydration: a partly restored view would publish its missing
+/// balances as zero. Owning the start here keeps it after hydration.
 pub(crate) async fn restore_inventory_at_boot(
     pool: &SqlitePool,
     inventory: &Arc<BroadcastingInventory>,
@@ -2036,47 +2055,88 @@ pub(crate) async fn restore_inventory_at_boot(
         .await
         .set_pending_offchain_orders(HashMap::new());
 
-    hydrate_inventory_from_snapshot(pool, inventory).await;
+    let hydration = hydrate_inventory_from_snapshot(pool, inventory).await;
 
     rebalancing_service
         .recover_pending_offchain_orders(position_projection)
         .await?;
 
+    match hydration {
+        Hydration::Complete => inventory.start_publishing_liq_metrics().await,
+        Hydration::Incomplete => error!(
+            "Inventory hydration was incomplete; the liq_ inventory series stay \
+             unpublished for this run. A restart does not bring them back while the \
+             failing snapshot is unchanged"
+        ),
+    }
+
     Ok(())
+}
+
+/// Whether boot read and applied every persisted inventory snapshot. Boot
+/// goes on either way; only the `liq_*` inventory series wait for a complete
+/// hydration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Hydration {
+    Complete,
+    Incomplete,
 }
 
 async fn hydrate_inventory_from_snapshot(
     pool: &SqlitePool,
     inventory: &Arc<BroadcastingInventory>,
-) {
+) -> Hydration {
     let ids = match load_all_ids::<InventorySnapshot>(pool).await {
         Ok(ids) => ids,
         Err(error) => {
             warn!(?error, "Failed to load InventorySnapshot IDs for hydration");
-            return;
+            return Hydration::Incomplete;
         }
     };
 
+    let mut hydration = Hydration::Complete;
     for id in &ids {
-        hydrate_single_snapshot(pool, inventory, id).await;
+        if hydrate_single_snapshot(pool, inventory, id).await == Hydration::Incomplete {
+            hydration = Hydration::Incomplete;
+        }
     }
+    hydration
 }
 
 async fn hydrate_single_snapshot(
     pool: &SqlitePool,
     inventory: &Arc<BroadcastingInventory>,
     id: &crate::inventory::snapshot::InventorySnapshotId,
-) {
-    let Ok(Some(snapshot)) = load_entity::<InventorySnapshot>(pool, id).await else {
-        return;
+) -> Hydration {
+    let snapshot = match load_entity::<InventorySnapshot>(pool, id).await {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return Hydration::Complete,
+        Err(error) => {
+            warn!(%id, ?error, "Failed to load InventorySnapshot for hydration");
+            return Hydration::Incomplete;
+        }
     };
 
-    let event_count = snapshot.hydrate_inventory(inventory).await;
-    if event_count == 0 {
-        return;
+    let report = snapshot.hydrate_inventory(inventory).await;
+    if report.events > 0 {
+        info!(
+            %id,
+            events = report.events,
+            failed = report.failed,
+            "Hydrated InventoryView from persisted snapshot"
+        );
     }
 
-    info!(%id, event_count, "Hydrated InventoryView from persisted snapshot");
+    if report.failed > 0 {
+        warn!(
+            %id,
+            failed = report.failed,
+            "Some InventorySnapshot events failed to apply during hydration"
+        );
+        return Hydration::Incomplete;
+    }
+
+    Hydration::Complete
 }
 
 struct RebalancingInfrastructure {
@@ -2624,6 +2684,9 @@ async fn attach_manifest_handles(
             marks: equity_prices,
         }))
         .await;
+    rebalancing_service.publish_equity_bands(EquityBandPublisher::new(
+        &crate::metrics::liquidity::LIQ_FAMILIES,
+    ));
 }
 
 /// Wires the pre-dispatch safety checks used by fresh rebalancing transfers:
@@ -3131,7 +3194,7 @@ async fn restore_capital_cctp_burns(
     let bridge = match bot_cctp_bridge(ctx, wallets) {
         Ok(bridge) => bridge,
         Err(error) => {
-            error!(target: "operational_alert", alert = true, ?error, "Could not build the CCTP bridge to restore pending capital CCTP burns; their nonces are not reserved, so startup skips Ethereum and Base token approvals and allowance revokes");
+            error!(target: "operational_alert", alert = true, kind = AlertKind::CapitalCctpBridgeUnavailable.as_str(), ?error, "Could not build the CCTP bridge to restore pending capital CCTP burns; their nonces are not reserved, so startup skips Ethereum and Base token approvals and allowance revokes");
             return BTreeSet::from([Chain::Ethereum, Chain::Base]);
         }
     };
@@ -4476,12 +4539,15 @@ async fn restore_redemption_withdrawal(
                  nonce restore and deferring to the resume job"
             );
             if let Err(alert_error) = notifier
-                .notify(&format!(
-                    "Equity redemption {redemption_id} has a submitted vault withdrawal whose \
+                .notify(
+                    AlertKind::WithdrawalHashUnavailableAtStartup,
+                    &format!(
+                        "Equity redemption {redemption_id} has a submitted vault withdrawal whose \
                      hash the node cannot return at startup ({error}). Monitoring started \
                      without it; the resume job will drive it to the reconciliation deadline. \
                      Verify the withdrawal onchain and reconcile if it will never confirm."
-                ))
+                    ),
+                )
                 .await
             {
                 warn!(
@@ -4568,7 +4634,7 @@ async fn rebroadcast_restored_withdrawal(
         "Could not rebroadcast a restored vault withdrawal at startup"
     );
     if let Err(alert_error) = notifier
-        .notify(&format!(
+        .notify(AlertKind::RebroadcastFailedAtStartup, &format!(
             "Equity redemption {redemption_id} has a signed vault withdrawal (tx {tx_hash}, nonce \
              {nonce}) that could not be rebroadcast at startup ({error}). Its nonce stays \
              reserved, so startup skips token approvals and allowance revokes on {chain}; the \
@@ -4612,6 +4678,7 @@ async fn restore_redemption_send(
         notify_or_warn(
             notifier,
             redemption_id,
+            AlertKind::RedemptionLegacyPendingSend,
             &format!(
                 "Equity redemption {redemption_id} on {chain} has a legacy pending send to the \
                  issuer with no recorded transaction. Recovery refuses to sign again and startup \
@@ -4634,6 +4701,7 @@ async fn restore_redemption_send(
         notify_or_warn(
             notifier,
             redemption_id,
+            AlertKind::RedemptionSendSignedByAnotherWallet,
             &format!(
                 "Equity redemption {redemption_id} on {chain} has a signed send {tx_hash} to the \
                  issuer (nonce {nonce}) signed by {signer}, not the wallet that sends to the \
@@ -4672,6 +4740,7 @@ async fn restore_redemption_send(
     notify_or_warn(
         notifier,
         redemption_id,
+        AlertKind::RedemptionSendUnresolved,
         &format!(
             "Equity redemption {redemption_id} on {chain} has an unresolved signed send {tx_hash} to \
              the issuer; startup approvals on {chain} are paused and recovery will \
@@ -4685,9 +4754,10 @@ async fn restore_redemption_send(
 async fn notify_or_warn(
     notifier: &dyn Notifier,
     redemption_id: &RedemptionAggregateId,
+    kind: AlertKind,
     message: &str,
 ) {
-    if let Err(error) = notifier.notify(message).await {
+    if let Err(error) = notifier.notify(kind, message).await {
         warn!(target: "rebalance", %redemption_id, %error, "Could not deliver a startup alert about a send to the issuer");
     }
 }
@@ -7890,8 +7960,12 @@ mod tests {
     use crate::conductor::builder::CqrsFrameworks;
     use crate::dashboard::{DashboardTradeDeliveryCtx, DashboardTradeDeliveryJobQueue};
     use crate::equity_redemption::{EquityRedemptionCommand, redemption_aggregate_id};
+    use crate::inventory::snapshot::{InventorySnapshotCommand, InventorySnapshotId};
     use crate::inventory::view::Operator;
     use crate::inventory::{ImbalanceThreshold, Inventory, InventoryView, Venue};
+    use crate::metrics::liquidity::LiqFamilies;
+    use crate::metrics::liquidity::inventory::tests::{leaked_families, publisher, rendered_store};
+    use crate::metrics::liquidity::tests::series;
     use crate::mint_authorization::{
         MintAuthorizationError, MockMintAuthorizer, StubVaultModeReader, VaultModeCheckError,
     };
@@ -8902,6 +8976,147 @@ mod tests {
         );
     }
 
+    /// The `liq_*` inventory series start only after a complete read, so
+    /// the hydration outcome must report a failed read.
+    #[tokio::test]
+    async fn hydration_reports_whether_every_snapshot_was_read() {
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default(),
+            event_sender,
+        ));
+
+        let pool = setup_test_db().await;
+        assert_eq!(
+            hydrate_inventory_from_snapshot(&pool, &inventory).await,
+            Hydration::Complete
+        );
+
+        pool.close().await;
+        assert_eq!(
+            hydrate_inventory_from_snapshot(&pool, &inventory).await,
+            Hydration::Incomplete
+        );
+    }
+
+    /// Runs the boot seam over `pool` into a view that publishes the `liq_*`
+    /// inventory series, and returns the families it publishes into.
+    async fn boot_publishing_inventory(pool: &SqlitePool) -> &'static LiqFamilies {
+        let families = leaked_families();
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(
+            BroadcastingInventory::new(InventoryView::default(), event_sender)
+                .publishing_liq_metrics(publisher(families)),
+        );
+        let projection = Projection::<Position>::sqlite(pool.clone());
+        projection.catch_up().await.unwrap();
+
+        restore_inventory_at_boot(
+            pool,
+            &inventory,
+            &freeze_guard_test_service().await,
+            &projection,
+        )
+        .await
+        .unwrap();
+
+        families
+    }
+
+    fn snapshot_id(owner: Address) -> InventorySnapshotId {
+        InventorySnapshotId {
+            orderbook: Address::repeat_byte(0x11),
+            owner,
+        }
+    }
+
+    async fn persist_offchain_aapl(pool: &SqlitePool, id: &InventorySnapshotId) {
+        test_store::<InventorySnapshot>(pool.clone(), ())
+            .send(
+                id,
+                InventorySnapshotCommand::OffchainEquity {
+                    positions: BTreeMap::from([(
+                        Symbol::new("AAPL").unwrap(),
+                        FractionalShares::new(float!(90)),
+                    )]),
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    fn offchain_aapl(families: &LiqFamilies) -> Option<f64> {
+        rendered_store(families)
+            .get(&series(
+                "liq_equity_offchain_available",
+                &[("symbol", "AAPL")],
+            ))
+            .copied()
+    }
+
+    /// Boot starts the `liq_*` inventory series once every snapshot was
+    /// read and applied, with the restored balances.
+    #[tokio::test]
+    async fn boot_publishes_the_inventory_series_after_a_complete_hydration() {
+        let pool = setup_test_db().await;
+        persist_offchain_aapl(&pool, &snapshot_id(Address::repeat_byte(0x22))).await;
+
+        let families = boot_publishing_inventory(&pool).await;
+
+        assert_eq!(offchain_aapl(families), Some(90.0));
+    }
+
+    /// One snapshot that cannot be read keeps every inventory series off,
+    /// even though another snapshot restored its balances: a partly
+    /// restored view would publish the missing balances as zero.
+    #[tokio::test]
+    async fn boot_keeps_the_inventory_series_off_when_a_snapshot_read_fails() {
+        let pool = setup_test_db().await;
+        persist_offchain_aapl(&pool, &snapshot_id(Address::repeat_byte(0x22))).await;
+        sqlx::query(
+            "INSERT INTO events (aggregate_type, aggregate_id, sequence, \
+             event_type, event_version, payload, metadata) \
+             VALUES (?1, ?2, 1, 'InventorySnapshotEvent::OffchainEquity', '1.0', \
+             '{not-json', '{}')",
+        )
+        .bind(InventorySnapshot::AGGREGATE_TYPE)
+        .bind(snapshot_id(Address::repeat_byte(0x33)).to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let families = boot_publishing_inventory(&pool).await;
+
+        assert_eq!(rendered_store(families), BTreeMap::new());
+    }
+
+    /// A snapshot event the view refuses also keeps the series off.
+    #[tokio::test]
+    async fn boot_keeps_the_inventory_series_off_when_a_snapshot_event_fails_to_apply() {
+        let pool = setup_test_db().await;
+        let id = snapshot_id(Address::repeat_byte(0x22));
+        persist_offchain_aapl(&pool, &id).await;
+        test_store::<InventorySnapshot>(pool.clone(), ())
+            .send(
+                &id,
+                InventorySnapshotCommand::InflightEquity {
+                    mints: BTreeMap::from([(
+                        Symbol::new("AAPL").unwrap(),
+                        FractionalShares::new(float!(-3)),
+                    )]),
+                    redemptions: BTreeMap::new(),
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let families = boot_publishing_inventory(&pool).await;
+
+        assert_eq!(rendered_store(families), BTreeMap::new());
+    }
+
     async fn freeze_guard_test_service() -> Arc<RebalancingService> {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (event_sender, _) = broadcast::channel::<Statement>(16);
@@ -9104,7 +9319,8 @@ mod tests {
         Arc<DashboardTradeDeliveryCtx>,
     ) {
         let (sender, receiver) = broadcast::channel(16);
-        let delivery = DashboardTradeDelivery::new(apalis_pool, pool, sender);
+        let delivery =
+            DashboardTradeDelivery::new(apalis_pool, pool, sender, EquityPriceStore::new([]));
         (delivery.broadcaster, receiver, delivery.queue, delivery.ctx)
     }
 
@@ -20533,7 +20749,7 @@ mod tests {
             let source: Arc<BoxDynError> = Arc::new("boom".into());
             Err(MonitorTaskError::TerminalJobFailure {
                 worker: "test-worker-0".to_string(),
-                context: "terminal failure",
+                context: "Job failed after retries",
                 source,
             })
         });
@@ -20584,7 +20800,7 @@ mod tests {
             let source: Arc<BoxDynError> = Arc::new("boom".into());
             Err(MonitorTaskError::TerminalJobFailure {
                 worker: "test-worker-0".to_string(),
-                context: "terminal failure",
+                context: "Job failed after retries",
                 source,
             })
         });
@@ -20605,7 +20821,7 @@ mod tests {
 
         let error = conductor.wait_for_completion().await.unwrap_err();
         assert!(
-            error.to_string().contains("terminal failure"),
+            error.to_string().contains("Job failed after retries"),
             "the terminal job failure must still propagate after alerting; got: {error}"
         );
         assert!(
@@ -20687,7 +20903,7 @@ mod tests {
             let source: Arc<BoxDynError> = Arc::new("boom".into());
             Err(MonitorTaskError::TerminalJobFailure {
                 worker: "test-worker-0".to_string(),
-                context: "terminal failure",
+                context: "Job failed after retries",
                 source,
             })
         });
@@ -20709,7 +20925,7 @@ mod tests {
         shutdown_token.cancel();
         let error = conductor.wait_for_completion().await.unwrap_err();
         assert!(
-            error.to_string().contains("terminal failure"),
+            error.to_string().contains("Job failed after retries"),
             "the terminal job failure surfaced during drain must still propagate; got: {error}"
         );
 
@@ -20735,7 +20951,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Notifier for HangingNotifier {
-        async fn notify(&self, _message: &str) -> Result<(), NotifierError> {
+        async fn notify(
+            &self,
+            kind: crate::alerts::AlertKind,
+            message: &str,
+        ) -> Result<(), NotifierError> {
+            crate::alerts::assert_kind_matches_extractor(kind, message);
             std::future::pending().await
         }
     }
@@ -20747,7 +20968,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Notifier for ErroringNotifier {
-        async fn notify(&self, _message: &str) -> Result<(), NotifierError> {
+        async fn notify(
+            &self,
+            kind: crate::alerts::AlertKind,
+            message: &str,
+        ) -> Result<(), NotifierError> {
+            crate::alerts::assert_kind_matches_extractor(kind, message);
             Err(NotifierError::Simulated)
         }
     }
@@ -20766,7 +20992,7 @@ mod tests {
             let source: Arc<BoxDynError> = Arc::new("boom".into());
             Err(MonitorTaskError::TerminalJobFailure {
                 worker: "test-worker-0".to_string(),
-                context: "terminal failure",
+                context: "Job failed after retries",
                 source,
             })
         });
@@ -20792,7 +21018,7 @@ mod tests {
             )
             .unwrap_err();
         assert!(
-            error.to_string().contains("terminal failure"),
+            error.to_string().contains("Job failed after retries"),
             "the terminal job failure must still propagate despite a hung notifier; got: {error}"
         );
     }
@@ -20810,7 +21036,7 @@ mod tests {
             let source: Arc<BoxDynError> = Arc::new("boom".into());
             Err(MonitorTaskError::TerminalJobFailure {
                 worker: "test-worker-0".to_string(),
-                context: "terminal failure",
+                context: "Job failed after retries",
                 source,
             })
         });
@@ -20830,7 +21056,7 @@ mod tests {
 
         let error = conductor.wait_for_completion().await.unwrap_err();
         assert!(
-            error.to_string().contains("terminal failure"),
+            error.to_string().contains("Job failed after retries"),
             "the terminal job failure must still propagate even when the notifier itself \
              errors; got: {error}"
         );
@@ -20846,7 +21072,7 @@ mod tests {
         let source: Arc<BoxDynError> = Arc::new("boom".into());
         let error = check_monitor_drain_result(Ok(Err(MonitorTaskError::TerminalJobFailure {
             worker: "test-worker-0".to_string(),
-            context: "terminal failure",
+            context: "Job failed after retries",
             source,
         })))
         .unwrap_err();

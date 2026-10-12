@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use thiserror::Error;
-use tracing::error;
+use tracing::{error, warn};
 
 use super::{BroadcastingInventory, divergence::ReconciliationGeneration};
 
@@ -97,6 +97,14 @@ fn reconciled_usdc_events(
         block_number,
         generation,
     }]
+}
+
+/// What [`InventorySnapshot::hydrate_inventory`] did with one snapshot: the
+/// events it read, and how many of them failed to apply.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HydrationReport {
+    pub(crate) events: usize,
+    pub(crate) failed: usize,
 }
 
 /// State tracking the latest inventory snapshots.
@@ -772,25 +780,40 @@ impl InventorySnapshot {
     ///
     /// Each field is applied as it is emitted -- no intermediate event
     /// buffer -- so startup hydration matches the persisted snapshot even
-    /// when deduplication suppresses the first post-restart poll.
-    pub(crate) async fn hydrate_inventory(&self, inventory: &Arc<BroadcastingInventory>) -> usize {
+    /// when deduplication suppresses the first post-restart poll. An event
+    /// that fails to apply is skipped with a warning and counted in the
+    /// report, and hydration goes on with the rest.
+    pub(crate) async fn hydrate_inventory(
+        &self,
+        inventory: &Arc<BroadcastingInventory>,
+    ) -> HydrationReport {
         let now = Utc::now();
         let mut view = inventory.write().await;
-        let mut event_count = 0usize;
+        let mut report = HydrationReport::default();
         let legacy_redemptions = !self.base_redemptions_chain_scoped;
 
         self.each_hydration_event(|event| {
-            event_count += 1;
-            if let Ok(updated) = view.clone().apply_snapshot_hydration_event_with_format(
+            report.events += 1;
+            match view.clone().apply_snapshot_hydration_event_with_format(
                 &event,
                 now,
                 legacy_redemptions,
             ) {
-                *view = updated;
+                Ok(updated) => *view = updated,
+                Err(error) => {
+                    report.failed += 1;
+                    // The event type only: the event carries balances.
+                    warn!(
+                        target: "inventory",
+                        event = event.event_type(),
+                        ?error,
+                        "Skipped a persisted inventory snapshot event that failed to apply"
+                    );
+                }
             }
         });
 
-        event_count
+        report
     }
 
     /// Produce events representing the full persisted state.
@@ -3289,6 +3312,85 @@ mod tests {
                 Chain::Base
             ),
             None
+        );
+    }
+
+    /// A persisted event the view refuses (here a negative inflight) is
+    /// skipped and counted, and the events before and after it still
+    /// hydrate: the chain redemptions come after the inflight equity.
+    #[tokio::test]
+    async fn hydration_counts_an_event_that_fails_to_apply_and_keeps_going() {
+        let symbol = test_symbol("AAPL");
+        let fetched_at = Utc::now();
+        let snapshot = replay::<InventorySnapshot>(vec![
+            InventorySnapshotEvent::OffchainEquity {
+                positions: BTreeMap::from([(symbol.clone(), test_shares(10))]),
+                fetched_at,
+            },
+            InventorySnapshotEvent::InflightEquity {
+                mints: BTreeMap::from([(symbol.clone(), test_shares(-3))]),
+                redemptions: BTreeMap::new(),
+                fetched_at,
+                base_redemptions_chain_scoped: true,
+            },
+            InventorySnapshotEvent::ChainInflightRedemptions {
+                chain: Chain::Base,
+                redemptions: BTreeMap::from([(symbol.clone(), test_shares(2))]),
+                fetched_at,
+            },
+        ])
+        .unwrap()
+        .unwrap();
+        let (sender, _) = tokio::sync::broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            crate::inventory::InventoryView::default(),
+            sender,
+        ));
+
+        let report = snapshot.hydrate_inventory(&inventory).await;
+
+        assert_eq!(
+            report,
+            HydrationReport {
+                events: 3,
+                failed: 1
+            }
+        );
+        let view = inventory.read().await;
+        assert_eq!(
+            view.equity_available(&symbol, crate::inventory::Venue::Hedging),
+            Some(test_shares(10))
+        );
+        assert_eq!(
+            view.equity_inflight_at(&symbol, crate::inventory::Venue::MarketMaking, Chain::Base),
+            Some(test_shares(2))
+        );
+        drop(view);
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_that_applies_cleanly_reports_no_failure() {
+        let symbol = test_symbol("AAPL");
+        let snapshot = replay::<InventorySnapshot>(vec![InventorySnapshotEvent::OffchainEquity {
+            positions: BTreeMap::from([(symbol, test_shares(10))]),
+            fetched_at: Utc::now(),
+        }])
+        .unwrap()
+        .unwrap();
+        let (sender, _) = tokio::sync::broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            crate::inventory::InventoryView::default(),
+            sender,
+        ));
+
+        let report = snapshot.hydrate_inventory(&inventory).await;
+
+        assert_eq!(
+            report,
+            HydrationReport {
+                events: 1,
+                failed: 0
+            }
         );
     }
 

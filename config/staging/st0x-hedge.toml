@@ -45,7 +45,7 @@ hedge_order_gate_reconciliation_timeout_secs = 10
 # t0.devops' pricing stack) : an ID token minted per connect, no
 # [pricing] secret exists. The droplet's ws://st0x-pricing:8080 was a
 # droplet-local container; it never existed on this VM.
-ws_url = "wss://st0x-pricing-3z4ofantqq-ey.a.run.app/ws"
+ws_url = "wss://t0-pricing-616358167422.europe-west3.run.app/ws"
 gcp_id_token = true
 # Slippage tolerance (basis points) for counter-trades that hedge
 # incoming orderbook fills.
@@ -279,6 +279,6 @@ vault_id = "0xfab"
 rebalancing = "disabled"
 
 # The per-symbol tables ([chains.<c>.trading.assets.equities.<SYM>] and
-# [assets.equities.<SYM>]) come from st0x.registry's token file in the bucket.
+# [assets.equities.<SYM>]) come from t0.tokens' token file in the bucket.
 [registry]
 url = "gs://t0-artifacts-tokens/staging/tokens.toml"

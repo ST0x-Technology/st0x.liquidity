@@ -68,3 +68,20 @@ cannot satisfy pull request branch protection.
 Use a pull request event for merge-blocking validation. Reserve
 `workflow_dispatch` for manual runs whose result does not need to become a pull
 request status check.
+
+## Board and parity checks
+
+The `backend build` job also runs two Python checks in the `ci-backend` shell,
+and `nix run .#ci` runs them too:
+
+- `python3 observability/gen-t0-liquidity.py --check` fails when the committed
+  liquidity board JSON differs from the generator output, or when a `liq_`
+  selector does not carry the `job=~"$source"` matcher (the job the board's
+  `source` variable picks), or another generator self-check fails.
+- `python3 scripts/liq-parity/test_compare.py` tests the staging parity tool
+  against a checked-in snapshot pair.
+
+The `liq_*` golden files under `src/metrics/liquidity/testdata/` are committed.
+CI does not regenerate them, because the exporter source is not in this
+repository; `scripts/liq-parity/golden.py` regenerates them from a local
+exporter checkout.

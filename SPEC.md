@@ -280,10 +280,10 @@ rebalancing on it (the wrappers are deployed and Alpaca's issuer serves its
 USDG and hedged, and Bebop's Robinhood hook is mapped as the inventory adapter,
 so its fills are attributed to Bebop. The production configuration runs it as an
 `active` secondary with the issuer's `redemption_wallet`, and rebalances against
-Alpaca the listings the pinned token file enables there (DNUT); every other
-listing keeps `rebalancing = "disabled"`. Staging watches the same inventory and
-runs it as a prefunded hedge-only secondary: every listing trades, and none
-rebalances. Its settlement stable is USDG at
+Alpaca the listings the pinned token file enables there (DNUT, PLBY, GRND, and
+WMT); every other listing keeps `rebalancing = "disabled"`. Staging watches the
+same inventory and runs it as a prefunded hedge-only secondary: every listing
+trades, and none rebalances. Its settlement stable is USDG at
 `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168` (6 decimals), so it is the first
 chain whose stable CCTP cannot carry. It pays gas in ETH, so the Base Chainlink
 ETH/USD read values its gas and `active` is reachable. Rebalancing an equity
@@ -1622,6 +1622,10 @@ migration files in `migrations/`.
   keeps TRACE on stdout for remote log shipping and INFO in local rotated files,
   reducing diagnostic log volume on the SQLite data disk without guaranteeing a
   hard byte bound.
+- Console JSON (`log_format = "json"`) is one flattened object per line: the
+  message and every event field are top-level keys beside `timestamp`, `level`
+  and `target`, so a parsing log shipper exposes them as structured fields. The
+  rotated files keep the nested `fields` shape that the log readers parse.
 - Require both log levels when rotated-file logging is enabled. A missing level
   must fail config validation instead of inheriting another sink's level.
 - API rate limiting and error tracking with metrics collection
@@ -1714,6 +1718,312 @@ one block-lag series and one poll-health report per hedged chain, primary first,
 each with its own current lag and its own cycle, error and skipped-tick counts:
 two chains never merge into one series, even when their orderbooks share an
 address.
+
+### Prometheus metrics (`liq_*` contract)
+
+`/metrics` serves two kinds of series. The `metrics` recorder renders the bot's
+native operational metrics (`hedge_*`, `registry_*` and others). After them, the
+bot renders the `liq_*` contract: the series that external consumers (the
+capital probe, the shareholder TVL report and the liquidity board) read. The
+contract was first published by an exporter sidecar that polled the bot's API.
+The bot now publishes the same names itself, so those consumers can stop
+depending on the sidecar.
+
+The native performance series count at the source. RPC and broker calls give
+`dependency_calls_total{dependency,operation,outcome}`,
+`dependency_call_duration_seconds{dependency,operation}` and
+`telemetry_samples_dropped_total`. Each fill watcher gives
+`order_fill_poll_cycles_total{chain,outcome}`,
+`order_fill_poll_skipped_ticks_total{chain}`,
+`order_fill_poll_duration_seconds{chain}`, `order_fill_block_lag_blocks{chain}`
+and `order_fill_block_lag_sampled_timestamp_seconds{chain}`. Each run of the
+prices, performance, orders and P&L collectors, failed or not, gives
+`metrics_refresh_duration_seconds{collector}`, and the file log gives
+`log_events_total{level,target}`. The duration histograms render with fixed
+buckets; the refresh histogram also has buckets from 90 to 300 seconds, so a run
+longer than 60 seconds is not only in `+Inf`. Each watcher registers its poll
+counters at 0 (every `outcome`, and the skipped ticks) when it starts, and the
+telemetry channel registers its dropped-sample counter at 0, so the first error,
+pause or drop is an increase from 0. An unknown block lag holds
+`order_fill_block_lag_blocks` at its last value, and its sample time stops
+advancing.
+
+- **Same meaning as the exporter.** Each ported name keeps the exporter's
+  labels, label values, units and sentinels, including the `wt`/`t` prefix rule
+  for `symbol` labels (a prefix is removed only before an uppercase letter). A
+  defect in an existing name is never fixed in place: the fix gets a new name,
+  and consumers move to it explicitly.
+- **Families replace as one unit.** Each source of `liq_*` series is one family:
+  health, settings, inventory, prices, equity bands, log counts, the four
+  performance families (latencies, reliability, infra, rebalances), pending
+  orders, Raindex orders, and one per P&L window. Inventory is replaced on each
+  inventory write, in write order, and also republished every 60 seconds from
+  the latest copy. Equity bands are replaced each time the trigger plans a
+  symbol, from the latest bands of every symbol: the planned symbol's samples
+  change and the others keep their last values. A refresh replaces every sample
+  of its family, so a symbol, chain or day that leaves the source leaves
+  `/metrics` on the next scrape instead of keeping its last value. A family
+  whose refresh fails keeps its last published samples.
+- **One writer per name.** Every `liq_*` name belongs to exactly one family, and
+  no `liq_*` name goes through the `metrics` macros. If the recorder ever
+  renders a `liq_` name, the contract skips its own block for that name and logs
+  an error, so the body stays valid. The one exception is the `liq_pnl_*` names:
+  they are exactly the names with a `window` label, and the six P&L window
+  families share them. Each window family publishes only the series whose
+  `window` label is its own window, so every series still has one writer. A
+  sample labelled with another window is dropped and logged, like a sample for a
+  name a family does not own.
+- **Freshness.** `liq_collector_last_success_ts_seconds{collector}` gives the
+  Unix time each family was last published, with `collector` from a closed set:
+  `health`, `settings`, `inventory`, `prices`, `equity_bands`, `logs`,
+  `latencies`, `reliability`, `infra`, `rebalances`, `pending_orders`,
+  `raindex`, and one per P&L window: `pnl_1d`, `pnl_1w`, `pnl_1m`, `pnl_ytd`,
+  `pnl_1y` and `pnl_all`. `health` and `settings` are published once at boot, so
+  their time stays at the boot time for the life of the process: that is not
+  staleness.
+- **Typed gauges.** Every `liq_*` block carries a `# HELP` line and a
+  `# TYPE <name> gauge` line. Every name is a gauge: snapshots, rolling `_24h`
+  windows, `*_total` names that mean a count now, and precomputed quantile
+  values. The exporter's series are untyped, so Managed Prometheus keeps them
+  apart from the bot's: a query by name with no `job` selector has a gap at the
+  cutover, and while both run, one name exists under both jobs. Consumers select
+  by `job`, so nothing counts twice. Label values escape backslash, double quote
+  and newline.
+- **Values.** Every value is a finite `f64`. Builders compute in exact types and
+  convert once at the end; a value that does not convert is absent and logged,
+  never replaced by a default. Integer settings beyond 2^53 are absent rather
+  than rounded.
+
+Settings and build identity are published once at boot: `liq_bot_info`
+(`git_commit`, first 12 characters), `liq_bot_start_timestamp_seconds` (process
+start, captured before the config loads; `/health` uptime counts from the same
+instant), `liq_settings_*` and `liq_asset_*` for every symbol the primary chain
+lists. An optional setting that is not configured has no series.
+`liq_asset_extended_hours` is absent while counter trading is disabled.
+`liq_settings_info{trading_mode}` is always empty, as it was in the exporter.
+`liq_usdc_corridor_target{chain}` and `liq_usdc_corridor_deviation{chain}` give
+the band of every configured USDC corridor, whatever the USDC mode.
+`liq_usdc_corridor_active{chain}` is 1 while the USDC trigger can start
+transfers on that corridor: the USDC mode is enabled and that chain's cash asset
+rebalancing is enabled. It is 0 otherwise, so a consumer can tell a band in use
+from one that is only configured.
+
+Inventory is published each time the inventory write lock is released, from a
+copy of the balances taken while the lock is held. Each copy is numbered in
+write order, and the store ignores a copy older than the one it holds, so a slow
+publisher never puts older balances back. Publishing starts once boot has
+restored the inventory from its snapshots: before that the view is empty, and
+its series would read as zero balances. If boot fails to read a snapshot, or one
+of its events fails to apply, the inventory series stay unpublished for that run
+and an error is logged. They return only after a start where every snapshot
+reads and applies; a restart does not help while the failing snapshot is
+unchanged, because boot rebuilds the same event from it. A task republishes the
+inventory every 60 seconds, which covers quiet periods.
+
+Every 60 seconds the same task publishes `liq_position_last_price_usd{symbol}`
+and `liq_equity_exposure_usd{symbol}` (net position times that price) for each
+symbol with a position. The price is the live, unexpired wrapped-token price
+from the pricing feed; positions and prices join on the `symbol` label. A symbol
+with a price but no position, or a position without a live price, has no series.
+If the positions fail to load, the last published prices stay.
+
+- `liq_equity_*{symbol}` and the unlabelled `liq_usdc_*` series keep the
+  exporter's meaning: the onchain values are the primary chain's vault only,
+  `liq_equity_total` excludes wallet tokens, and `liq_usdc_alpaca_total` is the
+  gross broker cash once read and the available broker cash until then.
+- `liq_usdc_rebalanceable` is withdrawable cash minus the reserve, never below
+  0. The reserve is the configured cash reserve, else the gross broker cash
+  minus the available broker cash once the gross is read, else 0. It is absent
+  until withdrawable cash is read.
+- `liq_equity_chain_{available,inflight}{symbol,chain}` and
+  `liq_usdc_chain_{available,inflight,ratio}{chain}` list each hedged chain's
+  vault separately. The hedged chains come from the config, not from the view. A
+  chain whose vault no snapshot has read yet is left out: a slot that only a
+  fill, transfer or inflight created holds a delta from 0, not a balance. A
+  chain the config no longer hedges is left out too. `liq_equity_chain_inflight`
+  is the equity in flight from that chain's vault, for example a redemption the
+  broker has not credited yet. Adding it to `liq_equity_chain_available` for the
+  same chain and symbol keeps that redemption from reading as a drop. Its unit
+  changes during a redemption: wrapped vault shares from the vault withdraw
+  until the bot unwraps, then underlying shares. A short unwrap moves the
+  difference into `liq_equity_chain_available`. So the per-chain sum is exact
+  only where the wrapper's ratio is 1. A redemption that is active across a
+  restart leaves both per-chain equity series absent for its chain and symbol
+  until it ends: boot recovery creates the slot from the in-flight quantity, and
+  the vault reads that would mark it read are refused while that redemption is
+  in flight. `liq_equity_chain_available` is in that chain's wrapped vault
+  shares. Each chain's wrapper has its own underlying-per-wrapped ratio, so the
+  series must not be summed across chains or added to broker shares.
+  `liq_usdc_chain_ratio` is that vault's available USDC over itself plus the
+  gross broker cash. It is absent until the gross broker cash is read and while
+  both are 0: it is a bot-only series, so the Values rule applies and no
+  exporter sentinel stands in. It is not the corridor's trigger ratio, which
+  uses the vault total, in flight included.
+
+Each time the rebalancing trigger plans a symbol, it publishes that symbol's
+`liq_equity_chain_share{chain,symbol}` and
+`liq_equity_chain_verdict{chain,symbol}` from the allocation planner's own
+input: each chain's share of the symbol's total in underlying shares (vaults
+through their wrapper ratio, plus the broker, transfers in flight included), and
+-1, 0 or 1 for below, within or above that chain's own target and band. A chain
+without a target, or whose listing is paused, still counts in the total but has
+no series, because the planner never picks it. The family keeps the latest bands
+of every symbol, so a symbol stays published while others are planned. A symbol
+leaves the family when the planner cannot size it (the broker or a listing chain
+not polled, a stale chain, a total of 0, or a plan input such as a wrapper ratio
+that cannot be read), and while its balance is divergent or restart tainted.
+When a symbol's transfer is in progress the trigger refreshes its bands without
+planning. Shares in flight count at the venue they leave, and venue snapshots
+are not applied while anything is in flight, so the verdict that started a
+transfer stays until the transfer completes; the refresh only picks up fills and
+provider polls of the amount in flight. A frozen asset keeps its last values
+until the next check. The `equity_bands` collector time moves whenever any
+symbol is published, so it does not say how old one symbol's values are. The
+verdict says where the chain sits, not whether the planner acts: it does not act
+while a transfer is in flight. Shares in flight are counted as underlying
+shares, the unit a provider poll and a stranded redemption use. The bot's own
+redemption is in flight in wrapped shares until a provider poll lists it, so
+while the ratio is not 1 the share is off by (ratio - 1) times that amount until
+then. A failed readiness probe of the chain the planner chose keeps the bands it
+recorded.
+
+Every 60 seconds a second task publishes the log counts and the performance
+families over the last 24 hours. The performance families come from the same
+loaders as the `/performance/*` endpoints; the log counts come from a counter in
+the process (see below):
+
+- `logs`: `liq_reliability_log_count_24h{level}` (`error` and `warning`, both
+  rows once seeded after a start) and `liq_log_target_count_24h{target,level}`
+  (`ERROR` or `WARN`, only targets with events).
+- `latencies`: `liq_hedge_latency_ms{stage,quantile}` (nearest-rank `p50`,
+  `p90`, `p95`, `p99` and `max`; a stage with no samples has no series),
+  `liq_hedge_latency_ms_samples{stage}`, and per open exposure
+  `liq_open_exposure_fill_count{symbol}` and
+  `liq_open_exposure_oldest_ts_seconds{symbol}`.
+- `reliability`: `liq_failure_event_count_24h{event_type}` and
+  `liq_job_queue{job_type,state}`. The job queue counts are the queue now, not a
+  window.
+- `infra`: `liq_block_lag_blocks{chain}`,
+  `liq_block_lag_sampled_ts_seconds{chain}`,
+  `liq_poll_{cycles,errors,skipped_ticks}_24h{chain}`,
+  `liq_poll_duration_ms{chain,quantile}`, and
+  `liq_dependency_{calls_24h,errors_24h}{dependency,operation}` with
+  `liq_dependency_latency_ms{dependency,operation,quantile}`. The block-lag and
+  poll series carry one `chain` per hedged chain; the exporter's unlabelled
+  versions came from a report shape the bot no longer serves. Each block-lag
+  series copies its `/performance/infra` field: a chain whose latest sample has
+  no cutoff block (ingestion paused) has a sample time and no lag, and a chain
+  with no checkpointed sample yet has neither.
+
+The log counts cover the events the file log writes, with the file log's filter,
+and are kept only when file logging is configured; without it both level rows
+are 0 and there are no target rows. The bot counts each event as it is logged,
+in one-minute buckets. Before it installs the subscriber it records the length
+of every log file. After a start it adds, once and in the background, the
+entries earlier processes wrote in the previous 24 hours, reading each file only
+up to its recorded length. So no entry is counted twice, even when the clock
+steps back after the start. The seed skips entries dated after the start (an
+earlier process whose clock ran ahead), and a minute after the current one is
+not counted until the clock reaches it, as the endpoint's upper bound skips such
+lines. Until that is done the `logs` family is not published. A scan that fails
+to read the files is retried twice on later refreshes, then kept with what it
+could read. A listing that missed files at the start cannot be repeated, since
+the files then also hold this process's lines, so the seed keeps the files it
+listed on its first attempt and logs an error. The `logs` family reads no
+database and runs first in the cycle, so it stays fresh while one `reliability`
+loader fails or times out. A stall of the whole database pool still delays it,
+since the slow cycle skips the next tick. Unlike `/performance/reliability`, the
+counts have no 50,000-entry cap, the first minute of the window counts as a
+whole, and lines another process (an operator's `st0x-cli` run) appends to the
+same files are counted only after the next restart. An event the file writer
+drops (a full queue or a failed write) is still counted.
+
+Every fifth cycle the task publishes `rebalances` over the last 30 days:
+`liq_rebalance_stage_ms{kind,stage,quantile}` (`kind` is `usdc` or `equity`) and
+`liq_attestation_last_ms{kind="usdc"}`, absent with no attestation in the
+window. A collector that fails or takes longer than 30 seconds keeps its last
+family. `logs` runs first, from the in-process counter; then `latencies`,
+`reliability`, `infra` and `rebalances` run one after another on purpose: the
+exporter called the same loaders in sequence, and the bot keeps that load shape
+on the SQLite pool the trading paths share. A slow cycle skips the next tick
+instead of overlapping it, and the collector times and
+`metrics_refresh_duration_seconds` show it.
+
+Every 60 seconds a task publishes the order series. `liq_pending_orders_total`
+and `liq_pending_orders{status}` count what `GET /orders/pending` returns, from
+the same loader: the newest 100 live broker order rows, without the ones whose
+payload does not parse (a malformed row still takes one of the 100). A read that
+fails keeps the last series and their collector time, and logs an error: the
+endpoint answers no orders then, but a 0 here would read as a fresh count. A
+status with no order has no series. `liq_pending_orders_uncapped_total` counts
+every live broker order row, with no limit and no payload check; it is absent
+when the count fails. `liq_raindex_orders_total` and
+`liq_raindex_orders_unavailable{reason}` come from the same fetch
+`GET /orders/raindex` proxies (page 1, 50 orders): the upstream
+`pagination.totalOrders` and `{reason=""} 0` while available, and
+`{reason="<why>"} 1` with no total while not. A `totalOrders` that is a number,
+or a string that parses as a finite number, is the total, as the exporter's
+`float()` read it. Any other value keeps the last Raindex family and logs a
+warning. The exporter failed its whole body on a non-numeric string, an array or
+an object, and published a boolean as 0 or 1 and a non-finite string as NaN or
+Inf, which the finite-value rule forbids. A 0 would read as a fresh count. Both
+order collectors record each run in `metrics_refresh_duration_seconds`.
+
+Every 5 minutes a task publishes the `liq_pnl_*` series of six windows, each
+labelled `window`: `1d`, `1w`, `1m`, `ytd`, `1y` and `all`. Each window's report
+is the one `GET /pnl` returns for its dates at the same ledger head, but the six
+share one ledger catch-up, one `asOfRowid` watermark and one replay: the replay
+does not read the dates, so only the summary, the Alpaca activities and the
+capital are built per window. Every window ends on the last day with fills
+(`availableRange.lastDate`); the starts are that day, 6 days, 30 days and 364
+days before it, January 1 of its year, and the first day with fills, and no
+start is before the first day with fills. Both days come from the shared replay
+itself, so the cycle that first replays a fill on a new day already ends every
+window on that day, as the exporter did, which took the range from a probe in
+the same pass. With no fills, no window is published. The task has its own
+report admission of one, so it never takes one of the two live `/pnl` permits;
+its report waits for that permit instead of failing, and takes it before the
+ledger catch-up, so the head it replays to is read after the wait.
+
+- The cycle waits up to 120 seconds for its report. A report that takes longer
+  is not cancelled: it keeps running and publishes its windows when it ends. No
+  cycle starts a new report until then, so two reports never publish one window
+  out of order, and the replay work never exceeds one report at a time.
+- The windows publish together, in the refresh order `1w`, `1d`, `all`, `1m`,
+  `ytd`, `1y`, after the shared report has built all six. Each window fetches
+  its own Alpaca activities one after another, so one window's slow fetch (such
+  as `all` paging through its history, or a call that waits for its HTTP
+  timeout) delays all six, and can push the report past the 120-second wait.
+- A window's `metrics_refresh_duration_seconds` sample runs from the start of
+  the shared report to that window's publish, failed or not. The windows publish
+  only after the shared report has built all six, so every sample covers the
+  whole shared report (the replay and every window's Alpaca fetch and capital
+  step) plus the publishes before it.
+- Each window is its own family (`collector="pnl_<window>"`). A window whose
+  report fails, or whose cycle's report is still running, keeps its last
+  samples, and its collector time stops advancing. A failure before the shared
+  replay ends, such as a ledger catch-up past its deadline, fails every window,
+  and records a duration sample for each of the six. The exporter dropped such a
+  window until its next cycle; this is a deliberate difference.
+- Summary, cost, capital, per-symbol and sample series copy `/pnl`'s fields. A
+  decimal that does not parse, and a capital figure that is not computed, leave
+  their series absent. Per-symbol rows whose symbols strip to the same label
+  (`tAAPL` and `wtAAPL`) are all left out, with an error log, rather than one
+  replacing the other; the exporter wrote both lines.
+- `liq_pnl_day_*{day}` come from the report's day buckets. A day sums its
+  symbols after the prefix rule, so `tAAPL` and `wtAAPL` add up. The running
+  totals run over every bucket, and only the last 90 buckets are published, so
+  the last bucket's running total equals the window total. A symbol stays in the
+  running totals after its last day. A day component that does not parse leaves
+  out the day value it adds up and every later running total that includes it,
+  and logs an error. The exporter counted such a component as 0 (a deliberate
+  difference: a 0 would read as a real day).
+
+**Exception to financial-integrity rules.** Some ported series reproduce the
+exporter's published sentinels: a ratio with a zero denominator is published as
+0, and a missing balance component counts as 0. These follow the exporter's
+published meaning so that existing consumers read the same numbers. They are for
+observation only and never feed a trading or rebalancing decision.
 
 ### Portfolio Capital and Return Tracking
 
@@ -2022,13 +2332,17 @@ Alternative approaches (Ansible, Kamal) were evaluated and documented in commit
 
 #### Config validation
 
-The GCP production and staging config TOMLs are committed beside their stacks in
-`t0.devops`, published as pinned Secret Manager versions, and mounted at
-`/run/t0-config/st0x-hedge.toml`. The OCI image contains no environment config;
-the compose file selects the mounted file with its `--config` flag. A config
-edit that only the deployed service can judge is a config edit whose first check
-is a bot that will not boot, which is what the `validate-config` binary exists
-to prevent.
+The GCP staging and production config TOMLs are committed in this repository
+(`config/staging/st0x-hedge.toml` and `config/prod/st0x-hedge.toml`). Each
+release validates the file inside the image that will run it, publishes it as a
+pinned `liquidity-runtime-config` Secret Manager version, and the VM mounts it
+at `/run/t0-config/st0x-hedge.toml`. A merge to `master` releases staging
+(`build-oci.yml`); production releases only through a manual
+`production-release.yml` run. The OCI image contains no environment config; the
+compose file selects the mounted file with its `--config` flag. A config edit
+that only the deployed service can judge is a config edit whose first check is a
+bot that will not boot, which is what the `validate-config` binary exists to
+prevent.
 
 `validate-config --config <path> [--secrets <path>] [--registry-file <path>]
 [--registry-state <dir>]`
@@ -2108,7 +2422,7 @@ pinned in code per chain, never configured.
 The per-symbol tables, `[chains.<c>.trading.assets.equities.<SYM>]` (addresses,
 vault ids, `trading` / `rebalancing` / `wrapped_equity_recovery`) and
 `[assets.equities.<SYM>]` (the hedge policy), are not in the bot's config. They
-come from the token file that `st0x.registry` publishes to
+come from the token file that `T0Trade/t0.tokens` publishes to
 `gs://t0-artifacts-tokens/<env>/tokens.toml`, one file per environment shared
 with pricing, the oracle, bebop and the price publisher. The config names it
 under `[registry]` (`url`, and in production `generation`) and must carry no
@@ -2120,7 +2434,7 @@ second budget, 4 MiB cap. A read that fails, a file that does not parse, a slot
 with a malformed switch or a missing address, a chain the config does not
 declare, or an empty universe all fail boot. The bot takes its own keys from
 each slot and ignores the others; which keys may appear is checked by
-`st0x.registry`'s CI before the file is published. The rows are merged into the
+`t0.tokens`' CI before the file is published. The rows are merged into the
 config's TOML table before it is deserialized, so every rule in
 `validate_config` runs on the result unchanged. A symbol listed under
 `retired_symbols` is dropped at the merge, so retiring is one config change and
@@ -5611,7 +5925,7 @@ release, together with the RAI-2780 production switch-on:
 3. A tag rollback from R to the release before it is safe only before R has run
    any equity operation on any chain: every redemption R runs, on Base too,
    persists `SendPrepared`, which older binaries cannot load. After that, stop
-   the Robinhood listing with a paused generation on R (a new st0x.registry
+   the Robinhood listing with a paused generation on R (a new token-file
    generation plus a pin bump, since `[registry]` refuses inline equities
    tables), or roll forward. A binary rollback below R follows the rules below.
 
@@ -6393,10 +6707,23 @@ transfer dispatch. It does not calculate cross-venue inventory imbalances.
   await retry or manual recovery)
 - `TokenizedEquityMintEvent::MintRejected` - No balance change (rejected before
   shares left Alpaca)
-- `TokenizedEquityMintEvent::MintAcceptanceFailed` - When emitted after
-  `MintAccepted`, reconciles the started inflight back to Alpaca available. When
-  emitted by an operator force-fail from `MintRequested` (pre-acceptance), no
-  inflight was ever started, so there is no balance change
+- `TokenizedEquityMintEvent::MintAcceptanceFailed` - When `MintAccepted` started
+  the mint's inflight in this process, reconciles it back to Alpaca available.
+  When emitted by an operator force-fail from `MintRequested` (pre-acceptance),
+  or when `MintAccepted` failed to start the inflight, the mint moved no shares,
+  so there is no balance change. A mint rebuilt on restart restores its inflight
+  without knowing whether the prior process debited available, so its failure
+  does not credit available either; the terminal clear below zeroes the restored
+  inflight and forces a reconcile
+- Every terminal mint event (`DepositedIntoRaindex`, `MintRejected`,
+  `MintAcceptanceFailed`, `RaindexDepositFailed`, `WrappingFailed`,
+  `OperatorReconciled`) also zeroes any Hedging inflight still left on the
+  symbol and, when it zeroes a non-zero amount, forces an offchain equity
+  reconcile. Hedging inflight holds only mint shares, and a symbol has one mint
+  at a time, so a residual there is inflight a provider poll wrote before the
+  mint became active (a restart replaying a persisted poll, or a provider still
+  listing the previous mint) or a restored mint's inflight, counted on top of
+  the mint's own or never started by it
 - `EquityRedemptionEvent::WithdrawnFromRaindex` - Moves tokens to inflight
   (leaving Raindex vault)
 - `EquityRedemptionEvent::TokensUnwrapped` - Exact-match unwraps, including
@@ -6492,6 +6819,13 @@ transfer dispatch. It does not calculate cross-venue inventory imbalances.
 - `InventorySnapshotEvent::InflightEquity` - Bot-owned pending tokenization
   requests polled from Alpaca; sets inflight at Hedging for mints on every chain
   and at Base's MarketMaking slot for Base redemptions only
+  - **Active mints**: from `MintRequested` until its terminal event, a mint owns
+    its symbol's Hedging inflight, so the poll neither sets nor zeroes that
+    inflight. The poll still records the symbol, so recovering another chain's
+    failed provider snapshot carries its broker balance. A snapshot-error reset
+    keeps the active mints and redemptions and each active mint's whole Hedging
+    balance: they come from aggregate events, and no poll would restore them. A
+    forced broker snapshot applied by that recovery still overwrites the balance
   - **Ownership**: determined by active rebalancing aggregate IDs --
     `issuer_request_id` / `tokenization_request_id` for mints,
     `tokenization_request_id` / `redemption_tx` for redemptions -- not by
@@ -6718,8 +7052,12 @@ detects imbalances that trigger rebalancing. It is the central projection that
 monitors total system inventory.
 
 Each asset type (equities per symbol, USDC) is tracked via a generic
-`Inventory<T>` containing `Option<VenueBalance<T>>` per venue. The `Option`
-distinguishes "not yet polled" from "polled with zero balance" — imbalance
+`Inventory<T>`: an optional `VenueBalance<T>` for the broker (Hedging), and one
+`VenueBalance<T>` per chain for the onchain vaults (MarketMaking). Venue-
+addressed operations act on the primary chain's slot; snapshot events route by
+their own chain. A slot that a fill, transfer or inflight created before any
+vault snapshot read it is marked unpolled, so it does not count as a reading.
+"Not yet polled" stays distinct from "polled with zero balance": imbalance
 detection requires both venues to have been initialized by snapshot events.
 
 When `InventoryView` applies an equity snapshot (`OnchainEquity` for the
@@ -8088,11 +8426,16 @@ multiple broker-specific contexts.
    trading domain. Dashboard pricing is a separate, process-local read model
    streamed in the initial WebSocket state and in live price updates; it does
    not mutate a Position or the event store. The same store also supplies the
-   rebalancer's minimum-operation-size price for a never-filled symbol and the
-   daily portfolio snapshot's newer-than-fill mark (see "USD marks"). Pricing
-   transport failures are retried. They never affect hedging; they can delay a
-   never-filled symbol's rebalancing, and a snapshot taken before any mark
-   arrives falls back to the last fill.
+   rebalancer's minimum-operation-size price for a never-filled symbol, the
+   daily portfolio snapshot's newer-than-fill mark (see "USD marks"), and the
+   `liq_*` prices family (`liq_position_last_price_usd` and
+   `liq_equity_exposure_usd`, see "Prometheus metrics (`liq_*` contract)").
+   Pricing transport failures are retried. They never affect hedging; they can
+   delay a never-filled symbol's rebalancing, a snapshot taken before any mark
+   arrives falls back to the last fill, and a symbol with no live price is
+   omitted from the replacement prices family at the next refresh that loads
+   positions (a refresh whose position load fails keeps the last family), so its
+   previous sample is dropped until a later refresh has a live price.
 
 3. **Spreads**: Last realized spreads per asset (buy/sell prices and spread bps)
    and per-symbol price charts over time.
@@ -8170,19 +8513,24 @@ multiple broker-specific contexts.
    rather than losing them. Adapter-specific venue values use
    `trade_protocol=terminal_outcomes_v3`; legacy, v1, and v2 responses downgrade
    every adapter or unknown-onchain venue to Raindex so an older exhaustive
-   dashboard cannot enter a parse/reconnect loop. A newer dashboard requests v3
-   and retries v2, then v1, when an older backend rejects an unknown protocol.
-   Legacy-protocol filter requests likewise collapse selected adapter venues to
-   Raindex so an old backend does not reject the venue query. The dashboard
-   continues to accept v1 responses and reconstructs the complete fill as the
-   legacy filled plus excess quantity. A legacy zero fill remains unknown
-   because v1 synthesized zero when no fill evidence existed. A successful
-   lower-version WebSocket fallback probes v3 again after its next disconnect so
-   a transient restart cannot pin the client to an older protocol. Failed
-   outcomes are sent only through a terminal-outcome protocol. Trade ordering
-   compares the complete RFC 3339 timestamp, including sub-millisecond
-   precision, then uses the same stable trade-ID tie-breaker for initial history
-   and live updates.
+   dashboard cannot enter a parse/reconnect loop. The v3 trade also carries
+   `price`, the fill price in USD per share of the trade's `shares`: the onchain
+   fill price per wrapped share, or the broker fill price per underlying share
+   of a filled counter-trade, and `null` for a failed or cancelled
+   counter-trade. A broker fill price that is not positive is logged as an error
+   and sent as `null`, since the dashboard rejects a non-positive price. Older
+   protocols omit the field. A newer dashboard requests v3 and retries v2, then
+   v1, when an older backend rejects an unknown protocol. Legacy-protocol filter
+   requests likewise collapse selected adapter venues to Raindex so an old
+   backend does not reject the venue query. The dashboard continues to accept v1
+   responses and reconstructs the complete fill as the legacy filled plus excess
+   quantity. A legacy zero fill remains unknown because v1 synthesized zero when
+   no fill evidence existed. A successful lower-version WebSocket fallback
+   probes v3 again after its next disconnect so a transient restart cannot pin
+   the client to an older protocol. Failed outcomes are sent only through a
+   terminal-outcome protocol. Trade ordering compares the complete RFC 3339
+   timestamp, including sub-millisecond precision, then uses the same stable
+   trade-ID tie-breaker for initial history and live updates.
 
    Every dashboard transport validates trade payloads at runtime before they
    enter client state. Snapshot, live WebSocket, and paginated HTTP paths use
@@ -8469,6 +8817,25 @@ for one release, then rejected -- `chat_id`/`message_thread_id` in the
 `[alerts]` config section, and a leftover `[alerts]` table (`bot_token`) in the
 secrets file. Deployed config versions still carry the former, deployed secret
 versions the latter, and the previous build required them.)
+
+Every alert line also carries a `kind` field: the alert class from a closed set
+in the bot. A kind the `operational_alerts` extractor already classifies has
+exactly the extractor's label, so the alert rules keyed on `kind` match the
+field unchanged; the bot pins that list against the rules. A kind the extractor
+does not know yet pages as unclassified until the extractor and the rules learn
+it. A wrapper alert that embeds a rendered error (a dead-lettered job, a
+supervised worker's terminal failure) takes the most specific known kind named
+in its text, as the extractor does. Each job's terminal failure message carries
+its own kind's phrase, so that kind applies when the error names nothing more
+specific; the bot pins that every such message holds a known phrase. The message
+text stays the same. A text log line also renders `kind="..."` after the
+message, and the extractor takes the rightmost phrase on the line, so a text
+line now classifies by the field unless a later field names another phrase. This
+changes a text-mode label only for an alert whose embedded runtime text named a
+different phrase. The phrase extractor is transitional: once the
+`operational_alerts` pager reads the `kind` field, the extracted and
+not-extracted split goes; the text classifier stays until wrapper alerts take
+their kind from the error type.
 
 ### BaseToAlpaca deposit send
 

@@ -11,7 +11,7 @@ use sqlx::SqlitePool;
 use tokio::sync::broadcast;
 use tracing::{info, trace, warn};
 
-use st0x_config::{ExecutionThreshold, OperationMode};
+use st0x_config::{ExecutionThreshold, OperationMode, UsdcCorridorCtx};
 use st0x_dto::{
     CurrentState, LegacyCompatibleTrade, Statement, TerminalOutcomesV1Trade, Trade, TradeOutcome,
     TransferWarning,
@@ -24,6 +24,8 @@ use crate::position::Position;
 
 pub(crate) mod equity_price;
 mod event;
+pub(crate) mod event_lines;
+pub(crate) mod order_loader;
 pub(crate) mod pnl;
 mod trade_loader;
 pub(crate) mod transfer_loader;
@@ -322,19 +324,28 @@ async fn stream_broadcasts(
 pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
     let (equity_target, equity_deviation, usdc_target, usdc_deviation) = {
         let rebalancing = &ctx.rebalancing;
-        // The one active corridor's band whatever its chain; with several,
-        // the primary chain's, until the dashboard shows one cash band per
-        // chain.
+        // The band of the one corridor the USDC trigger can act on, whatever
+        // its chain; with several, the primary chain's, until the dashboard
+        // shows one cash band per chain. The trigger skips a corridor whose
+        // chain does not rebalance its cash asset.
         let primary = ctx.chains.primary().chain;
+        let rebalances_cash = |usdc: &&UsdcCorridorCtx| {
+            ctx.chains
+                .hedged_chain(usdc.corridor.chain())
+                .and_then(|hedged| hedged.assets.rebalancing_cash())
+                .is_some()
+        };
         let (usdc_target, usdc_deviation) = rebalancing
             .usdc
             .active()
+            .filter(rebalances_cash)
             .exactly_one()
             .ok()
             .or_else(|| {
                 rebalancing
                     .usdc
                     .active()
+                    .filter(rebalances_cash)
                     .find(|usdc| usdc.corridor.chain() == primary)
             })
             .map_or((None, None), |usdc| {
@@ -508,8 +519,8 @@ mod tests {
 
     use st0x_bridge::corridor::{HopKind, UsdcCorridor};
     use st0x_config::{
-        ChainAssets, ChainEquityAsset, ImbalanceThreshold, RebalancingMode, UsdcCorridorCtx,
-        UsdcCorridors, create_test_ctx_with_order_owner,
+        ChainAssets, ChainCashAsset, ChainEquityAsset, HedgedChain, ImbalanceThreshold,
+        RebalancingMode, UsdcCorridorCtx, UsdcCorridors, create_test_ctx_with_order_owner,
     };
     use st0x_dto::{Direction, Trade, TradingVenue};
     use st0x_event_sorcery::StoreBuilder;
@@ -538,6 +549,7 @@ mod tests {
                 st0x_float_macro::float!(1),
             ))
             .unwrap(),
+            price: None,
             outcome: st0x_dto::TradeOutcome::Filled,
         })
     }
@@ -573,6 +585,7 @@ mod tests {
             direction: Direction::Sell,
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            price: None,
             outcome: TradeOutcome::Cancelled {
                 accepted_shares: Some(Positive::new(FractionalShares::new(float!(1))).unwrap()),
                 filled_shares: Some(
@@ -607,6 +620,7 @@ mod tests {
             direction: Direction::Buy,
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            price: None,
             outcome: TradeOutcome::Filled,
         };
 
@@ -694,6 +708,19 @@ mod tests {
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
         assert_ne!(ctx.chains.primary().chain, Chain::HyperEvm);
+        ctx.chains.insert_secondary(
+            HedgedChain::test()
+                .chain(Chain::HyperEvm)
+                .assets(ChainAssets {
+                    cash: Some(ChainCashAsset {
+                        vault_ids: Vec::new(),
+                        rebalancing: OperationMode::Enabled,
+                        operational_limit: None,
+                    }),
+                    ..ChainAssets::default()
+                })
+                .call(),
+        );
         ctx.rebalancing.usdc = UsdcCorridors::for_test(
             OperationMode::Enabled,
             [UsdcCorridorCtx {
@@ -1093,6 +1120,7 @@ mod tests {
             direction: Direction::Buy,
             symbol: Symbol::new("TSLA").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            price: None,
             outcome: TradeOutcome::Filled,
         };
         server
@@ -1125,6 +1153,7 @@ mod tests {
             direction: Direction::Sell,
             symbol: Symbol::new("TSLA").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            price: None,
             outcome: TradeOutcome::Failed {
                 error: "broker rejected order".to_string(),
                 accepted_shares: None,

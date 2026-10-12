@@ -1,0 +1,15 @@
+# Expected exporter output for settings-minimal.json, written by
+# scripts/liq-parity/golden.py from t0.devops revision 226c029.
+liq_settings_info{broker="alpaca",log_level="Info",orderbook="0x0000000000000000000000000000000000000002",server_port="",trading_mode="",turnkey_organization="",wallet_address="",wallet_kind=""} 1.0
+liq_settings_equity_deviation 0.1
+liq_settings_order_polling_seconds 1.0
+liq_settings_inventory_poll_seconds 1.0
+liq_settings_deployment_block 0.0
+liq_usdc_onchain_available 0.0
+liq_usdc_onchain_inflight 0.0
+liq_usdc_offchain_available 0.0
+liq_usdc_offchain_inflight 0.0
+liq_usdc_alpaca_total 0.0
+liq_usdc_inflight_total 0.0
+liq_usdc_total 0.0
+liq_usdc_ratio 0.0

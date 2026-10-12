@@ -12,13 +12,21 @@ use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::task::{Context as TaskContext, Poll};
+use std::time::SystemTime;
 use task_supervisor::{SupervisedTask, TaskResult};
 use tokio::sync::Notify;
 
 const READY_FILE_ENV: &str = "ST0X_STARTUP_READY_FILE";
+
+/// When this process started.
+///
+/// The server binary forces it before loading the config, so `/health` uptime
+/// and `liq_bot_start_timestamp_seconds` count from process start, not from the
+/// first request that reads them.
+pub static PROCESS_START: LazyLock<SystemTime> = LazyLock::new(SystemTime::now);
 
 pub(crate) trait StartupNotifier: Send + Sync {
     fn notify_ready(&self) -> io::Result<()>;

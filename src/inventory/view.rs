@@ -183,7 +183,10 @@ pub(crate) enum ActiveUsdcRebalance {
 
 /// Inventory at a pair of venues (onchain/offchain).
 ///
-/// Venues are `Option` to distinguish "not yet polled" from "polled with zero balance".
+/// The offchain venue is `Option` to distinguish "not yet polled" from "polled with zero
+/// balance". An onchain slot holds a reading only when its chain is not in
+/// `unpolled_onchain`: a fill, transfer or inflight can create the slot first. Use
+/// `polled_onchain()`, not `onchain.contains_key`, to ask whether a vault was read.
 /// Imbalance detection requires both venues to have been initialized by snapshot events.
 ///
 /// Fields are private - mutation is only possible through the closure-returning
@@ -192,10 +195,23 @@ pub(crate) enum ActiveUsdcRebalance {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Inventory<T> {
     /// On-chain balance per chain: the same symbol listed on two chains is
-    /// two slots. Absent entry = that chain not yet polled.
+    /// two slots. Absent entry = that chain not yet polled; a present entry
+    /// is a reading only when its chain is not in `unpolled_onchain`.
     onchain: BTreeMap<Chain, VenueBalance<T>>,
     offchain: Option<VenueBalance<T>>,
     last_rebalancing: Option<DateTime<Utc>>,
+    /// Chains whose onchain slot a fill, transfer or inflight created before
+    /// any vault snapshot set it: the slot's available is a delta from 0,
+    /// not a reading. A snapshot of that chain clears it.
+    #[serde(default)]
+    unpolled_onchain: BTreeSet<Chain>,
+}
+
+/// An onchain slot copied by a reset, with whether a vault snapshot set it.
+#[derive(Debug, Clone, Copy)]
+struct CarriedSlot<T> {
+    balance: VenueBalance<T>,
+    unpolled: bool,
 }
 
 /// Impl block with minimal bounds for `has_inflight` - shared by all other impl blocks.
@@ -249,6 +265,35 @@ where
         Ok(true)
     }
 
+    /// The onchain slot on `chain` with its poll marker, for a reset that
+    /// keeps the slot: it must also keep whether the slot holds a reading.
+    fn carried_onchain_slot(&self, chain: Chain) -> Option<CarriedSlot<T>>
+    where
+        VenueBalance<T>: Copy,
+    {
+        self.onchain.get(&chain).map(|balance| CarriedSlot {
+            balance: *balance,
+            unpolled: self.unpolled_onchain.contains(&chain),
+        })
+    }
+
+    fn insert_carried_slot(&mut self, chain: Chain, slot: CarriedSlot<T>) {
+        self.onchain.insert(chain, slot.balance);
+        if slot.unpolled {
+            self.unpolled_onchain.insert(chain);
+        } else {
+            self.unpolled_onchain.remove(&chain);
+        }
+    }
+
+    /// The onchain slots a vault snapshot has set, in chain order. A slot
+    /// that only a fill, transfer or inflight created holds no reading yet.
+    fn polled_onchain(&self) -> impl Iterator<Item = (&Chain, &VenueBalance<T>)> {
+        self.onchain
+            .iter()
+            .filter(|(chain, _)| !self.unpolled_onchain.contains(chain))
+    }
+
     fn get_venue(&self, venue: Venue, chain: Chain) -> Option<VenueBalance<T>>
     where
         VenueBalance<T>: Copy,
@@ -259,13 +304,29 @@ where
         }
     }
 
+    /// Set a venue from a snapshot: the onchain slot now holds a reading.
+    fn set_polled_venue(self, venue: Venue, chain: Chain, balance: VenueBalance<T>) -> Self {
+        let mut inventory = self.set_venue(venue, chain, Some(balance));
+        match venue {
+            Venue::MarketMaking => {
+                inventory.unpolled_onchain.remove(&chain);
+            }
+            Venue::Hedging => {}
+        }
+        inventory
+    }
+
     fn set_venue(mut self, venue: Venue, chain: Chain, balance: Option<VenueBalance<T>>) -> Self {
         match venue {
             Venue::MarketMaking => {
-                match balance {
-                    Some(balance) => self.onchain.insert(chain, balance),
-                    None => self.onchain.remove(&chain),
-                };
+                if let Some(balance) = balance {
+                    if self.onchain.insert(chain, balance).is_none() {
+                        self.unpolled_onchain.insert(chain);
+                    }
+                } else {
+                    self.onchain.remove(&chain);
+                    self.unpolled_onchain.remove(&chain);
+                }
                 self
             }
             Venue::Hedging => Self {
@@ -282,6 +343,7 @@ impl<T> Default for Inventory<T> {
             onchain: BTreeMap::new(),
             offchain: None,
             last_rebalancing: None,
+            unpolled_onchain: BTreeSet::new(),
         }
     }
 }
@@ -473,7 +535,7 @@ where
                 .unwrap_or_default()
                 .apply_snapshot(snapshot_balance)?;
 
-            Ok(inventory.set_venue(venue, chain, Some(balance)))
+            Ok(inventory.set_polled_venue(venue, chain, balance))
         })
     }
 
@@ -493,7 +555,7 @@ where
                 .unwrap_or_default()
                 .apply_snapshot(snapshot_balance)?;
 
-            Ok(inventory.set_venue(venue, chain, Some(balance)))
+            Ok(inventory.set_polled_venue(venue, chain, balance))
         })
     }
 
@@ -512,7 +574,7 @@ where
                 .unwrap_or_default()
                 .apply_snapshot_keeping_inflight(snapshot_balance);
 
-            Ok(inventory.set_venue(venue, chain, Some(balance)))
+            Ok(inventory.set_polled_venue(venue, chain, balance))
         })
     }
 
@@ -536,7 +598,7 @@ where
                 .unwrap_or_default()
                 .force_apply_snapshot(snapshot_balance, &recovering_from);
 
-            Ok(inventory.set_venue(venue, chain, Some(balance)))
+            Ok(inventory.set_polled_venue(venue, chain, balance))
         })
     }
 }
@@ -735,6 +797,59 @@ const PORTFOLIO_EQUITY_TRANSIT_LOCATIONS: [(InFlightEquityLocation, PortfolioLoc
     ),
 ];
 
+/// One symbol's balances as the dashboard and the `liq_*` series show them:
+/// the primary chain's vault, the offchain venue, and the Base wallet.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SymbolBalances {
+    pub(crate) symbol: Symbol,
+    pub(crate) onchain_available: FractionalShares,
+    pub(crate) onchain_inflight: FractionalShares,
+    pub(crate) offchain_available: FractionalShares,
+    pub(crate) offchain_inflight: FractionalShares,
+    pub(crate) base_wallet_unwrapped: FractionalShares,
+    pub(crate) base_wallet_wrapped: FractionalShares,
+}
+
+/// The cash balances as the dashboard and the `liq_*` series show them. The
+/// onchain fields are the primary chain's vault. `None` means not read yet.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct UsdcBalances {
+    pub(crate) onchain_available: Usdc,
+    pub(crate) onchain_inflight: Usdc,
+    pub(crate) offchain_available: Usdc,
+    pub(crate) offchain_inflight: Usdc,
+    pub(crate) offchain_gross: Option<Usdc>,
+    pub(crate) withdrawable_cash: Option<Usdc>,
+    pub(crate) alpaca_usdc: Option<Usdc>,
+    pub(crate) ethereum_wallet: Option<Usdc>,
+    pub(crate) base_wallet: Option<Usdc>,
+}
+
+/// The vault balances a snapshot has read on each chain the config hedges.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct OnchainByChain {
+    pub(crate) equities: Vec<ChainEquityBalance>,
+    pub(crate) usdc: Vec<ChainUsdcBalance>,
+}
+
+/// One chain vault's equity: shares available, and shares in flight from it
+/// (a redemption the broker has not credited yet).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ChainEquityBalance {
+    pub(crate) symbol: Symbol,
+    pub(crate) chain: Chain,
+    pub(crate) available: FractionalShares,
+    pub(crate) inflight: FractionalShares,
+}
+
+/// One chain's settlement-stable vault balance (USDC, or USDG on Robinhood).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ChainUsdcBalance {
+    pub(crate) chain: Chain,
+    pub(crate) available: Usdc,
+    pub(crate) inflight: Usdc,
+}
+
 /// Cross-aggregate projection tracking inventory across venues.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct InventoryView {
@@ -779,14 +894,14 @@ pub(crate) struct InventoryView {
     /// deposits into.
     ///
     /// Populated when a non-terminal mint event is processed, cleared on
-    /// terminal mint events.
+    /// terminal mint events. Kept across snapshot-error resets.
     #[serde(default)]
     active_mints: HashMap<Symbol, ActiveEquityTransfer<IssuerRequestId>>,
     /// In-flight equity redemptions, keyed by symbol, with the chain each
     /// redemption withdraws from.
     ///
     /// Populated when a non-terminal redemption event is processed, cleared
-    /// on terminal redemption events.
+    /// on terminal redemption events. Kept across snapshot-error resets.
     #[serde(default)]
     active_redemptions: HashMap<Symbol, ActiveEquityTransfer<RedemptionAggregateId>>,
     /// Equity tokens observed at intermediate wallet locations between
@@ -1063,7 +1178,46 @@ impl InventoryView {
     /// serialization.
     pub(crate) fn to_dto(&self) -> st0x_dto::Inventory {
         let per_symbol = self
-            .equities
+            .symbol_balances()
+            .into_iter()
+            .map(|balances| SymbolInventory {
+                symbol: balances.symbol,
+                onchain_available: balances.onchain_available,
+                onchain_inflight: balances.onchain_inflight,
+                offchain_available: balances.offchain_available,
+                offchain_inflight: balances.offchain_inflight,
+                inflight_equity: InFlightEquity {
+                    base_wallet_unwrapped: balances.base_wallet_unwrapped,
+                    base_wallet_wrapped: balances.base_wallet_wrapped,
+                },
+            })
+            .collect();
+
+        let usdc = self.usdc_balances();
+
+        st0x_dto::Inventory {
+            per_symbol,
+            usdc: UsdcInventory {
+                symbol: self.primary_chain.settlement_stable().symbol.to_string(),
+                onchain_available: usdc.onchain_available,
+                onchain_inflight: usdc.onchain_inflight,
+                offchain_available: usdc.offchain_available,
+                offchain_inflight: usdc.offchain_inflight,
+                offchain_gross: usdc.offchain_gross,
+                withdrawable_cash: usdc.withdrawable_cash,
+                alpaca_usdc: usdc.alpaca_usdc,
+                inflight_cash: InFlightCash {
+                    ethereum_wallet: usdc.ethereum_wallet,
+                    base_wallet: usdc.base_wallet,
+                },
+            },
+        }
+    }
+
+    /// Every symbol the view holds a balance or a wallet reading for, in
+    /// symbol order, as the dashboard and the `liq_*` series show it.
+    pub(crate) fn symbol_balances(&self) -> Vec<SymbolBalances> {
+        self.equities
             .keys()
             .chain(self.inflight_equity.keys().map(|(symbol, _)| symbol))
             .unique()
@@ -1072,9 +1226,8 @@ impl InventoryView {
                 let inventory = self.equities.get(symbol);
                 // The primary chain's slot alone, never a cross-chain total:
                 // a wrapped share is worth its own chain's underlying, so the
-                // chains cannot be added. Surfacing the other chains needs a
-                // chain-qualified field the dashboard can render per chain,
-                // not a wider sum here.
+                // chains cannot be added. Every hedged chain's polled slot is
+                // listed apart in `onchain_by_chain` instead.
                 let (onchain_available, onchain_inflight) = inventory
                     .map_or((FractionalShares::ZERO, FractionalShares::ZERO), |item| {
                         venue_balances(item.onchain.get(&self.primary_chain).copied())
@@ -1085,73 +1238,89 @@ impl InventoryView {
                         venue_balances(item.offchain)
                     });
 
-                let inflight_equity = InFlightEquity {
-                    base_wallet_unwrapped: self
-                        .inflight_equity
-                        .get(&(
-                            symbol.clone(),
-                            InFlightEquityLocation::WalletUnwrapped(Chain::Base),
-                        ))
-                        .map_or(FractionalShares::ZERO, |entry| entry.amount),
-                    base_wallet_wrapped: self
-                        .inflight_equity
-                        .get(&(
-                            symbol.clone(),
-                            InFlightEquityLocation::WalletWrapped(Chain::Base),
-                        ))
-                        .map_or(FractionalShares::ZERO, |entry| entry.amount),
+                let wallet = |location| {
+                    self.inflight_equity
+                        .get(&(symbol.clone(), location))
+                        .map_or(FractionalShares::ZERO, |entry| entry.amount)
                 };
 
-                SymbolInventory {
+                SymbolBalances {
                     symbol: symbol.clone(),
                     onchain_available,
                     onchain_inflight,
                     offchain_available,
                     offchain_inflight,
-                    inflight_equity,
+                    base_wallet_unwrapped: wallet(InFlightEquityLocation::WalletUnwrapped(
+                        Chain::Base,
+                    )),
+                    base_wallet_wrapped: wallet(InFlightEquityLocation::WalletWrapped(Chain::Base)),
                 }
             })
-            .collect();
+            .collect()
+    }
 
+    /// The cash balances as the dashboard and the `liq_*` series show them.
+    pub(crate) fn usdc_balances(&self) -> UsdcBalances {
         // The primary chain's slot alone: the dashboard measures this against
         // the rebalancing target, which governs that chain's vault. Cash
         // prefunded elsewhere is beyond the rebalancer's reach, so totalling it
         // in reads as a healthy allocation while the chain that rebalances is
         // underfunded.
-        let (usdc_onchain_available, usdc_onchain_inflight) =
+        let (onchain_available, onchain_inflight) =
             venue_balances(self.usdc.onchain.get(&self.primary_chain).copied());
 
-        let (usdc_offchain_available, usdc_offchain_inflight) = venue_balances(self.usdc.offchain);
+        let (offchain_available, offchain_inflight) = venue_balances(self.usdc.offchain);
 
-        let withdrawable_cash = self.withdrawable_cash_cents.and_then(Usdc::from_cents);
+        let wallet = |location| self.inflight_cash.get(&location).map(|entry| entry.amount);
 
-        let offchain_gross = self.offchain_gross_usd_cents.and_then(Usdc::from_cents);
-
-        let inflight_cash = InFlightCash {
-            ethereum_wallet: self
-                .inflight_cash
-                .get(&InFlightCashLocation::EthereumWallet)
-                .map(|entry| entry.amount),
-            base_wallet: self
-                .inflight_cash
-                .get(&InFlightCashLocation::BaseWallet)
-                .map(|entry| entry.amount),
-        };
-
-        st0x_dto::Inventory {
-            per_symbol,
-            usdc: UsdcInventory {
-                symbol: self.primary_chain.settlement_stable().symbol.to_string(),
-                onchain_available: usdc_onchain_available,
-                onchain_inflight: usdc_onchain_inflight,
-                offchain_available: usdc_offchain_available,
-                offchain_inflight: usdc_offchain_inflight,
-                offchain_gross,
-                withdrawable_cash,
-                alpaca_usdc: self.alpaca_usdc,
-                inflight_cash,
-            },
+        UsdcBalances {
+            onchain_available,
+            onchain_inflight,
+            offchain_available,
+            offchain_inflight,
+            offchain_gross: self.offchain_gross_usd_cents.and_then(Usdc::from_cents),
+            withdrawable_cash: self.withdrawable_cash_cents.and_then(Usdc::from_cents),
+            alpaca_usdc: self.alpaca_usdc,
+            ethereum_wallet: wallet(InFlightCashLocation::EthereumWallet),
+            base_wallet: wallet(InFlightCashLocation::BaseWallet),
         }
+    }
+
+    /// The onchain balances of each chain in `hedged` that a vault snapshot
+    /// has read, in symbol and chain order, for the `liq_*` per-chain series.
+    /// A slot that only a fill, transfer or inflight created holds a delta
+    /// from 0, not a reading, so it is left out; so is a chain the config no
+    /// longer hedges, whose persisted snapshots still replay.
+    pub(crate) fn onchain_by_chain(&self, hedged: &BTreeSet<Chain>) -> OnchainByChain {
+        let equities = self
+            .equities
+            .iter()
+            .sorted_by(|(left, _), (right, _)| left.cmp(right))
+            .flat_map(|(symbol, inventory)| {
+                inventory
+                    .polled_onchain()
+                    .filter(|(chain, _)| hedged.contains(chain))
+                    .map(|(chain, balance)| ChainEquityBalance {
+                        symbol: symbol.clone(),
+                        chain: *chain,
+                        available: balance.available(),
+                        inflight: balance.inflight(),
+                    })
+            })
+            .collect();
+
+        let usdc = self
+            .usdc
+            .polled_onchain()
+            .filter(|(chain, _)| hedged.contains(chain))
+            .map(|(chain, balance)| ChainUsdcBalance {
+                chain: *chain,
+                available: balance.available(),
+                inflight: balance.inflight(),
+            })
+            .collect();
+
+        OnchainByChain { equities, usdc }
     }
 
     /// Extracts a flat list of observed balances for the daily portfolio
@@ -1350,6 +1519,7 @@ impl InventoryView {
                     FractionalShares::ZERO,
                 )),
                 last_rebalancing: None,
+                unpolled_onchain: BTreeSet::new(),
             },
         );
         self
@@ -1613,6 +1783,7 @@ impl InventoryView {
                 )]),
                 offchain: Some(VenueBalance::new(offchain_available, Usdc::ZERO)),
                 last_rebalancing: None,
+                unpolled_onchain: BTreeSet::new(),
             },
             ..self
         }
@@ -1640,6 +1811,7 @@ impl InventoryView {
                 )]),
                 offchain: Some(VenueBalance::new(offchain_available, offchain_inflight)),
                 last_rebalancing: None,
+                unpolled_onchain: BTreeSet::new(),
             },
             ..self
         }
@@ -2155,8 +2327,8 @@ impl InventoryView {
         corrections
     }
 
-    /// A fresh default view retaining stranded redemption exposure and the
-    /// offchain-order guard state
+    /// A fresh default view retaining stranded redemption exposure, the
+    /// active mints and redemptions, the offchain-order guard state
     /// (pending orders and applied-fill times) and, for each gated symbol,
     /// the Hedging available balance that state guards.
     ///
@@ -2174,10 +2346,16 @@ impl InventoryView {
     /// watermarks, so a delayed older fill or read cannot be counted again on
     /// top of the kept balance; other onchain venues are left
     /// uninitialized (they are not delta-owned and nothing blocks their
-    /// repopulation). Every other field is intentionally
-    /// defaulted, which is why this uses functional-update syntax rather than
-    /// an exhaustive literal: a future field should default here unless it is
-    /// guard state.
+    /// repopulation). The active mints and redemptions come from their
+    /// aggregates' events, not from snapshots, so they survive like the guard
+    /// state. The poll never writes an active mint's Hedging inflight, and the
+    /// mint debits Hedging available on `MintAccepted`, so that symbol keeps
+    /// its whole Hedging balance and watermark: no poll restores the
+    /// inflight, and a dropped balance would fail the mint's own `Start`. A
+    /// forced broker snapshot applied after the reset still overwrites it.
+    /// Every other field is intentionally defaulted, which is why this uses
+    /// functional-update syntax rather than an exhaustive literal: a future
+    /// field should default here unless it is guard state.
     pub(crate) fn reset_preserving_offchain_order_state(&self) -> Self {
         let mut equities: HashMap<Symbol, Inventory<FractionalShares>> = self
             .equities
@@ -2196,6 +2374,7 @@ impl InventoryView {
                                     FractionalShares::ZERO,
                                 )),
                                 last_rebalancing: None,
+                                unpolled_onchain: BTreeSet::new(),
                             },
                         )
                     })
@@ -2214,16 +2393,15 @@ impl InventoryView {
         let mut onchain_equity_snapshot_block_watermarks: HashMap<Chain, HashMap<Symbol, u64>> =
             HashMap::new();
         for stranded in self.startup_stranded_redemptions.values() {
-            if let Some(balance) = self
+            if let Some(slot) = self
                 .equities
                 .get(&stranded.symbol)
-                .and_then(|inventory| inventory.get_venue(Venue::MarketMaking, stranded.chain))
+                .and_then(|inventory| inventory.carried_onchain_slot(stranded.chain))
             {
                 equities
                     .entry(stranded.symbol.clone())
                     .or_default()
-                    .onchain
-                    .insert(stranded.chain, balance);
+                    .insert_carried_slot(stranded.chain, slot);
                 self.carry_hedging_available(
                     &stranded.symbol,
                     &mut equities,
@@ -2262,8 +2440,23 @@ impl InventoryView {
             }
         }
 
+        for symbol in self.active_mints.keys() {
+            if let Some(balance) = self
+                .equities
+                .get(symbol)
+                .and_then(|inventory| inventory.offchain)
+            {
+                equities.entry(symbol.clone()).or_default().offchain = Some(balance);
+            }
+            if let Some(watermark) = self.offchain_equity_snapshot_watermarks.get(symbol) {
+                offchain_equity_snapshot_watermarks.insert(symbol.clone(), *watermark);
+            }
+        }
+
         Self {
             equities,
+            active_mints: self.active_mints.clone(),
+            active_redemptions: self.active_redemptions.clone(),
             startup_stranded_redemptions: self.startup_stranded_redemptions.clone(),
             previous_inflight_redemptions,
             onchain_equity_snapshot_watermarks,
@@ -2322,16 +2515,15 @@ impl InventoryView {
                 continue;
             }
             for symbol in symbols {
-                if let Some(balance) = self
+                if let Some(slot) = self
                     .equities
                     .get(symbol)
-                    .and_then(|inventory| inventory.onchain.get(chain))
+                    .and_then(|inventory| inventory.carried_onchain_slot(*chain))
                 {
                     view.equities
                         .entry(symbol.clone())
                         .or_default()
-                        .onchain
-                        .insert(*chain, *balance);
+                        .insert_carried_slot(*chain, slot);
                     self.carry_hedging_available(
                         symbol,
                         &mut view.equities,
@@ -3265,6 +3457,11 @@ impl InventoryView {
     /// because a stale poll could otherwise re-introduce inflight that was
     /// already cleared by a completed transfer.
     ///
+    /// Skips symbols with an active mint, both when setting and when zeroing:
+    /// the mint reactor owns their Hedging inflight from `MintRequested` on. A
+    /// poll that lists the request before `MintAccepted` lands would otherwise
+    /// count the shares a second time.
+    ///
     /// Mints are inflight at Hedging (shares leaving offchain broker toward
     /// onchain). Redemptions are inflight at MarketMaking (shares leaving
     /// onchain toward offchain broker).
@@ -3281,6 +3478,17 @@ impl InventoryView {
 
         // Set inflight for symbols present in the poll.
         for (symbol, &quantity) in mints {
+            if view.active_mints.contains_key(symbol) {
+                debug!(
+                    target: "inventory",
+                    %symbol,
+                    ?quantity,
+                    "Skipping mint inflight snapshot: an active mint owns \
+                     the symbol's Hedging inflight"
+                );
+                continue;
+            }
+
             if view.is_stale_for_symbol(symbol, fetched_at) {
                 debug!(
                     target: "inventory",
@@ -3301,8 +3509,12 @@ impl InventoryView {
 
         // Zero inflight for symbols that were in the previous poll but
         // disappeared. These are requests that completed or were rejected.
+        // An active mint owns the slot even if an earlier poll recorded it.
         for symbol in &prev_mints {
-            if !mints.contains_key(symbol) && !view.is_stale_for_symbol(symbol, fetched_at) {
+            if !mints.contains_key(symbol)
+                && !view.active_mints.contains_key(symbol)
+                && !view.is_stale_for_symbol(symbol, fetched_at)
+            {
                 view = view.update_equity(
                     symbol,
                     Inventory::set_inflight(Venue::Hedging, FractionalShares::ZERO),
@@ -3543,24 +3755,13 @@ impl InventoryView {
         Ok(view)
     }
 
-    /// Remove a symbol from the previous inflight mint marker set.
-    ///
-    /// Called when a new mint transfer starts (MintAccepted event) to
-    /// prevent the next inflight poll from incorrectly zeroing the new
-    /// inflight. Without this, a poll that fires before Alpaca reflects
-    /// the new pending request would see the symbol in `prev_mints` but
-    /// absent from the current poll, and zero it.
-    pub(crate) fn clear_previous_inflight_mint_marker(mut self, symbol: &Symbol) -> Self {
-        self.previous_inflight_mint_symbols.remove(symbol);
-        self
-    }
-
     /// Remove a symbol from `chain`'s previous inflight redemption markers.
     ///
     /// Called when a new redemption transfer starts
     /// (`VaultWithdrawPending` for legacy aggregates or
-    /// `VaultWithdrawSubmitting` for new aggregates) for the same reason as
-    /// [`Self::clear_previous_inflight_mint_marker`].
+    /// `VaultWithdrawSubmitting` for new aggregates), so a poll that fires
+    /// before the provider reflects the new request does not see the symbol
+    /// in the previous markers but absent from the current poll, and zero it.
     pub(crate) fn clear_previous_inflight_redemption_marker(
         mut self,
         symbol: &Symbol,
@@ -4522,6 +4723,7 @@ mod tests {
             onchain: BTreeMap::from([(Chain::Base, venue(onchain_available, onchain_inflight))]),
             offchain: Some(venue(offchain_available, offchain_inflight)),
             last_rebalancing: None,
+            unpolled_onchain: BTreeSet::new(),
         }
     }
 
@@ -4660,6 +4862,7 @@ mod tests {
             )]),
             offchain: Some(usdc_venue(offchain_available, offchain_inflight)),
             last_rebalancing: None,
+            unpolled_onchain: BTreeSet::new(),
         }
     }
 
@@ -5559,6 +5762,7 @@ mod tests {
             onchain: BTreeMap::from([(Chain::Base, venue(50, 0))]),
             offchain: Some(venue(50, 0)),
             last_rebalancing: Some(last_rebalancing),
+            unpolled_onchain: BTreeSet::new(),
         };
 
         // Stale snapshot should be rejected — inventory unchanged
@@ -5575,6 +5779,7 @@ mod tests {
             onchain: BTreeMap::from([(Chain::Base, venue(50, 0))]),
             offchain: Some(venue(50, 0)),
             last_rebalancing: Some(last_rebalancing),
+            unpolled_onchain: BTreeSet::new(),
         };
 
         // fetched_at == last_rebalancing should apply
@@ -5595,6 +5800,7 @@ mod tests {
             onchain: BTreeMap::from([(Chain::Base, venue(50, 0))]),
             offchain: Some(venue(50, 0)),
             last_rebalancing: Some(last_rebalancing),
+            unpolled_onchain: BTreeSet::new(),
         };
 
         let update_fn = Inventory::on_snapshot(Venue::MarketMaking, shares(999), fresh_fetched_at);
@@ -5611,6 +5817,7 @@ mod tests {
             onchain: BTreeMap::from([(Chain::Base, venue(50, 0))]),
             offchain: Some(venue(50, 0)),
             last_rebalancing: None,
+            unpolled_onchain: BTreeSet::new(),
         };
 
         let update_fn = Inventory::on_snapshot(Venue::MarketMaking, shares(999), Utc::now());
@@ -5771,6 +5978,7 @@ mod tests {
                     onchain: BTreeMap::new(),
                     offchain: Some(VenueBalance::new(shares(100), FractionalShares::ZERO)),
                     last_rebalancing: None,
+                    unpolled_onchain: BTreeSet::new(),
                 },
             ))
             .collect(),
@@ -6550,6 +6758,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reset_keeps_active_transfers_and_the_active_mint_hedging_watermark() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let tsla = Symbol::new("TSLA").unwrap();
+        let fetched_at = Utc::now();
+        let mint_id = IssuerRequestId::generate();
+        let redemption_id = RedemptionAggregateId::generate();
+
+        let view = InventoryView::default()
+            .with_equity(aapl.clone(), shares(20), shares(80))
+            .with_equity(tsla.clone(), shares(10), shares(50))
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OffchainEquity {
+                    positions: BTreeMap::from([(aapl.clone(), shares(100))]),
+                    fetched_at,
+                },
+                fetched_at,
+            )
+            .unwrap()
+            .set_active_mint(aapl.clone(), Chain::Base, mint_id.clone())
+            .set_active_redemption(tsla.clone(), Chain::Base, redemption_id.clone());
+
+        let reset = view.reset_preserving_offchain_order_state();
+
+        assert_eq!(reset.active_mint(&aapl), Some(&mint_id));
+        assert_eq!(reset.active_redemption(&tsla), Some(&redemption_id));
+        assert_eq!(
+            reset.equity_available(&aapl, Venue::Hedging),
+            Some(shares(100)),
+            "the active mint's Hedging balance must survive the reset"
+        );
+
+        let stale = reset
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OffchainEquity {
+                    positions: BTreeMap::from([(aapl.clone(), shares(50))]),
+                    fetched_at: fetched_at - Duration::seconds(1),
+                },
+                fetched_at,
+            )
+            .unwrap();
+        assert_eq!(
+            stale.equity_available(&aapl, Venue::Hedging),
+            Some(shares(100)),
+            "a broker snapshot older than the kept watermark must not overwrite \
+             the balance the mint will debit"
+        );
+    }
+
     /// The cash twin of the force-path gate above: while any hedge order is
     /// open, `force_apply_snapshot_event` must not write the venue-level
     /// `OffchainUsd` reading -- the fill delta owns the cash balance and the
@@ -6695,6 +6952,7 @@ mod tests {
                         )]),
                         offchain: Some(VenueBalance::new(shares(10), FractionalShares::ZERO)),
                         last_rebalancing: None,
+                        unpolled_onchain: BTreeSet::new(),
                     },
                 ),
                 (
@@ -6706,6 +6964,7 @@ mod tests {
                         )]),
                         offchain: Some(VenueBalance::new(shares(20), shares(5))),
                         last_rebalancing: None,
+                        unpolled_onchain: BTreeSet::new(),
                     },
                 ),
             ]
@@ -6818,7 +7077,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_previous_mint_marker_prevents_incorrect_zeroing() {
+    fn active_new_mint_keeps_inflight_a_previous_poll_marker_would_zero() {
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
@@ -6850,16 +7109,16 @@ mod tests {
             Some(FractionalShares::ZERO),
         );
 
-        // A new mint starts (MintAccepted sets inflight via
-        // TransferOp::Start) and clears the previous poll marker.
+        // A new mint registers as active (MintRequested), then MintAccepted
+        // sets inflight via TransferOp::Start. The previous poll marker stays.
         let view = view
+            .set_active_mint(symbol.clone(), Chain::Base, IssuerRequestId::generate())
             .update_equity(
                 &symbol,
                 Inventory::transfer(Venue::Hedging, TransferOp::Start, shares(20)),
                 now,
             )
-            .unwrap()
-            .clear_previous_inflight_mint_marker(&symbol);
+            .unwrap();
 
         assert_eq!(
             view.equity_inflight(&symbol, Venue::Hedging),
@@ -6867,7 +7126,6 @@ mod tests {
         );
 
         // Poll 2: Alpaca hasn't reflected the new request yet (empty).
-        // Without the marker clear, this would zero the new inflight.
         let view = view
             .apply_inflight_snapshot(&BTreeMap::new(), &BTreeMap::new(), now, now)
             .unwrap();
@@ -6875,8 +7133,27 @@ mod tests {
         assert_eq!(
             view.equity_inflight(&symbol, Venue::Hedging),
             Some(shares(20)),
-            "New inflight must be preserved when previous poll marker \
-             was cleared by MintAccepted"
+            "An active mint's new inflight must survive a poll that drops \
+             the symbol a previous poll recorded"
+        );
+    }
+
+    #[test]
+    fn inflight_poll_leaves_active_mint_hedging_inflight_to_the_mint() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let pending = BTreeMap::from([(symbol.clone(), shares(20))]);
+
+        let view = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .set_active_mint(symbol.clone(), Chain::Base, IssuerRequestId::generate())
+            .apply_inflight_snapshot(&pending, &BTreeMap::new(), now, now)
+            .unwrap();
+
+        assert_eq!(
+            view.equity_inflight(&symbol, Venue::Hedging),
+            Some(FractionalShares::ZERO),
+            "The poll must not count an active mint's request"
         );
     }
 
@@ -6965,6 +7242,81 @@ mod tests {
         assert_eq!(
             view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Robinhood),
             Some(shares(9))
+        );
+    }
+
+    /// A reset keeps a stranded slot's poll marker: a slot that only the
+    /// stranded inflight created stays out of the per-chain list, while a
+    /// slot a vault snapshot set stays in it.
+    #[test]
+    fn snapshot_error_reset_keeps_whether_each_stranded_slot_was_polled() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let hedged = BTreeSet::from([Chain::Base, Chain::Robinhood]);
+        let view = InventoryView::default()
+            .update_equity_at(
+                &symbol,
+                Chain::Base,
+                Inventory::on_snapshot(Venue::MarketMaking, shares(50), now),
+                now,
+            )
+            .unwrap()
+            .seed_stranded_redemption(
+                &RedemptionAggregateId::generate(),
+                &symbol,
+                Chain::Base,
+                shares(3),
+                now,
+            )
+            .unwrap()
+            .seed_stranded_redemption(
+                &RedemptionAggregateId::generate(),
+                &symbol,
+                Chain::Robinhood,
+                shares(7),
+                now,
+            )
+            .unwrap()
+            .reset_preserving_offchain_order_state();
+
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Robinhood),
+            Some(shares(7))
+        );
+        assert_eq!(
+            view.onchain_by_chain(&hedged).equities,
+            vec![ChainEquityBalance {
+                symbol,
+                chain: Chain::Base,
+                available: shares(50),
+                inflight: shares(3),
+            }]
+        );
+    }
+
+    /// The provider-failure reset carries other chains' slots with their
+    /// poll marker too.
+    #[test]
+    fn provider_failure_reset_keeps_an_unpolled_carried_slot_unlisted() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let view = InventoryView::default()
+            .apply_inflight_redemptions_at(
+                Chain::Robinhood,
+                &BTreeMap::from([(symbol.clone(), shares(2))]),
+                now,
+                now,
+            )
+            .unwrap()
+            .reset_carrying_other_provider_inflight(Chain::Base, now);
+
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Robinhood),
+            Some(shares(2))
+        );
+        assert_eq!(
+            view.onchain_by_chain(&BTreeSet::from([Chain::Base, Chain::Robinhood])),
+            OnchainByChain::default()
         );
     }
 
@@ -7607,6 +7959,223 @@ mod tests {
         assert_eq!(dto.usdc.symbol, "USDG");
     }
 
+    /// Every hedged chain the view holds a vault reading for gets its own
+    /// entry, in symbol and chain order, Robinhood's USDG vault included; the
+    /// primary-chain balances stay as they were.
+    #[test]
+    fn onchain_by_chain_lists_every_hedged_chains_vault_reading() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let tsla = Symbol::new("TSLA").unwrap();
+        let view = InventoryView {
+            equities: HashMap::from([
+                (
+                    tsla.clone(),
+                    Inventory {
+                        onchain: BTreeMap::from([(Chain::Base, venue(4, 0))]),
+                        offchain: None,
+                        last_rebalancing: None,
+                        unpolled_onchain: BTreeSet::new(),
+                    },
+                ),
+                (
+                    aapl.clone(),
+                    Inventory {
+                        onchain: BTreeMap::from([
+                            (Chain::Robinhood, venue(9, 1)),
+                            (Chain::Base, venue(50, 5)),
+                        ]),
+                        offchain: Some(venue(40, 0)),
+                        last_rebalancing: None,
+                        unpolled_onchain: BTreeSet::new(),
+                    },
+                ),
+            ]),
+            usdc: Inventory {
+                onchain: BTreeMap::from([
+                    (Chain::Robinhood, usdc_venue(300, 0)),
+                    (Chain::Base, usdc_venue(2000, 250)),
+                ]),
+                offchain: Some(usdc_venue(1000, 0)),
+                last_rebalancing: None,
+                unpolled_onchain: BTreeSet::new(),
+            },
+            ..InventoryView::for_primary_chain(Chain::Base)
+        };
+
+        assert_eq!(
+            view.onchain_by_chain(&BTreeSet::from([Chain::Base, Chain::Robinhood])),
+            OnchainByChain {
+                equities: vec![
+                    ChainEquityBalance {
+                        symbol: aapl.clone(),
+                        chain: Chain::Base,
+                        available: shares(50),
+                        inflight: shares(5),
+                    },
+                    ChainEquityBalance {
+                        symbol: aapl,
+                        chain: Chain::Robinhood,
+                        available: shares(9),
+                        inflight: shares(1),
+                    },
+                    ChainEquityBalance {
+                        symbol: tsla,
+                        chain: Chain::Base,
+                        available: shares(4),
+                        inflight: shares(0),
+                    },
+                ],
+                usdc: vec![
+                    ChainUsdcBalance {
+                        chain: Chain::Base,
+                        available: Usdc::new(float!(2000)),
+                        inflight: Usdc::new(float!(250)),
+                    },
+                    ChainUsdcBalance {
+                        chain: Chain::Robinhood,
+                        available: Usdc::new(float!(300)),
+                        inflight: Usdc::ZERO,
+                    },
+                ],
+            }
+        );
+
+        let dto = view.to_dto();
+        assert_eq!(dto.per_symbol[0].onchain_available, shares(50));
+        assert_eq!(dto.per_symbol[0].onchain_inflight, shares(5));
+        assert_eq!(dto.usdc.onchain_available, Usdc::new(float!(2000)));
+        assert_eq!(dto.usdc.symbol, "USDC");
+    }
+
+    /// The production vault reads (`apply_snapshot_event`, which hydration
+    /// replays too) mark a non-primary chain as read for equities and cash,
+    /// and a chain the config no longer hedges is not listed even though its
+    /// persisted snapshots replay.
+    #[test]
+    fn onchain_by_chain_lists_hedged_chains_read_through_snapshot_events_only() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let read = |view: InventoryView, chain: Chain| {
+            view.apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainEquity {
+                    chain,
+                    balances: BTreeMap::from([(aapl.clone(), shares(7))]),
+                    fetched_at: now,
+                    block_number: Some(100),
+                },
+                now,
+            )
+            .unwrap()
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainUsdc {
+                    chain,
+                    usdc_balance: Usdc::new(float!(300)),
+                    fetched_at: now,
+                    block_number: Some(100),
+                },
+                now,
+            )
+            .unwrap()
+        };
+        let view = read(
+            read(
+                InventoryView::for_primary_chain(Chain::Base),
+                Chain::Robinhood,
+            ),
+            Chain::HyperEvm,
+        );
+
+        assert_eq!(
+            view.onchain_by_chain(&BTreeSet::from([Chain::Base, Chain::Robinhood])),
+            OnchainByChain {
+                equities: vec![ChainEquityBalance {
+                    symbol: aapl,
+                    chain: Chain::Robinhood,
+                    available: shares(7),
+                    inflight: shares(0),
+                }],
+                usdc: vec![ChainUsdcBalance {
+                    chain: Chain::Robinhood,
+                    available: Usdc::new(float!(300)),
+                    inflight: Usdc::ZERO,
+                }],
+            }
+        );
+    }
+
+    /// An inflight redemption on a chain whose vault was never read creates
+    /// that chain's slot with available 0. That is not a reading, so the
+    /// chain stays out of the per-chain list.
+    #[test]
+    fn onchain_by_chain_lists_no_balance_for_a_chain_holding_only_inflight() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let view = InventoryView::for_primary_chain(Chain::Base)
+            .update_equity_at(
+                &aapl,
+                Chain::Robinhood,
+                Inventory::set_inflight(Venue::MarketMaking, shares(5)),
+                now,
+            )
+            .unwrap()
+            .update_usdc_at(
+                Chain::HyperEvm,
+                Inventory::set_inflight(Venue::MarketMaking, Usdc::new(float!(250))),
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(view.symbol_balances()[0].symbol, aapl);
+        assert_eq!(
+            view.onchain_by_chain(&BTreeSet::from([
+                Chain::Base,
+                Chain::Robinhood,
+                Chain::HyperEvm
+            ])),
+            OnchainByChain::default()
+        );
+    }
+
+    /// A fill on a chain whose vault was never read holds a delta from 0,
+    /// not a reading. The chain is listed once a vault snapshot sets it.
+    #[test]
+    fn onchain_by_chain_lists_a_chain_once_its_vault_snapshot_applies() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let hedged = BTreeSet::from([Chain::Base, Chain::Robinhood]);
+        let view = InventoryView::for_primary_chain(Chain::Base)
+            .update_equity_at(
+                &aapl,
+                Chain::Robinhood,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(3)),
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(view.onchain_by_chain(&hedged), OnchainByChain::default());
+
+        let view = view
+            .update_equity_at(
+                &aapl,
+                Chain::Robinhood,
+                Inventory::on_snapshot(Venue::MarketMaking, shares(40), now),
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(
+            view.onchain_by_chain(&hedged).equities,
+            vec![ChainEquityBalance {
+                symbol: aapl,
+                chain: Chain::Robinhood,
+                available: shares(40),
+                inflight: shares(0),
+            }]
+        );
+    }
+
     #[test]
     fn to_dto_converts_equities_and_usdc() {
         let aapl = Symbol::new("AAPL").unwrap();
@@ -7707,6 +8276,7 @@ mod tests {
                     onchain: BTreeMap::from([(Chain::Base, venue(75, 0))]),
                     offchain: None,
                     last_rebalancing: None,
+                    unpolled_onchain: BTreeSet::new(),
                 },
             ))
             .collect(),
@@ -7911,6 +8481,10 @@ mod tests {
 
         assert_eq!(aapl_dto.symbol, aapl);
         assert_eq!(aapl_dto.onchain_available, FractionalShares::ZERO);
+        assert_eq!(
+            view.onchain_by_chain(&BTreeSet::from([Chain::Base])),
+            OnchainByChain::default()
+        );
         assert_eq!(aapl_dto.offchain_available, FractionalShares::ZERO);
         assert_eq!(
             aapl_dto.inflight_equity.base_wallet_unwrapped,
@@ -8076,6 +8650,7 @@ mod tests {
                     onchain: BTreeMap::from([(Chain::Base, venue(75, 0))]),
                     offchain: None,
                     last_rebalancing: None,
+                    unpolled_onchain: BTreeSet::new(),
                 },
             ))
             .collect(),

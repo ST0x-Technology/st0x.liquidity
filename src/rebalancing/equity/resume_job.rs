@@ -431,6 +431,7 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
 
     use super::*;
+    use crate::alerts::AlertKind;
     use crate::equity_redemption::{
         EquityRedemption, EquityRedemptionCommand, redemption_aggregate_id,
     };
@@ -443,6 +444,16 @@ mod tests {
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintCommand};
     use crate::vault_lookup::MockVaultLookup;
+
+    #[test]
+    fn terminal_failure_message_carries_its_kind() {
+        assert_eq!(
+            AlertKind::most_specific_in(
+                <ResumeTokenizationAggregate as Job<ResumeTokenizationCtx>>::TERMINAL_FAILURE_MSG
+            ),
+            Some(AlertKind::TokenizationResumeFailed)
+        );
+    }
 
     /// The aggregate driver keeps its existing unbounded execution policy;
     /// signed sends to the issuer now remain safe when transport calls are retried.

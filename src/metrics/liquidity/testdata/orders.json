@@ -1,0 +1,61 @@
+{
+  "pending": [
+    {
+      "viewId": "00000000-0000-0000-0000-000000000003",
+      "status": "Submitted",
+      "symbol": "tAAPL",
+      "direction": "Buy",
+      "shares": "2",
+      "executor": "AlpacaBrokerApi",
+      "placedAt": "2026-03-03T14:30:00Z",
+      "submittedAt": "2026-03-03T14:30:01Z",
+      "sharesFilled": null,
+      "avgPrice": null
+    },
+    {
+      "viewId": "00000000-0000-0000-0000-000000000002",
+      "status": "Pending",
+      "symbol": "RKLB",
+      "direction": "Sell",
+      "shares": "1.5",
+      "executor": "AlpacaBrokerApi",
+      "placedAt": "2026-03-03T14:29:00Z",
+      "submittedAt": null,
+      "sharesFilled": null,
+      "avgPrice": null
+    },
+    {
+      "viewId": "00000000-0000-0000-0000-000000000001",
+      "status": "Pending",
+      "symbol": "RKLB",
+      "direction": "Buy",
+      "shares": "3",
+      "executor": "AlpacaBrokerApi",
+      "placedAt": "2026-03-03T14:28:00Z",
+      "submittedAt": null,
+      "sharesFilled": null,
+      "avgPrice": null
+    }
+  ],
+  "raindex": {
+    "orders": [
+      {
+        "orderHash": "0x00000000000000000000000000000000000000000000000000000000000000aa",
+        "owner": "0x0000000000000000000000000000000000000000",
+        "inputToken": { "address": "0x1111", "symbol": "USDC", "decimals": 6 },
+        "outputToken": { "address": "0x2222", "symbol": "wtAAPL", "decimals": 18 },
+        "outputVaultBalance": "12.5",
+        "ioRatio": "0.004",
+        "createdAt": 1772548200,
+        "orderbookId": "0x3333"
+      }
+    ],
+    "pagination": {
+      "page": 1,
+      "pageSize": 50,
+      "totalOrders": 3,
+      "totalPages": 1,
+      "hasMore": false
+    }
+  }
+}

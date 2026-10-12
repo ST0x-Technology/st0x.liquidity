@@ -1,0 +1,230 @@
+{
+  "attributionMethod": "backend_position_fill_replay_fifo",
+  "asOfRowid": 42,
+  "warnings": [
+    "first",
+    "second"
+  ],
+  "availableRange": {
+    "firstAt": "2026-02-20T14:30:00Z",
+    "lastAt": "2026-03-03T15:00:00Z",
+    "firstDate": "2026-02-20",
+    "lastDate": "2026-03-03"
+  },
+  "sampleStats": {
+    "firstAt": "2026-02-20T14:30:00.25Z",
+    "lastAt": "2026-03-03T15:00:00+00:00",
+    "symbolCount": 2,
+    "onchainFillCount": 5,
+    "offchainFillCount": 4,
+    "totalFillCount": 9,
+    "symbols": []
+  },
+  "summary": {
+    "counterTradePnlUsd": "12.5",
+    "onchainNettingPnlUsd": "-3.25",
+    "directionalInventoryBaselinePnlUsd": "4",
+    "directionalImbalanceExcessPnlUsd": "-1.75",
+    "directionalExposurePnlUsd": "2.25",
+    "totalPnlUsd": "11.5",
+    "grossRealizedPnlUsd": "20",
+    "trackedCostsUsd": "14.25",
+    "trackedRevenueUsd": "n/a",
+    "netRealizedPnlUsd": "7.25",
+    "realizedPnlUsd": "11.5",
+    "matchedShares": "300",
+    "onchainNotionalUsd": "6000",
+    "offchainNotionalUsd": "5950.5",
+    "inventoryDriftShares": "-2",
+    "inventoryDriftUsd": "-30.5",
+    "openLongShares": "10",
+    "openShortShares": "0",
+    "unmatchedOffchainShares": "1.5",
+    "unmatchedOffchainNotionalUsd": "22.5",
+    "onchainFillCount": 5,
+    "offchainFillCount": 4,
+    "matchedLotCount": 3,
+    "openLotCount": 2,
+    "unmatchedOffchainFillCount": 1
+  },
+  "costs": {
+    "totalTrackedCostsUsd": "14.25",
+    "totalTrackedRevenueUsd": "1.5",
+    "counterTradeCostsUsd": "9",
+    "onchainNettingCostsUsd": "0",
+    "directionalExposureCostsUsd": "0",
+    "genericCostsUsd": "5.25",
+    "dividendRevenueUsd": "1.5",
+    "offchainExecutionFeesUsd": "2",
+    "tokenizationFeesUsd": "3.5",
+    "cctpFeesUsd": "0.75",
+    "conversionSlippageUsd": "0",
+    "oracleWriteCostUsd": "0",
+    "brokerFeesUsd": "2",
+    "regulatoryFeesUsd": "0.01",
+    "marginInterestUsd": "4",
+    "botGasUsd": "1.99",
+    "walletTransferFeesUsd": "0",
+    "unclassifiedCostsUsd": "2",
+    "costEntryCount": 7,
+    "missingCostObservationCount": 2,
+    "coverage": [
+      {
+        "source": "tokenization_fees",
+        "accountingBucket": "generic",
+        "effect": "cost",
+        "status": "included",
+        "amountUsd": "0",
+        "note": "fixture"
+      },
+      {
+        "source": "wallet_transfer_fees",
+        "accountingBucket": "generic",
+        "effect": "cost",
+        "status": "not_ingested",
+        "amountUsd": "0",
+        "note": "fixture"
+      }
+    ]
+  },
+  "capital": {
+    "averageDeployedCapitalUsd": "12500.5",
+    "annualizedReturnPct": null,
+    "coverageDays": 3,
+    "sampleDays": 3,
+    "firstSnapshotDay": "2026-03-01",
+    "lastSnapshotDay": "2026-03-03",
+    "excludedDays": []
+  },
+  "symbols": [
+    {
+      "symbol": "tAAPL",
+      "counterTradePnlUsd": "10",
+      "onchainNettingPnlUsd": "-1",
+      "directionalInventoryBaselinePnlUsd": "3",
+      "directionalImbalanceExcessPnlUsd": "-1.5",
+      "directionalExposurePnlUsd": "1.5",
+      "totalPnlUsd": "10.5",
+      "grossRealizedPnlUsd": "15",
+      "trackedCostsUsd": "6",
+      "trackedRevenueUsd": "1",
+      "netRealizedPnlUsd": "10",
+      "realizedPnlUsd": "10.5",
+      "matchedShares": "200",
+      "inventoryDriftShares": "-1",
+      "inventoryDriftUsd": "-15.25",
+      "openLongShares": "8",
+      "openShortShares": "0",
+      "unmatchedOffchainShares": "1.5",
+      "matchedLotCount": 2,
+      "onchainFillCount": 2,
+      "offchainFillCount": 2,
+      "unmatchedOffchainFillCount": 0
+    },
+    {
+      "symbol": "RKLB",
+      "counterTradePnlUsd": "2.5",
+      "onchainNettingPnlUsd": "-2.25",
+      "directionalInventoryBaselinePnlUsd": "1",
+      "directionalImbalanceExcessPnlUsd": "-0.25",
+      "directionalExposurePnlUsd": "0.75",
+      "totalPnlUsd": "1",
+      "grossRealizedPnlUsd": "5",
+      "trackedCostsUsd": "8.25",
+      "trackedRevenueUsd": "0.5",
+      "netRealizedPnlUsd": "-2.75",
+      "realizedPnlUsd": "1",
+      "matchedShares": "",
+      "inventoryDriftShares": "-1",
+      "inventoryDriftUsd": "-15.25",
+      "openLongShares": "2",
+      "openShortShares": "0",
+      "unmatchedOffchainShares": "0",
+      "matchedLotCount": 1,
+      "onchainFillCount": 1,
+      "offchainFillCount": 1,
+      "unmatchedOffchainFillCount": 0
+    }
+  ],
+  "symbolUniverse": [
+    "RKLB",
+    "tAAPL"
+  ],
+  "entries": [],
+  "costEntries": [],
+  "total": 3,
+  "hasMore": true,
+  "windows": [
+    {
+      "windowId": "2026-03-03",
+      "startAt": "2026-03-03T05:00:00.000Z",
+      "endAt": "2026-03-03T04:59:59.999Z",
+      "label": "2026-03-03",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tAAPL",
+          "counterTradePnlUsd": "1.5",
+          "onchainNettingPnlUsd": "bad",
+          "directionalInventoryBaselinePnlUsd": "0.5",
+          "directionalImbalanceExcessPnlUsd": "-0.25",
+          "directionalExposurePnlUsd": "0.25",
+          "totalPnlUsd": "1.75"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-03-01",
+      "startAt": "2026-03-01T05:00:00.000Z",
+      "endAt": "2026-03-01T04:59:59.999Z",
+      "label": "2026-03-01",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": [
+        {
+          "symbol": "tAAPL",
+          "counterTradePnlUsd": "2",
+          "onchainNettingPnlUsd": "-1",
+          "directionalInventoryBaselinePnlUsd": "0.5",
+          "directionalImbalanceExcessPnlUsd": "0",
+          "directionalExposurePnlUsd": "0.5",
+          "totalPnlUsd": "1.5"
+        },
+        {
+          "symbol": "wtAAPL",
+          "counterTradePnlUsd": "1",
+          "onchainNettingPnlUsd": "0",
+          "directionalInventoryBaselinePnlUsd": "0",
+          "directionalImbalanceExcessPnlUsd": "0",
+          "directionalExposurePnlUsd": "0",
+          "totalPnlUsd": "1"
+        },
+        {
+          "symbol": "RKLB",
+          "counterTradePnlUsd": "0.25",
+          "onchainNettingPnlUsd": "0.5",
+          "directionalInventoryBaselinePnlUsd": "-1",
+          "directionalImbalanceExcessPnlUsd": "0.75",
+          "directionalExposurePnlUsd": "-0.25",
+          "totalPnlUsd": "0.5"
+        }
+      ]
+    },
+    {
+      "windowId": "2026-03-02",
+      "startAt": "2026-03-02T05:00:00.000Z",
+      "endAt": "2026-03-02T04:59:59.999Z",
+      "label": "2026-03-02",
+      "isWeekend": false,
+      "marketSession": "regular",
+      "counterTradingSession": "regular",
+      "granularity": "day",
+      "symbols": []
+    }
+  ]
+}

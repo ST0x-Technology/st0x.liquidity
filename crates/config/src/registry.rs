@@ -1,8 +1,9 @@
 //! The per-symbol tables, read from T0's token file in the bucket.
 //!
-//! One file, `t0/<env>.toml` in st0x.registry, holds every token's config
+//! One file, `t0/<env>.toml` in T0Trade/t0.tokens, holds every token's config
 //! for every T0 service; its CI uploads it to
-//! `gs://t0-artifacts-tokens/<env>/tokens.toml`. The bot takes from it
+//! `gs://t0-artifacts-tokens/<env>/tokens.toml` (staging on merge,
+//! production on a PAM-gated manual run). The bot takes from it
 //! exactly the tables its own config used to carry per symbol:
 //! `[chains.<c>.trading.assets.equities.<SYM>]` (addresses, vault ids and
 //! the trading/rebalancing/recovery switches) and `[assets.equities.<SYM>]`
@@ -409,7 +410,7 @@ fn is_rebalancing_mode(value: Option<&Value>) -> bool {
 /// every `[assets.equities.<SYM>]` that sets any of the bot's policy keys.
 /// The bot reads its own keys and leaves the rest to the services that own
 /// them: which keys may appear at all, and their spelling, is checked by
-/// st0x.registry's CI (`t0/check.jq`) before the file is published, so a
+/// t0.tokens' CI (`t0/check.jq`) before the file is published, so a
 /// new key of another service cannot fail a boot here. Anything malformed in
 /// the bot's own keys is refused, never dropped.
 pub fn project(file: &Table) -> Result<Projection, RegistryError> {
@@ -1269,7 +1270,7 @@ mod tests {
     }
 
     /// Another service's key on a slot or policy the bot takes is left to
-    /// that service: the token file's allowlist lives in st0x.registry's CI,
+    /// that service: the token file's allowlist lives in t0.tokens' CI,
     /// so a new key there must not fail a boot here.
     #[test]
     fn a_key_the_bot_does_not_own_is_left_alone() {
