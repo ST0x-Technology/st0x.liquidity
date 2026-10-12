@@ -16,6 +16,35 @@ beside SQLite. Rotation retains seven daily files, which caps file count but not
 bytes. The lower file level reduces within-day growth and disk-exhaustion risk;
 it does not enforce a per-file byte limit or filesystem quota.
 
+## Console format
+
+`log_format` selects the stdout shape. `text` is the human-readable line. `json`
+writes one flattened JSON object per line:
+
+```json
+{"timestamp":"...","level":"ERROR","target":"operational_alert","message":"Low gas: ...","alert":true,"kind":"Low gas","span":{...},"spans":[...]}
+```
+
+The message and every event field are top-level keys, so once a log shipper
+parses the line the text is at `message` (where the `operational_alerts`
+extractors read it) and each field is under its own name. Do not give an event a
+field named `message`, `timestamp`, `level`, `target`, `span` or `spans`: it
+would collide with those keys. This covers the dependencies too: `st0x-alpaca`
+v0.2.1 logs `Tokenization request failed` with a `message` field that holds the
+Alpaca error body. ST0x-Technology/st0x.alpaca#11 renames it to `error_body`.
+The rolling file layer is not flattened. It keeps the message under `fields`:
+the dashboard's log panel (`dashboard/src/lib/components/log-panel.svelte`) and
+the t0.devops liquidity exporter (`ship_botlogs`, which feeds the
+`liquidity-botlogs` log) read `fields` and `fields.message` from `/logs`, which
+serves these files.
+
+Switch an environment to `json` only where the log shipper parses JSON, staging
+before production, and only on a build whose `st0x-alpaca` has that rename
+(st0x.alpaca#11 released and bumped here). Before it, each failed tokenization
+request writes two `message` keys on one line. Unflattened JSON (any build
+before the flattening) puts the text at `jsonPayload.fields.message`, where no
+extractor looks. Rollback is `log_format = "text"`.
+
 The active GCP configs are `config/staging/st0x-hedge.toml` and
 `config/prod/st0x-hedge.toml` in this repository. Each release validates the
 file inside the image that will run it and publishes it as a
