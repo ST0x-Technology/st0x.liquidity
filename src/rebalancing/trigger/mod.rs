@@ -47418,8 +47418,9 @@ mod tests {
     }
 
     /// Every Relay swap state a resume moves on is re-armed at startup when
-    /// its job is lost, even past a terminal job row; a refund paid at the
-    /// other end and a Relay failure stay held for the operator.
+    /// its job is lost, even past a terminal job row; a short refund, a
+    /// refund paid at the other end and a Relay failure stay held for the
+    /// operator.
     #[tokio::test]
     async fn recover_usdc_guard_rearms_every_relay_swap_state() {
         let quote = UsdcRebalanceCommand::QuoteSwap {
@@ -47436,10 +47437,12 @@ mod tests {
             deposit_tx: TxHash::repeat_byte(0xa2),
             deposit_block: 9,
         };
-        let refund = |side| UsdcRebalanceCommand::RecordSwapRefund {
+        // 99.5 is the refund floor of the 100 quoted; below it a refund is
+        // short and waits for the operator.
+        let refund = |side, refunded: u64| UsdcRebalanceCommand::RecordSwapRefund {
             refund_tx: TxHash::repeat_byte(0xe1),
             side,
-            amount_refunded: U256::from(99_000_000u64),
+            amount_refunded: U256::from(refunded),
         };
         let fail = UsdcRebalanceCommand::FailSwap {
             reason: "Relay reported Failure".to_string(),
@@ -47478,10 +47481,20 @@ mod tests {
                         quote.clone(),
                         prepare.clone(),
                         confirm.clone(),
-                        refund(RefundSide::Origin),
+                        refund(RefundSide::Origin, 99_500_000),
                     ],
                     "SwapRefunded",
                     true,
+                ),
+                (
+                    vec![
+                        quote.clone(),
+                        prepare.clone(),
+                        confirm.clone(),
+                        refund(RefundSide::Origin, 99_000_000),
+                    ],
+                    "SwapRefunded",
+                    false,
                 ),
                 (
                     vec![
@@ -47498,7 +47511,7 @@ mod tests {
                         quote.clone(),
                         prepare.clone(),
                         confirm.clone(),
-                        refund(RefundSide::Destination),
+                        refund(RefundSide::Destination, 99_500_000),
                     ],
                     "SwapRefunded",
                     false,

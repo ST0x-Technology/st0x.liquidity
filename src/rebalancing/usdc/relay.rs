@@ -2700,11 +2700,18 @@ where
             .send(id, command)
             .await
             .map_err(|error| Box::new(error.into()))?;
+        let short = match payment {
+            RecoveredSwapPayment::Refund { .. } => {
+                self.hold_short_refund(id).await.map_err(Box::new)?
+            }
+            RecoveredSwapPayment::Fill { .. } => false,
+        };
         if let RecoveredSwapPayment::Refund {
             refund_tx,
             side: RefundSide::Destination,
             amount_refunded,
         } = payment
+            && !short
         {
             error!(target: "operational_alert", alert = true, %id, %refund_tx, %amount_refunded, "Recheck adopted a Relay refund paid at the other end; the transfer holds its guard until the operator moves it and reconciles");
         }

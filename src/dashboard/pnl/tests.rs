@@ -1406,6 +1406,7 @@ async fn late_relay_fill_books_its_costs_and_a_late_refund_none() {
             refund_tx: TxHash::random(),
             side: RefundSide::Origin,
             amount_refunded: Usdc::new(float!(99)),
+            short_of_floor: None,
         },
         recovered_at: parse_timestamp("2026-05-15T12:02:00Z").unwrap(),
     };

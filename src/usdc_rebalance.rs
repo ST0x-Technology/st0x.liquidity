@@ -1150,7 +1150,8 @@ pub enum RecoveredSwapPayment {
 }
 
 /// A late payment as `SwapCompletionRecovered` records it: a fill with the
-/// fee split `RelayFillVerified` carries, or a refund.
+/// fee split `RelayFillVerified` carries, or a refund with the refund floor
+/// of its order when it is below it, as `SwapRefunded` carries.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SwapRecovery {
     Fill {
@@ -1163,6 +1164,7 @@ pub enum SwapRecovery {
         refund_tx: TxHash,
         side: RefundSide,
         amount_refunded: Usdc,
+        short_of_floor: Option<U256>,
     },
 }
 
@@ -2828,7 +2830,7 @@ impl UsdcRebalance {
     ///
     /// On a Relay corridor every state after the withdrawal whose resume
     /// moves it on is resumable, in either direction: `WithdrawalComplete`,
-    /// the swap states but a destination-side `SwapRefunded` and
+    /// the swap states but a short or destination-side `SwapRefunded` and
     /// `SwapFailed`, and `Redepositing`.
     pub(crate) fn is_resumable_mid_flight_data(&self) -> Option<(RebalanceDirection, Usdc)> {
         match self {
@@ -2865,8 +2867,8 @@ impl UsdcRebalance {
             // persisted envelopes, reads Relay or finishes its redeposit, so
             // a lost job is re-armed in either direction: from a chain-to-
             // Alpaca `WithdrawalComplete` the job takes the binding quote,
-            // never a CCTP burn. A refund at the other end and a Relay
-            // failure wait for the operator.
+            // never a CCTP burn. A short refund, a refund at the other end
+            // and a Relay failure wait for the operator.
             | Self::WithdrawalComplete {
                 direction: direction @ RebalanceDirection::BaseToAlpaca,
                 corridor:
@@ -2890,6 +2892,7 @@ impl UsdcRebalance {
                 direction,
                 side: RefundSide::Origin,
                 amount,
+                short_of_floor: None,
                 ..
             }
             | Self::SwapEscrowUnresolved {
@@ -2916,6 +2919,10 @@ impl UsdcRebalance {
             | Self::Attested { .. }
             | Self::SwapRefunded {
                 side: RefundSide::Destination,
+                ..
+            }
+            | Self::SwapRefunded {
+                short_of_floor: Some(_),
                 ..
             }
             | Self::SwapFailed { .. }
@@ -6616,11 +6623,16 @@ impl UsdcRebalance {
                 refund_tx,
                 side,
                 amount_refunded,
-            } => SwapRecovery::Refund {
-                refund_tx,
-                side,
-                amount_refunded: proven_refund_amount(quote, amount_refunded)?,
-            },
+            } => {
+                let refunded = proven_refund_amount(quote, amount_refunded)?;
+                let floor = FirstDeposit::from(quote).refund_floor()?;
+                SwapRecovery::Refund {
+                    refund_tx,
+                    side,
+                    amount_refunded: refunded,
+                    short_of_floor: (amount_refunded < floor).then_some(floor),
+                }
+            }
         };
 
         Ok(vec![UsdcRebalanceEvent::SwapCompletionRecovered {
@@ -6675,6 +6687,7 @@ impl UsdcRebalance {
                 refund_tx,
                 side,
                 amount_refunded,
+                short_of_floor,
             } => Self::SwapRefunded {
                 direction: base.direction,
                 corridor: base.corridor,
@@ -6692,7 +6705,7 @@ impl UsdcRebalance {
                 refund_tx,
                 side,
                 amount_refunded,
-                short_of_floor: None,
+                short_of_floor,
                 refund_requotes: base.refund_requotes,
                 initiated_at: base.initiated_at,
                 refunded_at: recovered_at,
@@ -8586,6 +8599,62 @@ mod tests {
                 "{refused}: got {error:?}"
             );
         }
+    }
+
+    /// A late refund below its order's refund floor is recorded short: it is
+    /// not re-armed at startup and is reconcilable. One at the floor is
+    /// re-armed to be redeposited.
+    #[tokio::test]
+    async fn short_late_refund_is_held_for_the_operator() {
+        let failed = [
+            deposited(RebalanceDirection::BaseToAlpaca),
+            vec![UsdcRebalanceEvent::SwapFailed {
+                reason: "Relay reported Failure".to_string(),
+                failed_at: Utc::now(),
+            }],
+        ]
+        .concat();
+        let recover = |refunded: u64| {
+            let failed = failed.clone();
+            async move {
+                let events = TestHarness::<UsdcRebalance>::with(())
+                    .given(failed.clone())
+                    .when(UsdcRebalanceCommand::RecoverSwapCompletion {
+                        order_id: B256::repeat_byte(0x0a),
+                        deposit_tx: TxHash::repeat_byte(0xa2),
+                        payment: RecoveredSwapPayment::Refund {
+                            refund_tx: TxHash::repeat_byte(0xe1),
+                            side: RefundSide::Origin,
+                            amount_refunded: U256::from(refunded),
+                        },
+                    })
+                    .await
+                    .events();
+                replay::<UsdcRebalance>([failed, events].concat())
+                    .unwrap()
+                    .unwrap()
+            }
+        };
+
+        let short = recover(99_499_999).await;
+        let UsdcRebalance::SwapRefunded { short_of_floor, .. } = &short else {
+            panic!("expected SwapRefunded, got {short:?}");
+        };
+        assert_eq!(*short_of_floor, Some(U256::from(99_500_000u64)));
+        assert_eq!(short.is_resumable_mid_flight_data(), None);
+        assert!(short.is_reconcilable_failure());
+        assert!(short.guard_recovery_tracking_data().is_some());
+
+        let at_floor = recover(99_500_000).await;
+        let UsdcRebalance::SwapRefunded { short_of_floor, .. } = &at_floor else {
+            panic!("expected SwapRefunded, got {at_floor:?}");
+        };
+        assert_eq!(*short_of_floor, None);
+        assert_eq!(
+            at_floor.is_resumable_mid_flight_data(),
+            Some((RebalanceDirection::BaseToAlpaca, Usdc::new(float!(100))))
+        );
+        assert!(!at_floor.is_reconcilable_failure());
     }
 
     /// A refund of the failed order adopted from `SwapFailed` keeps the

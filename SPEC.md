@@ -5395,11 +5395,13 @@ signing a second deposit while an earlier one may still land:
   transfer that has no live job row (a terminal row does not block, since the
   resume only re-broadcasts, re-quotes or reads Relay), in either direction, at
   `WithdrawalComplete`, `SwapQuoted`, `SwapDepositPrepared`, `SwapDeposited`, an
-  origin-side `SwapRefunded`, `SwapEscrowUnresolved` and `Redepositing`. The job
-  routes by the recorded corridor, so a `WithdrawalComplete` resumes through the
-  Relay hop (the binding quote) and never reaches a CCTP burn. A
-  destination-side `SwapRefunded` and a `SwapFailed` are holds for the operator
-  and are not re-armed.
+  origin-side `SwapRefunded` at or above its refund floor,
+  `SwapEscrowUnresolved` and `Redepositing`. The job routes by the recorded
+  corridor, so a `WithdrawalComplete` resumes through the Relay hop (the binding
+  quote) and never reaches a CCTP burn. A short or destination-side
+  `SwapRefunded` and a `SwapFailed` are holds for the operator and are not
+  re-armed; a short late refund adopted by the escrow scan or by
+  `transfer recheck` (which pages it) holds the same way.
 - **Re-broadcast, never re-sign.** The persisted envelopes are restored before
   any other send from their wallet (see "Relay hop"), and a resume of
   `SwapDepositPrepared` broadcasts exactly those bytes. A new pair is signed
