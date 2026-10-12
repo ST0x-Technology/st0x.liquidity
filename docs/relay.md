@@ -13,8 +13,11 @@ refund). Response bodies from those reads and that test are pinned in
 
 ## API
 
-Base URL `https://api.relay.link`. An `x-api-key` header is optional:
-`RelayClient::new(None)` warns once and runs on unauthenticated limits.
+Base URL `https://api.relay.link`. Since 2026-10-02 Relay answers a `quote/v2`
+request without an `x-api-key` header with 401 `UNAUTHORIZED_QUOTE`.
+`RelayClient::new(None)` warns once; its `quote` returns `RelayError::NoApiKey`
+before any request, and only `status` works. The client follows no redirect, so
+the key never reaches another host.
 
 ### `POST /quote/v2`
 

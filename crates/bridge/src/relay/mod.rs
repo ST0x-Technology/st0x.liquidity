@@ -67,11 +67,11 @@ pub struct RelayClient {
 }
 
 impl RelayClient {
-    /// Builds the client. Without a key Relay applies its unauthenticated
-    /// rate limits, which it does not document.
+    /// Builds the client. Without a key only [`Self::status`] works: Relay
+    /// refuses every `quote/v2` request without one since 2026-10-02.
     pub fn new(api_key: Option<RelayApiKey>) -> Result<Self, RelayError> {
         if api_key.is_none() {
-            warn!(target: "bridge", "No Relay API key: requests use unauthenticated rate limits");
+            warn!(target: "bridge", "No Relay API key: quotes are refused, status reads only");
         }
 
         let api_key = api_key
@@ -107,7 +107,8 @@ impl RelayClient {
 
     /// Fetches an exact-input quote and checks its steps against `request`.
     /// Bound checks on the amounts are the caller's ([`QuoteAmounts::accept`]).
-    /// An origin with no pinned depository is refused before any request.
+    /// An origin with no pinned depository, or a client with no API key, is
+    /// refused before any request.
     pub async fn quote(&self, request: &QuoteRequest) -> Result<RelayQuote, RelayError> {
         let depository = request
             .origin
@@ -115,6 +116,10 @@ impl RelayClient {
             .ok_or(QuoteMismatch::NoDepository {
                 chain: request.origin,
             })?;
+
+        if self.api_key.is_none() {
+            return Err(RelayError::NoApiKey);
+        }
 
         let url = format!("{}/quote/v2", self.api_base);
         let body = QuoteRequestBody::from(request);
@@ -369,6 +374,10 @@ mod tests {
         "0x1790875063e29a43c3a2201049fa8f6e6542e940fe2060ed03ea9107630b5a49"
     ));
 
+    fn api_key() -> RelayApiKey {
+        RelayApiKey::from("secret-key".to_owned())
+    }
+
     fn client(server: &MockServer, api_key: Option<RelayApiKey>) -> RelayClient {
         let mut client = RelayClient::new(api_key)
             .unwrap()
@@ -381,20 +390,23 @@ mod tests {
     async fn quote_posts_the_request_and_checks_the_response() {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
-            when.method(POST).path("/quote/v2").json_body_includes(
-                json!({
-                    "user": FUNDED_WALLET,
-                    "amount": "5000000",
-                    "tradeType": "EXACT_INPUT",
-                    "slippageTolerance": "30",
-                    "ttl": 1800,
-                })
-                .to_string(),
-            );
+            when.method(POST)
+                .path("/quote/v2")
+                .header("x-api-key", "secret-key")
+                .json_body_includes(
+                    json!({
+                        "user": FUNDED_WALLET,
+                        "amount": "5000000",
+                        "tradeType": "EXACT_INPUT",
+                        "slippageTolerance": "30",
+                        "ttl": 1800,
+                    })
+                    .to_string(),
+                );
             then.status(200).body(FUNDED_QUOTE);
         });
 
-        let quote = client(&server, None)
+        let quote = client(&server, Some(api_key()))
             .quote(&funded_request())
             .await
             .unwrap();
@@ -417,7 +429,10 @@ mod tests {
             ..funded_request()
         };
 
-        let error = client(&server, None).quote(&request).await.unwrap_err();
+        let error = client(&server, Some(api_key()))
+            .quote(&request)
+            .await
+            .unwrap_err();
 
         assert!(
             matches!(
@@ -484,7 +499,7 @@ mod tests {
                 .header("Location", elsewhere.url("/intents/status/v3"));
         });
 
-        let error = client(&server, Some(RelayApiKey::from("secret-key".to_owned())))
+        let error = client(&server, Some(api_key()))
             .status(REQUEST_ID)
             .await
             .unwrap_err();
@@ -531,7 +546,7 @@ mod tests {
             then.status(429);
         });
 
-        let error = client(&server, None)
+        let error = client(&server, Some(api_key()))
             .quote(&funded_request())
             .await
             .unwrap_err();
@@ -564,7 +579,7 @@ mod tests {
                 then.status(400).body(fixture);
             });
 
-            let error = client(&server, None)
+            let error = client(&server, Some(api_key()))
                 .quote(&funded_request())
                 .await
                 .unwrap_err();
@@ -586,7 +601,7 @@ mod tests {
                 .json_body(json!({"message": "new", "errorCode": "BRAND_NEW_CODE"}));
         });
 
-        let error = client(&server, None)
+        let error = client(&server, Some(api_key()))
             .quote(&funded_request())
             .await
             .unwrap_err();
@@ -610,7 +625,7 @@ mod tests {
                 .json_body(json!({"message": "down", "errorCode": "SERVICE_UNAVAILABLE"}));
         });
 
-        let error = client(&server, None)
+        let error = client(&server, Some(api_key()))
             .quote(&funded_request())
             .await
             .unwrap_err();
