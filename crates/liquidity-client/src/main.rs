@@ -1,6 +1,7 @@
 //! Binary entrypoint: resolves the target environment, builds the auth-backed
 //! transport, dispatches the parsed command, and maps failures to exit codes.
 
+mod alpaca;
 mod auth;
 mod cli;
 mod output;
@@ -13,11 +14,11 @@ use std::process::ExitCode;
 
 use crate::auth::{AuthError, StaticToken, TokenSource};
 use crate::cli::{
-    Capital, Cctp, Cli, Command, Debug, HedgedChain, PortfolioSnapshot, Position, Read,
+    BotCommand, Capital, Cctp, Cli, Command, Debug, HedgedChain, PortfolioSnapshot, Position, Read,
     RebuildableView, RecheckTransferType, UsdcDirection, VaultArgs, View,
 };
 use crate::output::OutputError;
-use crate::target::Auth;
+use crate::target::{Auth, Env, Target};
 use crate::transport::{Client, TransportError, encode_segment};
 
 #[tokio::main]
@@ -47,12 +48,13 @@ enum Failure {
 }
 
 /// Aggregates the feature errors at the CLI boundary for display and exit
-/// codes. Auth and access-denied failures exit 77; everything else exits 1.
+/// codes. Auth and access denied failures exit 77; everything else exits 1.
 #[derive(Debug)]
 enum ApiError {
     Transport(TransportError),
     Output(OutputError),
     Auth(AuthError),
+    Alpaca(alpaca::Failure),
 }
 
 impl ApiError {
@@ -64,7 +66,8 @@ impl ApiError {
                 | TransportError::Forbidden(_)
                 | TransportError::Auth(_),
             ) => 77,
-            _ => 1,
+            Self::Alpaca(error) if error.is_access_denied() => 77,
+            Self::Transport(_) | Self::Output(_) | Self::Alpaca(_) => 1,
         }
     }
 }
@@ -87,12 +90,19 @@ impl From<AuthError> for ApiError {
     }
 }
 
+impl From<alpaca::Failure> for ApiError {
+    fn from(error: alpaca::Failure) -> Self {
+        Self::Alpaca(error)
+    }
+}
+
 impl std::fmt::Display for ApiError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Transport(error) => write!(formatter, "{error}"),
             Self::Output(error) => write!(formatter, "{error}"),
             Self::Auth(error) => write!(formatter, "{error}"),
+            Self::Alpaca(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -103,29 +113,22 @@ impl std::error::Error for ApiError {
             Self::Transport(error) => Some(error),
             Self::Output(error) => Some(error),
             Self::Auth(error) => Some(error),
+            Self::Alpaca(error) => Some(error),
         }
     }
 }
 
 async fn execute(cli: Cli) -> Result<(), Failure> {
-    let target = target::resolve(cli.env).map_err(Failure::Setup)?;
+    match cli.command {
+        Command::Bot(command) => execute_bot(cli.env, command).await,
+        Command::Alpaca(command) => execute_alpaca(cli.env, command).await,
+    }
+}
+
+async fn execute_bot(env: Env, command: BotCommand) -> Result<(), Failure> {
+    let target = target::resolve(env).map_err(Failure::Setup)?;
+    let token = sign_in(&target, env.cache_slug()).await?;
     let logging_url = target.logging_url;
-    let Auth::OauthDesktop {
-        client_id,
-        client_secret,
-    } = target.auth;
-    let token = auth::desktop_id_token(
-        cli.env.cache_slug(),
-        &client_id,
-        &client_secret,
-        target.request_timeout,
-        target.connect_timeout,
-    )
-    .await
-    .map_err(|error| Failure::Api {
-        error: error.into(),
-        logging_url: logging_url.clone(),
-    })?;
     let client = Client::new(
         target.base_url,
         StaticToken(token.clone()),
@@ -134,9 +137,51 @@ async fn execute(cli: Cli) -> Result<(), Failure> {
         target.connect_timeout,
     )
     .map_err(Failure::Setup)?;
-    dispatch(&client, cli.command)
+    dispatch(&client, command)
         .await
         .map_err(|error| Failure::Api { error, logging_url })
+}
+
+async fn execute_alpaca(env: Env, command: alpaca::Command) -> Result<(), Failure> {
+    // An `alpaca` argument rule clap cannot express is refused before any
+    // sign in, as a usage error.
+    command
+        .validate()
+        .map_err(|error| Failure::Setup(error.into()))?;
+    let target = target::resolve_alpaca(env).map_err(Failure::Setup)?;
+    let token = sign_in(&target, env.alpaca_cache_slug()).await?;
+    let logging_url = target.logging_url;
+    let value = alpaca::execute(&target.base_url, token, command, &mut std::io::stderr())
+        .await
+        .map_err(|error| Failure::Api {
+            error: error.into(),
+            logging_url: logging_url.clone(),
+        })?;
+    output::print(&value).map_err(|error| Failure::Api {
+        error: error.into(),
+        logging_url,
+    })
+}
+
+/// Signs in with `target`'s desktop OAuth client, reusing the refresh token
+/// cached under `cache_slug`, and returns the IAP identity token.
+async fn sign_in(target: &Target, cache_slug: &str) -> Result<String, Failure> {
+    let Auth::OauthDesktop {
+        client_id,
+        client_secret,
+    } = &target.auth;
+    auth::desktop_id_token(
+        cache_slug,
+        client_id,
+        client_secret,
+        target.request_timeout,
+        target.connect_timeout,
+    )
+    .await
+    .map_err(|error| Failure::Api {
+        error: error.into(),
+        logging_url: target.logging_url.clone(),
+    })
 }
 
 /// A single query parameter when `value` is given, none otherwise, so an
@@ -150,13 +195,13 @@ fn optional_query(key: &str, value: Option<String>) -> Vec<(String, String)> {
 
 async fn dispatch<A: TokenSource + Sync>(
     client: &Client<A>,
-    command: Command,
+    command: BotCommand,
 ) -> Result<(), ApiError> {
     let value = match command {
-        Command::Read(Read::Resource(args)) => {
+        BotCommand::Read(Read::Resource(args)) => {
             client.get(args.resource.path(), &args.params).await?
         }
-        Command::Read(Read::TradeEvents(args)) => {
+        BotCommand::Read(Read::TradeEvents(args)) => {
             let path = format!(
                 "/trades/{}/{}/events",
                 encode_segment(&args.venue),
@@ -164,7 +209,7 @@ async fn dispatch<A: TokenSource + Sync>(
             );
             client.get(&path, &args.params).await?
         }
-        Command::Read(Read::TransferEvents(args)) => {
+        BotCommand::Read(Read::TransferEvents(args)) => {
             let path = format!(
                 "/transfers/{}/{}/events",
                 encode_segment(&args.kind),
@@ -172,8 +217,8 @@ async fn dispatch<A: TokenSource + Sync>(
             );
             client.get(&path, &args.params).await?
         }
-        Command::Debug(debug) => send_debug(client, debug).await?,
-        Command::Capital(capital) => dispatch_capital(client, capital).await?,
+        BotCommand::Debug(debug) => send_debug(client, debug).await?,
+        BotCommand::Capital(capital) => dispatch_capital(client, capital).await?,
     };
     output::print(&value).map_err(ApiError::from)
 }
@@ -517,7 +562,7 @@ mod tests {
     use super::{ApiError, dispatch, records_operation};
     use crate::auth::{AuthError, StaticToken};
     use crate::cli::{
-        Capital, Cctp, CctpSourceChain, Command, Debug, EquityTransferKind, HedgedChain,
+        BotCommand, Capital, Cctp, CctpSourceChain, Debug, EquityTransferKind, HedgedChain,
         PortfolioSnapshot, Position, Read, ReadResource, RebuildViewArgs, RebuildableView,
         RecheckTransferType, ReleaseHedgeArgs, ResourceArgs, SetMarkArgs, SetPositionArgs,
         TradeEventsArgs, TransferEventsArgs, UsdcDirection, VaultArgs, View,
@@ -603,7 +648,7 @@ mod tests {
 
     /// Dispatches one command against the capture server and returns the raw
     /// request text so a test can assert its method and route.
-    async fn request_for(command: Command) -> Result<String, Box<dyn std::error::Error>> {
+    async fn request_for(command: BotCommand) -> Result<String, Box<dyn std::error::Error>> {
         let (port, requests) = capture_server()?;
         let client = build_client(port)?;
         dispatch(&client, command).await?;
@@ -612,7 +657,7 @@ mod tests {
 
     #[tokio::test]
     async fn resource_read_gets_the_read_path() -> Result<(), Box<dyn std::error::Error>> {
-        let request = request_for(Command::Read(Read::Resource(ResourceArgs {
+        let request = request_for(BotCommand::Read(Read::Resource(ResourceArgs {
             resource: ReadResource::Health,
             params: vec![],
         })))
@@ -626,7 +671,7 @@ mod tests {
 
     #[tokio::test]
     async fn trade_events_get_the_trade_path() -> Result<(), Box<dyn std::error::Error>> {
-        let request = request_for(Command::Read(Read::TradeEvents(TradeEventsArgs {
+        let request = request_for(BotCommand::Read(Read::TradeEvents(TradeEventsArgs {
             venue: "raindex".to_owned(),
             aggregate_id: "abc".to_owned(),
             params: vec![],
@@ -641,7 +686,7 @@ mod tests {
 
     #[tokio::test]
     async fn transfer_events_get_the_transfer_path() -> Result<(), Box<dyn std::error::Error>> {
-        let request = request_for(Command::Read(Read::TransferEvents(TransferEventsArgs {
+        let request = request_for(BotCommand::Read(Read::TransferEvents(TransferEventsArgs {
             kind: "mint".to_owned(),
             aggregate_id: "abc".to_owned(),
             params: vec![],
@@ -656,7 +701,7 @@ mod tests {
 
     #[tokio::test]
     async fn resume_posts_the_write_path() -> Result<(), Box<dyn std::error::Error>> {
-        let request = request_for(Command::Debug(Debug::Resume)).await?;
+        let request = request_for(BotCommand::Debug(Debug::Resume)).await?;
         assert_eq!(
             request_line(&request),
             "POST /liquidity-write/transfers/resume HTTP/1.1"
@@ -671,7 +716,7 @@ mod tests {
             (RecheckTransferType::Redemption, "equity_redemption"),
             (RecheckTransferType::Usdc, "usdc_bridge"),
         ] {
-            let request = request_for(Command::Debug(Debug::Recheck {
+            let request = request_for(BotCommand::Debug(Debug::Recheck {
                 kind,
                 id: "abc".to_owned(),
                 deposit_tx: None,
@@ -690,7 +735,7 @@ mod tests {
     #[tokio::test]
     async fn recheck_sends_the_deposit_tx_as_its_query_parameter()
     -> Result<(), Box<dyn std::error::Error>> {
-        let request = request_for(Command::Debug(Debug::Recheck {
+        let request = request_for(BotCommand::Debug(Debug::Recheck {
             kind: RecheckTransferType::Usdc,
             id: "abc".to_owned(),
             deposit_tx: Some("0xdeposit".to_owned()),
@@ -705,7 +750,7 @@ mod tests {
 
     #[tokio::test]
     async fn resume_usdc_posts_the_direction_segment() -> Result<(), Box<dyn std::error::Error>> {
-        let request = request_for(Command::Debug(Debug::ResumeUsdc {
+        let request = request_for(BotCommand::Debug(Debug::ResumeUsdc {
             direction: UsdcDirection::BaseToAlpaca,
             id: "r/1".to_owned(),
         }))
@@ -720,7 +765,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_usdc_posts_the_kebab_case_reason() -> Result<(), Box<dyn std::error::Error>>
     {
-        let request = request_for(Command::Debug(Debug::ReconcileUsdc {
+        let request = request_for(BotCommand::Debug(Debug::ReconcileUsdc {
             id: "abc".to_owned(),
             reason: ReconcileUsdcReason::DepositCreditedOffline,
             superseding_tx: None,
@@ -742,7 +787,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_usdc_sends_the_superseding_tx_when_given()
     -> Result<(), Box<dyn std::error::Error>> {
-        let request = request_for(Command::Debug(Debug::ReconcileUsdc {
+        let request = request_for(BotCommand::Debug(Debug::ReconcileUsdc {
             id: "abc".to_owned(),
             reason: ReconcileUsdcReason::FundsMovedManually,
             superseding_tx: Some("0xcancel".to_owned()),
@@ -761,7 +806,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_equity_posts_the_kind_segment_and_reason()
     -> Result<(), Box<dyn std::error::Error>> {
-        let request = request_for(Command::Debug(Debug::ReconcileEquity {
+        let request = request_for(BotCommand::Debug(Debug::ReconcileEquity {
             kind: EquityTransferKind::Redemption,
             id: "abc".to_owned(),
             reason: "settled by hand".to_owned(),
@@ -784,7 +829,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_equity_sends_the_superseding_tx_when_given()
     -> Result<(), Box<dyn std::error::Error>> {
-        let request = request_for(Command::Debug(Debug::ReconcileEquity {
+        let request = request_for(BotCommand::Debug(Debug::ReconcileEquity {
             kind: EquityTransferKind::Redemption,
             id: "abc".to_owned(),
             reason: "cancelled at its nonce".to_owned(),
@@ -806,7 +851,7 @@ mod tests {
     #[tokio::test]
     async fn adopt_withdrawal_posts_the_replacement_and_reason()
     -> Result<(), Box<dyn std::error::Error>> {
-        let request = request_for(Command::Debug(Debug::AdoptWithdrawal {
+        let request = request_for(BotCommand::Debug(Debug::AdoptWithdrawal {
             id: "abc".to_owned(),
             replacement_tx: "0xspeedup".to_owned(),
             reason: "wallet sped up the withdrawal".to_owned(),
@@ -828,7 +873,7 @@ mod tests {
 
     #[tokio::test]
     async fn clear_pending_burn_posts_the_reason() -> Result<(), Box<dyn std::error::Error>> {
-        let request = request_for(Command::Debug(Debug::ClearPendingBurn {
+        let request = request_for(BotCommand::Debug(Debug::ClearPendingBurn {
             id: "abc".to_owned(),
             reason: "burn never landed".to_owned(),
         }))
@@ -846,7 +891,7 @@ mod tests {
 
     #[tokio::test]
     async fn fail_usdc_transfer_posts_the_reason() -> Result<(), Box<dyn std::error::Error>> {
-        let request = request_for(Command::Debug(Debug::FailUsdcTransfer {
+        let request = request_for(BotCommand::Debug(Debug::FailUsdcTransfer {
             id: "abc".to_owned(),
             reason: "pre-burn crash, burn not attempted".to_owned(),
         }))
@@ -864,7 +909,7 @@ mod tests {
 
     #[tokio::test]
     async fn position_set_omits_an_absent_price() -> Result<(), Box<dyn std::error::Error>> {
-        let request = request_for(Command::Debug(Debug::Position(Position::Set(
+        let request = request_for(BotCommand::Debug(Debug::Position(Position::Set(
             SetPositionArgs {
                 symbol: "AAPL".to_owned(),
                 target_net: "-1.5".to_owned(),
@@ -886,7 +931,7 @@ mod tests {
 
     #[tokio::test]
     async fn position_set_sends_the_price_when_given() -> Result<(), Box<dyn std::error::Error>> {
-        let request = request_for(Command::Debug(Debug::Position(Position::Set(
+        let request = request_for(BotCommand::Debug(Debug::Position(Position::Set(
             SetPositionArgs {
                 symbol: "AAPL".to_owned(),
                 target_net: "2".to_owned(),
@@ -908,7 +953,7 @@ mod tests {
 
     #[tokio::test]
     async fn release_hedge_posts_the_order_id() -> Result<(), Box<dyn std::error::Error>> {
-        let request = request_for(Command::Debug(Debug::Position(Position::ReleaseHedge(
+        let request = request_for(BotCommand::Debug(Debug::Position(Position::ReleaseHedge(
             ReleaseHedgeArgs {
                 symbol: "AAPL".to_owned(),
                 order_id: "ord-1".to_owned(),
@@ -929,7 +974,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_mark_posts_every_field() -> Result<(), Box<dyn std::error::Error>> {
-        let request = request_for(Command::Debug(Debug::PortfolioSnapshot(
+        let request = request_for(BotCommand::Debug(Debug::PortfolioSnapshot(
             PortfolioSnapshot::SetMark(SetMarkArgs {
                 day: "2026-09-01".to_owned(),
                 symbol: "AAPL".to_owned(),
@@ -965,7 +1010,7 @@ mod tests {
             (EquityTransferKind::Mint, "equity_mint"),
             (EquityTransferKind::Redemption, "equity_redemption"),
         ] {
-            let request = request_for(Command::Debug(Debug::FailEquityTransfer {
+            let request = request_for(BotCommand::Debug(Debug::FailEquityTransfer {
                 kind,
                 id: "abc".to_owned(),
                 reason: "stuck at the issuer".to_owned(),
@@ -988,7 +1033,7 @@ mod tests {
     #[tokio::test]
     async fn process_tx_sends_the_chain_only_when_given() -> Result<(), Box<dyn std::error::Error>>
     {
-        let primary = request_for(Command::Debug(Debug::ProcessTx {
+        let primary = request_for(BotCommand::Debug(Debug::ProcessTx {
             tx_hash: "0xabc".to_owned(),
             chain: None,
         }))
@@ -998,7 +1043,7 @@ mod tests {
             "POST /liquidity-write/transactions/0xabc/process HTTP/1.1"
         );
 
-        let secondary = request_for(Command::Debug(Debug::ProcessTx {
+        let secondary = request_for(BotCommand::Debug(Debug::ProcessTx {
             tx_hash: "0xabc".to_owned(),
             chain: Some(HedgedChain::Ethereum),
         }))
@@ -1013,7 +1058,7 @@ mod tests {
     #[tokio::test]
     async fn cctp_complete_mint_posts_the_burn_and_source_chain()
     -> Result<(), Box<dyn std::error::Error>> {
-        let request = request_for(Command::Debug(Debug::Cctp(Cctp::CompleteMint {
+        let request = request_for(BotCommand::Debug(Debug::Cctp(Cctp::CompleteMint {
             burn_tx: "0xabc".to_owned(),
             source_chain: CctpSourceChain::Base,
         })))
@@ -1031,7 +1076,7 @@ mod tests {
 
     #[tokio::test]
     async fn view_rebuild_posts_one_id() -> Result<(), Box<dyn std::error::Error>> {
-        let request = request_for(Command::Debug(Debug::View(View::Rebuild(
+        let request = request_for(BotCommand::Debug(Debug::View(View::Rebuild(
             RebuildViewArgs {
                 view: RebuildableView::Position,
                 id: Some("AAPL".to_owned()),
@@ -1053,7 +1098,7 @@ mod tests {
     #[tokio::test]
     async fn view_rebuild_posts_a_whole_model_without_an_id()
     -> Result<(), Box<dyn std::error::Error>> {
-        let request = request_for(Command::Debug(Debug::View(View::Rebuild(
+        let request = request_for(BotCommand::Debug(Debug::View(View::Rebuild(
             RebuildViewArgs {
                 view: RebuildableView::RebalanceTiming,
                 id: None,
@@ -1076,7 +1121,7 @@ mod tests {
             (TransferUsdcDirection::ToRaindex, "to-raindex"),
             (TransferUsdcDirection::ToAlpaca, "to-alpaca"),
         ] {
-            let request = request_for(Command::Capital(Capital::TransferUsdc {
+            let request = request_for(BotCommand::Capital(Capital::TransferUsdc {
                 direction,
                 amount: "250.5".parse()?,
                 chain: None,
@@ -1091,7 +1136,7 @@ mod tests {
                 serde_json::json!({ "direction": spelling, "amount": "250.5" })
             );
         }
-        let request = request_for(Command::Capital(Capital::TransferUsdc {
+        let request = request_for(BotCommand::Capital(Capital::TransferUsdc {
             direction: TransferUsdcDirection::ToRaindex,
             amount: "250.5".parse()?,
             chain: Some(HedgedChain::Robinhood),
@@ -1120,7 +1165,7 @@ mod tests {
             (Capital::VaultDeposit(args.clone()), "vault-deposit"),
             (Capital::VaultWithdraw(args), "vault-withdraw"),
         ] {
-            let request = request_for(Command::Capital(command)).await?;
+            let request = request_for(BotCommand::Capital(command)).await?;
             assert_eq!(
                 request_line(&request),
                 format!("POST /liquidity-write/capital/{route} HTTP/1.1")
@@ -1141,7 +1186,7 @@ mod tests {
     #[tokio::test]
     async fn vault_withdraw_usdc_posts_the_chain_and_amount()
     -> Result<(), Box<dyn std::error::Error>> {
-        let request = request_for(Command::Capital(Capital::VaultWithdrawUsdc {
+        let request = request_for(BotCommand::Capital(Capital::VaultWithdrawUsdc {
             amount: "100".parse()?,
             network: HedgedChain::Base,
         }))
@@ -1162,7 +1207,7 @@ mod tests {
     /// `--operation-id` sends a fresh id; one with it sends that id.
     #[tokio::test]
     async fn cctp_bridge_posts_either_an_amount_or_all() -> Result<(), Box<dyn std::error::Error>> {
-        let amount = request_for(Command::Capital(Capital::CctpBridge {
+        let amount = request_for(BotCommand::Capital(Capital::CctpBridge {
             amount: Some("100".parse()?),
             all: false,
             from: CctpSourceChain::Ethereum,
@@ -1186,7 +1231,7 @@ mod tests {
         );
 
         let id: uuid::Uuid = "6f1c2a1e-6c39-4a77-9a8e-1f0b7d6e8c11".parse()?;
-        let all = request_for(Command::Capital(Capital::CctpBridge {
+        let all = request_for(BotCommand::Capital(Capital::CctpBridge {
             amount: None,
             all: true,
             from: CctpSourceChain::Base,
@@ -1204,7 +1249,7 @@ mod tests {
     async fn cctp_burn_supersede_posts_the_operation_and_the_superseding_tx()
     -> Result<(), Box<dyn std::error::Error>> {
         let id: uuid::Uuid = "6f1c2a1e-6c39-4a77-9a8e-1f0b7d6e8c11".parse()?;
-        let request = request_for(Command::Capital(Capital::CctpBurnSupersede {
+        let request = request_for(BotCommand::Capital(Capital::CctpBurnSupersede {
             operation_id: id,
             superseding_tx: "0xabc".to_owned(),
         }))
@@ -1222,7 +1267,7 @@ mod tests {
 
     #[tokio::test]
     async fn reset_allowance_posts_the_chain() -> Result<(), Box<dyn std::error::Error>> {
-        let request = request_for(Command::Capital(Capital::ResetAllowance {
+        let request = request_for(BotCommand::Capital(Capital::ResetAllowance {
             network: HedgedChain::Hyperevm,
         }))
         .await?;

@@ -5937,10 +5937,14 @@ mod tests {
             .await;
     }
 
-    /// Same regression as the mint case, for the redemption detection poll
-    /// (`alpaca_redeem_command`'s `poll_for_redemption`).
+    /// The redemption detection poll (`alpaca_redeem_command`'s
+    /// `poll_for_redemption`) retries a classified broker rate-limit (429) in
+    /// place by the shared poll retry rule, not surfacing it on the first
+    /// lookup. A persistent 429 ends only at the poll deadline, as the poll's
+    /// own timeout, which is not backpressure, so the outer
+    /// `retry_on_backpressure` does not start the poll again.
     #[tokio::test]
-    async fn alpaca_redeem_poll_for_redemption_retries_a_429_up_to_the_bounded_budget() {
+    async fn alpaca_redeem_poll_for_redemption_retries_a_429_until_its_deadline() {
         let server = httpmock::MockServer::start_async().await;
         let account_id = AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
         let requests_path = format!("/v1/accounts/{account_id}/tokenization/requests");
@@ -5966,7 +5970,12 @@ mod tests {
             Chain::Base,
             None,
         )
-        .expect("basic-auth tokenization service");
+        .expect("basic-auth tokenization service")
+        .with_polling_config(st0x_execution::PollingConfig {
+            interval: std::time::Duration::from_millis(10),
+            timeout: std::time::Duration::from_millis(200),
+            ..st0x_execution::PollingConfig::default()
+        });
         let tx_hash = alloy::primitives::TxHash::ZERO;
 
         let error = retry_on_backpressure(
@@ -5977,13 +5986,18 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(error, TokenizerError::Alpaca(_)),
-            "a persistent 429 must still surface as a real failure once the \
-             bounded budget is exhausted, got: {error}"
+            matches!(
+                error,
+                TokenizerError::Alpaca(
+                    st0x_tokenization::AlpacaTokenizationError::PollTimeout { .. }
+                )
+            ),
+            "a persistent 429 must be retried by the poll until its deadline, got: {error}"
         );
-        list_mock
-            .assert_calls_async(BACKPRESSURE_RETRY_MAX_ATTEMPTS as usize)
-            .await;
+        assert!(
+            list_mock.calls_async().await > 1,
+            "the poll must look the redemption up again after a 429"
+        );
     }
 
     #[tokio::test]

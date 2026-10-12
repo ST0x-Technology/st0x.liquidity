@@ -10,7 +10,7 @@ use crate::wire::{DecimalAmount, EvmAddress, ReconcileUsdcReason, TransferUsdcDi
 /// Rejects an empty or whitespace-only audit `--reason` at parse time, before
 /// the value can reach auth or the network. The server rejects blank reasons
 /// too, so this only moves the rejection earlier, into a clear clap error.
-fn nonblank_reason(value: &str) -> Result<String, String> {
+pub(crate) fn nonblank_reason(value: &str) -> Result<String, String> {
     if value.trim().is_empty() {
         Err("must not be blank".to_owned())
     } else {
@@ -32,8 +32,21 @@ pub(crate) struct Cli {
     pub(crate) command: Command,
 }
 
+/// The top level commands: the bot commands, routed to the liquidity API,
+/// and the `alpaca` group, routed to the T0 Alpaca gateway. Flattening the
+/// bot commands keeps them at the top level of the command line while each
+/// destination stays a type of its own.
 #[derive(Subcommand)]
 pub(crate) enum Command {
+    #[command(flatten)]
+    Bot(BotCommand),
+    /// Direct account operations through the T0 Alpaca gateway.
+    #[command(subcommand)]
+    Alpaca(crate::alpaca::Command),
+}
+
+#[derive(Subcommand)]
+pub(crate) enum BotCommand {
     /// Read-only queries against the liquidity bot.
     #[command(subcommand)]
     Read(Read),
@@ -592,8 +605,8 @@ mod tests {
     use clap::Parser as _;
 
     use super::{
-        Capital, CctpSourceChain, Cli, Command, Debug, EquityTransferKind, PortfolioSnapshot,
-        Position, UsdcDirection, parse_key_value,
+        BotCommand, Capital, CctpSourceChain, Cli, Command, Debug, EquityTransferKind,
+        PortfolioSnapshot, Position, UsdcDirection, parse_key_value,
     };
     use crate::target::Env;
     use crate::wire::{
@@ -659,9 +672,11 @@ mod tests {
         let full = ["st0x-liquidity-client", "--env", "staging", "debug"]
             .into_iter()
             .chain(args.iter().copied());
-        Cli::try_parse_from(full).map(|cli| match cli.command {
-            Command::Debug(debug) => debug,
-            Command::Read(_) | Command::Capital(_) => panic!("expected a debug command"),
+        Cli::try_parse_from(full).map(|cli| {
+            let Command::Bot(BotCommand::Debug(debug)) = cli.command else {
+                panic!("expected a debug command")
+            };
+            debug
         })
     }
 
@@ -982,9 +997,11 @@ mod tests {
         let full = ["st0x-liquidity-client", "--env", "staging", "capital"]
             .into_iter()
             .chain(args.iter().copied());
-        Cli::try_parse_from(full).map(|cli| match cli.command {
-            Command::Capital(capital) => capital,
-            Command::Read(_) | Command::Debug(_) => panic!("expected a capital command"),
+        Cli::try_parse_from(full).map(|cli| {
+            let Command::Bot(BotCommand::Capital(capital)) = cli.command else {
+                panic!("expected a capital command")
+            };
+            capital
         })
     }
 

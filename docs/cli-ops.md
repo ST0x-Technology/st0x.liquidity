@@ -625,9 +625,123 @@ before any signing. An orchestrator-mode mint reaching the signing step without
 its chain's entry fails there. A missing MintAuth policy is invisible at
 startup: the first orchestrator-mode mint on that chain fails at signing.
 
-## Alpaca Crypto Wallet Management
+## Alpaca Account Operations
 
-### USDC Deposits and Withdrawals
+Use `st0x-liquidity-client --env <staging|production> alpaca` for direct access
+to the T0 Alpaca account through its account bound gateway. The client never
+accepts an Alpaca account identifier and never reads the bot account
+credentials.
+
+The selected environment reads `T0_ALPACA_{STAGING,PROD}_URL`, `_CLIENT_ID`, and
+`_CLIENT_SECRET`, and optionally `_LOGGING_URL`, a T0 Cloud Logging console link
+printed after an error. The `_URL` must be a bare https origin, with no path,
+query, or fragment. The first interactive request opens Google sign in for the
+T0 operator account. Every successful response is one compact JSON object. Each
+gateway call is bounded by its operation's deadline plus a 15 second margin, and
+the Google token exchange by fixed 30 second request and 10 second connect
+bounds, so no timeout variable applies to these commands.
+
+Read commands include account information, cash, positions, market data, orders,
+wallet transfers, conversions, and tokenization requests:
+
+```bash
+st0x-liquidity-client --env staging alpaca account
+st0x-liquidity-client --env staging alpaca positions
+st0x-liquidity-client --env staging alpaca quote --symbol COIN
+st0x-liquidity-client --env staging alpaca transfers --pending
+st0x-liquidity-client --env staging alpaca tokenization-requests --network base
+```
+
+Mutations require a nonblank `--reason`. When a key is not supplied the client
+generates one. Before the request leaves, it prints the key and whether a same
+key resend is safe to stderr in one line, for example
+`operationId=<uuid>; retryableWithSameKey=false`, so a run cut short still shows
+them. The key is also in the JSON response and in every error. An error without
+a gateway answer, or one the gateway classified, prints `retryable`,
+`outcomeUnknown`, and `retryableWithSameKey`; an Alpaca rejection the gateway
+relays prints Alpaca's status and message:
+
+```bash
+st0x-liquidity-client --env staging alpaca buy --symbol COIN --quantity 10 --reason "operator purchase"
+st0x-liquidity-client --env staging alpaca convert --direction to-usd --amount 1000 --reason "fund purchase"
+st0x-liquidity-client --env staging alpaca withdraw --amount 500 --address 0x... --reason "treasury transfer"
+st0x-liquidity-client --env staging alpaca whitelist --address 0x... --reason "approve treasury wallet"
+st0x-liquidity-client --env staging alpaca whitelist-patch-travel-rule --reason "refresh beneficiary details"
+st0x-liquidity-client --env staging alpaca unwhitelist --address 0x... --reason "remove retired wallet"
+st0x-liquidity-client --env staging alpaca journal --counterparty issuance --symbol COIN --quantity 10 --reason "fund issuer"
+st0x-liquidity-client --env staging alpaca tokenize --symbol COIN --quantity 10 --recipient 0x... --network base --reason "mint inventory"
+```
+
+Whether a mutation may be sent again with the same key depends on the operation:
+
+- `buy` and `sell` are safe to resend with `--client-order-id` set to the UUID
+  part of the printed `clientOrderId=cli-<uuid>`, `cancel` with the same broker
+  order ID, `unwhitelist` and `whitelist-patch-travel-rule` with
+  `--operation-id` (their end state is idempotent and the ID is for audit only),
+  and `tokenize` with `--issuer-request-id`.
+- `withdraw`, `journal`, and `whitelist` (`--operation-id`) and `convert`
+  (`--client-order-id`) are not: their key is for audit and lookup only, and the
+  same `--operation-id` sent twice withdraws twice.
+
+An error the gateway call itself returned, from any mutation but `convert`, did
+not apply when it does not show `outcomeUnknown=true`: `outcomeUnknown=false` or
+a relayed Alpaca rejection. A refusal before sending did not apply either. An
+error raised after that call answered, such as a failure to write the JSON to
+stdout, says nothing about the outcome; the mutation applied, so read the key
+from the stderr line and look the result up instead of running it again.
+`convert` can fail while it waits for settlement, after the conversion was
+placed, so after any `convert` error, whatever its flags, run
+`alpaca conversion-find` with the UUID in the printed `clientOrderId` before
+converting again. After an unknown outcome or an interrupted run of a command
+that is not resendable, check the outcome before running it again:
+
+- `withdraw`: never run it again on the strength of one empty `alpaca transfers`
+  read. Run `alpaca transfers` repeatedly over a window longer than the
+  withdrawal's 75 second client bound plus Alpaca's processing delay, matching
+  amount, destination, and a creation time no earlier than the run.
+- `journal`: never send it again after an unknown outcome. Confirm the journal
+  in `alpaca activities --type JNLS`, and escalate when it is missing.
+- `convert`: run `alpaca conversion-find` with the UUID in the printed
+  `clientOrderId`.
+- `whitelist`: run `alpaca whitelist-list`.
+
+`buy` and `sell` read the market session first and refuse what the legacy
+`stox buy` and `stox sell` refuse: a market order during the overnight session
+(20:00 to 04:00 ET), and a limit order without `--extended-hours` then. A market
+order for an asset Alpaca does not report as fractionable is refused unless its
+`--quantity` is whole, since it would be floored to whole shares. A `--quantity`
+finer than nine decimal places is refused at parse time, and
+`convert --direction to-usdc` refuses an `--amount` finer than whole cents
+before sign in, so the order placed is always the one typed. `convert` waits
+until the conversion settles and prints the settled order; past 300 seconds the
+remainder is cancelled.
+
+Exit 77 means IAP refused the operator (its 401 or 403, or its sign in redirect)
+or the gateway refused the identity (`401 Unauthenticated`). A failed Google
+sign in or token exchange, before any gateway call, also exits 77. A gateway 403
+refuses the operation and exits 1: `forbidden` with `destination_not_allowed`
+for a destination outside the deployment's pinned lists, and
+`capability_disabled` for an operation the deployment switched off. An Alpaca
+rejection the gateway relays, a 403 included, exits 1.
+
+`alpaca deposit --network <network>` returns the account deposit address only.
+It does not send funds. `alpaca redeem <tx-hash> --network <network>` finds the
+provider request created by a separate token transfer only. Chain signing,
+wrapping, vault operations, transfer reconciliation, and bot recovery remain
+outside this client.
+
+A market on close order is not available through the gateway: the gateway takes
+no time in force for a market order until st0x.alpaca supports it. Place one
+with the legacy `stox buy` or `stox sell` and `--time-in-force market-on-close`.
+
+### Legacy `st0x-cli` Alpaca Verbs
+
+The `stox` Alpaca verbs below stay until the operations cutover, when the
+gateway client replaces them. Until then they are also the only path that signs
+and sends the chain transfer for a deposit (`alpaca-deposit`) and a redemption
+(`alpaca-redeem`, see "Selling and Redeeming" above).
+
+#### USDC Deposits and Withdrawals
 
 ```
 stox alpaca-deposit -a 500           # Deposit USDC from Ethereum to Alpaca
@@ -635,14 +749,14 @@ stox alpaca-withdraw -a 500          # Withdraw USDC from Alpaca
 stox alpaca-withdraw -a 500 -t 0x... # Withdraw to a specific address
 ```
 
-### USD/USDC Conversion
+#### USD/USDC Conversion
 
 ```
 stox alpaca-convert -d to-usd -a 1000    # USDC -> USD (for buying shares)
 stox alpaca-convert -d to-usdc -a 1000   # USD -> USDC (for withdrawals)
 ```
 
-### Address Whitelisting
+#### Address Whitelisting
 
 Addresses must be whitelisted before Alpaca will send withdrawals to them:
 
@@ -657,20 +771,20 @@ stox alpaca-whitelist-patch-travel-rule     # Patch travel rule info on all whit
 beneficiary identity from `[broker.travel_rule]` in the config. Required for
 addresses whitelisted before the travel rule deadline took effect.
 
-### Transfer History
+#### Transfer History
 
 ```
 stox alpaca-transfers                # All transfers
 stox alpaca-transfers --pending      # Only pending transfers
 ```
 
-### Tokenization Request History
+#### Tokenization Request History
 
 ```
 stox alpaca-tokenization-requests
 ```
 
-### Equity Journaling Between Accounts
+#### Equity Journaling Between Accounts
 
 Use `alpaca-journal` to transfer equity shares from the configured Alpaca
 account to another account under the same broker firm via a security journal

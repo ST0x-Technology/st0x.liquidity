@@ -52,9 +52,9 @@ use st0x_execution::{FractionalShares, SharesConversionError, Symbol};
 use st0x_issuance_dto::VaultModeTag;
 use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
 use st0x_tokenization::{
-    AlpacaTokenizationError, IssuerRequestId, MintVerificationError, TokenizationRequest,
-    TokenizationRequestId, TokenizationRequestIdError, TokenizationRequestStatus, Tokenizer,
-    TokenizerError,
+    AlpacaPermanence, AlpacaTokenizationError, IssuerRequestId, MintVerificationError,
+    TokenizationRequest, TokenizationRequestId, TokenizationRequestIdError,
+    TokenizationRequestStatus, Tokenizer, TokenizerError,
 };
 use st0x_wrapper::{
     UnderlyingPerWrapped, UnwrapConfirmation, UnwrappedToken, WrapConfirmation, Wrapper,
@@ -2271,6 +2271,10 @@ fn alpaca_resume_failure_kind(error: &AlpacaTokenizationError) -> ResumeFailureK
         AlpacaTokenizationError::Reqwest(_)
         | AlpacaTokenizationError::Auth(_)
         | AlpacaTokenizationError::PollTimeout { .. } => Retryable,
+        AlpacaTokenizationError::Gateway(hop) => match hop.permanence() {
+            AlpacaPermanence::Transient => Retryable,
+            AlpacaPermanence::Permanent => Permanent,
+        },
         AlpacaTokenizationError::ApiError { .. }
         | AlpacaTokenizationError::PrivateKeyJwtUnsupported
         | AlpacaTokenizationError::JsonParse(_)
@@ -2282,7 +2286,8 @@ fn alpaca_resume_failure_kind(error: &AlpacaTokenizationError) -> ResumeFailureK
         | AlpacaTokenizationError::DuplicateMintIssuerRequestId { .. }
         | AlpacaTokenizationError::InvalidBaseUrl(_)
         | AlpacaTokenizationError::WrongNetwork { .. }
-        | AlpacaTokenizationError::NetworkMissing { .. } => Permanent,
+        | AlpacaTokenizationError::NetworkMissing { .. }
+        | AlpacaTokenizationError::NotSent(_) => Permanent,
     }
 }
 
@@ -4370,7 +4375,9 @@ mod tests {
         MockVerificationOutcome,
     };
     use st0x_tokenization::tokenization_request_id;
-    use st0x_tokenization::{ClientRequestId, TokenizationRequestType, issuer_request_id};
+    use st0x_tokenization::{
+        ClientRequestId, GatewayHopError, TokenizationRequestType, issuer_request_id,
+    };
     use st0x_wrapper::MockWrapper;
 
     use super::*;
@@ -7492,6 +7499,33 @@ mod tests {
         )));
 
         assert_eq!(error.resume_failure_kind(), ResumeFailureKind::Retryable);
+    }
+
+    /// A gateway hop takes the gateway's own verdict: a hop that is safe to
+    /// resend only under the same idempotency key is Retryable, as is one a
+    /// fresh call may clear, and a hop the gateway marked final is Permanent.
+    #[test]
+    fn a_gateway_hop_resume_kind_follows_the_hop_permanence() {
+        let refused = GatewayHopError {
+            retryable: false,
+            ..GatewayHopError::transport("gateway refused the mint")
+        };
+        let same_key_only = GatewayHopError {
+            outcome_unknown: true,
+            retryable_with_same_key: true,
+            ..refused.clone()
+        };
+        let fresh_call = GatewayHopError::transport("gateway unreachable");
+
+        for (hop, expected) in [
+            (same_key_only, ResumeFailureKind::Retryable),
+            (fresh_call, ResumeFailureKind::Retryable),
+            (refused, ResumeFailureKind::Permanent),
+        ] {
+            let error = RedemptionError::Alpaca(AlpacaTokenizationError::Gateway(hop.clone()));
+
+            assert_eq!(error.resume_failure_kind(), expected, "{hop:?}");
+        }
     }
 
     /// Re-running the job entry point with an id whose aggregate already
