@@ -3377,6 +3377,7 @@ fn recorded_burn_tx(event: &UsdcRebalanceEvent) -> Option<TxHash> {
         | SwapApprovePrepared { .. }
         | SwapDepositPrepared { .. }
         | SwapDeposited { .. }
+        | SwapCompletionRecovered { .. }
         | SwapRequoted { .. }
         | SwapDepositReverted { .. }
         | RelayFillVerified { .. }
