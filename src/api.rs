@@ -4439,6 +4439,27 @@ struct DeclaredRoute {
     path: &'static str,
 }
 
+/// Mounts a GET handler that also owns HEAD on its path. Axum would serve HEAD
+/// from the GET handler anyway, but an explicit HEAD handler merged onto the
+/// same path would take precedence; owning HEAD here makes that merge panic
+/// at startup instead of running an undeclared handler.
+fn get_with_head<H, T>(handler: H) -> axum::routing::MethodRouter<AppState>
+where
+    H: axum::handler::Handler<T, AppState> + Clone,
+    T: 'static,
+{
+    get(handler.clone()).head(handler)
+}
+
+macro_rules! mount_method {
+    (get) => {
+        get_with_head
+    };
+    (post) => {
+        post
+    };
+}
+
 macro_rules! ops_method {
     (get) => {
         axum::http::Method::GET
@@ -4460,10 +4481,10 @@ macro_rules! ops_path {
 /// Mounts one declared route on the router of its role.
 macro_rules! mount_ops_route {
     (read, $read:ident, $write:ident, $method:ident, $path:literal, $handler:path) => {
-        $read = $read.route(ops_path!(read, $path), $method($handler));
+        $read = $read.route(ops_path!(read, $path), mount_method!($method)($handler));
     };
     (write, $read:ident, $write:ident, $method:ident, $path:literal, $handler:path) => {
-        $write = $write.route(ops_path!(write, $path), $method($handler));
+        $write = $write.route(ops_path!(write, $path), mount_method!($method)($handler));
     };
 }
 
@@ -4689,7 +4710,7 @@ macro_rules! define_public_routes {
         fn mount_public_routes() -> Router<AppState> {
             let mut router = Router::new();
             $(
-                router = router.route($path, get($handler));
+                router = router.route($path, get_with_head($handler));
             )+
             router
         }
@@ -4723,7 +4744,7 @@ macro_rules! define_service_routes {
         fn mount_service_routes() -> Router<AppState> {
             let mut router = Router::new();
             $(
-                router = router.route($path, get($handler));
+                router = router.route($path, get_with_head($handler));
             )+
             router
         }
@@ -4755,7 +4776,8 @@ enum RouteAdmission {
 }
 
 /// Checks a request against the declarations by its method and its matched
-/// route pattern. A GET route also answers HEAD, as axum mounts it.
+/// route pattern. A GET declaration also admits HEAD, because it mounts its
+/// handler for HEAD too (`get_with_head`).
 fn route_admission(method: &Method, pattern: Option<&str>) -> RouteAdmission {
     let Some(pattern) = pattern else {
         return RouteAdmission::UndeclaredRoute;
@@ -8577,8 +8599,8 @@ mod tests {
         }
     }
 
-    /// A GET declaration also admits HEAD, as axum serves HEAD from a GET
-    /// route; a route declared only for POST refuses HEAD.
+    /// A GET declaration also admits HEAD; a route declared only for POST
+    /// refuses it.
     #[test]
     fn head_follows_get_declarations() {
         assert!(matches!(
@@ -8589,6 +8611,37 @@ mod tests {
             route_admission(&Method::HEAD, Some("/transfers/resume")),
             RouteAdmission::UndeclaredMethod { ref allow } if allow == "POST"
         ));
+    }
+
+    /// Every GET declaration owns HEAD on its path, so merging an undeclared
+    /// HEAD handler onto a public, service, or read role path fails when the
+    /// router is built instead of serving that handler past the guard.
+    #[test]
+    fn undeclared_head_handlers_cannot_be_mounted_on_get_routes() {
+        for path in ["/health", "/metrics", "/liquidity-read/pnl"] {
+            let built = std::panic::catch_unwind(|| {
+                let undeclared: Router<AppState> =
+                    Router::new().route(path, axum::routing::head(|| async { "ran" }));
+                routes_with_ops_api(undeclared.merge(ops_api_routes_with_verifiers(
+                    &test_ops_api_config(),
+                    |audience, role| {
+                        Arc::new(crate::iap_auth::IapVerifier::new(
+                            audience,
+                            role,
+                            reqwest::Client::new(),
+                        ))
+                    },
+                )))
+            });
+            let message = built
+                .err()
+                .and_then(|panic| panic.downcast::<String>().ok())
+                .unwrap_or_else(|| panic!("{path} accepted an undeclared HEAD handler"));
+            assert!(
+                message.contains("Overlapping method route"),
+                "{path}: {message}"
+            );
+        }
     }
 
     /// A route, method, nested service, or fallback mounted outside every
