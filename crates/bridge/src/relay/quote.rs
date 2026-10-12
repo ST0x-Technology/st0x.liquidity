@@ -3,7 +3,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use alloy::primitives::{Address, B256, Bytes, U256, address};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::sol;
 use alloy::sol_types::{SolCall, SolStruct};
 use serde::de::IgnoredAny;
@@ -12,14 +12,6 @@ use serde::{Deserialize, Serialize};
 use st0x_evm::Chain;
 
 use super::acceptance::{BasisPoints, QuoteAmounts};
-
-/// The solver every live quote names, on both directions. The order lets it
-/// settle through a refund with a minimum of 0, so a quote naming any other
-/// solver is refused; a solver rotation at Relay needs a release.
-const RELAY_SOLVER: Address = address!("0xf70da97812cb96acdf810712aa562db8dfa3dbef");
-
-/// Relay's name for the chain [`RELAY_SOLVER`] is paid on.
-const RELAY_SOLVER_CHAIN: &str = "base";
 
 sol! {
     function approve(address spender, uint256 amount) external returns (bool);
@@ -182,10 +174,6 @@ pub enum QuoteStep {
 /// A value in a quote that must equal what the request implies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuoteField {
-    /// `protocol.v2.orderData.solver`: who may settle the order.
-    Solver,
-    /// `protocol.v2.orderData.solverChainId`: where the solver is paid.
-    SolverChain,
     /// `protocol.v2.orderData.output.chainId`: where the solver pays.
     OutputChain,
     /// `protocol.v2.paymentDetails.chainId`: where we deposit.
@@ -580,7 +568,6 @@ impl QuoteResponse {
         )?;
 
         check_fees(&self.fees, origin)?;
-        check_solver(&self.protocol.v2.order_data)?;
         check_order_input(&self.protocol.v2.order_data, request)?;
         check_output_payment(&self.details, &self.protocol.v2.order_data, request)?;
         check_refunds(&self.protocol.v2.order_data, request)?;
@@ -742,20 +729,6 @@ fn check_fees(fees: &RawFees, origin: Chain) -> Result<(), QuoteMismatch> {
         return Err(QuoteMismatch::GasFeeChain {
             expected: origin.chain_id(),
             actual: fees.gas.currency.chain_id,
-        });
-    }
-
-    Ok(())
-}
-
-fn check_solver(order: &RawOrderData) -> Result<(), QuoteMismatch> {
-    check_address(QuoteField::Solver, RELAY_SOLVER, order.solver)?;
-
-    if order.solver_chain_id != RELAY_SOLVER_CHAIN {
-        return Err(QuoteMismatch::ChainMismatch {
-            field: QuoteField::SolverChain,
-            expected: RELAY_SOLVER_CHAIN,
-            actual: order.solver_chain_id.clone(),
         });
     }
 
@@ -1248,62 +1221,6 @@ pub(super) mod tests {
                         "0x266b12442f9b86ef731fae285c34f489217acdfcedd755422ce47db429992d85"
                     ))
                         && derived != quoted
-            ),
-            "{error:?}"
-        );
-    }
-
-    /// Edits the funded quote's order data, then rewrites `protocol.v2.orderId`
-    /// and the deposit calldata id to the new order's hash, so the order-id
-    /// checks pass and only the edited field can refuse the quote.
-    fn rehashed_refusal(mutate: impl FnOnce(&mut Value)) -> QuoteMismatch {
-        refusal(|body| {
-            mutate(&mut body["protocol"]["v2"]["orderData"]);
-
-            let order: RawOrderData =
-                serde_json::from_value(body["protocol"]["v2"]["orderData"].clone()).unwrap();
-            let RelayOrderId(order_id) = derive_order_id(&order).unwrap();
-            body["protocol"]["v2"]["orderId"] = json!(order_id);
-
-            let calldata = body["steps"][1]["items"][0]["data"]["data"]
-                .as_str()
-                .unwrap()
-                .to_owned();
-            let (head, _) = calldata.split_at(calldata.len() - 64);
-            body["steps"][1]["items"][0]["data"]["data"] =
-                json!(format!("{head}{}", alloy::hex::encode(order_id)));
-        })
-    }
-
-    #[test]
-    fn order_naming_another_solver_is_refused() {
-        let error = rehashed_refusal(|order| order["solver"] = json!(OTHER));
-
-        assert!(
-            matches!(
-                error,
-                QuoteMismatch::AddressMismatch {
-                    field: QuoteField::Solver,
-                    expected,
-                    actual: OTHER,
-                } if expected == address!("0xf70da97812cb96acdf810712aa562db8dfa3dbef")
-            ),
-            "{error:?}"
-        );
-    }
-
-    #[test]
-    fn order_naming_another_solver_chain_is_refused() {
-        let error = rehashed_refusal(|order| order["solverChainId"] = json!("ethereum"));
-
-        assert!(
-            matches!(
-                &error,
-                QuoteMismatch::ChainMismatch {
-                    field: QuoteField::SolverChain,
-                    expected: "base",
-                    actual,
-                } if actual == "ethereum"
             ),
             "{error:?}"
         );
