@@ -476,9 +476,10 @@ fn read_matching_entries(
         // Collect this file's matches so they can be reversed: the newest
         // entry is last in the file and first on the page.
         let mut file_matches: Vec<serde_json::Value> = Vec::new();
-        if let Err(error) = visit_file_entries(&file_entry.path(), filter, &needles, |value| {
+        let visited = visit_file_entries(&file_entry.path(), None, filter, &needles, |value| {
             file_matches.push(value);
-        }) {
+        });
+        if let Err(error) = visited {
             debug!(%error, file = ?file_entry.path(), "Skipped unreadable log lines");
         }
 
@@ -504,27 +505,70 @@ fn read_matching_entries(
     (page_entries, total, has_more)
 }
 
-/// Calls `visit` with every entry in `log_dir` that passes `filter`, newest
-/// file first and in file order within a file, without holding them all.
+/// A log file and its length in bytes when it was listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LogFileExtent {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) length: u64,
+}
+
+/// The log files in `log_dir` that `filter`'s dates can match, newest first,
+/// each with its length now.
 ///
-/// A missing directory, a file removed after the listing, and a line that is
-/// not UTF-8 are skipped, as the endpoints skip them. Any other read error is
-/// returned once the files are read, so a caller that must not miss entries
-/// can retry.
-pub(crate) fn visit_matching_entries(
+/// A missing directory gives no files. A file whose length cannot be read is
+/// left out, and the first listing or length error is returned beside the
+/// files, so a caller can report what it could not list.
+pub(crate) fn log_file_extents(
     log_dir: &str,
+    filter: &LogFilter,
+) -> (Vec<LogFileExtent>, Option<std::io::Error>) {
+    let (log_files, mut first_error) = match matching_log_files(log_dir, filter) {
+        Ok(listing) => listing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (Vec::new(), None),
+        Err(error) => return (Vec::new(), Some(error)),
+    };
+
+    let extents = log_files
+        .iter()
+        .filter_map(|file_entry| match file_entry.metadata() {
+            Ok(metadata) => Some(LogFileExtent {
+                path: file_entry.path(),
+                length: metadata.len(),
+            }),
+            Err(error) => {
+                first_error.get_or_insert(error);
+                None
+            }
+        })
+        .collect();
+
+    (extents, first_error)
+}
+
+/// Calls `visit` with every entry of `extents` that passes `filter`, in
+/// their order and in file order within a file, without holding them all.
+///
+/// Each file is read only up to its recorded length, so bytes appended after
+/// the listing are never read; a line that length cuts does not parse and is
+/// skipped. A file removed since the listing and a line that is not UTF-8 are
+/// skipped, as the endpoints skip them. Any other read error is returned once
+/// the files are read, so a caller that must not miss entries can retry.
+pub(crate) fn visit_extent_entries(
+    extents: &[LogFileExtent],
     filter: &LogFilter,
     mut visit: impl FnMut(serde_json::Value),
 ) -> Result<(), std::io::Error> {
     let needles = LineNeedles::new(filter);
-    let (log_files, mut first_error) = match matching_log_files(log_dir, filter) {
-        Ok(listing) => listing,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
+    let mut first_error = None;
 
-    for file_entry in &log_files {
-        if let Err(error) = visit_file_entries(&file_entry.path(), filter, &needles, &mut visit) {
+    for extent in extents {
+        if let Err(error) = visit_file_entries(
+            &extent.path,
+            Some(extent.length),
+            filter,
+            &needles,
+            &mut visit,
+        ) {
             first_error.get_or_insert(error);
         }
     }
@@ -626,24 +670,26 @@ fn matching_log_files(
 }
 
 /// Calls `visit` with each entry of one file that passes the filters, in
-/// file order. A file removed since the listing and a line that is not UTF-8
-/// are skipped. Any other read error stops reading the file and is
-/// returned, with the entries before it already visited: a persistent error
-/// such as reading a directory would otherwise repeat forever.
+/// file order, reading at most `length` bytes when it is given. A file
+/// removed since the listing and a line that is not UTF-8 are skipped. Any
+/// other read error stops reading the file and is returned, with the entries
+/// before it already visited: a persistent error such as reading a directory
+/// would otherwise repeat forever.
 fn visit_file_entries(
     path: &std::path::Path,
+    length: Option<u64>,
     filter: &LogFilter,
     needles: &LineNeedles,
     mut visit: impl FnMut(serde_json::Value),
 ) -> Result<(), std::io::Error> {
-    use std::io::BufRead;
+    use std::io::{BufRead, Read};
 
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
-    let reader = std::io::BufReader::new(file);
+    let reader = std::io::BufReader::new(file.take(length.unwrap_or(u64::MAX)));
 
     for line_result in reader.lines() {
         let line = match line_result {

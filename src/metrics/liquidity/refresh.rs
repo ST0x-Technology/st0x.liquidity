@@ -14,7 +14,9 @@ use st0x_config::{ChainRegistry, Ctx};
 use st0x_dto::InfraReport;
 
 use super::log_counts::{LogCounts, LogWindow, active_log_counts};
-use super::performance::{infra_samples, latency_samples, rebalance_samples, reliability_samples};
+use super::performance::{
+    infra_samples, latency_samples, log_count_samples, rebalance_samples, reliability_samples,
+};
 use super::prices::{load_positions, price_samples};
 use super::{LiqFamilies, LiqFamily, LiqSample};
 use crate::dashboard::equity_price::EquityPriceStore;
@@ -117,11 +119,14 @@ pub(super) fn record_collector_duration(collector: &'static str, elapsed: Durati
     }
 }
 
-/// Every 60 seconds: the latencies, reliability and infra families over the
-/// last 24 hours, and every fifth cycle the rebalances over the last 30
-/// days. Each family comes from the loaders its `/performance/*` endpoint
-/// uses. A collector that fails or times out keeps its last family, and its
-/// `liq_collector_last_success_ts_seconds` stops advancing.
+/// Every 60 seconds: the log counts, and the latencies, reliability and
+/// infra families over the last 24 hours, and every fifth cycle the
+/// rebalances over the last 30 days. The log counts come from the in-process
+/// counter, with no database read, and run first, so one failing loader
+/// does not hold them back; a stall of the whole pool still skips ticks.
+/// Every other family comes from the loaders its `/performance/*`
+/// endpoint uses. A collector that fails or times out keeps its last family,
+/// and its `liq_collector_last_success_ts_seconds` stops advancing.
 #[derive(Clone)]
 pub(crate) struct LiqPerformanceRefresh {
     pub(crate) pool: SqlitePool,
@@ -129,48 +134,30 @@ pub(crate) struct LiqPerformanceRefresh {
     pub(crate) families: &'static LiqFamilies,
     /// `None` without file logging: the log levels then read 0, as the
     /// endpoint reports.
-    pub(crate) log_counts: Option<LogCountSource>,
-}
-
-/// The process's log counter and the directory its one-time seed reads.
-#[derive(Clone)]
-pub(crate) struct LogCountSource {
-    pub(crate) counts: Arc<LogCounts>,
-    pub(crate) log_dir: String,
+    pub(crate) log_counts: Option<Arc<LogCounts>>,
 }
 
 impl LiqPerformanceRefresh {
-    /// Counts logs only when this process activated the counter and has a
-    /// log directory to seed from.
+    /// Counts logs only when this process activated the counter, which it
+    /// does only with file logging.
     pub(crate) fn new(ctx: &Ctx, pool: SqlitePool, families: &'static LiqFamilies) -> Self {
-        let log_counts =
-            active_log_counts()
-                .zip(ctx.file_logging.as_ref())
-                .map(|(counts, file_logging)| LogCountSource {
-                    counts,
-                    log_dir: file_logging.directory().to_string(),
-                });
-
         Self {
             pool,
             chains: ctx.chains.clone(),
             families,
-            log_counts,
+            log_counts: active_log_counts(),
         }
     }
 
-    /// The log counts for the reliability family. `None` until the
-    /// one-time seed from the files is done: counts without the previous
-    /// process's events would read low, so the log names stay absent.
+    /// The log counts for the logs family. `None` until the one-time seed
+    /// from the files is done: counts without the previous process's events
+    /// would read low, so the log names stay absent.
     fn log_window(&self) -> Option<LogWindow> {
-        let Some(source) = &self.log_counts else {
+        let Some(counts) = &self.log_counts else {
             return Some(LogWindow::default());
         };
 
-        source
-            .counts
-            .seeded_or_start(&source.log_dir)
-            .then(|| source.counts.window(Utc::now()))
+        counts.seeded_or_start().then(|| counts.window(Utc::now()))
     }
 }
 
@@ -182,23 +169,24 @@ impl LiqPerformanceRefresh {
             to: now,
         };
 
+        // The log counts need no database, so no slow loader delays them.
+        if let Some(logs) = self.log_window() {
+            self.collect(LiqFamily::Logs, async { Ok(log_count_samples(&logs)) })
+                .await;
+        }
+
         self.collect(LiqFamily::Latencies, async {
             let performances = load_hedge_performance(&self.pool, &day).await?;
             Ok(latency_samples(&hedge_latency_report(&performances, &day)))
         })
         .await;
 
-        let logs = self.log_window();
         self.collect(LiqFamily::Reliability, async {
             let (failure_events, job_queues) = tokio::try_join!(
                 load_failure_events(&self.pool, &day),
                 load_job_queue_health(&self.pool),
             )?;
-            Ok(reliability_samples(
-                logs.as_ref(),
-                &failure_events,
-                &job_queues,
-            ))
+            Ok(reliability_samples(&failure_events, &job_queues))
         })
         .await;
 
@@ -317,7 +305,7 @@ mod tests {
     }
 
     fn performance_collectors(families: &'static LiqFamilies) -> Vec<Option<f64>> {
-        ["latencies", "reliability", "infra", "rebalances"]
+        ["logs", "latencies", "reliability", "infra", "rebalances"]
             .into_iter()
             .map(|name| collector(families, name))
             .collect()
@@ -336,7 +324,7 @@ mod tests {
         task.refresh_once(0).await;
 
         let durations = parse_exposition(&handle.render());
-        for collector in ["latencies", "reliability", "infra", "rebalances"] {
+        for collector in ["logs", "latencies", "reliability", "infra", "rebalances"] {
             assert_eq!(
                 durations.get(&series(
                     "metrics_refresh_duration_seconds_count",
@@ -358,12 +346,20 @@ mod tests {
             Some(&0.0)
         );
         assert_eq!(rendered.get(&series("liq_block_lag_blocks", &base)), None);
+        assert_eq!(
+            rendered.get(&series(
+                "liq_reliability_log_count_24h",
+                &[("level", "error")]
+            )),
+            Some(&0.0),
+            "without file logging both levels read 0"
+        );
     }
 
-    /// The log names wait for the background seed, so a restart does not
-    /// reset the 24-hour log counts; the rest of the family does not wait.
+    /// The logs family waits for the background seed, so a restart does not
+    /// reset the 24-hour log counts; the other families do not wait.
     #[tokio::test]
-    async fn the_reliability_family_counts_the_seeded_log_entries() {
+    async fn the_logs_family_counts_the_seeded_log_entries() {
         let dir = tempfile::tempdir().unwrap();
         let now = Utc::now();
         let earlier = (now - chrono::Duration::minutes(5)).to_rfc3339();
@@ -374,10 +370,10 @@ mod tests {
         .unwrap();
         let families = leaked_families();
         let mut task = performance(families, setup_test_db().await);
-        task.log_counts = Some(LogCountSource {
-            counts: Arc::new(LogCounts::new(now)),
-            log_dir: dir.path().to_str().unwrap().to_string(),
-        });
+        task.log_counts = Some(Arc::new(LogCounts::activate(
+            dir.path().to_str().unwrap(),
+            now,
+        )));
 
         task.refresh_once(0).await;
         assert_eq!(
@@ -388,11 +384,12 @@ mod tests {
             None,
             "absent until the seed is done"
         );
+        assert_eq!(collector(families, "logs"), None);
         assert!(collector(families, "reliability").is_some());
 
         let counts = task.log_counts.as_ref().unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while !counts.counts.seeded_or_start(&counts.log_dir) {
+            while !counts.seeded_or_start() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -461,9 +458,18 @@ mod tests {
             )),
             Some(&4.0)
         );
+        let collectors = performance_collectors(families);
+        assert_eq!(collectors[1..], [None, Some(100.0), None, None]);
+        assert!(
+            collectors[0].is_some_and(|time| time > 100.0),
+            "the log counts need no database, so they still refresh: {collectors:?}"
+        );
         assert_eq!(
-            performance_collectors(families),
-            [None, Some(100.0), None, None]
+            rendered_store(families).get(&series(
+                "liq_reliability_log_count_24h",
+                &[("level", "warning")]
+            )),
+            Some(&0.0)
         );
     }
 
