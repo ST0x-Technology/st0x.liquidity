@@ -3,7 +3,6 @@
 use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use alloy::primitives::{TxHash, U256};
 use axum::Json;
@@ -33,7 +32,6 @@ use st0x_event_sorcery::{
     send_command,
 };
 use st0x_evm::Chain;
-use st0x_execution::alpaca_broker_api::AccountActivitiesQuery;
 use st0x_execution::{AlpacaWalletError, Symbol};
 use st0x_finance::{FractionalShares, Positive};
 use st0x_float_serde::format_float;
@@ -43,8 +41,7 @@ use st0x_tokenization::IssuerRequestId;
 use crate::AppState;
 use crate::cctp_burn::{CctpBurnOperation, CctpSourceChain};
 use crate::dashboard::pnl::{
-    PnlError, PnlQuery, PnlResponse, acquire_pnl_report_permit, build_pnl_report_with_permit,
-    validate_pnl_snapshot_rowid,
+    PnlError, PnlQuery, PnlReportDeps, PnlReportError, PnlResponse, run_pnl_report,
 };
 use crate::dashboard::transfer_loader::{
     InvalidTransferKind, TransferHistoryQuery, TransferKind, query_transfer_history,
@@ -276,60 +273,38 @@ async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRespon
     )
 }
 
-/// Deadline for bringing the PnL ledger current on the `/pnl` request path.
-/// Catch-up work is proportional to the un-ingested backlog, not to the
-/// request, and concurrent requests serialize on the ledger's internal mutex
-/// before any admission control -- so past this deadline the request sheds
-/// with 503 instead of queueing behind ingestion. The boot-path catch-up
-/// stays unbounded: first-deploy backfill may legitimately exceed any
-/// request deadline. Cancellation is safe because each ingest batch commits
-/// its rows and checkpoint atomically; an elapsed deadline only rolls back
-/// the in-flight batch.
-const PNL_CATCH_UP_TIMEOUT: Duration = Duration::from_secs(10);
-
 async fn pnl(
     State(state): State<AppState>,
     Query(query): Query<PnlQuery>,
 ) -> Result<Json<PnlResponse>, (StatusCode, String)> {
-    let after = query
-        .activity_after()
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    let until = query
-        .activity_until()
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    query
-        .symbol_filter(&mut Vec::new())
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    let head = tokio::time::timeout(PNL_CATCH_UP_TIMEOUT, state.pnl_ledger.catch_up())
-        .await
-        .map_err(|_elapsed| {
-            warn!("PnL ledger catch-up exceeded its request deadline");
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "PnL ledger catch-up timed out".to_string(),
-            )
-        })?
-        .map_err(|error| pnl_error_response(PnlError::Ledger(error)))?;
-    validate_pnl_snapshot_rowid(head, &query).map_err(pnl_error_response)?;
-    let permit =
-        acquire_pnl_report_permit(&state.pnl_report_admission).map_err(pnl_error_response)?;
+    let BrokerCtx::AlpacaBrokerApi(broker) = &state.ctx.broker;
+    let deps = PnlReportDeps {
+        pool: &state.pool,
+        ledger: &state.pnl_ledger,
+        broker,
+    };
 
-    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &state.ctx.broker;
-    let activities = alpaca_auth
-        .fetch_account_activities(&AccountActivitiesQuery::pnl(after, until))
+    run_pnl_report(&deps, &query, &state.pnl_report_admission)
         .await
-        .map_err(|error| {
+        .map(Json)
+        .map_err(pnl_report_error_response)
+}
+
+fn pnl_report_error_response(error: PnlReportError) -> (StatusCode, String) {
+    match error {
+        PnlReportError::Report(error) => pnl_error_response(error),
+        PnlReportError::CatchUpTimeout => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "PnL ledger catch-up timed out".to_string(),
+        ),
+        PnlReportError::Activities(error) => {
             error!(%error, "Failed to fetch Alpaca account activities for PnL");
             (
                 StatusCode::BAD_GATEWAY,
                 "Failed to fetch Alpaca account activities".to_string(),
             )
-        })?;
-
-    build_pnl_report_with_permit(&state.pool, &query, activities, Utc::now(), permit, head)
-        .await
-        .map(Json)
-        .map_err(pnl_error_response)
+        }
+    }
 }
 
 fn pnl_error_response(error: PnlError) -> (StatusCode, String) {
@@ -4758,6 +4733,7 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     use alloy::consensus::{SignableTransaction as _, TxEip1559, TxEnvelope};
     use alloy::eips::eip2718::{EIP1559_TX_TYPE_ID, Encodable2718 as _};
@@ -4808,6 +4784,7 @@ mod tests {
     use super::*;
     use crate::bindings::IRaindexV6::{SignedContextV1, TakeOrderConfigV4, TakeOrderV3};
     use crate::dashboard;
+    use crate::dashboard::pnl::{PnlReportAdmission, acquire_pnl_report_permit};
     use crate::equity_redemption::redemption_aggregate_id;
     use crate::inventory::{
         self, BroadcastingInventory, PortfolioAsset, PortfolioBalanceRow, PortfolioLocation,
@@ -6082,6 +6059,78 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    /// The state and the Alpaca mock it reads, which serves until dropped.
+    async fn pnl_test_state() -> (AppState, AlpacaBrokerMock) {
+        let broker_mock = AlpacaBrokerMock::start()
+            .symbol_fill_prices(vec![])
+            .symbol_positions(vec![])
+            .call()
+            .await;
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.broker = crate::test_utils::mock_alpaca_broker_ctx(broker_mock.base_url());
+
+        (empty_app_state(ctx).await, broker_mock)
+    }
+
+    async fn shared_pnl_report(state: &AppState, query: &PnlQuery) -> PnlResponse {
+        let BrokerCtx::AlpacaBrokerApi(broker) = &state.ctx.broker;
+        let deps = PnlReportDeps {
+            pool: &state.pool,
+            ledger: &state.pnl_ledger,
+            broker,
+        };
+
+        run_pnl_report(&deps, query, &PnlReportAdmission::with_permits(1))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn pnl_route_returns_what_the_shared_report_path_builds() {
+        let (state, _broker_mock) = pnl_test_state().await;
+        seed_position_pnl_fill(&state.pool, &Symbol::new("RKLB").unwrap()).await;
+        let query = PnlQuery {
+            limit: Some(1),
+            from_date: Some("2026-03-01".to_string()),
+            to_date: Some("2026-03-09".to_string()),
+            ..PnlQuery::default()
+        };
+
+        let shared = serde_json::to_value(shared_pnl_report(&state, &query).await).unwrap();
+        let response = build_app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/pnl?limit=1&fromDate=2026-03-01&toDate=2026-03-09")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let routed: serde_json::Value =
+            serde_json::from_str(&body_to_string(response).await).unwrap();
+        assert_eq!(routed, shared);
+        assert_eq!(routed["summary"]["matchedLotCount"], serde_json::json!(1));
+    }
+
+    #[tokio::test]
+    async fn each_shared_report_sees_the_fills_recorded_before_it() {
+        let (state, _broker_mock) = pnl_test_state().await;
+        let query = PnlQuery {
+            limit: Some(1),
+            ..PnlQuery::default()
+        };
+
+        seed_position_pnl_fill(&state.pool, &Symbol::new("RKLB").unwrap()).await;
+        let first = shared_pnl_report(&state, &query).await;
+        seed_position_pnl_fill(&state.pool, &Symbol::new("TSLA").unwrap()).await;
+        let second = shared_pnl_report(&state, &query).await;
+
+        assert_eq!(first.summary.matched_lot_count, 1);
+        assert_eq!(second.summary.matched_lot_count, 2);
     }
 
     /// End-to-end `/pnl` coverage for capital/return-on-capital figures: three
