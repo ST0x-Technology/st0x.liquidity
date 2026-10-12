@@ -7916,7 +7916,6 @@ dependencies = [
  "event-sorcery",
  "flate2",
  "futures-util",
- "http-body-util",
  "httpmock",
  "itertools 0.14.0",
  "jsonwebtoken",

@@ -22,14 +22,15 @@ beside SQLite. Rotation retains seven daily files, which caps file count but not
 bytes. The lower file level reduces within-day growth and disk-exhaustion risk;
 it does not enforce a per-file byte limit or filesystem quota.
 
-The active GCP runtime config sources are `config/prod/st0x-hedge.toml` and
-`config/staging/st0x-hedge.toml` in this repository.
-`.github/workflows/config-drift.yml` validates both against the current schema,
-while `.github/workflows/build-oci.yml` validates and promotes the staging
-config with the image. Production promotion runs only through a manual
-`workflow_dispatch` of `.github/workflows/production-release.yml`: a version
-selects that tag's images and config, while a blank version selects the master
-config and preserves the live image tags.
+The active GCP configs are `config/staging/st0x-hedge.toml` and
+`config/prod/st0x-hedge.toml` in this repository. Each release validates the
+file inside the image that will run it and publishes it as a
+`liquidity-runtime-config` version together with the image digests. A production
+config-only release (empty `version`) rolls no image: it re-uses the digests
+that are live. A logging-schema release must therefore ship the matching image
+and runtime config together: a merge to master rolls staging with both from the
+same commit (`build-oci.yml`), and production pins both in one gated
+`production-release.yml` run.
 
 ## Tracing targets
 

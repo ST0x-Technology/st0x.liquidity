@@ -53,7 +53,10 @@ has no CCTP domain.
 - **Shared Operations Audit**: Every operator mutation request that reaches the
   service emits `st0x.operations.audit.v1` with stable principal, role, matched
   route template, request UUID, bounded target/reason fields, outcome, and
-  timestamp. Authentication precedes body capture, so in-service denials use
+  timestamp. `target_id` is the path values followed by the identifiers the
+  typed request body and query declare, and `reason` is the typed body's reason;
+  an oversized value is refused with `400` before the handler runs.
+  Authentication precedes body capture, so in-service denials use
   `not_identified`/`not_provided`; Cloud IAP edge rejections never reach the
   application. Docker's `gcplogs` driver forwards each JSON stdout record to
   Cloud Logging as a serialized line; field parsing depends on the ingestion

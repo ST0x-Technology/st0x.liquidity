@@ -145,28 +145,41 @@ async fn execute(cli: Cli) -> Result<(), Failure> {
         target.connect_timeout,
     )
     .map_err(Failure::Setup)?;
-    let is_write = matches!(cli.command, Command::Debug(_) | Command::Capital(_));
+    let writes = is_write(&cli.command);
     dispatch(&client, cli.command)
         .await
         .map_err(|error| Failure::Api {
-            request_id: audited_request_id(is_write, &error, client.request_id),
+            request_id: (writes && reached_bot(&error)).then_some(client.request_id),
             error,
             logging_url,
         })
 }
 
-/// The request id worth printing after a failure: only a write is audited,
-/// and a token that could not be minted means the request was never sent.
-fn audited_request_id(
-    is_write: bool,
-    error: &ApiError,
-    request_id: uuid::Uuid,
-) -> Option<uuid::Uuid> {
-    let sent = !matches!(
-        error,
-        ApiError::Auth(_) | ApiError::Transport(TransportError::Auth(_))
-    );
-    (is_write && sent).then_some(request_id)
+/// Only writes are audited, so only a write's request id names an event.
+const fn is_write(command: &Command) -> bool {
+    match command {
+        Command::Read(_) => false,
+        Command::Debug(_) | Command::Capital(_) => true,
+    }
+}
+
+/// Whether a failed request may have reached the bot. A token that could not
+/// be minted, or a connection that never opened, means it was never sent; a
+/// timeout after sending or any response means the bot may have audited it.
+fn reached_bot(error: &ApiError) -> bool {
+    match error {
+        ApiError::Auth(_) | ApiError::Transport(TransportError::Auth(_)) => false,
+        ApiError::Transport(TransportError::Transport(_, source)) => {
+            !(source.is_connect() || source.is_builder())
+        }
+        ApiError::Transport(
+            TransportError::Unauthorized(_)
+            | TransportError::Forbidden(_)
+            | TransportError::Http(..)
+            | TransportError::Decode { .. },
+        )
+        | ApiError::Output(_) => true,
+    }
 }
 
 /// A single query parameter when `value` is given, none otherwise, so an
@@ -545,7 +558,7 @@ mod tests {
     use std::sync::mpsc::{Receiver, channel};
     use std::time::Duration;
 
-    use super::{ApiError, audited_request_id, dispatch, records_operation};
+    use super::{ApiError, dispatch, is_write, reached_bot, records_operation};
     use crate::auth::{AuthError, StaticToken};
     use crate::cli::{
         Capital, Cctp, CctpSourceChain, Command, Debug, EquityTransferKind, HedgedChain,
@@ -1317,20 +1330,63 @@ mod tests {
         );
     }
 
-    #[test]
-    fn only_a_sent_write_prints_its_request_id() {
-        let request_id = uuid::Uuid::new_v4();
-        let rejected =
-            || ApiError::Transport(TransportError::Http(StatusCode::CONFLICT, String::new()));
-        let unminted =
-            || ApiError::Transport(TransportError::Auth(AuthError::Flow("x".to_owned())));
+    /// Serves one connection and answers `409 Conflict`, the shape of a write
+    /// the bot received and refused.
+    fn conflict_server() -> std::io::Result<u16> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        Ok(port)
+    }
 
-        assert_eq!(
-            audited_request_id(true, &rejected(), request_id),
-            Some(request_id)
-        );
-        assert_eq!(audited_request_id(false, &rejected(), request_id), None);
-        assert_eq!(audited_request_id(true, &unminted(), request_id), None);
+    #[test]
+    fn only_writes_are_audited_writes() {
+        assert!(!is_write(&Command::Read(Read::Resource(ResourceArgs {
+            resource: ReadResource::Health,
+            params: vec![],
+        }))));
+        assert!(is_write(&Command::Debug(Debug::Resume)));
+    }
+
+    /// A write the bot answered may be audited; one whose connection never
+    /// opened cannot be, so its request id would find nothing.
+    #[tokio::test]
+    async fn only_a_request_that_reached_the_bot_can_have_an_audit_event()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let refused = dispatch(
+            &build_client(conflict_server()?)?,
+            Command::Debug(Debug::Resume),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            refused,
+            ApiError::Transport(TransportError::Http(StatusCode::CONFLICT, _))
+        ));
+        assert!(reached_bot(&refused));
+
+        let closed_port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+        let unreachable = dispatch(&build_client(closed_port)?, Command::Debug(Debug::Resume))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            unreachable,
+            ApiError::Transport(TransportError::Transport(..))
+        ));
+        assert!(!reached_bot(&unreachable));
+
+        assert!(!reached_bot(&ApiError::Transport(TransportError::Auth(
+            AuthError::Flow("x".to_owned())
+        ))));
+        Ok(())
     }
 
     #[test]

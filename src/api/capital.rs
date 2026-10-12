@@ -40,8 +40,9 @@ use st0x_float_serde::format_float_with_fallback;
 use st0x_raindex::{Raindex, RaindexError, RaindexService, RaindexVaultId, RevokeOutcome};
 
 use super::{
-    ErrorResponse, OpsError, UsdcDriverPauseRequest, answer_from_detached, ops_command_error,
-    ops_precondition_error, quiesce_usdc_driver, spawn_detached, usdc_resume_error_response,
+    ErrorResponse, OpsError, UsdcDriverPauseRequest, answer_from_detached,
+    cctp_source_chain_wire_name, ops_command_error, ops_precondition_error, quiesce_usdc_driver,
+    spawn_detached, usdc_resume_error_response,
 };
 use crate::AppState;
 use crate::cctp_burn::{
@@ -50,6 +51,7 @@ use crate::cctp_burn::{
     bot_cctp_bridge, burn_receipt_fate, record_burn_fate, scrubbed, settle_burn_from_receipt,
     signed_by_source_wallet, verify_burn_superseded,
 };
+use crate::operations_audit::{Audited, AuditedRequest};
 use crate::rebalancing::UsdcResumeError;
 use crate::usdc_rebalance::RebalanceDirection;
 
@@ -85,6 +87,18 @@ pub(super) struct TransferUsdcRequest {
     chain: Option<Chain>,
 }
 
+impl AuditedRequest for TransferUsdcRequest {
+    fn audit_targets(&self) -> Vec<String> {
+        let direction = match self.direction {
+            TransferDirectionWire::ToRaindex => "to-raindex",
+            TransferDirectionWire::ToAlpaca => "to-alpaca",
+        };
+        std::iter::once(direction.to_string())
+            .chain(self.chain.iter().map(ToString::to_string))
+            .collect()
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct TransferUsdcResponse {
@@ -105,6 +119,16 @@ pub(super) struct VaultRequest {
     amount: String,
 }
 
+impl AuditedRequest for VaultRequest {
+    fn audit_targets(&self) -> Vec<String> {
+        vec![
+            self.chain.to_string(),
+            self.token.to_string(),
+            self.vault_id.to_string(),
+        ]
+    }
+}
+
 /// Wire contract for the vault withdraw USDC route: the chain's settlement
 /// stable out of its first configured cash vault.
 #[derive(Deserialize)]
@@ -113,6 +137,12 @@ pub(super) struct VaultWithdrawUsdcRequest {
     chain: Chain,
     /// Decimal amount of the settlement stable; must be positive.
     amount: String,
+}
+
+impl AuditedRequest for VaultWithdrawUsdcRequest {
+    fn audit_targets(&self) -> Vec<String> {
+        vec![self.chain.to_string()]
+    }
 }
 
 #[derive(Serialize)]
@@ -155,6 +185,15 @@ pub(super) struct CctpBridgeRequest {
     all: bool,
 }
 
+impl AuditedRequest for CctpBridgeRequest {
+    fn audit_targets(&self) -> Vec<String> {
+        vec![
+            self.operation_id.to_string(),
+            cctp_source_chain_wire_name(self.from).to_string(),
+        ]
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct CctpBridgeResponse {
@@ -193,11 +232,26 @@ pub(super) struct CctpBurnSupersedeRequest {
     superseding_tx: TxHash,
 }
 
+impl AuditedRequest for CctpBurnSupersedeRequest {
+    fn audit_targets(&self) -> Vec<String> {
+        vec![
+            self.operation_id.to_string(),
+            self.superseding_tx.to_string(),
+        ]
+    }
+}
+
 /// Wire contract for the orderbook allowance reset route.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct ResetAllowanceRequest {
     chain: Chain,
+}
+
+impl AuditedRequest for ResetAllowanceRequest {
+    fn audit_targets(&self) -> Vec<String> {
+        vec![self.chain.to_string()]
+    }
 }
 
 #[derive(Serialize)]
@@ -232,7 +286,7 @@ pub(super) struct ResetAllowanceResponse {
 /// the trigger start a second transfer on the corridor.
 pub(super) async fn transfer_usdc(
     State(state): State<AppState>,
-    Json(request): Json<TransferUsdcRequest>,
+    Audited(request): Audited<TransferUsdcRequest>,
 ) -> Result<Json<TransferUsdcResponse>, (StatusCode, Json<ErrorResponse>)> {
     let wire_direction = request.direction;
     let direction = RebalanceDirection::from(wire_direction);
@@ -291,7 +345,7 @@ pub(super) async fn transfer_usdc(
 /// `st0x-cli vault-deposit`.
 pub(super) async fn vault_deposit(
     State(state): State<AppState>,
-    Json(request): Json<VaultRequest>,
+    Audited(request): Audited<VaultRequest>,
 ) -> Result<Json<VaultDepositResponse>, (StatusCode, Json<ErrorResponse>)> {
     let VaultRequest {
         chain,
@@ -336,7 +390,7 @@ pub(super) async fn vault_deposit(
 /// the bot's wallet there. Mirrors `st0x-cli vault-withdraw`.
 pub(super) async fn vault_withdraw(
     State(state): State<AppState>,
-    Json(request): Json<VaultRequest>,
+    Audited(request): Audited<VaultRequest>,
 ) -> Result<Json<VaultWithdrawResponse>, (StatusCode, Json<ErrorResponse>)> {
     let VaultRequest {
         chain,
@@ -382,7 +436,7 @@ pub(super) async fn vault_withdraw(
 /// token and vault the same way and then runs the plain vault withdraw.
 pub(super) async fn vault_withdraw_usdc(
     State(state): State<AppState>,
-    Json(request): Json<VaultWithdrawUsdcRequest>,
+    Audited(request): Audited<VaultWithdrawUsdcRequest>,
 ) -> Result<Json<VaultWithdrawResponse>, (StatusCode, Json<ErrorResponse>)> {
     let VaultWithdrawUsdcRequest { chain, amount } = request;
     let amount = positive_amount(&amount, std::convert::identity)?;
@@ -466,7 +520,7 @@ pub(super) async fn vault_withdraw_usdc(
 /// burn's own receipt proves.
 pub(super) async fn cctp_bridge(
     State(state): State<AppState>,
-    Json(request): Json<CctpBridgeRequest>,
+    Audited(request): Audited<CctpBridgeRequest>,
 ) -> Result<Json<CctpBridgeResponse>, (StatusCode, Json<ErrorResponse>)> {
     let requested = burn_amount(request.amount.as_deref(), request.all)?;
     let operation_id = request.operation_id;
@@ -1040,7 +1094,7 @@ async fn confirm_recorded_burn(
 /// instead, and a settled one releases the nonce again (idempotent).
 pub(super) async fn cctp_burn_supersede(
     State(state): State<AppState>,
-    Json(request): Json<CctpBurnSupersedeRequest>,
+    Audited(request): Audited<CctpBurnSupersedeRequest>,
 ) -> Result<Json<CctpBridgeResponse>, OpsError> {
     let CctpBurnSupersedeRequest {
         operation_id,
@@ -1143,7 +1197,7 @@ pub(super) async fn cctp_burn_supersede(
 /// on the detached task.
 pub(super) async fn reset_allowance(
     State(state): State<AppState>,
-    Json(request): Json<ResetAllowanceRequest>,
+    Audited(request): Audited<ResetAllowanceRequest>,
 ) -> Result<Json<ResetAllowanceResponse>, (StatusCode, Json<ErrorResponse>)> {
     let ResetAllowanceRequest { chain } = request;
     let (trading, wallet) = hedged_chain_signer(&state, chain)?;
@@ -1605,6 +1659,40 @@ mod tests {
             emitted_logs: succeeded,
             confirmations,
         }
+    }
+
+    /// The audit record names what a body-only capital route acted on, from
+    /// the wire body the CLI sends; extra fields never reach it.
+    #[test]
+    fn capital_bodies_name_their_audit_targets() {
+        let vault: VaultRequest = serde_json::from_value(serde_json::json!({
+            "chain": "base",
+            "token": "0x1111111111111111111111111111111111111111",
+            "vaultId": format!("0x{}", "22".repeat(32)),
+            "amount": "1",
+            "vault_id": "forged alias",
+        }))
+        .unwrap();
+        assert_eq!(
+            vault.audit_targets(),
+            [
+                "base".to_string(),
+                "0x1111111111111111111111111111111111111111".to_string(),
+                format!("0x{}", "22".repeat(32)),
+            ]
+        );
+        assert_eq!(vault.audit_reason(), None);
+
+        let bridge: CctpBridgeRequest = serde_json::from_value(serde_json::json!({
+            "operationId": "33333333-3333-3333-3333-333333333333",
+            "from": "ethereum",
+            "all": true,
+        }))
+        .unwrap();
+        assert_eq!(
+            bridge.audit_targets(),
+            ["33333333-3333-3333-3333-333333333333", "ethereum"]
+        );
     }
 
     fn dropped() -> RaindexError {

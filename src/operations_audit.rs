@@ -1,21 +1,19 @@
 //! Shared structured audit records for mutation-capable operator routes.
 
-use std::error::Error as _;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use axum::Json;
-use axum::body::{Body, to_bytes};
-use axum::extract::{MatchedPath, Request};
+use axum::extract::{FromRequest, FromRequestParts, MatchedPath, Query, Request};
+use axum::http::request::Parts;
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use chrono::{SecondsFormat, Utc};
 use futures_util::FutureExt;
-use http_body_util::LengthLimitError;
 use parking_lot::Mutex;
 use percent_encoding::percent_decode_str;
-use serde_json::Value;
+use serde::de::DeserializeOwned;
 use tokio_util::task::TaskTracker;
 use tracing::{Level, error, info, warn};
 use uuid::Uuid;
@@ -25,7 +23,6 @@ use crate::api::spawn_detached;
 const AUDIT_SCHEMA: &str = "st0x.operations.audit.v1";
 const SERVICE: &str = "liquidity";
 const REQUEST_ID_HEADER: &str = "x-request-id";
-const BODY_LIMIT: usize = 2 * 1024 * 1024;
 const TARGET_VALUE_LIMIT: usize = 256;
 const REASON_LIMIT: usize = 1024;
 const UNAUTHENTICATED: &str = "unauthenticated";
@@ -51,11 +48,18 @@ struct AuditContextInner {
     role: &'static str,
     route: String,
     path: String,
-    principal: Mutex<String>,
-    targets: Mutex<Vec<String>>,
-    reason: Mutex<String>,
+    mutable: Mutex<AuditMutable>,
     #[cfg(test)]
     completion: Option<AuditCompletionSignal>,
+}
+
+/// What authentication and extraction learn after the context is created,
+/// behind one lock so no accessor depends on a lock order.
+#[derive(Debug)]
+struct AuditMutable {
+    principal: String,
+    targets: Vec<String>,
+    reason: String,
 }
 
 impl OperationsAuditContext {
@@ -77,9 +81,11 @@ impl OperationsAuditContext {
                 role,
                 route,
                 path: request.uri().path().to_string(),
-                principal: Mutex::new(principal.to_string()),
-                targets: Mutex::new(Vec::new()),
-                reason: Mutex::new(NOT_PROVIDED.to_string()),
+                mutable: Mutex::new(AuditMutable {
+                    principal: principal.to_string(),
+                    targets: Vec::new(),
+                    reason: NOT_PROVIDED.to_string(),
+                }),
                 #[cfg(test)]
                 completion: request.extensions().get::<AuditCompletionSignal>().cloned(),
             }),
@@ -87,7 +93,7 @@ impl OperationsAuditContext {
     }
 
     fn set_principal(&self, principal: impl Into<String>) {
-        *self.inner.principal.lock() = principal.into();
+        self.inner.mutable.lock().principal = principal.into();
     }
 
     fn capture_path_targets(&self) -> Result<(), AuditValueError> {
@@ -95,50 +101,52 @@ impl OperationsAuditContext {
         for target in &targets {
             validate_audit_value("path parameter", target, TARGET_VALUE_LIMIT)?;
         }
-        *self.inner.targets.lock() = targets;
+        self.inner.mutable.lock().targets = targets;
         Ok(())
     }
 
-    /// Captures the route's audited body fields. A non-empty body that does not
-    /// parse as JSON is refused on a route with audited fields: the typed
-    /// extractor accepts some bodies this parse rejects (it skips unknown
-    /// fields without serde_json's recursion limit), and the command must not
-    /// run with its reason and targets unrecorded.
-    fn capture_body(&self, bytes: &[u8]) -> Result<(), AuditValueError> {
-        let fields = audit_body_fields(&self.inner.route);
-        if bytes.is_empty() || (fields.targets.is_empty() && !fields.reason) {
-            return Ok(());
+    /// Records the identity a parsed request declares, after the path
+    /// targets. Every value is checked before any is recorded, so a refused
+    /// request leaves only its path targets.
+    fn record_request_identity(
+        &self,
+        request: &impl AuditedRequest,
+    ) -> Result<(), AuditValueError> {
+        let targets = request.audit_targets();
+        for target in &targets {
+            validate_audit_value("target", target, TARGET_VALUE_LIMIT)?;
         }
-        let body =
-            serde_json::from_slice::<Value>(bytes).map_err(|_| AuditValueError::UnparseableBody)?;
-        let metadata = audit_body_metadata(&self.inner.route, &body)?;
-        let mut targets = self.inner.targets.lock();
-        for target in metadata.targets {
-            if !targets.contains(&target) {
-                targets.push(target);
+        let reason = request.audit_reason();
+        if let Some(reason) = reason {
+            validate_audit_value("reason", reason, REASON_LIMIT)?;
+        }
+
+        let mut mutable = self.inner.mutable.lock();
+        for target in targets {
+            if !mutable.targets.contains(&target) {
+                mutable.targets.push(target);
             }
         }
-        drop(targets);
-
-        if let Some(reason) = metadata.reason {
-            *self.inner.reason.lock() = reason;
+        if let Some(reason) = reason {
+            mutable.reason = reason.to_string();
         }
+        drop(mutable);
         Ok(())
     }
 
     fn event(&self, status: StatusCode) -> OperationsAuditEvent {
-        let targets = self.inner.targets.lock();
+        let mutable = self.inner.mutable.lock();
         OperationsAuditEvent {
-            principal: self.inner.principal.lock().clone(),
+            principal: mutable.principal.clone(),
             role: self.inner.role,
             route: self.inner.route.clone(),
             request_id: self.inner.request_id,
-            target_id: if targets.is_empty() {
+            target_id: if mutable.targets.is_empty() {
                 NOT_IDENTIFIED.to_string()
             } else {
-                targets.join(":")
+                mutable.targets.join(":")
             },
-            reason: self.inner.reason.lock().clone(),
+            reason: mutable.reason.clone(),
             outcome: AuditOutcome::from_status(status),
             timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         }
@@ -344,78 +352,109 @@ pub(crate) async fn audit_request(
         Err(refusal) => return finalize_response(&context, refusal.into_response()),
     };
 
-    match completion.await {
-        Ok(response) => response,
-        Err(failure) => {
-            error!(
-                target: "operational_alert",
-                alert = true,
-                audit_schema = AUDIT_SCHEMA,
-                service = SERVICE,
-                role,
-                request_id = %context.inner.request_id,
-                "Audited operator command task failed"
-            );
-            finalize_response(&context, failure.into_response())
-        }
+    // The join error's text can carry a panic payload, so the caller gets the
+    // same generic body as a handler panic.
+    if let Ok(response) = completion.await {
+        response
+    } else {
+        error!(
+            target: "operational_alert",
+            alert = true,
+            audit_schema = AUDIT_SCHEMA,
+            service = SERVICE,
+            role,
+            request_id = %context.inner.request_id,
+            "Audited operator command task failed"
+        );
+        let response = (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "operator command failed" })),
+        )
+            .into_response();
+        finalize_response(&context, response)
     }
 }
 
-/// Captures only route-specific canonical audit identifiers from the JSON body
-/// after the caller has passed its authentication gate, then reconstructs the
-/// body unchanged for the route extractor.
-pub(crate) async fn capture_request_body(request: Request, next: Next) -> Response {
-    let context = request
-        .extensions()
-        .get::<OperationsAuditContext>()
-        .cloned();
-    if let Some(context) = &context
+/// Captures the route's path values as audit targets once the caller has
+/// passed its authentication gate. Identifiers in the body or query are
+/// recorded by [`Audited`] and [`AuditedQuery`] after they parse.
+pub(crate) async fn capture_audit_path_targets(request: Request, next: Next) -> Response {
+    if let Some(context) = request.extensions().get::<OperationsAuditContext>()
         && let Err(error) = context.capture_path_targets()
     {
         return audit_value_error_response(&error);
     }
 
-    let (parts, body) = request.into_parts();
-    let bytes = match to_bytes(body, BODY_LIMIT).await {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            let length_limited = error
-                .source()
-                .is_some_and(<dyn std::error::Error>::is::<LengthLimitError>);
-            if length_limited {
-                warn!(
-                    target: "api",
-                    %error,
-                    "Operations audit request body exceeded limit"
-                );
-                return (
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    Json(serde_json::json!({ "error": "request body exceeds limit" })),
-                )
-                    .into_response();
-            }
+    next.run(request).await
+}
 
-            warn!(
-                target: "api",
-                %error,
-                "Operations audit request body stream failed"
-            );
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "failed to read request body" })),
-            )
-                .into_response();
-        }
-    };
-
-    if let Some(context) = context
-        && let Err(error) = context.capture_body(&bytes)
-    {
-        return audit_value_error_response(&error);
+/// Entity identifiers and reason a mutation's typed request carries. Read
+/// only after the request parsed, so a field the command does not declare
+/// never reaches the audit record.
+pub(crate) trait AuditedRequest {
+    /// Identifiers the request names beyond the route's path parameters.
+    fn audit_targets(&self) -> Vec<String> {
+        Vec::new()
     }
 
-    next.run(Request::from_parts(parts, Body::from(bytes)))
-        .await
+    /// The operator's stated reason, when the command takes one.
+    fn audit_reason(&self) -> Option<&str> {
+        None
+    }
+}
+
+/// JSON extractor for audited mutation routes. Parses exactly like [`Json`]
+/// (same limit, same rejections), then records the body's
+/// [`AuditedRequest`] identity for the request's audit event. An identifier
+/// or reason over its size limit is refused with 400 before the handler runs.
+pub(crate) struct Audited<T>(pub(crate) T);
+
+impl<T, State> FromRequest<State> for Audited<T>
+where
+    T: DeserializeOwned + AuditedRequest,
+    State: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(request: Request, state: &State) -> Result<Self, Self::Rejection> {
+        let context = request
+            .extensions()
+            .get::<OperationsAuditContext>()
+            .cloned();
+        let Json(body) = Json::<T>::from_request(request, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        if let Some(context) = context {
+            context
+                .record_request_identity(&body)
+                .map_err(|error| audit_value_error_response(&error))?;
+        }
+        Ok(Self(body))
+    }
+}
+
+/// [`Audited`] for a query string: parses exactly like [`Query`], then
+/// records the query's [`AuditedRequest`] identity.
+pub(crate) struct AuditedQuery<T>(pub(crate) T);
+
+impl<T, State> FromRequestParts<State> for AuditedQuery<T>
+where
+    T: DeserializeOwned + AuditedRequest,
+    State: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &State) -> Result<Self, Self::Rejection> {
+        let Query(query) = Query::<T>::from_request_parts(parts, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        if let Some(context) = parts.extensions.get::<OperationsAuditContext>() {
+            context
+                .record_request_identity(&query)
+                .map_err(|error| audit_value_error_response(&error))?;
+        }
+        Ok(Self(query))
+    }
 }
 
 pub(crate) fn set_audit_route_template(request: &mut Request, route: &'static str) {
@@ -437,18 +476,6 @@ fn request_id(request: &Request) -> Uuid {
         .unwrap_or_else(Uuid::new_v4)
 }
 
-#[derive(Clone, Copy)]
-struct AuditBodyFields {
-    targets: &'static [&'static str],
-    reason: bool,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct AuditBodyMetadata {
-    targets: Vec<String>,
-    reason: Option<String>,
-}
-
 #[derive(Debug, PartialEq, Eq)]
 enum AuditValueError {
     TooLong {
@@ -456,108 +483,6 @@ enum AuditValueError {
         max_bytes: usize,
     },
     InvalidPathUtf8,
-    UnparseableBody,
-}
-
-fn audit_body_fields(route: &str) -> AuditBodyFields {
-    let no_fields = AuditBodyFields {
-        targets: &[],
-        reason: false,
-    };
-    match route {
-        "/liquidity-write/transfers/fail/{kind}/{id}"
-        | "/transfers/fail/{kind}/{id}"
-        | "/liquidity-write/transfers/usdc/{id}/clear-pending-burn"
-        | "/liquidity-write/transfers/usdc/{id}/fail"
-        | "/liquidity-write/positions/{symbol}/set" => AuditBodyFields {
-            targets: &[],
-            reason: true,
-        },
-        "/liquidity-write/transfers/usdc/{id}/reconcile"
-        | "/liquidity-write/transfers/{kind}/{id}/reconcile" => AuditBodyFields {
-            targets: &["supersedingTx"],
-            reason: true,
-        },
-        "/liquidity-write/transfers/equity_redemption/{id}/adopt-withdrawal" => AuditBodyFields {
-            targets: &["replacementTx"],
-            reason: true,
-        },
-        "/liquidity-write/positions/{symbol}/release-hedge" => AuditBodyFields {
-            targets: &["order_id"],
-            reason: true,
-        },
-        "/liquidity-write/portfolio-snapshot/marks" => AuditBodyFields {
-            targets: &["day", "symbol"],
-            reason: true,
-        },
-        "/liquidity-write/views/{view}/rebuild" => AuditBodyFields {
-            targets: &["id"],
-            reason: false,
-        },
-        "/liquidity-write/cctp/complete-mint" => AuditBodyFields {
-            targets: &["burnTx", "sourceChain"],
-            reason: false,
-        },
-        "/liquidity-write/capital/transfer-usdc" => AuditBodyFields {
-            targets: &["direction", "chain"],
-            reason: false,
-        },
-        "/liquidity-write/capital/vault-deposit" | "/liquidity-write/capital/vault-withdraw" => {
-            AuditBodyFields {
-                targets: &["chain", "token", "vaultId"],
-                reason: false,
-            }
-        }
-        "/liquidity-write/capital/vault-withdraw-usdc"
-        | "/liquidity-write/capital/reset-allowance" => AuditBodyFields {
-            targets: &["chain"],
-            reason: false,
-        },
-        "/liquidity-write/capital/cctp-bridge" => AuditBodyFields {
-            targets: &["operationId", "from"],
-            reason: false,
-        },
-        "/liquidity-write/capital/cctp-burn-supersede" => AuditBodyFields {
-            targets: &["operationId", "supersedingTx"],
-            reason: false,
-        },
-        _ => no_fields,
-    }
-}
-
-fn audit_body_metadata(route: &str, body: &Value) -> Result<AuditBodyMetadata, AuditValueError> {
-    let fields = audit_body_fields(route);
-    let Some(object) = body.as_object() else {
-        return Ok(AuditBodyMetadata {
-            targets: Vec::new(),
-            reason: None,
-        });
-    };
-
-    let mut targets = Vec::with_capacity(fields.targets.len());
-    for &field in fields.targets {
-        if let Some(value) = object.get(field).and_then(Value::as_str) {
-            validate_audit_value(field, value, TARGET_VALUE_LIMIT)?;
-            if !targets.iter().any(|target| target == value) {
-                targets.push(value.to_string());
-            }
-        }
-    }
-
-    let reason = if fields.reason {
-        object
-            .get("reason")
-            .and_then(Value::as_str)
-            .map(|reason| {
-                validate_audit_value("reason", reason, REASON_LIMIT)?;
-                Ok(reason.to_string())
-            })
-            .transpose()?
-    } else {
-        None
-    };
-
-    Ok(AuditBodyMetadata { targets, reason })
 }
 
 fn validate_audit_value(
@@ -589,13 +514,6 @@ fn audit_value_error_response(error: &AuditValueError) -> Response {
                 "Operations audit path parameter is not valid UTF-8"
             );
             "audit path parameter is not valid UTF-8".to_string()
-        }
-        AuditValueError::UnparseableBody => {
-            warn!(
-                target: "api",
-                "Operations audit request body is not parseable JSON"
-            );
-            "request body is not parseable JSON".to_string()
         }
     };
     (
@@ -633,13 +551,14 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
-    use axum::body::{Body, Bytes, to_bytes};
+    use axum::Router;
+    use axum::body::{Body, to_bytes};
     use axum::extract::{Path, Request};
     use axum::http::{Request as HttpRequest, StatusCode};
     use axum::middleware::Next;
     use axum::response::{IntoResponse, Response};
     use axum::routing::post;
-    use axum::{Json, Router};
+    use serde::Deserialize;
     use serde_json::Value;
     use tokio::sync::Notify;
     use tokio_util::task::TaskTracker;
@@ -650,10 +569,10 @@ mod tests {
     use uuid::uuid;
 
     use super::{
-        AuditBodyMetadata, AuditCompletionSignal, AuditOutcome, AuditRecordError, AuditValueError,
-        BODY_LIMIT, LogOperationsAuditRecorder, OperationsAuditEvent, OperationsAuditRecorder,
-        REASON_LIMIT, TARGET_VALUE_LIMIT, audit_body_metadata, audit_request, capture_request_body,
-        dynamic_path_values, record_principal, record_with,
+        AuditCompletionSignal, AuditOutcome, AuditRecordError, AuditValueError, Audited,
+        AuditedQuery, AuditedRequest, LogOperationsAuditRecorder, OperationsAuditEvent,
+        OperationsAuditRecorder, REASON_LIMIT, TARGET_VALUE_LIMIT, audit_request,
+        capture_audit_path_targets, dynamic_path_values, record_principal, record_with,
     };
 
     struct FailingRecorder;
@@ -698,99 +617,6 @@ mod tests {
     }
 
     #[test]
-    fn target_is_composed_from_path_and_canonical_body_identifiers() {
-        let path_targets = dynamic_path_values(
-            "/liquidity-write/transfers/{kind}/{id}/reconcile",
-            "/liquidity-write/transfers/mint/mint-9/reconcile",
-        )
-        .unwrap();
-        let body = audit_body_metadata(
-            "/liquidity-write/transfers/{kind}/{id}/reconcile",
-            &serde_json::json!({
-                "supersedingTx": "0x1234",
-                "reason": "incident 42"
-            }),
-        )
-        .unwrap();
-
-        assert_eq!(path_targets, ["mint", "mint-9"]);
-        assert_eq!(body.targets, ["0x1234"]);
-        assert_eq!(body.reason.as_deref(), Some("incident 42"));
-    }
-
-    #[test]
-    fn nested_and_alias_fields_cannot_forge_audit_metadata() {
-        let body = audit_body_metadata(
-            "/liquidity-write/transfers/{kind}/{id}/reconcile",
-            &serde_json::json!({
-                "audit_reason": "forged snake alias",
-                "auditReason": "forged alias",
-                "superseding_tx": "forged alias",
-                "nested": {
-                    "reason": "forged nested",
-                    "supersedingTx": "forged nested"
-                }
-            }),
-        )
-        .unwrap();
-
-        assert_eq!(
-            body,
-            AuditBodyMetadata {
-                targets: Vec::new(),
-                reason: None,
-            }
-        );
-    }
-
-    #[test]
-    fn body_only_routes_identify_their_canonical_targets() {
-        let cctp = audit_body_metadata(
-            "/liquidity-write/cctp/complete-mint",
-            &serde_json::json!({
-                "burnTx": "0xburn",
-                "sourceChain": "base",
-                "burn_tx": "forged"
-            }),
-        )
-        .unwrap();
-        assert_eq!(cctp.targets, ["0xburn", "base"]);
-
-        let capital = audit_body_metadata(
-            "/liquidity-write/capital/vault-deposit",
-            &serde_json::json!({
-                "chain": "base",
-                "token": "0xtoken",
-                "vaultId": "0xvault"
-            }),
-        )
-        .unwrap();
-        assert_eq!(capital.targets, ["base", "0xtoken", "0xvault"]);
-
-        let position = audit_body_metadata(
-            "/liquidity-write/positions/{symbol}/release-hedge",
-            &serde_json::json!({
-                "order_id": "order-1",
-                "orderId": "forged alias",
-                "reason": "incident 42"
-            }),
-        )
-        .unwrap();
-        assert_eq!(position.targets, ["order-1"]);
-
-        let mark = audit_body_metadata(
-            "/liquidity-write/portfolio-snapshot/marks",
-            &serde_json::json!({
-                "day": "2026-10-09",
-                "symbol": "AAPL",
-                "reason": "correct close"
-            }),
-        )
-        .unwrap();
-        assert_eq!(mark.targets, ["2026-10-09", "AAPL"]);
-    }
-
-    #[test]
     fn wildcard_paths_do_not_create_raw_uri_cardinality() {
         assert_eq!(
             dynamic_path_values(
@@ -818,40 +644,6 @@ mod tests {
                 "/liquidity-write/positions/%FF/set"
             ),
             Err(AuditValueError::InvalidPathUtf8)
-        );
-    }
-
-    #[test]
-    fn audit_body_values_have_explicit_size_limits() {
-        let oversized_reason = "r".repeat(REASON_LIMIT + 1);
-        let reason_error = audit_body_metadata(
-            "/liquidity-write/transfers/fail/{kind}/{id}",
-            &serde_json::json!({ "reason": oversized_reason }),
-        )
-        .unwrap_err();
-        assert_eq!(
-            reason_error,
-            AuditValueError::TooLong {
-                field: "reason",
-                max_bytes: REASON_LIMIT,
-            }
-        );
-
-        let oversized_target = "t".repeat(TARGET_VALUE_LIMIT + 1);
-        let target_error = audit_body_metadata(
-            "/liquidity-write/cctp/complete-mint",
-            &serde_json::json!({
-                "burnTx": oversized_target,
-                "sourceChain": "base"
-            }),
-        )
-        .unwrap_err();
-        assert_eq!(
-            target_error,
-            AuditValueError::TooLong {
-                field: "burnTx",
-                max_bytes: TARGET_VALUE_LIMIT,
-            }
         );
     }
 
@@ -902,9 +694,40 @@ mod tests {
         next.run(request).await
     }
 
+    /// A typed reconcile body: `supersedingTx` is its identifier and `reason`
+    /// its audit reason. Serde ignores every other field.
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ReconcileCommand {
+        superseding_tx: Option<String>,
+        reason: Option<String>,
+    }
+
+    impl AuditedRequest for ReconcileCommand {
+        fn audit_targets(&self) -> Vec<String> {
+            self.superseding_tx.iter().cloned().collect()
+        }
+
+        fn audit_reason(&self) -> Option<&str> {
+            self.reason.as_deref()
+        }
+    }
+
+    /// A typed recheck query: the operator asserts `deposit_tx`.
+    #[derive(Deserialize)]
+    struct RecheckProbe {
+        deposit_tx: Option<String>,
+    }
+
+    impl AuditedRequest for RecheckProbe {
+        fn audit_targets(&self) -> Vec<String> {
+            self.deposit_tx.iter().cloned().collect()
+        }
+    }
+
     async fn command(
         Path((kind, _id)): Path<(String, String)>,
-        Json(_body): Json<Value>,
+        Audited(_body): Audited<ReconcileCommand>,
     ) -> StatusCode {
         if kind == "failure" {
             StatusCode::INTERNAL_SERVER_ERROR
@@ -915,6 +738,20 @@ mod tests {
 
     async fn panicking_command() -> StatusCode {
         panic!("simulated handler panic");
+    }
+
+    /// Dropping this panic payload panics again, outside the command's unwind
+    /// guard, so the audited task itself fails to join.
+    struct PanicsWhenDropped;
+
+    impl Drop for PanicsWhenDropped {
+        fn drop(&mut self) {
+            panic!("secret panic payload");
+        }
+    }
+
+    async fn panic_escaping_the_unwind_guard() -> StatusCode {
+        std::panic::panic_any(PanicsWhenDropped);
     }
 
     async fn wait_then_panic(started: Arc<Notify>, release: Arc<Notify>) -> StatusCode {
@@ -935,7 +772,7 @@ mod tests {
 
     fn with_tracked_audit_layers(router: Router, detached_tasks: TaskTracker) -> Router {
         router
-            .layer(axum::middleware::from_fn(capture_request_body))
+            .layer(axum::middleware::from_fn(capture_audit_path_targets))
             .layer(axum::middleware::from_fn(test_authentication))
             .layer(axum::middleware::from_fn(move |request, next| {
                 let detached_tasks = detached_tasks.clone();
@@ -1106,13 +943,14 @@ mod tests {
         });
     }
 
+    #[traced_test]
     #[tokio::test]
-    async fn oversized_audit_value_is_rejected_before_the_handler() {
+    async fn oversized_identifier_or_reason_is_refused_before_the_handler() {
         let called = Arc::new(AtomicBool::new(false));
         let handler_called = Arc::clone(&called);
         let app = with_audit_layers(Router::new().route(
-            "/liquidity-write/positions/{symbol}/release-hedge",
-            post(move |Json(_body): Json<Value>| {
+            "/liquidity-write/transfers/{kind}/{id}/reconcile",
+            post(move |Audited(_body): Audited<ReconcileCommand>| {
                 let called = Arc::clone(&handler_called);
                 async move {
                     called.store(true, Ordering::SeqCst);
@@ -1120,52 +958,171 @@ mod tests {
                 }
             }),
         ));
+        let cases = [
+            (
+                "55555555-5555-5555-5555-555555555555",
+                serde_json::json!({
+                    "supersedingTx": "x".repeat(TARGET_VALUE_LIMIT + 1),
+                    "reason": "incident 42"
+                }),
+                format!("audit field `target` exceeds {TARGET_VALUE_LIMIT} bytes"),
+            ),
+            (
+                "56565656-5656-5656-5656-565656565656",
+                serde_json::json!({
+                    "supersedingTx": "op-1",
+                    "reason": "r".repeat(REASON_LIMIT + 1)
+                }),
+                format!("audit field `reason` exceeds {REASON_LIMIT} bytes"),
+            ),
+        ];
+
+        for (request_id, body, expected_error) in &cases {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    "/liquidity-write/transfers/mint/mint-9/reconcile",
+                    request_id,
+                    Some("accounts.google.com:1234"),
+                    &body.to_string(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{request_id}");
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body, serde_json::json!({ "error": expected_error }));
+        }
+        assert!(!called.load(Ordering::SeqCst), "the handler must not run");
+
+        logs_assert(|lines| {
+            for (request_id, _, _) in &cases {
+                let recorded = lines.iter().any(|line| {
+                    line.contains("operations_audit: Operations audit event")
+                        && line.contains(request_id)
+                        && line.contains("target_id=\"mint:mint-9\"")
+                        && line.contains("reason=\"not_provided\"")
+                        && line.contains("outcome=\"validation_failure\"")
+                });
+                if !recorded {
+                    return Err(format!(
+                        "refused request {request_id} must record only its path: {lines:?}"
+                    ));
+                }
+            }
+            Ok(())
+        });
+    }
+
+    /// Only the identity the typed request declares reaches the record: a
+    /// snake-case alias, an undeclared field, and a nested copy of a declared
+    /// field are parsed past and never recorded.
+    #[traced_test]
+    #[tokio::test]
+    async fn undeclared_aliased_and_nested_fields_never_reach_the_record() {
+        let request_id = "13131313-1313-1313-1313-131313131313";
         let body = serde_json::json!({
-            "order_id": "x".repeat(TARGET_VALUE_LIMIT + 1),
-            "reason": "incident 42"
+            "reason": "incident 42",
+            "superseding_tx": "forged-alias",
+            "auditReason": "forged-alias",
+            "orderId": "forged-undeclared",
+            "nested": {
+                "reason": "forged-nested",
+                "supersedingTx": "forged-nested"
+            }
         })
         .to_string();
 
-        let response = app
-            .clone()
+        let response = audited_router()
             .oneshot(request(
-                "/liquidity-write/positions/AAPL/release-hedge",
-                "55555555-5555-5555-5555-555555555555",
+                "/liquidity-write/transfers/success/widget-1/reconcile",
+                request_id,
                 Some("accounts.google.com:1234"),
                 &body,
             ))
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(!called.load(Ordering::SeqCst));
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            body,
-            serde_json::json!({
-                "error": format!(
-                    "audit field `order_id` exceeds {TARGET_VALUE_LIMIT} bytes"
-                )
-            })
-        );
+        logs_assert(|lines| {
+            let records: Vec<_> = lines
+                .iter()
+                .filter(|line| {
+                    line.contains("operations_audit: Operations audit event")
+                        && line.contains(request_id)
+                })
+                .collect();
+            match records.as_slice() {
+                [record]
+                    if record.contains("target_id=\"success:widget-1\"")
+                        && record.contains("reason=\"incident 42\"")
+                        && !record.contains("forged") =>
+                {
+                    Ok(())
+                }
+                _ => Err(format!(
+                    "expected one record of the declared identity: {lines:?}"
+                )),
+            }
+        });
+    }
 
-        let oversized_reason = serde_json::json!({
-            "order_id": "order-1",
-            "reason": "r".repeat(REASON_LIMIT + 1)
-        })
-        .to_string();
-        let response = app
+    #[traced_test]
+    #[tokio::test]
+    async fn query_identifier_is_recorded_as_a_target() {
+        let called = Arc::new(AtomicBool::new(false));
+        let handler_called = Arc::clone(&called);
+        let app = with_audit_layers(Router::new().route(
+            "/liquidity-write/transfers/recheck/{kind}/{id}",
+            post(move |AuditedQuery(_query): AuditedQuery<RecheckProbe>| {
+                let called = Arc::clone(&handler_called);
+                async move {
+                    called.store(true, Ordering::SeqCst);
+                    StatusCode::OK
+                }
+            }),
+        ));
+
+        let oversized = app
+            .clone()
             .oneshot(request(
-                "/liquidity-write/positions/AAPL/release-hedge",
-                "56565656-5656-5656-5656-565656565656",
+                &format!(
+                    "/liquidity-write/transfers/recheck/usdc_deposit/transfer-1?deposit_tx={}",
+                    "d".repeat(TARGET_VALUE_LIMIT + 1)
+                ),
+                "14141414-1414-1414-1414-141414141414",
                 Some("accounts.google.com:1234"),
-                &oversized_reason,
+                "",
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(!called.load(Ordering::SeqCst));
+        assert_eq!(oversized.status(), StatusCode::BAD_REQUEST);
+        assert!(!called.load(Ordering::SeqCst), "the handler must not run");
+
+        let request_id = "15151515-1515-1515-1515-151515151515";
+        let response = app
+            .oneshot(request(
+                "/liquidity-write/transfers/recheck/usdc_deposit/transfer-1?deposit_tx=0xabc",
+                request_id,
+                Some("accounts.google.com:1234"),
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        logs_assert(|lines| {
+            lines
+                .iter()
+                .any(|line| {
+                    line.contains("operations_audit: Operations audit event")
+                        && line.contains(request_id)
+                        && line.contains("target_id=\"usdc_deposit:transfer-1:0xabc\"")
+                        && line.contains("outcome=\"success\"")
+                })
+                .then_some(())
+                .ok_or_else(|| format!("missing query target in the audit: {lines:?}"))
+        });
     }
 
     #[traced_test]
@@ -1247,39 +1204,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn length_limit_and_body_stream_failures_have_distinct_statuses() {
-        let app = audited_router();
-        let too_large = request(
-            "/liquidity-write/transfers/success/widget/reconcile",
-            "66666666-6666-6666-6666-666666666666",
-            Some("accounts.google.com:1234"),
-            &"x".repeat(BODY_LIMIT + 1),
-        );
-        let response = app.clone().oneshot(too_large).await.unwrap();
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-
-        let stream = futures_util::stream::once(async {
-            Err::<Bytes, std::io::Error>(std::io::Error::other("stream failed"))
-        });
-        let failed_stream = HttpRequest::builder()
-            .method("POST")
-            .uri("/liquidity-write/transfers/success/widget/reconcile")
-            .header("content-type", "application/json")
-            .header("x-request-id", "77777777-7777-7777-7777-777777777777")
-            .header("x-test-principal", "accounts.google.com:1234")
-            .body(Body::from_stream(stream))
-            .unwrap();
-        let response = app.oneshot(failed_stream).await.unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            body,
-            serde_json::json!({ "error": "failed to read request body" })
-        );
-    }
-
     #[traced_test]
     #[tokio::test]
     async fn handler_task_failure_returns_and_audits_one_command_failure() {
@@ -1313,6 +1237,58 @@ mod tests {
             } else {
                 Err(format!(
                     "expected one command-failure audit, found {count}: {lines:?}"
+                ))
+            }
+        });
+    }
+
+    /// A join error's text carries the task's panic payload, so a failed join
+    /// answers with the same generic body as a handler panic.
+    #[traced_test]
+    #[tokio::test]
+    async fn task_join_failure_answers_with_the_generic_body() {
+        let app = with_audit_layers(Router::new().route(
+            "/liquidity-write/escaping-panic",
+            post(panic_escaping_the_unwind_guard),
+        ));
+        let request_id = "16161616-1616-1616-1616-161616161616";
+        let response = app
+            .oneshot(request(
+                "/liquidity-write/escaping-panic",
+                request_id,
+                Some("accounts.google.com:1234"),
+                "{}",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.headers().get("x-request-id").unwrap(), request_id);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({ "error": "operator command failed" })
+        );
+
+        logs_assert(|lines| {
+            let alerted = lines.iter().any(|line| {
+                line.contains("operational_alert: Audited operator command task failed")
+                    && line.contains(request_id)
+            });
+            let audits = lines
+                .iter()
+                .filter(|line| {
+                    line.contains("operations_audit: Operations audit event")
+                        && line.contains(request_id)
+                        && line.contains("outcome=\"command_failure\"")
+                })
+                .count();
+            if alerted && audits == 1 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected the task-failure alert and one command-failure audit: {lines:?}"
                 ))
             }
         });
@@ -1512,56 +1488,6 @@ mod tests {
                 }
             }
             Ok(())
-        });
-    }
-
-    /// The typed extractor skips unknown fields without serde_json's recursion
-    /// limit, so a body this parse rejects could otherwise run the command with
-    /// its reason unrecorded. Such a body is refused before the handler.
-    #[traced_test]
-    #[tokio::test]
-    async fn unparseable_body_on_an_audited_route_is_refused_before_the_handler() {
-        let called = Arc::new(AtomicBool::new(false));
-        let handler_called = Arc::clone(&called);
-        let app = with_audit_layers(Router::new().route(
-            "/liquidity-write/positions/{symbol}/set",
-            post(move || {
-                handler_called.store(true, Ordering::SeqCst);
-                async { StatusCode::OK }
-            }),
-        ));
-        let nested = format!("{}{}", "[".repeat(200), "]".repeat(200));
-        let body = format!(r#"{{"reason":"incident 42","ignored":{nested}}}"#);
-        let request_id = "12121212-1212-1212-1212-121212121212";
-
-        let response = app
-            .oneshot(request(
-                "/liquidity-write/positions/AAPL/set",
-                request_id,
-                Some("accounts.google.com:1234"),
-                &body,
-            ))
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(!called.load(Ordering::SeqCst), "the handler must not run");
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            body,
-            serde_json::json!({ "error": "request body is not parseable JSON" })
-        );
-        logs_assert(|lines| {
-            lines
-                .iter()
-                .any(|line| {
-                    line.contains("operations_audit: Operations audit event")
-                        && line.contains(request_id)
-                        && line.contains("outcome=\"validation_failure\"")
-                })
-                .then_some(())
-                .ok_or_else(|| format!("missing validation-failure audit: {lines:?}"))
         });
     }
 
