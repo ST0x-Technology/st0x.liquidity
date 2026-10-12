@@ -68,11 +68,15 @@ refunds, `failReason` and `refundFailReason` a code or `"N/A"`. Both hash fields
 are arrays; the client keeps every entry, as `IntentStatusReport::deposit_txs`
 and `IntentStatusReport::txs`, whatever the status. It keeps `refundFailReason`
 as `IntentStatusReport::refund_fail_reason` whatever the status too: a refund
-that did not complete may need Relay's manual review.
+that did not complete may need Relay's manual review. A `success`, `refund` or
+`failure` body without `txHashes` is `RelayError::Decode`, never an empty list:
+those statuses read it, and a `TRANSACTION_NOT_INCLUDED` failure that dropped
+the field must not settle as a terminal `Failure`. The caller reads the status
+again later.
 
 A `failure` with `TRANSACTION_NOT_INCLUDED` that still lists a tx is
 `IntentStatus::NotIncluded` (not terminal): that tx may confirm later. With no
-tx listed it is a terminal `Failure`.
+tx listed (`txHashes: []`) it is a terminal `Failure`.
 
 A `refund` counts as a paid refund (`IntentStatus::Refund`) only with at least
 one refund tx and no `refundFailReason`. With no refund tx it is

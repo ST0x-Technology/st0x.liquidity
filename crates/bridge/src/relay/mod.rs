@@ -168,7 +168,7 @@ impl RelayClient {
             read_json::<StatusResponse>(response, RelayEndpoint::Status).await
         };
 
-        let report = IntentStatusReport::from(self.with_retries(send).await?);
+        let StatusResponse(report) = self.with_retries(send).await?;
 
         if let IntentStatus::Unknown(status) = &report.status {
             warn!(target: "bridge", %request_id, %status, "Unknown Relay status, not terminal");

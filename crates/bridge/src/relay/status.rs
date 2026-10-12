@@ -1,7 +1,8 @@
 //! `GET /intents/status/v3`: where Relay says an order is.
 
 use alloy::primitives::TxHash;
-use serde::Deserialize;
+use serde::de::Error;
+use serde::{Deserialize, Deserializer};
 
 /// One status read: Relay's status plus every tx it has seen.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,27 +124,59 @@ impl FailReason {
     }
 }
 
+/// A status body read into its report. Only `success`, `refund` and
+/// `failure` read `txHashes`, so a body of theirs that omits it does not
+/// decode: a missing list must not pass for an empty one.
+#[derive(Debug)]
+pub(super) struct StatusResponse(pub(super) IntentStatusReport);
+
+impl<'de> Deserialize<'de> for StatusResponse {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = WireStatus::deserialize(deserializer)?;
+        IntentStatusReport::try_from(wire)
+            .map(Self)
+            .map_err(D::Error::custom)
+    }
+}
+
 /// Wire shape. A never-deposited request carries only `status` and
-/// `quoteCreatedAt`, so the arrays default to empty.
+/// `quoteCreatedAt`.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct StatusResponse {
+struct WireStatus {
     status: String,
     #[serde(default)]
     in_tx_hashes: Vec<TxHash>,
-    #[serde(default)]
-    tx_hashes: Vec<TxHash>,
+    tx_hashes: Option<Vec<TxHash>>,
     fail_reason: Option<String>,
     refund_fail_reason: Option<String>,
 }
 
-impl From<StatusResponse> for IntentStatusReport {
-    fn from(response: StatusResponse) -> Self {
+#[derive(Debug, thiserror::Error)]
+#[error("Relay status {status} omits txHashes")]
+struct MissingTxHashes {
+    status: String,
+}
+
+impl TryFrom<WireStatus> for IntentStatusReport {
+    type Error = MissingTxHashes;
+
+    fn try_from(response: WireStatus) -> Result<Self, MissingTxHashes> {
         let reason = response.fail_reason.as_deref().and_then(FailReason::parse);
         let refund_fail_reason = response
             .refund_fail_reason
             .as_deref()
             .and_then(FailReason::parse);
+
+        let txs = match response.tx_hashes {
+            Some(txs) => txs,
+            None if matches!(response.status.as_str(), "success" | "refund" | "failure") => {
+                return Err(MissingTxHashes {
+                    status: response.status,
+                });
+            }
+            None => vec![],
+        };
 
         let status = match response.status.as_str() {
             "waiting" => IntentStatus::Waiting,
@@ -151,32 +184,29 @@ impl From<StatusResponse> for IntentStatusReport {
             "pending" => IntentStatus::InFlight(InFlightStage::Pending),
             "submitted" => IntentStatus::InFlight(InFlightStage::Submitted),
             "delayed" => IntentStatus::InFlight(InFlightStage::Delayed),
-            "success" if response.tx_hashes.is_empty() => IntentStatus::Filling,
+            "success" if txs.is_empty() => IntentStatus::Filling,
             "success" => IntentStatus::Success,
             "refund" => match refund_fail_reason.clone() {
                 Some(refund_fail_reason) => IntentStatus::RefundFailed {
                     reason,
                     refund_fail_reason,
                 },
-                None if response.tx_hashes.is_empty() => IntentStatus::Refunding { reason },
+                None if txs.is_empty() => IntentStatus::Refunding { reason },
                 None => IntentStatus::Refund { reason },
             },
-            "failure"
-                if reason == Some(FailReason::TransactionNotIncluded)
-                    && !response.tx_hashes.is_empty() =>
-            {
+            "failure" if reason == Some(FailReason::TransactionNotIncluded) && !txs.is_empty() => {
                 IntentStatus::NotIncluded
             }
             "failure" => IntentStatus::Failure { reason },
             _ => IntentStatus::Unknown(response.status),
         };
 
-        Self {
+        Ok(Self {
             status,
             deposit_txs: response.in_tx_hashes,
-            txs: response.tx_hashes,
+            txs,
             refund_fail_reason,
-        }
+        })
     }
 }
 
@@ -188,7 +218,8 @@ mod tests {
     use super::*;
 
     fn report(body: &str) -> IntentStatusReport {
-        serde_json::from_str::<StatusResponse>(body).unwrap().into()
+        let StatusResponse(report) = serde_json::from_str(body).unwrap();
+        report
     }
 
     #[test]
@@ -247,7 +278,8 @@ mod tests {
 
     #[test]
     fn success_without_a_fill_tx_is_not_terminal() {
-        let report = report(&json!({"status": "success", "failReason": "N/A"}).to_string());
+        let report =
+            report(&json!({"status": "success", "txHashes": [], "failReason": "N/A"}).to_string());
 
         assert_eq!(report.status, IntentStatus::Filling);
         assert!(!report.status.is_terminal());
@@ -383,8 +415,10 @@ mod tests {
 
     #[test]
     fn failure_keeps_an_unknown_reason_verbatim() {
-        let report =
-            report(&json!({"status": "failure", "failReason": "SOMETHING_NEW"}).to_string());
+        let report = report(
+            &json!({"status": "failure", "txHashes": [], "failReason": "SOMETHING_NEW"})
+                .to_string(),
+        );
 
         assert_eq!(
             report.status,
@@ -428,6 +462,7 @@ mod tests {
         let report = report(
             &json!({
                 "status": "failure",
+                "txHashes": [],
                 "failReason": "SLIPPAGE",
                 "refundFailReason": "REFUND_RECIPIENT_IS_VASP",
             })
@@ -475,7 +510,12 @@ mod tests {
     #[test]
     fn failure_not_included_with_no_tx_is_terminal() {
         let report = report(
-            &json!({"status": "failure", "failReason": "TRANSACTION_NOT_INCLUDED"}).to_string(),
+            &json!({
+                "status": "failure",
+                "txHashes": [],
+                "failReason": "TRANSACTION_NOT_INCLUDED",
+            })
+            .to_string(),
         );
 
         assert_eq!(
