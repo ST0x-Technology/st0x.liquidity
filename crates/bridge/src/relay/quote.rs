@@ -2096,6 +2096,18 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn amount_that_is_not_plain_decimal_digits_does_not_decode() {
+        for amount in ["", "1_000", "+1000", " 1000"] {
+            let mut body = funded_body();
+            body["fees"]["relayer"]["amount"] = json!(amount);
+
+            let error = serde_json::from_value::<QuoteResponse>(body).unwrap_err();
+
+            assert!(error.is_data(), "{amount:?}: {error:?}");
+        }
+    }
+
+    #[test]
     fn unrepresentable_deadline_is_refused() {
         let error = refusal(|body| {
             body["protocol"]["v2"]["orderData"]["output"]["deadline"] = json!(u64::MAX);
