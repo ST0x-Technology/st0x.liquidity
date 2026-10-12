@@ -745,6 +745,33 @@ mod tests {
         );
     }
 
+    /// Only `waiting` may omit `txHashes`: a `TRANSACTION_NOT_INCLUDED`
+    /// failure without the field may still list a tx that confirms later, so
+    /// it must not read as a terminal failure with no tx.
+    #[tokio::test]
+    async fn failure_without_tx_hashes_is_a_decode_error() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/intents/status/v3");
+            then.status(200)
+                .json_body(json!({"status": "failure", "failReason": "TRANSACTION_NOT_INCLUDED"}));
+        });
+
+        let error = client(&server, None).status(REQUEST_ID).await.unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                RelayError::Decode {
+                    endpoint: RelayEndpoint::Status,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(mock.calls(), 1, "a decode error is not retried");
+    }
+
     #[test]
     fn api_key_is_redacted_in_debug_output() {
         let key = RelayApiKey::from("secret-key".to_owned());
