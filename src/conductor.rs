@@ -1348,6 +1348,7 @@ impl Conductor {
             .dashboard_trade_delivery_queue(dashboard_delivery.queue)
             .dashboard_trade_delivery_ctx(dashboard_delivery.ctx)
             .dashboard_trade_handoff_monitor(dashboard_delivery.handoff_monitor)
+            .transfer_line_sweep(dashboard_delivery.line_sweep)
             .hedge_queue(hedge_queue)
             .poll_status_queue(poll_status_queue)
             .reconcile_queue(reconcile_queue)
