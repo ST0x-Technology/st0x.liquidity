@@ -306,6 +306,21 @@ describe('transferRecoveryCommands', () => {
     )
   })
 
+  it('says a reconciled redemption stays in flight until the next restart', () => {
+    const reconcileText = (kind: 'equity_mint' | 'equity_redemption') =>
+      transferRecoveryCommands({ deployment: PROD, kind, id: 'X1', status: 'failed' }).find(
+        (entry) => entry.label === 'Reconcile'
+      )?.description ?? ''
+    // Startup seeds a DetectionFailed or RedemptionRejected redemption's
+    // stranded amount into inflight; reconcile clears it on the next start.
+    expect(
+      reconcileText('equity_redemption').includes(
+        'If the bot started after this redemption failed at detection or was rejected'
+      )
+    ).toBe(true)
+    expect(reconcileText('equity_mint').includes('stays in flight')).toBe(false)
+  })
+
   it('shows recheck + reconcile (not resume/fail) for a failed equity mint', () => {
     const commands = transferRecoveryCommands({
       deployment: PROD,
@@ -676,12 +691,77 @@ describe('transferRecoveryCommands', () => {
         status,
         postBurn: true
       })
-      expect(commands.map((entry) => entry.label)).toEqual(['Reconcile'])
+      expect(commands.map((entry) => entry.label)).toEqual([
+        'Resume',
+        'Reconcile',
+        'Reconcile (offline)'
+      ])
+      // The normal path for a post-burn Base to Alpaca failure is a resume,
+      // so it is a row the operator can copy, not only prose.
+      expect(commandFor(commands, 'Resume')).toBe(
+        `${CLIENT} debug resume-usdc base-to-alpaca BRIDGE001`
+      )
+      expect(commands.find((entry) => entry.label === 'Resume')?.mode).toBe('requires-bot')
+      // A deposit or conversion failure is enqueued but never moves on a
+      // resume, so the row sends those to Reconcile.
+      expect(
+        commands
+          .find((entry) => entry.label === 'Resume')
+          ?.description.includes('not a deposit or conversion failure')
+      ).toBe(true)
       expect(commandFor(commands, 'Reconcile')).toBe(
         `${CLIENT} debug reconcile-usdc BRIDGE001 --reason <funds-moved-manually|deposit-credited-offline>`
       )
       expect(commands.find((entry) => entry.label === 'Reconcile')?.mode).toBe('requires-bot')
+      // A post-burn Base to Alpaca failure is settled with the bot stopped,
+      // where the client cannot reach it, so the offline form is offered too.
+      expect(commandFor(commands, 'Reconcile (offline)')).toBe(
+        'stox transfer reconcile --kind usdc --id BRIDGE001 --reason <funds-moved-manually|deposit-credited-offline>'
+      )
+      expect(commands.find((entry) => entry.label === 'Reconcile (offline)')?.mode).toBe(
+        'direct-db'
+      )
     }
+  })
+
+  it('offers no offline reconcile for an Alpaca to Base failure, which nothing re-runs', () => {
+    const commands = transferRecoveryCommands({
+      deployment: PROD,
+      kind: 'usdc_bridge',
+      id: 'BRIDGE001',
+      status: 'failed',
+      direction: 'alpaca_to_base',
+      postBurn: true
+    })
+    expect(commands.map((entry) => entry.label)).toEqual(['Reconcile'])
+  })
+
+  it('asks to stop the Base to Alpaca recovery before a post-burn bridge is settled by hand', () => {
+    const reconcileText = (direction: 'alpaca_to_base' | 'base_to_alpaca' | null) =>
+      transferRecoveryCommands({
+        deployment: PROD,
+        kind: 'usdc_bridge',
+        id: 'BRIDGE001',
+        status: 'failed',
+        direction,
+        postBurn: true
+      }).find((entry) => entry.label === 'Reconcile')?.description ?? ''
+    // The bot re-runs a post-burn Base to Alpaca failure at every start and
+    // can send the USDC itself, so a hand settlement runs with the bot stopped
+    // and ends with the offline reconcile.
+    for (const direction of ['base_to_alpaca', null] as const) {
+      const text = reconcileText(direction)
+      expect(text.includes('re-runs its')).toBe(true)
+      // The bot finishes it on a resume unless the mint is unresolvable or
+      // funds were moved by hand.
+      expect(text.includes('keep the bot running and run resume-usdc base-to-alpaca')).toBe(true)
+      // One copy of the steps, in the runbook; the dialog points to it.
+      expect(text.includes('do not mint, send or reconcile it with the bot running')).toBe(true)
+      expect(
+        text.includes('docs/cli-ops.md, "Settling a post-burn Base to Alpaca failure by hand"')
+      ).toBe(true)
+    }
+    expect(reconcileText('alpaca_to_base').includes('re-runs its recovery')).toBe(false)
   })
 
   it('shows no per-object command for a pre-burn failed usdc bridge', () => {
@@ -909,6 +989,34 @@ describe('RECOVERY_GUIDE', () => {
   })
 })
 
+describe('RECOVERY_GUIDE follow-up steps', () => {
+  const guideEntry = (prefix: string) =>
+    RECOVERY_GUIDE.flatMap((group) => group.commands).find((entry) =>
+      entry.command.startsWith(`${CLIENT} ${prefix}`)
+    )
+
+  it('gives complete-mint its next step', () => {
+    expect(
+      guideEntry('debug cctp complete-mint')?.description.includes(
+        'run resume-usdc afterwards while the bridge is not terminal. Run reconcile-usdc only after a terminal failure whose funds leg is done and verified'
+      )
+    ).toBe(true)
+  })
+
+  it('gives the reconcile entries the same notes as their rows', () => {
+    expect(
+      guideEntry('debug reconcile-usdc')?.description.includes(
+        're-runs its recovery at every start'
+      )
+    ).toBe(true)
+    expect(
+      guideEntry('debug reconcile-equity')?.description.includes(
+        'For a redemption that failed at detection or was rejected before the bot started'
+      )
+    ).toBe(true)
+  })
+})
+
 describe('recoveryModeLabel', () => {
   it('renders a distinct badge for each execution mode', () => {
     expect(recoveryModeLabel('requires-bot')).toBe('REST — requires the running bot')
@@ -934,7 +1042,10 @@ describe('runbook headings the recovery text names', () => {
       .split('\n')
       .filter((line) => line.startsWith('#'))
       .map((line) => line.replace(/^#+\s*/, ''))
-    for (const heading of ['Clearing a pre-burn guard latch']) {
+    for (const heading of [
+      'Clearing a pre-burn guard latch',
+      'Settling a post-burn Base to Alpaca failure by hand'
+    ]) {
       expect(headings).toContain(heading)
     }
   })

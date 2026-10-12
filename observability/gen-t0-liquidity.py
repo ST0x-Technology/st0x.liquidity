@@ -698,6 +698,13 @@ def tab_links(active):
     return links
 
 
+def panel_module(name):
+    """A liquidity-panels script to prepend to an afterRender. Its export
+    line is for the SPA test; afterRender is not a module."""
+    with open(os.path.join(HERE, "liquidity-panels", name)) as f:
+        return "".join(line for line in f if not line.startswith("export "))
+
+
 def pills(y, w=24):
     """The SPA's HeaderBar and SettingsBar as one Business Text row,
     repeated on every tab like the SPA repeats its header: the settings
@@ -711,7 +718,8 @@ def pills(y, w=24):
     the script can keep the newest commit when a deploy leaves the previous
     one in the lookback window. The recovery guide is static data exported
     from the SPA (liquidity-panels/recovery-guide.json) and prepended to
-    the script.
+    the script with client-env.js, which retargets its commands at the
+    board's environment.
 
     w: the Dashboard tab narrows it to 23 to fit the detail panel beside
     it (see detail_panel()).
@@ -738,7 +746,8 @@ def pills(y, w=24):
     with open(os.path.join(HERE, "liquidity-panels", "recovery-guide.json")) as f:
         guide = json.load(f)
     with open(os.path.join(HERE, "liquidity-panels", "header.js")) as f:
-        after_render = f"const RECOVERY_GUIDE = {json.dumps(guide)};\n\n" + f.read()
+        after_render = (f"const RECOVERY_GUIDE = {json.dumps(guide)};\n\n"
+                        + panel_module("client-env.js") + "\n" + f.read())
     with open(os.path.join(HERE, "liquidity-panels", "header.css")) as f:
         styles = f.read()
     return [{
@@ -1298,18 +1307,16 @@ def detail_panel(x, y, trades_id, transfers_id):
     liquidity-panels/detail.js builds the dialog. renderMode "data" hands
     the script both frames, where "allRows" would draw a frame picker.
     MODE_LABELS (how each recovery command runs) is prepended from
-    recovery-guide.json, like the header's guide, and the per-row command
-    builders from recovery-commands.js, the status-history order from
-    status-history.js, and the bot-line helpers from log-lines.js.
+    recovery-guide.json, like the header's guide, the client prefix from
+    client-env.js, the per-row command builders from recovery-commands.js,
+    the status-history order from status-history.js, and the bot-line
+    helpers from log-lines.js.
     """
     with open(os.path.join(HERE, "liquidity-panels", "recovery-guide.json")) as f:
         mode_labels = json.load(f)["modeLabels"]
-    commands = ""
-    for module in ("recovery-commands.js", "status-history.js",
-                   "log-lines.js"):
-        with open(os.path.join(HERE, "liquidity-panels", module)) as f:
-            # Its export line is for the SPA test; afterRender is not a module.
-            commands += "".join(line for line in f if not line.startswith("export ")) + "\n"
+    commands = "".join(panel_module(module) + "\n" for module in (
+        "client-env.js", "recovery-commands.js", "status-history.js",
+        "log-lines.js"))
     with open(os.path.join(HERE, "liquidity-panels", "detail.js")) as f:
         after_render = (f"const MODE_LABELS = {json.dumps(mode_labels)};\n\n"
                         + commands + "\n" + f.read())

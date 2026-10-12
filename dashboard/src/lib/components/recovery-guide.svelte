@@ -55,9 +55,11 @@
     <p class="mb-4 text-xs text-muted-foreground">
       Every recovery command, grouped by object. They use
       <span class="font-mono">st0x-liquidity-client</span>, which signs in with your Google account and
-      calls the running bot's API, so no SSH is needed and the bot must be running. The one exception
-      is failing a Base to Alpaca USDC bridge after its vault withdrawal confirmed: that needs the offline
-      <span class="font-mono">stox fail-usdc-transfer</span> with the bot stopped.
+      calls the running bot's API, so no SSH is needed and the bot must be running. Some steps need the
+      offline <span class="font-mono">stox</span> with the bot stopped instead, for example failing a USDC
+      bridge after its nonce close (<span class="font-mono">stox fail-usdc-transfer</span>), and settling
+      a Base to Alpaca bridge by hand after its burn (<span class="font-mono">stox transfer reconcile</span>).
+      Each command's description says when.
     </p>
 
     <div class="space-y-5">

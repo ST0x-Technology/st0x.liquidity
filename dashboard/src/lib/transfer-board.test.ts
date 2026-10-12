@@ -1,7 +1,10 @@
 import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import {
+  LIQUIDITY_CLIENT,
   RECOVERY_GUIDE,
+  USDC_RECONCILE_BASE_TO_ALPACA,
+  forClientEnv,
   recoveryModeLabel,
   transferRecoveryCommands,
   tradeRecoveryCommands,
@@ -24,10 +27,47 @@ type BoardTransfer = { kind: TransferCategory; id: string; status: string; direc
 type BoardBuilders = {
   tradeCommands: (client: string, symbol: string) => BoardCommand[]
   transferCommands: (client: string, transfer: BoardTransfer) => BoardCommand[]
+  usdcFailedNote: (direction?: string) => string
+  USDC_RECONCILE_BASE_TO_ALPACA: string
 }
 
 // A plain script in the board, an ES module through its export line here.
 const board = (await import(new URL('recovery-commands.js', panels).href)) as BoardBuilders
+
+type ClientEnv = {
+  LIQUIDITY_CLIENT: string
+  boardEnv: (envText: string) => 'production' | 'staging'
+  forClientEnv: (command: string, env: 'production' | 'staging') => string
+  clientFor: (envText: string) => string
+}
+
+// A plain script in the board, an ES module through its export line here.
+const clientEnv = (await import(new URL('client-env.js', panels).href)) as ClientEnv
+
+// Every status the DTOs carry, so a status the drift tests skip cannot hide a
+// difference between the copies.
+const EQUITY_STATUSES = [
+  'minting',
+  'wrapping',
+  'depositing',
+  'sending',
+  'withdrawing',
+  'unwrapping',
+  'pending_confirmation',
+  'failed',
+  'completed',
+  'reconciled'
+]
+const USDC_STATUSES = [
+  'converting',
+  'withdrawing',
+  'bridging',
+  'depositing',
+  'failed',
+  'completed',
+  'reconciled'
+]
+const USDC_DIRECTIONS: (UsdcBridgeDirection | null)[] = ['alpaca_to_base', 'base_to_alpaca', null]
 
 type StatusEntry = {
   time: number
@@ -98,7 +138,7 @@ describe('board recovery-commands.js', () => {
   it('matches transferRecoveryCommands for every equity status', () => {
     const kinds: TransferCategory[] = ['equity_mint', 'equity_redemption']
     for (const kind of kinds) {
-      for (const status of ['wrapping', 'sending', 'failed', 'completed', 'reconciled']) {
+      for (const status of EQUITY_STATUSES) {
         expect(board.transferCommands(CLIENT, { kind, id: 'X1', status })).toEqual(
           withoutLabel(transferRecoveryCommands({ deployment: PROD, kind, id: 'X1', status }))
         )
@@ -109,16 +149,8 @@ describe('board recovery-commands.js', () => {
   it('matches transferRecoveryCommands for every usdc bridge status and direction', () => {
     // The exporter does not log the bridge's postBurn flag, so the board
     // matches the SPA without it: a failed bridge offers no reconcile.
-    const directions: (UsdcBridgeDirection | null)[] = ['alpaca_to_base', 'base_to_alpaca', null]
-    for (const direction of directions) {
-      for (const status of [
-        'converting',
-        'withdrawing',
-        'bridging',
-        'depositing',
-        'failed',
-        'completed'
-      ]) {
+    for (const direction of USDC_DIRECTIONS) {
+      for (const status of USDC_STATUSES) {
         expect(
           board.transferCommands(CLIENT, {
             kind: 'usdc_bridge',
@@ -139,6 +171,96 @@ describe('board recovery-commands.js', () => {
         )
       }
     }
+  })
+})
+
+describe('board failed-bridge note', () => {
+  it("carries the SPA's Base to Alpaca reconcile note word for word", () => {
+    // The board offers no USDC reconcile row, so its dialog note is the only
+    // place an operator reads the stop-first rule there.
+    expect(board.USDC_RECONCILE_BASE_TO_ALPACA).toBe(USDC_RECONCILE_BASE_TO_ALPACA)
+    for (const direction of ['base_to_alpaca', undefined]) {
+      expect(board.usdcFailedNote(direction).endsWith(USDC_RECONCILE_BASE_TO_ALPACA)).toBe(true)
+    }
+    // As in the SPA, an Alpaca to Base bridge does not get the Base to Alpaca rule.
+    expect(board.usdcFailedNote('alpaca_to_base').includes(USDC_RECONCILE_BASE_TO_ALPACA)).toBe(false)
+  })
+})
+
+describe('board client-env.js', () => {
+  it('builds the same client prefix as the SPA for each environment', () => {
+    expect(clientEnv.LIQUIDITY_CLIENT).toBe(LIQUIDITY_CLIENT)
+    for (const env of ['production', 'staging'] as const) {
+      expect(clientEnv.clientFor(env)).toBe(forClientEnv(LIQUIDITY_CLIENT, env))
+      const command = `${LIQUIDITY_CLIENT} debug resume`
+      expect(clientEnv.forClientEnv(command, env)).toBe(forClientEnv(command, env))
+    }
+  })
+
+  it('falls back to production for any other selector text', () => {
+    // Grafana gives the variable's text; only staging is not production.
+    expect(clientEnv.boardEnv('staging')).toBe('staging')
+    expect(clientEnv.boardEnv('production')).toBe('production')
+    expect(clientEnv.boardEnv('')).toBe('production')
+  })
+})
+
+// Every client command the SPA and the board show, written to a file that
+// the client crate's `every_shown_recovery_command_parses` test parses with
+// the real clap parser. A changed command fails here until the file is
+// regenerated (vitest -u), and the Rust test then checks that it still parses.
+describe('shown recovery commands', () => {
+  it('match the file the client parser test reads', async () => {
+    const shown = new Set<string>()
+    const offline = new Set<string>()
+    // The offline stox rows run another binary, with its own parser.
+    const add = (commands: RecoveryCommand[]) => {
+      for (const { command } of commands) {
+        if (command.startsWith('st0x-liquidity-client ')) shown.add(command)
+        if (command.startsWith('stox ')) offline.add(command)
+      }
+    }
+    add(tradeRecoveryCommands({ deployment: PROD, symbol: 'MSTR' }))
+    for (const kind of ['equity_mint', 'equity_redemption'] as const) {
+      for (const status of EQUITY_STATUSES) {
+        add(transferRecoveryCommands({ deployment: PROD, kind, id: 'X1', status }))
+      }
+    }
+    for (const direction of USDC_DIRECTIONS) {
+      for (const status of USDC_STATUSES) {
+        for (const postBurn of [true, false, null]) {
+          add(
+            transferRecoveryCommands({
+              deployment: PROD,
+              kind: 'usdc_bridge',
+              // A USDC rebalance id is a UUID, which the stox parser checks.
+              id: '00000000-0000-4000-8000-000000000001',
+              status,
+              direction,
+              postBurn
+            })
+          )
+        }
+      }
+    }
+    for (const group of RECOVERY_GUIDE) {
+      for (const { command } of group.commands) shown.add(command)
+    }
+    const header = [
+      '# Every st0x-liquidity-client command the SPA and the board show.',
+      '# Written by dashboard/src/lib/transfer-board.test.ts; do not edit by hand.'
+    ]
+    await expect([...header, ...[...shown].sort()].join('\n') + '\n').toMatchFileSnapshot(
+      '../../../crates/liquidity-client/testdata/shown-commands.txt'
+    )
+    const offlineHeader = [
+      '# Every offline stox command the SPA shows; crates/cli parses each with st0x-cli.',
+      '# Written by dashboard/src/lib/transfer-board.test.ts; do not edit by hand.'
+    ]
+    expect(offline.size).toBeGreaterThan(0)
+    await expect([...offlineHeader, ...[...offline].sort()].join('\n') + '\n').toMatchFileSnapshot(
+      '../../../crates/cli/testdata/shown-stox-commands.txt'
+    )
   })
 })
 
