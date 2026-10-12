@@ -1440,9 +1440,10 @@ mod tests {
     impl Notifier for FailOnceNotifier {
         async fn notify(
             &self,
-            _kind: crate::alerts::AlertKind,
-            _message: &str,
+            kind: crate::alerts::AlertKind,
+            message: &str,
         ) -> Result<(), NotifierError> {
+            crate::alerts::assert_kind_matches_extractor(kind, message);
             if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                 return Err(NotifierError::Simulated);
             }

@@ -30,7 +30,6 @@ use super::equity_price::EquityPriceStore;
 use super::event_lines::{
     EventId, EventParent, TransferLineSweep, TransferLines, log_event, log_trade, transfer_kind,
 };
-use crate::alerts::AlertKind;
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::equity_redemption::EquityRedemption;
 use crate::offchain::order::{
@@ -950,7 +949,6 @@ impl Job<DashboardTradeDeliveryCtx> for DeliverDashboardTrade {
         Some(crate::conductor::job::DEFAULT_PERFORM_TIMEOUT);
     const TERMINAL_FAILURE_MSG: &'static str =
         "Dashboard trade delivery failed after retries; terminal update remains undelivered";
-    const TERMINAL_FAILURE_KIND: AlertKind = AlertKind::DashboardTradeDeliveryFailed;
 
     #[cfg(any(test, feature = "test-support"))]
     const JOB_KIND: crate::conductor::job::JobKind =
@@ -1489,6 +1487,7 @@ mod tests {
     use st0x_finance::Usdc;
 
     use super::*;
+    use crate::alerts::AlertKind;
     use crate::conductor::job::{
         FailureInjector, TerminalFailureSignal, build_supervised_worker, build_worker_inner,
     };
@@ -1511,7 +1510,7 @@ mod tests {
             AlertKind::most_specific_in(
                 <DeliverDashboardTrade as Job<DashboardTradeDeliveryCtx>>::TERMINAL_FAILURE_MSG
             ),
-            Some(<DeliverDashboardTrade as Job<DashboardTradeDeliveryCtx>>::TERMINAL_FAILURE_KIND)
+            Some(AlertKind::DashboardTradeDeliveryFailed)
         );
     }
 

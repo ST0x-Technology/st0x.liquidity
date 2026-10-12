@@ -189,6 +189,34 @@ impl AlertKind {
     }
 }
 
+/// Whether `text` holds any extracted phrase, that is whether
+/// [`AlertKind::most_specific_in`] gives it a kind.
+///
+/// A `const fn` so the job worker macros (`build_supervised_worker!`,
+/// `build_best_effort_worker!`) can fail the build when a job's
+/// `TERMINAL_FAILURE_MSG` names no extracted kind, however the const is
+/// written.
+pub(crate) const fn names_extracted_kind(text: &str) -> bool {
+    let text = text.as_bytes();
+    let mut kind = 0;
+    while kind < EXTRACTED.len() {
+        let phrase = EXTRACTED[kind].as_str().as_bytes();
+        let mut start = 0;
+        while start + phrase.len() <= text.len() {
+            let mut matched = 0;
+            while matched < phrase.len() && text[start + matched] == phrase[matched] {
+                matched += 1;
+            }
+            if matched == phrase.len() {
+                return true;
+            }
+            start += 1;
+        }
+        kind += 1;
+    }
+    false
+}
+
 /// Sends an operational alert over some channel.
 ///
 /// Kept as a trait so monitors depend on the capability, not the concrete
@@ -231,7 +259,7 @@ impl Notifier for LogNotifier {
 }
 
 #[cfg(test)]
-pub(crate) use test_support::CapturingNotifier;
+pub(crate) use test_support::{CapturingNotifier, assert_kind_matches_extractor};
 
 /// Test-only notifier helpers. Lives in a `#[cfg(test)]` module (rather than
 /// bare `#[cfg(test)]` items) so clippy's `allow-unwrap-in-tests` applies to the
@@ -248,8 +276,9 @@ mod test_support {
     ///
     /// Every capture also checks the kind against the extractor: an extracted
     /// kind must be what the extractor reads from the message, and a kind the
-    /// extractor does not know must not collide with one it does. So every
-    /// test that drives an alert path pins its call site's kind.
+    /// extractor does not know must not collide with one it does and must
+    /// appear in the message. So every test that drives an alert path pins
+    /// its call site's kind.
     #[derive(Default)]
     pub(crate) struct CapturingNotifier {
         captured: std::sync::Mutex<Vec<(AlertKind, String)>>,
@@ -289,13 +318,22 @@ mod test_support {
 
     /// Fails when `kind` is not the label the extractor gives `message`: the
     /// extracted phrase itself, or, for a kind the extractor does not know,
-    /// no phrase at all.
+    /// no phrase at all. A kind the extractor does not know must still carry
+    /// its own phrase, so the message names the kind it is logged under.
+    ///
+    /// Test notifiers that do not capture through [`CapturingNotifier`] call
+    /// this from their own `notify`, so every alert path a test drives pins
+    /// its call site's kind.
     pub(crate) fn assert_kind_matches_extractor(kind: AlertKind, message: &str) {
         let expected = EXTRACTED.contains(&kind).then_some(kind);
         assert_eq!(
             AlertKind::most_specific_in(message),
             expected,
             "alert kind {kind:?} disagrees with the extractor on {message:?}"
+        );
+        assert!(
+            message.contains(kind.as_str()),
+            "alert kind {kind:?} names a phrase its message lacks: {message:?}"
         );
     }
 }
@@ -451,6 +489,20 @@ mod tests {
                 regex_kind
             );
         }
+
+        /// The compile-time check the worker macros run agrees with the
+        /// classifier on whether a text names a kind.
+        #[test]
+        fn names_extracted_kind_agrees_with_the_classifier(
+            parts in prop::collection::vec(phrase_or_noise(), 0..8)
+        ) {
+            let text = parts.concat();
+
+            prop_assert_eq!(
+                names_extracted_kind(&text),
+                AlertKind::most_specific_in(&text).is_some()
+            );
+        }
     }
 
     /// The target string is the delivery contract (the downstream metric
@@ -483,15 +535,10 @@ mod tests {
         );
     }
 
-    /// Every direct `operational_alert` line in the crate carries a `kind`
-    /// field, as `Notifier::notify` does.
-    #[test]
-    fn every_direct_operational_alert_line_carries_a_kind() {
-        // Built with concat! so this test's own source does not match it.
-        const DIRECT_ALERT_TARGET: &str = concat!("target: \"", "operational_alert", "\"");
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut pending = vec![src];
-        let mut sites = 0;
+    /// Every `.rs` file under `src`, with its path and contents.
+    fn crate_sources() -> Vec<(std::path::PathBuf, String)> {
+        let mut pending = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+        let mut sources = Vec::new();
 
         while let Some(path) = pending.pop() {
             if path.is_dir() {
@@ -502,23 +549,254 @@ mod tests {
                 );
                 continue;
             }
-            if path.extension().is_none_or(|extension| extension != "rs") {
-                continue;
+            if path.extension().is_some_and(|extension| extension == "rs") {
+                let source = std::fs::read_to_string(&path).unwrap();
+                sources.push((path, source));
             }
-            let source = std::fs::read_to_string(&path).unwrap();
+        }
+
+        sources
+    }
+
+    /// The value of the Rust string literal whose opening quote is at byte
+    /// `start` of `source`, and the byte offset just past its closing quote.
+    /// Folds `\` line continuations and the `\n`, `\t`, `\"` and `\\`
+    /// escapes; other escapes keep only their letter, and raw strings are not
+    /// read.
+    fn string_literal(source: &str, start: usize) -> (String, usize) {
+        let body_start = start + 1;
+        let mut value = String::new();
+        let mut chars = source[body_start..].char_indices().peekable();
+
+        while let Some((offset, character)) = chars.next() {
+            match character {
+                '"' => return (value, body_start + offset + 1),
+                '\\' => match chars.next().map(|(_, escaped)| escaped) {
+                    Some('\n') => {
+                        while chars.next_if(|(_, next)| next.is_whitespace()).is_some() {}
+                    }
+                    Some('n') => value.push('\n'),
+                    Some('t') => value.push('\t'),
+                    Some(escaped) => value.push(escaped),
+                    None => break,
+                },
+                other => value.push(other),
+            }
+        }
+
+        panic!("unterminated string literal at byte {start}");
+    }
+
+    /// The direct `operational_alert` macro invocation whose target starts at
+    /// byte `target_offset` of `source`: its text from the target to the
+    /// macro's closing bracket, and its message, the first positional string
+    /// literal at the macro's top level after the target. A literal after
+    /// `=`, `= %` or `= ?` is a field value, not the message. Brackets inside
+    /// string literals are skipped; brackets inside char literals are not.
+    fn direct_alert_invocation(source: &str, target_offset: usize) -> (&str, String) {
+        let mut depth = 1_usize;
+        let mut positional_literals = Vec::new();
+        let mut cursor = target_offset;
+
+        while depth > 0 {
+            let character = source[cursor..].chars().next().unwrap();
+            match character {
+                '"' => {
+                    let (value, end) = string_literal(source, cursor);
+                    let is_field_value = source[..cursor]
+                        .trim_end()
+                        .trim_end_matches(['%', '?'])
+                        .trim_end()
+                        .ends_with('=');
+                    if depth == 1 && !is_field_value {
+                        positional_literals.push(value);
+                    }
+                    cursor = end;
+                    continue;
+                }
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                _ => {}
+            }
+            cursor += character.len_utf8();
+        }
+
+        let invocation = &source[target_offset..cursor];
+        // The first positional literal is the target string itself.
+        let message = positional_literals
+            .into_iter()
+            .nth(1)
+            .unwrap_or_else(|| panic!("no message literal in {invocation}"));
+        (invocation, message)
+    }
+
+    #[test]
+    fn direct_alert_invocation_skips_field_values_with_and_without_sigils() {
+        let target = concat!("target: \"", "operational_alert", "\"");
+        for field in [
+            r#"detail = "Low gas""#,
+            r#"detail = %"Low gas""#,
+            r#"detail = ?"Low gas""#,
+            r#"detail=%"Low gas""#,
+        ] {
+            let source = format!(
+                "error!({target}, alert = true, {field}, \"Portfolio snapshot mark stale\");"
+            );
+            let target_offset = source.find(target).unwrap();
+
+            let (invocation, message) = direct_alert_invocation(&source, target_offset);
+
+            assert_eq!(message, "Portfolio snapshot mark stale", "for {field}");
+            assert!(invocation.ends_with(')'), "for {field}: {invocation}");
+        }
+    }
+
+    /// Every direct `operational_alert` line in the crate carries a `kind`
+    /// field naming an [`AlertKind`] variant, and that kind agrees with the
+    /// line's message literal as the extractor reads it, the same check
+    /// [`CapturingNotifier`] makes on `Notifier::notify`.
+    ///
+    /// The scan reads source text, so it has limits: the kind must be written
+    /// `kind = AlertKind::Variant`, the message must be a plain string literal
+    /// (not a raw string or a `concat!`), and a char literal holding a bracket
+    /// would end the invocation early. Runtime arguments interpolated into the
+    /// message are not seen. `LogNotifier`'s forwarding line (`kind =
+    /// kind.as_str()` over `"{message}"`) is the one site naming no variant.
+    #[test]
+    fn every_direct_operational_alert_line_carries_its_messages_kind() {
+        // Built with concat! so this test's own source does not match them.
+        const DIRECT_ALERT_TARGET: &str = concat!("target: \"", "operational_alert", "\"");
+        const KIND_FIELD: &str = concat!("kind = ", "AlertKind::");
+        let mut sites = 0;
+
+        for (path, source) in crate_sources() {
             for (offset, _) in source.match_indices(DIRECT_ALERT_TARGET) {
-                let invocation = &source[offset..];
-                let invocation = &invocation[..invocation.find(");").unwrap()];
+                let (invocation, message) = direct_alert_invocation(&source, offset);
                 sites += 1;
+                // `LogNotifier` forwards a caller's kind and message.
+                let forwarded_message = concat!("{", "message", "}");
+                if invocation.contains("kind = kind.as_str()") && message == forwarded_message {
+                    continue;
+                }
+                let Some(field) = invocation.find(KIND_FIELD) else {
+                    panic!(
+                        "{} has an operational_alert line without a kind: {invocation}",
+                        path.display()
+                    );
+                };
+                let variant: String = invocation[field + KIND_FIELD.len()..]
+                    .chars()
+                    .take_while(|character| character.is_alphanumeric() || *character == '_')
+                    .collect();
+                let kind = EXTRACTED
+                    .iter()
+                    .chain(NOT_EXTRACTED)
+                    .find(|candidate| format!("{candidate:?}") == variant)
+                    .unwrap_or_else(|| {
+                        panic!("{} names unknown AlertKind::{variant}", path.display())
+                    });
+                assert_kind_matches_extractor(*kind, &message);
+            }
+        }
+
+        assert!(sites > 20, "found only {sites} direct sites");
+    }
+
+    /// The value of each `const TERMINAL_FAILURE_MSG` declaration in
+    /// `source`, or `None` for one whose value is not a plain string literal.
+    /// Any type text between the name and the `=` is skipped, so `&str` and
+    /// `&'static str` both count.
+    fn terminal_failure_messages(source: &str) -> Vec<Option<String>> {
+        // Built with concat! so this test's own source does not match it.
+        const MESSAGE_CONST: &str = concat!("const TERMINAL_FAILURE", "_MSG");
+
+        source
+            .match_indices(MESSAGE_CONST)
+            .filter(|(offset, _)| {
+                // A declaration, not a mention in a comment or a string.
+                let line_start = source[..*offset]
+                    .rfind('\n')
+                    .map_or(0, |newline| newline + 1);
+                let declaration = source[line_start..*offset]
+                    .trim()
+                    .trim_start_matches("pub(crate)")
+                    .trim_start_matches("pub")
+                    .trim()
+                    .is_empty();
+                declaration
+                    && source[offset + MESSAGE_CONST.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(|next| next != '_' && !next.is_alphanumeric())
+            })
+            .map(|(offset, _)| {
+                let name_end = offset + MESSAGE_CONST.len();
+                let value_start = name_end + source[name_end..].find('=').unwrap() + 1;
+                source[value_start..]
+                    .find(|character: char| !character.is_whitespace())
+                    .map(|skipped| value_start + skipped)
+                    .filter(|literal_start| source[*literal_start..].starts_with('"'))
+                    .map(|literal_start| string_literal(source, literal_start).0)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn terminal_failure_messages_reads_any_type_spelling() {
+        let name = concat!("const TERMINAL_FAILURE", "_MSG");
+        for declaration in [
+            format!("{name}: &'static str = \"Low gas\";"),
+            format!("{name}: &str = \"Low gas\";"),
+            format!("{name}:&str=\"Low gas\";"),
+            format!("{name}: &'static str =\n        \"Low gas\";"),
+        ] {
+            let messages = terminal_failure_messages(&declaration);
+
+            assert_eq!(
+                messages,
+                vec![Some("Low gas".to_string())],
+                "for {declaration}"
+            );
+        }
+
+        let not_a_literal = format!("{name}: &str = OTHER_MESSAGE;");
+        assert_eq!(terminal_failure_messages(&not_a_literal), vec![None]);
+
+        let longer_name = format!("{name}_PREFIX: &str = \"Low gas\";");
+        assert!(terminal_failure_messages(&longer_name).is_empty());
+    }
+
+    /// Every job's terminal failure message, the trait default and each
+    /// override, carries an extracted phrase: a terminal job failure page
+    /// takes its kind from that text (`conductor::job::terminal_failure_kind`),
+    /// so a message without one would page as the generic job failure while
+    /// the extractor reads no kind at all. The worker macros check the same
+    /// at compile time with [`names_extracted_kind`]; this scan also covers
+    /// jobs no worker macro builds.
+    #[test]
+    fn every_terminal_failure_message_names_an_extracted_kind() {
+        let mut messages = 0;
+
+        for (path, source) in crate_sources() {
+            for message in terminal_failure_messages(&source) {
+                let Some(message) = message else {
+                    panic!(
+                        "{} sets TERMINAL_FAILURE_MSG to something other than a string literal",
+                        path.display()
+                    );
+                };
+                messages += 1;
                 assert!(
-                    invocation.contains("kind = AlertKind::")
-                        || invocation.contains("kind = kind.as_str()"),
-                    "{} has an operational_alert line without a kind: {invocation}",
+                    AlertKind::most_specific_in(&message).is_some(),
+                    "{} has a terminal failure message with no extracted phrase: {message:?}",
                     path.display()
                 );
             }
         }
 
-        assert!(sites > 20, "found only {sites} direct sites");
+        assert!(
+            messages >= 4,
+            "found only {messages} terminal failure messages"
+        );
     }
 }

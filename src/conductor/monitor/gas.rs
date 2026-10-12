@@ -261,7 +261,8 @@ mod tests {
     use crate::startup::{StartupBarrier, StartupTask};
 
     /// Notifier that records every message it is asked to deliver, so tests can
-    /// assert exactly which alerts fired.
+    /// assert exactly which alerts fired, and checks each alert's kind
+    /// against its message.
     struct CapturingNotifier {
         messages: Mutex<Vec<String>>,
     }
@@ -282,9 +283,10 @@ mod tests {
     impl Notifier for CapturingNotifier {
         async fn notify(
             &self,
-            _kind: crate::alerts::AlertKind,
+            kind: crate::alerts::AlertKind,
             message: &str,
         ) -> Result<(), crate::alerts::NotifierError> {
+            crate::alerts::assert_kind_matches_extractor(kind, message);
             self.messages.lock().unwrap().push(message.to_owned());
             Ok(())
         }
