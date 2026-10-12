@@ -156,7 +156,7 @@ struct WireStatus {
 #[derive(Debug, thiserror::Error)]
 #[error("Relay status {status} omits txHashes")]
 struct MissingTxHashes {
-    status: String,
+    status: &'static str,
 }
 
 impl TryFrom<WireStatus> for IntentStatusReport {
@@ -170,12 +170,10 @@ impl TryFrom<WireStatus> for IntentStatusReport {
             .and_then(FailReason::parse);
 
         // Only these arms read the tx list, so only they refuse a missing one.
-        let has_txs = |tx_hashes: Option<&Vec<TxHash>>, status: &str| {
+        let has_txs = |tx_hashes: Option<&Vec<TxHash>>, status: &'static str| {
             tx_hashes
                 .map(|txs| !txs.is_empty())
-                .ok_or_else(|| MissingTxHashes {
-                    status: status.to_owned(),
-                })
+                .ok_or(MissingTxHashes { status })
         };
         let listed = response.tx_hashes.as_ref();
 
@@ -202,7 +200,7 @@ impl TryFrom<WireStatus> for IntentStatusReport {
                 IntentStatus::NotIncluded
             }
             "failure" => IntentStatus::Failure { reason },
-            _ => IntentStatus::Unknown(response.status.clone()),
+            _ => IntentStatus::Unknown(response.status),
         };
 
         Ok(Self {

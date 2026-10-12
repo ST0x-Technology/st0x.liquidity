@@ -2132,11 +2132,9 @@ pub(super) mod tests {
 
             let error = serde_json::from_value::<QuoteResponse>(body).unwrap_err();
 
-            assert!(
-                error
-                    .to_string()
-                    .starts_with(&format!("amount {amount:?} is not a base-10 integer")),
-                "{amount:?}: {error}"
+            assert_eq!(
+                error.to_string(),
+                format!("amount {amount:?} is not a base-10 integer")
             );
         }
     }
