@@ -7814,6 +7814,10 @@ mod tests {
             )
             .await
             .unwrap();
+        let denied_request_id = denied.headers()["x-request-id"]
+            .to_str()
+            .unwrap()
+            .to_string();
         for uri in ["/transfers", "/transfers/interrupted"] {
             let response = app
                 .clone()
@@ -7878,17 +7882,23 @@ mod tests {
         assert_eq!(public_get.headers().get("x-request-id"), None);
 
         logs_assert(|lines| {
-            lines
-                .iter()
-                .any(|line| {
-                    line.contains("operations_audit: Operations audit event")
-                        && line.contains(&request_id.to_string())
-                        && line.contains("principal=local-loopback")
-                        && line.contains("role=\"local\"")
-                        && line.contains("route=/transfers/{*path}")
-                        && line.contains("target_id=not_identified")
-                        && line.contains("outcome=\"validation_failure\"")
-                })
+            let audited_not_found = lines.iter().any(|line| {
+                line.contains("operations_audit: Operations audit event")
+                    && line.contains(&request_id.to_string())
+                    && line.contains("principal=local-loopback")
+                    && line.contains("role=\"local\"")
+                    && line.contains("route=/transfers/{*path}")
+                    && line.contains("target_id=not_identified")
+                    && line.contains("outcome=\"validation_failure\"")
+            });
+            let audited_denial = lines.iter().any(|line| {
+                line.contains("operations_audit: Operations audit event")
+                    && line.contains(&denied_request_id)
+                    && line.contains("role=\"local\"")
+                    && line.contains("route=/transfers/{*path}")
+                    && line.contains("outcome=\"denied\"")
+            });
+            (audited_not_found && audited_denial)
                 .then_some(())
                 .ok_or_else(|| format!("missing stable unknown-route audit: {lines:?}"))
         });
@@ -8094,6 +8104,66 @@ mod tests {
                 }
             }
             Ok(())
+        });
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn unmatched_write_mutation_is_audited_and_unrelated_paths_are_not() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let ops_api = st0x_config::OpsApiConfig {
+            read_audience: "/projects/1/global/backendServices/11".to_string(),
+            write_audience: "/projects/1/global/backendServices/22".to_string(),
+        };
+        let app = routes(Some(&ops_api)).with_state(empty_app_state(ctx).await);
+        let write_request_id = "c3c3c3c3-c3c3-c3c3-c3c3-c3c3c3c3c3c3";
+        let unrelated_request_id = "d4d4d4d4-d4d4-d4d4-d4d4-d4d4d4d4d4d4";
+
+        let write = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/liquidity-write/not-a-command")
+                    .header("x-request-id", write_request_id)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(write.status(), StatusCode::UNAUTHORIZED);
+
+        let unrelated = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/not-an-operator-route")
+                    .header("x-request-id", unrelated_request_id)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unrelated.status(), StatusCode::NOT_FOUND);
+        assert_eq!(unrelated.headers().get("x-request-id"), None);
+
+        logs_assert(|lines| {
+            let audited_write = lines.iter().any(|line| {
+                line.contains("operations_audit: Operations audit event")
+                    && line.contains(write_request_id)
+                    && line.contains("role=\"write\"")
+                    && line.contains("route=/liquidity-write/{*path}")
+                    && line.contains("outcome=\"denied\"")
+            });
+            let audited_unrelated = lines.iter().any(|line| {
+                line.contains("operations_audit") && line.contains(unrelated_request_id)
+            });
+
+            match (audited_write, audited_unrelated) {
+                (true, false) => Ok(()),
+                (false, _) => Err(format!("missing write catchall audit: {lines:?}")),
+                (true, true) => Err(format!("unrelated path was audited: {lines:?}")),
+            }
         });
     }
 
