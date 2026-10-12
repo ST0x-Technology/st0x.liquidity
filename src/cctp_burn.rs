@@ -25,6 +25,8 @@ use st0x_config::{ChainRegistry, Ctx, OnchainWalletCtx};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil, Store};
 use st0x_evm::{Chain, MinedTx, PreparedTransaction, Wallet};
 
+use crate::alerts::AlertKind;
+
 /// The CCTP bridge over the bot's own Ethereum and Base wallets, as the
 /// capital `cctp-bridge` route and the startup burn restore use it.
 pub(crate) type BotCctpBridge =
@@ -533,7 +535,7 @@ pub(crate) async fn burn_receipt_fate(
     {
         Some(true) => Ok(Some(BurnReceiptFate::Confirmed)),
         Some(false) => {
-            error!(target: "operational_alert", alert = true, %burn_tx, ?source, "CCTP burn mined and succeeded but emitted no MessageSent, so Circle has nothing to attest; check the configured TokenMessenger before completing or retrying it");
+            error!(target: "operational_alert", alert = true, kind = AlertKind::CctpBurnEmittedNoMessageSent.as_str(), %burn_tx, ?source, "CCTP burn mined and succeeded but emitted no MessageSent, so Circle has nothing to attest; check the configured TokenMessenger before completing or retrying it");
             Ok(None)
         }
         // The node that answered this read has no receipt yet, though the
@@ -847,13 +849,13 @@ pub(crate) async fn restore_pending_cctp_burns(
     let (ids, unparseable) = match pending_cctp_burn_ids(pool).await {
         Ok(found) => found,
         Err(error) => {
-            error!(target: "operational_alert", alert = true, ?error, "Could not list the pending capital CCTP burns at startup; their nonces are not reserved, so startup skips Ethereum and Base token approvals and allowance revokes");
+            error!(target: "operational_alert", alert = true, kind = AlertKind::CapitalCctpBurnsUnlisted.as_str(), ?error, "Could not list the pending capital CCTP burns at startup; their nonces are not reserved, so startup skips Ethereum and Base token approvals and allowance revokes");
             outcome.unmined_chains.extend(both_chains);
             return outcome;
         }
     };
     if !unparseable.is_empty() {
-        error!(target: "operational_alert", alert = true, ?unparseable, "Pending capital CCTP burns with unparseable operation ids were not restored at startup, so startup skips Ethereum and Base token approvals and allowance revokes");
+        error!(target: "operational_alert", alert = true, kind = AlertKind::CapitalCctpBurnIdsUnparseable.as_str(), ?unparseable, "Pending capital CCTP burns with unparseable operation ids were not restored at startup, so startup skips Ethereum and Base token approvals and allowance revokes");
         outcome.unmined_chains.extend(both_chains);
     }
 
@@ -865,7 +867,7 @@ pub(crate) async fn restore_pending_cctp_burns(
                 continue;
             }
             Err(error) => {
-                error!(target: "operational_alert", alert = true, operation_id = %id, ?error, "Could not load a pending capital CCTP burn at startup; its nonce is not reserved, so startup skips Ethereum and Base token approvals and allowance revokes");
+                error!(target: "operational_alert", alert = true, kind = AlertKind::CapitalCctpBurnUnloadable.as_str(), operation_id = %id, ?error, "Could not load a pending capital CCTP burn at startup; its nonce is not reserved, so startup skips Ethereum and Base token approvals and allowance revokes");
                 outcome.unmined_chains.extend(both_chains);
                 continue;
             }
@@ -885,7 +887,7 @@ pub(crate) async fn restore_pending_cctp_burns(
 
         let direction = source.bridge_direction();
         if !signed_by_source_wallet(bridge, &operation) {
-            error!(target: "operational_alert", alert = true, operation_id = %id, %burn_tx, nonce, signer = ?operation.prepared.signer(), wallet = %bridge.source_signer(direction), "A pending capital CCTP burn was signed by another wallet (was the key rotated?); not restoring it into this wallet's nonces, so startup skips that chain's token approvals and allowance revokes");
+            error!(target: "operational_alert", alert = true, kind = AlertKind::CapitalCctpBurnSignedByAnotherWallet.as_str(), operation_id = %id, %burn_tx, nonce, signer = ?operation.prepared.signer(), wallet = %bridge.source_signer(direction), "A pending capital CCTP burn was signed by another wallet (was the key rotated?); not restoring it into this wallet's nonces, so startup skips that chain's token approvals and allowance revokes");
             outcome.unmined_chains.insert(source.chain());
             continue;
         }
@@ -911,7 +913,7 @@ pub(crate) async fn restore_pending_cctp_burns(
             .boxed()
             .await
         {
-            error!(target: "operational_alert", alert = true, operation_id = %id, %burn_tx, nonce, error = %scrubbed(&error), "Could not rebroadcast a pending capital CCTP burn at startup; its nonce stays reserved, so startup skips that chain's token approvals and allowance revokes, and a cctp-bridge rerun with its operation id broadcasts it again");
+            error!(target: "operational_alert", alert = true, kind = AlertKind::CapitalCctpBurnRebroadcastFailed.as_str(), operation_id = %id, %burn_tx, nonce, error = %scrubbed(&error), "Could not rebroadcast a pending capital CCTP burn at startup; its nonce stays reserved, so startup skips that chain's token approvals and allowance revokes, and a cctp-bridge rerun with its operation id broadcasts it again");
             outcome.unmined_chains.insert(source.chain());
             continue;
         }

@@ -44,7 +44,7 @@ use st0x_finance::Usdc;
 use super::UsdcTransferError;
 use super::driver_pause::UsdcDriverGate;
 use super::manager::CrossVenueCashTransfer;
-use crate::alerts::Notifier;
+use crate::alerts::{AlertKind, Notifier};
 use crate::bot_gas::redrive::{BotGasFailureClassifier, redrive_on_bot_gas_failure};
 use crate::conductor::job::{
     BACKPRESSURE_ALERT_STREAK, BACKPRESSURE_RESCHEDULE_LIMIT, BackpressureOutcome,
@@ -254,17 +254,13 @@ impl MintRecoveryDirection {
 /// which is out of scope here (see the finding this addresses).
 /// Best-effort operator alert delivery: a failed delivery is logged with the
 /// alert kind and never propagated -- alerting must never fail the job.
-async fn deliver_market_making_alert(
-    notifier: &Arc<dyn Notifier>,
-    message: &str,
-    alert_kind: &str,
-) {
-    if let Err(error) = notifier.notify(message).await {
+async fn deliver_usdc_alert(notifier: &Arc<dyn Notifier>, kind: AlertKind, message: &str) {
+    if let Err(error) = notifier.notify(kind, message).await {
         warn!(
             target: "rebalance",
             ?error,
-            alert_kind,
-            "Failed to deliver USDC market-making alert"
+            alert_kind = kind.as_str(),
+            "Failed to deliver USDC transfer alert"
         );
     }
 }
@@ -314,7 +310,10 @@ where
              acting; use `stox transfer resume --kind usdc --id {id} --direction \
              {cli_flag}` if the automatic redrive appears stuck."
         );
-        if let Err(notify_err) = notifier.notify(&message).await {
+        if let Err(notify_err) = notifier
+            .notify(AlertKind::StuckAtCctpMintRecovery, &message)
+            .await
+        {
             warn!(
                 target: "rebalance",
                 ?notify_err,
@@ -537,7 +536,10 @@ async fn log_and_alert_backpressure_outcome(
                  integration (suspended account, revoked key) needing manual \
                  reconciliation."
             );
-            if let Err(error) = notifier.notify(&message).await {
+            if let Err(error) = notifier
+                .notify(AlertKind::StructurallyDeadAlpacaIntegration, &message)
+                .await
+            {
                 warn!(
                     target: "rebalance", ?error,
                     "Failed to deliver USDC {alert} backpressure dead-letter alert"
@@ -564,7 +566,10 @@ async fn log_and_alert_backpressure_outcome(
                      Alpaca connectivity/rate limits before the \
                      {BACKPRESSURE_RESCHEDULE_LIMIT}-attempt budget is exhausted."
                 );
-                if let Err(error) = notifier.notify(&message).await {
+                if let Err(error) = notifier
+                    .notify(AlertKind::ConsecutiveReschedules, &message)
+                    .await
+                {
                     warn!(
                         target: "rebalance", ?error,
                         "Failed to deliver USDC {alert} sustained-backpressure alert"
@@ -583,26 +588,29 @@ async fn alert_withdrawal_poll_deadline_elapsed(
 ) {
     // Alpaca answered for a Complete withdrawal with no tx hash, so the
     // connectivity diagnosis below would be wrong.
-    let message = if let AlpacaWalletError::CompletedTransferMissingTx { transfer_id } = source {
-        format!(
-            "Alpaca->Base USDC transfer {id}: Alpaca reports withdrawal {transfer_id} \
+    let (kind, message) =
+        if let AlpacaWalletError::CompletedTransferMissingTx { transfer_id } = source {
+            let message = format!(
+                "Alpaca->Base USDC transfer {id}: Alpaca reports withdrawal {transfer_id} \
              complete with no tx hash for {elapsed:?} (>{WITHDRAWAL_POLL_ALERT_DEADLINE:?}). \
              The USDC has likely reached the Ethereum wallet, but the transfer is credited \
              only from its tx. Aggregate stays in Withdrawing (guard held) and keeps \
              re-polling for the hash; at the settlement retry deadline it fails to \
              BridgingFailed for `stox transfer reconcile --kind usdc`."
-        )
-    } else {
-        format!(
-            "Alpaca->Base USDC transfer {id}: withdrawal polling inconclusive \
+            );
+            (AlertKind::CompleteWithNoTxHash, message)
+        } else {
+            let message = format!(
+                "Alpaca->Base USDC transfer {id}: withdrawal polling inconclusive \
              for {elapsed:?} (>{WITHDRAWAL_POLL_ALERT_DEADLINE:?}). Alpaca may \
              be unreachable or credentials may have changed ({source}). Aggregate stays in \
              Withdrawing (guard held). Use `stox transfer resume --kind usdc --id \
              {id} --direction to-raindex` to manually re-poll, or investigate \
              Alpaca connectivity."
-        )
-    };
-    if let Err(notify_err) = notifier.notify(&message).await {
+            );
+            (AlertKind::WithdrawalPollingInconclusive, message)
+        };
+    if let Err(notify_err) = notifier.notify(kind, &message).await {
         warn!(
             target: "rebalance",
             ?notify_err,
@@ -955,9 +963,12 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
                     "USDC transfer {id} attestation retry deadline elapsed. \
                      Bridge marked failed; manual operator reconciliation required."
                 );
-                if let Err(error) = ctx.notifier.notify(&message).await {
-                    warn!(target: "rebalance", ?error, "Failed to deliver USDC hedging deadline-elapsed alert");
-                }
+                deliver_usdc_alert(
+                    &ctx.notifier,
+                    AlertKind::AttestationRetryDeadlineElapsed,
+                    &message,
+                )
+                .await;
             }
             Err(UsdcTransferError::PreviouslyFailedAggregate { id }) => {
                 warn!(
@@ -1061,9 +1072,7 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
                      absent from mempool past grace). Latched for operator reconciliation; \
                      verify on-chain before any reburn."
                 );
-                if let Err(error) = ctx.notifier.notify(&message).await {
-                    warn!(target: "rebalance", ?error, "Failed to deliver USDC hedging dropped-burn alert");
-                }
+                deliver_usdc_alert(&ctx.notifier, AlertKind::ClassifiedDropped, &message).await;
             }
             Err(UsdcTransferError::BurnRecordFailed { id, burn_tx }) => {
                 error!(
@@ -1079,9 +1088,7 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
                      durably recorded; a burn is in flight. Latched for operator reconciliation; \
                      verify on-chain before any reburn."
                 );
-                if let Err(error) = ctx.notifier.notify(&message).await {
-                    warn!(target: "rebalance", ?error, "Failed to deliver USDC hedging record-failed-burn alert");
-                }
+                deliver_usdc_alert(&ctx.notifier, AlertKind::NotDurablyRecorded, &message).await;
             }
             Err(
                 UsdcTransferError::BurnSubmitInconclusive { id }
@@ -1099,9 +1106,12 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
                      durably recorded; a burn may be in flight. Latched for operator \
                      reconciliation; verify on-chain before any reburn."
                 );
-                if let Err(error) = ctx.notifier.notify(&message).await {
-                    warn!(target: "rebalance", ?error, "Failed to deliver USDC hedging inconclusive-burn alert");
-                }
+                deliver_usdc_alert(
+                    &ctx.notifier,
+                    AlertKind::BurnSubmissionInconclusive,
+                    &message,
+                )
+                .await;
             }
             // The deposit is already failed for reconciliation: an unrecorded
             // same-amount send landed, or the signed send reverted.
@@ -1114,9 +1124,7 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
                      reconciliation (no auto-resend)"
                 );
                 let message = format!("{error}.");
-                if let Err(error) = ctx.notifier.notify(&message).await {
-                    warn!(target: "rebalance", ?error, "Failed to deliver USDC hedging deposit-send alert");
-                }
+                deliver_usdc_alert(&ctx.notifier, AlertKind::DepositMarkedFailed, &message).await;
             }
             // The post-deposit conversion's fate is unknown and the order may
             // still fill, so retrying would race a live order and recording a
@@ -1135,9 +1143,12 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
                      The broker order may still be live and may still fill; verify at Alpaca \
                      before forcing this rebalance either way."
                 );
-                if let Err(error) = ctx.notifier.notify(&message).await {
-                    warn!(target: "rebalance", ?error, "Failed to deliver USDC hedging unresolved-conversion alert");
-                }
+                deliver_usdc_alert(
+                    &ctx.notifier,
+                    AlertKind::ConversionLatchedBeforeForcing,
+                    &message,
+                )
+                .await;
             }
             // The inventory vault could not cover the withdraw. Either way the
             // job ends with NO retry and one alert: see
@@ -1238,7 +1249,11 @@ impl TransferUsdcToHedging {
                 format!("{other}.")
             }
         };
-        if let Err(notify_error) = ctx.notifier.notify(&message).await {
+        if let Err(notify_error) = ctx
+            .notifier
+            .notify(AlertKind::InventoryVaultUnderFunded, &message)
+            .await
+        {
             warn!(target: "rebalance", error = ?notify_error, "Failed to deliver USDC hedging vault-liquidity alert");
             // The page never went out, so the next rejection must try again.
             if let UsdcTransferError::WithdrawalRejectedUnderfunded { .. } = error {
@@ -1354,9 +1369,12 @@ impl TransferUsdcToHedging {
                  {next_attempts} attempts. Base->Alpaca transfer stalled; \
                  check aggregate state for current stage. Manual operator action required."
             );
-            if let Err(error) = ctx.notifier.notify(&message).await {
-                warn!(target: "rebalance", ?error, "Failed to deliver USDC hedging timeout-limit alert");
-            }
+            deliver_usdc_alert(
+                &ctx.notifier,
+                AlertKind::PerAttemptTimeoutRedriveLimit,
+                &message,
+            )
+            .await;
         } else if warn_threshold(ctx.max_burn_revert_redrives) == Some(next_attempts) {
             warn!(
                 target: "rebalance",
@@ -1372,9 +1390,7 @@ impl TransferUsdcToHedging {
                  (max: {}). Possible hung RPC or persistent network issue.",
                 ctx.max_burn_revert_redrives
             );
-            if let Err(error) = ctx.notifier.notify(&message).await {
-                warn!(target: "rebalance", ?error, "Failed to deliver USDC hedging timeout-warn alert");
-            }
+            deliver_usdc_alert(&ctx.notifier, AlertKind::PerAttemptTimeoutRetried, &message).await;
         } else {
             warn!(
                 target: "rebalance",
@@ -1449,9 +1465,7 @@ impl TransferUsdcToHedging {
                  manual operator action will be required if it fails to enqueue or also reverts.",
                 max = ctx.max_burn_revert_redrives
             );
-            if let Err(error) = ctx.notifier.notify(&message).await {
-                warn!(target: "rebalance", ?error, "Failed to deliver USDC hedging burn-revert-limit alert");
-            }
+            deliver_usdc_alert(&ctx.notifier, AlertKind::BurnRevertRedriveLimit, &message).await;
         } else if warn_threshold(ctx.max_burn_revert_redrives) == Some(next_attempts) {
             // Warn threshold: alert exactly once so operators can investigate
             // before the limit is reached, avoiding a silent infinite loop.
@@ -1469,9 +1483,7 @@ impl TransferUsdcToHedging {
                  (max: {}). Possible transient or persistent RPC/contract issue.",
                 ctx.max_burn_revert_redrives
             );
-            if let Err(error) = ctx.notifier.notify(&message).await {
-                warn!(target: "rebalance", ?error, "Failed to deliver USDC hedging burn-revert-warn alert");
-            }
+            deliver_usdc_alert(&ctx.notifier, AlertKind::BurnRevertRetried, &message).await;
         } else {
             warn!(
                 target: "rebalance",
@@ -1562,9 +1574,12 @@ impl TransferUsdcToHedging {
                  --kind usdc --id {id} --direction to-alpaca` if the automatic redrive appears \
                  stuck."
             );
-            if let Err(notify_err) = ctx.notifier.notify(&message).await {
-                warn!(target: "rebalance", ?notify_err, "Failed to deliver withdrawal-scan-deadline-elapsed alert");
-            }
+            deliver_usdc_alert(
+                &ctx.notifier,
+                AlertKind::VaultWithdrawalScanInconclusive,
+                &message,
+            )
+            .await;
         }
         // A non-429 self-heal redrive breaks the consecutive-429 streak, so reset
         // it (mirrors the burn-revert / withdrawal-poll-inconclusive redrives);
@@ -1628,9 +1643,12 @@ impl TransferUsdcToHedging {
                  transfer (`transfer reconcile --kind usdc --id {id} --superseding-tx \
                  <that tx>`) and restart the bot to release the send's nonce."
             );
-            if let Err(notify_error) = ctx.notifier.notify(&message).await {
-                warn!(target: "rebalance", ?notify_error, "Failed to deliver deposit-send reconciliation deadline alert");
-            }
+            deliver_usdc_alert(
+                &ctx.notifier,
+                AlertKind::DepositSendQueuesEthereumNonce,
+                &message,
+            )
+            .await;
         }
 
         let redriven = Self {
@@ -1811,6 +1829,8 @@ impl TransferUsdcToMarketMaking {
         ctx: &TransferUsdcToMarketMakingCtx,
         result: Result<(), UsdcTransferError>,
     ) -> Result<(), TransferUsdcToMarketMakingJobError> {
+        use AlertKind::*;
+
         match result {
             Ok(()) => {}
             Err(UsdcTransferError::AttestationTimedOut { id }) => {
@@ -1884,7 +1904,7 @@ impl TransferUsdcToMarketMaking {
                     "USDC transfer {id} attestation retry deadline elapsed. \
                      Bridge marked failed; manual operator reconciliation required."
                 );
-                deliver_market_making_alert(&ctx.notifier, &message, "deadline-elapsed").await;
+                deliver_usdc_alert(&ctx.notifier, AttestationRetryDeadlineElapsed, &message).await;
             }
             // Settlement retry deadline elapsed: `FailBridging` already
             // committed (pre-burn `BridgingFailed`, reconcile-eligible since
@@ -1904,7 +1924,7 @@ impl TransferUsdcToMarketMaking {
                      the funds actually sit (Alpaca balance vs the market-maker wallet), \
                      then settle them with `transfer reconcile --kind usdc`."
                 );
-                deliver_market_making_alert(&ctx.notifier, &message, "settlement-deadline").await;
+                deliver_usdc_alert(&ctx.notifier, SettlementRetryDeadlineElapsed, &message).await;
             }
             Err(UsdcTransferError::PreviouslyFailedAggregate { id }) => {
                 warn!(
@@ -1937,7 +1957,7 @@ impl TransferUsdcToMarketMaking {
                      units to the market-maker wallet against nominal {nominal}. Bridge \
                      marked failed; manual operator reconciliation required."
                 );
-                deliver_market_making_alert(&ctx.notifier, &message, "withdrawal-credit").await;
+                deliver_usdc_alert(&ctx.notifier, WithdrawalCreditMismatch, &message).await;
             }
             Err(UsdcTransferError::WithdrawalCreditUnreadable { id, tx, source }) => {
                 error!(
@@ -1953,7 +1973,7 @@ impl TransferUsdcToMarketMaking {
                      be computed ({source}). Bridge marked failed; manual operator \
                      reconciliation required."
                 );
-                deliver_market_making_alert(&ctx.notifier, &message, "withdrawal-credit").await;
+                deliver_usdc_alert(&ctx.notifier, WithdrawalCreditUncomputable, &message).await;
             }
             // Another transfer recorded this withdrawal tx. The aggregate has
             // already moved to BridgingFailed via FailBridging.
@@ -1969,8 +1989,7 @@ impl TransferUsdcToMarketMaking {
                     "{error}. Bridge marked failed; settle the withdrawn funds with \
                      `transfer reconcile --kind usdc`."
                 );
-                deliver_market_making_alert(&ctx.notifier, &message, "duplicate-withdrawal-tx")
-                    .await;
+                deliver_usdc_alert(&ctx.notifier, WithdrawalTxAlreadyRecorded, &message).await;
             }
             Err(UsdcTransferError::WithdrawalTxMissing { id }) => {
                 error!(
@@ -1984,7 +2003,7 @@ impl TransferUsdcToMarketMaking {
                      USDC can be credited to it. Bridge marked failed; manual operator \
                      reconciliation required."
                 );
-                deliver_market_making_alert(&ctx.notifier, &message, "missing-withdrawal-tx").await;
+                deliver_usdc_alert(&ctx.notifier, NoRecordedWithdrawalTxHash, &message).await;
             }
             // Indeterminate withdrawal poll: the Alpaca poll timed out or returned
             // a transport/API error without observing a terminal status. The
@@ -2046,20 +2065,7 @@ impl TransferUsdcToMarketMaking {
                 | UsdcTransferError::BurnRecordFailed { .. }
                 | UsdcTransferError::BurnSubmitInconclusive { .. }
                 | UsdcTransferError::BurnRecordTaskFailed { .. }),
-            ) => {
-                error!(
-                    target: "rebalance",
-                    id = %self.id,
-                    %error,
-                    "Alpaca->Base USDC transfer: latched at BridgingSubmitting \
-                     for operator reconciliation (no auto-reburn)"
-                );
-                let message = format!(
-                    "{error}. Latched for operator reconciliation; verify \
-                     on-chain before any reburn."
-                );
-                deliver_market_making_alert(&ctx.notifier, &message, "burn-safety").await;
-            }
+            ) => self.latch_burn_for_reconciliation(ctx, &error).await,
             // Both outcomes are deterministic across retries and neither has a
             // safe automatic next step, so they latch for an operator instead
             // of burning the retry budget on an identical failure. Returning
@@ -2077,6 +2083,32 @@ impl TransferUsdcToMarketMaking {
         Ok(())
     }
 
+    /// Logs and pages a fail-closed burn submission: the burn's onchain fate
+    /// is unknown, so the transfer stays latched at `BridgingSubmitting` with
+    /// no automatic reburn. The error's Display carries the id, burn tx and
+    /// situation, and names the page's kind with the phrase the extractor
+    /// reads (pinned per variant in the tests).
+    async fn latch_burn_for_reconciliation(
+        &self,
+        ctx: &TransferUsdcToMarketMakingCtx,
+        error: &UsdcTransferError,
+    ) {
+        error!(
+            target: "rebalance",
+            id = %self.id,
+            %error,
+            "Alpaca->Base USDC transfer: latched at BridgingSubmitting \
+             for operator reconciliation (no auto-reburn)"
+        );
+        let message = format!(
+            "{error}. Latched for operator reconciliation; verify \
+             on-chain before any reburn."
+        );
+        let kind =
+            AlertKind::most_specific_in(&message).unwrap_or(AlertKind::BurnSubmissionInconclusive);
+        deliver_usdc_alert(&ctx.notifier, kind, &message).await;
+    }
+
     /// Ends the attempt without a retry for the two conversion outcomes that
     /// are deterministic across retries and have no safe automatic next step,
     /// alerting the operator instead.
@@ -2091,12 +2123,13 @@ impl TransferUsdcToMarketMaking {
         ctx: &TransferUsdcToMarketMakingCtx,
         error: &UsdcTransferError,
     ) {
-        let (context, detail) = match error {
+        let (context, kind, detail) = match error {
             UsdcTransferError::ConversionBelowWithdrawalMinimum {
                 converted, minimum, ..
             } => (
                 "conversion settled below the broker's withdrawal minimum; the converted \
                  USDC is in the Alpaca crypto wallet and needs reconciliation",
+                AlertKind::NoWithdrawalAttempted,
                 format!(
                     "settled at {converted}, below Alpaca's {minimum} withdrawal minimum. \
                      No withdrawal was attempted."
@@ -2105,6 +2138,7 @@ impl TransferUsdcToMarketMaking {
             _ => (
                 "conversion outcome unresolved; the broker order may still be live. Latched \
                  with no failure recorded",
+                AlertKind::ConversionLatchedBeforeForcing,
                 format!(
                     "outcome unresolved ({error}). The order may still fill; verify at \
                      Alpaca before forcing this rebalance either way."
@@ -2115,7 +2149,7 @@ impl TransferUsdcToMarketMaking {
         error!(target: "rebalance", id = %self.id, %error, "Alpaca->Base USDC transfer: {context}");
 
         let message = format!("USDC transfer {}: {detail}", self.id);
-        deliver_market_making_alert(&ctx.notifier, &message, "conversion-latch").await;
+        deliver_usdc_alert(&ctx.notifier, kind, &message).await;
     }
 
     /// `reason` is supplied by the caller, where the concrete settlement
@@ -2399,7 +2433,7 @@ impl TransferUsdcToMarketMaking {
                  manual operator action will be required if it fails to enqueue or also reverts.",
                 max = ctx.max_burn_revert_redrives
             );
-            deliver_market_making_alert(&ctx.notifier, &message, "burn-revert-limit").await;
+            deliver_usdc_alert(&ctx.notifier, AlertKind::BurnRevertRedriveLimit, &message).await;
         } else if warn_threshold(ctx.max_burn_revert_redrives) == Some(next_attempts) {
             // Warn threshold: alert exactly once so operators can investigate
             // before the limit is reached, avoiding a silent infinite loop.
@@ -2417,7 +2451,7 @@ impl TransferUsdcToMarketMaking {
                  (max: {}). Possible transient or persistent RPC/contract issue.",
                 ctx.max_burn_revert_redrives
             );
-            deliver_market_making_alert(&ctx.notifier, &message, "burn-revert-warn").await;
+            deliver_usdc_alert(&ctx.notifier, AlertKind::BurnRevertRetried, &message).await;
         } else {
             warn!(
                 target: "rebalance",
@@ -4972,6 +5006,33 @@ mod tests {
         .await;
     }
 
+    /// Each fail-closed burn error names its page's kind with the phrase the
+    /// extractor reads, which is how the Alpaca->Base latch picks its kind.
+    #[test]
+    fn fail_closed_burn_errors_name_their_alert_kind() {
+        let id = UsdcRebalanceId(uuid::Uuid::nil());
+
+        let kinds: Vec<Option<AlertKind>> = [
+            TerminalOutcome::BurnTxDropped,
+            TerminalOutcome::BurnRecordFailed,
+            TerminalOutcome::BurnSubmitInconclusive,
+            TerminalOutcome::BurnRecordTaskFailed,
+        ]
+        .into_iter()
+        .map(|outcome| AlertKind::most_specific_in(&format!("{}.", outcome.into_error(&id))))
+        .collect();
+
+        assert_eq!(
+            kinds,
+            [
+                Some(AlertKind::NoLongerInMempool),
+                Some(AlertKind::RecordPendingBurnUncommitted),
+                Some(AlertKind::BurnSubmissionInconclusive),
+                Some(AlertKind::BurnSubmitTaskPanicked),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn hedging_job_fails_closed_on_burn_record_task_failed() {
         assert_hedging_fail_closed(
@@ -6032,7 +6093,11 @@ mod tests {
 
     #[async_trait]
     impl crate::alerts::Notifier for FailingNotifier {
-        async fn notify(&self, _message: &str) -> Result<(), crate::alerts::NotifierError> {
+        async fn notify(
+            &self,
+            _kind: crate::alerts::AlertKind,
+            _message: &str,
+        ) -> Result<(), crate::alerts::NotifierError> {
             Err(crate::alerts::NotifierError::Simulated)
         }
     }
@@ -6131,7 +6196,7 @@ mod tests {
     }
 
     /// The market-making leg's alerts flow through
-    /// `deliver_market_making_alert`: a failing notifier must be swallowed
+    /// `deliver_usdc_alert`: a failing notifier must be swallowed
     /// with a warning there too, preserving the clean-terminal outcome (Ok,
     /// no redrive) the job would have with a working notifier.
     #[tokio::test]

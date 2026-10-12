@@ -83,6 +83,33 @@ info!(%symbol, %shares, "Hedging trade");
 | `tokenization`      | Tokenized equity minting                                 |
 | `wallet`            | Alpaca wallet / onchain wallet                           |
 
+### Operational alert kinds
+
+Every `operational_alert` line carries a `kind` field, an `AlertKind` from
+`src/alerts/mod.rs`. Send alerts through `Notifier::notify(kind, message)`. A
+direct `error!(target: "operational_alert", ...)` line must also log
+`kind = AlertKind::...as_str()`; a test fails on one that does not.
+
+- An existing kind's string is exactly the label the `operational_alerts`
+  extractor (t0.devops `observability-consumer`) gives the line once that
+  extractor carries the full phrase list of the unclassified rule in
+  `observability/alerting/liquidity.rules.yml`; a test pins the extracted list
+  against that rule. Compare the field with the extractor's label on staging
+  only after the deployed extractor has the full list.
+- A new alert gets a new kind in the `not_extracted` group, whose string is a
+  fixed phrase of its message. Teach the extractor that phrase and add a rule;
+  then move the kind into the `extracted` group in the extractor's order.
+- `CapturingNotifier` checks every alert a test drives: an extracted kind must
+  be what the extractor reads from the message, and a not-extracted kind must
+  match no extracted phrase.
+
+The phrase extractor is transitional. Once the `operational_alerts` pager reads
+`jsonPayload.kind`, a new alert needs only a new `AlertKind` and a rule in
+`observability/alerting/liquidity.rules.yml`, and the extracted/not_extracted
+split goes. `AlertKind::most_specific_in` stays until the wrapper alerts (job
+dead letters, worker terminal failures) take their kind from the error type
+instead of its rendered text.
+
 When adding a new subsystem, pick a short, descriptive target name and add it to
 this table AND to `DOMAIN_TARGETS` in `crates/config/src/telemetry.rs`, so the
 default `EnvFilter` captures it.

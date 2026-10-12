@@ -26,7 +26,7 @@ use st0x_execution::{
     MarketOrder, MarketSession, Permanence, Positive, PostCloseGap, SupportedExecutor, Symbol, Usd,
 };
 
-use crate::alerts::Notifier;
+use crate::alerts::{AlertKind, Notifier};
 use crate::conductor::job::{
     BACKPRESSURE_RESCHEDULE_LIMIT, BackpressureOutcome, BackpressureStreak,
     DEFAULT_PERFORM_TIMEOUT, Job, JobQueue, Label, advance_backpressure, apply_backpressure_step,
@@ -384,11 +384,17 @@ pub(crate) async fn alert_dead_letter(
         return;
     }
     if reason == DeadLetterReason::ResidualAfterClose {
-        error!(target: "operational_alert", alert = true, %symbol, detail = message,
+        error!(target: "operational_alert", alert = true,
+            kind = AlertKind::ResidualExposureAfterLatchedClose.as_str(), %symbol, detail = message,
             "Residual exposure remains after the latched close; reconciliation continues");
     }
 
-    match tokio::time::timeout(DEAD_LETTER_ALERT_TIMEOUT, notifier.notify(message)).await {
+    match tokio::time::timeout(
+        DEAD_LETTER_ALERT_TIMEOUT,
+        notifier.notify(reason.alert_kind(), message),
+    )
+    .await
+    {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
             alerted_dead_letters.lock().await.remove(&key);
@@ -2377,7 +2383,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::alerts::Notifier for FlakyNotifier {
-        async fn notify(&self, message: &str) -> Result<(), crate::alerts::NotifierError> {
+        async fn notify(
+            &self,
+            _kind: crate::alerts::AlertKind,
+            message: &str,
+        ) -> Result<(), crate::alerts::NotifierError> {
             if self.failing.load(Ordering::SeqCst) {
                 return Err(crate::alerts::NotifierError::Simulated);
             }
@@ -2396,7 +2406,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::alerts::Notifier for PausingNotifier {
-        async fn notify(&self, _message: &str) -> Result<(), crate::alerts::NotifierError> {
+        async fn notify(
+            &self,
+            _kind: crate::alerts::AlertKind,
+            _message: &str,
+        ) -> Result<(), crate::alerts::NotifierError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.started.notify_one();
             self.release.notified().await;
@@ -2411,7 +2425,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::alerts::Notifier for HangingNotifier {
-        async fn notify(&self, _message: &str) -> Result<(), crate::alerts::NotifierError> {
+        async fn notify(
+            &self,
+            _kind: crate::alerts::AlertKind,
+            _message: &str,
+        ) -> Result<(), crate::alerts::NotifierError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             std::future::pending().await
         }

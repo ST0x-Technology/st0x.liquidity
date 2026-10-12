@@ -1325,6 +1325,7 @@ where
                 TerminalFailureInfo {
                     worker,
                     context,
+                    kind,
                     source,
                 } = failure_notify_for_select.notified(),
                     if !is_draining.is_cancelled() =>
@@ -1332,6 +1333,7 @@ where
                     Err(MonitorTaskError::TerminalJobFailure {
                         worker,
                         context,
+                        kind,
                         source,
                     })
                 }
