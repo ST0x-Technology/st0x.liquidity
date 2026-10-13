@@ -17,7 +17,7 @@ use st0x_evm::{Chain, EvmError, IERC20, PreparedTransaction, Wallet};
 use super::proof::{
     PaymentTerms, RelayErc20Deposit, UnverifiedReason, check_payment, deposit_event,
 };
-use super::quote::{StepTerms, check_steps};
+use super::quote::{StepTerms, StepTransaction, check_steps};
 use super::{AcceptedRelayQuote, QuoteField, QuoteMismatch, RelayOrderId};
 use crate::{
     DepositScan, HopDirection, PreparedSwap, PreparedSwapDeposit, SwapBridge, SwapDeposit,
@@ -493,7 +493,8 @@ impl<W: Wallet> RelayEnd<W> {
     }
 
     /// Signs the approve (the quote's, or our own exact one when the quote has
-    /// none and the allowance falls short) and the deposit at the next nonces.
+    /// none) only when the allowance falls short, and the deposit, at the next
+    /// nonces.
     /// Another send from this wallet between the two signs takes the nonce in
     /// between. Then only the deposit is discarded: the approve is returned to
     /// go out alone, so its nonce is not left as a gap the other send waits
@@ -506,10 +507,9 @@ impl<W: Wallet> RelayEnd<W> {
 
         self.check_steps(quote, wallet_chain)?;
 
-        let approve = match quote.approve() {
-            Some(step) => Some(step.data.clone()),
-            None => self.approve_if_short(quote.amounts().amount_in).await?,
-        };
+        let approve = self
+            .approve_if_short(quote.amounts().amount_in, quote.approve())
+            .await?;
 
         let approve = match approve {
             Some(calldata) => Some(
@@ -606,9 +606,16 @@ impl<W: Wallet> RelayEnd<W> {
         Ok(())
     }
 
-    /// With no approve step, the standing allowance must still cover the
-    /// deposit: another transfer from this wallet may have spent it.
-    async fn approve_if_short(&self, amount: U256) -> Result<Option<Bytes>, RelayBridgeError> {
+    /// The approve calldata to sign, `None` when the standing allowance covers
+    /// the deposit: an approve sent alone after a split pair stands, and
+    /// signing the quote's again would cost gas and a new split window. With
+    /// no approve step, another transfer from this wallet may have spent the
+    /// allowance, so a short one gets our own exact approve.
+    async fn approve_if_short(
+        &self,
+        amount: U256,
+        step: Option<&StepTransaction>,
+    ) -> Result<Option<Bytes>, RelayBridgeError> {
         let allowance = IERC20::new(self.stable, self.wallet.provider())
             .allowance(self.wallet.address(), self.depository)
             .call()
@@ -617,6 +624,10 @@ impl<W: Wallet> RelayEnd<W> {
 
         if allowance >= amount {
             return Ok(None);
+        }
+
+        if let Some(step) = step {
+            return Ok(Some(step.data.clone()));
         }
 
         warn!(

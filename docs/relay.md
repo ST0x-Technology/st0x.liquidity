@@ -248,9 +248,11 @@ its `refundTo` to be our wallet on both ends (`Quote(AddressMismatch)`): a fill
 or refund is proven against the wallet of the side it lands on, so a quote
 paying anyone else would be signed and never proven.
 
-- The approve is estimated and padded as usual. With no approve step in the
-  quote, the bridge reads the allowance and signs its own exact
-  `approve(depository, amount)` when it falls short.
+- The bridge reads the allowance first and signs no approve when it covers the
+  deposit, whatever the quote's shape: an approve sent alone after a split pair
+  stands. When it falls short, the bridge signs the quote's approve, or its own
+  exact `approve(depository, amount)` when the quote has none. The approve is
+  estimated and padded as usual.
 - The deposit cannot be estimated while its approve is unmined, so it is signed
   with a pinned `RELAY_DEPOSIT_GAS_LIMIT` of 57,114, the larger `gasUsed` of the
   funded test's deposits (57,114 on Robinhood, 49,083 on Ethereum), padded by
