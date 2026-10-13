@@ -131,6 +131,11 @@ pub enum RebalancingCtxError {
     #[error("[rebalancing.usdc.corridors.{chain}.relay] {key} must be non-zero")]
     RelayZeroSetting { chain: Chain, key: &'static str },
     #[error(
+        "[rebalancing.usdc.corridors.{chain}.relay] quote_max_age_secs is {secs}, above the \
+         maximum of {MAX_RELAY_QUOTE_MAX_AGE_SECS}"
+    )]
+    RelayQuoteMaxAgeTooLong { chain: Chain, secs: u64 },
+    #[error(
         "[rebalancing.usdc.corridors.{chain}] hop = \"relay\" needs [relay] api_key in the \
          secrets file: Relay refuses every quote without one"
     )]
@@ -221,6 +226,10 @@ fn default_usdc_conversion_failure_cooldown_secs() -> u64 {
 /// leave it unattended.
 const MAX_USDC_CONVERSION_FAILURE_COOLDOWN_SECS: u64 = 24 * 60 * 60;
 
+/// A Relay quote lives minutes. The bound keeps the prepare deadline, now
+/// plus this age, far from an `Instant` overflow.
+const MAX_RELAY_QUOTE_MAX_AGE_SECS: u64 = 60 * 60;
+
 /// One `[rebalancing.usdc.corridors.<chain>]` table. Every key is required;
 /// `relay` is required with `hop = "relay"` and refused otherwise.
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -307,6 +316,13 @@ impl RelayHopConfig {
             if value == 0 {
                 return Err(RebalancingCtxError::RelayZeroSetting { chain, key });
             }
+        }
+
+        if self.quote_max_age_secs > MAX_RELAY_QUOTE_MAX_AGE_SECS {
+            return Err(RebalancingCtxError::RelayQuoteMaxAgeTooLong {
+                chain,
+                secs: self.quote_max_age_secs,
+            });
         }
 
         let min_transfer = Usdc::new(self.min_transfer);
@@ -2493,6 +2509,37 @@ mod tests {
                     key: "fill_timeout_secs",
                     ..
                 }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn relay_quote_max_age_above_an_hour_is_refused() {
+        let error = corridor_error(&relay_corridor(
+            "robinhood",
+            &[("quote_max_age_secs", "9223372036854775807")],
+        ));
+
+        assert!(
+            matches!(
+                error,
+                RebalancingCtxError::RelayQuoteMaxAgeTooLong {
+                    chain: Chain::Robinhood,
+                    secs: 9_223_372_036_854_775_807,
+                }
+            ),
+            "got {error:?}"
+        );
+
+        let error = corridor_error(&relay_corridor(
+            "robinhood",
+            &[("quote_max_age_secs", "3601")],
+        ));
+        assert!(
+            matches!(
+                error,
+                RebalancingCtxError::RelayQuoteMaxAgeTooLong { secs: 3601, .. }
             ),
             "got {error:?}"
         );

@@ -2459,10 +2459,11 @@ rule fails startup with a named error:
 11. A `relay` sub-table missing a key, carrying an unknown one, or out of
     bounds: `slippage_bps <= max_quote_loss_bps <= 10000`,
     `min_transfer < max_transfer`, `min_transfer` less `max_quote_loss_bps`
-    still at least the Alpaca-to-Base minimum transfer (53 USDC), and non-zero
+    still at least the Alpaca-to-Base minimum transfer (53 USDC), non-zero
     `quote_max_age_secs`, `fill_timeout_secs`, `max_refund_retries` and
-    `max_deposit_revert_redrives`. A `relay` hop on a chain with no Relay
-    depository pinned in code is refused too.
+    `max_deposit_revert_redrives`, and `quote_max_age_secs` at most an hour. A
+    `relay` hop on a chain with no Relay depository pinned in code is refused
+    too.
 
 The `relay` sub-table:
 
