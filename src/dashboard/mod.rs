@@ -1,10 +1,8 @@
 //! WebSocket-based dashboard for real-time server state streaming.
 
-use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::response::IntoResponse;
-use axum::routing::get;
 use futures_util::sink::SinkExt;
 use futures_util::stream::{SplitSink, StreamExt};
 use itertools::Itertools;
@@ -137,12 +135,12 @@ impl TradeProtocol {
 }
 
 #[derive(Default, Deserialize)]
-struct WebSocketQuery {
+pub(crate) struct WebSocketQuery {
     #[serde(default)]
     trade_protocol: TradeProtocol,
 }
 
-async fn ws_endpoint(
+pub(crate) async fn ws_endpoint(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     Query(query): Query<WebSocketQuery>,
@@ -321,10 +319,6 @@ async fn stream_broadcasts(
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }
-}
-
-pub(crate) fn routes() -> Router<AppState> {
-    Router::new().route("/ws", get(ws_endpoint))
 }
 
 pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
@@ -919,7 +913,8 @@ mod tests {
         let event_sender = state.event_sender.clone();
         let inventory = Arc::clone(&state.inventory);
 
-        let app = Router::new().nest("/api", routes()).with_state(state);
+        let detached_tasks = state.detached_tasks.clone();
+        let app = crate::api::routes(None, &detached_tasks).with_state(state);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();

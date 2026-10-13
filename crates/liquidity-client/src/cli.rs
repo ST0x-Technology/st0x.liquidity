@@ -1482,10 +1482,12 @@ mod tests {
 
         for line in lines {
             // Clap never checks the program name, so a renamed binary would
-            // still parse here and fail for the operator.
+            // still parse here and fail for the operator. This module is
+            // compiled into the library, where Cargo sets no binary name; the
+            // binary takes the package name.
             assert_eq!(
                 shown_words(line).first().map(String::as_str),
-                Some(env!("CARGO_BIN_NAME")),
+                Some(env!("CARGO_PKG_NAME")),
                 "{line}"
             );
             for argv in expand_shown(&shown_words(line)) {

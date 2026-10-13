@@ -419,11 +419,7 @@ pub(crate) async fn require_iap(
 }
 
 #[cfg(test)]
-mod tests {
-    use axum::Router;
-    use axum::body::Body;
-    use axum::http::Request as HttpRequest;
-    use axum::routing::get;
+pub(crate) mod test_support {
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL;
     use httpmock::prelude::*;
@@ -431,13 +427,15 @@ mod tests {
     use p256::ecdsa::SigningKey;
     use p256::pkcs8::EncodePrivateKey;
     use serde::Serialize;
-    use tower::ServiceExt as _;
 
     use super::*;
 
-    const TEST_KID: &str = "test-key";
-    const READ_AUDIENCE: &str = "/projects/1/global/backendServices/11";
-    const WRITE_AUDIENCE: &str = "/projects/1/global/backendServices/22";
+    pub(crate) const TEST_KID: &str = "test-key";
+    pub(crate) const READ_AUDIENCE: &str = "/projects/1/global/backendServices/11";
+    pub(crate) const WRITE_AUDIENCE: &str = "/projects/1/global/backendServices/22";
+    pub(crate) const TEST_SUBJECT: &str = "accounts.google.com:1234";
+    pub(crate) const TEST_EMAIL: &str = "operator@t0trade.com";
+    pub(crate) const TEST_ISSUER: &str = IAP_ISSUER;
 
     #[derive(Serialize)]
     struct TestClaims {
@@ -450,13 +448,13 @@ mod tests {
 
     /// A P-256 keypair standing in for Google's: the JWK halves that go in the
     /// mocked key set, and the PEM that signs test tokens.
-    struct TestKey {
-        signing_pem: Vec<u8>,
-        x: String,
-        y: String,
+    pub(crate) struct TestKey {
+        pub(crate) signing_pem: Vec<u8>,
+        pub(crate) x: String,
+        pub(crate) y: String,
     }
 
-    fn test_key() -> TestKey {
+    pub(crate) fn test_key() -> TestKey {
         // Fixed bytes rather than a random key: a test that generates its own
         // key can pass while the code under test ignores the key entirely.
         let signing = SigningKey::from_bytes(&[7u8; 32].into()).expect("valid P-256 scalar");
@@ -473,7 +471,12 @@ mod tests {
         }
     }
 
-    fn token(key: &TestKey, audience: &str, issuer: &str, expires_in_secs: i64) -> String {
+    pub(crate) fn token(
+        key: &TestKey,
+        audience: &str,
+        issuer: &str,
+        expires_in_secs: i64,
+    ) -> String {
         let exp = u64::try_from(
             i64::try_from(
                 std::time::SystemTime::now()
@@ -492,8 +495,8 @@ mod tests {
         encode(
             &header,
             &TestClaims {
-                sub: "accounts.google.com:1234".to_string(),
-                email: "operator@t0trade.com".to_string(),
+                sub: TEST_SUBJECT.to_string(),
+                email: TEST_EMAIL.to_string(),
                 aud: audience.to_string(),
                 iss: issuer.to_string(),
                 exp,
@@ -503,7 +506,7 @@ mod tests {
         .expect("token encodes")
     }
 
-    fn jwks_server(key: &TestKey) -> MockServer {
+    pub(crate) fn jwks_server(key: &TestKey) -> MockServer {
         let server = MockServer::start();
         let body = serde_json::json!({
             "keys": [{
@@ -524,13 +527,33 @@ mod tests {
         server
     }
 
-    fn verifier(audience: &str, jwks: &MockServer) -> Arc<IapVerifier> {
+    pub(crate) fn verifier(
+        audience: &str,
+        role: &'static str,
+        jwks: &MockServer,
+    ) -> Arc<IapVerifier> {
         Arc::new(IapVerifier::with_jwks_url(
             audience,
-            "test",
+            role,
             jwks.url("/keys"),
         ))
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use axum::routing::get;
+    use httpmock::prelude::*;
+    use jsonwebtoken::DecodingKey;
+    use p256::ecdsa::SigningKey;
+    use p256::pkcs8::EncodePrivateKey;
+    use tower::ServiceExt as _;
+
+    use super::test_support::*;
+    use super::*;
 
     async fn call(verifier: Arc<IapVerifier>, header: Option<&str>) -> StatusCode {
         let app = Router::new()
@@ -557,7 +580,7 @@ mod tests {
         let jwks = jwks_server(&key);
 
         let status = call(
-            verifier(READ_AUDIENCE, &jwks),
+            verifier(READ_AUDIENCE, "test", &jwks),
             Some(&token(&key, READ_AUDIENCE, IAP_ISSUER, 300)),
         )
         .await;
@@ -575,7 +598,7 @@ mod tests {
         let jwks = jwks_server(&key);
 
         let status = call(
-            verifier(WRITE_AUDIENCE, &jwks),
+            verifier(WRITE_AUDIENCE, "test", &jwks),
             Some(&token(&key, READ_AUDIENCE, IAP_ISSUER, 300)),
         )
         .await;
@@ -591,7 +614,7 @@ mod tests {
         let jwks = jwks_server(&key);
 
         assert_eq!(
-            call(verifier(READ_AUDIENCE, &jwks), None).await,
+            call(verifier(READ_AUDIENCE, "test", &jwks), None).await,
             StatusCode::UNAUTHORIZED
         );
     }
@@ -602,7 +625,7 @@ mod tests {
         let jwks = jwks_server(&key);
 
         let status = call(
-            verifier(READ_AUDIENCE, &jwks),
+            verifier(READ_AUDIENCE, "test", &jwks),
             Some(&token(&key, READ_AUDIENCE, IAP_ISSUER, -3600)),
         )
         .await;
@@ -618,7 +641,7 @@ mod tests {
         let jwks = jwks_server(&key);
 
         let status = call(
-            verifier(READ_AUDIENCE, &jwks),
+            verifier(READ_AUDIENCE, "test", &jwks),
             Some(&token(
                 &key,
                 READ_AUDIENCE,
@@ -648,7 +671,7 @@ mod tests {
         };
 
         let status = call(
-            verifier(READ_AUDIENCE, &jwks),
+            verifier(READ_AUDIENCE, "test", &jwks),
             Some(&token(&impostor, READ_AUDIENCE, IAP_ISSUER, 300)),
         )
         .await;
@@ -668,7 +691,7 @@ mod tests {
         });
 
         let status = call(
-            verifier(READ_AUDIENCE, &unreachable),
+            verifier(READ_AUDIENCE, "test", &unreachable),
             Some(&token(&key, READ_AUDIENCE, IAP_ISSUER, 300)),
         )
         .await;
@@ -703,7 +726,7 @@ mod tests {
             then.status(500);
         });
 
-        let iap = verifier(READ_AUDIENCE, &unreachable);
+        let iap = verifier(READ_AUDIENCE, "test", &unreachable);
         seed_stale_cache(&iap, &key).await;
 
         let status = call(
@@ -730,7 +753,7 @@ mod tests {
             then.status(500);
         });
 
-        let iap = verifier(READ_AUDIENCE, &unreachable);
+        let iap = verifier(READ_AUDIENCE, "test", &unreachable);
         seed_stale_cache(&iap, &key).await;
 
         for _ in 0..3 {

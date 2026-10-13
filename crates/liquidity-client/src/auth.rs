@@ -60,10 +60,12 @@ pub trait TokenSource {
     fn bearer(&self) -> impl Future<Output = Result<String, AuthError>> + Send;
 }
 
-/// A fixed, already-minted bearer token. The desktop OAuth flow yields one ID
-/// token whose audience is the OAuth client id, and IAP admits both the read
-/// and write prefixes on that single identity (the Workspace group decides
-/// which paths succeed), so the same token backs both roles.
+/// A fixed bearer token that has already been minted.
+///
+/// The desktop OAuth flow yields one ID token whose audience is the OAuth
+/// client id, and IAP admits both the read and write prefixes on that single
+/// identity. The Workspace group decides which paths succeed, so the same
+/// token backs both roles.
 pub struct StaticToken(pub String);
 
 impl TokenSource for StaticToken {
