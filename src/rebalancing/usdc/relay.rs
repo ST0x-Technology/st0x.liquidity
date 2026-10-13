@@ -276,7 +276,9 @@ impl<Signer: Wallet> RelayHop<Signer> {
 
     /// Sends again, in nonce order, the approves that went out alone: the
     /// pair's nonces follow theirs, and a node may have dropped them. Each
-    /// is persisted, so a timeout leaves it for the retry.
+    /// is persisted, so a timeout leaves it for the retry. Then waits for
+    /// each to confirm, which releases its nonce and lets the pair signed
+    /// next find the allowance it grants instead of approving again.
     async fn broadcast_split_approves(
         &self,
         id: &UsdcRebalanceId,
@@ -289,6 +291,18 @@ impl<Signer: Wallet> RelayHop<Signer> {
                     .broadcast_approve(TO_HUB, approve)
                     .await
                     .map_err(Box::new)?;
+            }
+
+            for approve in split_approves {
+                match self.bridge.confirm_approve(TO_HUB, approve).await {
+                    Ok(()) => {}
+                    // Its nonce is used all the same; the pair approves
+                    // again when the allowance is short.
+                    Err(RelayBridgeError::ApproveReverted { tx }) => {
+                        warn!(target: "rebalance", %id, %tx, "A split Relay approve reverted; the pair signs its own approve if the allowance is short");
+                    }
+                    Err(error) => return Err(Box::new(error).into()),
+                }
             }
 
             Ok(())
