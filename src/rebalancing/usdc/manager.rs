@@ -1865,6 +1865,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
             .hop
             .ethereum_usdc_credit(withdrawal_tx, self.market_maker_wallet)
             .await
+            .map_err(Into::<CctpError>::into)
         {
             Ok(credited) => credited,
             // The receipt was read but its credit cannot be computed; a reread
