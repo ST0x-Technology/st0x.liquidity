@@ -1730,8 +1730,9 @@ hedging decisions.
 
 - **USDC rebalance stage timing**: per-stage durations of USDC rebalances
   (withdrawal, CCTP burn -> attestation -> mint, deposit, conversion) derived
-  from `UsdcRebalanceEvent` timestamps, including attestation-time trends. Shown
-  on its own dashboard chart, clearly labeled as USDC-specific.
+  from `UsdcRebalanceEvent` timestamps, including attestation-time trends. The
+  Relay swap events open no stage. Shown on its own dashboard chart, clearly
+  labeled as USDC-specific.
 - **Equity rebalance stage timing**: per-stage durations of equity mints
   (acceptance, token receipt, wrap, vault deposit) and redemptions (vault
   withdraw, unwrap, send, detection, completion), derived from
@@ -5005,8 +5006,9 @@ runs the chain-to-Alpaca side up to the confirmed deposit:
    so nothing moves and the guard frees through the dead-letter path.
 2. The vault withdraw, exactly as on a CCTP corridor.
 3. The binding quote (`QuoteSwap` -> `SwapQuoted`), checked against the bounds
-   (`max_quote_loss_bps`, the slippage floor, the Alpaca deposit minimum) and
-   against the withdrawn amount. A refusal here leaves the transfer at
+   (`max_quote_loss_bps` and the slippage floor) and against the withdrawn
+   amount. The Alpaca deposit sets no minimum here: `min_transfer` sizes the
+   transfer against it at the trigger. A refusal here leaves the transfer at
    `WithdrawalComplete` with its guard held: the USDG is in the wallet, and only
    the redeposit step that follows may return it. The timeout sweep holds that
    guard and pages, there and at every swap state after it, and
@@ -5038,8 +5040,9 @@ startup skips that chain's approvals and revokes.
 The swap states hold the corridor guard, are never reconcilable failures, and
 refuse `fail-usdc-transfer` (a deposit may be on chain). On the shared Ethereum
 wallet's credit ledger an Ethereum-origin `SwapQuoted` is held credit and a
-persisted Ethereum pair is in flight, so a Base deposit send cannot spend the
-USDC a Relay swap is about to deposit.
+persisted Ethereum pair is in flight, so a Base deposit send that would spend
+the USDC a Relay swap is about to deposit pages a shortfall. The ledger only
+pages: it reserves nothing and does not block the send.
 
 ##### Crash-safe resume
 
@@ -7404,7 +7407,11 @@ from `BridgingSubmitting`, `WithdrawalComplete`, or a BaseToAlpaca
 `WithdrawalSubmitting` (above) -- it is refused for all post-burn states
 (`Bridging`, `AwaitingAttestation`, `Attested`, `Bridged`, `DepositInitiated`,
 `DepositConfirmed`, `DepositFailed`, `Reconciled`, or any `BridgingFailed` with
-a recorded `burn_tx_hash`). The two surfaces differ in how the in-memory guard
+a recorded `burn_tx_hash`) and for the swap states (`SwapQuoted`,
+`SwapDepositPrepared`, `SwapDeposited`). On a Relay corridor a BaseToAlpaca
+transfer at `WithdrawalComplete` is refused too, with a Relay-specific reason:
+the withdrawn stable is outside the vault, and only the swap or a redeposit
+settles it (see "Relay hop"). The two surfaces differ in how the in-memory guard
 is reconciled. The live route sends `FailBridging` through the conductor-built
 wired store, so the rebalancing reactor runs in process and keeps the transfer's
 corridor guard held for the AlpacaToBase outcome, matching the reported
