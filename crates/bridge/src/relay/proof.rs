@@ -212,7 +212,7 @@ pub(super) fn deposit_event(log: &Log, depository: Address) -> Option<RelayErc20
 #[cfg(test)]
 mod tests {
     use alloy::consensus::Transaction as _;
-    use alloy::primitives::{address, b256};
+    use alloy::primitives::{LogData, address, b256};
     use alloy::rpc::types::Transaction;
 
     use super::*;
@@ -413,6 +413,86 @@ mod tests {
                 selector: IERC20::transferCall::SELECTOR.into()
             }
         );
+    }
+
+    fn transfer_logs(receipt: &mut TransactionReceipt) -> &mut Vec<Log> {
+        &mut receipt
+            .inner
+            .as_receipt_with_bloom_mut()
+            .unwrap()
+            .receipt
+            .logs
+    }
+
+    fn fill_check(tx: &Transaction, receipt: &TransactionReceipt) -> UnverifiedReason {
+        check_payment(
+            &terms(ETHEREUM_USDC, FILLED_ORDER),
+            tx.to(),
+            tx.input(),
+            receipt,
+        )
+        .unwrap_err()
+    }
+
+    #[test]
+    fn fill_without_its_transfer_log_is_unverified() {
+        let (tx, mut receipt) = fill();
+        transfer_logs(&mut receipt).clear();
+
+        assert_eq!(
+            fill_check(&tx, &receipt),
+            UnverifiedReason::TransferCount { count: 0 }
+        );
+    }
+
+    #[test]
+    fn fill_with_its_transfer_logged_twice_is_unverified() {
+        let (tx, mut receipt) = fill();
+        let logs = transfer_logs(&mut receipt);
+        let [transfer] = logs.as_slice() else {
+            panic!("expected the fill's one Transfer log, got {logs:?}");
+        };
+        logs.push(transfer.clone());
+
+        assert_eq!(
+            fill_check(&tx, &receipt),
+            UnverifiedReason::TransferCount { count: 2 }
+        );
+    }
+
+    #[test]
+    fn transfer_from_another_sender_than_the_calldata_is_unverified() {
+        let (tx, mut receipt) = fill();
+        let other = address!("0x2222222222222222222222222222222222222222");
+        let log = &mut transfer_logs(&mut receipt)[0];
+        let mut topics = log.topics().to_vec();
+        topics[1] = other.into_word();
+        log.inner.data = LogData::new_unchecked(topics, log.data().data.clone());
+
+        assert_eq!(
+            fill_check(&tx, &receipt),
+            UnverifiedReason::TransferSender {
+                calldata: SOLVER,
+                logged: other,
+            }
+        );
+    }
+
+    #[test]
+    fn calldata_address_with_dirty_high_bits_is_unverified() {
+        let (tx, receipt) = fill();
+        let mut input = tx.input().to_vec();
+        input[4] = 0x01;
+
+        let reason = check_payment(
+            &terms(ETHEREUM_USDC, FILLED_ORDER),
+            tx.to(),
+            &input,
+            &receipt,
+        )
+        .unwrap_err();
+
+        assert_eq!(reason, UnverifiedReason::CalldataUndecodable);
     }
 
     #[test]

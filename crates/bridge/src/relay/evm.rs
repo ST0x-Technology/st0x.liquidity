@@ -2572,6 +2572,44 @@ mod tests {
         );
     }
 
+    /// Two ends on one node see every tx on both chains, so its side is
+    /// ambiguous.
+    #[tokio::test]
+    async fn payment_on_both_chains_is_unverified() {
+        let harness = Harness::new().await;
+        let bridge = RelayBridge::try_from_ctx(RelayCtx {
+            chain: Chain::Robinhood,
+            ethereum_wallet: wallet(&harness.chain),
+            chain_wallet: wallet(&harness.chain),
+            ethereum_confirmations: CONFIRMATIONS,
+            chain_confirmations: CONFIRMATIONS,
+        })
+        .unwrap()
+        .with_local_contracts(contracts(&harness.chain), contracts(&harness.chain));
+        let order_id = B256::random();
+        harness.chain.mint(harness.chain.solver(), AMOUNT).await;
+        let payment = harness
+            .chain
+            .pay(harness.chain.wallet(), AMOUNT, order_id)
+            .await;
+        harness.chain.mine(CONFIRMATIONS - 1).await;
+
+        let error = bridge
+            .verify_fill(
+                HopDirection::ToHub,
+                RelayOrderId(order_id),
+                MINIMUM_OUT,
+                &[payment],
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            unverified_fill(error),
+            (vec![payment], UnverifiedReason::OnBothChains)
+        );
+    }
+
     #[tokio::test]
     async fn fill_with_two_txs_is_ambiguous() {
         let harness = Harness::new().await;
