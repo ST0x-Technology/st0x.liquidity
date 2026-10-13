@@ -4428,6 +4428,19 @@ impl UsdcRebalance {
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {
+            // As in `transition_fail_bridging`: the mined withdraw left the
+            // stable outside the vault, and only a redeposit returns it.
+            Self::Withdrawing {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor:
+                    corridor @ UsdcCorridor::HubRouted {
+                        hop: HopKind::Relay,
+                        ..
+                    },
+                ..
+            } => Err(UsdcRebalanceError::RelayWithdrawalAwaitsRedeposit {
+                corridor: *corridor,
+            }),
             Self::Withdrawing { .. } => Ok(vec![WithdrawalFailed {
                 reason,
                 failed_at: Utc::now(),
@@ -6101,6 +6114,51 @@ mod tests {
         assert_eq!(
             cctp.pre_burn_fail_eligibility(),
             PreBurnFailEligibility::Eligible
+        );
+    }
+
+    /// A chain-to-Alpaca Relay transfer at `Withdrawing` has its mined
+    /// withdraw's stable outside the vault, so `FailWithdrawal` is refused as
+    /// `FailBridging` is at `WithdrawalComplete`. A CCTP one still fails.
+    #[tokio::test]
+    async fn relay_withdrawing_refuses_fail_withdrawal() {
+        let initiated = |corridor| {
+            withdrawn(RebalanceDirection::BaseToAlpaca, corridor)
+                .into_iter()
+                .take(1)
+                .collect::<Vec<_>>()
+        };
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(initiated(ROBINHOOD_RELAY))
+            .when(UsdcRebalanceCommand::FailWithdrawal {
+                reason: "mismatch".to_string(),
+            })
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(UsdcRebalanceError::RelayWithdrawalAwaitsRedeposit {
+                    corridor: ROBINHOOD_RELAY
+                })
+            ),
+            "got {error:?}"
+        );
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(initiated(UsdcCorridor::BASE_CCTP))
+            .when(UsdcRebalanceCommand::FailWithdrawal {
+                reason: "mismatch".to_string(),
+            })
+            .await
+            .events();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [UsdcRebalanceEvent::WithdrawalFailed { .. }]
+            ),
+            "got {events:?}"
         );
     }
 

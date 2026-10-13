@@ -442,9 +442,15 @@ where
             }
 
             Some(UsdcRebalance::Withdrawing {
-                direction, amount, ..
+                direction,
+                amount,
+                withdrawal_ref,
+                initiated_at,
+                ..
             }) => {
                 Self::require_base_to_alpaca(id, direction)?;
+                self.require_recorded_withdrawal_amount(id, amount, &withdrawal_ref, initiated_at)
+                    .await?;
                 self.cqrs
                     .send(
                         id,
@@ -1231,7 +1237,7 @@ mod tests {
         AlpacaBrokerAuth, AlpacaWalletService, Backpressure, Executor as _, TimeInForce,
     };
     use st0x_float_macro::float;
-    use st0x_raindex::{RaindexContracts, RaindexService, RaindexVaultId};
+    use st0x_raindex::{Raindex as _, RaindexContracts, RaindexService, RaindexVaultId};
 
     use super::*;
     use crate::bot_gas::BotGasReceiptCostEnqueuer;
@@ -1240,7 +1246,8 @@ mod tests {
     use crate::telemetry::TelemetrySender;
     use crate::telemetry::broker::InstrumentedAlpacaBroker;
     use crate::test_utils::{
-        TestAnvilInstance, anvil_wallet, relay_test_client, setup_test_db, spawn_anvil,
+        AnvilRaindexChain, TestAnvilInstance, anvil_wallet, relay_test_client, setup_test_db,
+        spawn_anvil,
     };
     use crate::usdc_rebalance::TransferRef;
 
@@ -1336,6 +1343,33 @@ mod tests {
         store: Arc<Store<UsdcRebalance>>,
         bounds: RelayHopCtx,
     ) -> CrossVenueCashTransfer<TestWallet, RelayHop<TestWallet>> {
+        relay_transfer_on_raindex(
+            server,
+            relay_api,
+            ethereum_wallet,
+            chain_wallet,
+            contracts,
+            store,
+            bounds,
+            RaindexContracts {
+                inventory: Address::repeat_byte(0x0b),
+                orderbook: Address::repeat_byte(0x0b),
+            },
+        )
+        .await
+    }
+
+    /// As [`relay_transfer_with_bounds`], with its vault on `raindex`.
+    async fn relay_transfer_on_raindex(
+        server: &MockServer,
+        relay_api: &MockServer,
+        ethereum_wallet: TestWallet,
+        chain_wallet: TestWallet,
+        contracts: RelayEndContracts,
+        store: Arc<Store<UsdcRebalance>>,
+        bounds: RelayHopCtx,
+        raindex: RaindexContracts,
+    ) -> CrossVenueCashTransfer<TestWallet, RelayHop<TestWallet>> {
         let hub_wallet = ethereum_wallet.address();
         let bridge = RelayBridge::try_from_ctx(RelayCtx {
             chain: Chain::Robinhood,
@@ -1350,10 +1384,7 @@ mod tests {
         let (broker, alpaca_wallet) = alpaca_services(server).await;
         let raindex = Arc::new(RaindexService::new(
             chain_wallet.clone(),
-            RaindexContracts {
-                inventory: Address::repeat_byte(0x0b),
-                orderbook: Address::repeat_byte(0x0b),
-            },
+            raindex,
             chain_wallet.address(),
         ));
 
@@ -1519,6 +1550,157 @@ mod tests {
         let state = store.load(&id).await.unwrap().unwrap();
         assert_eq!(state.state_name(), "WithdrawalComplete");
         assert!(state.holds_rebalance_guard());
+    }
+
+    /// A transfer resumed at `Withdrawing` moves on only once its recorded
+    /// vault withdraw is read back at the recorded amount. One that realized
+    /// another amount, has no receipt, or is shadowed by a later withdraw
+    /// stays at `Withdrawing` with its guard, and no quote is asked.
+    #[tokio::test]
+    async fn resume_at_withdrawing_checks_the_recorded_withdraw() {
+        let chain = AnvilRaindexChain::deploy().await;
+        let stable = Chain::Robinhood.settlement_stable();
+        chain
+            .etch_bot_stable(stable.address, U256::from(1_000_000_000_u64))
+            .await;
+        let vault_id = RaindexVaultId(B256::repeat_byte(0x0c));
+        let raindex_contracts = RaindexContracts {
+            inventory: chain.orderbook,
+            orderbook: chain.orderbook,
+        };
+        let vault = RaindexService::new(chain.bot_wallet.clone(), raindex_contracts, chain.bot);
+        let deposit = vault
+            .submit_deposit(
+                stable.address,
+                vault_id,
+                U256::from(500_000_000_u64),
+                stable.decimals,
+            )
+            .await
+            .unwrap();
+        vault.confirm_tx(deposit).await.unwrap();
+
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let quote = relay_api.mock(|when, then| {
+            when.method(POST).path("/quote/v2");
+            then.status(400).json_body(json!({
+                "message": "No routes",
+                "errorCode": "NO_SWAP_ROUTES_FOUND",
+                "requestId": "0x00"
+            }));
+        });
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = relay_transfer_on_raindex(
+            &server,
+            &relay_api,
+            chain.bot_wallet.clone(),
+            chain.bot_wallet.clone(),
+            RelayEndContracts {
+                stable: stable.address,
+                depository: Address::repeat_byte(0x52),
+            },
+            store.clone(),
+            relay_bounds(),
+            raindex_contracts,
+        )
+        .await;
+        let withdraw = || async {
+            vault
+                .withdraw(
+                    stable.address,
+                    vault_id,
+                    U256::from(40_000_000_u64),
+                    stable.decimals,
+                )
+                .await
+                .unwrap()
+        };
+        let initiate = |amount, withdraw_tx| {
+            let store = store.clone();
+            async move {
+                let id = UsdcRebalanceId(Uuid::new_v4());
+                store
+                    .send(
+                        &id,
+                        UsdcRebalanceCommand::Initiate {
+                            direction: RebalanceDirection::BaseToAlpaca,
+                            corridor: ROBINHOOD_RELAY,
+                            amount: Usdc::new(amount),
+                            withdrawal: TransferRef::OnchainTx(withdraw_tx),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                id
+            }
+        };
+        let held_at_withdrawing = |id: UsdcRebalanceId| {
+            let store = store.clone();
+            async move {
+                let state = store.load(&id).await.unwrap().unwrap();
+                assert_eq!(state.state_name(), "Withdrawing", "got {state:?}");
+                assert!(state.holds_rebalance_guard());
+            }
+        };
+
+        let short = initiate(float!(100), withdraw().await).await;
+        let error = transfer
+            .resume_base_to_alpaca(&short, Usdc::new(float!(100)), ROBINHOOD_RELAY)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                UsdcTransferError::AdoptedWithdrawalAmountMismatch { withdrawn, requested, .. }
+                    if withdrawn == U256::from(40_000_000_u64)
+                        && requested == U256::from(100_000_000_u64)
+            ),
+            "got {error:?}"
+        );
+        held_at_withdrawing(short.clone()).await;
+
+        let unmined = initiate(float!(40), TxHash::repeat_byte(0x77)).await;
+        let error = transfer
+            .resume_base_to_alpaca(&unmined, Usdc::new(float!(40)), ROBINHOOD_RELAY)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                UsdcTransferError::RecordedWithdrawalUnverified { .. }
+            ),
+            "got {error:?}"
+        );
+        held_at_withdrawing(unmined).await;
+        quote.assert_calls(0);
+
+        let exact = initiate(float!(40), withdraw().await).await;
+        let error = transfer
+            .resume_base_to_alpaca(&exact, Usdc::new(float!(40)), ROBINHOOD_RELAY)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, UsdcTransferError::RelayApi(relay)
+                if matches!(**relay, RelayError::QuoteRefused { code: QuoteErrorCode::NoSwapRoutesFound })),
+            "the exact withdraw moves on to the quote; got {error:?}"
+        );
+        let state = store.load(&exact).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "WithdrawalComplete");
+        quote.assert_calls(1);
+
+        let error = transfer
+            .resume_base_to_alpaca(&short, Usdc::new(float!(100)), ROBINHOOD_RELAY)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                UsdcTransferError::RecordedWithdrawalUnverified { .. }
+            ),
+            "a later withdraw shadows the short one; got {error:?}"
+        );
+        held_at_withdrawing(short).await;
     }
 
     /// The Alpaca-to-chain side is refused before any call, and a CCTP mint

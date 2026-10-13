@@ -61,7 +61,7 @@ use crate::bot_gas::redrive::BotGasFailureClassifier;
 use crate::inventory::InventoryViewError;
 use crate::native_gas::GasReadinessFailure;
 use crate::usdc_rebalance::{
-    BurnTxOwnershipLookupError, RebalanceDirection, UsdcRebalance, UsdcRebalanceId,
+    BurnTxOwnershipLookupError, RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceId,
 };
 
 #[derive(Debug, Error)]
@@ -412,6 +412,16 @@ pub enum UsdcTransferError {
         id: UsdcRebalanceId,
         withdrawn: alloy::primitives::U256,
         requested: alloy::primitives::U256,
+    },
+    /// The realized amount of the vault withdraw recorded at `Withdrawing`
+    /// cannot be read yet, so the transfer does not move past it.
+    #[error(
+        "USDC rebalance {id}: the realized amount of its recorded vault withdrawal \
+         {withdrawal:?} is not known yet; holding at Withdrawing"
+    )]
+    RecordedWithdrawalUnverified {
+        id: UsdcRebalanceId,
+        withdrawal: TransferRef,
     },
     /// The USD->USDC conversion settled below Alpaca's withdrawal minimum,
     /// which the trigger can only enforce on the amount it *requests*: a
@@ -791,6 +801,7 @@ impl UsdcTransferError {
             | Self::DepositRefMustBeOnchain { .. }
             | Self::ResumeDirectionMismatch { .. }
             | Self::AdoptedWithdrawalAmountMismatch { .. }
+            | Self::RecordedWithdrawalUnverified { .. }
             | Self::WithdrawalRefMustBeAlpacaId { .. }
             | Self::WithdrawalTxMissing { .. }
             | Self::WithdrawalCreditMismatch { .. }
@@ -869,6 +880,7 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::DepositRefMustBeOnchain { .. }
             | Self::ResumeDirectionMismatch { .. }
             | Self::AdoptedWithdrawalAmountMismatch { .. }
+            | Self::RecordedWithdrawalUnverified { .. }
             | Self::WithdrawalRefMustBeAlpacaId { .. }
             | Self::WithdrawalTxMissing { .. }
             | Self::WithdrawalCreditMismatch { .. }

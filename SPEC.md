@@ -5004,7 +5004,11 @@ runs the chain-to-Alpaca side up to the confirmed deposit:
 1. A pre-flight quote at dispatch, never persisted. A refusal, or a quote
    outside the sub-table's bounds, ends the attempt before anything is recorded,
    so nothing moves and the guard frees through the dead-letter path.
-2. The vault withdraw, exactly as on a CCTP corridor.
+2. The vault withdraw, as on a CCTP corridor, except that an adopted withdraw
+   that realized another amount is not failed: the transfer holds at
+   `Withdrawing` with its guard, its stable outside the vault. A resume at
+   `Withdrawing` reads the recorded withdraw back and moves on only at the
+   recorded amount, and `FailWithdrawal` is refused there.
 3. The binding quote (`QuoteSwap` -> `SwapQuoted`), checked against the bounds
    (`max_quote_loss_bps` and the slippage floor) and against the withdrawn
    amount. The Alpaca deposit sets no minimum here: `min_transfer` sizes the
