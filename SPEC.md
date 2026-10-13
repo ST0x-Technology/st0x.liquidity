@@ -5036,6 +5036,11 @@ runs the chain-to-Alpaca side up to the confirmed deposit:
    the quote's order id.
 6. The transfer then waits at `SwapDeposited` with its guard held.
 
+A Relay rate limit (429) on either quote is backpressure, as a broker 429 is
+(see "Broker rate-limit (429) backpressure"): the job reschedules after Relay's
+`Retry-After` instead of spending its retries, and the resume quotes again from
+the recorded state.
+
 At startup the persisted pairs are restored before any other send from their
 wallet: pairs signed on the Ethereum wallet once, by the hub service, together
 with the Alpaca deposit sends; pairs signed on a corridor chain by that

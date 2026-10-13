@@ -22,6 +22,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tracing::{debug, error, warn};
 
+use st0x_bridge::relay::RelayError;
 use st0x_execution::{AlpacaBrokerApiError, AlpacaWalletError, Backpressure, Permanence};
 use st0x_tokenization::{AlpacaTokenizationError, TokenizerError};
 
@@ -269,9 +270,10 @@ pub(crate) async fn apply_backpressure_step<
 ///
 /// Walks the `.source()` chain,
 /// broker rate-limit (429) response, checking the error itself before
-/// descending into its sources. Tries each of four known error types in
-/// turn, short-circuiting on the first `Some` -- this is the one place that
-/// needs to "know about" all of them (RAI-1494).
+/// descending into its sources. Tries each of four known Alpaca error types,
+/// then a Relay API rate limit, in turn, short-circuiting on the first
+/// `Some` -- this is the one place that needs to "know about" all of them
+/// (RAI-1494).
 ///
 /// `AlpacaMarketDataError` (market-data 429s, e.g. from
 /// `fetch_latest_trade_price`) is NOT one of the four: it only ever reaches
@@ -309,7 +311,31 @@ pub fn find_backpressure(error: &(dyn std::error::Error + 'static)) -> Option<Ba
                     .downcast_ref::<TokenizerError>()
                     .and_then(TokenizerError::backpressure)
             })
+            .or_else(|| relay_backpressure(error))
     })
+}
+
+/// A Relay API rate limit, with Relay's `Retry-After`. The USDC transfer
+/// errors box `RelayError`, and a `Box` in the chain downcasts only as
+/// itself, so both shapes are tried.
+fn relay_backpressure(error: &(dyn std::error::Error + 'static)) -> Option<Backpressure> {
+    let relay = error
+        .downcast_ref::<RelayError>()
+        .or_else(|| error.downcast_ref::<Box<RelayError>>().map(AsRef::as_ref))?;
+
+    match relay {
+        RelayError::RateLimited { retry_after } => Some(Backpressure {
+            retry_after: *retry_after,
+        }),
+        RelayError::Transport(_)
+        | RelayError::Decode { .. }
+        | RelayError::QuoteRefused { .. }
+        | RelayError::HttpStatus { .. }
+        | RelayError::QuoteMismatch(_)
+        | RelayError::ApiKeyHeader(_)
+        | RelayError::NoApiKey
+        | RelayError::Unauthorized { .. } => None,
+    }
 }
 
 /// Walks an error chain for a broker failure's [`Permanence`], the same way
