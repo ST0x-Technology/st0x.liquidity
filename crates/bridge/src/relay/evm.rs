@@ -1797,6 +1797,45 @@ mod tests {
         );
     }
 
+    /// A mined deposit proves its approve's nonce used, so confirming it
+    /// releases both reservations.
+    #[tokio::test]
+    async fn confirmed_deposit_releases_its_approve_nonce() {
+        let harness = Harness::new().await;
+        harness.chain.mint(harness.chain.wallet(), AMOUNT).await;
+        let order_id = B256::random();
+        let quote = accepted(quote(&harness.chain, order_id, true));
+        let prepared = harness
+            .bridge
+            .prepare_deposit(HopDirection::ToHub, &quote)
+            .await
+            .map(deposit_pair)
+            .unwrap();
+        let approve = prepared.approve.clone().unwrap().tx_hash();
+        let wallet = &harness.bridge.chain.wallet;
+        assert_eq!(
+            wallet
+                .transaction_submission(approve)
+                .map(|submission| submission.nonce),
+            Some(0)
+        );
+
+        let deposit = harness
+            .bridge
+            .broadcast_deposit(HopDirection::ToHub, &prepared)
+            .await
+            .unwrap();
+        harness.chain.mine(CONFIRMATIONS - 1).await;
+        harness
+            .bridge
+            .confirm_deposit(HopDirection::ToHub, RelayOrderId(order_id), deposit)
+            .await
+            .unwrap();
+
+        assert_eq!(wallet.transaction_submission(approve), None);
+        assert_eq!(wallet.transaction_submission(deposit), None);
+    }
+
     #[tokio::test]
     async fn deposit_and_payment_short_of_the_bridge_confirmations_are_unconfirmed() {
         let harness = Harness::new().await;
