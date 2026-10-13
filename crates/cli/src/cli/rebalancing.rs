@@ -2736,6 +2736,18 @@ mod tests {
         );
     }
 
+    /// A recorded vault withdrawal with no tx hash never gains one, so the
+    /// worker does not redrive it and the CLI must not hand it off.
+    #[test]
+    fn recorded_withdrawal_without_tx_hash_is_not_a_bot_resumable_wait() {
+        assert!(!is_bot_resumable_wait(
+            &UsdcTransferError::RecordedWithdrawalUnverified {
+                id: UsdcRebalanceId(Uuid::from_u128(7)),
+                withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::from_u128(1))),
+            }
+        ));
+    }
+
     #[test]
     fn burn_ownership_refusals_are_not_bot_resumable_waits() {
         let id = UsdcRebalanceId(Uuid::from_u128(7));
