@@ -629,27 +629,36 @@ where
             .await
             .map_err(Box::new)?;
         let split_approves = self.split_approves(id).await?;
-        let deposit = self
+        let confirmed = self
             .hop
             .bridge
             .confirm_deposit(TO_HUB, RelayOrderId(order_id), &pair, &split_approves)
-            .await
-            .map_err(Box::new)?;
+            .await;
 
-        // Enqueued before `ConfirmSwapDeposit` (see `enqueue_bot_gas_cost`): a
-        // failed enqueue leaves `SwapDepositPrepared`, whose retry sends the
-        // same pair again and enqueues again.
-        let chain = self.corridor.chain();
-        for approve in split_approves.iter().chain(&pair.approve) {
-            self.enqueue_bot_gas_cost(
-                chain,
-                approve.tx_hash(),
-                BotGasOperationCategory::RelayApprove,
-            )
-            .await?;
+        // A reverted deposit was mined too, so the bot paid for it and its
+        // approves. Enqueued before `ConfirmSwapDeposit` (see
+        // `enqueue_bot_gas_cost`): a failed enqueue leaves
+        // `SwapDepositPrepared`, whose retry sends the same pair again and
+        // enqueues again.
+        let mined = match &confirmed {
+            Ok(_) | Err(RelayBridgeError::DepositReverted { .. }) => true,
+            Err(_) => false,
+        };
+        if mined {
+            let chain = self.corridor.chain();
+            for approve in split_approves.iter().chain(&pair.approve) {
+                self.enqueue_bot_gas_cost(
+                    chain,
+                    approve.tx_hash(),
+                    BotGasOperationCategory::RelayApprove,
+                )
+                .await?;
+            }
+            self.enqueue_bot_gas_cost(chain, deposit_tx, BotGasOperationCategory::RelayDeposit)
+                .await?;
         }
-        self.enqueue_bot_gas_cost(chain, deposit_tx, BotGasOperationCategory::RelayDeposit)
-            .await?;
+
+        let deposit = confirmed.map_err(Box::new)?;
 
         self.cqrs
             .send(
