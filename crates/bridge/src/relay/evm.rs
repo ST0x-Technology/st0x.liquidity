@@ -18,7 +18,7 @@ use super::proof::{
     PaymentTerms, RelayErc20Deposit, UnverifiedReason, check_payment, deposit_event,
 };
 use super::quote::{StepTerms, check_steps};
-use super::{AcceptedRelayQuote, QuoteMismatch, RelayOrderId};
+use super::{AcceptedRelayQuote, QuoteField, QuoteMismatch, RelayOrderId};
 use crate::{
     DepositScan, HopDirection, PreparedSwap, PreparedSwapDeposit, SwapBridge, SwapDeposit,
     SwapPayment, SwapSide,
@@ -196,6 +196,42 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> RelayBridge<EthWallet, ChainWallet>
         self
     }
 
+    /// The quote must move `direction`'s way, pay the fill to our wallet on
+    /// the destination and every refund to our wallet on both ends: a payment
+    /// is proven against the wallet of the side it lands on, so a quote
+    /// paying anyone else would be signed and never proven.
+    fn check_ends(
+        &self,
+        direction: HopDirection,
+        quote: &AcceptedRelayQuote,
+    ) -> Result<(), RelayBridgeError> {
+        let (origin, destination) = match direction {
+            HopDirection::ToHub => (self.chain.chain, self.hub.chain),
+            HopDirection::FromHub => (self.hub.chain, self.chain.chain),
+        };
+
+        if (quote.origin(), quote.destination()) != (origin, destination) {
+            return Err(RelayBridgeError::DirectionMismatch {
+                direction,
+                origin: quote.origin(),
+                destination: quote.destination(),
+            });
+        }
+
+        let destination_wallet = match direction {
+            HopDirection::ToHub => self.hub.wallet.address(),
+            HopDirection::FromHub => self.chain.wallet.address(),
+        };
+
+        check_wallet(QuoteField::Recipient, destination_wallet, quote.recipient())?;
+
+        for wallet in [self.hub.wallet.address(), self.chain.wallet.address()] {
+            check_wallet(QuoteField::RefundRecipient, wallet, quote.refund_to())?;
+        }
+
+        Ok(())
+    }
+
     /// Finds `tx` on the origin or the destination chain of `direction`.
     async fn locate(
         &self,
@@ -289,6 +325,8 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> SwapBridge for RelayBridge<EthWalle
         direction: HopDirection,
         quote: &AcceptedRelayQuote,
     ) -> Result<PreparedSwap, RelayBridgeError> {
+        self.check_ends(direction, quote)?;
+
         match direction {
             HopDirection::ToHub => self.chain.prepare_deposit(quote).await,
             HopDirection::FromHub => self.hub.prepare_deposit(quote).await,
@@ -922,6 +960,18 @@ impl<W: Wallet> RelayEnd<W> {
     }
 }
 
+fn check_wallet(field: QuoteField, wallet: Address, quoted: Address) -> Result<(), QuoteMismatch> {
+    if quoted == wallet {
+        return Ok(());
+    }
+
+    Err(QuoteMismatch::AddressMismatch {
+        field,
+        expected: wallet,
+        actual: quoted,
+    })
+}
+
 /// The approve must sit at the nonce right before its deposit.
 fn check_pair_nonces(
     approve: &PreparedTransaction,
@@ -1001,8 +1051,8 @@ mod tests {
     use super::super::quote::depositErc20Call;
     use super::super::test_chain::RelayChain;
     use super::super::{
-        BasisPoints, QuoteAmounts, QuoteBounds, QuoteFees, QuoteField, QuoteStep, RelayQuote,
-        RelayRequestId, StepTransaction,
+        BasisPoints, QuoteAmounts, QuoteBounds, QuoteFees, QuoteStep, RelayQuote, RelayRequestId,
+        StepTransaction,
     };
     use super::*;
 

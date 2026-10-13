@@ -177,6 +177,27 @@ impl RelayQuote {
         self.fees
     }
 
+    /// The chain the deposit is on, checked against the request.
+    pub const fn origin(&self) -> Chain {
+        self.origin
+    }
+
+    /// The chain the solver fills on, checked against the request.
+    pub const fn destination(&self) -> Chain {
+        self.destination
+    }
+
+    /// Who the fill pays, checked against the request.
+    pub const fn recipient(&self) -> Address {
+        self.recipient
+    }
+
+    /// Who every refund option pays, on either chain, checked against the
+    /// request.
+    pub const fn refund_to(&self) -> Address {
+        self.refund_to
+    }
+
     /// The quote, ready to sign, if its amounts clear `bounds`.
     pub fn accept(self, bounds: &QuoteBounds) -> Result<AcceptedRelayQuote, QuoteAcceptanceError> {
         self.amounts.accept(bounds)?;

@@ -242,6 +242,11 @@ Before signing it runs the quote's step check again, against its own end
 native value (the wallet signs none), the approve calls the stable and allows
 the depository exactly `amount_in`, and the deposit calls the depository and
 credits the signing wallet `amount_in` of the stable for the quote's order id.
+It also requires the quote's checked chains to match the direction
+(`DirectionMismatch`), its recipient to be our wallet on the destination, and
+its `refundTo` to be our wallet on both ends (`Quote(AddressMismatch)`): a fill
+or refund is proven against the wallet of the side it lands on, so a quote
+paying anyone else would be signed and never proven.
 
 - The approve is estimated and padded as usual. With no approve step in the
   quote, the bridge reads the allowance and signs its own exact
