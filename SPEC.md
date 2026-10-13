@@ -5287,8 +5287,10 @@ left a vault:
    `signed_order_ids`), while fewer than `max_refund_retries` re-quotes followed
    a refund (`refund_requotes`), the refunded amount is at least `min_transfer`
    and the refund is not short of its refund floor (step 8 above; `RequoteSwap`
-   refuses a short one); each such re-quote starts a fresh revert budget.
-   Otherwise the transfer holds at `SwapRefunded`, guard held, paged, for
+   refuses a short one); each such re-quote starts a fresh revert budget but
+   keeps `first_deposit`, so the refund of every attempt is measured against the
+   transfer's first deposit and losses never stack across re-quotes. Otherwise
+   the transfer holds at `SwapRefunded`, guard held, paged, for
    `transfer reconcile`. A refund paid in the chain's stable (destination side)
    holds the same way: the stable is in the chain wallet, not the vault. A
    failure and an unresolved escrow follow step 8 above.

@@ -1409,7 +1409,7 @@ where
     /// holds at `SwapRefunded`, guard kept, for the operator.
     async fn hold_short_refund(&self, id: &UsdcRebalanceId) -> Result<bool, UsdcTransferError> {
         let Some(UsdcRebalance::SwapRefunded {
-            quote,
+            first_deposit,
             refund_tx,
             side,
             amount_refunded,
@@ -1424,7 +1424,7 @@ where
             return Ok(false);
         };
 
-        let deposited = quote.amount_in;
+        let deposited = first_deposit.amount_in;
         let refunded = usdc_to_u256(amount_refunded)?;
         let shortfall = deposited.saturating_sub(refunded);
         error!(target: "operational_alert", alert = true, kind = AlertKind::RelayRefundBelowFloor.as_str(), %id, %refund_tx, ?side, %deposited, %refunded, %floor, %shortfall, "Relay refunded less than the refund floor; the transfer holds its guard at SwapRefunded until the operator settles it and reconciles");

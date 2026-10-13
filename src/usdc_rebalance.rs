@@ -4161,12 +4161,14 @@ impl EventSourced for UsdcRebalance {
             },
 
             // An Alpaca-to-chain refund at the hub quoted again: a fresh
-            // attempt on the refunded amount, its revert budget anew.
+            // attempt on the refunded amount, its revert budget anew, its
+            // refunds still measured against the first deposit.
             (
                 SwapRequoted { quote, quoted_at },
                 Self::SwapRefunded {
                     direction,
                     corridor,
+                    first_deposit,
                     signed_order_ids,
                     refund_requotes,
                     initiated_at,
@@ -4176,7 +4178,7 @@ impl EventSourced for UsdcRebalance {
                 direction: *direction,
                 corridor: *corridor,
                 amount: swap_input(quote)?,
-                first_deposit: FirstDeposit::from(quote.as_ref()),
+                first_deposit: *first_deposit,
                 quote: quote.clone(),
                 signed_order_ids: signed_order_ids.clone(),
                 split_approves: Vec::new(),
