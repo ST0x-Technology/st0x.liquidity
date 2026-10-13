@@ -2482,4 +2482,62 @@ mod tests {
             .unwrap();
         assert_eq!(next.nonce(), first_nonce, "the pair's nonces are released");
     }
+
+    /// A pair that mined before a restart recorded its deposit is restored,
+    /// but it does not count as unmined: startup still runs the chain's
+    /// approvals and revokes.
+    #[tokio::test]
+    async fn restored_pair_that_already_mined_is_not_counted_unmined() {
+        let anvil = spawn_anvil(Anvil::new());
+        let (wallet, contracts) = funded_relay_end(&anvil).await;
+        let pool = setup_test_db().await;
+        let store = Arc::new(test_store(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let transfer = relay_transfer(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet.clone(),
+            contracts,
+            store.clone(),
+        )
+        .await;
+        record_quoted(
+            &store,
+            &id,
+            exact_quote(&wallet, contracts, B256::repeat_byte(0x0d)).await,
+        )
+        .await;
+        let (pair, _order_id) = transfer
+            .prepare_and_persist_swap_pair(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        transfer
+            .hop
+            .bridge
+            .broadcast_deposit(TO_HUB, &pair)
+            .await
+            .unwrap();
+        wallet.await_receipt(pair.deposit.tx_hash()).await.unwrap();
+        assert_eq!(
+            store.load(&id).await.unwrap().unwrap().state_name(),
+            "SwapDepositPrepared"
+        );
+
+        let by_chain = transfer.restore_chain_signed_swaps(&pool).await;
+
+        assert_eq!(
+            by_chain,
+            BTreeMap::from([(
+                Chain::Robinhood,
+                RestoredDepositSends {
+                    restored: 2,
+                    unmined: 0,
+                },
+            )])
+        );
+    }
 }
