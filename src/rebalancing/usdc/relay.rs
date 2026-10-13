@@ -1227,13 +1227,14 @@ mod tests {
     use st0x_evm::{Evm, EvmError, IERC20};
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
-        AlpacaBrokerAuth, AlpacaWalletService, Executor as _, TimeInForce,
+        AlpacaBrokerAuth, AlpacaWalletService, Backpressure, Executor as _, TimeInForce,
     };
     use st0x_float_macro::float;
     use st0x_raindex::{RaindexContracts, RaindexService, RaindexVaultId};
 
     use super::*;
     use crate::bot_gas::BotGasReceiptCostEnqueuer;
+    use crate::conductor::job::find_backpressure;
     use crate::rebalancing::usdc::{MarketMakingUsdcEndpoints, UsdcSettlementParams};
     use crate::telemetry::TelemetrySender;
     use crate::telemetry::broker::InstrumentedAlpacaBroker;
@@ -2582,6 +2583,68 @@ mod tests {
                     unmined: 0,
                 },
             )])
+        );
+    }
+
+    /// A binding quote that Relay rate-limits after the vault withdrawal is
+    /// backpressure carrying Relay's `Retry-After`, so the job reschedules
+    /// past the limit instead of spending its retries; the transfer stays at
+    /// `WithdrawalComplete`.
+    #[tokio::test]
+    async fn rate_limited_binding_quote_is_backpressure() {
+        let anvil = spawn_anvil(Anvil::new());
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        relay_api.mock(|when, then| {
+            when.method(POST).path("/quote/v2");
+            then.status(429).header("retry-after", "17");
+        });
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let contracts = RelayEndContracts {
+            stable: Address::repeat_byte(0x51),
+            depository: Address::repeat_byte(0x52),
+        };
+        let transfer = relay_transfer(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet,
+            contracts,
+            store.clone(),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        for command in [
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor: ROBINHOOD_RELAY,
+                amount: Usdc::new(float!(100)),
+                withdrawal: TransferRef::OnchainTx(TxHash::repeat_byte(0x77)),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+        ] {
+            store.send(&id, command).await.unwrap();
+        }
+
+        let error = transfer
+            .resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            find_backpressure(&error),
+            Some(Backpressure {
+                retry_after: Some(Duration::from_secs(17)),
+            }),
+            "got {error:?}"
+        );
+        assert_eq!(
+            store.load(&id).await.unwrap().unwrap().state_name(),
+            "WithdrawalComplete"
         );
     }
 }
