@@ -144,6 +144,10 @@ pub struct RelayQuote {
     pub(super) amounts: QuoteAmounts,
     pub(super) deadline: SystemTime,
     pub(super) fees: QuoteFees,
+    pub(super) origin: Chain,
+    pub(super) destination: Chain,
+    pub(super) recipient: Address,
+    pub(super) refund_to: Address,
     pub(super) approve: Option<StepTransaction>,
     pub(super) deposit: StepTransaction,
 }
@@ -680,6 +684,10 @@ impl QuoteResponse {
                 relayer: self.fees.relayer.amount,
                 gas: self.fees.gas.amount,
             },
+            origin,
+            destination: request.destination,
+            recipient: request.recipient,
+            refund_to: request.refund_to,
             approve,
             deposit,
         })

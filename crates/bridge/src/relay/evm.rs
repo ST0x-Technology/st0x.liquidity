@@ -101,6 +101,12 @@ pub enum RelayBridgeError {
     /// A step does not match the quote or the end it is signed on.
     #[error(transparent)]
     Quote(#[from] QuoteMismatch),
+    #[error("quote moves {origin} -> {destination}, not {direction:?}")]
+    DirectionMismatch {
+        direction: HopDirection,
+        origin: Chain,
+        destination: Chain,
+    },
     #[error("prepared approve has nonce {approve}, the deposit {deposit}: not consecutive")]
     PairNonces { approve: u64, deposit: u64 },
     #[error("tx {tx} has {confirmations} confirmations, the bridge needs {required}")]
@@ -1185,8 +1191,9 @@ mod tests {
         }
     }
 
-    /// A quote for depositing `AMOUNT` on `origin`, shaped like a checked
-    /// live one.
+    /// A Robinhood -> hub quote for depositing `AMOUNT` on `origin`, shaped
+    /// like a checked live one: the fill and refunds pay our wallet, whose
+    /// address is the same on both ends.
     fn quote(origin: &RelayChain, order_id: B256, with_approve: bool) -> RelayQuote {
         let step = |to, data: Vec<u8>| StepTransaction {
             chain_id: origin.chain_id(),
@@ -1209,6 +1216,10 @@ mod tests {
                 relayer: U256::from(236_245),
                 gas: U256::from(1_000),
             },
+            origin: Chain::Robinhood,
+            destination: Chain::Ethereum,
+            recipient: origin.wallet(),
+            refund_to: origin.wallet(),
             approve: with_approve.then(|| {
                 step(
                     origin.stable,
@@ -1907,6 +1918,108 @@ mod tests {
                 }) if actual == other
             ),
             "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn quote_paying_another_recipient_is_refused_at_signing() {
+        let harness = Harness::new().await;
+        let mut quote = quote(&harness.chain, B256::random(), true);
+        let other = Address::repeat_byte(0x33);
+        quote.recipient = other;
+
+        let error = harness
+            .bridge
+            .prepare_deposit(HopDirection::ToHub, &accepted(quote))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                RelayBridgeError::Quote(QuoteMismatch::AddressMismatch {
+                    field: QuoteField::Recipient,
+                    expected,
+                    actual,
+                }) if expected == harness.hub.wallet() && actual == other
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn quote_refunding_another_address_is_refused_at_signing() {
+        let harness = Harness::new().await;
+        let mut quote = quote(&harness.chain, B256::random(), true);
+        let other = Address::repeat_byte(0x33);
+        quote.refund_to = other;
+
+        let error = harness
+            .bridge
+            .prepare_deposit(HopDirection::ToHub, &accepted(quote))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                RelayBridgeError::Quote(QuoteMismatch::AddressMismatch {
+                    field: QuoteField::RefundRecipient,
+                    actual,
+                    ..
+                }) if actual == other
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// A quote is signed only for the direction it was quoted: its steps
+    /// matching one end is not enough.
+    #[tokio::test]
+    async fn quote_for_the_reverse_direction_is_refused_at_signing() {
+        let harness = Harness::new().await;
+        let mut reversed = quote(&harness.chain, B256::random(), true);
+        reversed.origin = Chain::Ethereum;
+        reversed.destination = Chain::Robinhood;
+        let to_hub = quote(&harness.chain, B256::random(), true);
+
+        let reversed_quote = harness
+            .bridge
+            .prepare_deposit(HopDirection::ToHub, &accepted(reversed))
+            .await
+            .unwrap_err();
+        let reversed_call = harness
+            .bridge
+            .prepare_deposit(HopDirection::FromHub, &accepted(to_hub))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                reversed_quote,
+                RelayBridgeError::DirectionMismatch {
+                    direction: HopDirection::ToHub,
+                    origin: Chain::Ethereum,
+                    destination: Chain::Robinhood,
+                }
+            ),
+            "{reversed_quote:?}"
+        );
+        assert!(
+            matches!(
+                reversed_call,
+                RelayBridgeError::DirectionMismatch {
+                    direction: HopDirection::FromHub,
+                    origin: Chain::Robinhood,
+                    destination: Chain::Ethereum,
+                }
+            ),
+            "{reversed_call:?}"
+        );
+        assert_eq!(
+            next_two_nonces(&harness.bridge.chain.wallet).await,
+            [0, 1],
+            "nothing was signed"
         );
     }
 
