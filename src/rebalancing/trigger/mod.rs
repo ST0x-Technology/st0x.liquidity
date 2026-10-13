@@ -45986,13 +45986,14 @@ mod tests {
     }
 
     /// Sweeps a chain-to-Alpaca Robinhood Relay transfer recorded in `store`
-    /// whose tracking still reads `WithdrawalConfirmed` and is past its
-    /// timeout, whatever state the store holds.
-    async fn sweep_stale_relay_transfer(
+    /// whose tracking reads `stage` and is past its timeout, whatever state
+    /// the store holds.
+    async fn sweep_timed_out_relay_transfer(
         pool: &SqlitePool,
         store: Arc<Store<UsdcRebalance>>,
         id: &UsdcRebalanceId,
         amount: Usdc,
+        stage: usdc::UsdcRebalanceStage,
     ) -> Arc<RebalancingService> {
         let now = Utc::now();
         let config = RebalancingServiceConfig {
@@ -46041,7 +46042,7 @@ mod tests {
                 direction: RebalanceDirection::BaseToAlpaca,
                 initiated_amount: amount,
                 bridged_amount_received: None,
-                stage: usdc::UsdcRebalanceStage::WithdrawalConfirmed,
+                stage,
                 last_progress_at: now - ChronoDuration::minutes(31),
             },
         );
@@ -46077,7 +46078,14 @@ mod tests {
             store.send(&id, command).await.unwrap();
         }
 
-        let trigger = sweep_stale_relay_transfer(&pool, store, &id, amount).await;
+        let trigger = sweep_timed_out_relay_transfer(
+            &pool,
+            store,
+            &id,
+            amount,
+            usdc::UsdcRebalanceStage::WithdrawalConfirmed,
+        )
+        .await;
 
         assert!(
             trigger.usdc_guards.is_held(Chain::Robinhood),
@@ -46140,7 +46148,14 @@ mod tests {
             .await
             .unwrap();
 
-        let trigger = sweep_stale_relay_transfer(&pool, store, &id, usdc(100)).await;
+        let trigger = sweep_timed_out_relay_transfer(
+            &pool,
+            store,
+            &id,
+            usdc(100),
+            usdc::UsdcRebalanceStage::WithdrawalConfirmed,
+        )
+        .await;
 
         assert!(
             trigger.usdc_guards.is_held(Chain::Robinhood),
@@ -46163,6 +46178,62 @@ mod tests {
                 .cloned(),
             Some(id),
             "the transfer must stay the active rebalance",
+        );
+    }
+
+    /// Tracking that is current at `SwapDeposited` reads as past the hop, so
+    /// the sweep takes its post-burn branch: it must still send the Relay
+    /// hold page, not the CCTP-burn page, since no CCTP burn exists.
+    #[tokio::test]
+    async fn sweep_sends_the_relay_hold_page_for_current_tracking_at_swap_deposited() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let deposit = PreparedTransaction::for_test(TxHash::repeat_byte(0xa3), 6);
+        crate::usdc_rebalance::record_swap_pair_for_test(
+            &store,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            ROBINHOOD_RELAY,
+            None,
+            deposit.clone(),
+        )
+        .await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmSwapDeposit {
+                    deposit_tx: deposit.tx_hash(),
+                    deposit_block: 9,
+                },
+            )
+            .await
+            .unwrap();
+
+        let trigger = sweep_timed_out_relay_transfer(
+            &pool,
+            store,
+            &id,
+            usdc(100),
+            usdc::UsdcRebalanceStage::SwapDeposited,
+        )
+        .await;
+
+        assert!(
+            trigger.usdc_guards.is_held(Chain::Robinhood),
+            "the guard must stay held while the deposit is with Relay",
+        );
+        assert!(
+            trigger
+                .relay_withdrawal_hold_alerted
+                .read()
+                .await
+                .contains(&id),
+            "the sweep must page that the stable is outside the vault",
+        );
+        assert!(
+            !trigger.post_burn_timeout_alerted.read().await.contains(&id),
+            "a Relay transfer has no CCTP burn to page about",
         );
     }
 }
