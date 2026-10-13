@@ -20,13 +20,14 @@ use tokio::task::{JoinError, JoinHandle};
 use tokio::time::Instant;
 use tracing::{error, info, warn};
 
-use st0x_bridge::cctp::{AttestationResponse, CctpError, UsdcTransferStatus};
+use st0x_bridge::cctp::{AttestationResponse, UsdcTransferStatus};
 use st0x_bridge::corridor::{HopKind, UsdcCorridor};
 use st0x_bridge::relay::{
     AcceptedRelayQuote, BasisPoints, QuoteAcceptanceError, QuoteAmounts, QuoteBounds, QuoteFees,
     QuoteRequest, RecordedRelayQuote, RelayBridge, RelayBridgeError, RelayClient, RelayOrderId,
     RelayRequestId, StepTransaction,
 };
+use st0x_bridge::stable_endpoint::StableEndpointError;
 use st0x_bridge::{BridgeDirection, HopDirection, PreparedSwap, PreparedSwapDeposit, SwapBridge};
 use st0x_config::RelayHopCtx;
 use st0x_event_sorcery::Store;
@@ -908,19 +909,31 @@ fn basis_points(bps: u16) -> Result<BasisPoints, UsdcTransferError> {
 /// Relay serves the hub legs through its bridge's Ethereum end.
 #[async_trait]
 impl<Signer: Wallet> UsdcBridgeHelper for RelayHop<Signer> {
-    async fn ethereum_tx_confirmations(&self, tx_hash: TxHash) -> Result<Option<u64>, CctpError> {
+    type HubError = StableEndpointError;
+
+    fn hub_leg_failure(error: StableEndpointError) -> UsdcTransferError {
+        RelayBridge::<Signer, Signer>::hub_leg_failure(error)
+    }
+
+    async fn ethereum_tx_confirmations(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<Option<u64>, StableEndpointError> {
         self.bridge.ethereum_tx_confirmations(tx_hash).await
     }
 
-    async fn ethereum_tx_block(&self, tx_hash: TxHash) -> Result<u64, CctpError> {
+    async fn ethereum_tx_block(&self, tx_hash: TxHash) -> Result<u64, StableEndpointError> {
         self.bridge.ethereum_tx_block(tx_hash).await
     }
 
-    async fn ethereum_mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, CctpError> {
+    async fn ethereum_mined_tx(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<Option<MinedTx>, StableEndpointError> {
         self.bridge.ethereum_mined_tx(tx_hash).await
     }
 
-    async fn ethereum_usdc_balance(&self, holder: Address) -> Result<U256, CctpError> {
+    async fn ethereum_usdc_balance(&self, holder: Address) -> Result<U256, StableEndpointError> {
         self.bridge.ethereum_usdc_balance(holder).await
     }
 
@@ -928,7 +941,7 @@ impl<Signer: Wallet> UsdcBridgeHelper for RelayHop<Signer> {
         &self,
         tx_hash: TxHash,
         recipient: Address,
-    ) -> Result<U256, CctpError> {
+    ) -> Result<U256, StableEndpointError> {
         self.bridge.ethereum_usdc_credit(tx_hash, recipient).await
     }
 
@@ -937,7 +950,7 @@ impl<Signer: Wallet> UsdcBridgeHelper for RelayHop<Signer> {
         tx_hash: TxHash,
         sender: Address,
         recipient: Address,
-    ) -> Result<U256, CctpError> {
+    ) -> Result<U256, StableEndpointError> {
         self.bridge
             .ethereum_usdc_sent(tx_hash, sender, recipient)
             .await
@@ -947,14 +960,14 @@ impl<Signer: Wallet> UsdcBridgeHelper for RelayHop<Signer> {
         &self,
         to: Address,
         amount: U256,
-    ) -> Result<PreparedTransaction, CctpError> {
+    ) -> Result<PreparedTransaction, StableEndpointError> {
         self.bridge.prepare_usdc_on_ethereum(to, amount).await
     }
 
     async fn broadcast_usdc_on_ethereum(
         &self,
         prepared: &PreparedTransaction,
-    ) -> Result<TxHash, CctpError> {
+    ) -> Result<TxHash, StableEndpointError> {
         self.bridge.broadcast_usdc_on_ethereum(prepared).await
     }
 
@@ -969,7 +982,7 @@ impl<Signer: Wallet> UsdcBridgeHelper for RelayHop<Signer> {
     async fn confirm_usdc_on_ethereum(
         &self,
         tx_hash: TxHash,
-    ) -> Result<UsdcTransferStatus, CctpError> {
+    ) -> Result<UsdcTransferStatus, StableEndpointError> {
         self.bridge.confirm_usdc_on_ethereum(tx_hash).await
     }
 
@@ -979,7 +992,7 @@ impl<Signer: Wallet> UsdcBridgeHelper for RelayHop<Signer> {
         to: Address,
         amount: U256,
         from_block: u64,
-    ) -> Result<Vec<TxHash>, CctpError> {
+    ) -> Result<Vec<TxHash>, StableEndpointError> {
         self.bridge
             .find_recent_usdc_transfers(from, to, amount, from_block)
             .await
