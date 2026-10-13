@@ -68,7 +68,8 @@ use crate::operator::position::{
     OffchainOrderOutcome, PointerOutcome, release_pending_offchain_order, set_position,
 };
 use crate::operator::process_tx::{
-    self, PlacedHedgeDisposition, ProcessTxFill, ProcessTxOutcome, ProcessTxReport, ProcessTxStores,
+    self, PlacedHedgeDisposition, ProcessTxFailure, ProcessTxFill, ProcessTxOutcome,
+    ProcessTxReport, ProcessTxStores,
 };
 use crate::performance::equity_timing::load_equity_timings;
 use crate::performance::infra::{load_dependency_stats, load_monitor_telemetry};
@@ -4002,9 +4003,17 @@ async fn set_position_exposure(
     }))
 }
 
-/// Decoded fill and processing outcome returned by the process-tx route.
+/// Every fill of the transaction the process-tx route processed, in the
+/// order it reported them.
 #[derive(Debug, Serialize)]
 struct ProcessTxResponse {
+    fills: Vec<ProcessTxReportResponse>,
+}
+
+/// One decoded fill, when there was one, and its processing outcome.
+#[derive(Debug, Serialize)]
+struct ProcessTxReportResponse {
+    log_index: Option<u64>,
     fill: Option<ProcessTxFillResponse>,
     #[serde(flatten)]
     outcome: ProcessTxOutcomeResponse,
@@ -4057,6 +4066,13 @@ enum ProcessTxOutcomeResponse {
     AlreadyExcluded {
         detail: String,
     },
+    FillSkipped {
+        reason: String,
+        detail: String,
+    },
+    SettlementQuarantined {
+        reason: String,
+    },
     SkippedZeroUnderlying {
         symbol: String,
         chain: String,
@@ -4064,6 +4080,9 @@ enum ProcessTxOutcomeResponse {
     },
     PlacementRejected {
         symbol: String,
+    },
+    HedgeRejected {
+        reason: String,
     },
     PreflightDeferred {
         symbol: String,
@@ -4109,6 +4128,13 @@ impl From<ProcessTxOutcome> for ProcessTxOutcomeResponse {
                 detail,
             },
             ProcessTxOutcome::AlreadyExcluded { detail } => Self::AlreadyExcluded { detail },
+            ProcessTxOutcome::FillSkipped { reason, detail } => Self::FillSkipped {
+                reason: reason.to_owned(),
+                detail,
+            },
+            ProcessTxOutcome::SettlementQuarantined { reason } => Self::SettlementQuarantined {
+                reason: reason.to_string(),
+            },
             ProcessTxOutcome::SkippedZeroUnderlying {
                 symbol,
                 chain,
@@ -4120,6 +4146,9 @@ impl From<ProcessTxOutcome> for ProcessTxOutcomeResponse {
             },
             ProcessTxOutcome::PlacementRejected { symbol } => Self::PlacementRejected {
                 symbol: symbol.to_string(),
+            },
+            ProcessTxOutcome::HedgeRejected { reason } => Self::HedgeRejected {
+                reason: reason.to_string(),
             },
             ProcessTxOutcome::PreflightDeferred { symbol, reason } => Self::PreflightDeferred {
                 symbol: symbol.to_string(),
@@ -4155,11 +4184,36 @@ impl From<ProcessTxOutcome> for ProcessTxOutcomeResponse {
     }
 }
 
-impl TryFrom<ProcessTxReport> for ProcessTxResponse {
+/// Formats each report on its own, so one that cannot be formatted hides no
+/// other. Returns the formatted reports and a description of each report that
+/// failed.
+fn format_process_tx_reports(
+    tx_hash: TxHash,
+    reports: Vec<ProcessTxReport>,
+) -> (Vec<ProcessTxReportResponse>, Vec<String>) {
+    let mut formatted = Vec::with_capacity(reports.len());
+    let mut unformatted = Vec::new();
+    for report in reports {
+        let log_index = report.log_index;
+        match ProcessTxReportResponse::try_from(report) {
+            Ok(response) => formatted.push(response),
+            Err(format_error) => {
+                error!(%tx_hash, ?log_index, %format_error, "failed to format a process-tx report");
+                unformatted.push(format!(
+                    "the report for log index {log_index:?} could not be formatted: {format_error}"
+                ));
+            }
+        }
+    }
+    (formatted, unformatted)
+}
+
+impl TryFrom<ProcessTxReport> for ProcessTxReportResponse {
     type Error = rain_math_float::FloatError;
 
     fn try_from(report: ProcessTxReport) -> Result<Self, Self::Error> {
         Ok(Self {
+            log_index: report.log_index,
             fill: report
                 .fill
                 .map(ProcessTxFillResponse::try_from)
@@ -4329,7 +4383,7 @@ async fn spawn_and_join_process_tx<ChainProvider: alloy::providers::Provider + C
     cache: SymbolCache,
     handle: &ProcessTxHandle,
     detached: DetachedProcessTx<'_>,
-) -> Result<ProcessTxReport, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Vec<ProcessTxReport>, ProcessTxError> {
     let DetachedProcessTx {
         tracker: detached_tasks,
         projection_write,
@@ -4356,18 +4410,67 @@ async fn spawn_and_join_process_tx<ChainProvider: alloy::providers::Provider + C
         // JoinHandle), so the outcome is recorded here rather than only where
         // it is rendered into a response.
         match &result {
-            Ok(report) => debug!(%tx_hash, outcome = ?report.outcome, "process-tx finished"),
-            Err(OperatorError::Rejected(reason)) => {
-                warn!(%tx_hash, %reason, "process-tx rejected");
-            }
-            Err(error) => error!(%tx_hash, %error, "process-tx failed"),
+            Ok(reports) => debug!(
+                %tx_hash,
+                outcomes = ?reports.iter().map(|report| &report.outcome).collect::<Vec<_>>(),
+                "process-tx finished"
+            ),
+            Err(ProcessTxFailure { error, .. }) => error!(%tx_hash, %error, "process-tx failed"),
         }
         result
-    })?
-    .await?
+    })
+    .map_err(process_tx_error)?
+    .await
+    .map_err(process_tx_error)?
     // The detached task above already logged the failure, so render it
     // without logging it a second time.
-    .map_err(operator_error_response)
+    .map_err(|failure| process_tx_failure_response(tx_hash, failure))
+}
+
+/// The status and body of a failed process-tx request: the fills the run
+/// finished before it stopped come back with the error.
+type ProcessTxError = (StatusCode, Json<ProcessTxErrorResponse>);
+
+#[derive(Debug, Serialize)]
+struct ProcessTxErrorResponse {
+    error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stopped_at_log_index: Option<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    completed: Vec<ProcessTxReportResponse>,
+}
+
+fn process_tx_error((status, Json(ErrorResponse { error })): OpsError) -> ProcessTxError {
+    (
+        status,
+        Json(ProcessTxErrorResponse {
+            error,
+            stopped_at_log_index: None,
+            completed: Vec::new(),
+        }),
+    )
+}
+
+fn process_tx_failure_response(tx_hash: TxHash, failure: ProcessTxFailure) -> ProcessTxError {
+    let ProcessTxFailure {
+        completed,
+        stopped_at,
+        error,
+    } = failure;
+    let (status, Json(ErrorResponse { error })) = operator_error_response(error);
+    let (completed, unformatted) = format_process_tx_reports(tx_hash, completed);
+    let error = std::iter::once(error)
+        .chain(unformatted)
+        .collect::<Vec<_>>()
+        .join("; ");
+    (
+        status,
+        Json(ProcessTxErrorResponse {
+            error,
+            stopped_at_log_index: stopped_at,
+            completed,
+        }),
+    )
 }
 
 /// Accounts a missed on-chain fill and places the opposite hedge inside the
@@ -4377,11 +4480,13 @@ async fn process_transaction(
     State(state): State<AppState>,
     Path(tx_hash): Path<String>,
     AuditedQuery(query): AuditedQuery<ProcessTransactionQuery>,
-) -> Result<Json<ProcessTxResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<ProcessTxResponse>, ProcessTxError> {
     let tx_hash = TxHash::from_str(&tx_hash)
-        .map_err(|error| ops_precondition_error(format!("invalid transaction hash: {error}")))?;
+        .map_err(|error| ops_precondition_error(format!("invalid transaction hash: {error}")))
+        .map_err(process_tx_error)?;
     let trading_chain = process_tx::resolve_chain(&state.ctx, query.chain)
-        .map_err(ops_precondition_error)?
+        .map_err(ops_precondition_error)
+        .map_err(process_tx_error)?
         .clone();
 
     // process-tx places a live broker hedge, so require FULL startup readiness,
@@ -4393,8 +4498,10 @@ async fn process_transaction(
     if !state.health.is_ready() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
+            Json(ProcessTxErrorResponse {
                 error: "process-tx is unavailable until startup completes".to_owned(),
+                stopped_at_log_index: None,
+                completed: Vec::new(),
             }),
         ));
     }
@@ -4402,8 +4509,10 @@ async fn process_transaction(
     let handle = state.process_tx.get().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
+            Json(ProcessTxErrorResponse {
                 error: "process-tx is unavailable until the conductor finishes startup".to_owned(),
+                stopped_at_log_index: None,
+                completed: Vec::new(),
             }),
         )
     })?;
@@ -4423,12 +4532,14 @@ async fn process_transaction(
             );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
+                Json(ProcessTxErrorResponse {
                     error: format!("no RPC provider is wired for chain {}", trading_chain.chain),
+                    stopped_at_log_index: None,
+                    completed: Vec::new(),
                 }),
             )
         })?;
-    let report = spawn_and_join_process_tx(
+    let reports = spawn_and_join_process_tx(
         tx_hash,
         state.ctx.clone(),
         state.pool.clone(),
@@ -4443,16 +4554,18 @@ async fn process_transaction(
     )
     .await?;
 
-    let response = ProcessTxResponse::try_from(report).map_err(|error| {
-        error!(%tx_hash, %error, "failed to format the process-tx response");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("failed to format the process-tx response: {error}"),
-            }),
-        )
-    })?;
-    Ok(Json(response))
+    let (fills, unformatted) = format_process_tx_reports(tx_hash, reports);
+    if unformatted.is_empty() {
+        return Ok(Json(ProcessTxResponse { fills }));
+    }
+    Err((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ProcessTxErrorResponse {
+            error: format!("process-tx finished, but {}", unformatted.join("; ")),
+            stopped_at_log_index: None,
+            completed: fills,
+        }),
+    ))
 }
 
 /// Wire contract for the portfolio-snapshot mark route.
@@ -15543,6 +15656,135 @@ mod tests {
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
     }
 
+    /// The route answers with every fill of the transaction, each in the
+    /// shape of a single report, including the two outcomes that carry no
+    /// decoded fill.
+    #[test]
+    fn process_tx_response_lists_every_fill_of_the_transaction() {
+        let reports = vec![
+            ProcessTxReport {
+                log_index: Some(7),
+                fill: None,
+                outcome: ProcessTxOutcome::FillSkipped {
+                    reason: "unpriceable_fill",
+                    detail: "non-positive price".to_string(),
+                },
+            },
+            ProcessTxReport {
+                log_index: None,
+                fill: None,
+                outcome: ProcessTxOutcome::SettlementQuarantined {
+                    reason: crate::operator::process_tx::QuarantineReason::UnorderedLegs,
+                },
+            },
+            ProcessTxReport {
+                log_index: Some(10),
+                fill: Some(decoded_fill(10)),
+                outcome: ProcessTxOutcome::AlreadyAccounted,
+            },
+            ProcessTxReport {
+                log_index: Some(20),
+                fill: Some(decoded_fill(20)),
+                outcome: ProcessTxOutcome::HedgeRejected {
+                    reason: RejectionReason::PositionNotFound {
+                        symbol: Symbol::new("AAPL").unwrap(),
+                    },
+                },
+            },
+        ];
+
+        assert_eq!(
+            serde_json::to_value(ProcessTxResponse {
+                fills: format_process_tx_reports(TxHash::repeat_byte(0x11), reports).0,
+            })
+            .unwrap(),
+            serde_json::json!({
+                "fills": [
+                    {
+                        "log_index": 7,
+                        "fill": null,
+                        "outcome": "fill_skipped",
+                        "reason": "unpriceable_fill",
+                        "detail": "non-positive price",
+                    },
+                    {
+                        "log_index": null,
+                        "fill": null,
+                        "outcome": "settlement_quarantined",
+                        "reason": "a leg has no log index, or two legs share one",
+                    },
+                    {
+                        "log_index": 10,
+                        "fill": decoded_fill_json(10),
+                        "outcome": "already_accounted",
+                    },
+                    {
+                        "log_index": 20,
+                        "fill": decoded_fill_json(20),
+                        "outcome": "hedge_rejected",
+                        "reason": "position AAPL not found",
+                    },
+                ]
+            }),
+        );
+    }
+
+    fn decoded_fill(log_index: u64) -> ProcessTxFill {
+        ProcessTxFill {
+            tx_hash: TxHash::repeat_byte(0x11),
+            log_index,
+            symbol: Symbol::new("AAPL").unwrap(),
+            direction: st0x_execution::Direction::Buy,
+            quantity: FractionalShares::new(float!(2)),
+            price: float!(100),
+        }
+    }
+
+    fn decoded_fill_json(log_index: u64) -> serde_json::Value {
+        serde_json::json!({
+            "tx_hash": TxHash::repeat_byte(0x11).to_string(),
+            "log_index": log_index,
+            "symbol": "AAPL",
+            "direction": "buy",
+            "quantity": "2",
+            "price": "100",
+        })
+    }
+
+    /// A run that stops at a fill answers with the fills it finished first and
+    /// the log index it stopped at.
+    #[test]
+    fn process_tx_failure_response_carries_the_completed_fills() {
+        let (status, Json(body)) = process_tx_failure_response(
+            TxHash::repeat_byte(0x11),
+            ProcessTxFailure {
+                completed: vec![ProcessTxReport {
+                    log_index: Some(10),
+                    fill: Some(decoded_fill(10)),
+                    outcome: ProcessTxOutcome::AlreadyAccounted,
+                }],
+                stopped_at: Some(20),
+                error: OperatorError::Operational(anyhow::anyhow!("rpc down")),
+            },
+        );
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            serde_json::to_value(body).unwrap(),
+            serde_json::json!({
+                "error": "Operator write command failed",
+                "stopped_at_log_index": 20,
+                "completed": [
+                    {
+                        "log_index": 10,
+                        "fill": decoded_fill_json(10),
+                        "outcome": "already_accounted",
+                    },
+                ],
+            }),
+        );
+    }
+
     /// A fill kept out of hedging must reach the operator with its cover
     /// detail, whether this run excluded it or an earlier one did.
     #[test]
@@ -15555,6 +15797,7 @@ mod tests {
                     detail: "cover by SELL".to_string(),
                 },
                 serde_json::json!({
+                    "log_index": null,
                     "fill": null,
                     "outcome": "excluded_from_hedging",
                     "symbol": "AAPL",
@@ -15567,6 +15810,7 @@ mod tests {
                     detail: "cover by SELL".to_string(),
                 },
                 serde_json::json!({
+                    "log_index": null,
                     "fill": null,
                     "outcome": "already_excluded",
                     "detail": "cover by SELL",
@@ -15576,11 +15820,12 @@ mod tests {
 
         for (outcome, expected) in cases {
             let report = ProcessTxReport {
+                log_index: None,
                 fill: None,
                 outcome,
             };
             assert_eq!(
-                serde_json::to_value(ProcessTxResponse::try_from(report).unwrap()).unwrap(),
+                serde_json::to_value(ProcessTxReportResponse::try_from(report).unwrap()).unwrap(),
                 expected,
             );
         }
@@ -15602,16 +15847,19 @@ mod tests {
         let mut cases: Vec<(ProcessTxReport, serde_json::Value)> = vec![
             (
                 ProcessTxReport {
+                    log_index: None,
                     fill: None,
                     outcome: ProcessTxOutcome::NoTradeableEvents,
                 },
                 serde_json::json!({
+                    "log_index": null,
                     "fill": null,
                     "outcome": "no_tradeable_events",
                 }),
             ),
             (
                 ProcessTxReport {
+                    log_index: None,
                     fill: None,
                     outcome: ProcessTxOutcome::TransactionNotFound {
                         tx_hash: TxHash::repeat_byte(0x22),
@@ -15619,6 +15867,7 @@ mod tests {
                     },
                 },
                 serde_json::json!({
+                    "log_index": null,
                     "fill": null,
                     "outcome": "transaction_not_found",
                     "tx_hash": TxHash::repeat_byte(0x22).to_string(),
@@ -15627,42 +15876,50 @@ mod tests {
             ),
             (
                 ProcessTxReport {
+                    log_index: None,
                     fill: Some(fill()),
                     outcome: ProcessTxOutcome::AlreadyAccounted,
                 },
                 serde_json::json!({
+                    "log_index": null,
                     "fill": fill_json,
                     "outcome": "already_accounted",
                 }),
             ),
             (
                 ProcessTxReport {
+                    log_index: None,
                     fill: Some(fill()),
                     outcome: ProcessTxOutcome::PendingHedgeInFlight,
                 },
                 serde_json::json!({
+                    "log_index": null,
                     "fill": fill_json,
                     "outcome": "pending_hedge_in_flight",
                 }),
             ),
             (
                 ProcessTxReport {
+                    log_index: None,
                     fill: Some(fill()),
                     outcome: ProcessTxOutcome::BelowExecutionThreshold,
                 },
                 serde_json::json!({
+                    "log_index": null,
                     "fill": fill_json,
                     "outcome": "below_execution_threshold",
                 }),
             ),
             (
                 ProcessTxReport {
+                    log_index: None,
                     fill: Some(fill()),
                     outcome: ProcessTxOutcome::PlacementRejected {
                         symbol: Symbol::new("AAPL").unwrap(),
                     },
                 },
                 serde_json::json!({
+                    "log_index": null,
                     "fill": fill_json,
                     "outcome": "placement_rejected",
                     "symbol": "AAPL",
@@ -15676,6 +15933,7 @@ mod tests {
         ] {
             cases.push((
                 ProcessTxReport {
+                    log_index: None,
                     fill: Some(fill()),
                     outcome: ProcessTxOutcome::HedgePlaced {
                         symbol: Symbol::new("AAPL").unwrap(),
@@ -15688,6 +15946,7 @@ mod tests {
                     },
                 },
                 serde_json::json!({
+                    "log_index": null,
                     "fill": fill_json,
                     "outcome": "hedge_placed",
                     "symbol": "AAPL",
@@ -15701,6 +15960,7 @@ mod tests {
 
         cases.push((
             ProcessTxReport {
+                log_index: None,
                 fill: Some(fill()),
                 outcome: ProcessTxOutcome::PreflightDeferred {
                     symbol: Symbol::new("AAPL").unwrap(),
@@ -15708,6 +15968,7 @@ mod tests {
                 },
             },
             serde_json::json!({
+                "log_index": null,
                 "fill": fill_json,
                 "outcome": "preflight_deferred",
                 "symbol": "AAPL",
@@ -15717,12 +15978,14 @@ mod tests {
 
         cases.push((
             ProcessTxReport {
+                log_index: None,
                 fill: Some(fill()),
                 outcome: ProcessTxOutcome::HedgePlacementCleared {
                     symbol: Symbol::new("AAPL").unwrap(),
                 },
             },
             serde_json::json!({
+                "log_index": null,
                 "fill": fill_json,
                 "outcome": "hedge_placement_cleared",
                 "symbol": "AAPL",
@@ -15731,12 +15994,14 @@ mod tests {
 
         cases.push((
             ProcessTxReport {
+                log_index: None,
                 fill: Some(fill()),
                 outcome: ProcessTxOutcome::HedgePlacementDeferred {
                     symbol: Symbol::new("AAPL").unwrap(),
                 },
             },
             serde_json::json!({
+                "log_index": null,
                 "fill": fill_json,
                 "outcome": "hedge_placement_deferred",
                 "symbol": "AAPL",
@@ -15745,6 +16010,7 @@ mod tests {
 
         cases.push((
             ProcessTxReport {
+                log_index: None,
                 fill: Some(fill()),
                 outcome: ProcessTxOutcome::PendingHedgeDeferred {
                     symbol: Symbol::new("AAPL").unwrap(),
@@ -15754,6 +16020,7 @@ mod tests {
                 },
             },
             serde_json::json!({
+                "log_index": null,
                 "fill": fill_json,
                 "outcome": "pending_hedge_deferred",
                 "symbol": "AAPL",
@@ -15763,7 +16030,7 @@ mod tests {
 
         for (report, expected) in cases {
             assert_eq!(
-                serde_json::to_value(ProcessTxResponse::try_from(report).unwrap()).unwrap(),
+                serde_json::to_value(ProcessTxReportResponse::try_from(report).unwrap()).unwrap(),
                 expected,
             );
         }
@@ -16107,12 +16374,11 @@ mod tests {
         );
     }
 
-    /// A domain rejection from the process-tx workload maps to a 400 through the
-    /// handler seam: with the trading schedule disabled (a standalone process), a
-    /// retained pre-placement `Pending` hedge is a typed rejection that
-    /// `spawn_and_join_process_tx` renders as a 400.
+    /// A hedge refused after its fill is settled is that fill's report, not a
+    /// failed request: with the trading schedule disabled (a standalone
+    /// process), a retained pre-placement `Pending` hedge refuses the hedge.
     #[tokio::test]
-    async fn spawn_and_join_process_tx_maps_a_domain_rejection_to_400() {
+    async fn spawn_and_join_process_tx_reports_a_refused_hedge() {
         let (pool, apalis_pool) = setup_test_pools().await;
 
         let symbol = Symbol::new("AAPL").unwrap();
@@ -16148,7 +16414,7 @@ mod tests {
             "this context configures no trading schedule, so the stores must have it disabled"
         );
 
-        let Err((status, Json(body))) = spawn_and_join_process_tx(
+        let reports = spawn_and_join_process_tx(
             tx_hash,
             ctx,
             pool,
@@ -16162,14 +16428,17 @@ mod tests {
             },
         )
         .await
-        else {
-            panic!("a schedule-disabled retained Pending must surface as a rejection");
-        };
-        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {}", body.error);
+        .unwrap();
+        let [report] = <[ProcessTxReport; 1]>::try_from(reports).unwrap();
         assert!(
-            body.error.contains("schedule is disabled"),
-            "the 400 body must explain the schedule-disabled rejection, got: {}",
-            body.error
+            matches!(
+                &report.outcome,
+                ProcessTxOutcome::HedgeRejected {
+                    reason: RejectionReason::RetainedPendingWithoutSchedule { .. },
+                }
+            ),
+            "a schedule-disabled retained Pending must refuse the hedge, got: {:?}",
+            report.outcome
         );
     }
 

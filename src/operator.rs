@@ -1553,7 +1553,9 @@ pub mod process_tx {
         terminal_position_finalization,
     };
     use crate::onchain::accumulator::{ExecutionCtx, check_execution_readiness};
-    use crate::onchain::trade::{BotOperator, RecoveryActors};
+    use crate::onchain::trade::{
+        BotOperator, FailedRecoveryFill, RecoveryActors, SkippedRecoveryFill, TxRecovery,
+    };
     use crate::onchain::{OnChainError, OnchainTrade, TradeValidationError};
     use crate::onchain_trade::{OnChainTrade, OnChainTradeId};
     use crate::position::{AnchorDisposition, Position, PositionCommand};
@@ -1561,9 +1563,12 @@ pub mod process_tx {
         BuyingPowerReservationError, acquire_counter_trade_submission_file_lock,
         live_buying_power_reservations,
     };
+    use crate::trading::onchain::skipped_fill::record_skipped_fill;
     use crate::trading::onchain::trade_accountant::witness_then_load_wrapper_ratio;
 
     use super::{OperatorError, RejectionReason};
+
+    pub use crate::onchain::backfill::QuarantineReason;
 
     /// The state of a hedge order after (attempted) broker placement, or of an
     /// existing pending hedge found before placement.
@@ -1636,7 +1641,8 @@ pub mod process_tx {
     /// What processing a transaction's fill resolved to.
     #[derive(Debug)]
     pub enum ProcessTxOutcome {
-        /// No orderbook events in the transaction matched the configured order.
+        /// No fill in the transaction matched the configured order or the
+        /// shared inventory.
         NoTradeableEvents,
         /// The selected chain's RPC endpoint did not find the transaction.
         TransactionNotFound { tx_hash: TxHash, chain: Chain },
@@ -1670,6 +1676,24 @@ pub mod process_tx {
         /// order, an equity transfer, or a changed net), so the fill was settled
         /// without placing a hedge.
         PlacementRejected { symbol: Symbol },
+        /// The fill was accounted and settled, but its hedge stopped on
+        /// `reason` and needs reconciliation. The hedge may already be placed:
+        /// an order this run placed can come back filled without a price, or
+        /// still pending. `reason` names any order, which the operator checks
+        /// at the broker before hedging by hand.
+        HedgeRejected { reason: RejectionReason },
+        /// The fill failed conversion with an error the fill worker also
+        /// skips per fill (a non-hedgeable token pair, an unpriceable fill, an
+        /// unrecognized inventory token, and the like), so it was recorded in
+        /// `skipped_fills` under `reason` and not hedged.
+        FillSkipped {
+            reason: &'static str,
+            detail: String,
+        },
+        /// The transaction's inventory legs could not be paired into
+        /// settlements, so none of them was accounted or hedged. An operational
+        /// alert lists every leg; an operator covers the net vault change.
+        SettlementQuarantined { reason: QuarantineReason },
         /// The fill's wrapped quantity converts to zero underlying shares at
         /// its fill-block ratio, for example a dust fill at a ratio below 1. It
         /// is recorded in `skipped_fills` and acknowledged, and never hedged;
@@ -1719,8 +1743,31 @@ pub mod process_tx {
     /// The decoded fill, when one was found, and its processing outcome.
     #[derive(Debug)]
     pub struct ProcessTxReport {
+        /// Log index of the fill this report covers; `None` for a report on
+        /// the whole transaction.
+        pub log_index: Option<u64>,
         pub fill: Option<ProcessTxFill>,
         pub outcome: ProcessTxOutcome,
+    }
+
+    /// A process-tx run that stopped on `error`. The fills in `completed`
+    /// stay accounted, and a rerun resumes after them.
+    #[derive(Debug)]
+    pub struct ProcessTxFailure {
+        pub completed: Vec<ProcessTxReport>,
+        /// Log index of the fill the run stopped at, when it stopped at one.
+        pub stopped_at: Option<u64>,
+        pub error: OperatorError,
+    }
+
+    impl From<OperatorError> for ProcessTxFailure {
+        fn from(error: OperatorError) -> Self {
+            Self {
+                completed: Vec::new(),
+                stopped_at: None,
+                error,
+            }
+        }
     }
 
     /// The stores a process-tx writes through, plus the trading-schedule flag
@@ -1867,8 +1914,13 @@ pub mod process_tx {
         trade_id: OnChainTradeId,
     }
 
-    /// Accounts a missed on-chain fill from `tx_hash` and, when the resulting
-    /// net exposure warrants it, places the opposite hedge.
+    /// Accounts every missed on-chain fill of `tx_hash` and, when the
+    /// resulting net exposure warrants it, places the opposite hedge.
+    ///
+    /// Fills run in log order, one report each, plus one report per skipped
+    /// fill and one for a quarantined inventory settlement. An error on one
+    /// fill stops the run, and the [`ProcessTxFailure`] carries the reports
+    /// before it: those fills stay accounted, and a rerun resumes after them.
     ///
     /// Run inside the bot process, pass a [`ProcessTxChainContext`] containing
     /// the selected hedged-chain config and its provider, the conductor's wired
@@ -1892,7 +1944,7 @@ pub mod process_tx {
         order_placer: Arc<dyn OrderPlacer>,
         submission_lock: Option<&Mutex<()>>,
         poll_enrollment: Option<(&PollOrderStatusJobQueue, Duration)>,
-    ) -> Result<ProcessTxReport, OperatorError> {
+    ) -> Result<Vec<ProcessTxReport>, ProcessTxFailure> {
         let ProcessTxChainContext {
             trading_chain,
             provider,
@@ -1904,61 +1956,228 @@ pub mod process_tx {
         };
         let read_evm = ReadOnlyEvm::new(provider.clone());
 
-        match OnchainTrade::try_from_tx_hash(tx_hash, &read_evm, cache, trading_chain, actors).await
-        {
-            Ok(Some(mut onchain_trade)) => {
-                // The decoder is fed the requested chain, so a decoded fill on a
-                // different chain is an invariant break: refuse rather than hedge
-                // a fill from a chain the operator did not select.
-                ensure_decoded_chain_matches(onchain_trade.chain, trading_chain.chain)
-                    .map_err(|mismatch| OperatorError::Operational(mismatch.into()))?;
-                let fill = match witness_found_fill(
-                    pool,
-                    &stores.onchain_trade,
-                    &mut onchain_trade,
-                    &read_evm,
-                )
-                .await?
-                {
-                    FoundFill::Witnessed(fill) => fill,
-                    FoundFill::SkippedZeroUnderlying { detail } => {
-                        return Ok(ProcessTxReport {
-                            fill: None,
-                            outcome: ProcessTxOutcome::SkippedZeroUnderlying {
-                                symbol: onchain_trade.symbol().clone(),
-                                chain: onchain_trade.chain,
-                                detail,
+        let recovery =
+            match OnchainTrade::try_from_tx_hash(tx_hash, &read_evm, cache, trading_chain, actors)
+                .await
+            {
+                Ok(recovery) => recovery,
+                Err(OnChainError::Validation(TradeValidationError::TransactionNotFound(_))) => {
+                    return Ok(vec![ProcessTxReport {
+                        log_index: None,
+                        fill: None,
+                        outcome: ProcessTxOutcome::TransactionNotFound {
+                            tx_hash,
+                            chain: trading_chain.chain,
+                        },
+                    }]);
+                }
+                Err(error) => {
+                    return Err(OperatorError::Operational(anyhow::Error::new(error)).into());
+                }
+            };
+        let TxRecovery {
+            trades,
+            skipped,
+            failed,
+            quarantine,
+        } = recovery;
+        let mut fills: Vec<RecoveredFill> = trades
+            .into_iter()
+            .map(RecoveredFill::Converted)
+            .chain(skipped.into_iter().map(RecoveredFill::Skipped))
+            .chain(failed.into_iter().map(RecoveredFill::Failed))
+            .collect();
+        fills.sort_by_key(RecoveredFill::log_index);
+
+        let mut reports: Vec<ProcessTxReport> = quarantine
+            .map(|reason| ProcessTxReport {
+                log_index: None,
+                fill: None,
+                outcome: ProcessTxOutcome::SettlementQuarantined { reason },
+            })
+            .into_iter()
+            .collect();
+
+        for recovered in fills {
+            let log_index = recovered.log_index();
+            let report = match recovered {
+                RecoveredFill::Converted(mut onchain_trade) => {
+                    async {
+                        // The decoder is fed the requested chain, so a decoded fill on a
+                        // different chain is an invariant break: refuse rather than hedge
+                        // a fill from a chain the operator did not select.
+                        ensure_decoded_chain_matches(onchain_trade.chain, trading_chain.chain)
+                            .map_err(|mismatch| OperatorError::Operational(mismatch.into()))?;
+                        let report = match witness_found_fill(
+                            pool,
+                            &stores.onchain_trade,
+                            &mut onchain_trade,
+                            &read_evm,
+                        )
+                        .await?
+                        {
+                            FoundFill::Witnessed(fill) => {
+                                let outcome = match process_found_trade(
+                                    onchain_trade,
+                                    ctx,
+                                    pool,
+                                    stores,
+                                    Arc::clone(&order_placer),
+                                    submission_lock,
+                                    poll_enrollment,
+                                )
+                                .await
+                                {
+                                    Ok(outcome) => outcome,
+                                    // A rejection is returned only once the fill is
+                                    // settled, so the fills after it still run.
+                                    Err(OperatorError::Rejected(reason)) => {
+                                        ProcessTxOutcome::HedgeRejected { reason }
+                                    }
+                                    Err(error) => return Err(error),
+                                };
+                                ProcessTxReport {
+                                    log_index: Some(log_index),
+                                    fill,
+                                    outcome,
+                                }
+                            }
+                            FoundFill::SkippedZeroUnderlying { detail } => ProcessTxReport {
+                                log_index: Some(log_index),
+                                fill: None,
+                                outcome: ProcessTxOutcome::SkippedZeroUnderlying {
+                                    symbol: onchain_trade.symbol().clone(),
+                                    chain: onchain_trade.chain,
+                                    detail,
+                                },
                             },
-                        });
+                        };
+                        Ok::<_, OperatorError>(report)
                     }
-                };
-                let outcome = process_found_trade(
-                    onchain_trade,
-                    ctx,
-                    pool,
-                    stores,
-                    order_placer,
-                    submission_lock,
-                    poll_enrollment,
-                )
-                .await?;
-                Ok(ProcessTxReport { fill, outcome })
+                    .await
+                }
+                RecoveredFill::Skipped(skipped) => {
+                    record_recovery_skip(
+                        pool,
+                        &stores.onchain_trade,
+                        trading_chain.chain,
+                        tx_hash,
+                        skipped,
+                    )
+                    .await
+                }
+                RecoveredFill::Failed(FailedRecoveryFill { error, .. }) => {
+                    Err(OperatorError::Operational(
+                        anyhow::Error::new(error).context("failed to decode the fill"),
+                    ))
+                }
+            };
+
+            match report {
+                Ok(report) => reports.push(report),
+                Err(error) => return Err(stopped_at_fill(tx_hash, reports, log_index, error)),
             }
-            Ok(None) => Ok(ProcessTxReport {
+        }
+
+        if reports.is_empty() {
+            reports.push(ProcessTxReport {
+                log_index: None,
                 fill: None,
                 outcome: ProcessTxOutcome::NoTradeableEvents,
-            }),
-            Err(OnChainError::Validation(TradeValidationError::TransactionNotFound(_))) => {
-                Ok(ProcessTxReport {
-                    fill: None,
-                    outcome: ProcessTxOutcome::TransactionNotFound {
-                        tx_hash,
-                        chain: trading_chain.chain,
-                    },
-                })
-            }
-            Err(error) => Err(OperatorError::Operational(anyhow::Error::new(error))),
+            });
         }
+
+        Ok(reports)
+    }
+
+    /// Logs where a process-tx run stopped and what it finished before.
+    fn stopped_at_fill(
+        tx_hash: TxHash,
+        completed: Vec<ProcessTxReport>,
+        log_index: u64,
+        error: OperatorError,
+    ) -> ProcessTxFailure {
+        error!(
+            %tx_hash,
+            log_index,
+            completed = ?completed.iter().map(|report| &report.outcome).collect::<Vec<_>>(),
+            %error,
+            "process-tx stopped at this fill; the reports before it are done, and a rerun \
+             resumes the fills after it",
+        );
+        ProcessTxFailure {
+            completed,
+            stopped_at: Some(log_index),
+            error,
+        }
+    }
+
+    /// A fill of the transaction as [`OnchainTrade::try_from_tx_hash`]
+    /// recovered it, processed in log order.
+    enum RecoveredFill {
+        Converted(OnchainTrade),
+        Skipped(SkippedRecoveryFill),
+        Failed(FailedRecoveryFill),
+    }
+
+    impl RecoveredFill {
+        fn log_index(&self) -> u64 {
+            match self {
+                Self::Converted(trade) => trade.log_index,
+                Self::Skipped(skipped) => skipped.log_index,
+                Self::Failed(failed) => failed.log_index,
+            }
+        }
+    }
+
+    /// Logs and records a fill [`OnchainTrade::try_from_tx_hash`] skipped, as
+    /// the fill worker records the fills it skips, and reports it. A fill an
+    /// earlier run already accounted is reported as such, since a config
+    /// change since then can make it fail conversion now.
+    async fn record_recovery_skip(
+        pool: &SqlitePool,
+        onchain_trade_store: &Store<OnChainTrade>,
+        chain: Chain,
+        tx_hash: TxHash,
+        skipped: SkippedRecoveryFill,
+    ) -> Result<ProcessTxReport, OperatorError> {
+        let SkippedRecoveryFill {
+            event_type,
+            log_index,
+            skip,
+        } = skipped;
+        let accounted = onchain_trade_store
+            .load(&OnChainTradeId::new(chain, tx_hash, log_index))
+            .await
+            .context("failed to load the skipped fill's onchain trade")?
+            .is_some_and(|trade| trade.is_acknowledged());
+        if accounted {
+            return Ok(ProcessTxReport {
+                log_index: Some(log_index),
+                fill: None,
+                outcome: ProcessTxOutcome::AlreadyAccounted,
+            });
+        }
+        skip.log(event_type, tx_hash, log_index);
+        record_skipped_fill(
+            pool,
+            chain,
+            tx_hash,
+            log_index,
+            event_type,
+            skip.reason,
+            &skip.detail,
+        )
+        .await
+        .map_err(|error| OperatorError::Operational(error.into()))?;
+        Ok(ProcessTxReport {
+            log_index: Some(log_index),
+            fill: None,
+            outcome: ProcessTxOutcome::FillSkipped {
+                reason: skip.reason.as_str(),
+                detail: skip.detail,
+            },
+        })
     }
 
     /// Witnesses a decoded fill, then reads its exact-block wrapper ratio only
@@ -3238,8 +3457,9 @@ pub mod process_tx {
         use std::sync::Arc;
         use std::time::Duration;
 
-        use alloy::primitives::{Address, B256, TxHash, U256};
+        use alloy::primitives::{Address, B256, IntoLogData, TxHash, U256};
         use alloy::providers::{ProviderBuilder, mock::Asserter};
+        use alloy::rpc::types::Log;
         use alloy::sol_types::SolCall;
         use async_trait::async_trait;
         use chrono::Utc;
@@ -3247,11 +3467,13 @@ pub mod process_tx {
         use tokio::sync::Mutex;
 
         use st0x_config::{
-            ChainAssets, Ctx, ExecutionThreshold, HedgedChain, HedgingAssets, PricingCtx,
+            ChainAssets, Ctx, ExecutionThreshold, HedgedChain, HedgingAssets, InventoryAdapter,
+            InventoryAdapterVenue, InventoryAdapters, InventoryMode, PricingCtx,
             TradingScheduleConfig, TradingScheduleMode, UsdcCorridors,
         };
         use st0x_event_sorcery::{AggregateError, SendError, StoreBuilder};
-        use st0x_evm::{Chain, ReadOnlyEvm};
+        use st0x_evm::IERC20::decimalsCall;
+        use st0x_evm::{Chain, ReadOnlyEvm, USDC_BASE};
         use st0x_execution::{
             AlpacaBrokerApiError, BuyingPowerReservationCents, CancellationOutcome, ClientOrderId,
             CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason, Direction,
@@ -3262,6 +3484,7 @@ pub mod process_tx {
         use st0x_registry::SymbolCache;
 
         use crate::bindings::IERC4626;
+        use crate::bindings::IRaindexInventory::{OperatorDeposit, OperatorWithdraw};
         use crate::bindings::IRaindexV6::{ClearConfigV2, ClearV3};
         use crate::conductor::job::find_backpressure;
         use crate::conductor::{
@@ -3293,11 +3516,12 @@ pub mod process_tx {
         use super::{
             FillMissingBlockNumber, FoundFill, HedgeDisposition, OperatorError,
             PlacedHedgeDisposition, PlacementContext, PreflightReservationMismatch,
-            PreflightVerdict, ProcessTxChainContext, ProcessTxFill, ProcessTxOutcome,
-            ProcessTxStores, RejectionReason, ensure_decoded_chain_matches,
-            gate_fill_for_placement, preflight_placement, process_found_trade, process_tx,
-            reconcile_failed_anchor, reconcile_offchain_order_state, reconcile_post_place_state,
-            resolve_chain, witness_found_fill,
+            PreflightVerdict, ProcessTxChainContext, ProcessTxFailure, ProcessTxFill,
+            ProcessTxOutcome, ProcessTxReport, ProcessTxStores, QuarantineReason, RejectionReason,
+            ensure_decoded_chain_matches, gate_fill_for_placement, preflight_placement,
+            process_found_trade, process_tx, reconcile_failed_anchor,
+            reconcile_offchain_order_state, reconcile_post_place_state, resolve_chain,
+            witness_found_fill,
         };
 
         /// Parses a positive share quantity for process-tx fixtures.
@@ -3559,7 +3783,7 @@ pub mod process_tx {
             let provider = ProviderBuilder::new().connect_mocked_client(asserter);
             let tx_hash = TxHash::repeat_byte(0x44);
 
-            let report = process_tx(
+            let reports = process_tx(
                 tx_hash,
                 &ctx,
                 &pool,
@@ -3571,6 +3795,7 @@ pub mod process_tx {
             )
             .await
             .unwrap();
+            let [report] = <[ProcessTxReport; 1]>::try_from(reports).unwrap();
 
             assert!(report.fill.is_none());
             assert!(matches!(
@@ -3580,6 +3805,886 @@ pub mod process_tx {
                     chain: Chain::Ethereum,
                 } if missing == tx_hash
             ));
+        }
+
+        const SETTLEMENT_OPERATOR: Address = Address::repeat_byte(0xb3);
+        const SETTLEMENT_INVENTORY: Address = Address::repeat_byte(0x1e);
+        const WT_AAPL: Address = Address::repeat_byte(0xaa);
+        const SETTLEMENT_TX: TxHash = TxHash::repeat_byte(0x61);
+
+        fn settlement_log(data: alloy::primitives::LogData, log_index: u64) -> Log {
+            Log {
+                inner: alloy::primitives::Log {
+                    address: SETTLEMENT_INVENTORY,
+                    data,
+                },
+                block_hash: None,
+                block_number: Some(42),
+                block_timestamp: Some(1_700_000_000),
+                transaction_hash: Some(SETTLEMENT_TX),
+                transaction_index: None,
+                log_index: Some(log_index),
+                removed: false,
+            }
+        }
+
+        /// A settlement in which the vault paid `usdc` and received `equity`
+        /// of `equity_token`: a withdraw at `log_index`, then a deposit.
+        fn usdc_for_equity(
+            equity_token: Address,
+            usdc: u64,
+            equity: U256,
+            log_index: u64,
+        ) -> [Log; 2] {
+            let withdraw = OperatorWithdraw {
+                operator: SETTLEMENT_OPERATOR,
+                token: USDC_BASE,
+                vaultId: B256::ZERO,
+                amount: U256::from(usdc),
+            };
+            let deposit = OperatorDeposit {
+                operator: SETTLEMENT_OPERATOR,
+                token: equity_token,
+                vaultId: B256::ZERO,
+                amount: equity,
+            };
+            [
+                settlement_log(withdraw.to_log_data(), log_index),
+                settlement_log(deposit.to_log_data(), log_index + 1),
+            ]
+        }
+
+        fn settlement_receipt(logs: &[Log]) -> serde_json::Value {
+            serde_json::json!({
+                "transactionHash": SETTLEMENT_TX,
+                "transactionIndex": "0x1",
+                "blockHash": B256::repeat_byte(0x42),
+                "blockNumber": "0x2a",
+                "from": Address::repeat_byte(0x05),
+                "to": Address::repeat_byte(0x06),
+                "gasUsed": "0x5208",
+                "effectiveGasPrice": "0x77359400",
+                "cumulativeGasUsed": "0x5208",
+                "status": "0x1",
+                "type": "0x2",
+                "logsBloom": format!("0x{}", "0".repeat(512)),
+                "logs": logs
+            })
+        }
+
+        /// A context whose primary chain hedges AAPL through `WT_AAPL` and
+        /// reads `SETTLEMENT_OPERATOR`'s settlements off a managed inventory.
+        fn settlement_ctx() -> (Ctx, HedgedChain) {
+            let mut ctx = aapl_trading_ctx();
+            let primary = ctx.chains.primary_mut();
+            primary.inventory = InventoryMode::Managed {
+                inventory: SETTLEMENT_INVENTORY,
+            };
+            primary.inventory_adapters = InventoryAdapters::try_new(vec![InventoryAdapter {
+                venue: InventoryAdapterVenue::Bebop,
+                operator: SETTLEMENT_OPERATOR,
+            }])
+            .unwrap();
+            primary
+                .assets
+                .equities
+                .symbols
+                .get_mut(&Symbol::new("AAPL").unwrap())
+                .unwrap()
+                .tokenized_equity_derivative = WT_AAPL;
+            let trading_chain = ctx.chains.primary().clone();
+            (ctx, trading_chain)
+        }
+
+        fn settlement_cache() -> SymbolCache {
+            let cache = SymbolCache::default();
+            cache.preload_symbol(Chain::Base, USDC_BASE, "USDC");
+            cache.preload_symbol(Chain::Base, WT_AAPL, "wtAAPL");
+            cache
+        }
+
+        fn mocked_provider(
+            receipt: &serde_json::Value,
+            responses: &[Vec<u8>],
+        ) -> impl alloy::providers::Provider + Clone + 'static {
+            let asserter = Asserter::new();
+            asserter.push_success(receipt);
+            for response in responses {
+                asserter.push_success(&alloy::primitives::Bytes::from(response.clone()));
+            }
+            ProviderBuilder::new().connect_mocked_client(asserter)
+        }
+
+        fn decimals(value: u8) -> Vec<u8> {
+            <decimalsCall as SolCall>::abi_encode_returns(&value)
+        }
+
+        fn unit_ratio() -> Vec<u8> {
+            <IERC4626::convertToAssetsCall as SolCall>::abi_encode_returns(&U256::from(
+                1_000_000_000_000_000_000_u64,
+            ))
+        }
+
+        /// Two settlements of one symbol in one tx are both accounted in one
+        /// run. The first places the hedge; the second finds it in flight and
+        /// settles against it, as the live path does, leaving its share of the
+        /// net for the position scan once the first order completes. A rerun
+        /// repeats neither.
+        #[tokio::test]
+        async fn process_tx_accounts_every_settlement_in_the_tx() {
+            let pool = setup_test_db().await;
+            let (ctx, trading_chain) = settlement_ctx();
+            let cache = settlement_cache();
+            // The first fill nets +2, so the hedge sells 2 shares.
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(PreflightPlacer {
+                verdict: CounterTradePreflight::Allowed {
+                    reservation: Some(CounterTradeReservation::Equity {
+                        symbol: Symbol::new("AAPL").unwrap(),
+                        required: positive_shares("2"),
+                        available: FractionalShares::new(float!(2)),
+                    }),
+                },
+                place: true,
+                preflighted: Arc::default(),
+            });
+            let stores = stores_for(&pool, &order_placer).await;
+            let [first_withdraw, first_deposit] = usdc_for_equity(
+                WT_AAPL,
+                200_000_000,
+                U256::from(2_000_000_000_000_000_000_u64),
+                10,
+            );
+            let [second_withdraw, second_deposit] = usdc_for_equity(
+                WT_AAPL,
+                300_000_000,
+                U256::from(3_000_000_000_000_000_000_u64),
+                20,
+            );
+            let receipt = settlement_receipt(&[
+                first_withdraw,
+                first_deposit,
+                second_withdraw,
+                second_deposit,
+            ]);
+            let conversions = [decimals(18), decimals(6), decimals(18), decimals(6)];
+            let first_run_responses: Vec<Vec<u8>> = conversions
+                .iter()
+                .cloned()
+                .chain(std::iter::repeat_with(unit_ratio).take(4))
+                .collect();
+            let provider = mocked_provider(&receipt, &first_run_responses);
+
+            let reports = process_tx(
+                SETTLEMENT_TX,
+                &ctx,
+                &pool,
+                ProcessTxChainContext::new(&trading_chain, &provider, &cache),
+                &stores,
+                Arc::clone(&order_placer),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let [first, second] = <[ProcessTxReport; 2]>::try_from(reports).unwrap();
+            assert_eq!(first.fill.as_ref().map(|fill| fill.log_index), Some(10));
+            assert!(
+                matches!(
+                    &first.outcome,
+                    ProcessTxOutcome::HedgePlaced {
+                        direction: Direction::Sell,
+                        ..
+                    }
+                ),
+                "got {:?}",
+                first.outcome
+            );
+            assert_eq!(second.fill.as_ref().map(|fill| fill.log_index), Some(20));
+            assert!(
+                matches!(second.outcome, ProcessTxOutcome::PendingHedgeInFlight),
+                "got {:?}",
+                second.outcome
+            );
+            let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+            let position = position_store
+                .load(&Symbol::new("AAPL").unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                position.net.inner().eq(float!(5)).unwrap(),
+                "both settlements are in the position, got {:?}",
+                position.net
+            );
+
+            let rerun_provider = mocked_provider(&receipt, &conversions);
+            let rerun = process_tx(
+                SETTLEMENT_TX,
+                &ctx,
+                &pool,
+                ProcessTxChainContext::new(&trading_chain, &rerun_provider, &cache),
+                &stores,
+                order_placer,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                rerun
+                    .iter()
+                    .map(|report| report.log_index)
+                    .collect::<Vec<_>>(),
+                [Some(10), Some(20)]
+            );
+            for report in rerun {
+                assert!(
+                    matches!(report.outcome, ProcessTxOutcome::AlreadyAccounted),
+                    "got {:?}",
+                    report.outcome
+                );
+            }
+        }
+
+        /// A failure on the second fill stops the run after the first fill is
+        /// durably accounted and hedged. The rerun resumes the second fill and
+        /// does not hedge the first again.
+        #[tokio::test]
+        async fn process_tx_rerun_resumes_after_a_later_fill_fails() {
+            let pool = setup_test_db().await;
+            let (ctx, trading_chain) = settlement_ctx();
+            let cache = settlement_cache();
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(PreflightPlacer {
+                verdict: CounterTradePreflight::Allowed {
+                    reservation: Some(CounterTradeReservation::Equity {
+                        symbol: Symbol::new("AAPL").unwrap(),
+                        required: positive_shares("2"),
+                        available: FractionalShares::new(float!(2)),
+                    }),
+                },
+                place: true,
+                preflighted: Arc::default(),
+            });
+            let stores = stores_for(&pool, &order_placer).await;
+            let [first_withdraw, first_deposit] = usdc_for_equity(
+                WT_AAPL,
+                200_000_000,
+                U256::from(2_000_000_000_000_000_000_u64),
+                10,
+            );
+            let [second_withdraw, second_deposit] = usdc_for_equity(
+                WT_AAPL,
+                300_000_000,
+                U256::from(3_000_000_000_000_000_000_u64),
+                20,
+            );
+            let receipt = settlement_receipt(&[
+                first_withdraw,
+                first_deposit,
+                second_withdraw,
+                second_deposit,
+            ]);
+            let conversions = [decimals(18), decimals(6), decimals(18), decimals(6)];
+            // Ratio reads for the first fill only: the second fill's read fails.
+            let failing_responses: Vec<Vec<u8>> = conversions
+                .iter()
+                .cloned()
+                .chain(std::iter::repeat_with(unit_ratio).take(2))
+                .collect();
+            let failing_provider = mocked_provider(&receipt, &failing_responses);
+
+            let Err(ProcessTxFailure {
+                completed,
+                stopped_at,
+                error: OperatorError::Operational(_),
+            }) = process_tx(
+                SETTLEMENT_TX,
+                &ctx,
+                &pool,
+                ProcessTxChainContext::new(&trading_chain, &failing_provider, &cache),
+                &stores,
+                Arc::clone(&order_placer),
+                None,
+                None,
+            )
+            .await
+            else {
+                panic!("the second fill's failed ratio read must fail the run");
+            };
+            assert_eq!(stopped_at, Some(20));
+            let [hedged] = <[ProcessTxReport; 1]>::try_from(completed).unwrap();
+            assert_eq!(hedged.fill.as_ref().map(|fill| fill.log_index), Some(10));
+            assert!(
+                matches!(hedged.outcome, ProcessTxOutcome::HedgePlaced { .. }),
+                "the failure must carry the hedge placed before it, got {:?}",
+                hedged.outcome
+            );
+            assert_eq!(offchain_order_ids(&pool).await.len(), 1);
+
+            let resumed_responses: Vec<Vec<u8>> = conversions
+                .iter()
+                .cloned()
+                .chain(std::iter::repeat_with(unit_ratio).take(2))
+                .collect();
+            let resumed_provider = mocked_provider(&receipt, &resumed_responses);
+            let reports = process_tx(
+                SETTLEMENT_TX,
+                &ctx,
+                &pool,
+                ProcessTxChainContext::new(&trading_chain, &resumed_provider, &cache),
+                &stores,
+                order_placer,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let [first, second] = <[ProcessTxReport; 2]>::try_from(reports).unwrap();
+            assert!(
+                matches!(first.outcome, ProcessTxOutcome::AlreadyAccounted),
+                "got {:?}",
+                first.outcome
+            );
+            assert!(
+                matches!(second.outcome, ProcessTxOutcome::PendingHedgeInFlight),
+                "got {:?}",
+                second.outcome
+            );
+            assert_eq!(
+                offchain_order_ids(&pool).await.len(),
+                1,
+                "the rerun must not hedge the first fill again"
+            );
+        }
+
+        /// A fill whose conversion fails with an error the fill worker does not
+        /// skip stops the run at its log index, after the fills before it. The
+        /// first fill is accounted by an earlier run, so the second run reads
+        /// nothing after the failing conversion.
+        #[tokio::test]
+        async fn process_tx_stops_at_a_fill_that_fails_conversion() {
+            let pool = setup_test_db().await;
+            let (ctx, trading_chain) = settlement_ctx();
+            let cache = settlement_cache();
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(PreflightPlacer {
+                verdict: CounterTradePreflight::Allowed {
+                    reservation: Some(CounterTradeReservation::Equity {
+                        symbol: Symbol::new("AAPL").unwrap(),
+                        required: positive_shares("2"),
+                        available: FractionalShares::new(float!(2)),
+                    }),
+                },
+                place: true,
+                preflighted: Arc::default(),
+            });
+            let stores = stores_for(&pool, &order_placer).await;
+            let first_settlement = usdc_for_equity(
+                WT_AAPL,
+                200_000_000,
+                U256::from(2_000_000_000_000_000_000_u64),
+                10,
+            );
+            let first_provider = mocked_provider(
+                &settlement_receipt(&first_settlement),
+                &[decimals(18), decimals(6), unit_ratio(), unit_ratio()],
+            );
+            process_tx(
+                SETTLEMENT_TX,
+                &ctx,
+                &pool,
+                ProcessTxChainContext::new(&trading_chain, &first_provider, &cache),
+                &stores,
+                Arc::clone(&order_placer),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let [first_withdraw, first_deposit] = first_settlement;
+            let [second_withdraw, second_deposit] = usdc_for_equity(
+                WT_AAPL,
+                300_000_000,
+                U256::from(3_000_000_000_000_000_000_u64),
+                20,
+            );
+            let asserter = Asserter::new();
+            asserter.push_success(&settlement_receipt(&[
+                first_withdraw,
+                first_deposit,
+                second_withdraw,
+                second_deposit,
+            ]));
+            for response in [decimals(18), decimals(6)] {
+                asserter.push_success(&alloy::primitives::Bytes::from(response));
+            }
+            // Every attempt of both concurrent decimals reads of the second fill.
+            for _ in 0..2 * (crate::onchain::trade::INVENTORY_TOKEN_DECIMALS_MAX_RETRIES + 1) {
+                asserter.push_failure_msg("connection reset by peer");
+            }
+            let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+            let Err(ProcessTxFailure {
+                completed,
+                stopped_at,
+                error: OperatorError::Operational(error),
+            }) = process_tx(
+                SETTLEMENT_TX,
+                &ctx,
+                &pool,
+                ProcessTxChainContext::new(&trading_chain, &provider, &cache),
+                &stores,
+                order_placer,
+                None,
+                None,
+            )
+            .await
+            else {
+                panic!("the second fill's failed conversion must stop the run");
+            };
+
+            assert_eq!(stopped_at, Some(20));
+            assert!(
+                format!("{error:#}").starts_with("failed to decode the fill"),
+                "got {error:#}"
+            );
+            let [accounted] = <[ProcessTxReport; 1]>::try_from(completed).unwrap();
+            assert_eq!(accounted.log_index, Some(10));
+            assert!(
+                matches!(accounted.outcome, ProcessTxOutcome::AlreadyAccounted),
+                "got {:?}",
+                accounted.outcome
+            );
+            assert_eq!(offchain_order_ids(&pool).await.len(), 1);
+        }
+
+        /// Skipped and decoded fills are processed and reported in log order.
+        #[tokio::test]
+        async fn process_tx_reports_skipped_and_decoded_fills_in_log_order() {
+            let pool = setup_test_db().await;
+            let (ctx, trading_chain) = settlement_ctx();
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(PreflightPlacer {
+                verdict: CounterTradePreflight::Allowed {
+                    reservation: Some(CounterTradeReservation::Equity {
+                        symbol: Symbol::new("AAPL").unwrap(),
+                        required: positive_shares("3"),
+                        available: FractionalShares::new(float!(3)),
+                    }),
+                },
+                place: true,
+                preflighted: Arc::default(),
+            });
+            let stores = stores_for(&pool, &order_placer).await;
+            let spoofed = Address::repeat_byte(0xbb);
+            let cache = settlement_cache();
+            cache.preload_symbol(Chain::Base, spoofed, "wtAAPL");
+            let [skipped_withdraw, skipped_deposit] = usdc_for_equity(
+                spoofed,
+                200_000_000,
+                U256::from(2_000_000_000_000_000_000_u64),
+                10,
+            );
+            let [decoded_withdraw, decoded_deposit] = usdc_for_equity(
+                WT_AAPL,
+                300_000_000,
+                U256::from(3_000_000_000_000_000_000_u64),
+                20,
+            );
+            let receipt = settlement_receipt(&[
+                skipped_withdraw,
+                skipped_deposit,
+                decoded_withdraw,
+                decoded_deposit,
+            ]);
+            let responses: Vec<Vec<u8>> = [decimals(18), decimals(6), decimals(18), decimals(6)]
+                .into_iter()
+                .chain(std::iter::repeat_with(unit_ratio).take(2))
+                .collect();
+            let provider = mocked_provider(&receipt, &responses);
+
+            let reports = process_tx(
+                SETTLEMENT_TX,
+                &ctx,
+                &pool,
+                ProcessTxChainContext::new(&trading_chain, &provider, &cache),
+                &stores,
+                order_placer,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let [skipped, decoded] = <[ProcessTxReport; 2]>::try_from(reports).unwrap();
+            assert_eq!(skipped.log_index, Some(10));
+            assert!(
+                matches!(skipped.outcome, ProcessTxOutcome::FillSkipped { .. }),
+                "got {:?}",
+                skipped.outcome
+            );
+            assert_eq!(decoded.log_index, Some(20));
+            assert!(decoded.fill.is_some(), "got {decoded:?}");
+        }
+
+        /// A skippable fill after a failed conversion is neither recorded nor
+        /// reported: the run stops at the failure.
+        #[tokio::test]
+        async fn process_tx_does_not_record_a_skip_after_the_fill_it_stopped_at() {
+            let pool = setup_test_db().await;
+            let (ctx, trading_chain) = settlement_ctx();
+            let order_placer = noop_order_placer();
+            let stores = stores_for(&pool, &order_placer).await;
+            let spoofed = Address::repeat_byte(0xbb);
+            let cache = settlement_cache();
+            cache.preload_symbol(Chain::Base, spoofed, "wtAAPL");
+            let [failing_withdraw, failing_deposit] = usdc_for_equity(
+                WT_AAPL,
+                200_000_000,
+                U256::from(2_000_000_000_000_000_000_u64),
+                10,
+            );
+            let [skipped_withdraw, skipped_deposit] = usdc_for_equity(
+                spoofed,
+                300_000_000,
+                U256::from(3_000_000_000_000_000_000_u64),
+                20,
+            );
+            let asserter = Asserter::new();
+            asserter.push_success(&settlement_receipt(&[
+                failing_withdraw,
+                failing_deposit,
+                skipped_withdraw,
+                skipped_deposit,
+            ]));
+            // Every attempt of both concurrent decimals reads of the first fill.
+            // The second fill gets what is left: it is skipped or fails, and
+            // either way it comes after the stop.
+            for _ in 0..2 * (crate::onchain::trade::INVENTORY_TOKEN_DECIMALS_MAX_RETRIES + 1) {
+                asserter.push_failure_msg("connection reset by peer");
+            }
+            for response in [decimals(18), decimals(6)] {
+                asserter.push_success(&alloy::primitives::Bytes::from(response));
+            }
+            let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+            let Err(ProcessTxFailure {
+                completed,
+                stopped_at,
+                ..
+            }) = process_tx(
+                SETTLEMENT_TX,
+                &ctx,
+                &pool,
+                ProcessTxChainContext::new(&trading_chain, &provider, &cache),
+                &stores,
+                order_placer,
+                None,
+                None,
+            )
+            .await
+            else {
+                panic!("the first fill's failed conversion must stop the run");
+            };
+
+            assert_eq!(stopped_at, Some(10));
+            assert!(completed.is_empty(), "got {completed:?}");
+            let recorded: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM skipped_fills")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(recorded, 0);
+        }
+
+        /// A hedge that stops on a rejection does so after its fill is settled,
+        /// so the run reports it and goes on to account the next fill.
+        #[tokio::test]
+        async fn process_tx_reports_a_refused_hedge_and_runs_the_next_fill() {
+            let pool = setup_test_db().await;
+            let (ctx, trading_chain) = settlement_ctx();
+            let cache = settlement_cache();
+            let symbol = Symbol::new("AAPL").unwrap();
+            let (position_store, pending_id) = seed_retained_pending(&pool, &symbol).await;
+            let net_before = position_store.load(&symbol).await.unwrap().unwrap().net;
+            let order_placer = noop_order_placer();
+            let stores = stores_for(&pool, &order_placer).await;
+            assert!(!stores.schedule_enabled);
+            let [first_withdraw, first_deposit] = usdc_for_equity(
+                WT_AAPL,
+                200_000_000,
+                U256::from(2_000_000_000_000_000_000_u64),
+                10,
+            );
+            let [second_withdraw, second_deposit] = usdc_for_equity(
+                WT_AAPL,
+                300_000_000,
+                U256::from(3_000_000_000_000_000_000_u64),
+                20,
+            );
+            let receipt = settlement_receipt(&[
+                first_withdraw,
+                first_deposit,
+                second_withdraw,
+                second_deposit,
+            ]);
+            let responses: Vec<Vec<u8>> = [decimals(18), decimals(6), decimals(18), decimals(6)]
+                .into_iter()
+                .chain(std::iter::repeat_with(unit_ratio).take(4))
+                .collect();
+            let provider = mocked_provider(&receipt, &responses);
+
+            let reports = process_tx(
+                SETTLEMENT_TX,
+                &ctx,
+                &pool,
+                ProcessTxChainContext::new(&trading_chain, &provider, &cache),
+                &stores,
+                order_placer,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let [first, second] = <[ProcessTxReport; 2]>::try_from(reports).unwrap();
+            for (report, log_index) in [(&first, 10), (&second, 20)] {
+                assert_eq!(
+                    report.fill.as_ref().map(|fill| fill.log_index),
+                    Some(log_index)
+                );
+                assert!(
+                    matches!(
+                        &report.outcome,
+                        ProcessTxOutcome::HedgeRejected {
+                            reason: RejectionReason::RetainedPendingWithoutSchedule {
+                                offchain_order_id,
+                                ..
+                            },
+                        } if *offchain_order_id == pending_id
+                    ),
+                    "got {:?}",
+                    report.outcome
+                );
+            }
+            let position = position_store.load(&symbol).await.unwrap().unwrap();
+            assert!(
+                position
+                    .net
+                    .inner()
+                    .eq((net_before.inner() + float!(5)).unwrap())
+                    .unwrap(),
+                "both fills are in the position, got {:?}",
+                position.net
+            );
+            for log_index in [10, 20] {
+                assert!(
+                    !position.pending_acknowledged_trade_ids.contains(&TradeId {
+                        chain: Chain::Base,
+                        tx_hash: SETTLEMENT_TX,
+                        log_index,
+                    }),
+                    "the fill at log index {log_index} must be settled"
+                );
+            }
+            assert_eq!(position.pending_offchain_order_id, Some(pending_id));
+        }
+
+        #[tokio::test]
+        async fn process_tx_reports_a_quarantined_settlement() {
+            let pool = setup_test_db().await;
+            let (ctx, trading_chain) = settlement_ctx();
+            let order_placer = noop_order_placer();
+            let stores = stores_for(&pool, &order_placer).await;
+            let [first_withdraw, first_deposit] =
+                usdc_for_equity(WT_AAPL, 200_000_000, U256::from(2_u64), 10);
+            let [second_withdraw, second_deposit] =
+                usdc_for_equity(WT_AAPL, 300_000_000, U256::from(3_u64), 20);
+            // Both withdraws, then both deposits: two legs of one kind in a row.
+            let mut legs = [
+                first_withdraw,
+                second_withdraw,
+                first_deposit,
+                second_deposit,
+            ];
+            for (log_index, leg) in (10..).zip(legs.iter_mut()) {
+                leg.log_index = Some(log_index);
+            }
+            let provider = mocked_provider(&settlement_receipt(&legs), &[]);
+
+            let reports = process_tx(
+                SETTLEMENT_TX,
+                &ctx,
+                &pool,
+                ProcessTxChainContext::new(&trading_chain, &provider, &settlement_cache()),
+                &stores,
+                order_placer,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let [report] = <[ProcessTxReport; 1]>::try_from(reports).unwrap();
+            assert!(report.fill.is_none());
+            assert!(
+                matches!(
+                    report.outcome,
+                    ProcessTxOutcome::SettlementQuarantined {
+                        reason: QuarantineReason::ConsecutiveSameKind {
+                            operator: SETTLEMENT_OPERATOR
+                        }
+                    }
+                ),
+                "got {:?}",
+                report.outcome
+            );
+        }
+
+        /// A settlement the fill worker would skip is recorded in
+        /// `skipped_fills` once, also across a rerun, and reported.
+        #[tokio::test]
+        async fn process_tx_records_a_skipped_settlement_once() {
+            let pool = setup_test_db().await;
+            let (ctx, trading_chain) = settlement_ctx();
+            let order_placer = noop_order_placer();
+            let stores = stores_for(&pool, &order_placer).await;
+            let spoofed = Address::repeat_byte(0xbb);
+            let cache = settlement_cache();
+            cache.preload_symbol(Chain::Base, spoofed, "wtAAPL");
+            let receipt = settlement_receipt(&usdc_for_equity(
+                spoofed,
+                200_000_000,
+                U256::from(2_000_000_000_000_000_000_u64),
+                10,
+            ));
+
+            for _ in 0..2 {
+                let provider = mocked_provider(&receipt, &[decimals(18), decimals(6)]);
+                let reports = process_tx(
+                    SETTLEMENT_TX,
+                    &ctx,
+                    &pool,
+                    ProcessTxChainContext::new(&trading_chain, &provider, &cache),
+                    &stores,
+                    Arc::clone(&order_placer),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+
+                let [report] = <[ProcessTxReport; 1]>::try_from(reports).unwrap();
+                assert_eq!(report.log_index, Some(10));
+                assert!(
+                    matches!(
+                        &report.outcome,
+                        ProcessTxOutcome::FillSkipped {
+                            reason: "unrecognized_inventory_token",
+                            ..
+                        }
+                    ),
+                    "got {:?}",
+                    report.outcome
+                );
+            }
+
+            let recorded: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM skipped_fills")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(recorded, 1);
+        }
+
+        /// A rerun after the equity's wrapper address changed reports the fill
+        /// an earlier run hedged as accounted, and records no skip for it.
+        #[tokio::test]
+        async fn process_tx_rerun_reports_an_accounted_fill_that_now_fails_conversion() {
+            let pool = setup_test_db().await;
+            let (ctx, trading_chain) = settlement_ctx();
+            let cache = settlement_cache();
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(PreflightPlacer {
+                verdict: CounterTradePreflight::Allowed {
+                    reservation: Some(CounterTradeReservation::Equity {
+                        symbol: Symbol::new("AAPL").unwrap(),
+                        required: positive_shares("2"),
+                        available: FractionalShares::new(float!(2)),
+                    }),
+                },
+                place: true,
+                preflighted: Arc::default(),
+            });
+            let stores = stores_for(&pool, &order_placer).await;
+            let receipt = settlement_receipt(&usdc_for_equity(
+                WT_AAPL,
+                200_000_000,
+                U256::from(2_000_000_000_000_000_000_u64),
+                10,
+            ));
+            let provider = mocked_provider(
+                &receipt,
+                &[decimals(18), decimals(6), unit_ratio(), unit_ratio()],
+            );
+            let reports = process_tx(
+                SETTLEMENT_TX,
+                &ctx,
+                &pool,
+                ProcessTxChainContext::new(&trading_chain, &provider, &cache),
+                &stores,
+                Arc::clone(&order_placer),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let [hedged] = <[ProcessTxReport; 1]>::try_from(reports).unwrap();
+            assert!(
+                matches!(hedged.outcome, ProcessTxOutcome::HedgePlaced { .. }),
+                "got {:?}",
+                hedged.outcome
+            );
+
+            let (mut rewrapped_ctx, _) = settlement_ctx();
+            rewrapped_ctx
+                .chains
+                .primary_mut()
+                .assets
+                .equities
+                .symbols
+                .get_mut(&Symbol::new("AAPL").unwrap())
+                .unwrap()
+                .tokenized_equity_derivative = Address::repeat_byte(0xcc);
+            let rewrapped_chain = rewrapped_ctx.chains.primary().clone();
+            let rerun_provider = mocked_provider(&receipt, &[decimals(18), decimals(6)]);
+            let rerun = process_tx(
+                SETTLEMENT_TX,
+                &rewrapped_ctx,
+                &pool,
+                ProcessTxChainContext::new(&rewrapped_chain, &rerun_provider, &cache),
+                &stores,
+                order_placer,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let [report] = <[ProcessTxReport; 1]>::try_from(rerun).unwrap();
+            assert_eq!(report.log_index, Some(10));
+            assert!(
+                matches!(report.outcome, ProcessTxOutcome::AlreadyAccounted),
+                "got {:?}",
+                report.outcome
+            );
+            let recorded: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM skipped_fills")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(recorded, 0);
         }
 
         /// Builds the minimal application context required by process-tx tests.

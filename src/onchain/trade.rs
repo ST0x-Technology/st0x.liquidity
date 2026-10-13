@@ -25,11 +25,14 @@ use crate::bindings::IERC4626;
 use crate::bindings::IRaindexInventory::{OperatorDeposit, OperatorWithdraw};
 use crate::bindings::IRaindexV6::{ClearV3, OrderV4, TakeOrderV3};
 use crate::onchain::OnChainError;
-use crate::onchain::backfill::{bucket_inventory_logs, pair_inventory_settlements};
+use crate::onchain::backfill::{
+    QuarantineReason, bucket_inventory_logs, pair_inventory_settlements,
+};
 use crate::onchain::io::{
     InputToken, OutputToken, TokenizedSymbol, TradeDetails, Usdc, WrappedTokenizedShares,
 };
 use crate::onchain_trade::{InventoryVenue, OnChainTradeSource};
+use crate::trading::onchain::skipped_fill::FillSkip;
 
 /// Onchain trade event feeding the hedge pipeline.
 ///
@@ -577,20 +580,23 @@ impl OnchainTrade {
         .await
     }
 
-    /// Attempts to create an OnchainTrade from a transaction hash by looking up
-    /// the transaction receipt and parsing relevant orderbook or inventory
-    /// events. Tries `ClearV3`/`TakeOrderV3` orderbook fills first; if none
-    /// match, falls back to an `OperatorDeposit`/`OperatorWithdraw`
-    /// `InventoryTrade` settlement, paired via the same `bucket_inventory_logs`
-    /// rules the backfill path uses -- so the manual `process-tx` recovery
-    /// path can recover both fill sources this bot hedges.
-    pub async fn try_from_tx_hash<EvmImpl: Evm>(
+    /// Recovers every fill a transaction holds, for the manual `process-tx`
+    /// path: each `ClearV3`/`TakeOrderV3` that converts, and each
+    /// `InventoryTrade` paired from the shared inventory's
+    /// `OperatorDeposit`/`OperatorWithdraw` logs under the same
+    /// [`bucket_inventory_logs`]/[`pair_inventory_settlements`] rules the
+    /// backfill path uses. A fill whose conversion fails with an error the fill
+    /// worker skips per fill is returned in `skipped` instead of failing the
+    /// call, so it cannot block the other fills. A fill whose conversion fails
+    /// with any other error is returned in `failed`, so `process-tx` can
+    /// account the fills before it and stop there.
+    pub(crate) async fn try_from_tx_hash<EvmImpl: Evm>(
         tx_hash: TxHash,
         evm: &EvmImpl,
         cache: &SymbolCache,
         ctx: &HedgedChain,
         actors: RecoveryActors,
-    ) -> Result<Option<Self>, OnChainError> {
+    ) -> Result<TxRecovery, OnChainError> {
         let receipt = evm
             .provider()
             .get_transaction_receipt(tx_hash)
@@ -600,30 +606,22 @@ impl OnchainTrade {
             })?;
 
         let logs = receipt.inner.logs();
-
-        let trades: Vec<_> = logs
-            .iter()
-            .filter(|log| {
-                (log.topic0() == Some(&ClearV3::SIGNATURE_HASH)
-                    || log.topic0() == Some(&TakeOrderV3::SIGNATURE_HASH))
-                    && log.address() == ctx.orderbook
-            })
-            .collect();
-
-        if trades.len() > 1 {
-            warn!(
-                target: "hedge",
-                "Found {} potential trades in the tx with hash {tx_hash}, returning first match",
-                trades.len()
-            );
-        }
-
         let receipt_metadata = ReceiptMetadata {
             block_number: receipt.block_number,
         };
+        let mut recovery = TxRecovery::default();
 
-        for log in trades {
-            if let Some(trade) = try_convert_log_to_onchain_trade(
+        for log in logs.iter().filter(|log| {
+            (log.topic0() == Some(&ClearV3::SIGNATURE_HASH)
+                || log.topic0() == Some(&TakeOrderV3::SIGNATURE_HASH))
+                && log.address() == ctx.orderbook
+        }) {
+            let event_type = if log.topic0() == Some(&ClearV3::SIGNATURE_HASH) {
+                "ClearV3"
+            } else {
+                "TakeOrderV3"
+            };
+            let converted = try_convert_log_to_onchain_trade(
                 log,
                 evm,
                 cache,
@@ -631,98 +629,101 @@ impl OnchainTrade {
                 receipt_metadata,
                 actors.order_owner,
             )
-            .await?
-            {
-                return Ok(Some(trade));
-            }
+            .await;
+            recovery.add(event_type, log.log_index, converted)?;
         }
 
-        // The receipt is already in hand here, so pass its block-number
-        // metadata through instead of letting `try_from_inventory_trade`
-        // re-fetch the same receipt via a second `eth_getTransactionReceipt`.
-        let recovery_config = InventoryRecoveryConfig {
-            cache,
-            hedged_chain: ctx,
-        };
-
-        Self::try_inventory_trade_from_receipt_logs(
-            tx_hash,
-            evm,
-            &recovery_config,
-            actors.bot_operator,
-            logs,
-            receipt_metadata,
-        )
-        .await
-    }
-
-    /// Fallback half of [`Self::try_from_tx_hash`]: looks for an
-    /// `OperatorDeposit`/`OperatorWithdraw` pair emitted by the shared
-    /// inventory among the receipt's logs, using the exact same
-    /// [`bucket_inventory_logs`]/[`pair_inventory_settlements`]
-    /// pairing/quarantine rules as backfill -- an ambiguous multi-deposit or
-    /// multi-withdraw settlement is quarantined here identically, never
-    /// resolved by picking an arbitrary "first match".
-    async fn try_inventory_trade_from_receipt_logs<EvmImpl: Evm>(
-        tx_hash: TxHash,
-        evm: &EvmImpl,
-        config: &InventoryRecoveryConfig<'_>,
-        bot_operator: BotOperator,
-        logs: &[Log],
-        receipt_metadata: ReceiptMetadata,
-    ) -> Result<Option<Self>, OnChainError> {
         let inventory_logs: Vec<Log> = logs
             .iter()
             .filter(|log| {
-                log.address() == config.hedged_chain.inventory_address()
+                log.address() == ctx.inventory_address()
                     && (log.topic0() == Some(&OperatorDeposit::SIGNATURE_HASH)
                         || log.topic0() == Some(&OperatorWithdraw::SIGNATURE_HASH))
             })
             .cloned()
             .collect();
+        let paired = pair_inventory_settlements(
+            bucket_inventory_logs(inventory_logs, actors.bot_operator),
+            ctx.chain,
+        );
+        // All logs share one tx, so at most one quarantine.
+        recovery.quarantine = paired.quarantined.into_iter().next();
 
-        if inventory_logs.is_empty() {
-            return Ok(None);
+        for (inventory_trade, withdraw_log) in paired.trades {
+            let log_index = withdraw_log.log_index;
+            let converted = Self::try_from_inventory_trade(
+                ctx.chain,
+                cache,
+                evm,
+                &ctx.assets,
+                &ctx.inventory_adapters,
+                &inventory_trade,
+                withdraw_log,
+                Some(receipt_metadata),
+            )
+            .await;
+            recovery.add("InventoryTrade", log_index, converted)?;
         }
 
-        let (deposits_by_tx, withdraws_by_tx) = bucket_inventory_logs(inventory_logs, bot_operator);
-        // All logs above share `tx_hash` (filtered from a single receipt), so
-        // this pairs into at most one `InventoryTrade`; a quarantined or
-        // unpaired settlement surfaces as an empty result here, already
-        // logged/counted by `pair_inventory_settlements`.
-        let paired = pair_inventory_settlements(deposits_by_tx, withdraws_by_tx);
-
-        let Some((RaindexTradeEvent::InventoryTrade(inv), withdraw_log)) =
-            paired.into_iter().next()
-        else {
-            debug!(
-                target: "hedge",
-                %tx_hash,
-                "No pairable OperatorDeposit/OperatorWithdraw settlement in this tx; see \
-                 prior inventory warnings/errors for the reason",
-            );
-            return Ok(None);
-        };
-
-        Self::try_from_inventory_trade(
-            config.hedged_chain.chain,
-            config.cache,
-            evm,
-            &config.hedged_chain.assets,
-            &config.hedged_chain.inventory_adapters,
-            &inv,
-            withdraw_log,
-            Some(receipt_metadata),
-        )
-        .await
+        recovery.trades.sort_by_key(|trade| trade.log_index);
+        Ok(recovery)
     }
 }
 
-/// Read-only config bundled for [`OnchainTrade::try_inventory_trade_from_receipt_logs`],
-/// keeping its argument count under the clippy threshold.
-struct InventoryRecoveryConfig<'config> {
-    cache: &'config SymbolCache,
-    hedged_chain: &'config HedgedChain,
+/// Every fill [`OnchainTrade::try_from_tx_hash`] found in one transaction.
+#[derive(Debug, Default)]
+pub(crate) struct TxRecovery {
+    /// Converted fills, in log order.
+    pub(crate) trades: Vec<OnchainTrade>,
+    /// Fills skipped per fill, as the fill worker would skip them.
+    pub(crate) skipped: Vec<SkippedRecoveryFill>,
+    /// Fills whose conversion failed with an error the fill worker does not
+    /// skip, such as an RPC failure.
+    pub(crate) failed: Vec<FailedRecoveryFill>,
+    /// Why the transaction's inventory legs were quarantined, if they were.
+    pub(crate) quarantine: Option<QuarantineReason>,
+}
+
+/// A fill [`OnchainTrade::try_from_tx_hash`] skipped instead of converting.
+#[derive(Debug)]
+pub(crate) struct SkippedRecoveryFill {
+    pub(crate) event_type: &'static str,
+    pub(crate) log_index: u64,
+    pub(crate) skip: FillSkip,
+}
+
+/// A fill whose conversion failed with an error the fill worker does not skip.
+#[derive(Debug)]
+pub(crate) struct FailedRecoveryFill {
+    pub(crate) log_index: u64,
+    pub(crate) error: OnChainError,
+}
+
+impl TxRecovery {
+    fn add(
+        &mut self,
+        event_type: &'static str,
+        log_index: Option<u64>,
+        converted: Result<Option<OnchainTrade>, OnChainError>,
+    ) -> Result<(), OnChainError> {
+        match converted {
+            Ok(Some(trade)) => self.trades.push(trade),
+            Ok(None) => {}
+            Err(error) => match (FillSkip::classify(&error), log_index) {
+                (Some(skip), Some(log_index)) => self.skipped.push(SkippedRecoveryFill {
+                    event_type,
+                    log_index,
+                    skip,
+                }),
+                (Some(_), None) => return Err(TradeValidationError::NoLogIndex.into()),
+                (None, Some(log_index)) => {
+                    self.failed.push(FailedRecoveryFill { log_index, error });
+                }
+                (None, None) => return Err(error),
+            },
+        }
+        Ok(())
+    }
 }
 
 fn inventory_trade_source(
@@ -1102,6 +1103,7 @@ mod tests {
     use crate::test_utils::{
         get_test_order, panic_revert_payload, seed_get_test_order_token_symbols,
     };
+    use crate::trading::onchain::skipped_fill::SkipReason;
 
     /// Preloads a symbol under every chain the fixtures run on, so tests
     /// exercising either Base- or Ethereum-flavored parsing hit the cache.
@@ -1602,7 +1604,7 @@ mod tests {
             .vault_owner(order_owner)
             .call();
 
-        let trade = OnchainTrade::try_from_tx_hash(
+        let recovery = OnchainTrade::try_from_tx_hash(
             tx_hash,
             &ReadOnlyEvm::new(provider),
             &cache,
@@ -1613,8 +1615,8 @@ mod tests {
             },
         )
         .await
-        .unwrap()
         .unwrap();
+        let [trade] = <[OnchainTrade; 1]>::try_from(recovery.trades).unwrap();
 
         assert_eq!(trade.block_number, Some(42));
     }
@@ -1718,7 +1720,7 @@ mod tests {
             ..ctx
         };
 
-        let trade = OnchainTrade::try_from_tx_hash(
+        let recovery = OnchainTrade::try_from_tx_hash(
             tx_hash,
             &ReadOnlyEvm::new(provider),
             &cache,
@@ -1729,8 +1731,8 @@ mod tests {
             },
         )
         .await
-        .unwrap()
         .unwrap();
+        let [trade] = <[OnchainTrade; 1]>::try_from(recovery.trades).unwrap();
 
         assert_eq!(trade.symbol.to_string(), "wtCOIN");
         assert_eq!(trade.direction, Direction::Sell);
@@ -1849,7 +1851,7 @@ mod tests {
             .vault_owner(inventory)
             .call();
 
-        let trade = OnchainTrade::try_from_tx_hash(
+        let recovery = OnchainTrade::try_from_tx_hash(
             tx_hash,
             &ReadOnlyEvm::new(provider),
             &cache,
@@ -1863,9 +1865,15 @@ mod tests {
         .unwrap();
 
         assert!(
-            trade.is_none(),
+            recovery.trades.is_empty(),
             "an ambiguous multi-withdraw settlement must be quarantined, not recovered by \
              picking an arbitrary first withdraw"
+        );
+        assert_eq!(
+            recovery.quarantine,
+            Some(QuarantineReason::ConsecutiveSameKind {
+                operator: venue_operator
+            })
         );
     }
 
@@ -1953,7 +1961,7 @@ mod tests {
             .vault_owner(inventory)
             .call();
 
-        let trade = OnchainTrade::try_from_tx_hash(
+        let recovery = OnchainTrade::try_from_tx_hash(
             tx_hash,
             &ReadOnlyEvm::new(provider),
             &cache,
@@ -1967,10 +1975,14 @@ mod tests {
         .unwrap();
 
         assert!(
-            trade.is_none(),
+            recovery.trades.is_empty(),
             "a deposit and withdraw emitted by different operators must be quarantined, not \
              paired into a fabricated hedge"
         );
+        assert!(matches!(
+            recovery.quarantine,
+            Some(QuarantineReason::UnequalLegCounts { .. })
+        ));
     }
 
     fn make_io(token: Address, vault_id: B256) -> IRaindexV6::IOV2 {
@@ -2666,7 +2678,7 @@ mod tests {
             .assets(assets_config_with_equity("COIN", REAL_WTCOIN_BASE))
             .call();
 
-        let trade = OnchainTrade::try_from_tx_hash(
+        let recovery = OnchainTrade::try_from_tx_hash(
             tx_hash,
             &evm,
             &cache,
@@ -2677,8 +2689,9 @@ mod tests {
             },
         )
         .await
-        .unwrap()
-        .expect("the real Bebop fill must decode from its paired inventory events");
+        .unwrap();
+        let [trade] = <[OnchainTrade; 1]>::try_from(recovery.trades)
+            .expect("the real Bebop fill must decode from its paired inventory events");
 
         assert_eq!(trade.symbol.to_string(), "wtCOIN");
         assert_eq!(trade.direction, Direction::Sell);
@@ -2957,5 +2970,266 @@ mod tests {
                 panic!("expected TokenIntrospectionFailed for a genuine revert, got {other:?}")
             }
         }
+    }
+
+    const SETTLEMENT_INVENTORY: Address = address!("0x000000000000000000000000000000000000a11c");
+    const BEBOP_OPERATOR: Address = address!("0x000000000000000000000000000000000000b0b0");
+    const EQUITY: Address = address!("0x000000000000000000000000000000000000e001");
+    const DOUBLE_SETTLEMENT_TX: TxHash =
+        fixed_bytes!("0xd5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5");
+
+    fn settlement_log(event: alloy::primitives::LogData, log_index: u64) -> Log {
+        Log {
+            inner: alloy::primitives::Log {
+                address: SETTLEMENT_INVENTORY,
+                data: event,
+            },
+            block_hash: None,
+            block_number: Some(1_000),
+            block_timestamp: Some(1_700_000_000),
+            transaction_hash: Some(DOUBLE_SETTLEMENT_TX),
+            transaction_index: None,
+            log_index: Some(log_index),
+            removed: false,
+        }
+    }
+
+    /// A USDC withdraw and a deposit of `equity_token` by the Bebop operator: the vault paid `usdc` and received `equity`.
+    fn usdc_for_equity_settlement(
+        equity_token: Address,
+        usdc: U256,
+        equity: U256,
+        withdraw_log_index: u64,
+    ) -> [Log; 2] {
+        let withdraw = OperatorWithdraw {
+            operator: BEBOP_OPERATOR,
+            token: REAL_USDC_BASE,
+            vaultId: b256!("0x0000000000000000000000000000000000000000000000000000000000000fab"),
+            amount: usdc,
+        };
+        let deposit = OperatorDeposit {
+            operator: BEBOP_OPERATOR,
+            token: equity_token,
+            vaultId: b256!("0x0000000000000000000000000000000000000000000000000000000000000fab"),
+            amount: equity,
+        };
+        [
+            settlement_log(withdraw.to_log_data(), withdraw_log_index),
+            settlement_log(deposit.to_log_data(), withdraw_log_index + 11),
+        ]
+    }
+
+    fn settlement_receipt(logs: &[Log]) -> serde_json::Value {
+        serde_json::json!({
+            "transactionHash": DOUBLE_SETTLEMENT_TX,
+            "transactionIndex": "0x3b",
+            "blockHash": "0xabababababababababababababababababababababababababababababababab",
+            "blockNumber": "0x3e8",
+            "from": "0x000000000000000000000000000000000000f00d",
+            "to": "0x000000000000000000000000000000000000beef",
+            "gasUsed": "0x7a62d",
+            "effectiveGasPrice": "0x57bcf0",
+            "cumulativeGasUsed": "0xa00b4e",
+            "status": "0x1",
+            "type": "0x2",
+            "logsBloom": format!("0x{}", "0".repeat(512)),
+            "logs": logs
+        })
+    }
+
+    fn settlement_chain() -> HedgedChain {
+        let ctx = HedgedChain::test()
+            .orderbook(address!("0x1111111111111111111111111111111111111111"))
+            .inventory(InventoryMode::Managed {
+                inventory: SETTLEMENT_INVENTORY,
+            })
+            .inventory_adapters(inventory_adapters(
+                InventoryAdapterVenue::Bebop,
+                BEBOP_OPERATOR,
+            ))
+            .vault_owner(SETTLEMENT_INVENTORY)
+            .call();
+        HedgedChain {
+            assets: assets_config_with_equity("AAPL", EQUITY),
+            ..ctx
+        }
+    }
+
+    fn settlement_symbol_cache() -> SymbolCache {
+        let cache = SymbolCache::default();
+        preload_on_all_chains(&cache, REAL_USDC_BASE, "USDC");
+        preload_on_all_chains(&cache, EQUITY, "wtAAPL");
+        cache
+    }
+
+    async fn recover_settlement_tx(
+        logs: &[Log],
+        decimals: &[u8],
+        cache: &SymbolCache,
+        ctx: &HedgedChain,
+    ) -> TxRecovery {
+        let asserter = Asserter::new();
+        asserter.push_success(&settlement_receipt(logs));
+        for decimals in decimals {
+            asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(decimals));
+        }
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        OnchainTrade::try_from_tx_hash(
+            DOUBLE_SETTLEMENT_TX,
+            &ReadOnlyEvm::new(provider),
+            cache,
+            ctx,
+            RecoveryActors {
+                order_owner: SETTLEMENT_INVENTORY,
+                bot_operator: BotOperator(address!("0x0000000000000000000000000000000000000b07")),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Both Bebop settlements of one tx are recovered as two equity buys by
+    /// the vault.
+    #[tokio::test]
+    async fn try_from_tx_hash_recovers_every_settlement_of_a_tx() {
+        let [first_withdraw, first_deposit] = usdc_for_equity_settlement(
+            EQUITY,
+            uint!(200_000_000_U256),
+            U256::from(2_000_000_000_000_000_000_u64),
+            10,
+        );
+        let [second_withdraw, second_deposit] = usdc_for_equity_settlement(
+            EQUITY,
+            uint!(300_000_000_U256),
+            U256::from(3_000_000_000_000_000_000_u64),
+            30,
+        );
+        let logs = [
+            first_withdraw,
+            first_deposit,
+            second_withdraw,
+            second_deposit,
+        ];
+
+        let recovery = recover_settlement_tx(
+            &logs,
+            &[18, 6, 18, 6],
+            &settlement_symbol_cache(),
+            &settlement_chain(),
+        )
+        .await;
+
+        assert!(recovery.skipped.is_empty());
+        assert_eq!(recovery.quarantine, None);
+        let [first, second] = <[OnchainTrade; 2]>::try_from(recovery.trades).unwrap();
+        for (trade, log_index, raw_equity) in [
+            (&first, 10, 2_000_000_000_000_000_000_u64),
+            (&second, 30, 3_000_000_000_000_000_000_u64),
+        ] {
+            assert_eq!(trade.log_index, log_index);
+            assert_eq!(trade.direction, Direction::Buy);
+            assert_eq!(trade.equity_token, EQUITY);
+            let expected = Float::from_fixed_decimal(U256::from(raw_equity), 18).unwrap();
+            assert!(
+                trade.amount.inner().eq(expected).unwrap(),
+                "log {log_index}"
+            );
+        }
+    }
+
+    /// A pair the fill worker would skip is skipped here too, and does not
+    /// stop its sibling pair from converting.
+    #[tokio::test]
+    async fn try_from_tx_hash_skips_a_pair_with_an_unrecognized_token_and_keeps_the_other() {
+        let spoofed_equity = address!("0x00000000000000000000000000000000000000d3");
+        let cache = settlement_symbol_cache();
+        preload_on_all_chains(&cache, spoofed_equity, "wtAAPL");
+        let [first_withdraw, first_deposit] =
+            usdc_for_equity_settlement(EQUITY, uint!(200_000_000_U256), uint!(3_U256), 10);
+        let [second_withdraw, second_deposit] =
+            usdc_for_equity_settlement(spoofed_equity, uint!(300_000_000_U256), uint!(4_U256), 30);
+        let logs = [
+            first_withdraw,
+            first_deposit,
+            second_withdraw,
+            second_deposit,
+        ];
+
+        let recovery =
+            recover_settlement_tx(&logs, &[18, 6, 18, 6], &cache, &settlement_chain()).await;
+
+        let [trade] = <[OnchainTrade; 1]>::try_from(recovery.trades).unwrap();
+        assert_eq!(trade.log_index, 10);
+        let [skipped] = <[SkippedRecoveryFill; 1]>::try_from(recovery.skipped).unwrap();
+        assert_eq!(skipped.event_type, "InventoryTrade");
+        assert_eq!(skipped.log_index, 30);
+        assert_eq!(skipped.skip.reason, SkipReason::UnrecognizedInventoryToken);
+    }
+
+    /// An orderbook fill the fill worker would skip as unpriceable is skipped
+    /// here too, and the inventory settlement in the same tx still converts.
+    #[tokio::test]
+    async fn try_from_tx_hash_skips_an_unpriceable_orderbook_fill_and_keeps_the_settlement() {
+        let ctx = settlement_chain();
+        let order = get_test_order();
+        let take_order = IRaindexV6::TakeOrderV3 {
+            sender: address!("0x2222222222222222222222222222222222222222"),
+            config: IRaindexV6::TakeOrderConfigV4 {
+                order: order.clone(),
+                inputIOIndex: U256::from(0),
+                outputIOIndex: U256::from(1),
+                signedContext: Vec::new(),
+            },
+            input: Float::from_fixed_decimal_lossy(uint!(9_U256), 0)
+                .unwrap()
+                .0
+                .get_inner(),
+            output: Float::from_fixed_decimal_lossy(U256::ZERO, 0)
+                .unwrap()
+                .0
+                .get_inner(),
+        };
+        let orderbook_log = Log {
+            inner: alloy::primitives::Log {
+                address: ctx.orderbook,
+                data: take_order.to_log_data(),
+            },
+            ..settlement_log(take_order.to_log_data(), 7)
+        };
+        let [withdraw, deposit] =
+            usdc_for_equity_settlement(EQUITY, uint!(200_000_000_U256), uint!(3_U256), 10);
+        let cache = settlement_symbol_cache();
+        seed_get_test_order_token_symbols(&cache);
+        let ctx = HedgedChain {
+            vault_owner: order.owner,
+            ..ctx
+        };
+
+        let recovery = OnchainTrade::try_from_tx_hash(
+            DOUBLE_SETTLEMENT_TX,
+            &ReadOnlyEvm::new({
+                let asserter = Asserter::new();
+                asserter.push_success(&settlement_receipt(&[orderbook_log, withdraw, deposit]));
+                asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
+                asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
+                ProviderBuilder::new().connect_mocked_client(asserter)
+            }),
+            &cache,
+            &ctx,
+            RecoveryActors {
+                order_owner: order.owner,
+                bot_operator: BotOperator(Address::ZERO),
+            },
+        )
+        .await
+        .unwrap();
+
+        let [trade] = <[OnchainTrade; 1]>::try_from(recovery.trades).unwrap();
+        assert_eq!(trade.log_index, 10);
+        let [skipped] = <[SkippedRecoveryFill; 1]>::try_from(recovery.skipped).unwrap();
+        assert_eq!(skipped.event_type, "TakeOrderV3");
+        assert_eq!(skipped.log_index, 7);
+        assert_eq!(skipped.skip.reason, SkipReason::UnpriceableFill);
     }
 }
