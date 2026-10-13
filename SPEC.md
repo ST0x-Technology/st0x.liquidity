@@ -1526,13 +1526,14 @@ migration files in `migrations/`.
 #### Bot-Paid Gas Cost Recording
 
 - After each bot-signed on-chain transaction mines successfully -- vault
-  deposit, vault withdraw, wrap, unwrap, CCTP burn, CCTP mint, or the USDC
-  transfer to the Alpaca deposit address -- the confirming service enqueues a
-  durable `RecordBotGasReceiptCost` job identifying the chain, transaction hash,
-  operation category, and symbol (when known). Each CCTP burn that mines but
-  reverts is also enqueued: the confirming or recovery path records that attempt
-  before retrying the burn, because a reverted transaction still consumes real
-  gas
+  deposit, vault withdraw, wrap, unwrap, CCTP burn, CCTP mint, the USDC transfer
+  to the Alpaca deposit address, or a Relay approve or deposit (each approve
+  queued once the deposit after it confirms) -- the confirming service enqueues
+  a durable `RecordBotGasReceiptCost` job identifying the chain, transaction
+  hash, operation category, and symbol (when known). Each CCTP burn that mines
+  but reverts is also enqueued: the confirming or recovery path records that
+  attempt before retrying the burn, because a reverted transaction still
+  consumes real gas
 - The recorded native cost is `gas_used * effective_gas_price` from the
   transaction receipt, plus the receipt's `l1Fee` on Base. The Base fee is
   required and decoded from the OP-Stack receipt shape; a missing or malformed

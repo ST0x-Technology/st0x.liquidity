@@ -41,6 +41,7 @@ use super::{
     ResumeBaseToAlpaca, UsdcRecheckError, UsdcTransferError,
 };
 use crate::alerts::AlertKind;
+use crate::bot_gas::BotGasOperationCategory;
 use crate::native_gas::TransferGasRoute;
 use crate::rebalancing::equity::RecheckOutcome;
 use crate::usdc_rebalance::{
@@ -634,6 +635,21 @@ where
             .confirm_deposit(TO_HUB, RelayOrderId(order_id), &pair, &split_approves)
             .await
             .map_err(Box::new)?;
+
+        // Enqueued before `ConfirmSwapDeposit` (see `enqueue_bot_gas_cost`): a
+        // failed enqueue leaves `SwapDepositPrepared`, whose retry sends the
+        // same pair again and enqueues again.
+        let chain = self.corridor.chain();
+        for approve in split_approves.iter().chain(&pair.approve) {
+            self.enqueue_bot_gas_cost(
+                chain,
+                approve.tx_hash(),
+                BotGasOperationCategory::RelayApprove,
+            )
+            .await?;
+        }
+        self.enqueue_bot_gas_cost(chain, deposit_tx, BotGasOperationCategory::RelayDeposit)
+            .await?;
 
         self.cqrs
             .send(
@@ -2227,6 +2243,112 @@ mod tests {
                 (Chain::Robinhood, deposit, "relay_deposit".to_string()),
             ]
         );
+    }
+
+    /// An approve that went out alone is paid by the bot too: its gas is
+    /// queued once the deposit after it confirms, not while it is unconfirmed.
+    #[tokio::test]
+    async fn split_approve_gas_is_queued_with_the_deposit() {
+        let anvil = spawn_anvil(Anvil::new());
+        let (wallet, contracts) = funded_relay_end(&anvil).await;
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let witness = Arc::new(
+            BroadcastWitness::new(wallet.clone(), store.clone(), id.clone()).on_deposit_signing(
+                OnDepositSigning::AnotherSendFirst {
+                    to: contracts.stable,
+                },
+            ),
+        );
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let (transfer, apalis_pool) = relay_transfer_recording_gas(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            witness.clone(),
+            contracts,
+            store.clone(),
+        )
+        .await;
+        record_quoted(
+            &store,
+            &id,
+            exact_quote(&wallet, contracts, B256::repeat_byte(0x0d)).await,
+        )
+        .await;
+
+        let error = transfer
+            .resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, UsdcTransferError::SwapPairSplit { .. }),
+            "got {error:?}"
+        );
+        assert_eq!(queued_gas_costs(&apalis_pool).await, vec![]);
+
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the deposit mines")
+        .unwrap();
+
+        let UsdcRebalance::SwapDeposited { deposit_tx, .. } =
+            store.load(&id).await.unwrap().unwrap()
+        else {
+            panic!("expected SwapDeposited");
+        };
+        let split_approve = witness.broadcasts()[0];
+        assert_eq!(
+            queued_gas_costs(&apalis_pool).await,
+            vec![
+                (Chain::Robinhood, split_approve, "relay_approve".to_string()),
+                (Chain::Robinhood, deposit_tx, "relay_deposit".to_string()),
+            ]
+        );
+    }
+
+    /// A failed gas enqueue leaves the confirmed pair at `SwapDepositPrepared`,
+    /// so the retry sends the same pair and enqueues again.
+    #[tokio::test]
+    async fn failed_relay_gas_enqueue_leaves_the_pair_for_the_retry() {
+        let anvil = spawn_anvil(Anvil::new());
+        let (wallet, contracts) = funded_relay_end(&anvil).await;
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let (transfer, apalis_pool) = relay_transfer_recording_gas(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet.clone(),
+            contracts,
+            store.clone(),
+        )
+        .await;
+        record_quoted(
+            &store,
+            &id,
+            exact_quote(&wallet, contracts, B256::repeat_byte(0x0d)).await,
+        )
+        .await;
+        apalis_pool.close().await;
+
+        let error = transfer
+            .resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::BotGasEnqueue(_)),
+            "got {error:?}"
+        );
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "SwapDepositPrepared");
     }
 
     /// A job timeout that cancels the attempt after the pair is signed and

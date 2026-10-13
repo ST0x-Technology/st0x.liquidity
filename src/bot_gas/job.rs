@@ -366,8 +366,9 @@ impl Job<RecordBotGasReceiptCostCtx> for RecordBotGasReceiptCost {
         // mint) can legitimately have been submitted and paid for by a
         // relayer rather than this bot, unlike every other enqueue site
         // (vault deposit/withdraw, wrap/unwrap, USDC wallet transfer, CCTP
-        // burn), which the bot always originates. The payer is knowable from
-        // the receipt alone (`receipt.from` vs `bot_wallet`), so check it
+        // burn, Relay approve/deposit), which the bot always originates. The
+        // payer is knowable from the receipt alone (`receipt.from` vs
+        // `bot_wallet`), so check it
         // here -- before the block fetch and the Chainlink valuation calls --
         // rather than after both, so a relayer-paid mint skips cleanly
         // without incurring either RPC read or risking their transient-error

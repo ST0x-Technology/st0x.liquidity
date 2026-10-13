@@ -161,6 +161,8 @@ pub(crate) enum BotGasOperationCategory {
     CctpBurn,
     CctpMint,
     WalletTransfer,
+    RelayApprove,
+    RelayDeposit,
 }
 
 impl BotGasOperationCategory {
@@ -173,6 +175,8 @@ impl BotGasOperationCategory {
             Self::CctpBurn => "cctp_burn",
             Self::CctpMint => "cctp_mint",
             Self::WalletTransfer => "wallet_transfer",
+            Self::RelayApprove => "relay_approve",
+            Self::RelayDeposit => "relay_deposit",
         }
     }
 }

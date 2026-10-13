@@ -1217,7 +1217,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
     /// `DepositInitiated` resume arm repeats this same enqueue call after its
     /// own `confirm_tx_receipt`, since no resume path re-enters `deposit_to_vault`
     /// itself once past that state (see that resume arm's comment).
-    async fn enqueue_bot_gas_cost(
+    pub(super) async fn enqueue_bot_gas_cost(
         &self,
         chain: Chain,
         tx_hash: TxHash,
