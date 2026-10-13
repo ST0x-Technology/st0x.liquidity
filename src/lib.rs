@@ -65,6 +65,7 @@ mod native_gas;
 mod offchain;
 mod onchain;
 mod onchain_trade;
+mod operations_audit;
 pub mod operator;
 mod performance;
 mod portfolio_snapshot;
@@ -90,11 +91,23 @@ mod vault_registry;
 mod view_rebuild;
 mod wrapped_equity_recovery;
 
+pub use metrics::liquidity::log_counts::activate_log_counts;
 pub use registry_boot::report_boot as report_registry_boot;
 pub use st0x_config::{
     ExtraLayer, FileLogGuard, TelemetryError, TelemetryGuard, mk_env_filter, setup_tracing,
 };
+pub use startup::PROCESS_START;
 pub use tls::install_tls_crypto_provider;
+
+/// Installs the process-wide Prometheus recorder; the bot session reuses it.
+///
+/// Call it before the tracing setup: an event the counting layer forwards
+/// before the recorder exists increments no `log_events_total`, so the
+/// warnings logged while the bot boots would be missing from it.
+pub fn install_metrics_recorder() -> anyhow::Result<()> {
+    metrics::setup().context("failed to install Prometheus recorder")?;
+    Ok(())
+}
 
 #[cfg(any(test, feature = "test-support"))]
 pub use offchain::order::{OffchainOrder, OffchainOrderId};
@@ -307,10 +320,16 @@ async fn run_bot_session_inner(
 
     let metrics_handle = metrics::setup().context("failed to install Prometheus recorder")?;
 
-    let inventory = Arc::new(inventory::BroadcastingInventory::new(
-        inventory::InventoryView::for_primary_chain(ctx.chains.primary().chain),
-        event_sender.clone(),
-    ));
+    let inventory = Arc::new(
+        inventory::BroadcastingInventory::new(
+            inventory::InventoryView::for_primary_chain(ctx.chains.primary().chain),
+            event_sender.clone(),
+        )
+        .publishing_liq_metrics(metrics::liquidity::inventory::InventoryPublisher::new(
+            &ctx,
+            &metrics::liquidity::LIQ_FAMILIES,
+        )),
+    );
     let equity_prices = dashboard::equity_price::EquityPriceStore::new(
         ctx.chains.hedged().map(|hedged| &hedged.assets),
     );
@@ -355,6 +374,12 @@ async fn run_bot_session_inner(
     let health = startup::HealthGate::default();
     let detached_tasks = TaskTracker::new();
     let (reload_sender, reload_receiver) = tokio::sync::mpsc::channel(1);
+    metrics::liquidity::settings::publish_boot_families(
+        &ctx,
+        api::GIT_COMMIT,
+        *PROCESS_START,
+        &metrics::liquidity::LIQ_FAMILIES,
+    );
     let state = AppState {
         ctx: ctx.clone(),
         pool: pools.cqrs.clone(),
@@ -370,7 +395,7 @@ async fn run_bot_session_inner(
         projection_maintenance: projection_maintenance.clone(),
         pnl_report_admission: dashboard::pnl::pnl_report_admission(),
         pnl_ledger: pnl_ledger.clone(),
-        metrics_handle,
+        metrics_handle: metrics_handle.clone(),
         health: health.clone(),
         detached_tasks: detached_tasks.clone(),
     };
@@ -387,12 +412,19 @@ async fn run_bot_session_inner(
         startup_barrier.token(),
         startup_barrier.token(),
     );
-    let equity_price_supervisor = equity_price_task.map(|task| {
-        non_escalating_supervisor_builder()
-            .with_task("dashboard-equity-prices", task)
-            .build()
-            .run()
-    });
+    let auxiliary_supervisor = spawn_auxiliary_supervisor(
+        equity_price_task,
+        metrics_handle,
+        metrics::liquidity::refresh::LiqStateRefresh {
+            inventory: inventory.clone(),
+            equity_prices: equity_prices.clone(),
+            pool: pools.cqrs.clone(),
+            families: &metrics::liquidity::LIQ_FAMILIES,
+        },
+        &ctx,
+        &pools.cqrs,
+        &pnl_ledger,
+    );
     let mut bot_task = tokio::spawn(Box::pin(run_conductor_session(
         ctx.clone(),
         pools,
@@ -425,7 +457,7 @@ async fn run_bot_session_inner(
     let mut session_guard = SessionTaskGuard {
         conductor: bot_task.abort_handle(),
         server_supervisor: server_supervisor.clone(),
-        equity_price_supervisor: equity_price_supervisor.clone(),
+        auxiliary_supervisor: auxiliary_supervisor.clone(),
         armed: true,
     };
 
@@ -474,7 +506,7 @@ async fn run_bot_session_inner(
             StartupOutcome::Started => {
                 await_shutdown(
                     server_supervisor,
-                    equity_price_supervisor,
+                    auxiliary_supervisor,
                     bot_task,
                     &detached_tasks,
                     shutdown_token,
@@ -484,9 +516,10 @@ async fn run_bot_session_inner(
                 .await
             }
             StartupOutcome::ShutdownSignal => {
-                shutdown_equity_price_supervisor(equity_price_supervisor.as_ref());
-                drain_for_shutdown_signal(
+                drain_session(
+                    ShutdownTrigger::Signal,
                     &server_supervisor,
+                    &auxiliary_supervisor,
                     bot_task,
                     &detached_tasks,
                     shutdown_token,
@@ -595,7 +628,7 @@ fn transfer_id<Tag>(id: uuid::Uuid) -> st0x_finance::Id<Tag> {
 struct SessionTaskGuard {
     conductor: AbortHandle,
     server_supervisor: SupervisorHandle,
-    equity_price_supervisor: Option<SupervisorHandle>,
+    auxiliary_supervisor: SupervisorHandle,
     armed: bool,
 }
 
@@ -613,7 +646,7 @@ impl Drop for SessionTaskGuard {
 
         self.conductor.abort();
         shutdown_supervisor(&self.server_supervisor);
-        shutdown_equity_price_supervisor(self.equity_price_supervisor.as_ref());
+        shutdown_auxiliary_supervisor(&self.auxiliary_supervisor);
     }
 }
 
@@ -684,9 +717,10 @@ fn spawn_server_supervisor(
 ) -> SupervisorHandle {
     // Read before `state` moves into the router below.
     let ops_api = state.ctx.ops_api.clone();
+    let detached_tasks = state.detached_tasks.clone();
 
     let main_router = Router::new()
-        .merge(api::routes(ops_api.as_ref()))
+        .merge(api::routes(ops_api.as_ref(), &detached_tasks))
         .nest("/api", dashboard::routes())
         .route("/metrics", axum::routing::get(metrics::endpoint))
         .with_state(state);
@@ -731,13 +765,55 @@ fn spawn_server_supervisor(
         .run()
 }
 
+/// The supervisor for tasks that must never stop trading: the dashboard
+/// price feed (when pricing is configured), the metrics recorder upkeep and
+/// the `liq_*` refreshes.
+fn spawn_auxiliary_supervisor(
+    equity_price_task: Option<startup::StartupTask<dashboard::equity_price::EquityPriceMonitor>>,
+    metrics_handle: PrometheusHandle,
+    liq_state_refresh: metrics::liquidity::refresh::LiqStateRefresh,
+    ctx: &Ctx,
+    pool: &SqlitePool,
+    pnl_ledger: &Arc<dashboard::pnl::PnlLedger>,
+) -> SupervisorHandle {
+    let liq_performance_refresh = metrics::liquidity::refresh::LiqPerformanceRefresh::new(
+        ctx,
+        pool.clone(),
+        &metrics::liquidity::LIQ_FAMILIES,
+    );
+    let liq_pnl_refresh =
+        metrics::liquidity::pnl_refresh::LiqPnlRefresh::live(ctx, pool.clone(), pnl_ledger.clone());
+
+    let builder = non_escalating_supervisor_builder()
+        .with_task(
+            "metrics-recorder-upkeep",
+            metrics::RecorderUpkeep {
+                handle: metrics_handle,
+            },
+        )
+        .with_task("liq-state-refresh", liq_state_refresh)
+        .with_task("liq-performance-refresh", liq_performance_refresh)
+        .with_task("liq-pnl-refresh", liq_pnl_refresh)
+        .with_task(
+            "liq-orders-refresh",
+            metrics::liquidity::orders::LiqOrdersRefresh::new(ctx.clone(), pool.clone()),
+        );
+
+    match equity_price_task {
+        Some(task) => builder.with_task("dashboard-equity-prices", task),
+        None => builder,
+    }
+    .build()
+    .run()
+}
+
 fn non_escalating_supervisor_builder() -> SupervisorBuilder {
     SupervisorBuilder::default().with_unlimited_restarts()
 }
 
 async fn await_shutdown<S>(
     server_supervisor: SupervisorHandle,
-    equity_price_supervisor: Option<SupervisorHandle>,
+    auxiliary_supervisor: SupervisorHandle,
     mut bot_task: JoinHandle<anyhow::Result<()>>,
     detached_tasks: &TaskTracker,
     shutdown_token: CancellationToken,
@@ -754,12 +830,59 @@ where
         result = server_supervisor.wait() => ShutdownTrigger::ServerExit(result),
         result = &mut bot_task => ShutdownTrigger::BotExit(result),
     };
-    shutdown_equity_price_supervisor(equity_price_supervisor.as_ref());
 
+    drain_session(
+        trigger,
+        &server_supervisor,
+        &auxiliary_supervisor,
+        bot_task,
+        detached_tasks,
+        shutdown_token,
+        drain_timeout,
+    )
+    .await
+}
+
+/// Stops the auxiliary supervisor and drains the session for whatever ended
+/// it, waiting for the auxiliary supervisor beside the other drains.
+async fn drain_session(
+    trigger: ShutdownTrigger,
+    server_supervisor: &SupervisorHandle,
+    auxiliary_supervisor: &SupervisorHandle,
+    bot_task: JoinHandle<anyhow::Result<()>>,
+    detached_tasks: &TaskTracker,
+    shutdown_token: CancellationToken,
+    drain_timeout: Duration,
+) -> anyhow::Result<()> {
+    shutdown_auxiliary_supervisor(auxiliary_supervisor);
+    let (drained, ()) = tokio::join!(
+        drain_after_trigger(
+            trigger,
+            server_supervisor,
+            bot_task,
+            detached_tasks,
+            shutdown_token,
+            drain_timeout,
+        ),
+        drain_auxiliary_supervisor(auxiliary_supervisor, drain_timeout),
+    );
+    drained
+}
+
+/// Drains the bot, the server supervisor and the detached request tasks for
+/// whatever ended the session.
+async fn drain_after_trigger(
+    trigger: ShutdownTrigger,
+    server_supervisor: &SupervisorHandle,
+    bot_task: JoinHandle<anyhow::Result<()>>,
+    detached_tasks: &TaskTracker,
+    shutdown_token: CancellationToken,
+    drain_timeout: Duration,
+) -> anyhow::Result<()> {
     match trigger {
         ShutdownTrigger::Signal => {
             drain_for_shutdown_signal(
-                &server_supervisor,
+                server_supervisor,
                 bot_task,
                 detached_tasks,
                 shutdown_token,
@@ -779,7 +902,7 @@ where
             check_server_result(result)
         }
         ShutdownTrigger::BotExit(result) => {
-            shutdown_supervisor(&server_supervisor);
+            shutdown_supervisor(server_supervisor);
             drain_detached_tasks(detached_tasks, drain_timeout).await;
             check_bot_result(result)
         }
@@ -802,6 +925,26 @@ async fn drain_for_shutdown_signal(
         drain_detached_tasks(detached_tasks, drain_timeout),
     );
     bot_drained
+}
+
+/// Waits up to `timeout` for the auxiliary supervisor, already told to stop,
+/// to handle the stop: it aborts its tasks (the `liq_*` refreshes and the
+/// price feed) and ends. It does not wait for an aborted task to finish
+/// unwinding, nor for a P&L replay on a blocking thread. Bounded, so a stuck
+/// supervisor cannot hold the shutdown.
+async fn drain_auxiliary_supervisor(handle: &SupervisorHandle, timeout: Duration) {
+    match tokio::time::timeout(timeout, handle.wait()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            warn!(target: "shutdown", %error, "Auxiliary supervisor stopped with an error");
+        }
+        Err(_elapsed) => {
+            warn!(
+                target: "shutdown",
+                "Auxiliary supervisor did not stop before the drain timeout"
+            );
+        }
+    }
 }
 
 /// Closes the detached request tracker and waits up to `timeout` for its work
@@ -900,10 +1043,8 @@ fn shutdown_supervisor(handle: &SupervisorHandle) {
     shutdown_named_supervisor("server", handle);
 }
 
-fn shutdown_equity_price_supervisor(handle: Option<&SupervisorHandle>) {
-    if let Some(handle) = handle {
-        shutdown_named_supervisor("dashboard-equity-prices", handle);
-    }
+fn shutdown_auxiliary_supervisor(handle: &SupervisorHandle) {
+    shutdown_named_supervisor("auxiliary", handle);
 }
 
 fn shutdown_named_supervisor(name: &'static str, handle: &SupervisorHandle) {
@@ -1005,6 +1146,7 @@ async fn run_conductor_session(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
+    use futures_util::FutureExt as _;
     use std::io;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -1283,7 +1425,7 @@ mod tests {
         let mut guard = SessionTaskGuard {
             conductor: conductor_task.abort_handle(),
             server_supervisor: supervisor.clone(),
-            equity_price_supervisor: None,
+            auxiliary_supervisor: pending_test_supervisor(),
             armed: true,
         };
 
@@ -1318,7 +1460,7 @@ mod tests {
         let guard = SessionTaskGuard {
             conductor: conductor_task.abort_handle(),
             server_supervisor: supervisor.clone(),
-            equity_price_supervisor: None,
+            auxiliary_supervisor: pending_test_supervisor(),
             armed: true,
         };
 
@@ -1352,7 +1494,7 @@ mod tests {
             let mut guard = SessionTaskGuard {
                 conductor: conductor_abort,
                 server_supervisor: supervisor,
-                equity_price_supervisor: None,
+                auxiliary_supervisor: pending_test_supervisor(),
                 armed: true,
             };
             let coordinated_shutdown = async move {
@@ -1411,8 +1553,8 @@ mod tests {
 
         let supervisor = SupervisorBuilder::default().build().run();
         let supervisor_handle_for_assert = supervisor.clone();
-        let equity_price_supervisor = pending_test_supervisor();
-        let equity_price_handle_for_assert = equity_price_supervisor.clone();
+        let auxiliary_supervisor = pending_test_supervisor();
+        let auxiliary_handle_for_assert = auxiliary_supervisor.clone();
 
         let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
         let signal_fut = async move {
@@ -1426,7 +1568,7 @@ mod tests {
 
         await_shutdown(
             supervisor,
-            Some(equity_price_supervisor),
+            auxiliary_supervisor,
             bot_task,
             &TaskTracker::new(),
             shutdown_token,
@@ -1447,15 +1589,68 @@ mod tests {
             post_wait.is_ok(),
             "supervisor.wait() should return after signal-triggered shutdown"
         );
-        let equity_price_post_wait = tokio::time::timeout(
-            Duration::from_secs(1),
-            equity_price_handle_for_assert.wait(),
-        )
-        .await;
+        let auxiliary_post_wait =
+            tokio::time::timeout(Duration::from_secs(1), auxiliary_handle_for_assert.wait()).await;
         assert!(
-            equity_price_post_wait.is_ok(),
-            "equity price supervisor should stop during signal-triggered shutdown"
+            matches!(auxiliary_post_wait, Ok(Ok(()))),
+            "auxiliary supervisor should stop during signal-triggered shutdown: \
+             {auxiliary_post_wait:?}"
         );
+    }
+
+    /// A bot task that has already finished, so awaiting it does not yield.
+    async fn finished_bot_task() -> JoinHandle<anyhow::Result<()>> {
+        let bot_task = tokio::spawn(async { Ok(()) });
+        while !bot_task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        bot_task
+    }
+
+    /// Every trigger drains through `drain_session`, which returns only once
+    /// the auxiliary supervisor has handled the stop. With a finished bot
+    /// task and no detached tasks, the auxiliary wait is the only point that
+    /// yields, so a single poll of its handle tells whether it was awaited.
+    #[tokio::test]
+    async fn every_shutdown_trigger_waits_for_the_auxiliary_supervisor() {
+        for name in ["signal", "server exit", "bot exit"] {
+            let trigger = match name {
+                "signal" => ShutdownTrigger::Signal,
+                "server exit" => ShutdownTrigger::ServerExit(Ok(())),
+                "bot exit" => ShutdownTrigger::BotExit(Ok(Ok(()))),
+                other => panic!("no trigger named {other}"),
+            };
+            let auxiliary_supervisor = pending_test_supervisor();
+
+            drain_session(
+                trigger,
+                &SupervisorBuilder::default().build().run(),
+                &auxiliary_supervisor,
+                finished_bot_task().await,
+                &TaskTracker::new(),
+                CancellationToken::new(),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                matches!(auxiliary_supervisor.wait().now_or_never(), Some(Ok(()))),
+                "{name}: the auxiliary supervisor must have stopped before the drain returned"
+            );
+        }
+    }
+
+    /// A supervisor that does not stop cannot hold the shutdown past its
+    /// drain timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_auxiliary_supervisor_cannot_hold_the_shutdown() {
+        let stuck = pending_test_supervisor();
+        let wait = drain_auxiliary_supervisor(&stuck, Duration::from_secs(5));
+
+        tokio::time::timeout(Duration::from_secs(6), wait)
+            .await
+            .expect("the drain must give up after its timeout");
     }
 
     #[tokio::test]
@@ -1469,7 +1664,7 @@ mod tests {
 
         await_shutdown(
             supervisor,
-            None,
+            pending_test_supervisor(),
             bot_task,
             &TaskTracker::new(),
             shutdown_token,
@@ -1511,7 +1706,7 @@ mod tests {
 
         await_shutdown(
             supervisor,
-            None,
+            pending_test_supervisor(),
             bot_task,
             &TaskTracker::new(),
             shutdown_token,
@@ -1589,7 +1784,7 @@ mod tests {
                 async move {
                     await_shutdown(
                         supervisor,
-                        None,
+                        pending_test_supervisor(),
                         bot_task,
                         &detached_tasks,
                         shutdown_token,
@@ -1646,7 +1841,7 @@ mod tests {
 
         await_shutdown(
             supervisor,
-            None,
+            pending_test_supervisor(),
             bot_task,
             &TaskTracker::new(),
             shutdown_token,

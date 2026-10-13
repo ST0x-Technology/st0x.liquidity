@@ -76,6 +76,38 @@ For an interactive session, SSH in first (drop `--command`), then
 in the docker group. The image has no shell, so `docker exec` must invoke
 `/bin/st0x-cli` directly.
 
+### Offline commands on GCP
+
+Some commands need the bot stopped, for example the offline
+`stox fail-usdc-transfer`, or `stox transfer reconcile` before the next start.
+`docker exec` needs the bot container running, so instead:
+
+1. Stop the liquidity workload, not its VM: disable and stop the roll timer,
+   stop a running roll, then disable and stop the stack unit, and confirm that
+   no workload container runs. The private `T0Trade/t0.devops` runbook
+   (`docs/incident-runbooks.md`, "Stop the liquidity workload, not its VM") has
+   the commands and names for each environment.
+2. On the VM, run the CLI in a one-off container of the compose `bot` service,
+   which mounts the same config, secrets, and database. `IMAGES_ENV` and
+   `COMPOSE_FILE` are the stack's files that the runbook names. The in-container
+   paths are the same in both environments:
+
+   ```sh
+   sudo docker compose --env-file IMAGES_ENV -f COMPOSE_FILE \
+     run --rm --no-deps --entrypoint /bin/st0x-cli bot \
+     --config /run/t0-config/st0x-hedge.toml \
+     --secrets /run/t0-secrets/t0-liquidity-secrets.toml \
+     SUBCOMMAND OPTIONS
+   ```
+
+   The one-off container publishes no ports, and its output also goes to the
+   stack's log stream.
+
+3. Start the stack again, then the roll timer, as the same runbook describes.
+   Starting the timer can adopt a pending `images.env` at once.
+
+Nobody has run this procedure on a VM yet.
+
 ## Token Address Reference
 
 The **unwrapped** tokenized-equity contract address per symbol. The tokenization
@@ -336,7 +368,13 @@ that is below its gas threshold, or retry if the message says its balance could
 not be read. `capital cctp-bridge` waits for neither Circle nor the burn's
 receipt: it returns the burn tx as soon as the burn is broadcast, and
 `debug cctp complete-mint` fetches the attestation and mints once Circle has
-attested it.
+attested it. If the burn belongs to a stuck USDC rebalance, run
+`debug resume-usdc` afterwards while the rebalance is not terminal. Run
+`debug reconcile-usdc` only after a terminal failure whose funds leg is done and
+verified at the destination. For a BaseToAlpaca rebalance that failed after its
+burn, follow
+[Settling a post-burn Base to Alpaca failure by hand](#settling-a-post-burn-base-to-alpaca-failure-by-hand)
+instead.
 
 A bot release from before operation ids ignores the id and burns on every call,
 so the bot ships before this client: after deploy, and after a rollback of the
@@ -471,12 +509,16 @@ are no longer seen or recovered. `paused` keeps all of them until you have
 checked that nothing is left. Removing the listing or the chain from config
 while its work is still open refuses startup.
 
-1. In `st0x.registry`, set `rebalancing = "paused"` on
-   `[chains.<chain>.assets.equities.<SYM>]` and publish the token file. The
-   planner and `transfer-equity` start no new mint or redemption for that
-   listing. Transfers already under way, their resume jobs and wallet recovery
-   on that chain run to completion: a paused listing keeps the chain's equity
-   services, so its wallet is still polled.
+1. In `t0.tokens`, set `rebalancing = "paused"` on
+   `[chains.<chain>.assets.equities.<SYM>]` and publish the token file. A merge
+   uploads only staging. In production, run `publish-t0-tokens` on `main` with
+   its PAM grant. While production pins `[registry].generation`, also bump it to
+   the new generation and release it with a config-only `production-release`
+   run. Confirm `registry_applied_generation` shows the new generation before
+   you go to step 2. Then the planner and `transfer-equity` start no new mint or
+   redemption for that listing. Transfers already under way, their resume jobs
+   and wallet recovery on that chain run to completion: a paused listing keeps
+   the chain's equity services, so its wallet is still polled.
 2. Wait until nothing for that symbol and chain is in flight. This lists every
    mint and redemption that has not reached a terminal state:
 
@@ -495,7 +537,8 @@ while its work is still open refuses startup.
    steps in this guide (`transfer recheck`, `transfer resume`, `transfer fail`).
    A mint that the issuer never received stays at `MintRequested` while paused.
    Confirm with the issuer, then use `transfer fail --kind mint`.
-3. Set `rebalancing = "disabled"` and publish again.
+3. Set `rebalancing = "disabled"` and publish again, with the same production
+   steps as step 1.
 
 Pausing does not move the listing's equity off the chain. To move it first, use
 `vault-withdraw`, `unwrap-equity`, then `alpaca-redeem` with the unwrapped
@@ -890,17 +933,106 @@ the guard -- settle the funds with `transfer reconcile --kind usdc`. For
 BaseToAlpaca the funds moved out of the Raindex vault into the market maker
 wallet: the failure reconciles to source and the guard clears on the next
 restart, and the wallet USDC is moved back to the vault by hand. The offline
-command is safe to run once the bot is stopped.
+command is safe to run once the bot is stopped, but read the transfer's state
+again after the stop: a bot that moved on before the stop may have reached
+`BridgingSubmitting` and broadcast a burn. If it did, follow the checks and the
+nonce close below.
 
 `BridgingSubmitting` is NOT unconditionally safe. A crash at this state may have
 already broadcast a CCTP burn whose `BridgingInitiated` event never persisted.
 Before running this command on a `BridgingSubmitting` transfer, verify on-chain
 that no recent CCTP burn was submitted from the market-maker wallet (e.g. via
-`cast` against the Circle CCTP contract or by inspecting recent wallet txs).
+`cast` against the Circle CCTP contract or by inspecting recent wallet txs). The
+burn runs on Ethereum for AlpacaToBase and on Base for BaseToAlpaca. Look there
+for a `DepositForBurn` from the bot wallet after the transfer started. A burn
+the network accepted but has not mined is not in the logs yet, and a send queued
+behind a nonce gap does not count as pending, so the checks below look at both.
+These checks cannot prove that nothing is pending: the bot recorded no burn hash
+for this transfer, and a provider can hold a transaction that no other provider
+shows.
 
-- **If no burn is found**: run `fail-usdc-transfer`. For BaseToAlpaca the guard
-  then clears on restart; for AlpacaToBase it stays held until
-  `transfer reconcile --kind usdc` settles the withdrawn funds.
+- **If no burn is found**: close the nonce before you fail the transfer.
+  1. Stop the bot so that it sends nothing more from that wallet.
+  2. On the burn's chain, confirm that the bot wallet has no pending
+     transaction: pending nonce equal to latest nonce on more than one RPC
+     provider, and no queued transaction from the wallet in the explorer's
+     pending list (or `txpool_inspect` where the provider supports it). A queued
+     transaction waits behind a nonce gap. For each gap nonce below it, in
+     order, first run the step 3 check on that nonce: a kept send that dropped
+     out of every mempool is a common cause of a gap, and filling its nonce
+     means it can never mine. Then fill the nonce with a self-transfer as in
+     step 4, so the queued transaction can mine, and look for the burn again. If
+     a burn mined, start the bot, then follow the step for a found burn below;
+     otherwise repeat this step. Do not close the queued transaction's own nonce
+     unless it is this transfer's burn. If you cannot tell, do not fail the
+     transfer: start the bot, then follow the step for an uncertain burn.
+  3. Make sure no send the bot signed and keeps holds that nonce: a redemption's
+     vault withdrawal or its send to the issuer, a BaseToAlpaca deposit send, or
+     a capital burn, which the bot rebroadcasts at startup. Check every open
+     send of that kind on that chain, not only this transfer's events, and the
+     startup log's rebroadcasts. If one does, start the bot so that it
+     rebroadcasts the send, let it mine, and start again from step 1.
+  4. From the bot wallet, send a 0-value transfer with no calldata to the wallet
+     itself at that nonce, with `maxFeePerGas` and `maxPriorityFeePerGas` well
+     above the current market fee. Wait until it has the chain's required
+     confirmations.
+  5. The self-transfer closes only that nonce. Look for the burn again, and
+     repeat the pending and queued checks from step 2. If a burn mined,
+     something is pending or queued, or you cannot tell, do not fail the
+     transfer: start the bot, then follow the step for a found or an uncertain
+     burn. Otherwise run the offline `fail-usdc-transfer` before you start the
+     bot again (at `BridgingSubmitting`, for AlpacaToBase, the live route after
+     a restart works too; at `WithdrawalComplete` a restart sends the burn). For
+     BaseToAlpaca the guard then clears on restart; for AlpacaToBase it stays
+     held until `transfer reconcile --kind usdc` settles the withdrawn funds.
+- **If a burn for this transfer mines after the fail**, its USDC is in flight to
+  the destination chain (Base for AlpacaToBase, Ethereum for BaseToAlpaca). Mint
+  it with
+  `stox cctp complete-mint --burn-tx <burn-tx> --source-chain
+  <ethereum|base>`
+  (the burn's chain) with the bot stopped: the offline command sends from the
+  bot's wallet, reads the nonce itself, and fee-bumps until it replaces whatever
+  is pending at that nonce, so beside a live bot it can replace or block one of
+  the bot's sends. Stopping the bot does not remove sends it already broadcast
+  on the mint's chain, so before each offline mint or deposit, run the step 2
+  pending and queued checks and the step 3 kept-send check on that command's
+  chain, and let any kept send mine first. For AlpacaToBase, whose guard stays
+  held until the reconcile, you can instead use the live
+  `st0x-liquidity-client --env <env> debug cctp complete-mint` with the bot
+  running: it takes the recovery lock and pauses the USDC driver. It fetches the
+  Circle message and attestation by the burn's hash, and adopts the mint when a
+  relayer already minted it. Do not build the mint by hand: the burn's
+  `MessageSent` log holds a placeholder, not the nonce. If the mint reverts
+  because the attestation expired and no relayer minted it, request a new
+  attestation from Circle (`POST /v2/reattest/{nonce}`, with the nonce from the
+  attested message, not from `MessageSent`), wait for it, and run
+  `complete-mint` again. The amount received is the burn amount less the CCTP
+  fee. The offline command prints "Amount received" in USDC base units: divide
+  it by 1,000,000 for the whole-USDC amount the deposit commands below take. The
+  live route returns `amountReceived` in whole USDC: use it as is (an
+  undecodable result gives base units). For AlpacaToBase, then deposit that
+  amount to the cash vault on Base
+  (`st0x-liquidity-client --env <env> capital vault-deposit --amount <amount>
+  --network base --token <usdc> --vault-id <cash-vault-id>`
+  with the bot running, or the offline `stox vault-deposit` with the same
+  options with it stopped) and reconcile with `--kind usdc`. For BaseToAlpaca,
+  resume and reconcile both refuse the failure, and the guard clears on restart
+  while that USDC is in flight, so a running bot can plan another transfer from
+  a balance that leaves it out. Keep the bot stopped through the offline mint
+  and the deposit (`stox alpaca-deposit` also sends from the bot's Ethereum
+  wallet and replaces what is pending at its nonce). Send the amount received,
+  in whole USDC as above, to Alpaca with `stox alpaca-deposit -a <amount>`, and
+  do not move the wallet USDC that burn took back to the vault. Once Alpaca
+  credits it, convert it with `stox alpaca-convert -d to-usd -a <amount>`, as
+  the bot would have: until then it does not count as broker cash for hedging.
+  There is no reconcile step.
+- **If you are not certain** that no burn is pending: run
+  `transfer resume --kind usdc`. At `BridgingSubmitting` it adopts a burn that
+  landed. If it finds none, it fails closed and the transfer stays at
+  `BridgingSubmitting` (it never sends a second burn). Repeat the checks above,
+  and once every check is clean, follow the first step. At `WithdrawalComplete`
+  no burn was sent yet, and a resume or a restart sends it and the transfer goes
+  on.
 - **If a burn IS found** while the aggregate is still `BridgingSubmitting`: do
   NOT run `fail-usdc-transfer` (strands the burned funds) and do NOT run
   `transfer reconcile` (its preflight rejects `BridgingSubmitting` -- it only
@@ -913,20 +1045,48 @@ that no recent CCTP burn was submitted from the market-maker wallet (e.g. via
 A Base->Alpaca transfer at `WithdrawalSubmitting` recorded its vault withdrawal
 intent (with `from_block`), but no withdrawal was initiated. A resume only
 adopts a withdrawal mined after `from_block` and never re-issues one, so if none
-landed it scans forever. First check on Base for an `OperatorWithdraw` by the
-bot wallet on the inventory after `from_block` (the latch alert names the
-block). A withdraw the network accepted but has not mined is not in the logs
-yet, so also wait until the transfer's attempt timeout has passed and confirm
-the bot wallet has no pending transaction to the inventory (no pending
-`withdraw4` in the explorer, or pending nonce equal to latest nonce):
+landed it scans forever. First confirm on Base that the bot wallet made no
+`OperatorWithdraw` on the inventory after the transfer's `from_block` (the latch
+alert names the block), and no `WithdrawV2` on the orderbook either (a
+withdrawal sent before the inventory migration). Only a USDC withdrawal from the
+cash vault counts: the event's `vaultId` must equal `vault_id` under
+`[chains.base.trading.assets.cash]` in the bot config. Withdrawals of other
+tokens or vaults (for example equity rebalancing) do not count. The bot wallet
+must be the `operator` of the `OperatorWithdraw` or the `sender` of the
+`WithdrawV2`. Since the migration, inventory withdrawals also emit a
+`WithdrawV2` with the inventory as `sender` (for example from the Bebop and
+univ4 hooks), and that event does not count. A withdraw the network accepted but
+has not mined is not in the logs yet, so also wait until the transfer's attempt
+timeout has passed and confirm the bot wallet has no pending transaction (no
+pending `withdraw4` in the explorer, and pending nonce equal to latest nonce on
+more than one RPC provider). These checks cannot prove that nothing is pending:
+the bot never records the withdrawal's hash or nonce, and on Base the sequencer
+can hold a transaction that no provider shows.
 
-- **If one landed**: run `transfer resume --kind usdc`; it adopts it.
-- **If none landed**: run `fail-usdc-transfer`. It sends `RejectWithdrawal`, and
-  the transfer ends in `WithdrawalFailed` with no withdrawal recorded. Nothing
-  moved, so the guard clears. The live route (bot running) clears it at once and
-  kills the transfer's queued job rows; the offline command clears it on
-  restart. Base->Alpaca planning on the corridor then waits for the 30-minute
-  withdraw cooldown and a fresh vault read; both survive a restart.
+- **If one landed** (an `OperatorWithdraw` or a `WithdrawV2`), or you are not
+  certain: run `transfer resume --kind usdc`. It adopts a landed withdrawal of
+  the full amount, and the transfer continues. A withdrawal that moved less than
+  the transfer amount (a `WithdrawV2` can fill short) makes the resume end the
+  transfer in `WithdrawalFailed` with the withdrawal recorded; move that USDC
+  from the bot wallet back to the vault by hand. If nothing landed, the resume
+  keeps redriving and the scan stays inconclusive: repeat the checks above, and
+  once they show that no withdrawal landed and none is pending, follow the next
+  step.
+- **If none landed**: close the nonce before you fail the transfer. Stop the bot
+  so that it does not send at that nonce. From the bot wallet on Base, send a
+  0-value transfer with no calldata to the wallet itself at the latest nonce,
+  with `maxFeePerGas` and `maxPriorityFeePerGas` well above the current market
+  fee. Wait until it has the chain's required confirmations, then check the
+  withdrawal logs again. If a withdrawal mined instead, follow the step above.
+  Otherwise run `fail-usdc-transfer` (the offline command, or the live route
+  after a restart). It sends `RejectWithdrawal`, and the transfer ends in
+  `WithdrawalFailed` with no withdrawal recorded. Nothing moved, so the guard
+  clears. The live route (bot running) clears it at once and kills the
+  transfer's queued job rows; the offline command clears it on restart.
+  Base->Alpaca planning on the corridor then waits for the 30-minute withdraw
+  cooldown and a fresh vault read; both survive a restart. If a withdrawal for
+  this transfer mines later anyway, the scan no longer adopts it and its USDC
+  sits in the bot wallet: move that USDC back to the vault by hand.
 
 `transfer reconcile` is the path for persisted terminal failures whose funds
 left the source venue (e.g. `DepositFailed`, `BridgingFailed` with a burn tx
@@ -972,14 +1132,21 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   rejected, including `WithdrawalFailed` and an `AlpacaToBase`
   `ConversionFailed`, whose funds never left Alpaca.
 - `--kind usdc` is bookkeeping only: it moves no funds. Before you reconcile a
-  post-burn `BridgingFailed`, finish the transfer by hand: (1) read the recorded
-  nonce (`usedNonces`) on the destination chain (Base for `AlpacaToBase`,
-  Ethereum for `BaseToAlpaca`); a relayer can mint any burn. (2) If the nonce is
-  used, find its mint (the `MessageReceived` log for the nonce). If it is
-  unused, get the Circle attestation for the burn tx and mint it. (3) Finish the
-  funds leg: deposit the minted USDC to the vault on Base (`AlpacaToBase`), or
-  send it to Alpaca from Ethereum (`BaseToAlpaca`). (4) Verify that the funds
-  arrived, then reconcile.
+  post-burn `BridgingFailed`, finish the transfer by hand.
+
+  For a post-burn `BaseToAlpaca` `BridgingFailed` (one with a burn tx), follow
+  [Settling a post-burn Base to Alpaca failure by hand](#settling-a-post-burn-base-to-alpaca-failure-by-hand)
+  instead: the bot re-runs its recovery at every start, so the steps run with it
+  stopped and reconcile before any funds move.
+
+  The steps in either direction, except that a post-burn `BaseToAlpaca`
+  reconciles before its funds leg: (1) read the recorded nonce (`usedNonces`) on
+  the destination chain (Base for `AlpacaToBase`, Ethereum for `BaseToAlpaca`);
+  a relayer can mint any burn. (2) If the nonce is used, find its mint (the
+  `MessageReceived` log for the nonce). If it is unused, get the Circle
+  attestation for the burn tx and mint it. (3) Finish the funds leg: deposit the
+  minted USDC to the vault on Base (`AlpacaToBase`), or send it to Alpaca from
+  Ethereum (`BaseToAlpaca`). (4) Verify that the funds arrived, then reconcile.
 - An `Attested` resume whose CCTP nonce is used on chain but whose mint is not
   in the bounded log scan (`MintNotFoundInScanWindow`) redrives when the nonce
   read unused at the block below the scan's floor: the scan covers the mint, so
@@ -1000,19 +1167,22 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   and redrives; if Circle keeps timing out, the 4-hour mint recovery alert
   pages. A mint outside the scan pages with "the CCTP mint cannot be resolved
   automatically" in both directions, and the bot stops retrying it: find the
-  mint and finish the funds leg, then reconcile with `--kind usdc`. A
-  BaseToAlpaca `BridgingFailed` recovery (for example after a restart) that
+  mint and finish the funds leg, then reconcile with `--kind usdc` (for
+  BaseToAlpaca, follow
+  [Settling a post-burn Base to Alpaca failure by hand](#settling-a-post-burn-base-to-alpaca-failure-by-hand)).
+  A BaseToAlpaca `BridgingFailed` recovery (for example after a restart) that
   reads the nonce used but cannot find its mint applies the same floor rule: it
   redrives while the rule places the mint inside its scan, and otherwise pages
   the same way and stops. One that finds the mint but cannot adopt it also pages
   the same way and stops, so it never adopts a relayer mint and sends the USDC
-  to Alpaca after you did. After a manual send to Alpaca, run
-  `transfer reconcile --kind usdc` right away: until then every restart re-runs
-  the recovery. The legacy re-poll latch pages with the same text for
-  AlpacaToBase only. A BaseToAlpaca latch for the legacy re-poll, or for a
-  message that can never mint, does not page: its retry may still adopt or mint
-  and send the deposit, so do not move the funds by hand while it retries; the
-  job's dead-letter alert says when it gave up.
+  to Alpaca after you did. Every restart re-runs that recovery until the
+  transfer is reconciled, so settle it by hand only as
+  [Settling a post-burn Base to Alpaca failure by hand](#settling-a-post-burn-base-to-alpaca-failure-by-hand)
+  describes. The legacy re-poll latch pages with the same text for AlpacaToBase
+  only. A BaseToAlpaca latch for the legacy re-poll, or for a message that can
+  never mint, does not page: its retry may still adopt or mint and send the
+  deposit, so do not move the funds by hand while it retries; the job's
+  dead-letter alert says when it gave up.
 - An `AlpacaToBase` transfer whose Circle attestation poll fails hard (or, for a
   legacy `Attested` transfer, whose re-poll fails with the nonce unused) is
   marked `BridgingFailed` and pages with "the burned USDC cannot be minted
@@ -1139,6 +1309,81 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
 - A redemption on `SendPending` with no signed send to the issuer is a legacy
   row; see
   [Legacy pending send to the issuer](#legacy-pending-send-to-the-issuer).
+
+#### Settling a post-burn Base to Alpaca failure by hand
+
+A post-burn `BaseToAlpaca` `BridgingFailed` (one with a burn tx) usually needs
+no hand settlement. Unless the mint was reported unresolvable ("the CCTP mint
+cannot be resolved automatically") or funds were already moved by hand, keep the
+bot running and run
+`st0x-liquidity-client --env <env> debug resume-usdc
+base-to-alpaca <id>`: it
+re-polls Circle, then mints and sends. Otherwise settle it by hand as below:
+stop first and reconcile before you move funds. The bot re-runs its recovery at
+every start, and that recovery can mint and send the USDC to Alpaca on its own,
+with no check for an earlier send. A recovery that ran until the stop can also
+have moved the transfer on.
+
+1. Read the transfer and confirm it is failed, then stop the bot and disable its
+   roll timer (see "Offline commands on GCP").
+2. On Ethereum, wait until the bot wallet has no pending transaction: pending
+   nonce equals latest nonce on more than one RPC provider. That does not show a
+   send the bot saved but never broadcast, or one that dropped out of every
+   mempool, so also check that the bot has no saved Ethereum operation in flight
+   (a pending capital burn, or another transfer's prepared deposit send). If it
+   has and this transfer's funds were not moved by hand, start the bot to finish
+   that operation first, then start again from step 1. If this transfer's funds
+   were already moved by hand, do not start the bot while the transfer is still
+   failed: its recovery would send again (RAI-3155). Run the offline reconcile
+   of step 4 first, and start the bot only once it succeeded.
+3. If the CCTP mint has not landed (steps (1) and (2) of the `--kind usdc`
+   bullet above), mint it with the offline `stox cctp complete-mint`. If Circle
+   has not attested the burn yet, that fails as retryable: start the bot and its
+   roll timer again instead of waiting with it stopped, and stop here: do not
+   run steps 4 to 6, because a reconcile of a transfer whose USDC was never
+   minted marks the burned USDC settled and nothing finishes the mint. Startup
+   re-arms this transfer, which re-polls Circle; check that it moves on, and run
+   `debug resume-usdc base-to-alpaca <id>` only if it does not.
+4. Before the reconcile, check at Alpaca whether this transfer's USDC was
+   already credited or partly converted: a recovery that ran until the stop can
+   reach `ConversionFailed` or `DepositFailed`, which the reconcile also
+   accepts. This is a check only: note what was credited and converted, and move
+   nothing yet. Then run the offline `stox transfer reconcile` before you move
+   any funds. If it refuses the transfer, read the state in its message. If the
+   transfer is already `Reconciled` (a second run of this step, say), go on with
+   step 5 with the bot stopped. Otherwise the recovery moved it on before the
+   stop (for example to `Bridged`): send and convert nothing by hand. If this
+   transfer's funds were already moved by hand, do not start the bot either,
+   because its recovery would send a second time (RAI-3155): get a second
+   operator to settle the state the reconcile reported. If they were not, start
+   the bot and check that the transfer moves on. Startup re-arms only some
+   states, so if it does not move, run
+   `st0x-liquidity-client --env <env> debug resume-usdc
+   base-to-alpaca <id>`.
+   Then skip steps 5 and 6: do not send or convert by hand, because the bot
+   finishes the transfer.
+5. Only if the reconcile succeeded, or step 4 found the transfer already
+   `Reconciled`, take the minted amount: the "Amount received" that
+   `complete-mint` printed in step 3 or, when the mint had already landed, the
+   USDC that the mint transaction from step (2) of the `--kind usdc` bullet
+   credited to the bot wallet. Both are in base units, so divide by 1,000,000
+   for whole USDC. Do not use the transfer's recorded amount: it is the gross
+   burned amount, and the mint is net of the CCTP fee. Find this transfer's
+   send: one from the bot wallet to the Alpaca deposit address after this mint,
+   for the minted amount, that no other transfer records (the wallet and the
+   deposit address are shared). If it landed, or step 4 found the credit, verify
+   the credit at Alpaca. If not, check that the minted USDC is still in the bot
+   wallet, send it to Alpaca with `stox alpaca-deposit -a <amount>`, the minted
+   amount in whole USDC, with the bot still stopped, since it sends from the bot
+   wallet's nonce, and verify the credit. Then convert the part of this credit
+   that is not converted yet (step 4 noted any partial conversion; skip the sale
+   when nothing is left) once with `stox alpaca-convert -d to-usd -a <amount>`,
+   with that part as `<amount>`, also in whole USDC, as the bot would have, and
+   check that the order filled: until then it does not count as broker cash for
+   hedging.
+6. Start the bot only after that. Every start in this section, here and in steps
+   2 to 4, is step 3 of "Offline commands on GCP": start the stack, then enable
+   and start the roll timer.
 
 ### Legacy pending send to the issuer
 
@@ -1382,15 +1627,42 @@ a recorded burn as post-burn, `transfer resume` re-derives `Dropped`, and
 never landed (the USDC never left the market-maker wallet), it clears the
 recorded hash, returning the aggregate to `BridgingSubmitting` with no recorded
 burn. It does NOT release the guard on its own -- run `fail-usdc-transfer` next
-(if the burn never landed) to release it, or `transfer resume --kind usdc` to
-continue the bridge.
+(if the burn never landed) to release it. `transfer resume --kind usdc` after
+the clear adopts the burn if it landed and otherwise fails closed: it does not
+burn again. A load-balanced RPC can report a burn as dropped while a node still
+holds it, so before the fail run the checks in "Clearing a pre-burn guard latch"
+above, with the bot stopped before any self-transfer here (a live bot can send
+from that wallet at one of these nonces, and the above-market self-transfer
+would replace it): look for that burn and for anything pending or queued from
+the wallet. Then compare the dropped burn's nonce with the wallet's latest
+nonce. Read the burn's nonce from the bot's `Transaction submitted` log line for
+the recorded burn tx hash (it logs `tx_hash` and `nonce`); an explorer usually
+has no record of a dropped transaction. If a different transaction mined at the
+burn's nonce, that burn can never mine and needs no close: go on with the checks
+for the latest nonce as in pre-burn steps 1 to 5. Otherwise the self-transfer at
+the burn's nonce must replace the burn wherever a node still holds it, so give
+it a `maxFeePerGas` and a `maxPriorityFeePerGas` at least 10% above the burn's
+and above the market fee, or well above the market fee when the burn's fees are
+not known. If the burn's nonce equals the latest nonce, send that self-transfer.
+If it is above the latest nonce, send that self-transfer first, then fill the
+empty nonces from the latest up to it, in order, running step 3 of the pre-burn
+checks on each nonce before you fill it (a kept send can hold one). Do not
+replace a transaction queued at one of those nonces: only the burn's own nonce
+is replaced. Wait for the confirmations, check that the transaction mined at the
+burn's nonce is your self-transfer, and look for a `DepositForBurn` again. If a
+burn mined, start the bot and resume, which adopts it. If the replacement did
+not hold, or a transaction mined at a filled nonce is neither your self-transfer
+nor the burn, do not fail: repeat the checks until they are clean. If you cannot
+find the burn's nonce, fall back to pre-burn steps 1 to 5 for the latest nonce.
 
-Safe to run with the bot live: this command only loads the aggregate and sends a
-single CQRS command, and the precondition is a `Dropped`-latched transfer whose
-job has already fail-closed -- no active job is driving that rebalance, so there
-is no race. Do NOT run it against a transfer that is still being actively
-processed (one that has not yet latched); always confirm the latch and the
-burn-absent on-chain state first.
+Only `clear-pending-burn` below is safe to run with the bot live: run the
+`fail-usdc-transfer` after it only once the checks above are done, with the bot
+stopped. `clear-pending-burn` is safe live because it only loads the aggregate
+and sends a single CQRS command, and the precondition is a `Dropped`-latched
+transfer whose job has already fail-closed -- no active job is driving that
+rebalance, so there is no race. Do NOT run it against a transfer that is still
+being actively processed (one that has not yet latched); always confirm the
+latch and the burn-absent on-chain state first.
 
     stox clear-pending-burn --id <uuid> --reason "dropped burn verified absent on-chain"
     stox fail-usdc-transfer --id <uuid> --reason "pre-burn crash, burn never landed"

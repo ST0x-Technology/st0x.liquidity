@@ -44,6 +44,7 @@ use super::driver_pause::UsdcDriverGate;
 use super::{
     DepositSendPending, UnresolvedDepositSend, UsdcTransferError, refuse_unserved_corridor,
 };
+use crate::alerts::AlertKind;
 use crate::bot_gas::{BotGasOperationCategory, BotGasReceiptCostEnqueuer, RecordBotGasReceiptCost};
 use crate::inventory::view::alpaca_to_base_usdc_capacity;
 use crate::native_gas::{ConfiguredGasReadiness, GasReadiness, TransferGasRoute};
@@ -552,6 +553,7 @@ fn page_shared_withdrawal_txs(credits: &[(UsdcRebalanceId, EthereumWalletCredit)
             error!(
                 target: "operational_alert",
                 alert = true,
+                kind = AlertKind::SharedAlpacaWithdrawalTx.as_str(),
                 %withdrawal_tx,
                 ?transfers,
                 "Open USDC transfers share one Alpaca withdrawal tx; it paid only one of them"
@@ -566,11 +568,14 @@ fn alert_unresolvable_mint(id: &UsdcRebalanceId, reason: &str) {
     error!(
         target: "operational_alert",
         alert = true,
+        kind = AlertKind::CctpMintUnresolvable.as_str(),
         %id,
         "USDC transfer {id}: the CCTP mint cannot be resolved automatically ({reason}). \
-         Bridge marked failed; find the mint of the recorded nonce on chain, finish the \
-         funds leg (vault deposit on Base, or send to Alpaca) and verify it, then settle \
-         it with `transfer reconcile --kind usdc`."
+         Bridge marked failed. Base to Alpaca: every restart re-runs this recovery, so do \
+         not mint, send or reconcile with the bot running: stop it and its roll timer and \
+         follow docs/cli-ops.md, \"Settling a post-burn Base to Alpaca failure by hand\". Alpaca to Base: find \
+         the mint of the recorded nonce on chain, deposit it to the vault on Base and \
+         verify it, then settle it with `transfer reconcile --kind usdc`."
     );
 }
 
@@ -581,6 +586,7 @@ fn alert_failed_mint(id: &UsdcRebalanceId, burn_tx: TxHash, reason: &str) {
     error!(
         target: "operational_alert",
         alert = true,
+        kind = AlertKind::CctpMintOnBaseIncomplete.as_str(),
         %id,
         %burn_tx,
         "USDC transfer {id}: the CCTP mint on Base did not complete ({reason}). \
@@ -897,6 +903,7 @@ impl<
                 error!(
                     target: "operational_alert",
                     alert = true,
+                    kind = AlertKind::UsdcShortfallCheckOff.as_str(),
                     %id,
                     %error,
                     "Could not derive the Ethereum credit ledger; the USDC shortfall check is off"
@@ -933,6 +940,7 @@ impl<
                 error!(
                     target: "operational_alert",
                     alert = true,
+                    kind = AlertKind::UsdcShortfallCheckOff.as_str(),
                     %id,
                     %error,
                     "Could not total the Ethereum credit ledger; the USDC shortfall check is off"
@@ -967,6 +975,7 @@ impl<
             error!(
                 target: "operational_alert",
                 alert = true,
+                kind = AlertKind::ShortOfOpenUsdcTransferCredits.as_str(),
                 %id,
                 ?held_by,
                 outstanding = %display_usdc(outstanding),
@@ -1244,6 +1253,7 @@ impl<
             BridgeDirection::EthereumToBase => error!(
                 target: "operational_alert",
                 alert = true,
+                kind = AlertKind::BurnedUsdcUnmintable.as_str(),
                 %id,
                 %burn_tx,
                 "USDC transfer {id}: the burned USDC cannot be minted automatically ({reason}). \
@@ -1577,6 +1587,7 @@ impl<
             BridgeDirection::EthereumToBase => error!(
                 target: "operational_alert",
                 alert = true,
+                kind = AlertKind::RecordedCctpMessageCannotMint.as_str(),
                 %id,
                 %burn_tx,
                 "USDC transfer {id}: the recorded CCTP message cannot mint on Base ({reason}). \
@@ -1629,6 +1640,7 @@ impl<
             BridgeDirection::EthereumToBase => error!(
                 target: "operational_alert",
                 alert = true,
+                kind = AlertKind::AttestedCctpMessageNonceMismatch.as_str(),
                 %id,
                 %burn_tx,
                 "USDC transfer {id}: the attested CCTP message does not match the recorded nonce \
@@ -2658,6 +2670,7 @@ impl<
         error!(
             target: "operational_alert",
             alert = true,
+            kind = AlertKind::CreditedLessUsdcThanRequested.as_str(),
             %id,
             %withdrawal_tx,
             %requested,
@@ -3841,13 +3854,13 @@ impl<
         let (ids, unparseable) = match prepared_deposit_send_ids(pool).await {
             Ok(found) => found,
             Err(error) => {
-                error!(target: "operational_alert", alert = true, ?error, "Could not list signed Alpaca deposit sends at startup; their nonces are not reserved until each transfer resumes, so startup skips Ethereum token approvals and allowance revokes");
+                error!(target: "operational_alert", alert = true, kind = AlertKind::AlpacaDepositSendsUnlisted.as_str(), ?error, "Could not list signed Alpaca deposit sends at startup; their nonces are not reserved until each transfer resumes, so startup skips Ethereum token approvals and allowance revokes");
                 outcome.unmined += 1;
                 return outcome;
             }
         };
         if !unparseable.is_empty() {
-            error!(target: "operational_alert", alert = true, ?unparseable, "Signed Alpaca deposit sends with unparseable transfer ids were not restored at startup, so startup skips Ethereum token approvals and allowance revokes");
+            error!(target: "operational_alert", alert = true, kind = AlertKind::AlpacaDepositSendIdsUnparseable.as_str(), ?unparseable, "Signed Alpaca deposit sends with unparseable transfer ids were not restored at startup, so startup skips Ethereum token approvals and allowance revokes");
             outcome.unmined += unparseable.len();
         }
 
@@ -3870,7 +3883,7 @@ impl<
                     warn!(target: "rebalance", %id, ?state, "Transfer left Bridged before its signed deposit send was restored");
                 }
                 Err(error) => {
-                    error!(target: "operational_alert", alert = true, %id, ?error, "Could not load a transfer with a signed Alpaca deposit send at startup; its nonce is not reserved until it resumes, so startup skips Ethereum token approvals and allowance revokes");
+                    error!(target: "operational_alert", alert = true, kind = AlertKind::AlpacaDepositSendTransferUnloadable.as_str(), %id, ?error, "Could not load a transfer with a signed Alpaca deposit send at startup; its nonce is not reserved until it resumes, so startup skips Ethereum token approvals and allowance revokes");
                     outcome.unmined += 1;
                 }
             }
@@ -3890,7 +3903,7 @@ impl<
         let tx = prepared.tx_hash();
         let nonce = prepared.nonce();
         if let Err(error) = self.cctp_bridge.broadcast_usdc_on_ethereum(prepared).await {
-            error!(target: "operational_alert", alert = true, %id, %tx, nonce, ?error, "Could not rebroadcast a signed Alpaca deposit send at startup; its nonce stays reserved, so startup skips Ethereum token approvals and allowance revokes, and the transfer's resume broadcasts it again");
+            error!(target: "operational_alert", alert = true, kind = AlertKind::AlpacaDepositSendRebroadcastFailed.as_str(), %id, %tx, nonce, ?error, "Could not rebroadcast a signed Alpaca deposit send at startup; its nonce stays reserved, so startup skips Ethereum token approvals and allowance revokes, and the transfer's resume broadcasts it again");
             return false;
         }
 
@@ -6700,7 +6713,7 @@ async fn release_unpersisted_deposit_send<Helper: UsdcBridgeHelper + ?Sized>(
     }
 
     let reload = reload.map(|state| state.map(|state| state.state_name()));
-    error!(target: "operational_alert", alert = true, %id, %tx, nonce, ?reload, "Cannot tell whether a signed Alpaca deposit send was persisted; its nonce stays reserved and later Ethereum wallet sends wait behind it until a restart");
+    error!(target: "operational_alert", alert = true, kind = AlertKind::AlpacaDepositSendPersistenceUnknown.as_str(), %id, %tx, nonce, ?reload, "Cannot tell whether a signed Alpaca deposit send was persisted; its nonce stays reserved and later Ethereum wallet sends wait behind it until a restart");
 }
 
 fn usdc_to_u256(usdc: Usdc) -> Result<U256, UsdcTransferError> {
@@ -15626,10 +15639,8 @@ mod tests {
         assert!(logs_contain("operational_alert"));
         assert!(logs_contain(&format!(
             "USDC transfer {id}: the CCTP mint cannot be resolved automatically \
-             (Circle re-poll failed on a consumed nonce: {}). Bridge marked failed; find \
-             the mint of the recorded nonce on chain, finish the funds leg (vault deposit \
-             on Base, or send to Alpaca) and verify it, then settle it with \
-             `transfer reconcile --kind usdc`.",
+             (Circle re-poll failed on a consumed nonce: {}). Bridge marked failed. Base \
+             to Alpaca: every restart re-runs this recovery",
             CctpError::PlaceholderNonce
         )));
     }
@@ -26175,9 +26186,14 @@ mod tests {
         assert!(logs_contain(&format!(
             "USDC transfer {id}: the CCTP mint cannot be resolved automatically"
         )));
+        // Base to Alpaca: the stop-first rule comes before any funds step.
         assert!(logs_contain(
-            "find the mint of the recorded nonce on chain, finish the funds leg (vault \
-             deposit on Base, or send to Alpaca) and verify it, then settle it with \
+            "Base to Alpaca: every restart re-runs this recovery, so do not mint, send \
+             or reconcile with the bot running"
+        ));
+        assert!(logs_contain(
+            "Alpaca to Base: find the mint of the recorded nonce on chain, deposit it to \
+             the vault on Base and verify it, then settle it with \
              `transfer reconcile --kind usdc`"
         ));
     }
@@ -26588,9 +26604,14 @@ mod tests {
         assert!(logs_contain(&format!(
             "USDC transfer {id}: the CCTP mint cannot be resolved automatically"
         )));
+        // Base to Alpaca: the stop-first rule comes before any funds step.
         assert!(logs_contain(
-            "find the mint of the recorded nonce on chain, finish the funds leg (vault \
-             deposit on Base, or send to Alpaca) and verify it, then settle it with \
+            "Base to Alpaca: every restart re-runs this recovery, so do not mint, send \
+             or reconcile with the bot running"
+        ));
+        assert!(logs_contain(
+            "Alpaca to Base: find the mint of the recorded nonce on chain, deposit it to \
+             the vault on Base and verify it, then settle it with \
              `transfer reconcile --kind usdc`"
         ));
     }

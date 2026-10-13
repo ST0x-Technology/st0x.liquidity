@@ -445,6 +445,15 @@ once in `Conductor::start` via `StoreBuilder`, then shared. Multiple instances
 cause silent bugs: events persist but reactors/projections on other instances
 never see them.
 
+An interim exception: the operator equity reconciles (the API's mint and
+redemption reconcile routes and the offline CLI's `transfer reconcile`) build a
+standalone store with the projection and no reactor, so their events update the
+transfer view that the `liq_transfer` line sweep reads, without running the
+conductor's trigger. A writer that tails the transfer events from a durable
+checkpoint removes the need for it
+([RAI-3191](https://linear.app/makeitrain/issue/RAI-3191)); see the sweep
+paragraph in [observability.md](observability.md).
+
 ## cqrs-es / sqlite-es Internals Reference
 
 These details are hidden by st0x-event-sorcery but documented here for debugging

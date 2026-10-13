@@ -203,6 +203,127 @@ impl Candidate {
     }
 }
 
+/// Where one chain's vault sits against its band, as the planner sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BandVerdict {
+    /// Below `target - band`: the planner would mint to this chain.
+    Below,
+    Within,
+    /// Above `target + band`: the planner would redeem from this chain.
+    Above,
+}
+
+/// One chain's band position for a symbol: its share of the symbol's total
+/// in underlying shares, and the verdict against its own target and band.
+#[derive(Debug, Clone)]
+pub(crate) struct ChainBand {
+    pub(crate) chain: Chain,
+    pub(crate) share: Float,
+    pub(crate) verdict: BandVerdict,
+}
+
+/// The band position of every chain the planner can pick, from the same
+/// total and deviations the planner uses. A paused chain or a chain without
+/// a target still counts in the total but has no band. `None` when the planner could not size
+/// the symbol at all: the broker unpolled, no chain polled, a listing chain
+/// without a slot (a partial total), or a total of zero. Transfers in flight
+/// are counted, as in the planner's total.
+pub(crate) fn chain_bands(
+    input: &EquityPlanInput,
+) -> Result<Option<Vec<ChainBand>>, EquityPlanError> {
+    let Ok(offchain) = sizable_offchain(input) else {
+        return Ok(None);
+    };
+
+    let (underlying, total) = underlying_and_total(input, offchain)?;
+    if total.is_zero()? {
+        return Ok(None);
+    }
+
+    let mut bands = Vec::new();
+    for (chain, slot) in &input.onchain {
+        match slot.participation {
+            Participation::Plans => {}
+            Participation::Paused | Participation::NoTarget => continue,
+        }
+
+        let (_, verdict) = band_position(slot, underlying[chain], total)?;
+        bands.push(ChainBand {
+            chain: *chain,
+            share: (underlying[chain].inner() / total.inner())?,
+            verdict,
+        });
+    }
+
+    Ok(Some(bands))
+}
+
+/// The broker balance, once every venue the symbol's total needs has a
+/// reading; otherwise why the symbol cannot be sized.
+fn sizable_offchain(
+    input: &EquityPlanInput,
+) -> Result<VenueBalance<FractionalShares>, DeclineReason> {
+    let Some(offchain) = input.offchain else {
+        return Err(DeclineReason::OffchainUnpolled);
+    };
+    if input.onchain.is_empty() {
+        return Err(DeclineReason::NoPolledChain);
+    }
+    if let Some(chain) = input
+        .listing_chains
+        .iter()
+        .find(|chain| !input.onchain.contains_key(chain))
+    {
+        return Err(DeclineReason::ChainUnpolled { chain: *chain });
+    }
+
+    Ok(offchain)
+}
+
+/// Each slot's balance in underlying shares, and the symbol's total with
+/// the broker's. A vault's available shares are wrapped and go through its
+/// ratio; its shares in flight are counted as underlying, the unit a
+/// provider poll and a stranded redemption use. The planner only sizes a
+/// symbol with nothing in flight, where the two agree.
+fn underlying_and_total(
+    input: &EquityPlanInput,
+    offchain: VenueBalance<FractionalShares>,
+) -> Result<(BTreeMap<Chain, FractionalShares>, FractionalShares), EquityPlanError> {
+    let mut underlying = BTreeMap::new();
+    let mut total = FractionalShares::ZERO;
+    for (chain, slot) in &input.onchain {
+        let wrapped = slot.balance.available();
+        let inflight = (slot.balance.total()? - wrapped)?;
+        let shares = (slot.ratio.to_underlying_fractional(wrapped)? + inflight)?;
+        total = (total + shares)?;
+        underlying.insert(*chain, shares);
+    }
+
+    Ok((underlying, (total + offchain.total()?)?))
+}
+
+/// A slot's signed distance from its target in underlying shares, and where
+/// that puts it against its band. The planner's candidates and the published
+/// verdicts both come from here, so they cannot drift apart.
+fn band_position(
+    slot: &ChainSlot,
+    underlying: FractionalShares,
+    total: FractionalShares,
+) -> Result<(FractionalShares, BandVerdict), FloatError> {
+    let target = (total * slot.target.inner())?;
+    let deviation = (underlying - target)?;
+    let band = (total * slot.band.inner())?;
+    let verdict = if !deviation.abs()?.inner().gt(band.inner())? {
+        BandVerdict::Within
+    } else if deviation.is_negative()? {
+        BandVerdict::Below
+    } else {
+        BandVerdict::Above
+    };
+
+    Ok((deviation, verdict))
+}
+
 /// Picks at most one operation for the symbol.
 ///
 /// The guards run first, then the best-ranked candidate that survives the
@@ -214,33 +335,15 @@ impl Candidate {
 pub(crate) fn plan_equity_operation(
     input: &EquityPlanInput,
 ) -> Result<EquityPlan, EquityPlanError> {
-    let Some(offchain) = input.offchain else {
-        return Ok(EquityPlan::Decline(DeclineReason::OffchainUnpolled));
+    let offchain = match sizable_offchain(input) {
+        Ok(offchain) => offchain,
+        Err(reason) => return Ok(EquityPlan::Decline(reason)),
     };
-    if input.onchain.is_empty() {
-        return Ok(EquityPlan::Decline(DeclineReason::NoPolledChain));
-    }
-    if let Some(chain) = input
-        .listing_chains
-        .iter()
-        .find(|chain| !input.onchain.contains_key(chain))
-    {
-        return Ok(EquityPlan::Decline(DeclineReason::ChainUnpolled {
-            chain: *chain,
-        }));
-    }
     if input.has_inflight {
         return Ok(EquityPlan::Decline(DeclineReason::Inflight));
     }
 
-    let mut underlying = BTreeMap::new();
-    let mut total = FractionalShares::ZERO;
-    for (chain, slot) in &input.onchain {
-        let shares = slot.ratio.to_underlying_fractional(slot.balance.total()?)?;
-        total = (total + shares)?;
-        underlying.insert(*chain, shares);
-    }
-    let total = (total + offchain.total()?)?;
+    let (underlying, total) = underlying_and_total(input, offchain)?;
     if total.is_zero()? {
         return Ok(EquityPlan::Decline(DeclineReason::TotalZero));
     }
@@ -364,22 +467,17 @@ fn ranked_candidates(
     let mut deviations = BTreeMap::new();
     let mut remaining = Vec::new();
     for (chain, slot) in &input.onchain {
-        let target = (total * slot.target.inner())?;
-        let deviation = (underlying[chain] - target)?;
+        let (deviation, verdict) = band_position(slot, underlying[chain], total)?;
         deviations.insert(*chain, deviation);
-        if slot.participation == Participation::NoTarget {
+        if slot.participation == Participation::NoTarget || verdict == BandVerdict::Within {
             continue;
         }
 
-        let magnitude = deviation.abs()?;
-        let band = (total * slot.band.inner())?;
-        if magnitude.inner().gt(band.inner())? {
-            remaining.push(Candidate {
-                chain: *chain,
-                deviation,
-                magnitude,
-            });
-        }
+        remaining.push(Candidate {
+            chain: *chain,
+            deviation,
+            magnitude: deviation.abs()?,
+        });
     }
 
     let mut ranked = Vec::with_capacity(remaining.len());
@@ -561,6 +659,157 @@ mod tests {
             direction: PlannedDirection::Redemption,
             quantity: positive(quantity),
         })
+    }
+
+    fn bands(input: &EquityPlanInput) -> Option<Vec<(Chain, String, BandVerdict)>> {
+        chain_bands(input).unwrap().map(|bands| {
+            bands
+                .into_iter()
+                .map(|band| (band.chain, band.share.format().unwrap(), band.verdict))
+                .collect()
+        })
+    }
+
+    /// The verdict uses the planner's own total and band: 60 of 100 is
+    /// within 0.5 +/- 0.2, 15 is below it, and 90 above it.
+    #[test]
+    fn chain_bands_judge_each_chain_against_its_band() {
+        for (onchain, offchain, share, verdict) in [
+            ("60", "40", "0.6", BandVerdict::Within),
+            ("15", "85", "0.15", BandVerdict::Below),
+            ("90", "10", "0.9", BandVerdict::Above),
+        ] {
+            assert_eq!(
+                bands(&input(
+                    Some(balance(offchain)),
+                    BTreeMap::from([(Chain::Base, slot(onchain, "0.5"))]),
+                )),
+                Some(vec![(Chain::Base, share.to_string(), verdict)]),
+                "{onchain} onchain, {offchain} offchain"
+            );
+        }
+    }
+
+    /// The share is in underlying shares, so a wrapper ratio of 1.5 counts
+    /// 40 wrapped shares as 60.
+    #[test]
+    fn chain_bands_count_wrapped_shares_through_the_ratio() {
+        let ratio = UnderlyingPerWrapped::new(U256::from(1_500_000_000_000_000_000u64)).unwrap();
+        let wrapped = ChainSlot {
+            ratio,
+            ..slot("40", "0.5")
+        };
+
+        assert_eq!(
+            bands(&input(
+                Some(balance("40")),
+                BTreeMap::from([(Chain::Base, wrapped)]),
+            )),
+            Some(vec![(Chain::Base, "0.6".to_string(), BandVerdict::Within)])
+        );
+    }
+
+    /// Shares in flight are underlying, so they skip the ratio: 40 wrapped
+    /// at 1.5 is 60, plus 40 underlying in flight, plus 50 at the broker,
+    /// gives 100 of 150.
+    #[test]
+    fn chain_bands_count_shares_in_flight_as_underlying() {
+        let ratio = UnderlyingPerWrapped::new(U256::from(1_500_000_000_000_000_000u64)).unwrap();
+        let stranded = ChainSlot {
+            balance: VenueBalance::new(shares("40"), shares("40")),
+            ratio,
+            ..slot("40", "0.5")
+        };
+
+        assert_eq!(
+            bands(&input(
+                Some(balance("50")),
+                BTreeMap::from([(Chain::Base, stranded)]),
+            )),
+            Some(vec![(
+                Chain::Base,
+                (float!(100) / float!(150)).unwrap().format().unwrap(),
+                BandVerdict::Within
+            )])
+        );
+    }
+
+    /// Shares in flight count toward the total, as in the planner.
+    #[test]
+    fn chain_bands_count_shares_in_flight() {
+        let moving = ChainSlot {
+            balance: VenueBalance::new(shares("10"), shares("50")),
+            ..slot("10", "0.5")
+        };
+
+        assert_eq!(
+            bands(&input(
+                Some(balance("40")),
+                BTreeMap::from([(Chain::Base, moving)]),
+            )),
+            Some(vec![(Chain::Base, "0.6".to_string(), BandVerdict::Within)])
+        );
+    }
+
+    /// A chain with no target is left out; the others keep their verdict.
+    #[test]
+    fn chain_bands_leave_out_a_chain_with_no_target() {
+        let untargeted = ChainSlot {
+            participation: Participation::NoTarget,
+            ..slot("30", "0")
+        };
+
+        assert_eq!(
+            bands(&input(
+                Some(balance("40")),
+                BTreeMap::from([
+                    (Chain::Base, slot("30", "0.3")),
+                    (Chain::Robinhood, untargeted),
+                ]),
+            )),
+            Some(vec![(Chain::Base, "0.3".to_string(), BandVerdict::Within)])
+        );
+    }
+
+    /// A paused chain counts in the total but has no verdict, because the
+    /// planner never picks it: Base holds 30 of 100 although Robinhood,
+    /// paused, sits far below its own band.
+    #[test]
+    fn chain_bands_leave_out_a_paused_chain() {
+        let paused = ChainSlot {
+            participation: Participation::Paused,
+            ..slot("5", "0.5")
+        };
+
+        assert_eq!(
+            bands(&input(
+                Some(balance("65")),
+                BTreeMap::from([(Chain::Base, slot("30", "0.3")), (Chain::Robinhood, paused),]),
+            )),
+            Some(vec![(Chain::Base, "0.3".to_string(), BandVerdict::Within)])
+        );
+    }
+
+    /// No verdict where the planner cannot size the symbol.
+    #[test]
+    fn chain_bands_are_absent_when_the_total_is_unknown_or_zero() {
+        let base = || BTreeMap::from([(Chain::Base, slot("15", "0.5"))]);
+        assert_eq!(bands(&input(None, base())), None);
+        assert_eq!(bands(&input(Some(balance("85")), BTreeMap::new())), None);
+        assert_eq!(
+            bands(&EquityPlanInput {
+                listing_chains: BTreeSet::from([Chain::Base, Chain::Robinhood]),
+                ..input(Some(balance("85")), base())
+            }),
+            None
+        );
+        assert_eq!(
+            bands(&input(
+                Some(balance("0")),
+                BTreeMap::from([(Chain::Base, slot("0", "0.5"))]),
+            )),
+            None
+        );
     }
 
     #[test]

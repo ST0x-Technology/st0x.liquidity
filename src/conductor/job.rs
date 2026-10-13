@@ -25,7 +25,7 @@ use tracing::{debug, error, warn};
 use st0x_execution::{AlpacaBrokerApiError, AlpacaWalletError, Backpressure, Permanence};
 use st0x_tokenization::{AlpacaTokenizationError, TokenizerError};
 
-use crate::alerts::Notifier;
+use crate::alerts::{AlertKind, Notifier};
 
 /// Deterministic exponential backoff for the apalis retry layer.
 /// Doubles the delay each attempt up to `max`, with no jitter (unnecessary
@@ -656,6 +656,12 @@ where
 
     /// Logged when retries are exhausted and the supervisor receives
     /// a terminal failure for this job.
+    ///
+    /// It is also the alert's sole kind source: the page takes the kind of
+    /// the most specific extracted phrase in the rendered alert (see
+    /// [`terminal_failure_kind`]), so an override must carry the phrase of
+    /// its own extracted [`AlertKind`]. The worker macros fail the build on
+    /// a message with no extracted phrase.
     const TERMINAL_FAILURE_MSG: &'static str = "Job failed after retries";
 
     /// Upper bound on a single [`perform`](Job::perform) invocation, past
@@ -745,6 +751,28 @@ macro_rules! build_worker_inner {
 
 pub(crate) use build_worker_inner;
 
+/// Fails the build when a job's
+/// [`TERMINAL_FAILURE_MSG`](Job::TERMINAL_FAILURE_MSG) carries no extracted
+/// [`AlertKind`] phrase. The terminal failure page takes its kind from that
+/// text (see [`terminal_failure_kind`]), so a message without one would page
+/// as the generic job failure while the `operational_alerts` extractor reads
+/// no kind at all. Both worker macros run it, so every production worker is
+/// checked however the const is written.
+macro_rules! assert_terminal_failure_msg_names_a_kind {
+    (::<$ctx_type:ty, $job:ty>) => {
+        const {
+            assert!(
+                $crate::alerts::names_extracted_kind(
+                    <$job as $crate::conductor::job::Job<$ctx_type>>::TERMINAL_FAILURE_MSG
+                ),
+                "TERMINAL_FAILURE_MSG must contain the phrase of an extracted AlertKind"
+            );
+        }
+    };
+}
+
+pub(crate) use assert_terminal_failure_msg_names_a_kind;
+
 /// Builds a `Worker` for a `Job<Ctx>` impl.
 ///
 /// Mirrors the `work::<Ctx, Job>` turbofish style: pass the same two
@@ -772,6 +800,8 @@ macro_rules! build_supervised_worker {
         $failure_notify:expr
         $(, $failure_injector:expr)? $(,)?
     ) => {{
+        $crate::conductor::job::assert_terminal_failure_msg_names_a_kind!(::<$ctx_type, $job>);
+
         build_worker_inner!(
             ::<$ctx_type, $job>,
             $index,
@@ -814,6 +844,8 @@ macro_rules! build_best_effort_worker {
         use ::apalis::layers::retry::RetryPolicy;
         use ::apalis::prelude::WorkerBuilder;
         use ::apalis_core::worker::ext::event_listener::EventListenerExt;
+
+        $crate::conductor::job::assert_terminal_failure_msg_names_a_kind!(::<$ctx_type, $job>);
 
         let builder = WorkerBuilder::new(format!(
             "{}-{}",
@@ -1500,11 +1532,12 @@ pub(crate) fn on_best_effort_terminal_failure(
 
         let message =
             format!("st0x-hedge: {worker}: {error_msg}: {err}; worker and conductor will continue");
+        let kind = terminal_failure_kind(&message);
         let notifier = Arc::clone(&notifier);
         tokio::spawn(async move {
             match tokio::time::timeout(
                 super::TERMINAL_FAILURE_ALERT_TIMEOUT,
-                notifier.notify(&message),
+                notifier.notify(kind, &message),
             )
             .await
             {
@@ -1518,6 +1551,16 @@ pub(crate) fn on_best_effort_terminal_failure(
             }
         });
     }
+}
+
+/// The kind of a terminal job failure alert: the most specific extracted
+/// phrase in the rendered `alert`, as the log extractor reads it. The alert
+/// embeds the job's [`TERMINAL_FAILURE_MSG`](Job::TERMINAL_FAILURE_MSG), which
+/// carries its own kind's phrase, so a deeper cause in the rendered error
+/// wins and the job's message decides otherwise. The generic job failure kind
+/// covers an alert that holds no phrase at all.
+pub(crate) fn terminal_failure_kind(alert: &str) -> AlertKind {
+    AlertKind::most_specific_in(alert).unwrap_or(AlertKind::JobFailedAfterRetries)
 }
 
 fn find_job_error<'a>(mut error: &'a (dyn std::error::Error + 'static)) -> Option<&'a JobError> {
@@ -1596,7 +1639,7 @@ mod tests {
                         .retry(RetryPolicy::retries(WORKER_RETRIES).with_backoff(FAST_BACKOFF))
                         .on_event(on_best_effort_terminal_failure(
                             Arc::new(CapturingNotifier::default()),
-                            "low-budget terminal failure",
+                            "Job failed after retries",
                         ))
                         .build(work::<HookCtx, HookJob>)
                 });
@@ -1617,8 +1660,7 @@ mod tests {
     #[tokio::test]
     async fn best_effort_alerts_once_per_task_when_rendered_errors_match() {
         let notifier = Arc::new(CapturingNotifier::default());
-        let handler =
-            on_best_effort_terminal_failure(notifier.clone(), "test best-effort terminal failure");
+        let handler = on_best_effort_terminal_failure(notifier.clone(), "Job failed after retries");
         let ctx = WorkerContext::new::<TestJob>("test-best-effort-worker");
         let first = terminal_job_event("first-task");
         let second = terminal_job_event("second-task");
@@ -1642,6 +1684,76 @@ mod tests {
             "duplicate events must collapse without collapsing distinct tasks: {messages:?}",
         );
         assert_eq!(messages[0], messages[1], "the rendered errors must match");
+        assert_eq!(
+            notifier.kinds(),
+            [
+                AlertKind::JobFailedAfterRetries,
+                AlertKind::JobFailedAfterRetries
+            ]
+        );
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("Raindex vault withdraw failed: inventory vault under-funded: {0}")]
+    struct UnderFundedJobError(#[source] JobError);
+
+    /// A dead letter pages as the most specific known cause in its error, as
+    /// the log extractor reads it, not as the generic job failure.
+    #[tokio::test]
+    async fn best_effort_alert_takes_the_kind_of_the_most_specific_cause() {
+        let notifier = Arc::new(CapturingNotifier::default());
+        let handler = on_best_effort_terminal_failure(notifier.clone(), "Job failed after retries");
+        let ctx = WorkerContext::new::<TestJob>("test-best-effort-worker");
+        let error: BoxDynError = Box::new(UnderFundedJobError(JobError::Injected {
+            task_identity: TaskIdentity("under-funded-task".to_owned()),
+            durably_terminal: true,
+        }));
+
+        handler(&ctx, &Event::Error(Arc::new(error)));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while notifier.kinds().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the dead letter must alert");
+        assert_eq!(notifier.kinds(), [AlertKind::InventoryVaultUnderFunded]);
+    }
+
+    /// The default terminal failure text carries the generic job failure
+    /// phrase, so a dead letter pages under that kind when its error names
+    /// nothing more specific.
+    #[test]
+    fn default_terminal_failure_message_carries_its_kind() {
+        assert_eq!(
+            AlertKind::most_specific_in(<TestJob as Job<TestCtx>>::TERMINAL_FAILURE_MSG),
+            Some(AlertKind::JobFailedAfterRetries)
+        );
+    }
+
+    /// The rendered error's deeper cause names the page; the job's own
+    /// message names it otherwise; an alert with no phrase at all pages as
+    /// the generic job failure.
+    #[test]
+    fn terminal_failure_kind_prefers_the_most_specific_phrase() {
+        assert_eq!(
+            terminal_failure_kind(
+                "st0x-hedge: worker-0: Job failed after retries: Raindex vault withdraw \
+                 failed: inventory vault under-funded"
+            ),
+            AlertKind::InventoryVaultUnderFunded
+        );
+        assert_eq!(
+            terminal_failure_kind(
+                "st0x-hedge: worker-0: Dashboard trade delivery failed after retries: boom"
+            ),
+            AlertKind::DashboardTradeDeliveryFailed
+        );
+        assert_eq!(
+            terminal_failure_kind("st0x-hedge: worker-0: stress test terminal failure: boom"),
+            AlertKind::JobFailedAfterRetries
+        );
     }
 
     #[derive(Debug, thiserror::Error)]

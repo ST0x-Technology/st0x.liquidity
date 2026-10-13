@@ -27,9 +27,9 @@ equities (wtDNUT, wtFGI) are ingested, validated against USDG and hedged, with
 Bebop's Robinhood hook mapped as the inventory adapter. The build values its gas
 (it pays gas in ETH), so `active` is reachable. Production runs it `active` and
 rebalances against Alpaca the listings the pinned token file enables there
-(DNUT); staging runs it as a prefunded hedge-only secondary with
-`rebalancing = "disabled"` on every asset. It cannot rebalance cash, because it
-has no CCTP domain.
+(DNUT, PLBY, GRND, and WMT); staging runs it as a prefunded hedge-only secondary
+with `rebalancing = "disabled"` on every asset. It cannot rebalance cash,
+because it has no CCTP domain.
 
 ## Features
 
@@ -50,6 +50,18 @@ has no CCTP domain.
   directional exposure from onchain fills
 - **Operator Vault Controls**: CLI supports generic ERC20 deposits to and
   withdrawals from Raindex vaults, with a USDC-specific withdrawal shortcut
+- **Shared Operations Audit**: Every operator mutation request that reaches the
+  service emits `st0x.operations.audit.v1` with stable principal, role, matched
+  route template, request UUID, bounded target/reason fields, and outcome.
+  `target_id` is the path values followed by the identifiers the typed request
+  body and query declare, and `reason` is the typed body's reason; an oversized
+  value is refused with `400` before the handler runs. Authentication precedes
+  body capture, so in-service denials use `not_identified`/`not_provided`; Cloud
+  IAP edge rejections never reach the application. The event is an ordinary
+  stdout log line, which Docker's `gcplogs` driver forwards to Cloud Logging as
+  message text. VictoriaLogs receives the compatible event only when
+  `[telemetry]` configures the OTLP log exporter. Responses echo the UUID in
+  `x-request-id`, and the operator CLI prints it when a write fails.
 - **Public Incident Messaging**: The
   [`scripts/turnkey-message`](scripts/turnkey-message/README.md) utility
   prepares, signs, verifies, sends, and reads zero-value Base messages from an
@@ -477,10 +489,14 @@ nix run .#deployAll   # first deployment
   touches them provisions them into a throwaway Grafana; a merge to `master`
   ships them to the production T0 Grafana. See
   [observability/README.md](observability/README.md).
-- **Production** bot images are promoted from `t0.devops`, not this repo:
-  promote a digest proven in staging into
-  `terraform/production-liquidity/images.yaml` and merge. The apply requires 2
-  of 4 approvers (Juan, Alastair, Kais, Josh).
+- **Production** (`.github/workflows/production-release.yml`): the only way to
+  roll production. A manual run with `version = vX.Y.Z` releases the images and
+  `config/prod/st0x-hedge.toml` from that tag. A run with an empty `version` is
+  a config-only release of `config/prod/st0x-hedge.toml` onto the images that
+  are live. It takes the file from the branch selected in "Use workflow from",
+  not always `master`, so select `master`; any other branch publishes that
+  branch's unreviewed config. Each run waits for an approved `app-deploy` PAM
+  grant in `t0-liquidity`.
 
 Track staging and production deploys in the Grafana deployments dashboard:
 https://grafana.t0trade.com/d/t0-deployments/deployments

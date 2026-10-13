@@ -23,7 +23,7 @@ use st0x_dto::{Direction, Trade, TradeOutcome, TradingVenue};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
 use st0x_evm::{Chain, ParseChainError};
 use st0x_execution::Symbol;
-use st0x_finance::{FractionalShares, NotPositive, Positive};
+use st0x_finance::{FractionalShares, NotPositive, Positive, Usd};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct OnChainTradeId {
@@ -322,6 +322,7 @@ impl OnChainTrade {
             direction: self.direction,
             symbol: self.symbol,
             shares: Positive::new(FractionalShares::new(self.amount))?,
+            price: Some(Usd::new(self.price_usdc)),
             outcome: TradeOutcome::Filled,
         })
     }
@@ -1291,6 +1292,33 @@ mod tests {
             matches!(error, ParseOnChainTradeIdError::Chain(_)),
             "got {error:?}"
         );
+    }
+
+    #[test]
+    fn dashboard_trade_carries_the_fill_price() {
+        let now = Utc::now();
+        let trade = replay::<OnChainTrade>(vec![OnChainTradeEvent::Filled {
+            source: OnChainTradeSource::Raindex,
+            symbol: Symbol::new("AAPL").unwrap(),
+            amount: float!(2),
+            direction: Direction::Buy,
+            price_usdc: float!(150.25),
+            block_number: 12345,
+            block_timestamp: now,
+            filled_at: now,
+        }])
+        .unwrap()
+        .unwrap();
+
+        let dashboard_trade = trade
+            .try_into_trade(&OnChainTradeId {
+                chain: Chain::Base,
+                tx_hash: TxHash::ZERO,
+                log_index: 0,
+            })
+            .unwrap();
+
+        assert_eq!(dashboard_trade.price, Some(Usd::new(float!(150.25))));
     }
 
     #[test]

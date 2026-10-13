@@ -46,7 +46,7 @@ use super::{
 use super::{
     WITHDRAWAL_RECONCILIATION_ALERT_DEADLINE, WITHDRAWAL_RECONCILIATION_POST_DEADLINE_REDRIVE_DELAY,
 };
-use crate::alerts::Notifier;
+use crate::alerts::{AlertKind, Notifier};
 #[cfg(test)]
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::bot_gas::redrive::{BotGasFailureClassifier, redrive_on_bot_gas_failure};
@@ -1469,7 +1469,11 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
                     self.aggregate_id,
                     self.aggregate_id,
                 );
-                if let Err(alert_error) = ctx.notifier.notify(&message).await {
+                if let Err(alert_error) = ctx
+                    .notifier
+                    .notify(AlertKind::TransferJobBudgetExhausted, &message)
+                    .await
+                {
                     warn!(
                         target: "rebalance",
                         aggregate_id = %self.aggregate_id,

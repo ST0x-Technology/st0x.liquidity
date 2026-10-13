@@ -1,0 +1,4 @@
+# Expected exporter output for orders-unavailable.json, written by
+# scripts/liq-parity/golden.py from t0.devops revision 226c029.
+liq_pending_orders_total 0.0
+liq_raindex_orders_unavailable{reason="REST API unreachable"} 1.0

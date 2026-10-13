@@ -19,6 +19,15 @@ cctp = [
   "dep:tokio",
   "dep:tracing",
 ]
+relay = [
+  "dep:backon",
+  "dep:reqwest",
+  "dep:serde",
+  "dep:serde_json",
+  "dep:st0x-evm",
+  "dep:thiserror",
+  "dep:tracing",
+]
 mock = ["cctp", "dep:anyhow", "dep:httpmock", "dep:rand"]
 
 [dependencies]
@@ -27,7 +36,7 @@ alloy-primitives.workspace = true
 anyhow = { workspace = true, optional = true }
 async-trait.workspace = true
 
-# Optional deps gated behind cctp feature
+# Optional deps gated behind the cctp and relay features
 backon = { workspace = true, optional = true }
 httpmock = { workspace = true, optional = true }
 rain-math-float = { workspace = true, optional = true }

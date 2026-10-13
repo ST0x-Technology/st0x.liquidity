@@ -19,16 +19,21 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::time::{Instant, interval, sleep_until};
 use tracing::{debug, info, warn};
 
-use st0x_dto::{Statement, Trade, TradeOutcome};
+use st0x_dto::{Statement, Trade, TradeOutcome, TransferOperation};
 use st0x_event_sorcery::{
-    AggregateError, EntityList, Reactor, SendError, deps, is_retryable_sqlite_busy, load_entity,
+    AggregateError, Committed, Dependent, EntityList, EventSourced, Reactor, SendError, deps,
+    is_retryable_sqlite_busy, load_entity,
 };
-use st0x_finance::{FractionalShares, NotPositive, Positive};
+use st0x_finance::{FractionalShares, NotPositive, Positive, Usd};
 
+use super::equity_price::EquityPriceStore;
+use super::event_lines::{
+    EventId, EventParent, TransferLineSweep, TransferLines, log_event, log_trade, transfer_kind,
+};
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::equity_redemption::EquityRedemption;
 use crate::offchain::order::{
-    OffchainOrder, OffchainOrderEvent, OffchainOrderId, TradeConversionError,
+    OffchainOrder, OffchainOrderEvent, OffchainOrderId, TradeConversionError, executor_venue,
 };
 use crate::onchain_trade::{
     OnChainTrade, OnChainTradeEvent, OnChainTradeId, ParseOnChainTradeIdError,
@@ -107,6 +112,9 @@ pub(crate) struct DashboardTradeDelivery {
     pub(crate) ctx: Arc<DashboardTradeDeliveryCtx>,
     pub(crate) broadcaster: Arc<Broadcaster>,
     pub(crate) handoff_monitor: DashboardTradeHandoffMonitor,
+    /// Heals the `liq_transfer` lines from the transfers' current state,
+    /// sharing the status memory with the broadcaster.
+    pub(crate) line_sweep: TransferLineSweep,
     #[cfg(test)]
     store: Arc<DashboardTradeDeliveryStore>,
     enqueuer: Arc<DashboardTradeEnqueuer>,
@@ -117,6 +125,7 @@ impl DashboardTradeDelivery {
         apalis_pool: &apalis_sqlite::SqlitePool,
         pool: &SqlitePool,
         sender: broadcast::Sender<Statement>,
+        equity_prices: EquityPriceStore,
     ) -> Self {
         let queue = DashboardTradeDeliveryJobQueue::new(apalis_pool);
         let store = Arc::new(DashboardTradeDeliveryStore::new(pool.clone()));
@@ -128,6 +137,8 @@ impl DashboardTradeDelivery {
         let test_store = store.clone();
         let (handoff_retry_sender, handoff_retry_receiver) =
             mpsc::channel(HANDOFF_RETRY_QUEUE_CAPACITY);
+        let transfer_lines = Arc::new(TransferLines::new(equity_prices));
+        let line_sweep = TransferLineSweep::new(pool.clone(), transfer_lines.clone());
         let ctx = Arc::new(DashboardTradeDeliveryCtx::with_store(
             sender.clone(),
             store,
@@ -142,6 +153,7 @@ impl DashboardTradeDelivery {
             revision_reload_fault.clone(),
             revision_tracker.clone(),
             publish_lock.clone(),
+            transfer_lines,
         ));
         let handoff_monitor = DashboardTradeHandoffMonitor::new(
             handoff_retry_receiver,
@@ -158,6 +170,7 @@ impl DashboardTradeDelivery {
             ctx,
             broadcaster,
             handoff_monitor,
+            line_sweep,
             #[cfg(test)]
             store: test_store,
             enqueuer,
@@ -971,6 +984,7 @@ pub(crate) struct Broadcaster {
     revision_reload_fault: OnchainRevisionReloadFault,
     revision_tracker: OnchainRevisionTracker,
     publish_lock: Arc<Mutex<()>>,
+    transfer_lines: Arc<TransferLines>,
 }
 
 impl Broadcaster {
@@ -982,6 +996,7 @@ impl Broadcaster {
         revision_reload_fault: OnchainRevisionReloadFault,
         revision_tracker: OnchainRevisionTracker,
         publish_lock: Arc<Mutex<()>>,
+        transfer_lines: Arc<TransferLines>,
     ) -> Self {
         Self {
             sender,
@@ -991,6 +1006,7 @@ impl Broadcaster {
             revision_reload_fault,
             revision_tracker,
             publish_lock,
+            transfer_lines,
         }
     }
 
@@ -1015,35 +1031,75 @@ impl Broadcaster {
         Ok(())
     }
 
+    /// Enqueues a terminal offchain order's `Trade`, and writes its
+    /// `liq_trade` line when the event committed. The caller loaded the order
+    /// once for both; an order it could not load is queued for reload retry.
     async fn enqueue_offchain_trade(
         &self,
         id: OffchainOrderId,
+        order: Option<OffchainOrder>,
+        event_id: Option<&EventId>,
     ) -> Result<(), DashboardTradeEnqueueError> {
-        match load_entity::<OffchainOrder>(&self.pool, &id).await {
-            Ok(Some(order)) => match order.try_into_trade(&id) {
-                Ok(trade) => return self.enqueue_trade(trade).await,
+        if let Some(order) = order {
+            match order.try_into_trade(&id) {
+                Ok(trade) => {
+                    if let Some(event_id) = event_id {
+                        log_trade(&trade, event_id);
+                    }
+                    return self.enqueue_trade(trade).await;
+                }
                 Err(error) => warn!(
                     target: "dashboard",
-                    %id, %error,
-                    "Failed to convert terminal OffchainOrder; queued for reload retry"
+                    %id,
+                    event_id = event_id.map(tracing::field::display),
+                    %error,
+                    "Failed to convert terminal OffchainOrder; its liq_trade line is not \
+                     written and it is queued for reload retry"
                 ),
-            },
-            Ok(None) => warn!(
-                target: "dashboard",
-                %id,
-                "Terminal OffchainOrder replayed to empty state; queued for reload retry"
-            ),
-            Err(error) => warn!(
-                target: "dashboard",
-                %id, ?error,
-                "Failed to load terminal OffchainOrder; queued for reload retry"
-            ),
+            }
         }
 
         self.handoff_retry_sender
             .send(DashboardTradeHandoff::ReloadOffchainOrder(id))
             .await?;
         Ok(())
+    }
+
+    /// Loads an offchain order once for its log lines and its dashboard
+    /// trade, logging why when it cannot.
+    async fn load_offchain_order(
+        &self,
+        id: &OffchainOrderId,
+        event_id: Option<&EventId>,
+        terminal: bool,
+    ) -> Option<OffchainOrder> {
+        let retry = if terminal {
+            "; it is queued for reload retry"
+        } else {
+            ""
+        };
+        match load_entity::<OffchainOrder>(&self.pool, id).await {
+            Ok(Some(order)) => Some(order),
+            Ok(None) => {
+                warn!(
+                    target: "dashboard",
+                    %id,
+                    event_id = event_id.map(tracing::field::display),
+                    "Offchain order replayed to empty state; its log lines are not written{retry}",
+                );
+                None
+            }
+            Err(error) => {
+                warn!(
+                    target: "dashboard",
+                    %id,
+                    event_id = event_id.map(tracing::field::display),
+                    ?error,
+                    "Failed to load offchain order; its log lines are not written{retry}",
+                );
+                None
+            }
+        }
     }
 
     async fn broadcast_onchain_trade_revision(
@@ -1154,37 +1210,80 @@ pub(crate) enum DashboardTradeEnqueueError {
 impl Reactor for Broadcaster {
     type Error = DashboardTradeEnqueueError;
 
+    /// Broadcasts without writing log lines: they need the committed
+    /// sequence, which only `react_committed` has.
     async fn react(
         &self,
         event: <Self::Dependencies as EntityList>::Event,
     ) -> Result<(), Self::Error> {
+        self.handle(event, None).await
+    }
+
+    async fn react_committed(
+        &self,
+        event: <Self::Dependencies as EntityList>::Event,
+        committed: Committed,
+    ) -> Result<(), Self::Error> {
+        self.handle(event, Some(committed)).await
+    }
+}
+
+impl Broadcaster {
+    /// Broadcasts the event to dashboard clients and, for a commit, writes
+    /// its `liq_trade`, `liq_transfer` and `liq_event` lines first.
+    async fn handle(
+        &self,
+        event: <<Self as Dependent>::Dependencies as EntityList>::Event,
+        committed: Option<Committed>,
+    ) -> Result<(), DashboardTradeEnqueueError> {
         event
             .on(|id, event| async move {
+                let event_id =
+                    committed.map(|committed| EventId::of::<OnChainTrade>(&id, committed));
+
                 match event {
                     OnChainTradeEvent::Filled {
                         source,
-                        symbol,
+                        ref symbol,
                         amount,
                         direction,
+                        price_usdc,
                         block_timestamp,
                         ..
                     } => {
-                        self.enqueue_trade(Trade {
+                        // The event carries everything both lines need, so
+                        // the fill is not replayed from the store.
+                        let venue = source.trading_venue();
+                        if let Some(event_id) = &event_id {
+                            log_event::<OnChainTrade>(EventParent::Trade(venue), &event, event_id);
+                        }
+                        let trade = Trade {
                             id: id.to_string(),
                             occurred_at: block_timestamp,
-                            venue: source.trading_venue(),
+                            venue,
                             direction,
-                            symbol,
+                            symbol: symbol.clone(),
                             shares: Positive::new(FractionalShares::new(amount))?,
+                            price: Some(Usd::new(price_usdc)),
                             outcome: TradeOutcome::Filled,
-                        })
-                        .await?;
+                        };
+                        if let Some(event_id) = &event_id {
+                            log_trade(&trade, event_id);
+                        }
+                        self.enqueue_trade(trade).await?;
                     }
                     OnChainTradeEvent::SourceAttributed { .. } => {
+                        if let Some(event_id) = &event_id {
+                            self.log_onchain_trade(&id, &event, event_id).await;
+                        }
                         self.broadcast_onchain_trade_revision(id).await?;
                     }
                     OnChainTradeEvent::Enriched { .. }
-                    | OnChainTradeEvent::Acknowledged { .. } => {}
+                    | OnChainTradeEvent::Acknowledged { .. } => {
+                        if let Some(event_id) = &event_id {
+                            self.log_onchain_trade(&id, &event, event_id).await;
+                        }
+                    }
                 }
 
                 Ok(())
@@ -1216,48 +1315,158 @@ impl Reactor for Broadcaster {
 
             .on(|id, event| async move {
                 use OffchainOrderEvent::*;
-                match event {
-                    Filled { .. } | Failed { .. } | Cancelled { .. } => {
-                        self.enqueue_offchain_trade(id).await?;
-                    }
+
+                let terminal = match event {
+                    Filled { .. } | Failed { .. } | Cancelled { .. } => true,
                     Placed { .. }
                     | Submitted { .. }
                     | Accepted { .. }
                     | PartiallyFilled { .. }
-                    | CancelRequested { .. } => {}
+                    | CancelRequested { .. } => false,
+                };
+                let event_id =
+                    committed.map(|committed| EventId::of::<OffchainOrder>(&id, committed));
+                if !terminal && event_id.is_none() {
+                    return Ok(());
+                }
+
+                // One load serves the `liq_event` line, the `liq_trade` line
+                // and the dashboard trade: this runs on the hedge path, before
+                // the command that committed the event returns.
+                let order = self.load_offchain_order(&id, event_id.as_ref(), terminal).await;
+                if let (Some(event_id), Some(order)) = (&event_id, &order) {
+                    log_event::<OffchainOrder>(
+                        EventParent::Trade(executor_venue(order.executor())),
+                        &event,
+                        event_id,
+                    );
+                }
+
+                if terminal {
+                    self.enqueue_offchain_trade(id, order, event_id.as_ref()).await?;
                 }
 
                 Ok(())
             })
 
-            .on(|id, _event| async move {
+            .on(|id, event| async move {
+                let event_id = committed.map(|committed| EventId::of::<TokenizedEquityMint>(&id, committed));
                 match load_entity::<TokenizedEquityMint>(&self.pool, &id).await {
-                    Ok(Some(entity)) => self.broadcast_transfer(entity.to_dto(&id)),
-                    Ok(None) => warn!(target: "dashboard", %id, "Mint entity not found for transfer broadcast"),
-                    Err(error) => warn!(target: "dashboard", %id, ?error, "Failed to load mint for broadcast"),
+                    Ok(Some(entity)) => {
+                        let transfer = entity.to_dto(&id);
+                        if let Some(event_id) = &event_id {
+                            self.log_transfer::<TokenizedEquityMint>(&event, &transfer, event_id).await;
+                        }
+                        self.broadcast_transfer(transfer);
+                    }
+                    Ok(None) => warn!(target: "dashboard", %id, event_id = event_id.as_ref().map(tracing::field::display), "Mint entity not found for transfer broadcast"),
+                    Err(error) => warn!(target: "dashboard", %id, event_id = event_id.as_ref().map(tracing::field::display), ?error, "Failed to load mint for broadcast"),
                 }
                 Ok(())
             })
 
-            .on(|id, _event| async move {
+            .on(|id, event| async move {
+                let event_id = committed.map(|committed| EventId::of::<EquityRedemption>(&id, committed));
                 match load_entity::<EquityRedemption>(&self.pool, &id).await {
-                    Ok(Some(entity)) => self.broadcast_transfer(entity.to_dto(&id)),
-                    Ok(None) => warn!(target: "dashboard", %id, "Redemption entity not found for broadcast"),
-                    Err(error) => warn!(target: "dashboard", %id, ?error, "Failed to load redemption for broadcast"),
+                    Ok(Some(entity)) => {
+                        let transfer = entity.to_dto(&id);
+                        if let Some(event_id) = &event_id {
+                            self.log_transfer::<EquityRedemption>(&event, &transfer, event_id).await;
+                        }
+                        self.broadcast_transfer(transfer);
+                    }
+                    Ok(None) => warn!(target: "dashboard", %id, event_id = event_id.as_ref().map(tracing::field::display), "Redemption entity not found for broadcast"),
+                    Err(error) => warn!(target: "dashboard", %id, event_id = event_id.as_ref().map(tracing::field::display), ?error, "Failed to load redemption for broadcast"),
                 }
                 Ok(())
             })
 
-            .on(|id, _event| async move {
+            .on(|id, event| async move {
+                let event_id = committed.map(|committed| EventId::of::<UsdcRebalance>(&id, committed));
                 match load_entity::<UsdcRebalance>(&self.pool, &id).await {
-                    Ok(Some(entity)) => self.broadcast_transfer(entity.to_dto(&id)),
-                    Ok(None) => warn!(target: "dashboard", %id, "USDC rebalance entity not found for broadcast"),
-                    Err(error) => warn!(target: "dashboard", %id, ?error, "Failed to load rebalance for broadcast"),
+                    Ok(Some(entity)) => {
+                        let transfer = entity.to_dto(&id);
+                        if let Some(event_id) = &event_id {
+                            self.log_transfer::<UsdcRebalance>(&event, &transfer, event_id).await;
+                        }
+                        self.broadcast_transfer(transfer);
+                    }
+                    Ok(None) => warn!(target: "dashboard", %id, event_id = event_id.as_ref().map(tracing::field::display), "USDC rebalance entity not found for broadcast"),
+                    Err(error) => warn!(target: "dashboard", %id, event_id = event_id.as_ref().map(tracing::field::display), ?error, "Failed to load rebalance for broadcast"),
                 }
                 Ok(())
             })
             .exhaustive()
             .await
+    }
+
+    /// Writes the `liq_event` line of a committed onchain trade event other
+    /// than `Filled`, and its `liq_trade` line when the event corrects the
+    /// trade's venue. The venue comes from the stored trade, because
+    /// `Enriched` and `Acknowledged` do not carry it.
+    async fn log_onchain_trade(
+        &self,
+        id: &OnChainTradeId,
+        event: &OnChainTradeEvent,
+        event_id: &EventId,
+    ) {
+        let entity = match load_entity::<OnChainTrade>(&self.pool, id).await {
+            Ok(Some(entity)) => entity,
+            Ok(None) => {
+                warn!(
+                    target: "dashboard",
+                    %event_id,
+                    "Onchain trade replayed to empty state; its log lines are not written",
+                );
+                return;
+            }
+            Err(error) => {
+                warn!(
+                    target: "dashboard",
+                    %event_id,
+                    ?error,
+                    "Failed to load onchain trade; its log lines are not written",
+                );
+                return;
+            }
+        };
+
+        log_event::<OnChainTrade>(
+            EventParent::Trade(entity.source.trading_venue()),
+            event,
+            event_id,
+        );
+
+        match event {
+            OnChainTradeEvent::SourceAttributed { .. } => match entity.try_into_trade(id) {
+                Ok(trade) => log_trade(&trade, event_id),
+                Err(error) => warn!(
+                    target: "dashboard",
+                    %event_id,
+                    %error,
+                    "Failed to convert onchain trade; its liq_trade line is not written",
+                ),
+            },
+            OnChainTradeEvent::Filled { .. }
+            | OnChainTradeEvent::Enriched { .. }
+            | OnChainTradeEvent::Acknowledged { .. } => {}
+        }
+    }
+
+    /// Writes the `liq_event` line of a committed transfer event, and its
+    /// `liq_transfer` line when the transfer's status changes.
+    async fn log_transfer<Entity: EventSourced>(
+        &self,
+        event: &Entity::Event,
+        transfer: &TransferOperation,
+        event_id: &EventId,
+    ) {
+        log_event::<Entity>(
+            EventParent::Transfer(transfer_kind(transfer)),
+            event,
+            event_id,
+        );
+        self.transfer_lines.log(transfer, event_id).await;
     }
 }
 
@@ -1265,19 +1474,24 @@ impl Reactor for Broadcaster {
 mod tests {
     use apalis::prelude::Monitor;
     use std::borrow::Cow;
+    use std::collections::BTreeMap;
     use std::fmt::{Display, Formatter};
     use std::sync::Arc;
     use std::time::Duration;
 
+    use st0x_bridge::corridor::UsdcCorridor;
     use st0x_dto::TradingVenue;
     use st0x_event_sorcery::{LifecycleError, ReactorHarness, StoreBuilder};
     use st0x_evm::Chain;
     use st0x_execution::Symbol;
+    use st0x_finance::Usdc;
 
     use super::*;
+    use crate::alerts::AlertKind;
     use crate::conductor::job::{
         FailureInjector, TerminalFailureSignal, build_supervised_worker, build_worker_inner,
     };
+    use crate::dashboard::event_lines::test_support::CapturedLines;
     use crate::dashboard::{TradeQuery, query_trades};
     use crate::offchain::order::{OffchainOrderCommand, OffchainOrderEvent};
     use crate::onchain_trade::{
@@ -1285,6 +1499,20 @@ mod tests {
     };
     use crate::position::{PositionCommand, PositionEvent, TradeId};
     use crate::test_utils::setup_test_pools;
+    use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
+    use crate::usdc_rebalance::{
+        RebalanceDirection, TransferRef, UsdcRebalanceCommand, UsdcRebalanceId,
+    };
+
+    #[test]
+    fn terminal_failure_message_carries_its_kind() {
+        assert_eq!(
+            AlertKind::most_specific_in(
+                <DeliverDashboardTrade as Job<DashboardTradeDeliveryCtx>>::TERMINAL_FAILURE_MSG
+            ),
+            Some(AlertKind::DashboardTradeDeliveryFailed)
+        );
+    }
 
     #[derive(Debug)]
     struct TestDatabaseError {
@@ -1346,7 +1574,8 @@ mod tests {
         Arc<DashboardTradeDeliveryCtx>,
     ) {
         let (sender, receiver) = broadcast::channel(16);
-        let delivery = DashboardTradeDelivery::new(apalis_pool, pool, sender);
+        let delivery =
+            DashboardTradeDelivery::new(apalis_pool, pool, sender, EquityPriceStore::new([]));
         (delivery.broadcaster, receiver, delivery.queue, delivery.ctx)
     }
 
@@ -1373,6 +1602,7 @@ mod tests {
             direction: st0x_execution::Direction::Sell,
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(st0x_float_macro::float!(1))).unwrap(),
+            price: None,
             outcome: TradeOutcome::Filled,
         }
     }
@@ -1381,8 +1611,14 @@ mod tests {
         pool: SqlitePool,
         id: OffchainOrderId,
         filled_shares: Option<st0x_execution::FractionalShares>,
+        broadcaster: Option<Arc<Broadcaster>>,
     ) {
-        let (store, _projection) = StoreBuilder::<OffchainOrder>::new(pool)
+        let builder = StoreBuilder::<OffchainOrder>::new(pool);
+        let builder = match broadcaster {
+            Some(broadcaster) => builder.with(broadcaster),
+            None => builder,
+        };
+        let (store, _projection) = builder
             .build(crate::offchain::order::noop_order_placer())
             .await
             .unwrap();
@@ -1519,7 +1755,8 @@ mod tests {
     async fn no_broadcast_without_events() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (sender, mut receiver) = broadcast::channel(16);
-        let _delivery = DashboardTradeDelivery::new(&apalis_pool, &pool, sender);
+        let _delivery =
+            DashboardTradeDelivery::new(&apalis_pool, &pool, sender, EquityPriceStore::new([]));
 
         let result =
             tokio::time::timeout(std::time::Duration::from_millis(10), receiver.recv()).await;
@@ -1531,7 +1768,8 @@ mod tests {
     async fn terminal_trade_reactor_persists_delivery_job() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (sender, _receiver) = broadcast::channel(16);
-        let delivery = DashboardTradeDelivery::new(&apalis_pool, &pool, sender);
+        let delivery =
+            DashboardTradeDelivery::new(&apalis_pool, &pool, sender, EquityPriceStore::new([]));
         let harness = ReactorHarness::new(delivery.broadcaster);
         let now = chrono::Utc::now();
 
@@ -1571,7 +1809,8 @@ mod tests {
     async fn failed_reactor_handoff_retries_without_restart() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (sender, _receiver) = broadcast::channel(16);
-        let delivery = DashboardTradeDelivery::new(&apalis_pool, &pool, sender);
+        let delivery =
+            DashboardTradeDelivery::new(&apalis_pool, &pool, sender, EquityPriceStore::new([]));
         delivery.store.fail_next_registration(1);
         let harness = ReactorHarness::new(delivery.broadcaster.clone());
         let mut handoff_monitor = delivery.handoff_monitor.clone();
@@ -1624,7 +1863,8 @@ mod tests {
     async fn failed_offchain_reload_retries_without_restart() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (sender, _receiver) = broadcast::channel(16);
-        let delivery = DashboardTradeDelivery::new(&apalis_pool, &pool, sender);
+        let delivery =
+            DashboardTradeDelivery::new(&apalis_pool, &pool, sender, EquityPriceStore::new([]));
         let harness = ReactorHarness::new(delivery.broadcaster.clone());
         let mut handoff_monitor = delivery.handoff_monitor.clone();
         let monitor = tokio::spawn(async move { handoff_monitor.run().await });
@@ -1699,7 +1939,8 @@ mod tests {
     async fn exhausted_handoff_is_recovered_by_periodic_authoritative_reconciliation() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (sender, _receiver) = broadcast::channel(16);
-        let delivery = DashboardTradeDelivery::new(&apalis_pool, &pool, sender);
+        let delivery =
+            DashboardTradeDelivery::new(&apalis_pool, &pool, sender, EquityPriceStore::new([]));
         let mut handoff_monitor = delivery
             .handoff_monitor
             .clone()
@@ -1718,7 +1959,7 @@ mod tests {
             .await
             .expect("the missing handoff must exhaust its immediate retry budget");
 
-        persist_failed_offchain_order(pool, id, None).await;
+        persist_failed_offchain_order(pool, id, None, None).await;
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let pending: i64 = sqlx_apalis::query_scalar(
@@ -1743,7 +1984,8 @@ mod tests {
     async fn failed_reconciliation_pass_keeps_the_monitor_running() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (sender, _receiver) = broadcast::channel(16);
-        let delivery = DashboardTradeDelivery::new(&apalis_pool, &pool, sender);
+        let delivery =
+            DashboardTradeDelivery::new(&apalis_pool, &pool, sender, EquityPriceStore::new([]));
         let mut handoff_monitor = delivery
             .handoff_monitor
             .clone()
@@ -1786,11 +2028,13 @@ mod tests {
             Some(st0x_execution::FractionalShares::new(
                 st0x_float_macro::float!(0.5),
             )),
+            None,
         )
         .await;
         corrupt_persisted_terminal_fill(&pool, id).await;
         let (sender, _receiver) = broadcast::channel(16);
-        let delivery = DashboardTradeDelivery::new(&apalis_pool, &pool, sender);
+        let delivery =
+            DashboardTradeDelivery::new(&apalis_pool, &pool, sender, EquityPriceStore::new([]));
         let mut handoff_monitor = delivery.handoff_monitor.clone();
         let monitor = tokio::spawn(async move { handoff_monitor.run().await });
 
@@ -1818,7 +2062,8 @@ mod tests {
     async fn poison_handoff_does_not_block_later_terminal_trade() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (sender, _receiver) = broadcast::channel(16);
-        let delivery = DashboardTradeDelivery::new(&apalis_pool, &pool, sender);
+        let delivery =
+            DashboardTradeDelivery::new(&apalis_pool, &pool, sender, EquityPriceStore::new([]));
         let mut handoff_monitor = delivery.handoff_monitor.clone();
         let monitor = tokio::spawn(async move { handoff_monitor.run().await });
 
@@ -1864,7 +2109,8 @@ mod tests {
     async fn saturated_revision_retry_queue_does_not_hold_the_publish_lock() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (sender, _receiver) = broadcast::channel(16);
-        let delivery = DashboardTradeDelivery::new(&apalis_pool, &pool, sender);
+        let delivery =
+            DashboardTradeDelivery::new(&apalis_pool, &pool, sender, EquityPriceStore::new([]));
         for _ in 0..HANDOFF_RETRY_QUEUE_CAPACITY {
             delivery
                 .broadcaster
@@ -1954,7 +2200,8 @@ mod tests {
             .unwrap();
 
         let (sender, _receiver) = broadcast::channel(16);
-        let delivery = DashboardTradeDelivery::new(&apalis_pool, &pool, sender);
+        let delivery =
+            DashboardTradeDelivery::new(&apalis_pool, &pool, sender, EquityPriceStore::new([]));
 
         assert_eq!(delivery.reconcile().await.unwrap(), 1);
         let pending: i64 = sqlx_apalis::query_scalar(
@@ -1998,7 +2245,8 @@ mod tests {
             .unwrap();
 
         let (sender, _receiver) = broadcast::channel(16);
-        let delivery = DashboardTradeDelivery::new(&apalis_pool, &pool, sender);
+        let delivery =
+            DashboardTradeDelivery::new(&apalis_pool, &pool, sender, EquityPriceStore::new([]));
         assert_eq!(delivery.reconcile().await.unwrap(), 1);
 
         // Simulates the crash window between publishing and `mark_delivered`:
@@ -2058,7 +2306,8 @@ mod tests {
             .unwrap();
 
         let (sender, _receiver) = broadcast::channel(16);
-        let delivery = DashboardTradeDelivery::new(&apalis_pool, &pool, sender);
+        let delivery =
+            DashboardTradeDelivery::new(&apalis_pool, &pool, sender, EquityPriceStore::new([]));
         delivery.store.register(&id.to_string()).await.unwrap();
         delivery
             .store
@@ -2113,7 +2362,8 @@ mod tests {
             .unwrap();
 
         let (sender, _receiver) = broadcast::channel(16);
-        let delivery = DashboardTradeDelivery::new(&apalis_pool, &pool, sender);
+        let delivery =
+            DashboardTradeDelivery::new(&apalis_pool, &pool, sender, EquityPriceStore::new([]));
         let mut queue = delivery.queue.clone();
         let mut stale_trade = test_trade();
         stale_trade.id = id.to_string();
@@ -2172,7 +2422,8 @@ mod tests {
     async fn orphaned_delivery_replays_after_restart() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (sender, mut receiver) = broadcast::channel(16);
-        let delivery = DashboardTradeDelivery::new(&apalis_pool, &pool, sender);
+        let delivery =
+            DashboardTradeDelivery::new(&apalis_pool, &pool, sender, EquityPriceStore::new([]));
         let mut queue = delivery.queue.clone();
         enqueue_test_delivery(&mut queue, &delivery.ctx, test_trade()).await;
         sqlx_apalis::query("UPDATE Jobs SET status = 'Running' WHERE job_type = ?")
@@ -2201,7 +2452,8 @@ mod tests {
     async fn exhausted_delivery_is_redriven_once_by_startup_reconciliation() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (sender, _receiver) = broadcast::channel(16);
-        let delivery = DashboardTradeDelivery::new(&apalis_pool, &pool, sender);
+        let delivery =
+            DashboardTradeDelivery::new(&apalis_pool, &pool, sender, EquityPriceStore::new([]));
         let mut queue = delivery.queue.clone();
         enqueue_test_delivery(&mut queue, &delivery.ctx, test_trade()).await;
         sqlx_apalis::query("UPDATE Jobs SET status = 'Killed', attempts = 5 WHERE job_type = ?")
@@ -2376,6 +2628,10 @@ mod tests {
             panic!("expected TradeUpdate message");
         };
         assert_eq!(trade.venue, TradingVenue::Bebop);
+        assert_eq!(
+            trade.price,
+            Some(st0x_finance::Usd::new(st0x_float_macro::float!(150)))
+        );
     }
 
     #[tokio::test]
@@ -2537,7 +2793,8 @@ mod tests {
             .unwrap();
 
         let (sender, mut receiver) = broadcast::channel(16);
-        let delivery = DashboardTradeDelivery::new(&apalis_pool, &pool, sender);
+        let delivery =
+            DashboardTradeDelivery::new(&apalis_pool, &pool, sender, EquityPriceStore::new([]));
         let broadcaster = delivery.broadcaster;
         let harness = ReactorHarness::new(broadcaster.clone());
         let mut handoff_monitor = delivery.handoff_monitor;
@@ -2613,7 +2870,8 @@ mod tests {
             .unwrap();
 
         let (sender, mut receiver) = broadcast::channel(16);
-        let delivery = DashboardTradeDelivery::new(&apalis_pool, &pool, sender);
+        let delivery =
+            DashboardTradeDelivery::new(&apalis_pool, &pool, sender, EquityPriceStore::new([]));
         let broadcaster = delivery.broadcaster.clone();
         let harness = ReactorHarness::new(broadcaster.clone());
         let mut first_monitor = delivery.handoff_monitor.clone();
@@ -2667,7 +2925,8 @@ mod tests {
     async fn revision_retry_exhaustion_recovers_a_dropped_terminal_handoff_after_restart() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (sender, _receiver) = broadcast::channel(16);
-        let delivery = DashboardTradeDelivery::new(&apalis_pool, &pool, sender);
+        let delivery =
+            DashboardTradeDelivery::new(&apalis_pool, &pool, sender, EquityPriceStore::new([]));
         let mut first_monitor = delivery.handoff_monitor.clone();
         let started = first_monitor.startup_notification();
         let first = tokio::spawn(async move { first_monitor.run().await });
@@ -2865,6 +3124,10 @@ mod tests {
                 assert!(matches!(trade.venue, TradingVenue::Alpaca));
                 assert!(matches!(trade.direction, st0x_dto::Direction::Sell));
                 assert_eq!(trade.symbol, Symbol::new("TSLA").unwrap());
+                assert_eq!(
+                    trade.price,
+                    Some(st0x_finance::Usd::new(st0x_float_macro::float!(245)))
+                );
             }
             other => panic!("expected TradeUpdate message, got {other:?}"),
         }
@@ -2973,6 +3236,7 @@ mod tests {
                     &trade.outcome, &history[0].outcome,
                     "live and historical failure provenance must be identical"
                 );
+                assert_eq!(trade.price, None);
                 match trade.outcome {
                     st0x_dto::TradeOutcome::Failed {
                         error,
@@ -3119,6 +3383,7 @@ mod tests {
         .unwrap()
         .trades;
         assert_eq!(trade.outcome, history[0].outcome);
+        assert_eq!(trade.price, None);
         assert!(matches!(
             trade.outcome,
             TradeOutcome::Cancelled {
@@ -3300,5 +3565,576 @@ mod tests {
             }
             other => panic!("expected PositionUpdate message, got {other:?}"),
         }
+    }
+
+    fn line_keys(line: &BTreeMap<String, String>) -> Vec<&str> {
+        line.keys().map(String::as_str).collect()
+    }
+
+    const TRADE_LINE_KEYS: [&str; 13] = [
+        "direction",
+        "error",
+        "event_id",
+        "filled_shares",
+        "id",
+        "message",
+        "occurred_at",
+        "price",
+        "shares",
+        "status",
+        "symbol",
+        "usd",
+        "venue",
+    ];
+
+    const EVENT_LINE_KEYS: [&str; 9] = [
+        "event_id", "id", "kind", "message", "parent", "payload", "sequence", "step", "venue",
+    ];
+
+    #[tokio::test]
+    async fn committed_onchain_fill_writes_lines_that_a_restart_does_not_rewrite() {
+        let (captured, _guard) = CapturedLines::install();
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let id = OnChainTradeId {
+            chain: Chain::Base,
+            tx_hash: alloy::primitives::TxHash::ZERO,
+            log_index: 0,
+        };
+
+        let (broadcaster, _receiver, _queue, _delivery_ctx) = test_broadcaster(&pool, &apalis_pool);
+        let (store, _view) = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .with(broadcaster)
+            .build(())
+            .await
+            .unwrap();
+        let fill_time = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        store
+            .send(
+                &id,
+                OnChainTradeCommand::Witness {
+                    source: OnChainTradeSource::Raindex,
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    amount: st0x_float_macro::float!(2),
+                    direction: st0x_execution::Direction::Buy,
+                    price_usdc: st0x_float_macro::float!(150.5),
+                    block_number: 1,
+                    block_timestamp: fill_time,
+                },
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let first_run = captured.take();
+        let filled_event_id = format!("OnChainTrade:{id}:1");
+        let [(event_target, event_line), (trade_target, trade_line)] =
+            first_run.try_into().unwrap();
+        assert_eq!(event_target, "liq_event");
+        assert_eq!(line_keys(&event_line), EVENT_LINE_KEYS);
+        assert_eq!(event_line["event_id"], filled_event_id);
+        assert_eq!(event_line["parent"], "trade");
+        assert_eq!(event_line["venue"], "raindex");
+        assert_eq!(event_line["kind"], "");
+        assert_eq!(event_line["id"], id.to_string());
+        assert_eq!(event_line["sequence"], "1");
+        assert_eq!(event_line["step"], "Filled");
+        let payload: serde_json::Value = serde_json::from_str(&event_line["payload"]).unwrap();
+        assert_eq!(payload["symbol"], serde_json::json!("AAPL"));
+        assert_eq!(payload["amount"], serde_json::json!("2"));
+        assert_eq!(payload["price_usdc"], serde_json::json!("150.5"));
+
+        assert_eq!(trade_target, "liq_trade");
+        assert_eq!(line_keys(&trade_line), TRADE_LINE_KEYS);
+        assert_eq!(trade_line["event_id"], filled_event_id);
+        assert_eq!(trade_line["id"], id.to_string());
+        assert_eq!(trade_line["venue"], "raindex");
+        assert_eq!(trade_line["direction"], "buy");
+        assert_eq!(trade_line["shares"], "2");
+        assert_eq!(trade_line["status"], "filled");
+        assert_eq!(trade_line["price"], "150.5");
+        assert_eq!(trade_line["usd"], "301");
+        assert_eq!(trade_line["occurred_at"], "2023-11-14T22:13:20Z");
+
+        // A restart builds the store again over the same events. Building
+        // it, rebuilding the view and loading the trade all replay the
+        // stored fill, and none of that may write its lines again.
+        let (broadcaster, _receiver, _queue, _delivery_ctx) = test_broadcaster(&pool, &apalis_pool);
+        let (store, view) = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .with(broadcaster)
+            .build(())
+            .await
+            .unwrap();
+        view.rebuild_all().await.unwrap();
+        let reloaded = load_entity::<OnChainTrade>(&pool, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.source, OnChainTradeSource::Raindex);
+        assert_eq!(captured.take(), vec![]);
+
+        store
+            .send(&id, OnChainTradeCommand::Acknowledge)
+            .await
+            .unwrap();
+
+        let [(target, line)] = captured.take().try_into().unwrap();
+        assert_eq!(target, "liq_event");
+        assert_eq!(line["event_id"], format!("OnChainTrade:{id}:2"));
+        assert_eq!(line["sequence"], "2");
+        assert_eq!(line["step"], "Acknowledged");
+        assert_eq!(line["venue"], "raindex");
+    }
+
+    #[tokio::test]
+    async fn committed_failed_counter_trade_writes_its_events_and_trade_line() {
+        let (captured, _guard) = CapturedLines::install();
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (broadcaster, _receiver, _queue, _delivery_ctx) = test_broadcaster(&pool, &apalis_pool);
+        let id = OffchainOrderId::new();
+
+        persist_failed_offchain_order(pool, id, None, Some(broadcaster)).await;
+
+        let lines = captured.take();
+        let summary: Vec<(&str, &str, &str)> = lines
+            .iter()
+            .map(|(target, line)| {
+                (
+                    target.as_str(),
+                    line["event_id"].as_str(),
+                    line.get("step").map_or("", String::as_str),
+                )
+            })
+            .collect();
+        let event_id = |sequence: usize| format!("OffchainOrder:{id}:{sequence}");
+        assert_eq!(
+            summary,
+            vec![
+                ("liq_event", event_id(1).as_str(), "Placed"),
+                ("liq_event", event_id(2).as_str(), "Accepted"),
+                ("liq_event", event_id(3).as_str(), "Failed"),
+                ("liq_trade", event_id(3).as_str(), ""),
+            ]
+        );
+        for (_target, event_line) in &lines[..3] {
+            assert_eq!(line_keys(event_line), EVENT_LINE_KEYS);
+            assert_eq!(event_line["parent"], "trade");
+            assert_eq!(event_line["venue"], "alpaca");
+            assert_eq!(event_line["kind"], "");
+        }
+
+        let (_target, trade_line) = &lines[3];
+        assert_eq!(line_keys(trade_line), TRADE_LINE_KEYS);
+        assert_eq!(trade_line["venue"], "alpaca");
+        assert_eq!(trade_line["direction"], "sell");
+        assert_eq!(trade_line["status"], "failed");
+        assert_eq!(trade_line["error"], "broker unavailable");
+        assert_eq!(trade_line["price"], "");
+        assert_eq!(trade_line["usd"], "");
+    }
+
+    #[tokio::test]
+    async fn react_without_a_commit_writes_no_lines() {
+        let (captured, _guard) = CapturedLines::install();
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (broadcaster, _receiver, _queue, _delivery_ctx) = test_broadcaster(&pool, &apalis_pool);
+        let harness = ReactorHarness::new(broadcaster);
+
+        harness
+            .receive::<OnChainTrade>(
+                OnChainTradeId {
+                    chain: Chain::Base,
+                    tx_hash: alloy::primitives::TxHash::ZERO,
+                    log_index: 0,
+                },
+                OnChainTradeEvent::Acknowledged {
+                    acknowledged_at: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(captured.take(), vec![]);
+    }
+
+    #[tokio::test]
+    async fn committed_usdc_bridge_writes_an_event_line_each_and_a_transfer_line_per_status() {
+        let (captured, _guard) = CapturedLines::install();
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (broadcaster, _receiver, _queue, _delivery_ctx) = test_broadcaster(&pool, &apalis_pool);
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .with(broadcaster)
+            .build(())
+            .await
+            .unwrap();
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        let amount = Usdc::new(st0x_float_macro::float!(500));
+
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::BeginWithdrawal {
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount,
+                    from_block: 1,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(alloy::primitives::TxHash::repeat_byte(
+                        0x22,
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::BeginBridging {
+                    from_block: 2,
+                    burn_amount: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let event_id = |sequence: usize| format!("UsdcRebalance:{id}:{sequence}");
+        let summary: Vec<(String, String, String)> = captured
+            .take()
+            .into_iter()
+            .map(|(target, line)| {
+                let detail = match target.as_str() {
+                    "liq_event" => line["step"].clone(),
+                    _ => line["status"].clone(),
+                };
+                (target, line["event_id"].clone(), detail)
+            })
+            .collect();
+        let row = |target: &str, sequence: usize, detail: &str| {
+            (target.to_string(), event_id(sequence), detail.to_string())
+        };
+        assert_eq!(
+            summary,
+            vec![
+                row("liq_event", 1, "WithdrawalSubmitting"),
+                row("liq_transfer", 1, "withdrawing"),
+                row("liq_event", 2, "Initiated"),
+                row("liq_event", 3, "WithdrawalConfirmed"),
+                row("liq_event", 4, "BridgingSubmitting"),
+                row("liq_transfer", 4, "bridging"),
+            ]
+        );
+    }
+
+    /// Takes a USDC rebalance through withdrawal to `bridging` on `store`.
+    async fn usdc_rebalance_at_bridging(
+        store: &st0x_event_sorcery::Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+    ) {
+        let amount = Usdc::new(st0x_float_macro::float!(500));
+        for command in [
+            UsdcRebalanceCommand::BeginWithdrawal {
+                corridor: UsdcCorridor::BASE_CCTP,
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount,
+                from_block: 1,
+            },
+            UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount,
+                withdrawal: TransferRef::OnchainTx(alloy::primitives::TxHash::repeat_byte(0x22)),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceCommand::BeginBridging {
+                from_block: 2,
+                burn_amount: None,
+            },
+        ] {
+            store.send(id, command).await.unwrap();
+        }
+    }
+
+    fn transfer_lines(captured: &CapturedLines) -> Vec<(String, String)> {
+        captured
+            .take()
+            .into_iter()
+            .filter(|(target, _)| target == "liq_transfer")
+            .map(|(_, line)| (line["event_id"].clone(), line["status"].clone()))
+            .collect()
+    }
+
+    /// A status committed with no reactor (the offline CLI, or a crash
+    /// before the reactor ran) gets its line from the sweep, under the
+    /// transfer's last event. A second pass writes nothing.
+    #[tokio::test]
+    async fn the_sweep_writes_a_status_no_reactor_wrote_once() {
+        let (captured, _guard) = CapturedLines::install();
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (sender, _receiver) = broadcast::channel(16);
+        let delivery =
+            DashboardTradeDelivery::new(&apalis_pool, &pool, sender, EquityPriceStore::new([]));
+        let (standalone, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        usdc_rebalance_at_bridging(&standalone, &id).await;
+
+        delivery.line_sweep.sweep().await;
+        assert_eq!(
+            transfer_lines(&captured),
+            vec![(format!("UsdcRebalance:{id}:4"), "bridging".to_string())]
+        );
+
+        delivery.line_sweep.sweep().await;
+        assert_eq!(transfer_lines(&captured), vec![]);
+
+        standalone
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "operator".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        delivery.line_sweep.sweep().await;
+        assert_eq!(
+            transfer_lines(&captured),
+            vec![(format!("UsdcRebalance:{id}:5"), "failed".to_string())]
+        );
+    }
+
+    /// The sweep seeds the memory the reactor reads, so after a restart an
+    /// event that leaves the status as it was writes no line again.
+    #[tokio::test]
+    async fn after_the_sweep_an_unchanged_status_writes_no_line() {
+        let (captured, _guard) = CapturedLines::install();
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (sender, _receiver) = broadcast::channel(16);
+        let delivery =
+            DashboardTradeDelivery::new(&apalis_pool, &pool, sender, EquityPriceStore::new([]));
+        let (standalone, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        usdc_rebalance_at_bridging(&standalone, &id).await;
+        delivery.line_sweep.sweep().await;
+        transfer_lines(&captured);
+
+        let (wired, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .with(delivery.broadcaster.clone())
+            .build(())
+            .await
+            .unwrap();
+        wired
+            .send(
+                &id,
+                UsdcRebalanceCommand::RecordPendingBurn {
+                    burn_tx: alloy::primitives::TxHash::repeat_byte(0x33),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(transfer_lines(&captured), vec![]);
+    }
+
+    /// The sweep names a mint's event as the reactor does, so both writers
+    /// share one memory entry and one `event_id` per event.
+    #[tokio::test]
+    async fn the_sweep_names_a_mint_event_as_the_reactor_does() {
+        let (captured, _guard) = CapturedLines::install();
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (sender, _receiver) = broadcast::channel(16);
+        let symbol = Symbol::new("AAPL").unwrap();
+        let delivery = DashboardTradeDelivery::new(
+            &apalis_pool,
+            &pool,
+            sender,
+            EquityPriceStore::with_live_mark(symbol.clone(), st0x_float_macro::float!(100)),
+        );
+        let (standalone, _projection) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+            .build(crate::rebalancing::equity::EquityTransferServices::panicking())
+            .await
+            .unwrap();
+        let id = st0x_tokenization::issuer_request_id("sweep-mint");
+        standalone
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol,
+                    chain: Chain::Base,
+                    quantity: st0x_float_macro::float!(10),
+                    wallet: alloy::primitives::Address::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        standalone
+            .send(
+                &id,
+                TokenizedEquityMintCommand::FailAcceptance {
+                    reason: "timed out".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        delivery.line_sweep.sweep().await;
+
+        assert_eq!(
+            transfer_lines(&captured),
+            vec![(
+                EventId::of::<TokenizedEquityMint>(&id, Committed::new(2)).to_string(),
+                "failed".to_string(),
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_position_event_writes_no_line_but_still_broadcasts() {
+        let (captured, _guard) = CapturedLines::install();
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (broadcaster, mut receiver, _queue, _delivery_ctx) =
+            test_broadcaster(&pool, &apalis_pool);
+        let (store, _projection) = StoreBuilder::<Position>::new(pool.clone())
+            .with(broadcaster)
+            .build(())
+            .await
+            .unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: st0x_config::ExecutionThreshold::Shares(
+                        st0x_execution::Positive::new(st0x_execution::FractionalShares::new(
+                            st0x_float_macro::float!(1),
+                        ))
+                        .unwrap(),
+                    ),
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: alloy::primitives::TxHash::ZERO,
+                        log_index: 0,
+                    },
+                    amount: st0x_execution::FractionalShares::new(st0x_float_macro::float!(1)),
+                    direction: st0x_execution::Direction::Buy,
+                    price_usdc: st0x_float_macro::float!(150),
+                    block_timestamp: chrono::Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let Statement::PositionUpdate(position) = receiver.recv().await.unwrap() else {
+            panic!("expected a position update");
+        };
+        assert_eq!(position.symbol, symbol);
+        assert_eq!(captured.take(), vec![]);
+    }
+
+    #[tokio::test]
+    async fn source_correction_writes_the_trade_again_with_its_new_venue() {
+        let (captured, _guard) = CapturedLines::install();
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (broadcaster, _receiver, _queue, _delivery_ctx) = test_broadcaster(&pool, &apalis_pool);
+        let (store, _view) = StoreBuilder::<OnChainTrade>::new(pool)
+            .with(broadcaster)
+            .build(())
+            .await
+            .unwrap();
+        let id = OnChainTradeId {
+            chain: Chain::Base,
+            tx_hash: alloy::primitives::TxHash::ZERO,
+            log_index: 196,
+        };
+        let now = chrono::Utc::now();
+
+        store
+            .send(
+                &id,
+                OnChainTradeCommand::WitnessAt {
+                    source: OnChainTradeSource::Legacy,
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    amount: st0x_float_macro::float!(10),
+                    direction: st0x_execution::Direction::Buy,
+                    price_usdc: st0x_float_macro::float!(150),
+                    block_number: 12345,
+                    block_timestamp: now,
+                    filled_at: now,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                OnChainTradeCommand::AttributeSource {
+                    source: OnChainTradeSource::Inventory {
+                        operator: alloy::primitives::Address::repeat_byte(0x8b),
+                        venue: InventoryVenue::Bebop,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        let summary: Vec<(String, String, String, String)> = captured
+            .take()
+            .into_iter()
+            .map(|(target, line)| {
+                let step = line.get("step").cloned().unwrap_or_default();
+                (
+                    target,
+                    line["event_id"].clone(),
+                    step,
+                    line["venue"].clone(),
+                )
+            })
+            .collect();
+        let row = |target: &str, sequence: usize, step: &str, venue: &str| {
+            (
+                target.to_string(),
+                format!("OnChainTrade:{id}:{sequence}"),
+                step.to_string(),
+                venue.to_string(),
+            )
+        };
+        assert_eq!(
+            summary,
+            vec![
+                row("liq_event", 1, "Filled", "raindex"),
+                row("liq_trade", 1, "", "raindex"),
+                row("liq_event", 2, "SourceAttributed", "bebop"),
+                row("liq_trade", 2, "", "bebop"),
+            ]
+        );
     }
 }

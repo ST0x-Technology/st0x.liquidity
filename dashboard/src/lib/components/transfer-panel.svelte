@@ -14,6 +14,7 @@
   import {
     getApiBaseUrl,
     getExplorerTxUrl,
+    getLiquidityClientEnv,
     getSimulateBackendPort,
     getSimulateSourceId
   } from '$lib/env'
@@ -753,7 +754,8 @@
           {@const recoveryCommands = transferRecoveryCommands({
             deployment: {
               simulateSourceId: getSimulateSourceId(),
-              backendPort: getSimulateBackendPort()
+              backendPort: getSimulateBackendPort(),
+              clientEnv: getLiquidityClientEnv()
             },
             kind: transfer.kind,
             id: transfer.id,

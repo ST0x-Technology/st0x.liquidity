@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { getWebSocketUrl, getExplorerTxUrl } from './env'
+import { getWebSocketUrl, getExplorerTxUrl, getLiquidityClientEnv } from './env'
 
 const mockEnv = { current: {} as Record<string, string | undefined> }
 const mockDev = { current: true }
@@ -176,5 +176,31 @@ describe('getExplorerTxUrl', () => {
     mockEnv.current = { PUBLIC_EXPLORER_URL: '  https://arbiscan.io  ' }
 
     expect(getExplorerTxUrl('0xabc123')).toBe('https://arbiscan.io/tx/0xabc123')
+  })
+})
+
+describe('getLiquidityClientEnv', () => {
+  const onHost = (hostname: string) =>
+    Object.defineProperty(globalThis, 'window', {
+      value: { location: { hostname } },
+      writable: true,
+      configurable: true
+    })
+
+  it('targets staging on the staging SPA host', () => {
+    onHost('liquidity-staging.t0trade.com')
+    expect(getLiquidityClientEnv()).toBe('staging')
+  })
+
+  it('targets production only on the production SPA host', () => {
+    onHost('liquidity.t0trade.com')
+    expect(getLiquidityClientEnv()).toBe('production')
+  })
+
+  it('leaves the environment unknown on any other host, such as an IAP tunnel', () => {
+    for (const hostname of ['localhost', '127.0.0.1', 'example.com']) {
+      onHost(hostname)
+      expect(getLiquidityClientEnv()).toBe(null)
+    }
   })
 })

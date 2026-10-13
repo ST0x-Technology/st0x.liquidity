@@ -14,6 +14,7 @@
   import {
     getApiBaseUrl,
     getExplorerTxUrl,
+    getLiquidityClientEnv,
     getSimulateBackendPort,
     getSimulateSourceId
   } from '$lib/env'
@@ -799,7 +800,8 @@
         {@const recoveryCommands = tradeRecoveryCommands({
           deployment: {
             simulateSourceId: getSimulateSourceId(),
-            backendPort: getSimulateBackendPort()
+            backendPort: getSimulateBackendPort(),
+            clientEnv: getLiquidityClientEnv()
           },
           symbol: trade.symbol
         })}

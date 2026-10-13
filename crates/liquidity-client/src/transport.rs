@@ -4,6 +4,7 @@
 
 use reqwest::StatusCode;
 use url::Url;
+use uuid::Uuid;
 
 use crate::auth::{AuthError, TokenSource};
 /// Failure talking to the liquidity ops API over HTTP.
@@ -103,6 +104,9 @@ pub struct Client<A> {
     base_url: Url,
     read_auth: A,
     write_auth: A,
+    /// Sent as `x-request-id`. One CLI invocation sends one request, so this
+    /// names the audit event of the write it performed.
+    pub(crate) request_id: Uuid,
 }
 
 impl<A: TokenSource + Sync> Client<A> {
@@ -123,6 +127,7 @@ impl<A: TokenSource + Sync> Client<A> {
             base_url,
             read_auth,
             write_auth,
+            request_id: Uuid::new_v4(),
         })
     }
 
@@ -202,6 +207,7 @@ impl<A: TokenSource + Sync> Client<A> {
     ) -> Result<serde_json::Value, TransportError> {
         let response = request
             .bearer_auth(token)
+            .header("x-request-id", self.request_id.to_string())
             .send()
             .await
             .map_err(|source| TransportError::Transport(target.clone(), source))?;
@@ -394,6 +400,10 @@ mod tests {
         assert_eq!(
             header(&request, "authorization"),
             Some("Bearer write-token")
+        );
+        assert_eq!(
+            header(&request, "x-request-id"),
+            Some(client.request_id.to_string().as_str())
         );
         Ok(())
     }

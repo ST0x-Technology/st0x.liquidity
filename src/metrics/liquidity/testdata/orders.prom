@@ -1,0 +1,10 @@
+# Expected exporter output for orders.json, written by
+# scripts/liq-parity/golden.py from t0.devops revision 226c029.
+liq_pending_orders_total 3.0
+liq_pending_orders{status="Submitted"} 1.0
+liq_pending_orders{status="Pending"} 2.0
+liq_raindex_orders_total 3.0
+liq_raindex_orders_unavailable{reason=""} 0.0
+liq_raindex_order_vault_balance{input="USDC",order="0x00000000",output="wtAAPL"} 12.5
+liq_raindex_order_io_ratio{input="USDC",order="0x00000000",output="wtAAPL"} 0.004
+liq_raindex_order_created_ts_seconds{input="USDC",order="0x00000000",output="wtAAPL"} 1772548200.0
