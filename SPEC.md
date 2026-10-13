@@ -7487,71 +7487,6 @@ effect rather than a generic intent:
   recover, only a missing fill to backfill. Its accounting, execution paths, and
   hedge placement rules are in the `process-tx` standing rule below.
 
-### Shared operations audit event
-
-Every request that reaches a service on a mutation-capable operator route emits
-exactly one structured audit event, including denied requests and requests
-rejected before a handler runs. Liquidity covers every matched and unknown
-`POST` under its mounted `/liquidity-write` prefix and loopback `/transfers`
-mutation namespace. A rejection performed by Cloud IAP at the load-balancer edge
-never reaches the process and is therefore outside this application audit
-contract. The liquidity and issuance bots use the same versioned event contract
-so Cloud Logging and, when OTLP telemetry is configured, VictoriaLogs queries do
-not depend on service-specific log messages:
-
-| Field          | Contract                                                                                                                                                            |
-| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `audit_schema` | Constant `st0x.operations.audit.v1`.                                                                                                                                |
-| `service`      | `issuance` or `liquidity`.                                                                                                                                          |
-| `principal`    | Verified IAP subject; `local-loopback` for the liquidity bot's in-container CLI routes; `unauthenticated` when no identity was verified.                            |
-| `role`         | The admitted operator tier (`debug`, `capital`, `breakglass`, or `write`); `local` for loopback-only routes.                                                        |
-| `route`        | Stable matched route template, including a fixed wildcard template for an unknown mutation; never the raw unmatched URI.                                            |
-| `request_id`   | Caller-supplied UUID from `x-request-id`, or a server-generated UUID returned in the same response header.                                                          |
-| `target_id`    | Colon-separated dynamic path values, then the identifiers the typed request body and query declare, each at most 256 bytes; `not_identified` when none is captured. |
-| `reason`       | The typed request body's reason, at most 1024 bytes; `not_provided` when the route takes none or the authenticated body did not parse.                              |
-| `outcome`      | `success`, `denied`, `validation_failure`, or `command_failure`.                                                                                                    |
-
-The log line's own timestamp records when the event was emitted; the event
-carries no separate `timestamp` field.
-
-Authentication and the loopback gate run before request-body capture. A request
-denied there is not parsed for untrusted identifiers or reasons and therefore
-uses `not_identified` as `target_id` and `not_provided` as `reason`. After
-authentication, dynamic path targets are percent-decoded to the same UTF-8
-values accepted by the route extractor; invalid UTF-8 is rejected without lossy
-conversion. Body and query identifiers and the reason are read from the typed
-request only after it parses, so an undeclared field, a nested value, or an
-alternate field alias is never an audit input. An authenticated request whose
-target or reason exceeds its limit is refused with `400` before the handler
-runs; values are never truncated. `principal`, `route`, `target_id`, and
-`reason` are recorded as quoted, escaped strings, so a newline in a decoded path
-segment or reason cannot start a forged record line.
-
-The tracing target is `operations_audit`, with an unconditional INFO filter
-floor even when `RUST_LOG` is stricter. Success is INFO; every other outcome is
-WARN. A `2xx` response is `success`, `401` or `403` is `denied`, request shape
-and route errors (`400`, `404`, `405`, `413`, `415`, `422`) are
-`validation_failure`, and every other response is `command_failure`. Downstream
-handling and final recording run in one task on the bot's detached-task tracker,
-so client cancellation cannot cancel the command or its audit completion, and
-the shutdown drain waits for both. A request that arrives after the drain began
-is refused with `503` and recorded as a command failure. A handler panic is
-converted inside that task to a generic `500` response and one command-failure
-audit; neither the response nor the audit fields include the panic payload. An
-outer task join failure likewise returns the same generic `500` response and
-records one command failure.
-
-Audit recording is fail-open with respect to the operator command. An immediate
-recorder refusal, such as a disabled `operations_audit` target, emits an ERROR
-on `operational_alert` with the same query dimensions and never replaces the
-mutation's response. The production recorder emits to tracing; it does not
-acknowledge per-event delivery by Cloud Logging, stdout consumers, or an OTLP
-exporter. Downstream exporter failure is telemetry-pipeline health, not an
-event-correlated recorder failure. The event is an ordinary stdout log line,
-which Docker's `gcplogs` driver forwards to Cloud Logging as message text.
-VictoriaLogs receives the same compatible event without a second schema only
-when `[telemetry]` configures the OTLP log exporter.
-
 **Standing rules:**
 
 - **All state-mutating recovery commands go through the CQRS aggregate-command
@@ -7929,6 +7864,71 @@ when `[telemetry]` configures the OTLP log exporter.
   order id as the idempotency anchor, clears the claim, settles the fill, and
   surfaces the error; the standing position check then runs anchor recovery
   under that client id. None of these cases retain a Pending intent.
+
+### Shared operations audit event
+
+Every request that reaches a service on a mutation-capable operator route emits
+exactly one structured audit event, including denied requests and requests
+rejected before a handler runs. Liquidity covers every matched and unknown
+`POST` under its mounted `/liquidity-write` prefix and loopback `/transfers`
+mutation namespace. A rejection performed by Cloud IAP at the load-balancer edge
+never reaches the process and is therefore outside this application audit
+contract. The liquidity and issuance bots use the same versioned event contract
+so Cloud Logging and, when OTLP telemetry is configured, VictoriaLogs queries do
+not depend on service-specific log messages:
+
+| Field          | Contract                                                                                                                                                            |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `audit_schema` | Constant `st0x.operations.audit.v1`.                                                                                                                                |
+| `service`      | `issuance` or `liquidity`.                                                                                                                                          |
+| `principal`    | Verified IAP subject; `local-loopback` for the liquidity bot's in-container CLI routes; `unauthenticated` when no identity was verified.                            |
+| `role`         | The admitted operator tier (`debug`, `capital`, `breakglass`, or `write`); `local` for loopback-only routes.                                                        |
+| `route`        | Stable matched route template, including a fixed wildcard template for an unknown mutation; never the raw unmatched URI.                                            |
+| `request_id`   | Caller-supplied UUID from `x-request-id`, or a server-generated UUID returned in the same response header.                                                          |
+| `target_id`    | Colon-separated dynamic path values, then the identifiers the typed request body and query declare, each at most 256 bytes; `not_identified` when none is captured. |
+| `reason`       | The typed request body's reason, at most 1024 bytes; `not_provided` when the route takes none or the authenticated body did not parse.                              |
+| `outcome`      | `success`, `denied`, `validation_failure`, or `command_failure`.                                                                                                    |
+
+The log line's own timestamp records when the event was emitted; the event
+carries no separate `timestamp` field.
+
+Authentication and the loopback gate run before request-body capture. A request
+denied there is not parsed for untrusted identifiers or reasons and therefore
+uses `not_identified` as `target_id` and `not_provided` as `reason`. After
+authentication, dynamic path targets are percent-decoded to the same UTF-8
+values accepted by the route extractor; invalid UTF-8 is rejected without lossy
+conversion. Body and query identifiers and the reason are read from the typed
+request only after it parses, so an undeclared field, a nested value, or an
+alternate field alias is never an audit input. An authenticated request whose
+target or reason exceeds its limit is refused with `400` before the handler
+runs; values are never truncated. `principal`, `route`, `target_id`, and
+`reason` are recorded as quoted, escaped strings, so a newline in a decoded path
+segment or reason cannot start a forged record line.
+
+The tracing target is `operations_audit`, with an unconditional INFO filter
+floor even when `RUST_LOG` is stricter. Success is INFO; every other outcome is
+WARN. A `2xx` response is `success`, `401` or `403` is `denied`, request shape
+and route errors (`400`, `404`, `405`, `413`, `415`, `422`) are
+`validation_failure`, and every other response is `command_failure`. Downstream
+handling and final recording run in one task on the bot's detached-task tracker,
+so client cancellation cannot cancel the command or its audit completion, and
+the shutdown drain waits for both. A request that arrives after the drain began
+is refused with `503` and recorded as a command failure. A handler panic is
+converted inside that task to a generic `500` response and one command-failure
+audit; neither the response nor the audit fields include the panic payload. An
+outer task join failure likewise returns the same generic `500` response and
+records one command failure.
+
+Audit recording is fail-open with respect to the operator command. An immediate
+recorder refusal, such as a disabled `operations_audit` target, emits an ERROR
+on `operational_alert` with the same query dimensions and never replaces the
+mutation's response. The production recorder emits to tracing; it does not
+acknowledge per-event delivery by Cloud Logging, stdout consumers, or an OTLP
+exporter. Downstream exporter failure is telemetry-pipeline health, not an
+event-correlated recorder failure. The event is an ordinary stdout log line,
+which Docker's `gcplogs` driver forwards to Cloud Logging as message text.
+VictoriaLogs receives the same compatible event without a second schema only
+when `[telemetry]` configures the OTLP log exporter.
 
 ### Event Processing Flow
 
