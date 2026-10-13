@@ -346,7 +346,7 @@ pub enum UsdcRebalanceError {
     /// deposit's refund.
     #[error("swap refund of {refunded} is not within the deposited {deposited}")]
     SwapRefundOutOfRange { refunded: U256, deposited: U256 },
-    /// The quote's refund floor does not compute: a loss bound above 10000
+    /// The first deposit's refund floor does not compute: a loss bound above 10000
     /// basis points, or an input too large to scale.
     #[error("the refund floor of {amount_in} at {max_quote_loss_bps} bps does not compute")]
     RefundFloorUndefined {
@@ -882,7 +882,7 @@ pub enum UsdcRebalanceEvent {
         filled_at: DateTime<Utc>,
     },
     /// Relay's refund of the deposit, proven on `side`. `short_of_floor` is
-    /// the quote's refund floor when the refund is below it.
+    /// the first deposit's refund floor when the refund is below it.
     SwapRefunded {
         refund_tx: TxHash,
         side: RefundSide,
@@ -1137,8 +1137,8 @@ pub struct SwapQuote {
     pub expected_out: U256,
     pub minimum_out: U256,
     pub slippage_bps: u16,
-    /// The corridor's loss bound when quoted: a refund below `amount_in`
-    /// less it is short (see [`SwapQuote::refund_floor`]).
+    /// The corridor's loss bound when quoted; the first quote's sets the
+    /// transfer's refund floor (see [`FirstDeposit::refund_floor`]).
     pub max_quote_loss_bps: u16,
     /// In the origin stable, already out of `expected_out`.
     pub relayer_fee: U256,
@@ -1159,8 +1159,26 @@ pub struct SwapQuote {
     pub origin_from_block: u64,
 }
 
-impl SwapQuote {
-    /// The least a refund of this deposit may pay before it is short:
+/// The input and loss bound of a transfer's first binding quote, kept
+/// through every re-quote: a refund on any attempt is measured against it,
+/// so losses never stack across re-quotes.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FirstDeposit {
+    pub amount_in: U256,
+    pub max_quote_loss_bps: u16,
+}
+
+impl From<&SwapQuote> for FirstDeposit {
+    fn from(quote: &SwapQuote) -> Self {
+        Self {
+            amount_in: quote.amount_in,
+            max_quote_loss_bps: quote.max_quote_loss_bps,
+        }
+    }
+}
+
+impl FirstDeposit {
+    /// The least a refund of the transfer may pay before it is short:
     /// `amount_in` less `max_quote_loss_bps`, rounded up, in the stables'
     /// 6-decimal units (both stables have 6, so they compare unit for unit).
     pub(crate) fn refund_floor(&self) -> Result<U256, UsdcRebalanceError> {
@@ -1346,6 +1364,8 @@ pub enum UsdcRebalance {
         corridor: UsdcCorridor,
         /// The swap's input, in the origin stable.
         amount: Usdc,
+        /// Every refund of the transfer is measured against it.
+        first_deposit: FirstDeposit,
         quote: Box<SwapQuote>,
         /// Every order id a deposit was ever signed for; never shrinks.
         signed_order_ids: Vec<B256>,
@@ -1361,6 +1381,7 @@ pub enum UsdcRebalance {
         direction: RebalanceDirection,
         corridor: UsdcCorridor,
         amount: Usdc,
+        first_deposit: FirstDeposit,
         quote: Box<SwapQuote>,
         signed_order_ids: Vec<B256>,
         split_approves: Vec<PreparedTransaction>,
@@ -1378,6 +1399,7 @@ pub enum UsdcRebalance {
         direction: RebalanceDirection,
         corridor: UsdcCorridor,
         amount: Usdc,
+        first_deposit: FirstDeposit,
         quote: Box<SwapQuote>,
         signed_order_ids: Vec<B256>,
         deposit_tx: TxHash,
@@ -1385,14 +1407,15 @@ pub enum UsdcRebalance {
         initiated_at: DateTime<Utc>,
         deposited_at: DateTime<Utc>,
     },
-    /// Relay proved a refund of the deposit. One below the quote's refund
-    /// floor (`short_of_floor` set to it) waits, guard held, for the operator
+    /// Relay proved a refund of the deposit. One below the first deposit's
+    /// refund floor (`short_of_floor` set to it) waits, guard held, for the operator
     /// on either side. Otherwise an origin-side refund is redeposited next; a
     /// destination-side one waits, guard held, for the operator.
     SwapRefunded {
         direction: RebalanceDirection,
         corridor: UsdcCorridor,
         amount: Usdc,
+        first_deposit: FirstDeposit,
         quote: Box<SwapQuote>,
         signed_order_ids: Vec<B256>,
         deposit_tx: TxHash,
@@ -1409,6 +1432,7 @@ pub enum UsdcRebalance {
         direction: RebalanceDirection,
         corridor: UsdcCorridor,
         amount: Usdc,
+        first_deposit: FirstDeposit,
         quote: Box<SwapQuote>,
         signed_order_ids: Vec<B256>,
         deposit_tx: TxHash,
@@ -3405,8 +3429,8 @@ impl EventSourced for UsdcRebalance {
     // every snapshot into the new shape.
     // v15: the Relay fill, refund, escrow, failure and redeposit states and
     // events, `HopEvidence::Relay`, `deposit_reverts` on the swap states,
-    // `max_quote_loss_bps` on `SwapQuote` and `short_of_floor` on
-    // `SwapRefunded`.
+    // `max_quote_loss_bps` on `SwapQuote`, `first_deposit` on the swap
+    // states and `short_of_floor` on `SwapRefunded`.
     const SCHEMA_VERSION: u64 = 15;
 
     fn originate(event: &Self::Event) -> Option<Self> {
@@ -3949,6 +3973,7 @@ impl EventSourced for UsdcRebalance {
                 direction: *direction,
                 corridor: *corridor,
                 amount: swap_input(quote)?,
+                first_deposit: FirstDeposit::from(quote.as_ref()),
                 quote: quote.clone(),
                 signed_order_ids: Vec::new(),
                 split_approves: Vec::new(),
@@ -3963,6 +3988,7 @@ impl EventSourced for UsdcRebalance {
                     direction,
                     corridor,
                     amount,
+                    first_deposit,
                     quote,
                     signed_order_ids,
                     split_approves,
@@ -3974,6 +4000,7 @@ impl EventSourced for UsdcRebalance {
                 direction: *direction,
                 corridor: *corridor,
                 amount: *amount,
+                first_deposit: *first_deposit,
                 quote: quote.clone(),
                 signed_order_ids: signed_order_ids.clone(),
                 split_approves: split_approves
@@ -3996,6 +4023,7 @@ impl EventSourced for UsdcRebalance {
                     direction,
                     corridor,
                     amount,
+                    first_deposit,
                     quote,
                     signed_order_ids,
                     split_approves,
@@ -4007,6 +4035,7 @@ impl EventSourced for UsdcRebalance {
                 direction: *direction,
                 corridor: *corridor,
                 amount: *amount,
+                first_deposit: *first_deposit,
                 quote: quote.clone(),
                 signed_order_ids: with_order_id(signed_order_ids, quote.order_id),
                 split_approves: split_approves.clone(),
@@ -4027,6 +4056,7 @@ impl EventSourced for UsdcRebalance {
                     direction,
                     corridor,
                     amount,
+                    first_deposit,
                     quote,
                     signed_order_ids,
                     initiated_at,
@@ -4036,6 +4066,7 @@ impl EventSourced for UsdcRebalance {
                 direction: *direction,
                 corridor: *corridor,
                 amount: *amount,
+                first_deposit: *first_deposit,
                 quote: quote.clone(),
                 signed_order_ids: signed_order_ids.clone(),
                 deposit_tx: *deposit_tx,
@@ -4050,6 +4081,7 @@ impl EventSourced for UsdcRebalance {
                     direction,
                     corridor,
                     amount,
+                    first_deposit,
                     signed_order_ids,
                     split_approves,
                     deposit_reverts,
@@ -4060,6 +4092,7 @@ impl EventSourced for UsdcRebalance {
                 direction: *direction,
                 corridor: *corridor,
                 amount: *amount,
+                first_deposit: *first_deposit,
                 quote: quote.clone(),
                 signed_order_ids: signed_order_ids.clone(),
                 split_approves: split_approves.clone(),
@@ -4077,6 +4110,7 @@ impl EventSourced for UsdcRebalance {
                     direction,
                     corridor,
                     amount,
+                    first_deposit,
                     quote,
                     signed_order_ids,
                     deposit_reverts,
@@ -4088,6 +4122,7 @@ impl EventSourced for UsdcRebalance {
                 direction: *direction,
                 corridor: *corridor,
                 amount: *amount,
+                first_deposit: *first_deposit,
                 quote: quote.clone(),
                 signed_order_ids: signed_order_ids.clone(),
                 split_approves: Vec::new(),
@@ -4150,6 +4185,7 @@ impl EventSourced for UsdcRebalance {
                     direction,
                     corridor,
                     amount,
+                    first_deposit,
                     quote,
                     signed_order_ids,
                     deposit_tx,
@@ -4160,6 +4196,7 @@ impl EventSourced for UsdcRebalance {
                     direction,
                     corridor,
                     amount,
+                    first_deposit,
                     quote,
                     signed_order_ids,
                     deposit_tx,
@@ -4170,6 +4207,7 @@ impl EventSourced for UsdcRebalance {
                 direction: *direction,
                 corridor: *corridor,
                 amount: *amount,
+                first_deposit: *first_deposit,
                 quote: quote.clone(),
                 signed_order_ids: signed_order_ids.clone(),
                 deposit_tx: *deposit_tx,
@@ -4187,6 +4225,7 @@ impl EventSourced for UsdcRebalance {
                     direction,
                     corridor,
                     amount,
+                    first_deposit,
                     quote,
                     signed_order_ids,
                     deposit_tx,
@@ -4197,6 +4236,7 @@ impl EventSourced for UsdcRebalance {
                 direction: *direction,
                 corridor: *corridor,
                 amount: *amount,
+                first_deposit: *first_deposit,
                 quote: quote.clone(),
                 signed_order_ids: signed_order_ids.clone(),
                 deposit_tx: *deposit_tx,
@@ -6157,14 +6197,29 @@ impl UsdcRebalance {
     }
 
     /// Records a proven refund: more than nothing, at most the input, and
-    /// short when below the quote's refund floor.
+    /// short when below the refund floor of the transfer's first deposit.
     fn transition_record_swap_refund(
         &self,
         refund_tx: TxHash,
         side: RefundSide,
         amount_refunded: U256,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
-        let quote = self.swap_deposited("RecordSwapRefund")?;
+        let (Self::SwapDeposited {
+            quote,
+            first_deposit,
+            ..
+        }
+        | Self::SwapEscrowUnresolved {
+            quote,
+            first_deposit,
+            ..
+        }) = self
+        else {
+            return Err(UsdcRebalanceError::InvalidCommand {
+                command: "RecordSwapRefund".to_string(),
+                state: self.state_name().to_string(),
+            });
+        };
 
         if amount_refunded == U256::ZERO || amount_refunded > quote.amount_in {
             return Err(UsdcRebalanceError::SwapRefundOutOfRange {
@@ -6173,7 +6228,7 @@ impl UsdcRebalance {
             });
         }
 
-        let floor = quote.refund_floor()?;
+        let floor = first_deposit.refund_floor()?;
         let short_of_floor = (amount_refunded < floor).then_some(floor);
         let amount_refunded = Float::from_fixed_decimal(amount_refunded, 6)
             .map(Usdc::new)
@@ -7817,37 +7872,84 @@ mod tests {
     /// and is refused when it does not compute.
     #[test]
     fn refund_floor_rounds_up() {
-        let quote = |amount_in: U256, max_quote_loss_bps| SwapQuote {
+        let first_deposit = |amount_in, max_quote_loss_bps| FirstDeposit {
+            amount_in,
             max_quote_loss_bps,
-            ..swap_quote_for_test(amount_in, B256::repeat_byte(0x0a))
         };
 
         assert_eq!(
-            quote(U256::from(100_000_000u64), 50).refund_floor(),
+            first_deposit(U256::from(100_000_000u64), 50).refund_floor(),
             Ok(U256::from(99_500_000u64))
         );
         // 1_000_001 * 9_950 / 10_000 = 995_000.995
         assert_eq!(
-            quote(U256::from(1_000_001u64), 50).refund_floor(),
+            first_deposit(U256::from(1_000_001u64), 50).refund_floor(),
             Ok(U256::from(995_001u64))
         );
         assert_eq!(
-            quote(U256::from(100_000_000u64), 0).refund_floor(),
+            first_deposit(U256::from(100_000_000u64), 0).refund_floor(),
             Ok(U256::from(100_000_000u64))
         );
         assert_eq!(
-            quote(U256::from(100_000_000u64), 10_000).refund_floor(),
+            first_deposit(U256::from(100_000_000u64), 10_000).refund_floor(),
             Ok(U256::ZERO)
         );
         for (amount_in, max_quote_loss_bps) in [(U256::from(1u64), 10_001), (U256::MAX, 50)] {
             assert_eq!(
-                quote(amount_in, max_quote_loss_bps).refund_floor(),
+                first_deposit(amount_in, max_quote_loss_bps).refund_floor(),
                 Err(UsdcRebalanceError::RefundFloorUndefined {
                     amount_in,
                     max_quote_loss_bps,
                 })
             );
         }
+    }
+
+    /// A re-quote keeps the first quote's loss bound: a 99.4 refund clears a
+    /// 100 bps re-quote's floor of 99 but not the first quote's 99.5.
+    #[tokio::test]
+    async fn refund_after_a_requote_is_measured_against_the_first_quote() {
+        let deposited_after_requote = [
+            quoted(RebalanceDirection::BaseToAlpaca),
+            vec![
+                UsdcRebalanceEvent::SwapRequoted {
+                    quote: Box::new(SwapQuote {
+                        max_quote_loss_bps: 100,
+                        ..hundred_usdc_quote(0x0b)
+                    }),
+                    quoted_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::SwapDepositPrepared {
+                    approve: None,
+                    deposit: PreparedTransaction::for_test(TxHash::repeat_byte(0xa3), 7),
+                    prepared_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::SwapDeposited {
+                    deposit_tx: TxHash::repeat_byte(0xa3),
+                    deposit_block: 10,
+                    deposited_at: Utc::now(),
+                },
+            ],
+        ]
+        .concat();
+
+        let refunded = TestHarness::<UsdcRebalance>::with(())
+            .given(deposited_after_requote.clone())
+            .when(UsdcRebalanceCommand::RecordSwapRefund {
+                refund_tx: TxHash::repeat_byte(0xe1),
+                side: RefundSide::Origin,
+                amount_refunded: U256::from(99_400_000u64),
+            })
+            .await
+            .events();
+        let state = replay::<UsdcRebalance>([deposited_after_requote, refunded].concat())
+            .unwrap()
+            .unwrap();
+
+        let UsdcRebalance::SwapRefunded { short_of_floor, .. } = &state else {
+            panic!("expected SwapRefunded, got {state:?}");
+        };
+        assert_eq!(*short_of_floor, Some(U256::from(99_500_000u64)));
     }
 
     /// A refund one unit below the floor is recorded short, on either side,

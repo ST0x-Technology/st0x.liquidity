@@ -4766,7 +4766,8 @@ struct SwapQuote {
     expected_out: U256,
     minimum_out: U256,
     slippage_bps: u16,
-    // The corridor's loss bound when quoted; it sets the refund floor.
+    // The corridor's loss bound when quoted; the first quote's sets the
+    // transfer's refund floor (see `FirstDeposit`).
     max_quote_loss_bps: u16,
     relayer_fee: U256,
     gas_fee: U256,
@@ -4782,6 +4783,15 @@ struct SwapQuote {
     // Origin chain head read before the quote: no deposit for this order can
     // sit below it.
     origin_from_block: u64,
+}
+
+// The `amount_in` and `max_quote_loss_bps` of the transfer's first binding
+// quote, kept through every re-quote: each refund, on any attempt, is
+// measured against its floor.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+struct FirstDeposit {
+    amount_in: U256,
+    max_quote_loss_bps: u16,
 }
 
 // One transaction a quote asks the origin wallet to send.
@@ -4915,6 +4925,7 @@ enum UsdcRebalance {
         direction: RebalanceDirection,
         corridor: UsdcCorridor,
         amount: Usdc,
+        first_deposit: FirstDeposit,
         quote: SwapQuote,
         signed_order_ids: Vec<B256>,
         // Approves signed alone when another send split a pair; each is
@@ -4930,6 +4941,7 @@ enum UsdcRebalance {
         direction: RebalanceDirection,
         corridor: UsdcCorridor,
         amount: Usdc,
+        first_deposit: FirstDeposit,
         quote: SwapQuote,
         signed_order_ids: Vec<B256>,
         split_approves: Vec<PreparedTransaction>,
@@ -4946,6 +4958,7 @@ enum UsdcRebalance {
         direction: RebalanceDirection,
         corridor: UsdcCorridor,
         amount: Usdc,
+        first_deposit: FirstDeposit,
         quote: SwapQuote,
         signed_order_ids: Vec<B256>,
         deposit_tx: TxHash,
@@ -4961,13 +4974,14 @@ enum UsdcRebalance {
         direction: RebalanceDirection,
         corridor: UsdcCorridor,
         amount: Usdc,
+        first_deposit: FirstDeposit,
         quote: SwapQuote,
         signed_order_ids: Vec<B256>,
         deposit_tx: TxHash,
         refund_tx: TxHash,
         side: RefundSide,
         amount_refunded: Usdc,
-        // The refund floor, when the refund is below it.
+        // The first deposit's refund floor, when the refund is below it.
         short_of_floor: Option<U256>,
         initiated_at: DateTime<Utc>,
         refunded_at: DateTime<Utc>,
@@ -4978,6 +4992,7 @@ enum UsdcRebalance {
         direction: RebalanceDirection,
         corridor: UsdcCorridor,
         amount: Usdc,
+        first_deposit: FirstDeposit,
         quote: SwapQuote,
         signed_order_ids: Vec<B256>,
         deposit_tx: TxHash,
@@ -5169,17 +5184,18 @@ proven fill or the stable back in the vault, never in a guard-freeing failure:
    holds the guard, pages, and is read again every 30 minutes.
 8. A `refund` is adopted only once `verify_refund` proves it, on either chain,
    at most the deposited amount: `RecordSwapRefund` -> `SwapRefunded`. A refund
-   below the refund floor, the quote's `amount_in` less its `max_quote_loss_bps`
-   (recorded with the quote) rounded up, is short (both stables have 6 decimals
-   and compare unit for unit), and `SwapRefunded` records the floor in
-   `short_of_floor`: on either side it pages with the deposit, the refund, the
-   floor and the shortfall, and holds at `SwapRefunded`, guard kept, on adoption
-   and on every resume, never redeposited, quoted again or released, until the
-   operator settles it with `transfer reconcile`. A short refund so costs at
-   most one deposit, capped by `max_transfer`, and stops the corridor. Otherwise
-   an origin-side refund redeposits (step 9). A destination-side refund leaves
-   the other stable at the other end: the transfer holds its guard at
-   `SwapRefunded`, pages, and is accepted by `transfer reconcile` once the
+   below the refund floor, measured against the transfer's first deposit (the
+   first binding quote's `amount_in` less its `max_quote_loss_bps`, rounded up,
+   kept as `first_deposit` through every re-quote), is short (both stables have
+   6 decimals and compare unit for unit), and `SwapRefunded` records the floor
+   in `short_of_floor`: on either side it pages with the deposit, the refund,
+   the floor and the shortfall, and holds at `SwapRefunded`, guard kept, on
+   adoption and on every resume, never redeposited, quoted again or released,
+   until the operator settles it with `transfer reconcile`. A short refund so
+   costs at most one deposit, capped by `max_transfer`, and stops the corridor.
+   Otherwise an origin-side refund redeposits (step 9). A destination-side
+   refund leaves the other stable at the other end: the transfer holds its guard
+   at `SwapRefunded`, pages, and is accepted by `transfer reconcile` once the
    operator has moved it. A `failure`, or a `refund` with a refund fail reason,
    is terminal at Relay with nothing paid back: `FailSwap` -> `SwapFailed`,
    guard held, paged, accepted by `transfer reconcile`. When `fill_timeout_secs`
@@ -5398,7 +5414,7 @@ enum UsdcRebalanceCommand {
     // from `SwapDeposited` and `SwapEscrowUnresolved`, as are the next two.
     ConfirmSwapFill { fill_tx: TxHash, amount_received: U256 },
     // A refund `verify_refund` proved, more than zero and at most the input;
-    // recorded short of the quote's refund floor when below it.
+    // recorded short of the first deposit's refund floor when below it.
     RecordSwapRefund { refund_tx: TxHash, side: RefundSide, amount_refunded: U256 },
     // Relay reported a terminal failure with nothing paid back.
     FailSwap { reason: String },
