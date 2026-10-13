@@ -1157,8 +1157,9 @@ pub struct SwapQuote {
 }
 
 /// The input and loss bound of a transfer's first binding quote, kept
-/// through every re-quote: a refund on any attempt is measured against it,
-/// so refund losses never stack across re-quotes.
+/// through every re-quote: it bounds the whole transfer's loss, refunds and
+/// fills. A refund on any attempt is measured against its floor, and every
+/// later quote must guarantee at least that floor.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FirstDeposit {
     pub amount_in: U256,

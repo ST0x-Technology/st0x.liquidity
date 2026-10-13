@@ -61,7 +61,8 @@ use crate::bot_gas::redrive::BotGasFailureClassifier;
 use crate::inventory::InventoryViewError;
 use crate::native_gas::GasReadinessFailure;
 use crate::usdc_rebalance::{
-    BurnTxOwnershipLookupError, RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceId,
+    BurnTxOwnershipLookupError, RebalanceDirection, TransferRef, UsdcRebalance,
+    UsdcRebalanceError, UsdcRebalanceId,
 };
 
 #[derive(Debug, Error)]
@@ -330,6 +331,14 @@ pub enum UsdcTransferError {
         id: UsdcRebalanceId,
         #[source]
         source: QuoteAcceptanceError,
+    },
+    /// The first deposit's refund floor, which a re-quote must reach, does
+    /// not compute; the quote is refused.
+    #[error("USDC rebalance {id}: the first deposit's refund floor does not compute: {source}")]
+    RefundFloorUndefined {
+        id: UsdcRebalanceId,
+        #[source]
+        source: Box<UsdcRebalanceError>,
     },
     /// Another send took a nonce between the swap's approve and deposit: the
     /// approve went out alone and the next attempt signs the deposit again.
@@ -853,6 +862,7 @@ impl UsdcTransferError {
             | Self::RelayApi(_)
             | Self::RelayBridge(_)
             | Self::SwapQuoteOutOfBounds { .. }
+            | Self::RefundFloorUndefined { .. }
             | Self::SwapPairSplit { .. }
             | Self::SwapPrepareTaskPanicked { .. }
             | Self::SwapPrepareTimedOut { .. }
@@ -935,6 +945,7 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::RelayApi(_)
             | Self::RelayBridge(_)
             | Self::SwapQuoteOutOfBounds { .. }
+            | Self::RefundFloorUndefined { .. }
             | Self::SwapPairSplit { .. }
             | Self::SwapPrepareTaskPanicked { .. }
             | Self::SwapPrepareTimedOut { .. }

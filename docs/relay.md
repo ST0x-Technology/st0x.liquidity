@@ -198,7 +198,10 @@ so the bridge checks them again before signing it.
 - `minimum_out >= expected_out * (10000 - slippage) / 10000`, else
   `QuoteFloorBelowBound`: Relay's floor is not looser than the slippage we sent,
   which `QuoteAmounts` carries from the request;
-- `minimum_out >= downstream_minimum`, else `QuoteBelowDownstreamMinimum`;
+- `minimum_out >= downstream_minimum`, else `QuoteBelowDownstreamMinimum`; the
+  hedge sets it to zero on a transfer's first quote and to the first deposit's
+  refund floor on every quote after it, so a re-quote's fill never loses past
+  the first deposit's bound;
 - `minimum_out <= expected_out`, else `MinimumAboveExpected`.
 
 ## On chain
@@ -339,4 +342,9 @@ below is the hedge's job. A refund under the refund floor, measured against the
 transfer's first deposit (the first binding quote's `amount_in` less its
 `max_quote_loss_bps`, rounded up, whatever attempt the refund pays), is recorded
 at `SwapRefunded` and held there, paged, guard kept, instead of being
-redeposited or quoted again (SPEC.md, Relay hop step 8).
+redeposited or quoted again (SPEC.md, Relay hop step 8). A refund at or above
+the floor is quoted again only for a `minimum_out` at or above the same floor:
+the first deposit bounds the whole transfer's loss, refunds and fills, so a
+refund and a re-quoted fill never lose more than one `max_quote_loss_bps`
+between them. A re-quote below the floor is refused and the transfer holds,
+paged, guard kept.

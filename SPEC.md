@@ -4787,7 +4787,7 @@ struct SwapQuote {
 
 // The `amount_in` and `max_quote_loss_bps` of the transfer's first binding
 // quote, kept through every re-quote: each refund, on any attempt, is
-// measured against its floor.
+// measured against its floor, and every later quote's minimum must reach it.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 struct FirstDeposit {
     amount_in: U256,
@@ -5289,12 +5289,19 @@ left a vault:
    a refund (`refund_requotes`), the refunded amount is at least `min_transfer`
    and the refund is not short of its refund floor (step 8 above; `RequoteSwap`
    refuses a short one); each such re-quote starts a fresh revert budget but
-   keeps `first_deposit`, so the refund of every attempt is measured against the
-   transfer's first deposit and refund losses never stack across re-quotes.
-   Otherwise the transfer holds at `SwapRefunded`, guard held, paged, for
-   `transfer reconcile`. A refund paid in the chain's stable (destination side)
-   holds the same way: the stable is in the chain wallet, not the vault. A
-   failure and an unresolved escrow follow step 8 above.
+   keeps `first_deposit`. The first deposit bounds the whole transfer's loss,
+   refunds and fills: the refund of every attempt is measured against its refund
+   floor, and every quote after the first one (a refund's re-quote, and any
+   re-quote of it once expired or signed) is accepted only if its `minimum_out`
+   is at least that floor, besides the corridor's bounds on its own input. A
+   re-quote guaranteeing less is refused like any refused quote: the transfer
+   holds, guard held, paged, at `SwapRefunded` (or at `SwapQuoted` when an
+   expired re-quote would be replaced), never deposited, redeposited or quoted
+   again until the operator resumes or reconciles it. Otherwise the transfer
+   holds at `SwapRefunded`, guard held, paged, for `transfer reconcile`. A
+   refund paid in the chain's stable (destination side) holds the same way: the
+   stable is in the chain wallet, not the vault. A failure and an unresolved
+   escrow follow step 8 above.
 
 At startup the persisted pairs are restored before any other send from their
 wallet: pairs signed on the Ethereum wallet once, by the hub service, together

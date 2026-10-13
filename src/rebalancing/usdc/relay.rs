@@ -14,7 +14,8 @@
 //! withdrawal to the hub, then the same swap states with the pair signed on
 //! the shared Ethereum wallet under its deposit-send lock, and a proven fill
 //! deposited into the chain's vault. A refund at the hub is quoted again
-//! within the corridor's bounds; everything else that cannot go on holds the
+//! within the corridor's bounds and the first deposit's refund floor;
+//! everything else that cannot go on holds the
 //! USDC at the hub, guard held, for `transfer reconcile`.
 //!
 //! In either direction a refund below its refund floor holds at
@@ -60,8 +61,8 @@ use crate::bot_gas::BotGasOperationCategory;
 use crate::native_gas::TransferGasRoute;
 use crate::rebalancing::equity::RecheckOutcome;
 use crate::usdc_rebalance::{
-    RebalanceDirection, RedepositReason, RefundSide, SwapQuote, SwapStep, TransferRef,
-    UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId, prepared_swap_ids,
+    FirstDeposit, RebalanceDirection, RedepositReason, RefundSide, SwapQuote, SwapStep,
+    TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId, prepared_swap_ids,
 };
 
 /// One Relay corridor's hop: the bridge that signs the deposit and proves
@@ -802,7 +803,7 @@ where
             .await?;
 
         let preflight = self
-            .accepted_quote(id, usdc_to_u256(amount)?, HopDirection::FromHub)
+            .accepted_quote(id, usdc_to_u256(amount)?, HopDirection::FromHub, None)
             .await?;
         info!(target: "rebalance", %id, %amount, request_id = %preflight.request_id(), "Relay pre-flight quote from the hub accepted");
 
@@ -832,7 +833,7 @@ where
             .await?;
 
         let quote = match self
-            .binding_quote(id, credited, HopDirection::FromHub)
+            .binding_quote(id, credited, HopDirection::FromHub, None)
             .await
         {
             Ok(quote) => quote,
@@ -870,7 +871,7 @@ where
             .await?;
 
         let amount_u256 = usdc_to_u256(amount)?;
-        let preflight = self.accepted_quote(id, amount_u256, TO_HUB).await?;
+        let preflight = self.accepted_quote(id, amount_u256, TO_HUB, None).await?;
         info!(target: "rebalance", %id, %amount, request_id = %preflight.request_id(), "Relay pre-flight quote accepted");
 
         self.withdraw_from_vault(id, amount, amount_u256).await?;
@@ -886,7 +887,10 @@ where
         id: &UsdcRebalanceId,
         amount: Usdc,
     ) -> Result<(), UsdcTransferError> {
-        let quote = match self.binding_quote(id, usdc_to_u256(amount)?, TO_HUB).await {
+        let quote = match self
+            .binding_quote(id, usdc_to_u256(amount)?, TO_HUB, None)
+            .await
+        {
             Ok(quote) => quote,
             Err(error) if quote_refused(&error) => {
                 warn!(target: "rebalance", %id, %error, "Binding Relay quote refused after the vault withdrawal; returning the stable to the vault");
@@ -917,6 +921,7 @@ where
         id: &UsdcRebalanceId,
         amount_in: U256,
         direction: HopDirection,
+        first_deposit: Option<&FirstDeposit>,
     ) -> Result<SwapQuote, UsdcTransferError> {
         let origin_from_block = self
             .hop
@@ -924,7 +929,9 @@ where
             .origin_block(direction)
             .await
             .map_err(Box::new)?;
-        let quote = self.accepted_quote(id, amount_in, direction).await?;
+        let quote = self
+            .accepted_quote(id, amount_in, direction, first_deposit)
+            .await?;
 
         Ok(swap_quote(&quote, &self.hop.bounds, origin_from_block))
     }
@@ -937,6 +944,7 @@ where
     async fn requote_or_redeposit(&self, id: &UsdcRebalanceId) -> Result<bool, UsdcTransferError> {
         let Some(UsdcRebalance::SwapQuoted {
             direction,
+            first_deposit,
             quote,
             quoted_at,
             signed_order_ids,
@@ -977,7 +985,12 @@ where
 
         info!(target: "rebalance", %id, signed, expired, order_id = %quote.order_id, "Re-quoting the Relay swap before signing");
         match self
-            .binding_quote(id, quote.amount_in, hop_direction(direction))
+            .binding_quote(
+                id,
+                quote.amount_in,
+                hop_direction(direction),
+                Some(&first_deposit),
+            )
             .await
         {
             Ok(requoted) => {
@@ -1018,13 +1031,15 @@ where
     }
 
     /// A quote for `amount_in` of the origin stable on the `direction` side,
-    /// accepted only within the corridor's bounds. The depositor takes any
-    /// refund, on either chain.
+    /// accepted only within the corridor's bounds and, once the transfer has
+    /// a `first_deposit`, at or above its refund floor. The depositor takes
+    /// any refund, on either chain.
     async fn accepted_quote(
         &self,
         id: &UsdcRebalanceId,
         amount_in: U256,
         direction: HopDirection,
+        first_deposit: Option<&FirstDeposit>,
     ) -> Result<AcceptedRelayQuote, UsdcTransferError> {
         let RelayHopCtx {
             slippage_bps,
@@ -1059,7 +1074,9 @@ where
         };
         let quote = self.hop.client.quote(&request).await.map_err(Box::new)?;
 
-        accept_quote(id, &self.hop.bounds, |bounds| quote.accept(bounds))
+        accept_quote(id, &self.hop.bounds, first_deposit, |bounds| {
+            quote.accept(bounds)
+        })
     }
 
     /// Signs and persists the pair, or picks up the one already persisted,
@@ -1437,7 +1454,8 @@ where
     /// the hub, then signs and sends the new deposit: while fewer than
     /// `max_refund_retries` re-quotes followed a refund and the refund is at
     /// least `min_transfer` and not below its refund floor. Otherwise, or
-    /// when Relay refuses the quote, the transfer holds at `SwapRefunded`,
+    /// when Relay refuses the quote or quotes a minimum below the first
+    /// deposit's refund floor, the transfer holds at `SwapRefunded`,
     /// paged, for `transfer reconcile`; a transient failure is left for the
     /// retry.
     async fn requote_refund_toward_chain(
@@ -1447,6 +1465,7 @@ where
         let Some(UsdcRebalance::SwapRefunded {
             direction: RebalanceDirection::AlpacaToBase,
             side: RefundSide::Origin,
+            first_deposit,
             amount_refunded,
             refund_requotes,
             ..
@@ -1471,7 +1490,12 @@ where
         }
 
         let quote = match self
-            .binding_quote(id, usdc_to_u256(amount_refunded)?, HopDirection::FromHub)
+            .binding_quote(
+                id,
+                usdc_to_u256(amount_refunded)?,
+                HopDirection::FromHub,
+                Some(&first_deposit),
+            )
             .await
         {
             Ok(quote) => quote,
@@ -1928,17 +1952,32 @@ fn quote_expired(
         || stale_at.is_none_or(|stale_at| now >= stale_at)
 }
 
-/// Accepts a quote within the corridor's bounds. The leg after the hop, the
-/// Alpaca deposit or the vault deposit, sets no minimum; the trigger's
-/// `min_transfer` sizes against it.
+/// The least output the leg after the hop, the Alpaca deposit or the vault
+/// deposit, takes: none, the trigger's `min_transfer` sizes against it.
+const NEXT_LEG_MINIMUM: U256 = U256::ZERO;
+
+/// Accepts a quote within the corridor's bounds. Once the transfer has a
+/// `first_deposit`, the quote's minimum must also reach that deposit's refund
+/// floor: a re-quote after a refund is bound to the first deposit's loss, not
+/// to a loss on the refunded amount on top of it.
 fn accept_quote(
     id: &UsdcRebalanceId,
     ctx: &RelayHopCtx,
+    first_deposit: Option<&FirstDeposit>,
     accept: impl FnOnce(&QuoteBounds) -> Result<AcceptedRelayQuote, QuoteAcceptanceError>,
 ) -> Result<AcceptedRelayQuote, UsdcTransferError> {
+    let transfer_floor = match first_deposit {
+        Some(first_deposit) => first_deposit.refund_floor().map_err(|source| {
+            UsdcTransferError::RefundFloorUndefined {
+                id: id.clone(),
+                source: Box::new(source),
+            }
+        })?,
+        None => NEXT_LEG_MINIMUM,
+    };
     let bounds = QuoteBounds {
         max_loss: basis_points(ctx.max_quote_loss_bps)?,
-        downstream_minimum: U256::ZERO,
+        downstream_minimum: NEXT_LEG_MINIMUM.max(transfer_floor),
     };
 
     accept(&bounds).map_err(|source| UsdcTransferError::SwapQuoteOutOfBounds {
@@ -2031,7 +2070,7 @@ fn relay_quote(
         deposit: step_transaction(&quote.deposit),
     };
 
-    accept_quote(id, ctx, |bounds| recorded.accept(bounds))
+    accept_quote(id, ctx, None, |bounds| recorded.accept(bounds))
 }
 
 /// Whether Relay definitively refused a quote: a non-transient error code, a
@@ -2040,7 +2079,8 @@ fn relay_quote(
 /// retry, so the stable stays out of the vault for it.
 fn quote_refused(error: &UsdcTransferError) -> bool {
     match error {
-        UsdcTransferError::SwapQuoteOutOfBounds { .. } => true,
+        UsdcTransferError::SwapQuoteOutOfBounds { .. }
+        | UsdcTransferError::RefundFloorUndefined { .. } => true,
         UsdcTransferError::RelayApi(relay) => match relay.as_ref() {
             RelayError::QuoteRefused { code } => !code.is_transient(),
             RelayError::QuoteMismatch(_) => true,
@@ -6674,6 +6714,34 @@ mod tests {
         assert!(state.is_reconcilable_failure());
     }
 
+    /// Relay quotes the 99.5 refunded at the hub to `wallet` at 99.3
+    /// expected, 99.1 guaranteed: within the corridor's 50 bps of 99.5, below
+    /// the 99.5 floor of the 100 first deposited.
+    fn mock_quote_below_the_first_deposits_floor(
+        relay_api: &MockServer,
+        wallet: Address,
+    ) -> httpmock::Mock<'_> {
+        let request = QuoteRequest {
+            origin: Chain::Ethereum,
+            destination: Chain::Robinhood,
+            amount: U256::from(99_500_000_u64),
+            user: wallet,
+            recipient: wallet,
+            refund_to: wallet,
+            slippage: BasisPoints::new(relay_bounds().slippage_bps).unwrap(),
+            ttl: relay_bounds().fill_timeout,
+        };
+
+        relay_api.mock(|when, then| {
+            when.method(POST).path("/quote/v2");
+            then.status(200).json_body(quote_body_for_test(
+                &request,
+                U256::from(99_300_000_u64),
+                U256::from(99_100_000_u64),
+            ));
+        })
+    }
+
     /// A refund at the hub that clears the first deposit's floor is quoted
     /// again only for a fill that clears it too: 99.5 refunded of 100 at
     /// 50 bps, a re-quote guaranteeing 99.1 is within its own loss bound but
@@ -6686,26 +6754,9 @@ mod tests {
         let key = B256::from_slice(&anvil.keys()[0].to_bytes());
         let wallet = anvil_wallet(anvil.endpoint_url(), &key);
         let refunded = U256::from(99_500_000_u64);
-        let request = QuoteRequest {
-            origin: Chain::Ethereum,
-            destination: Chain::Robinhood,
-            amount: refunded,
-            user: wallet.address(),
-            recipient: wallet.address(),
-            refund_to: wallet.address(),
-            slippage: BasisPoints::new(relay_bounds().slippage_bps).unwrap(),
-            ttl: relay_bounds().fill_timeout,
-        };
         let server = MockServer::start();
         let relay_api = MockServer::start();
-        let quote = relay_api.mock(|when, then| {
-            when.method(POST).path("/quote/v2");
-            then.status(200).json_body(quote_body_for_test(
-                &request,
-                U256::from(99_300_000_u64),
-                U256::from(99_100_000_u64),
-            ));
-        });
+        let quote = mock_quote_below_the_first_deposits_floor(&relay_api, wallet.address());
         let store = Arc::new(test_store(setup_test_db().await, ()));
         let contracts = RelayEndContracts {
             stable: Address::repeat_byte(0x51),
@@ -6754,6 +6805,83 @@ mod tests {
         assert!(logs_contain(
             "Relay refused the quote for a refund at the hub"
         ));
+    }
+
+    /// An expired re-quote of a refund is quoted again within the first
+    /// deposit's floor too: one guaranteeing 99.1 of the 99.5 refunded is
+    /// refused and the transfer holds at `SwapQuoted`, guard held.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn expired_refund_requote_below_the_first_deposits_floor_holds_at_the_hub() {
+        let anvil = spawn_anvil(Anvil::new());
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let quote = mock_quote_below_the_first_deposits_floor(&relay_api, wallet.address());
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let contracts = RelayEndContracts {
+            stable: Address::repeat_byte(0x51),
+            depository: Address::repeat_byte(0x52),
+        };
+        let transfer = relay_transfer_with_bounds(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet,
+            contracts,
+            store.clone(),
+            RelayHopCtx {
+                min_transfer: Usdc::new(float!(10)),
+                ..relay_bounds()
+            },
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited_toward_chain(&store, &id, TOWARD_CHAIN_ORDER_ID).await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::RecordSwapRefund {
+                    refund_tx: TxHash::repeat_byte(0xe1),
+                    side: RefundSide::Origin,
+                    amount_refunded: U256::from(99_500_000_u64),
+                },
+            )
+            .await
+            .unwrap();
+        let mut expired = crate::usdc_rebalance::swap_quote_for_test(
+            U256::from(99_500_000_u64),
+            B256::repeat_byte(0x1e),
+        );
+        expired.deadline = Utc::now() - chrono::Duration::minutes(1);
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::RequoteSwap {
+                    quote: Box::new(expired),
+                },
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends")
+        .unwrap();
+
+        assert!(quote.calls() > 0, "the expired quote is quoted again");
+        let state = store.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::SwapQuoted { quote: kept, .. } = &state else {
+            panic!("expected SwapQuoted, got {state:?}");
+        };
+        assert_eq!(kept.order_id, B256::repeat_byte(0x1e));
+        assert!(state.holds_rebalance_guard());
+        assert!(state.is_reconcilable_failure());
+        assert!(logs_contain("Relay refused the re-quote from the hub"));
     }
 
     /// A refund Relay pays in USDG to the chain wallet, proven on the chain,
