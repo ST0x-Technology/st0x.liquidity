@@ -1240,14 +1240,16 @@ mod tests {
     use st0x_raindex::{Raindex as _, RaindexContracts, RaindexService, RaindexVaultId};
 
     use super::*;
-    use crate::bot_gas::BotGasReceiptCostEnqueuer;
+    use crate::bot_gas::{
+        BotGasReceiptCostEnqueuer, RecordBotGasReceiptCostJobQueue, pending_bot_gas_jobs,
+    };
     use crate::conductor::job::find_backpressure;
     use crate::rebalancing::usdc::{MarketMakingUsdcEndpoints, UsdcSettlementParams};
     use crate::telemetry::TelemetrySender;
     use crate::telemetry::broker::InstrumentedAlpacaBroker;
     use crate::test_utils::{
         AnvilRaindexChain, TestAnvilInstance, anvil_wallet, relay_test_client, setup_test_db,
-        spawn_anvil,
+        setup_test_pools, spawn_anvil,
     };
     use crate::usdc_rebalance::TransferRef;
 
@@ -1343,33 +1345,56 @@ mod tests {
         store: Arc<Store<UsdcRebalance>>,
         bounds: RelayHopCtx,
     ) -> CrossVenueCashTransfer<TestWallet, RelayHop<TestWallet>> {
-        relay_transfer_on_raindex(
+        relay_transfer_with(
             server,
             relay_api,
             ethereum_wallet,
             chain_wallet,
             contracts,
             store,
-            bounds,
-            RaindexContracts {
-                inventory: Address::repeat_byte(0x0b),
-                orderbook: Address::repeat_byte(0x0b),
+            RelayTestSetup {
+                bounds,
+                ..RelayTestSetup::default()
             },
         )
         .await
     }
 
-    /// As [`relay_transfer_with_bounds`], with its vault on `raindex`.
-    async fn relay_transfer_on_raindex(
+    /// What a test sets on its Relay service besides its wallets and ends.
+    struct RelayTestSetup {
+        bounds: RelayHopCtx,
+        /// Where the service's vault lives.
+        raindex: RaindexContracts,
+        bot_gas: BotGasReceiptCostEnqueuer,
+    }
+
+    impl Default for RelayTestSetup {
+        fn default() -> Self {
+            Self {
+                bounds: relay_bounds(),
+                raindex: RaindexContracts {
+                    inventory: Address::repeat_byte(0x0b),
+                    orderbook: Address::repeat_byte(0x0b),
+                },
+                bot_gas: BotGasReceiptCostEnqueuer::Disabled,
+            }
+        }
+    }
+
+    async fn relay_transfer_with(
         server: &MockServer,
         relay_api: &MockServer,
         ethereum_wallet: TestWallet,
         chain_wallet: TestWallet,
         contracts: RelayEndContracts,
         store: Arc<Store<UsdcRebalance>>,
-        bounds: RelayHopCtx,
-        raindex: RaindexContracts,
+        setup: RelayTestSetup,
     ) -> CrossVenueCashTransfer<TestWallet, RelayHop<TestWallet>> {
+        let RelayTestSetup {
+            bounds,
+            raindex,
+            bot_gas,
+        } = setup;
         let hub_wallet = ethereum_wallet.address();
         let bridge = RelayBridge::try_from_ctx(RelayCtx {
             chain: Chain::Robinhood,
@@ -1408,7 +1433,7 @@ mod tests {
                 token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
                 message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
             },
-            BotGasReceiptCostEnqueuer::Disabled,
+            bot_gas,
         )
     }
 
@@ -1591,7 +1616,7 @@ mod tests {
             }));
         });
         let store = Arc::new(test_store(setup_test_db().await, ()));
-        let transfer = relay_transfer_on_raindex(
+        let transfer = relay_transfer_with(
             &server,
             &relay_api,
             chain.bot_wallet.clone(),
@@ -1601,8 +1626,10 @@ mod tests {
                 depository: Address::repeat_byte(0x52),
             },
             store.clone(),
-            relay_bounds(),
-            raindex_contracts,
+            RelayTestSetup {
+                raindex: raindex_contracts,
+                ..RelayTestSetup::default()
+            },
         )
         .await;
         let withdraw = || async {
@@ -2105,6 +2132,101 @@ mod tests {
                 "both envelopes must be persisted before {tx} is broadcast"
             );
         }
+    }
+
+    /// A Relay service on `wallet`'s chain whose bot-gas jobs land in the
+    /// returned pool.
+    async fn relay_transfer_recording_gas(
+        server: &MockServer,
+        relay_api: &MockServer,
+        wallet: TestWallet,
+        chain_wallet: TestWallet,
+        contracts: RelayEndContracts,
+        store: Arc<Store<UsdcRebalance>>,
+    ) -> (
+        CrossVenueCashTransfer<TestWallet, RelayHop<TestWallet>>,
+        apalis_sqlite::SqlitePool,
+    ) {
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let transfer = relay_transfer_with(
+            server,
+            relay_api,
+            wallet,
+            chain_wallet,
+            contracts,
+            store,
+            RelayTestSetup {
+                bot_gas: BotGasReceiptCostEnqueuer::Enabled(RecordBotGasReceiptCostJobQueue::new(
+                    &apalis_pool,
+                )),
+                ..RelayTestSetup::default()
+            },
+        )
+        .await;
+
+        (transfer, apalis_pool)
+    }
+
+    /// Each queued bot-gas job as its chain, tx and category.
+    async fn queued_gas_costs(
+        apalis_pool: &apalis_sqlite::SqlitePool,
+    ) -> Vec<(Chain, TxHash, String)> {
+        pending_bot_gas_jobs(apalis_pool)
+            .await
+            .into_iter()
+            .map(|job| (job.chain, job.tx_hash, job.category.to_string()))
+            .collect()
+    }
+
+    /// The confirmed pair's approve and deposit were signed and paid by the
+    /// bot on the chain, so each has its gas cost queued.
+    #[tokio::test]
+    async fn confirmed_relay_pair_queues_the_gas_of_its_approve_and_deposit() {
+        let anvil = spawn_anvil(Anvil::new());
+        let (wallet, contracts) = funded_relay_end(&anvil).await;
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let witness = Arc::new(BroadcastWitness::new(
+            wallet.clone(),
+            store.clone(),
+            id.clone(),
+        ));
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let (transfer, apalis_pool) = relay_transfer_recording_gas(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            witness.clone(),
+            contracts,
+            store.clone(),
+        )
+        .await;
+        record_quoted(
+            &store,
+            &id,
+            exact_quote(&wallet, contracts, B256::repeat_byte(0x0d)).await,
+        )
+        .await;
+
+        transfer
+            .resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
+            .await
+            .unwrap();
+
+        let [approve, deposit] = witness.broadcasts()[..] else {
+            panic!(
+                "expected the approve, then the deposit: {:?}",
+                witness.broadcasts()
+            );
+        };
+        assert_eq!(
+            queued_gas_costs(&apalis_pool).await,
+            vec![
+                (Chain::Robinhood, approve, "relay_approve".to_string()),
+                (Chain::Robinhood, deposit, "relay_deposit".to_string()),
+            ]
+        );
     }
 
     /// A job timeout that cancels the attempt after the pair is signed and
