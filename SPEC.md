@@ -7420,24 +7420,25 @@ from `BridgingSubmitting`, `WithdrawalComplete`, or a BaseToAlpaca
 `DepositConfirmed`, `DepositFailed`, `Reconciled`, or any `BridgingFailed` with
 a recorded `burn_tx_hash`) and for the swap states (`SwapQuoted`,
 `SwapDepositPrepared`, `SwapDeposited`). On a Relay corridor a BaseToAlpaca
-transfer at `WithdrawalComplete` is refused too, with a Relay-specific reason:
-the withdrawn stable is outside the vault, and only the swap or a redeposit
-settles it (see "Relay hop"). The two surfaces differ in how the in-memory guard
-is reconciled. The live route sends `FailBridging` through the conductor-built
-wired store, so the rebalancing reactor runs in process and keeps the transfer's
-corridor guard held for the AlpacaToBase outcome, matching the reported
-`guardHeld`. The timeout sweep never clears the guard of an AlpacaToBase
-transfer past its withdrawal with no confirmed burn (`BridgingSubmitting`, or
-`BridgingFailed` with no burn): it holds the guard without a tombstone and pages
-once that the transfer has no confirmed burn and its funds are off Alpaca,
-naming the recovery step, until the operator reconciles. Neither state proves
-that no burn was broadcast: a crash between a burn's broadcast and its record
-leaves the same state. So before reconciling the operator verifies on chain that
-no burn left the market maker wallet. The offline CLI writes through a
-standalone store the (stopped) bot's reactor never observes, so its outcome is
-reconciled on the next startup: `recover_usdc_guard` clears a non-guard-holding
-aggregate and re-latches an AlpacaToBase one until the operator reconciles.
-Either way, once the guard is released automatic USDC rebalancing resumes.
+transfer at `Withdrawing` or `WithdrawalComplete` is refused too, with a
+Relay-specific reason: the withdrawn stable is outside the vault, and only the
+swap or a redeposit settles it (see "Relay hop"). The two surfaces differ in how
+the in-memory guard is reconciled. The live route sends `FailBridging` through
+the conductor-built wired store, so the rebalancing reactor runs in process and
+keeps the transfer's corridor guard held for the AlpacaToBase outcome, matching
+the reported `guardHeld`. The timeout sweep never clears the guard of an
+AlpacaToBase transfer past its withdrawal with no confirmed burn
+(`BridgingSubmitting`, or `BridgingFailed` with no burn): it holds the guard
+without a tombstone and pages once that the transfer has no confirmed burn and
+its funds are off Alpaca, naming the recovery step, until the operator
+reconciles. Neither state proves that no burn was broadcast: a crash between a
+burn's broadcast and its record leaves the same state. So before reconciling the
+operator verifies on chain that no burn left the market maker wallet. The
+offline CLI writes through a standalone store the (stopped) bot's reactor never
+observes, so its outcome is reconciled on the next startup: `recover_usdc_guard`
+clears a non-guard-holding aggregate and re-latches an AlpacaToBase one until
+the operator reconciles. Either way, once the guard is released automatic USDC
+rebalancing resumes.
 
 **Operator reconciliation of a stranded post-burn failure**: A USDC rebalance
 that fails after the CCTP burn holds the rebalancing guard, blocking further

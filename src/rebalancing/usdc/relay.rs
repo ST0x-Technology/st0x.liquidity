@@ -84,12 +84,9 @@ impl<Signer: Wallet> RelayHop<Signer> {
     /// Signs and persists the pair, or picks up the one already persisted;
     /// `None` once the deposit is confirmed. Read and signed under the chain
     /// wallet's prepare lock: a timed-out attempt's prepare may have
-    /// persisted a pair this one must send instead of signing anew. The
-    /// attempt stops waiting on the signing after `quote_max_age`, but the
-    /// signing is not cancelled: it keeps its RPC calls under the wallet's
-    /// send lock, and its pair's nonces are released once it returns. A retry
-    /// does not sign meanwhile, since the quote is older than `quote_max_age`
-    /// by then.
+    /// persisted a pair this one must send instead of signing anew. A
+    /// signing that outlasts `quote_max_age` is not cancelled; a retry does
+    /// not sign above its nonces, as the quote is too old by then.
     async fn prepare_swap_pair(
         self: &Arc<Self>,
         cqrs: &Store<UsdcRebalance>,
@@ -2495,7 +2492,7 @@ mod tests {
         let id = UsdcRebalanceId(Uuid::new_v4());
         let witness = Arc::new(
             BroadcastWitness::new(wallet.clone(), store.clone(), id.clone())
-                .on_deposit_signing(OnDepositSigning::SlowAfterSigning(Duration::from_secs(3))),
+                .on_deposit_signing(OnDepositSigning::SlowAfterSigning(Duration::from_secs(6))),
         );
         let chain_wallet: TestWallet = witness.clone();
         let server = MockServer::start();
@@ -2511,7 +2508,7 @@ mod tests {
         .await;
         let mut quote = exact_quote(&wallet, contracts, B256::repeat_byte(0x0d)).await;
         let approve_step = quote.approve.clone().unwrap();
-        quote.deadline = Utc::now() + QUOTE_DEADLINE_HEADROOM + chrono::Duration::seconds(2);
+        quote.deadline = Utc::now() + QUOTE_DEADLINE_HEADROOM + chrono::Duration::seconds(4);
         record_quoted(&store, &id, quote).await;
         let first_nonce = wallet
             .provider()
@@ -2530,6 +2527,10 @@ mod tests {
         assert!(
             matches!(&error, UsdcTransferError::SwapQuoteExpired { id: refused, .. } if *refused == id),
             "got {error:?}"
+        );
+        assert!(
+            witness.on_deposit_signing.lock().unwrap().is_none(),
+            "the quote must expire during the signing, not before it"
         );
         assert_eq!(
             store.load(&id).await.unwrap().unwrap().state_name(),
@@ -2677,7 +2678,7 @@ mod tests {
             BroadcastWitness::new(wallet.clone(), store.clone(), id.clone()).on_deposit_signing(
                 OnDepositSigning::AnotherSendFirstThenSlow {
                     to: contracts.stable,
-                    delay: Duration::from_secs(3),
+                    delay: Duration::from_secs(6),
                 },
             ),
         );
@@ -2694,7 +2695,7 @@ mod tests {
         )
         .await;
         let mut quote = exact_quote(&wallet, contracts, B256::repeat_byte(0x0d)).await;
-        quote.deadline = Utc::now() + QUOTE_DEADLINE_HEADROOM + chrono::Duration::seconds(2);
+        quote.deadline = Utc::now() + QUOTE_DEADLINE_HEADROOM + chrono::Duration::seconds(4);
         record_quoted(&store, &id, quote).await;
         let first_nonce = wallet
             .provider()
@@ -2723,5 +2724,57 @@ mod tests {
         };
         assert_eq!(approve.nonce(), first_nonce);
         assert_eq!(witness.broadcasts(), vec![approve.tx_hash()]);
+    }
+
+    /// A restored pair with no receipt after its rebroadcast counts as
+    /// unmined, so startup skips the chain's approvals and revokes while its
+    /// nonces are in flight.
+    #[tokio::test]
+    async fn restored_pair_without_a_receipt_is_counted_unmined() {
+        let anvil = spawn_anvil(Anvil::new());
+        let (wallet, contracts) = funded_relay_end(&anvil).await;
+        let pool = setup_test_db().await;
+        let store = Arc::new(test_store(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let transfer = relay_transfer(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet.clone(),
+            contracts,
+            store.clone(),
+        )
+        .await;
+        record_quoted(
+            &store,
+            &id,
+            exact_quote(&wallet, contracts, B256::repeat_byte(0x0d)).await,
+        )
+        .await;
+        transfer
+            .prepare_and_persist_swap_pair(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        wallet
+            .provider()
+            .raw_request::<_, ()>("evm_setAutomine".into(), (false,))
+            .await
+            .unwrap();
+
+        let by_chain = transfer.restore_chain_signed_swaps(&pool).await;
+
+        assert_eq!(
+            by_chain,
+            BTreeMap::from([(
+                Chain::Robinhood,
+                RestoredDepositSends {
+                    restored: 2,
+                    unmined: 2,
+                },
+            )])
+        );
     }
 }
