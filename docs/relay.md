@@ -261,18 +261,21 @@ paying anyone else would be signed and never proven.
 Another send from the same wallet between the two signs takes the nonce in
 between. Then `prepare_deposit` discards only the deposit and returns
 `PreparedSwap::ApproveOnly`: the caller persists the approve, sends it alone
-with `broadcast_approve` and prepares the deposit again. Discarding the approve
-too would leave its nonce as a gap that the other send waits behind and that a
-retry, rewound to it, splits again. An approve to our own pinned depository is
-harmless alone; the retry finds the allowance and signs only the deposit, or
-signs a fresh pair. `broadcast_deposit` sends the approve and then the deposit,
-refusing a pair that is not consecutive with `PairNonces`; a repeat sends the
-same bytes. `confirm_deposit` waits for the receipt, requires the origin chain's
-confirmations from `RelayCtx` (`RelayBridgeError::Unconfirmed` until it has
-them, as the wallet's own wait may count fewer), a receipt from the canonical
-block at its height (`NotCanonical` for one a lagging node serves from a
-reorged-out block; retry) and a `RelayErc20Deposit` from our wallet, in the
-origin stable, for the order id.
+with `broadcast_approve`, releases its nonce with `confirm_approve` once it has
+the origin chain's confirmations, and prepares the deposit again. Discarding the
+approve too would leave its nonce as a gap that the other send waits behind and
+that a retry, rewound to it, splits again. An approve to our own pinned
+depository is harmless alone; the retry finds the allowance and signs only the
+deposit, or signs a fresh pair. `broadcast_deposit` sends the approve and then
+the deposit, refusing a pair that is not consecutive with `PairNonces`; a repeat
+sends the same bytes. `confirm_deposit` waits for the receipt, requires the
+origin chain's confirmations from `RelayCtx` (`RelayBridgeError::Unconfirmed`
+until it has them, as the wallet's own wait may count fewer), a receipt from the
+canonical block at its height (`NotCanonical` for one a lagging node serves from
+a reorged-out block; retry) and a `RelayErc20Deposit` from our wallet, in the
+origin stable, for the order id. It takes the prepared pair: once the deposit is
+confirmed, the approve's nonce before it is used too, so its reservation is
+released, even when the deposit reverted.
 
 `find_recent_deposits` scans the depository's logs from a captured
 `origin_block` in 10,000-block chunks, reads each chunk 5 times (a lagging

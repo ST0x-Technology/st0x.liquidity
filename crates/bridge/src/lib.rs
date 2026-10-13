@@ -317,7 +317,8 @@ pub enum PreparedSwap {
     /// [`SwapBridge::broadcast_approve`] to fill its nonce; the caller then
     /// prepares the deposit again. The caller must persist and broadcast it:
     /// a dropped approve leaves its nonce as a gap that every later send from
-    /// the wallet waits behind until restart.
+    /// the wallet waits behind until restart. [`SwapBridge::confirm_approve`]
+    /// releases its nonce once it is mined.
     ApproveOnly {
         approve: PreparedTransaction,
     },
@@ -431,14 +432,25 @@ pub trait SwapBridge: Send + Sync + 'static {
         approve: &PreparedTransaction,
     ) -> Result<TxHash, Self::Error>;
 
-    /// Waits for the deposit's receipt and checks that it funded `order_id`.
-    /// Short of the origin chain's confirmations it fails, to be retried.
+    /// Waits for the receipt of the pair's deposit and checks that it funded
+    /// `order_id`. Short of the origin chain's confirmations it fails, to be
+    /// retried. Once the deposit is confirmed, its approve's nonce, the one
+    /// before it, is used too, and its reservation is released.
     async fn confirm_deposit(
         &self,
         direction: HopDirection,
         order_id: Self::OrderId,
-        deposit_tx: TxHash,
+        prepared: &PreparedSwapDeposit,
     ) -> Result<SwapDeposit<Self::OrderId>, Self::Error>;
+
+    /// Waits for the receipt of a [`PreparedSwap::ApproveOnly`] approve with
+    /// the origin chain's confirmations, releasing its nonce's reservation.
+    /// Short of them it fails, to be retried.
+    async fn confirm_approve(
+        &self,
+        direction: HopDirection,
+        approve: &PreparedTransaction,
+    ) -> Result<(), Self::Error>;
 
     /// Returns the origin chain's head, the floor for a later
     /// [`SwapBridge::find_recent_deposits`].

@@ -119,6 +119,8 @@ pub enum RelayBridgeError {
     NotCanonical { tx: TxHash, block: u64 },
     #[error("deposit {tx} reverted")]
     DepositReverted { tx: TxHash },
+    #[error("approve {tx} reverted")]
+    ApproveReverted { tx: TxHash },
     #[error("deposit {tx} emitted no deposit for order {order_id} from our wallet")]
     DepositUnverified { tx: TxHash, order_id: RelayOrderId },
     #[error("deposit log for order {order_id} carries no tx hash, block or block hash")]
@@ -373,11 +375,22 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> SwapBridge for RelayBridge<EthWalle
         &self,
         direction: HopDirection,
         order_id: RelayOrderId,
-        deposit_tx: TxHash,
+        prepared: &PreparedSwapDeposit,
     ) -> Result<SwapDeposit<RelayOrderId>, RelayBridgeError> {
         match direction {
-            HopDirection::ToHub => self.chain.confirm_deposit(order_id, deposit_tx).await,
-            HopDirection::FromHub => self.hub.confirm_deposit(order_id, deposit_tx).await,
+            HopDirection::ToHub => self.chain.confirm_deposit(order_id, prepared).await,
+            HopDirection::FromHub => self.hub.confirm_deposit(order_id, prepared).await,
+        }
+    }
+
+    async fn confirm_approve(
+        &self,
+        direction: HopDirection,
+        approve: &PreparedTransaction,
+    ) -> Result<(), RelayBridgeError> {
+        match direction {
+            HopDirection::ToHub => self.chain.confirm_approve(approve).await,
+            HopDirection::FromHub => self.hub.confirm_approve(approve).await,
         }
     }
 
@@ -701,9 +714,21 @@ impl<W: Wallet> RelayEnd<W> {
     async fn confirm_deposit(
         &self,
         order_id: RelayOrderId,
-        tx: TxHash,
+        prepared: &PreparedSwapDeposit,
     ) -> Result<SwapDeposit<RelayOrderId>, RelayBridgeError> {
+        let tx = prepared.deposit.tx_hash();
+
+        if let Some(approve) = &prepared.approve {
+            check_pair_nonces(approve, &prepared.deposit)?;
+        }
+
         let receipt = self.confirmed_receipt(tx).await?;
+
+        // The deposit is mined at the nonce after its approve's, reverted or
+        // not, so that nonce is used: nothing else can mine at it.
+        if let Some(approve) = &prepared.approve {
+            self.wallet.release_superseded(approve.tx_hash()).await;
+        }
 
         if !receipt.status() {
             return Err(RelayBridgeError::DepositReverted { tx });
@@ -728,6 +753,17 @@ impl<W: Wallet> RelayEnd<W> {
             amount: deposit.amount,
             block,
         })
+    }
+
+    async fn confirm_approve(&self, approve: &PreparedTransaction) -> Result<(), RelayBridgeError> {
+        let tx = approve.tx_hash();
+        let receipt = self.confirmed_receipt(tx).await?;
+
+        if !receipt.status() {
+            return Err(RelayBridgeError::ApproveReverted { tx });
+        }
+
+        Ok(())
     }
 
     /// `tx`'s receipt once it has this end's confirmations in a canonical
@@ -1103,8 +1139,9 @@ mod tests {
             Self { hub, chain, bridge }
         }
 
-        /// Signs and broadcasts a Robinhood -> hub deposit, mined in one block.
-        async fn send_deposit_to_hub(&self, order_id: B256) -> TxHash {
+        /// Signs and broadcasts a Robinhood -> hub deposit pair, mined in one
+        /// block.
+        async fn send_deposit_to_hub(&self, order_id: B256) -> PreparedSwapDeposit {
             self.chain.mint(self.chain.wallet(), AMOUNT).await;
             let quote = accepted(quote(&self.chain, order_id, true));
 
@@ -1118,17 +1155,19 @@ mod tests {
             self.bridge
                 .broadcast_deposit(HopDirection::ToHub, &prepared)
                 .await
-                .unwrap()
+                .unwrap();
+
+            prepared
         }
 
         /// [`Self::send_deposit_to_hub`], then mines to its confirmations and
         /// confirms it.
         async fn deposit_to_hub(&self, order_id: B256) -> SwapDeposit<RelayOrderId> {
-            let tx = self.send_deposit_to_hub(order_id).await;
+            let pair = self.send_deposit_to_hub(order_id).await;
             self.chain.mine(CONFIRMATIONS - 1).await;
 
             self.bridge
-                .confirm_deposit(HopDirection::ToHub, RelayOrderId(order_id), tx)
+                .confirm_deposit(HopDirection::ToHub, RelayOrderId(order_id), &pair)
                 .await
                 .unwrap()
         }
@@ -1507,6 +1546,25 @@ mod tests {
         nonces
     }
 
+    /// `tx`, sent on the corridor chain by any account, as a pair with no
+    /// approve: what a caller handing the wrong tx to `confirm_deposit` holds.
+    async fn sent_pair(harness: &Harness, tx: TxHash) -> PreparedSwapDeposit {
+        let raw = harness
+            .bridge
+            .chain
+            .wallet
+            .provider()
+            .get_raw_transaction_by_hash(tx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        PreparedSwapDeposit {
+            approve: None,
+            deposit: PreparedTransaction::from_raw(raw).unwrap(),
+        }
+    }
+
     fn deposit_pair(prepared: PreparedSwap) -> PreparedSwapDeposit {
         match prepared {
             PreparedSwap::Deposit(pair) => pair,
@@ -1666,7 +1724,11 @@ mod tests {
             .broadcast_approve(HopDirection::ToHub, &approve)
             .await
             .unwrap();
-        bridge.chain.wallet.await_receipt(sent).await.unwrap();
+        harness.chain.mine(CONFIRMATIONS - 1).await;
+        bridge
+            .confirm_approve(HopDirection::ToHub, &approve)
+            .await
+            .unwrap();
         let retry = bridge
             .prepare_deposit(HopDirection::ToHub, &quote)
             .await
@@ -1675,6 +1737,7 @@ mod tests {
 
         assert_eq!(approve.nonce(), 0);
         assert_eq!(sent, approve.tx_hash());
+        assert_eq!(bridge.chain.wallet.transaction_submission(sent), None);
         assert_eq!(
             harness
                 .chain
@@ -1782,7 +1845,7 @@ mod tests {
 
         let deposit = harness
             .bridge
-            .confirm_deposit(HopDirection::ToHub, RelayOrderId(order_id), first)
+            .confirm_deposit(HopDirection::ToHub, RelayOrderId(order_id), &prepared)
             .await
             .unwrap();
 
@@ -1828,7 +1891,7 @@ mod tests {
         harness.chain.mine(CONFIRMATIONS - 1).await;
         harness
             .bridge
-            .confirm_deposit(HopDirection::ToHub, RelayOrderId(order_id), deposit)
+            .confirm_deposit(HopDirection::ToHub, RelayOrderId(order_id), &prepared)
             .await
             .unwrap();
 
@@ -1861,7 +1924,7 @@ mod tests {
 
         let confirm = harness
             .bridge
-            .confirm_deposit(HopDirection::ToHub, quote.order_id, deposit)
+            .confirm_deposit(HopDirection::ToHub, quote.order_id, &prepared)
             .await
             .unwrap_err();
         let verify = harness
@@ -1894,7 +1957,8 @@ mod tests {
         let bridge = hooked_bridge(&harness, None, true);
         let order_id = B256::random();
         let refunded = AMOUNT - U256::from(4_846);
-        let deposit = harness.send_deposit_to_hub(order_id).await;
+        let pair = harness.send_deposit_to_hub(order_id).await;
+        let deposit = pair.deposit.tx_hash();
         harness.chain.mint(harness.chain.solver(), refunded).await;
         let refund = harness
             .chain
@@ -1903,7 +1967,7 @@ mod tests {
         harness.chain.mine(CONFIRMATIONS - 1).await;
 
         let confirm = bridge
-            .confirm_deposit(HopDirection::ToHub, RelayOrderId(order_id), deposit)
+            .confirm_deposit(HopDirection::ToHub, RelayOrderId(order_id), &pair)
             .await
             .unwrap_err();
         let verify = bridge
@@ -1950,21 +2014,19 @@ mod tests {
             )
         );
 
+        let pair = PreparedSwapDeposit {
+            approve: Some(approve),
+            deposit: short.deposit,
+        };
         let deposit = harness
             .bridge
-            .broadcast_deposit(
-                HopDirection::ToHub,
-                &PreparedSwapDeposit {
-                    approve: Some(approve),
-                    deposit: short.deposit,
-                },
-            )
+            .broadcast_deposit(HopDirection::ToHub, &pair)
             .await
             .unwrap();
         harness.chain.mine(CONFIRMATIONS - 1).await;
         let reverted = harness
             .bridge
-            .confirm_deposit(HopDirection::ToHub, quote.order_id, deposit)
+            .confirm_deposit(HopDirection::ToHub, quote.order_id, &pair)
             .await
             .unwrap_err();
         assert!(
@@ -2796,7 +2858,11 @@ mod tests {
             .unwrap();
         let confirm = harness
             .bridge
-            .confirm_deposit(HopDirection::ToHub, RelayOrderId(order_id), top_up)
+            .confirm_deposit(
+                HopDirection::ToHub,
+                RelayOrderId(order_id),
+                &sent_pair(&harness, top_up).await,
+            )
             .await
             .unwrap_err();
 
@@ -2833,7 +2899,11 @@ mod tests {
             .unwrap();
         let confirm = harness
             .bridge
-            .confirm_deposit(HopDirection::ToHub, RelayOrderId(order_id), spoof)
+            .confirm_deposit(
+                HopDirection::ToHub,
+                RelayOrderId(order_id),
+                &sent_pair(&harness, spoof).await,
+            )
             .await
             .unwrap_err();
 
@@ -2947,7 +3017,7 @@ mod tests {
             .await
             .unwrap();
         let order_id = B256::random();
-        let tx = harness.send_deposit_to_hub(order_id).await;
+        let pair = harness.send_deposit_to_hub(order_id).await;
         harness.chain.mine(CONFIRMATIONS - 2).await;
 
         let early = harness
@@ -2963,7 +3033,7 @@ mod tests {
             .unwrap();
         let deposit = harness
             .bridge
-            .confirm_deposit(HopDirection::ToHub, RelayOrderId(order_id), tx)
+            .confirm_deposit(HopDirection::ToHub, RelayOrderId(order_id), &pair)
             .await
             .unwrap();
 
