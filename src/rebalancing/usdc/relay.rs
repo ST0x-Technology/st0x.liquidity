@@ -887,7 +887,7 @@ where
                         },
                     )
                     .await?;
-                error!(target: "operational_alert", alert = true, %id, %deposit_tx, ?status, "Relay failed the swap with nothing paid back; the transfer holds its guard at SwapFailed until the funds are settled and it is reconciled");
+                error!(target: "operational_alert", alert = true, kind = AlertKind::RelaySwapFailedNothingPaid.as_str(), %id, %deposit_tx, ?status, "Relay failed the swap with nothing paid back; the transfer holds its guard at SwapFailed until the funds are settled and it is reconciled");
                 Ok(())
             }
             IntentStatus::Waiting
@@ -914,14 +914,14 @@ where
                 error @ (RelayBridgeError::FillUnverified { .. }
                 | RelayBridgeError::RefundUnverified { .. }),
             ) => {
-                error!(target: "operational_alert", alert = true, %id, %error, "The Relay payment does not prove on chain; the transfer holds its guard");
+                error!(target: "operational_alert", alert = true, kind = AlertKind::RelayPaymentUnproven.as_str(), %id, %error, "The Relay payment does not prove on chain; the transfer holds its guard");
                 Err(UsdcTransferError::SwapPaymentUnverified {
                     id: id.clone(),
                     source: Box::new(error),
                 })
             }
             Err(error) if past_window => {
-                error!(target: "operational_alert", alert = true, %id, %error, "Relay names a payment the chain still does not show past the fill window; the transfer holds its guard");
+                error!(target: "operational_alert", alert = true, kind = AlertKind::RelayPaymentUnseenPastFillWindow.as_str(), %id, %error, "Relay names a payment the chain still does not show past the fill window; the transfer holds its guard");
                 Err(UsdcTransferError::SwapPaymentUnverified {
                     id: id.clone(),
                     source: Box::new(error),
@@ -996,7 +996,7 @@ where
                 self.redeposit(id, RedepositReason::Refunded).await
             }
             RefundSide::Destination => {
-                error!(target: "operational_alert", alert = true, %id, refund_tx = %payment.tx, amount = %payment.amount, ?reason, "Relay refunded the deposit in USDC at the hub; the transfer holds its guard until the operator moves it and reconciles");
+                error!(target: "operational_alert", alert = true, kind = AlertKind::RelayRefundedAtHub.as_str(), %id, refund_tx = %payment.tx, amount = %payment.amount, ?reason, "Relay refunded the deposit in USDC at the hub; the transfer holds its guard until the operator moves it and reconciles");
                 Ok(())
             }
         }
@@ -1024,7 +1024,7 @@ where
         let deposited = quote.amount_in;
         let refunded = usdc_to_u256(amount_refunded)?;
         let shortfall = deposited.saturating_sub(refunded);
-        error!(target: "operational_alert", alert = true, %id, %refund_tx, ?side, %deposited, %refunded, %floor, %shortfall, "Relay refunded less than the refund floor; the transfer holds its guard at SwapRefunded until the operator settles it and reconciles");
+        error!(target: "operational_alert", alert = true, kind = AlertKind::RelayRefundBelowFloor.as_str(), %id, %refund_tx, ?side, %deposited, %refunded, %floor, %shortfall, "Relay refunded less than the refund floor; the transfer holds its guard at SwapRefunded until the operator settles it and reconciles");
         Ok(true)
     }
 
@@ -1038,7 +1038,7 @@ where
         wait: PaymentWait,
     ) -> Result<(), UsdcTransferError> {
         let PaymentWait::FillWindow { deposited_at } = wait else {
-            error!(target: "operational_alert", alert = true, %id, %deposit_tx, "Relay deposit still unresolved past its fill window; the transfer holds its guard, and the next resume reads Relay again");
+            error!(target: "operational_alert", alert = true, kind = AlertKind::RelayDepositUnresolvedPastFillWindow.as_str(), %id, %deposit_tx, "Relay deposit still unresolved past its fill window; the transfer holds its guard, and the next resume reads Relay again");
             return Ok(());
         };
 
@@ -1052,7 +1052,7 @@ where
         self.cqrs
             .send(id, UsdcRebalanceCommand::RecordSwapEscrowUnresolved)
             .await?;
-        error!(target: "operational_alert", alert = true, %id, %deposit_tx, %deposited_at, fill_timeout = ?self.hop.bounds.fill_timeout, "Relay deposit has no fill and no refund past its fill window; the transfer holds its guard at SwapEscrowUnresolved");
+        error!(target: "operational_alert", alert = true, kind = AlertKind::RelayEscrowUnresolved.as_str(), %id, %deposit_tx, %deposited_at, fill_timeout = ?self.hop.bounds.fill_timeout, "Relay deposit has no fill and no refund past its fill window; the transfer holds its guard at SwapEscrowUnresolved");
         Ok(())
     }
 
@@ -1121,7 +1121,7 @@ where
                 UsdcTransferError::Vault(vault)
                     if vault.is_transaction_dropped() || !vault.is_reconciliation_pending() =>
                 {
-                    error!(target: "operational_alert", alert = true, %id, %deposit_tx, %error, "The redeposit into the vault was dropped, reverted or refused; the transfer holds its guard at Redepositing until the stable is settled by hand and the transfer reconciled");
+                    error!(target: "operational_alert", alert = true, kind = AlertKind::RelayRedepositFailed.as_str(), %id, %deposit_tx, %error, "The redeposit into the vault was dropped, reverted or refused; the transfer holds its guard at Redepositing until the stable is settled by hand and the transfer reconciled");
                 }
                 _ => {
                     warn!(target: "rebalance", %id, %deposit_tx, %error, "The redeposit into the vault is not confirmed yet; retrying");

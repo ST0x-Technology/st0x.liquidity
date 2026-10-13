@@ -176,6 +176,15 @@ alert_kinds! {
         RelayPairPreparePanicked => "The Relay pair prepare task panicked",
         RelayPairsOnUnservedCorridor => "Signed Relay pairs on a corridor this build does not serve",
         RelayWithdrawalHoldTimedOut => "moved the stable out of the vault",
+        RelaySwapFailedNothingPaid => "Relay failed the swap with nothing paid back",
+        RelayPaymentUnproven => "The Relay payment does not prove on chain",
+        RelayPaymentUnseenPastFillWindow => "Relay names a payment the chain still does not show past the fill window",
+        RelayRefundedAtHub => "Relay refunded the deposit in USDC at the hub",
+        RelayRefundBelowFloor => "Relay refunded less than the refund floor",
+        RelayDepositUnresolvedPastFillWindow => "Relay deposit still unresolved past its fill window",
+        RelayEscrowUnresolved => "Relay deposit has no fill and no refund past its fill window",
+        RelayRedepositFailed => "The redeposit into the vault was dropped, reverted or refused",
+        RelaySwapPaymentUnverified => "check the order with Relay's status API",
     }
 }
 

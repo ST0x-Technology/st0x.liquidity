@@ -470,7 +470,10 @@ where
                 "{error}. The transfer holds its guard; check the order with Relay's status API. \
                  The status is read again in {SWAP_PAYMENT_UNVERIFIED_REDRIVE_DELAY:?}."
             );
-            if let Err(notify_error) = notifier.notify(&message).await {
+            if let Err(notify_error) = notifier
+                .notify(AlertKind::RelaySwapPaymentUnverified, &message)
+                .await
+            {
                 warn!(target: "rebalance", error = ?notify_error, "Failed to deliver the Relay payment page");
             }
             SWAP_PAYMENT_UNVERIFIED_REDRIVE_DELAY
