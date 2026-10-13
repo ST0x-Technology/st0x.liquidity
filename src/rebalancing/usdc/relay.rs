@@ -605,13 +605,13 @@ where
             .broadcast_deposit(TO_HUB, &pair)
             .await
             .map_err(Box::new)?;
+        let split_approves = self.split_approves(id).await?;
         let deposit = self
             .hop
             .bridge
-            .confirm_deposit(TO_HUB, RelayOrderId(order_id), &pair)
+            .confirm_deposit(TO_HUB, RelayOrderId(order_id), &pair, &split_approves)
             .await
             .map_err(Box::new)?;
-        self.release_split_approves(id, TO_HUB).await;
 
         self.cqrs
             .send(
@@ -633,31 +633,17 @@ where
         Ok(())
     }
 
-    /// Releases the nonces of the approves that went out alone before a
-    /// confirmed deposit: at lower nonces, they are mined at least as deep,
-    /// so each confirms at once. Only housekeeping: a failure leaves the
-    /// reservation until restart, logged.
-    async fn release_split_approves(&self, id: &UsdcRebalanceId, direction: HopDirection) {
-        let split_approves = match self.cqrs.load(id).await {
-            Ok(Some(UsdcRebalance::SwapDepositPrepared { split_approves, .. })) => split_approves,
-            Ok(state) => {
-                warn!(target: "rebalance", %id, state = ?state.as_ref().map(UsdcRebalance::state_name), "Relay deposit confirmed off SwapDepositPrepared; its split approves stay reserved until restart");
-                return;
-            }
-            Err(error) => {
-                warn!(target: "rebalance", %id, ?error, "Could not load the Relay transfer to release its split approves; they stay reserved until restart");
-                return;
-            }
-        };
-
-        for approve in &split_approves {
-            match self.hop.bridge.confirm_approve(direction, approve).await {
-                // A reverted approve is mined all the same, so its nonce is
-                // released too.
-                Ok(()) | Err(RelayBridgeError::ApproveReverted { .. }) => {}
-                Err(error) => {
-                    warn!(target: "rebalance", %id, approve = %approve.tx_hash(), ?error, "Could not confirm a split Relay approve under its confirmed deposit; its nonce stays reserved until restart");
-                }
+    /// The approves that went out alone before the persisted pair: below
+    /// its deposit, their nonces are released when it confirms.
+    async fn split_approves(
+        &self,
+        id: &UsdcRebalanceId,
+    ) -> Result<Vec<PreparedTransaction>, UsdcTransferError> {
+        match self.cqrs.load(id).await? {
+            Some(UsdcRebalance::SwapDepositPrepared { split_approves, .. }) => Ok(split_approves),
+            state => {
+                warn!(target: "rebalance", %id, state = ?state.as_ref().map(UsdcRebalance::state_name), "Relay pair sent off SwapDepositPrepared; its split approves, if any, stay reserved until restart");
+                Ok(Vec::new())
             }
         }
     }
