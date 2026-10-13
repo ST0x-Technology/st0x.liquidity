@@ -693,7 +693,7 @@ where
                 if self.hold_short_refund(id).await? {
                     return Ok(());
                 }
-                error!(target: "operational_alert", alert = true, %id, %refund_tx, %amount_refunded, "Relay refunded the deposit in USDC at the hub; the transfer holds its guard for the operator to move it and reconcile");
+                error!(target: "operational_alert", alert = true, kind = AlertKind::RelayRefundedAtHub.as_str(), %id, %refund_tx, %amount_refunded, "Relay refunded the deposit in USDC at the hub; the transfer holds its guard for the operator to move it and reconcile");
                 Ok(())
             }
 
@@ -844,7 +844,7 @@ where
                 if self.hold_short_refund(id).await? {
                     return Ok(());
                 }
-                error!(target: "operational_alert", alert = true, %id, %refund_tx, %amount_refunded, "Relay refunded the deposit in the chain's stable to the chain wallet; the transfer holds its guard for the operator to move it and reconcile");
+                error!(target: "operational_alert", alert = true, kind = AlertKind::RelayRefundedToChainWallet.as_str(), %id, %refund_tx, %amount_refunded, "Relay refunded the deposit in the chain's stable to the chain wallet; the transfer holds its guard for the operator to move it and reconcile");
                 Ok(())
             }
 
@@ -1741,7 +1741,7 @@ where
         };
 
         let order_id = quote.order_id;
-        error!(target: "operational_alert", alert = true, %id, deposit_tx = %deposit.tx, %order_id, block = deposit.block, "A deposit of a reverted Relay order is on chain; the transfer signs and redeposits nothing until its payment proves");
+        error!(target: "operational_alert", alert = true, kind = AlertKind::RevertedRelayOrderDepositOnChain.as_str(), %id, deposit_tx = %deposit.tx, %order_id, block = deposit.block, "A deposit of a reverted Relay order is on chain; the transfer signs and redeposits nothing until its payment proves");
         let Some(payment) = self.proven_order_payment(id, side, quote).await? else {
             return Err(UsdcTransferError::RevertedSwapDepositLive {
                 id: id.clone(),
@@ -2713,7 +2713,7 @@ where
         } = payment
             && !short
         {
-            error!(target: "operational_alert", alert = true, %id, %refund_tx, %amount_refunded, "Recheck adopted a Relay refund paid at the other end; the transfer holds its guard until the operator moves it and reconciles");
+            error!(target: "operational_alert", alert = true, kind = AlertKind::RecheckAdoptedRelayRefund.as_str(), %id, %refund_tx, %amount_refunded, "Recheck adopted a Relay refund paid at the other end; the transfer holds its guard until the operator moves it and reconciles");
         }
         warn!(target: "rebalance", %id, order_id = %quote.order_id, ?payment, "Recheck adopted a late Relay payment; the transfer's job or a resume moves it on");
 

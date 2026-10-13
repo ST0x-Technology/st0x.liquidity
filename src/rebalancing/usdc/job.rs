@@ -504,7 +504,10 @@ where
                  `stox relay status <request>`. It is read again in \
                  {SWAP_ESCROW_RECHECK_DELAY:?}."
             );
-            if let Err(notify_error) = notifier.notify(&message).await {
+            if let Err(notify_error) = notifier
+                .notify(AlertKind::RevertedRelayDepositLive, &message)
+                .await
+            {
                 warn!(target: "rebalance", error = ?notify_error, "Failed to deliver the reverted Relay deposit page");
             }
             SWAP_ESCROW_RECHECK_DELAY
