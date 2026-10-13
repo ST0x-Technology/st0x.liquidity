@@ -5011,8 +5011,10 @@ runs the chain-to-Alpaca side up to the confirmed deposit:
    transfer against it at the trigger. A refusal here leaves the transfer at
    `WithdrawalComplete` with its guard held: the USDG is in the wallet, and only
    the redeposit step that follows may return it. The timeout sweep holds that
-   guard and pages, there and at every swap state after it, and
-   `fail-usdc-transfer` refuses the transfer there with a Relay-specific reason.
+   guard and pages, there, at `Withdrawing` before it (recorded once the vault
+   withdraw is mined) and at every swap state after it, whatever stage its
+   tracking reads, and `fail-usdc-transfer` refuses the transfer there with a
+   Relay-specific reason.
 4. The approve and the deposit are signed together under the origin wallet's
    lock (the Ethereum wallet's deposit-send lock when Ethereum is the origin)
    and persisted in one event (`SwapDepositPrepared`) before either is

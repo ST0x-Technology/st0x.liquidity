@@ -1179,9 +1179,10 @@ enum UsdcTimeoutCleanup {
         direction: RebalanceDirection,
     },
     /// A chain-to-Alpaca Relay transfer stopped after its withdrawal, at
-    /// `WithdrawalComplete` or a swap state: the withdrawn stable is outside
-    /// the vault, in the chain wallet or with Relay, and only the swap or a
-    /// redeposit (not built yet) settles it, so the guard stays held.
+    /// `Withdrawing`, `WithdrawalComplete` or a swap state: the withdrawn
+    /// stable is outside the vault, in the chain wallet or with Relay, and
+    /// only the swap or a redeposit (not built yet) settles it, so the guard
+    /// stays held.
     HeldOutsideVault {
         tracking: usdc::UsdcRebalanceTracking,
         elapsed: Duration,

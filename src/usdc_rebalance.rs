@@ -1494,8 +1494,18 @@ impl UsdcRebalance {
         match self {
             // A chain-to-Alpaca Relay withdrawal left the stable outside
             // the vault, and `FailBridging` refuses it and every swap state:
-            // only the swap or a redeposit settles it.
-            Self::WithdrawalComplete {
+            // only the swap or a redeposit settles it. `Withdrawing` is
+            // recorded only once the vault withdraw is mined.
+            Self::Withdrawing {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor:
+                    UsdcCorridor::HubRouted {
+                        hop: HopKind::Relay,
+                        ..
+                    },
+                ..
+            }
+            | Self::WithdrawalComplete {
                 direction: RebalanceDirection::BaseToAlpaca,
                 corridor:
                     UsdcCorridor::HubRouted {
