@@ -87,6 +87,16 @@ pub mod turnkey;
 #[cfg(feature = "mock")]
 pub mod test_chain;
 
+/// Anvil builder for test nodes: evicted block states are dropped instead of
+/// written to `~/.foundry/anvil/tmp`, where Anvil leaves them after exit. See
+/// "Anvil Test Nodes" in `docs/alloy.md` for the memory cost.
+#[cfg(any(test, feature = "mock"))]
+pub fn anvil_without_disk_states() -> alloy::node_bindings::Anvil {
+    alloy::node_bindings::Anvil::new()
+        .arg("--max-persisted-states")
+        .arg("0")
+}
+
 #[cfg(feature = "test-support")]
 pub mod stub;
 #[cfg(feature = "test-support")]
@@ -3877,11 +3887,7 @@ mod tests {
     #[tokio::test]
     async fn wait_for_receipt_waits_for_multiple_confirmations() {
         // Anvil with 1-second block time auto-mines blocks.
-        let anvil = Anvil::new()
-            .block_time(1)
-            .arg("--max-persisted-states")
-            .arg("0")
-            .spawn();
+        let anvil = super::anvil_without_disk_states().block_time(1).spawn();
         let signer = anvil_signer(&anvil);
         let provider = ProviderBuilder::new()
             .wallet(signer)

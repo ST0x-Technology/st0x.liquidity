@@ -52,8 +52,9 @@ redundant_pub_crate = "allow"
 [profile.dev]
 debug = "line-tables-only"
 
-# Third-party crates skip even line tables: file:line stays for our own code,
-# while every dependency rlib and every linked test/bin binary gets smaller.
+# Crates outside the workspace, including our git dependencies, skip even line
+# tables: backtraces keep file:line for workspace code (panic messages need no
+# debuginfo), while every dependency rlib and linked test/bin binary shrinks.
 [profile.dev.package."*"]
 debug = false
 

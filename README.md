@@ -100,7 +100,7 @@ cd st0x.liquidity
 direnv allow      # or `nix develop` if not using direnv
 sqlx db create    # create SQLite database for sqlx macros
 sqlx migrate run  # apply migrations
-cargo check       # verify setup
+cargo check --workspace --all-targets --all-features # verify setup
 ```
 
 Solidity ABIs are produced as per-feature Nix derivations under `nix/`
@@ -501,7 +501,7 @@ nix run .#deployAll   # first deployment
 Track staging and production deploys in the Grafana deployments dashboard:
 https://grafana.t0trade.com/d/t0-deployments/deployments
 
-For a backend-only verification pass, use the same dev shell as CI:
+For a backend only verification pass, use the same dev shell as CI:
 
 ```bash
 nix develop .#ci-backend -c cargo check --workspace
@@ -641,7 +641,7 @@ observability/             # Grafana boards and alert rules, shipped on merge
 ### Building and Testing
 
 ```bash
-cargo check                  # fast compilation check
+cargo check --workspace --all-targets --all-features # fast compilation check
 cargo nextest run --workspace --all-features # run all tests
 cargo clippy --workspace --all-targets --all-features -- -D clippy::all
 cargo fmt                    # format Rust code
@@ -653,13 +653,15 @@ dependency auditing. For the standalone audit and its regression tests, see
 [Rust dependency auditing](docs/dependency-audit.md).
 
 Debug builds use `debug = "line-tables-only"` for workspace crates and no
-debuginfo for third-party crates (workspace `Cargo.toml`), and the Linux dev
-shells link with mold (`flake.nix`), which keeps the `st0x-hedge` test binary
-well under 1 GB and takes about 20 s of link time off every test cycle. Panics
-in our code still report file and line. The `default` and `ci-backend` shells
-refuse to start unless mold is on `PATH` and the target rustflags variable
-carries `-fuse-ld=mold`, so cargo cannot silently fall back to the stock linker.
-To inspect a binary anyway:
+debuginfo for every crate outside the workspace, including our git dependencies
+(workspace `Cargo.toml`), and the Linux dev shells link with mold (`flake.nix`),
+which keeps the `st0x-hedge` test binary well under 1 GB and takes about 20 s of
+link time off every test cycle. Panic messages still report file and line in
+every crate; backtrace frames and debugger source views lose them only inside
+crates outside the workspace. The `default` and `ci-backend` shells refuse to
+start unless mold is on `PATH` and the target rustflags variable carries
+`-fuse-ld=mold`, so cargo cannot silently fall back to the stock linker. To
+inspect a binary anyway:
 `readelf -p .comment target/debug/deps/st0x_hedge-<hash> | grep mold`. Nix
 release builds (`nix build`, OCI images) are not affected.
 

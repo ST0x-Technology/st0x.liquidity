@@ -6,7 +6,8 @@ The nix dev shell sets `SQLX_OFFLINE=true` (in `flake.nix`), which tells sqlx
 compile-time macros (`query!`, `query_scalar!`, etc.) to use cached metadata
 from the `.sqlx/` directory instead of connecting to the database. This means:
 
-- Regular `cargo check`/`cargo nextest run` typically don't need a running
+- Regular `cargo check --workspace --all-targets --all-features` and
+  `cargo nextest run --workspace --all-features` typically don't need a running
   database -- they read from `.sqlx/` cache files checked into version control.
   Exception: test code using `query!` macros (see below).
 - If you add or change a `query!` macro invocation, you must regenerate the
@@ -15,7 +16,7 @@ from the `.sqlx/` directory instead of connecting to the database. This means:
 ## Regenerating the query cache
 
 ```bash
-cargo sqlx prepare --workspace -- --all-targets
+cargo sqlx prepare --workspace -- --all-targets --all-features
 ```
 
 Then check the updated `.sqlx/` files into version control.
@@ -27,8 +28,9 @@ with `-- --all-targets`. This is a known limitation -- the `--all-targets` flag
 is supposed to compile test targets during preparation, but in practice the
 test-only queries are silently skipped.
 
-When you then run `cargo nextest run` (which enables `cfg(test)`), the compiler
-sees the query macro, finds no cached metadata, and fails with:
+When you then run `cargo nextest run --workspace --all-features` (which enables
+`cfg(test)`), the compiler sees the query macro, finds no cached metadata, and
+fails with:
 
 ```
 `SQLX_OFFLINE=true` but there is no cached data for this query
