@@ -23,6 +23,7 @@ use st0x_bridge::cctp::{
 };
 use st0x_bridge::corridor::UsdcCorridor;
 use st0x_bridge::relay::RelayBridge;
+use st0x_bridge::stable_endpoint::StableEndpointError;
 use st0x_bridge::{
     Attestation, Bridge, BridgeDirection, BurnReceipt, BurnTxStatus, MintReceipt, RecordedBurnScan,
 };
@@ -185,26 +186,39 @@ impl MarketMakingUsdcEndpoints {
 /// exercise these operations.
 #[async_trait::async_trait]
 pub trait UsdcBridgeHelper: Send + Sync + 'static {
+    /// What this hop's Ethereum stable reads and sends fail with. Converts to
+    /// [`CctpError`] for the settlement checks whose source is typed so.
+    type HubError: Into<CctpError> + std::error::Error + Send + Sync + 'static;
+
+    /// Reports a failed deposit-send read or send, so a hop without CCTP
+    /// never reports it as a CCTP error.
+    fn hub_leg_failure(error: Self::HubError) -> UsdcTransferError
+    where
+        Self: Sized;
+
     /// Returns the number of confirmations for `tx_hash` on Ethereum, or
     /// `None` if the transaction has not yet been mined.
-    async fn ethereum_tx_confirmations(&self, tx_hash: TxHash) -> Result<Option<u64>, CctpError>;
+    async fn ethereum_tx_confirmations(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<Option<u64>, Self::HubError>;
 
     /// Returns the block in which `tx_hash` was mined on Ethereum.
-    async fn ethereum_tx_block(&self, tx_hash: TxHash) -> Result<u64, CctpError>;
+    async fn ethereum_tx_block(&self, tx_hash: TxHash) -> Result<u64, Self::HubError>;
 
     /// Returns the sender, nonce and confirmations of `tx_hash` on Ethereum,
     /// or `None` while it has no receipt.
-    async fn ethereum_mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, CctpError>;
+    async fn ethereum_mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, Self::HubError>;
 
     /// Returns the USDC balance of `holder` on Ethereum.
-    async fn ethereum_usdc_balance(&self, holder: Address) -> Result<U256, CctpError>;
+    async fn ethereum_usdc_balance(&self, holder: Address) -> Result<U256, Self::HubError>;
 
     /// Returns the USDC that `tx_hash` paid `recipient` on Ethereum.
     async fn ethereum_usdc_credit(
         &self,
         tx_hash: TxHash,
         recipient: Address,
-    ) -> Result<U256, CctpError>;
+    ) -> Result<U256, Self::HubError>;
 
     /// Returns the USDC that `tx_hash` moved from `sender` to `recipient` on
     /// Ethereum, once the tx is confirmed.
@@ -213,7 +227,7 @@ pub trait UsdcBridgeHelper: Send + Sync + 'static {
         tx_hash: TxHash,
         sender: Address,
         recipient: Address,
-    ) -> Result<U256, CctpError>;
+    ) -> Result<U256, Self::HubError>;
 
     /// Signs a transfer of `amount` USDC (6-decimal) from the bot wallet to
     /// `to` on Ethereum without broadcasting it.
@@ -221,14 +235,14 @@ pub trait UsdcBridgeHelper: Send + Sync + 'static {
         &self,
         to: Address,
         amount: U256,
-    ) -> Result<PreparedTransaction, CctpError>;
+    ) -> Result<PreparedTransaction, Self::HubError>;
 
     /// Broadcasts a transfer signed by `prepare_usdc_on_ethereum`; a repeat
     /// sends the same bytes.
     async fn broadcast_usdc_on_ethereum(
         &self,
         prepared: &PreparedTransaction,
-    ) -> Result<TxHash, CctpError>;
+    ) -> Result<TxHash, Self::HubError>;
 
     /// Releases the nonce of a signed transfer that was never persisted.
     async fn discard_usdc_on_ethereum(&self, prepared: &PreparedTransaction);
@@ -241,7 +255,7 @@ pub trait UsdcBridgeHelper: Send + Sync + 'static {
     async fn confirm_usdc_on_ethereum(
         &self,
         tx_hash: TxHash,
-    ) -> Result<UsdcTransferStatus, CctpError>;
+    ) -> Result<UsdcTransferStatus, Self::HubError>;
 
     /// Scans Ethereum for USDC `Transfer(from, to, value == amount)` events
     /// at or after `from_block`, returning every matching tx hash, newest first.
@@ -251,11 +265,17 @@ pub trait UsdcBridgeHelper: Send + Sync + 'static {
         to: Address,
         amount: U256,
         from_block: u64,
-    ) -> Result<Vec<TxHash>, CctpError>;
+    ) -> Result<Vec<TxHash>, Self::HubError>;
 }
 
 #[async_trait::async_trait]
 impl<EthWallet: Wallet, BaseWallet: Wallet> UsdcBridgeHelper for CctpBridge<EthWallet, BaseWallet> {
+    type HubError = CctpError;
+
+    fn hub_leg_failure(error: CctpError) -> UsdcTransferError {
+        UsdcTransferError::Cctp(Box::new(error))
+    }
+
     async fn ethereum_tx_confirmations(&self, tx_hash: TxHash) -> Result<Option<u64>, CctpError> {
         self.ethereum_tx_confirmations(tx_hash).await
     }
@@ -331,37 +351,47 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> UsdcBridgeHelper for CctpBridge<EthW
     }
 }
 
-/// Relay serves the hub legs through its Ethereum end; its stable errors
-/// keep the [`CctpError`] shapes the shared legs classify.
+/// Relay serves the hub legs through its Ethereum end.
 #[async_trait::async_trait]
 impl<EthWallet: Wallet, ChainWallet: Wallet> UsdcBridgeHelper
     for RelayBridge<EthWallet, ChainWallet>
 {
-    async fn ethereum_tx_confirmations(&self, tx_hash: TxHash) -> Result<Option<u64>, CctpError> {
-        Ok(self.ethereum_stable().tx_confirmations(tx_hash).await?)
+    type HubError = StableEndpointError;
+
+    fn hub_leg_failure(error: StableEndpointError) -> UsdcTransferError {
+        UsdcTransferError::StableEndpoint(Box::new(error))
     }
 
-    async fn ethereum_tx_block(&self, tx_hash: TxHash) -> Result<u64, CctpError> {
-        Ok(self.ethereum_stable().tx_block(tx_hash).await?)
+    async fn ethereum_tx_confirmations(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<Option<u64>, StableEndpointError> {
+        self.ethereum_stable().tx_confirmations(tx_hash).await
     }
 
-    async fn ethereum_mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, CctpError> {
-        Ok(self.ethereum_stable().mined_tx(tx_hash).await?)
+    async fn ethereum_tx_block(&self, tx_hash: TxHash) -> Result<u64, StableEndpointError> {
+        self.ethereum_stable().tx_block(tx_hash).await
     }
 
-    async fn ethereum_usdc_balance(&self, holder: Address) -> Result<U256, CctpError> {
-        Ok(self.ethereum_stable().balance(holder).await?)
+    async fn ethereum_mined_tx(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<Option<MinedTx>, StableEndpointError> {
+        self.ethereum_stable().mined_tx(tx_hash).await
+    }
+
+    async fn ethereum_usdc_balance(&self, holder: Address) -> Result<U256, StableEndpointError> {
+        self.ethereum_stable().balance(holder).await
     }
 
     async fn ethereum_usdc_credit(
         &self,
         tx_hash: TxHash,
         recipient: Address,
-    ) -> Result<U256, CctpError> {
-        Ok(self
-            .ethereum_stable()
+    ) -> Result<U256, StableEndpointError> {
+        self.ethereum_stable()
             .credited_in_tx(tx_hash, recipient)
-            .await?)
+            .await
     }
 
     async fn ethereum_usdc_sent(
@@ -369,26 +399,25 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> UsdcBridgeHelper
         tx_hash: TxHash,
         sender: Address,
         recipient: Address,
-    ) -> Result<U256, CctpError> {
-        Ok(self
-            .ethereum_stable()
+    ) -> Result<U256, StableEndpointError> {
+        self.ethereum_stable()
             .sent_in_tx(tx_hash, sender, recipient)
-            .await?)
+            .await
     }
 
     async fn prepare_usdc_on_ethereum(
         &self,
         to: Address,
         amount: U256,
-    ) -> Result<PreparedTransaction, CctpError> {
-        Ok(self.ethereum_stable().prepare_transfer(to, amount).await?)
+    ) -> Result<PreparedTransaction, StableEndpointError> {
+        self.ethereum_stable().prepare_transfer(to, amount).await
     }
 
     async fn broadcast_usdc_on_ethereum(
         &self,
         prepared: &PreparedTransaction,
-    ) -> Result<TxHash, CctpError> {
-        Ok(self.ethereum_stable().broadcast_transfer(prepared).await?)
+    ) -> Result<TxHash, StableEndpointError> {
+        self.ethereum_stable().broadcast_transfer(prepared).await
     }
 
     async fn discard_usdc_on_ethereum(&self, prepared: &PreparedTransaction) {
@@ -402,8 +431,8 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> UsdcBridgeHelper
     async fn confirm_usdc_on_ethereum(
         &self,
         tx_hash: TxHash,
-    ) -> Result<UsdcTransferStatus, CctpError> {
-        Ok(self.ethereum_stable().confirm_transfer(tx_hash).await?)
+    ) -> Result<UsdcTransferStatus, StableEndpointError> {
+        self.ethereum_stable().confirm_transfer(tx_hash).await
     }
 
     async fn find_recent_usdc_transfers(
@@ -412,11 +441,10 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> UsdcBridgeHelper
         to: Address,
         amount: U256,
         from_block: u64,
-    ) -> Result<Vec<TxHash>, CctpError> {
-        Ok(self
-            .ethereum_stable()
+    ) -> Result<Vec<TxHash>, StableEndpointError> {
+        self.ethereum_stable()
             .find_recent_transfers(from, to, amount, from_block)
-            .await?)
+            .await
     }
 }
 
@@ -1730,7 +1758,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
                 .await?;
                 return Err(UsdcTransferError::SettlementCheckTransient {
                     id: id.clone(),
-                    source: Box::new(error),
+                    source: Box::new(error.into()),
                 });
             }
         };
@@ -1998,7 +2026,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
             .await
             .map_err(|error| UsdcTransferError::SettlementCheckTransient {
                 id: id.clone(),
-                source: Box::new(error),
+                source: Box::new(error.into()),
             })? {
             None => {
                 warn!(
@@ -2648,7 +2676,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
             .cctp_bridge
             .ethereum_tx_block(mint_tx)
             .await
-            .map_err(|error| UsdcTransferError::Cctp(Box::new(error)))?;
+            .map_err(B::hub_leg_failure)?;
 
         let matches = self
             .cctp_bridge
@@ -2659,7 +2687,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
                 from_block,
             )
             .await
-            .map_err(|error| UsdcTransferError::Cctp(Box::new(error)))?;
+            .map_err(B::hub_leg_failure)?;
 
         if let Some(unrecorded_tx) = self.first_unclaimed_deposit_send(id, matches).await? {
             return Err(self
@@ -2768,7 +2796,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
                 .inspect_err(|error| {
                     warn!(target: "rebalance", id = %task_id, %error, "Signing the Alpaca deposit send failed; nothing was sent");
                 })
-                .map_err(|error| UsdcTransferError::Cctp(Box::new(error)))?;
+                .map_err(B::hub_leg_failure)?;
 
             // Anchors this attempt's alert deadline; a resume reads the
             // persisted time instead.
@@ -2818,13 +2846,13 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
         self.cctp_bridge
             .broadcast_usdc_on_ethereum(prepared)
             .await
-            .map_err(|error| pending(DepositSendPending::Broadcast(Box::new(error))))?;
+            .map_err(|error| pending(DepositSendPending::Broadcast(Box::new(error.into()))))?;
 
         let status = self
             .cctp_bridge
             .confirm_usdc_on_ethereum(expected)
             .await
-            .map_err(|error| pending(DepositSendPending::Confirmation(Box::new(error))))?;
+            .map_err(|error| pending(DepositSendPending::Confirmation(Box::new(error.into()))))?;
 
         match status {
             UsdcTransferStatus::Confirmed => {
@@ -3240,7 +3268,8 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
 /// that run them.
 impl<
     Signer: Wallet,
-    B: Bridge<Error = CctpError, Attestation = AttestationResponse> + UsdcBridgeHelper,
+    B: Bridge<Error = CctpError, Attestation = AttestationResponse>
+        + UsdcBridgeHelper<HubError = CctpError>,
 > CrossVenueCashTransfer<Signer, B>
 {
     fn attestation_retry_deadline_at(
@@ -7110,9 +7139,9 @@ pub async fn verify_deposit_send_superseded<Helper: UsdcBridgeHelper + ?Sized>(
         });
     }
 
-    let read = |source| DepositSendNotSuperseded::Read {
+    let read = |source: Helper::HubError| DepositSendNotSuperseded::Read {
         superseding,
-        source: Box::new(source),
+        source: Box::new(source.into()),
     };
     let mined = bridge.ethereum_mined_tx(superseding).await.map_err(read)?;
     let Some(MinedTx {
@@ -8072,6 +8101,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl UsdcBridgeHelper for MockBridge {
+        type HubError = CctpError;
+
+        fn hub_leg_failure(error: CctpError) -> UsdcTransferError {
+            UsdcTransferError::Cctp(Box::new(error))
+        }
+
         async fn ethereum_tx_confirmations(
             &self,
             tx_hash: TxHash,
@@ -8339,8 +8374,14 @@ mod tests {
     #[async_trait::async_trait]
     impl<InnerBridge> UsdcBridgeHelper for MintErrorBridge<InnerBridge>
     where
-        InnerBridge: UsdcBridgeHelper,
+        InnerBridge: UsdcBridgeHelper<HubError = CctpError>,
     {
+        type HubError = CctpError;
+
+        fn hub_leg_failure(error: CctpError) -> UsdcTransferError {
+            InnerBridge::hub_leg_failure(error)
+        }
+
         async fn ethereum_tx_confirmations(
             &self,
             tx_hash: TxHash,
@@ -8551,8 +8592,14 @@ mod tests {
     #[async_trait::async_trait]
     impl<InnerBridge> UsdcBridgeHelper for FindAttestedMintErrorBridge<InnerBridge>
     where
-        InnerBridge: UsdcBridgeHelper,
+        InnerBridge: UsdcBridgeHelper<HubError = CctpError>,
     {
+        type HubError = CctpError;
+
+        fn hub_leg_failure(error: CctpError) -> UsdcTransferError {
+            InnerBridge::hub_leg_failure(error)
+        }
+
         async fn ethereum_tx_confirmations(
             &self,
             tx_hash: TxHash,
@@ -8762,8 +8809,14 @@ mod tests {
     #[async_trait::async_trait]
     impl<InnerBridge> UsdcBridgeHelper for CreditReadErrorBridge<InnerBridge>
     where
-        InnerBridge: UsdcBridgeHelper,
+        InnerBridge: UsdcBridgeHelper<HubError = CctpError>,
     {
+        type HubError = CctpError;
+
+        fn hub_leg_failure(error: CctpError) -> UsdcTransferError {
+            InnerBridge::hub_leg_failure(error)
+        }
+
         async fn ethereum_tx_confirmations(
             &self,
             tx_hash: TxHash,
@@ -30559,7 +30612,7 @@ mod tests {
         })
         .unwrap()
         .with_local_contracts(contracts, contracts);
-        let helper: &dyn UsdcBridgeHelper = &bridge;
+        let helper: &dyn UsdcBridgeHelper<HubError = StableEndpointError> = &bridge;
 
         let mint_tx = MintableStable::new(contracts.stable, &deployer)
             .mint(wallet, minted)
