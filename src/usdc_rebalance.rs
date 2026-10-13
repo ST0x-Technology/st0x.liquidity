@@ -2932,8 +2932,9 @@ impl EventSourced for UsdcRebalance {
     // v13: `WithdrawalFailed.withdrawal_ref` is optional: `RejectWithdrawal`
     // fails a withdrawal rejected before it was sent, which has no reference.
     // v14: the post-hop states carry `hop: HopEvidence` in place of the burn
-    // and mint hashes, and the Relay swap states exist. Events are unchanged,
-    // so replay rebuilds every snapshot into the new shape.
+    // and mint hashes, and the Relay swap states exist, with four new events
+    // that record them. No existing event changed shape, so replay rebuilds
+    // every snapshot into the new shape.
     const SCHEMA_VERSION: u64 = 14;
 
     fn originate(event: &Self::Event) -> Option<Self> {
