@@ -19,7 +19,7 @@ use super::proof::{
 };
 use super::quote::{StepTerms, StepTransaction, check_steps};
 use super::{AcceptedRelayQuote, QuoteField, QuoteMismatch, RelayOrderId};
-use crate::stable_endpoint::StableEndpoint;
+use crate::stable_endpoint::{SCAN_ATTEMPTS, SCAN_RETRY_BACKOFF, StableEndpoint};
 use crate::{
     DepositScan, HopDirection, PreparedSwap, PreparedSwapDeposit, SwapBridge, SwapDeposit,
     SwapPayment, SwapSide,
@@ -37,13 +37,6 @@ const RELAY_DEPOSIT_GAS_LIMIT: u64 = 57_114;
 
 /// Blocks per `eth_getLogs` call of a deposit scan.
 const DEPOSIT_LOG_CHUNK: u64 = 10_000;
-
-/// Reads of each chunk of a deposit scan: one lagging load-balanced node can
-/// answer a range empty, as `CctpEndpoint::find_recent_burn` also guards.
-const SCAN_ATTEMPTS: u32 = 5;
-
-/// Pause between reads of a chunk, so another node may answer.
-const SCAN_RETRY_BACKOFF: Duration = Duration::from_millis(150);
 
 /// Who builds a [`RelayBridge`]: the corridor chain and a wallet on each end,
 /// with the confirmations each end requires of a deposit, a payment and a
