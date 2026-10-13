@@ -7575,6 +7575,63 @@ mod tests {
         );
     }
 
+    /// A refund after a re-quote is measured against the transfer's first
+    /// deposit: 99.2 clears the 99.6 re-quote's floor of 99.102 but not the
+    /// 100 deposit's floor of 99.5, so it is held.
+    #[tokio::test]
+    async fn requoted_refund_below_the_first_deposits_floor_is_held() {
+        let deposited = deposited(RebalanceDirection::AlpacaToBase);
+        let refund = |refund_tx: u8, amount_refunded: u64| UsdcRebalanceCommand::RecordSwapRefund {
+            refund_tx: TxHash::repeat_byte(refund_tx),
+            side: RefundSide::Origin,
+            amount_refunded: U256::from(amount_refunded),
+        };
+        let first_refund = TestHarness::<UsdcRebalance>::with(())
+            .given(deposited.clone())
+            .when(refund(0xe1, 99_600_000))
+            .await
+            .events();
+        let deposited_again = [
+            deposited,
+            first_refund,
+            vec![
+                UsdcRebalanceEvent::SwapRequoted {
+                    quote: Box::new(swap_quote_for_test(
+                        U256::from(99_600_000u64),
+                        B256::repeat_byte(0x1e),
+                    )),
+                    quoted_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::SwapDepositPrepared {
+                    approve: None,
+                    deposit: PreparedTransaction::for_test(TxHash::repeat_byte(0xa3), 7),
+                    prepared_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::SwapDeposited {
+                    deposit_tx: TxHash::repeat_byte(0xa3),
+                    deposit_block: 10,
+                    deposited_at: Utc::now(),
+                },
+            ],
+        ]
+        .concat();
+
+        let second_refund = TestHarness::<UsdcRebalance>::with(())
+            .given(deposited_again.clone())
+            .when(refund(0xe2, 99_200_000))
+            .await
+            .events();
+        let state = replay::<UsdcRebalance>([deposited_again, second_refund].concat())
+            .unwrap()
+            .unwrap();
+
+        let UsdcRebalance::SwapRefunded { short_of_floor, .. } = &state else {
+            panic!("expected SwapRefunded, got {state:?}");
+        };
+        assert_eq!(*short_of_floor, Some(U256::from(99_500_000u64)));
+        assert!(state.is_reconcilable_failure());
+    }
+
     /// A re-quote after a refund must be for the refunded amount, under an
     /// order id never signed, and only for an Alpaca-to-chain refund at the
     /// hub.
