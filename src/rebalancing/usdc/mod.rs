@@ -43,6 +43,7 @@ use tracing::error;
 
 use st0x_bridge::cctp::CctpError;
 use st0x_bridge::corridor::UsdcCorridor;
+use st0x_bridge::stable_endpoint::StableEndpointError;
 use st0x_event_sorcery::SendError;
 use st0x_execution::{
     AlpacaBrokerApiError, AlpacaWalletError, ClientOrderId, InvalidSharesError, NotPositive,
@@ -67,6 +68,9 @@ pub enum UsdcTransferError {
     AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
     #[error("CCTP bridge error: {0}")]
     Cctp(#[from] Box<CctpError>),
+    /// A hub leg's Ethereum stable read or send failed on a hop without CCTP.
+    #[error("Ethereum stable error: {0}")]
+    StableEndpoint(#[from] Box<StableEndpointError>),
     #[error(
         "USDC rebalance {id}: burn {tx} is already recorded by rebalance {recorded_by}; not adopting or reburning"
     )]
@@ -684,6 +688,7 @@ impl UsdcTransferError {
             Self::AlpacaWallet(_)
             | Self::AlpacaBrokerApi(_)
             | Self::Cctp(_)
+            | Self::StableEndpoint(_)
             | Self::BurnTxAlreadyRecorded { .. }
             | Self::BurnTxOwnershipUnchecked { .. }
             | Self::BurnTxOwnershipLookupFailed { .. }
@@ -753,6 +758,7 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::AlpacaWallet(_)
             | Self::AlpacaBrokerApi(_)
             | Self::Cctp(_)
+            | Self::StableEndpoint(_)
             | Self::BurnTxAlreadyRecorded { .. }
             | Self::BurnTxOwnershipUnchecked { .. }
             | Self::BurnTxOwnershipLookupFailed { .. }

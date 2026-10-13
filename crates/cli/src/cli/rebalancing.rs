@@ -715,6 +715,7 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::AlpacaWallet(_)
         | UsdcTransferError::AlpacaBrokerApi(_)
         | UsdcTransferError::Cctp(_)
+        | UsdcTransferError::StableEndpoint(_)
         | UsdcTransferError::BotGasEnqueue(_)
         | UsdcTransferError::BurnRevert(_)
         | UsdcTransferError::Vault(_)

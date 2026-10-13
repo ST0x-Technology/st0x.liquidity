@@ -17,6 +17,8 @@ pub mod cctp;
 pub mod corridor;
 #[cfg(feature = "relay")]
 pub mod relay;
+#[cfg(any(feature = "cctp", feature = "relay"))]
+pub mod stable_endpoint;
 
 /// Direction of a bridge transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
