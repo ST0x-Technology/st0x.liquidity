@@ -84,7 +84,7 @@ pub struct QuoteAmounts {
 
 impl QuoteAmounts {
     /// Accepts the quote only if every bound holds.
-    pub fn accept(&self, bounds: &QuoteBounds) -> Result<(), QuoteAcceptanceError> {
+    pub(super) fn accept(&self, bounds: &QuoteBounds) -> Result<(), QuoteAcceptanceError> {
         let Self {
             amount_in,
             expected_out,

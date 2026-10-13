@@ -1,6 +1,7 @@
 //! `POST /quote/v2`: the request we send, the quote we accept, and the checks
 //! that bind Relay's approve and deposit steps to the transfer we asked for.
 
+use std::ops::Deref;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, B256, Bytes, U256};
@@ -11,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use st0x_evm::Chain;
 
-use super::acceptance::{BasisPoints, QuoteAmounts};
+use super::acceptance::{BasisPoints, QuoteAcceptanceError, QuoteAmounts, QuoteBounds};
 
 sol! {
     function approve(address spender, uint256 amount) external returns (bool);
@@ -133,20 +134,102 @@ impl std::fmt::Display for RelayOrderId {
 }
 
 /// A quote whose approve and deposit steps were checked against the request.
+///
+/// Only [`RelayClient::quote`](super::RelayClient::quote) builds one, and its
+/// steps are signable only once [`Self::accept`] clears its amounts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayQuote {
-    pub request_id: RelayRequestId,
+    pub(super) request_id: RelayRequestId,
+    pub(super) order_id: RelayOrderId,
+    pub(super) amounts: QuoteAmounts,
+    pub(super) deadline: SystemTime,
+    pub(super) fees: QuoteFees,
+    pub(super) origin: Chain,
+    pub(super) destination: Chain,
+    pub(super) recipient: Address,
+    pub(super) refund_to: Address,
+    pub(super) approve: Option<StepTransaction>,
+    pub(super) deposit: StepTransaction,
+}
+
+impl RelayQuote {
+    pub const fn request_id(&self) -> RelayRequestId {
+        self.request_id
+    }
+
     /// Decoded from the deposit step's calldata, equal to
     /// `protocol.v2.orderId` and to the hash of the checked order.
-    pub order_id: RelayOrderId,
-    pub amounts: QuoteAmounts,
+    pub const fn order_id(&self) -> RelayOrderId {
+        self.order_id
+    }
+
+    pub const fn amounts(&self) -> QuoteAmounts {
+        self.amounts
+    }
+
     /// The order's `output.deadline`: until then the solver may still fill.
     /// Relay sets it a week after the quote whatever `ttl` asks for.
-    pub deadline: SystemTime,
-    pub fees: QuoteFees,
+    pub const fn deadline(&self) -> SystemTime {
+        self.deadline
+    }
+
+    pub const fn fees(&self) -> QuoteFees {
+        self.fees
+    }
+
+    /// The chain the deposit is on, checked against the request.
+    pub const fn origin(&self) -> Chain {
+        self.origin
+    }
+
+    /// The chain the solver fills on, checked against the request.
+    pub const fn destination(&self) -> Chain {
+        self.destination
+    }
+
+    /// Who the fill pays, checked against the request.
+    pub const fn recipient(&self) -> Address {
+        self.recipient
+    }
+
+    /// Who every refund option pays, on either chain, checked against the
+    /// request.
+    pub const fn refund_to(&self) -> Address {
+        self.refund_to
+    }
+
+    /// The quote, ready to sign, if its amounts clear `bounds`.
+    pub fn accept(self, bounds: &QuoteBounds) -> Result<AcceptedRelayQuote, QuoteAcceptanceError> {
+        self.amounts.accept(bounds)?;
+        Ok(AcceptedRelayQuote(self))
+    }
+}
+
+/// A [`RelayQuote`] whose amounts cleared the caller's bounds: the only form
+/// whose steps [`RelayBridge`](super::RelayBridge) signs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedRelayQuote(RelayQuote);
+
+impl Deref for AcceptedRelayQuote {
+    type Target = RelayQuote;
+
+    fn deref(&self) -> &RelayQuote {
+        let Self(quote) = self;
+        quote
+    }
+}
+
+impl AcceptedRelayQuote {
     /// `None` when Relay sends no approve step.
-    pub approve: Option<StepTransaction>,
-    pub deposit: StepTransaction,
+    pub const fn approve(&self) -> Option<&StepTransaction> {
+        let Self(quote) = self;
+        quote.approve.as_ref()
+    }
+
+    pub const fn deposit(&self) -> &StepTransaction {
+        let Self(quote) = self;
+        &quote.deposit
+    }
 }
 
 /// Fees Relay quoted, both paid on the origin chain.
@@ -580,14 +663,17 @@ impl QuoteResponse {
 
         let (approve, deposit) = split_steps(self.steps)?;
 
-        let approve = approve
-            .map(|approve| {
-                check_approve(&approve, origin, origin_stable, depository, request.amount)?;
-                Ok::<_, QuoteMismatch>(approve)
-            })
-            .transpose()?;
-
-        let order_id = check_deposit(&deposit, request, origin_stable, depository)?;
+        let order_id = check_steps(
+            approve.as_ref(),
+            &deposit,
+            &StepTerms {
+                chain_id: origin.chain_id(),
+                stable: origin_stable,
+                depository,
+                depositor: request.user,
+                amount: request.amount,
+            },
+        )?;
 
         let quoted = RelayOrderId(self.protocol.v2.order_id);
         if quoted != order_id {
@@ -619,6 +705,10 @@ impl QuoteResponse {
                 relayer: self.fees.relayer.amount,
                 gas: self.fees.gas.amount,
             },
+            origin,
+            destination: request.destination,
+            recipient: request.recipient,
+            refund_to: request.refund_to,
             approve,
             deposit,
         })
@@ -989,17 +1079,44 @@ fn split_steps(
     Ok((approve, deposit))
 }
 
+/// What a quote's approve and deposit steps must say: sent on `chain_id`,
+/// with no native value, the approve to `stable` allowing `depository`
+/// exactly `amount`, and the deposit to `depository` crediting `depositor`
+/// that `amount` of `stable`.
+pub(super) struct StepTerms {
+    pub(super) chain_id: u64,
+    pub(super) stable: Address,
+    pub(super) depository: Address,
+    pub(super) depositor: Address,
+    pub(super) amount: U256,
+}
+
+/// The one check of a quote's steps, run when the quote is parsed and again
+/// before its steps are signed. Returns the order id the deposit calldata
+/// names.
+pub(super) fn check_steps(
+    approve: Option<&StepTransaction>,
+    deposit: &StepTransaction,
+    terms: &StepTerms,
+) -> Result<RelayOrderId, QuoteMismatch> {
+    if let Some(approve) = approve {
+        check_approve(approve, terms)?;
+    }
+
+    check_deposit(deposit, terms)
+}
+
 fn check_step_envelope(
     step: QuoteStep,
     transaction: &StepTransaction,
-    origin: Chain,
+    chain_id: u64,
     target_field: QuoteField,
     expected_target: Address,
 ) -> Result<(), QuoteMismatch> {
-    if transaction.chain_id != origin.chain_id() {
+    if transaction.chain_id != chain_id {
         return Err(QuoteMismatch::StepChain {
             step,
-            expected: origin.chain_id(),
+            expected: chain_id,
             actual: transaction.chain_id,
         });
     }
@@ -1016,19 +1133,13 @@ fn check_step_envelope(
     Ok(())
 }
 
-fn check_approve(
-    approve: &StepTransaction,
-    origin: Chain,
-    origin_stable: Address,
-    depository: Address,
-    amount: U256,
-) -> Result<(), QuoteMismatch> {
+fn check_approve(approve: &StepTransaction, terms: &StepTerms) -> Result<(), QuoteMismatch> {
     check_step_envelope(
         QuoteStep::Approve,
         approve,
-        origin,
+        terms.chain_id,
         QuoteField::ApproveTarget,
-        origin_stable,
+        terms.stable,
     )?;
 
     let call =
@@ -1037,22 +1148,20 @@ fn check_approve(
             source,
         })?;
 
-    check_address(QuoteField::ApproveSpender, depository, call.spender)?;
-    check_amount(QuoteField::ApproveAmount, amount, call.amount)
+    check_address(QuoteField::ApproveSpender, terms.depository, call.spender)?;
+    check_amount(QuoteField::ApproveAmount, terms.amount, call.amount)
 }
 
 fn check_deposit(
     deposit: &StepTransaction,
-    request: &QuoteRequest,
-    origin_stable: Address,
-    depository: Address,
+    terms: &StepTerms,
 ) -> Result<RelayOrderId, QuoteMismatch> {
     check_step_envelope(
         QuoteStep::Deposit,
         deposit,
-        request.origin,
+        terms.chain_id,
         QuoteField::DepositTarget,
-        depository,
+        terms.depository,
     )?;
 
     let call = depositErc20Call::abi_decode(&deposit.data).map_err(|source| {
@@ -1062,9 +1171,9 @@ fn check_deposit(
         }
     })?;
 
-    check_address(QuoteField::Depositor, request.user, call.depositor)?;
-    check_address(QuoteField::DepositToken, origin_stable, call.token)?;
-    check_amount(QuoteField::DepositAmount, request.amount, call.amount)?;
+    check_address(QuoteField::Depositor, terms.depositor, call.depositor)?;
+    check_address(QuoteField::DepositToken, terms.stable, call.token)?;
+    check_amount(QuoteField::DepositAmount, terms.amount, call.amount)?;
 
     Ok(RelayOrderId(call.id))
 }
@@ -1096,7 +1205,6 @@ pub(super) mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::relay::acceptance::QuoteBounds;
 
     pub(in crate::relay) const FUNDED_QUOTE: &str =
         include_str!("../../relay-fixtures/quote_funded_robinhood_to_ethereum.json");
@@ -1349,8 +1457,29 @@ pub(super) mod tests {
         ] {
             let quote = validate(&serde_json::from_str(fixture).unwrap(), &request).unwrap();
 
-            assert_eq!(quote.amounts.accept(&bounds), Ok(()), "{:?}", quote.amounts);
+            quote.accept(&bounds).unwrap();
         }
+    }
+
+    /// The fixed relayer fee is 4.7% of the funded 5 dollar transfer.
+    #[test]
+    fn quote_losing_more_than_the_bound_is_not_accepted() {
+        let quote = validate(&funded_body(), &funded_request()).unwrap();
+
+        let error = quote
+            .accept(&QuoteBounds {
+                max_loss: BasisPoints::new(50).unwrap(),
+                downstream_minimum: U256::ZERO,
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            QuoteAcceptanceError::QuoteLossExceedsBound {
+                minimum: U256::from(4_749_464),
+                bound: U256::from(4_975_000),
+            }
+        );
     }
 
     #[test]

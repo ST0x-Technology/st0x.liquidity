@@ -2,22 +2,35 @@
 //!
 //! Relay moves a stable between chains through a depository and a solver: we
 //! approve and deposit on the origin chain, and Relay's solver pays the
-//! recipient on the destination chain. This module speaks the HTTP API only:
-//! [`RelayClient::quote`] fetches and checks a quote, and
-//! [`RelayClient::status`] reads where an order is. See `docs/relay.md`.
+//! recipient on the destination chain. [`RelayClient::quote`] fetches and
+//! checks a quote, and [`RelayClient::status`] reads where an order is.
+//! [`RelayBridge`] signs and sends the deposit and proves the fill or refund
+//! on chain. See `docs/relay.md`.
 
 mod acceptance;
+mod evm;
+mod proof;
 mod quote;
 mod status;
+#[cfg(test)]
+mod test_chain;
+#[cfg(any(test, feature = "mock"))]
+mod test_contracts;
 
 pub use acceptance::{
     BasisPoints, BasisPointsOutOfRange, QuoteAcceptanceError, QuoteAmounts, QuoteBounds,
 };
+#[cfg(any(test, feature = "mock"))]
+pub use evm::RelayEndContracts;
+pub use evm::{RelayBridge, RelayBridgeError, RelayCtx};
+pub use proof::UnverifiedReason;
 pub use quote::{
-    QuoteFees, QuoteField, QuoteMismatch, QuoteRequest, QuoteStep, QuotedCurrency, RelayOrderId,
-    RelayQuote, RelayRequestId, StepTransaction,
+    AcceptedRelayQuote, QuoteFees, QuoteField, QuoteMismatch, QuoteRequest, QuoteStep,
+    QuotedCurrency, RelayOrderId, RelayQuote, RelayRequestId, StepTransaction,
 };
 pub use status::{FailReason, InFlightStage, IntentStatus, IntentStatusReport};
+#[cfg(feature = "mock")]
+pub use test_contracts::deploy_relay_end;
 
 use std::time::Duration;
 
@@ -106,7 +119,8 @@ impl RelayClient {
     }
 
     /// Fetches an exact-input quote and checks its steps against `request`.
-    /// Bound checks on the amounts are the caller's ([`QuoteAmounts::accept`]).
+    /// Bound checks on the amounts are the caller's: [`RelayQuote::accept`]
+    /// yields the [`AcceptedRelayQuote`] whose steps [`RelayBridge`] signs.
     /// An origin with no pinned depository, or a client with no API key, is
     /// refused before any request.
     pub async fn quote(&self, request: &QuoteRequest) -> Result<RelayQuote, RelayError> {

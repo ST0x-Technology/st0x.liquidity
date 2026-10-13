@@ -11,8 +11,9 @@ bridge-crate-specific additions and clarifications.
 ## Bridge Crate Scope
 
 This is a **standalone library crate** for cross-chain settlement-stable
-transfers: a generic `Bridge` trait for CCTP's USDC burn and mint, and a Relay
-API client for USDG <-> USDC. When working in this crate:
+transfers: a generic `Bridge` trait for CCTP's USDC burn and mint, and a
+`SwapBridge` trait with the Relay API client and `RelayBridge` for USDG <->
+USDC. When working in this crate:
 
 - **Stay focused on bridge abstractions**: This crate should remain independent
   of the parent application
@@ -22,6 +23,8 @@ API client for USDG <-> USDC. When working in this crate:
   trait and shared domain types. Features:
   - `cctp`: the CCTP implementation
   - `relay`: the Relay API client (`relay` module, see `docs/relay.md`)
+  - `mock`: CCTP and Relay stand-in contracts and their deployers, for
+    integration tests downstream (`deploy_relay_end` needs `relay` too)
   - the `corridor` module compiles under either
 
 ## CRITICAL: No Leaky Abstractions
@@ -46,6 +49,12 @@ not the CCTP implementation directly. Implementation details must remain hidden.
 5. **Context type** - `CctpCtx` (behind `cctp` feature)
 6. **Relay client** - `RelayClient`, `RelayApiKey`, the quote, status and
    quote-acceptance types, and `RelayError` (behind `relay` feature)
+7. **Swap bridge** - the `SwapBridge` trait and its domain types
+   (`HopDirection`, `PreparedSwap`, `PreparedSwapDeposit`, `SwapDeposit`,
+   `DepositScan`, `SwapSide`, `SwapPayment`), `RelayBridge`, `RelayCtx`,
+   `RelayBridgeError` and `UnverifiedReason` (behind `relay` feature)
+8. **Test stand-ins** - the CCTP deployers, `deploy_relay_end`,
+   `RelayEndContracts` and `RelayBridge::with_local_contracts` (behind `mock`)
 
 **What must remain private:**
 
@@ -67,14 +76,28 @@ not the CCTP implementation directly. Implementation details must remain hidden.
 
 - **HTTP mocking**: Use `httpmock` for Circle API testing
 - **Anvil**: Use `alloy::node_bindings::Anvil` for on-chain integration tests
+- **Relay test contracts**: `relay-test-contracts/` holds the Solidity sources
+  and the solc 0.8.25 artifacts of the Anvil `MockDepository` and `MockStable`.
+  When a source changes, rebuild both flat `{abi, bytecode}` artifacts from that
+  directory, in a shell that provides `solc-0.8.25` (`nix develop` does not):
+
+  ```bash
+  nix shell --inputs-from . 'rainix#pkgs.x86_64-linux.solc_0_8_25'
+  for contract in MockStable MockDepository; do
+    solc-0.8.25 --optimize --combined-json abi,bin "$contract.sol" \
+      | jq --arg key "$contract.sol:$contract" \
+        '.contracts[$key] | {abi, bytecode: ("0x" + .bin)}' > "$contract.json"
+  done
+  ```
 - **No test utils bloat**: Only add test utilities that are reused across
   multiple test modules
 
 ## Architecture Constraints
 
-- **Trait-based design**: All functionality goes through the `Bridge` trait
-- **Feature flags**: CCTP implementation behind `cctp`, Relay client behind
-  `relay`
+- **Trait-based design**: All functionality goes through the `Bridge` and
+  `SwapBridge` traits
+- **Feature flags**: CCTP implementation behind `cctp`, Relay client and
+  `RelayBridge` behind `relay`
 - **No runtime selection**: Implementation choice happens at compile time
   through generics
 - **Associated types**: Error and Attestation types are associated to enable

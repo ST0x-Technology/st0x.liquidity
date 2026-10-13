@@ -1,0 +1,64 @@
+{
+  "abi": [
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": false,
+          "internalType": "address",
+          "name": "from",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "address",
+          "name": "token",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "amount",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "bytes32",
+          "name": "id",
+          "type": "bytes32"
+        }
+      ],
+      "name": "RelayErc20Deposit",
+      "type": "event"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "depositor",
+          "type": "address"
+        },
+        {
+          "internalType": "address",
+          "name": "token",
+          "type": "address"
+        },
+        {
+          "internalType": "uint256",
+          "name": "amount",
+          "type": "uint256"
+        },
+        {
+          "internalType": "bytes32",
+          "name": "id",
+          "type": "bytes32"
+        }
+      ],
+      "name": "depositErc20",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    }
+  ],
+  "bytecode": "0x6080604052348015600e575f80fd5b506102068061001c5f395ff3fe608060405234801561000f575f80fd5b5060043610610029575f3560e01c8063e80179521461002d575b5f80fd5b61004061003b36600461016b565b610042565b005b6040516323b872dd60e01b8152336004820152306024820152604481018390526001600160a01b038416906323b872dd906064016020604051808303815f875af1158015610092573d5f803e3d5ffd5b505050506040513d601f19601f820116820180604052508101906100b691906101aa565b6100f85760405162461bcd60e51b815260206004820152600f60248201526e1d1c985b9cd9995c8819985a5b1959608a1b604482015260640160405180910390fd5b604080516001600160a01b03808716825285166020820152908101839052606081018290527f49fed1d0b752ce30eee63c7a81133f3363b532fec5d4d7dd1ccfd005de4555e19060800160405180910390a150505050565b80356001600160a01b0381168114610166575f80fd5b919050565b5f805f806080858703121561017e575f80fd5b61018785610150565b935061019560208601610150565b93969395505050506040820135916060013590565b5f602082840312156101ba575f80fd5b815180151581146101c9575f80fd5b939250505056fea2646970667358221220f4675efe7650a56a8669aa306838da6eea69253779489cd58d335a65f546237364736f6c63430008190033"
+}
