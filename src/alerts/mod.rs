@@ -161,6 +161,9 @@ alert_kinds! {
         RecoveryChainServicesMissing => "its chain has no equity services",
         WrappedRecoveryValidationFailed => "active aggregate validation failed",
         RecoveryClaimHeldForOtherChain => "the slot is held for another chain's recovery",
+        AuditedOperatorCommandPanicked => "Audited operator command panicked",
+        AuditedOperatorCommandTaskFailed => "Audited operator command task failed",
+        OperationsAuditRecordingFailed => "Operations audit recording failed",
     }
 }
 

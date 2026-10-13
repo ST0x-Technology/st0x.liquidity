@@ -913,7 +913,8 @@ mod tests {
         let event_sender = state.event_sender.clone();
         let inventory = Arc::clone(&state.inventory);
 
-        let app = crate::api::routes(None).with_state(state);
+        let detached_tasks = state.detached_tasks.clone();
+        let app = crate::api::routes(None, &detached_tasks).with_state(state);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();

@@ -39,6 +39,8 @@ use serde::Deserialize;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+use crate::operations_audit::record_principal;
+
 /// Header IAP stamps on every request it forwards.
 const ASSERTION_HEADER: &str = "x-goog-iap-jwt-assertion";
 
@@ -410,7 +412,8 @@ pub(crate) async fn require_iap(
             IapError::MalformedAssertion
         })?;
 
-    verifier.verify(token).await?;
+    let principal = verifier.verify(token).await?;
+    record_principal(&request, principal);
 
     Ok(next.run(request).await)
 }

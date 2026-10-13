@@ -65,6 +65,7 @@ mod native_gas;
 mod offchain;
 mod onchain;
 mod onchain_trade;
+mod operations_audit;
 pub mod operator;
 mod performance;
 mod portfolio_snapshot;
@@ -716,8 +717,9 @@ fn spawn_server_supervisor(
 ) -> SupervisorHandle {
     // Read before `state` moves into the router below.
     let ops_api = state.ctx.ops_api.clone();
+    let detached_tasks = state.detached_tasks.clone();
 
-    let main_router = api::routes(ops_api.as_ref()).with_state(state);
+    let main_router = api::routes(ops_api.as_ref(), &detached_tasks).with_state(state);
 
     // apalis-board's embedded UI is built with hardcoded absolute paths
     // (`/apalis-board-web-*`) and the wasm calls `/api/v1/*` directly,

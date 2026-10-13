@@ -7,11 +7,11 @@ use std::sync::Arc;
 use alloy::primitives::{TxHash, U256};
 use axum::Json;
 use axum::Router;
-use axum::extract::{ConnectInfo, Path, Query, Request, State};
+use axum::extract::{ConnectInfo, MatchedPath, Path, Query, Request, State};
 use axum::http::header::{CACHE_CONTROL, HeaderName};
 use axum::http::{Method, StatusCode};
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use chrono::{DateTime, NaiveDate, Utc};
 use rain_math_float::Float;
@@ -55,6 +55,10 @@ use crate::equity_redemption::{
 };
 use crate::iap_auth::{IapVerifier, require_iap};
 use crate::offchain::order::{OffchainOrderId, OrderPlacer, PollOrderStatusJobQueue};
+use crate::operations_audit::{
+    Audited, AuditedQuery, AuditedRequest, audit_request, capture_audit_path_targets,
+    record_principal, set_audit_route_template,
+};
 use crate::operator::OperatorError;
 use crate::operator::equity_transfer::{
     EquityTransferKind, FailTransferError, validate_failure_reason,
@@ -1317,7 +1321,7 @@ async fn raindex_orders(
 }
 
 #[derive(Debug, Serialize)]
-struct ErrorResponse {
+pub(crate) struct ErrorResponse {
     error: String,
 }
 
@@ -1600,13 +1604,19 @@ struct FailTransferRequest {
     reason: String,
 }
 
+impl AuditedRequest for FailTransferRequest {
+    fn audit_reason(&self) -> Option<&str> {
+        Some(&self.reason)
+    }
+}
+
 /// Force-fails one equity transfer through the conductor-owned CQRS store so
 /// the terminal event reaches the live transfer reactor before this request
 /// returns.
 async fn fail_transfer(
     State(state): State<AppState>,
     Path((kind_str, id)): Path<(String, String)>,
-    Json(request): Json<FailTransferRequest>,
+    Audited(request): Audited<FailTransferRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     validate_failure_reason(&request.reason).map_err(|error| {
         (
@@ -1735,6 +1745,14 @@ struct RecheckQuery {
     deposit_tx: Option<TxHash>,
 }
 
+/// The operator asserts `deposit_tx` in the query string, so it identifies
+/// what the recheck acted on.
+impl AuditedRequest for RecheckQuery {
+    fn audit_targets(&self) -> Vec<String> {
+        self.deposit_tx.iter().map(ToString::to_string).collect()
+    }
+}
+
 /// Re-checks a single failed (or active) transfer against the tokenization
 /// provider, recovering it in-process so the live inventory view is corrected.
 ///
@@ -1750,7 +1768,7 @@ struct RecheckQuery {
 async fn recheck_transfer(
     State(state): State<AppState>,
     Path((kind_str, id)): Path<(String, String)>,
-    Query(query): Query<RecheckQuery>,
+    AuditedQuery(query): AuditedQuery<RecheckQuery>,
 ) -> Result<Json<RecheckResponse>, (StatusCode, Json<ErrorResponse>)> {
     let kind = TransferKind::from_str(&kind_str).map_err(|error| {
         (
@@ -2269,9 +2287,26 @@ struct ReconcileUsdcRequest {
     superseding_tx: Option<TxHash>,
 }
 
+impl AuditedRequest for ReconcileUsdcRequest {
+    fn audit_targets(&self) -> Vec<String> {
+        self.superseding_tx
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    fn audit_reason(&self) -> Option<&str> {
+        Some(match self.reason {
+            ReconcileReasonWire::FundsMovedManually => "funds-moved-manually",
+            ReconcileReasonWire::DepositCreditedOffline => "deposit-credited-offline",
+        })
+    }
+}
+
 /// The fixed `--reason` vocabulary for a USDC reconcile, kebab-cased on the
 /// wire (`funds-moved-manually`, `deposit-credited-offline`).
 #[derive(Deserialize, Clone, Copy)]
+#[cfg_attr(test, derive(Serialize))]
 #[serde(rename_all = "kebab-case")]
 enum ReconcileReasonWire {
     FundsMovedManually,
@@ -2293,6 +2328,12 @@ struct ClearPendingBurnRequest {
     /// Operator audit reason, logged with the action (the command itself
     /// carries no reason field).
     reason: String,
+}
+
+impl AuditedRequest for ClearPendingBurnRequest {
+    fn audit_reason(&self) -> Option<&str> {
+        Some(&self.reason)
+    }
 }
 
 #[derive(Serialize)]
@@ -2386,7 +2427,7 @@ fn ops_command_error<Entity: EventSourced>(
 async fn reconcile_usdc_transfer(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(request): Json<ReconcileUsdcRequest>,
+    Audited(request): Audited<ReconcileUsdcRequest>,
 ) -> Result<Json<TransferOpResponse>, (StatusCode, Json<ErrorResponse>)> {
     let id = parse_usdc_rebalance_id(&id)?;
     let reason = ReconcileReason::from(request.reason);
@@ -2563,7 +2604,7 @@ fn deposit_send_not_superseded_response(
 async fn clear_pending_usdc_burn(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(request): Json<ClearPendingBurnRequest>,
+    Audited(request): Audited<ClearPendingBurnRequest>,
 ) -> Result<Json<TransferOpResponse>, (StatusCode, Json<ErrorResponse>)> {
     let id = parse_usdc_rebalance_id(&id)?;
 
@@ -2646,6 +2687,12 @@ struct FailUsdcTransferRequest {
     reason: String,
 }
 
+impl AuditedRequest for FailUsdcTransferRequest {
+    fn audit_reason(&self) -> Option<&str> {
+        Some(&self.reason)
+    }
+}
+
 /// Result of failing a pre-burn USDC rebalance.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2689,7 +2736,7 @@ struct FailUsdcTransferResponse {
 async fn fail_usdc_transfer(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(request): Json<FailUsdcTransferRequest>,
+    Audited(request): Audited<FailUsdcTransferRequest>,
 ) -> Result<Json<FailUsdcTransferResponse>, (StatusCode, Json<ErrorResponse>)> {
     let id = parse_usdc_rebalance_id(&id)?;
 
@@ -2926,6 +2973,12 @@ struct RebuildViewRequest {
     all: bool,
 }
 
+impl AuditedRequest for RebuildViewRequest {
+    fn audit_targets(&self) -> Vec<String> {
+        self.id.iter().cloned().collect()
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RebuildViewResponse {
@@ -2965,7 +3018,7 @@ fn view_rebuild_error_response(error: ViewRebuildError) -> (StatusCode, Json<Err
 async fn rebuild_materialized_view(
     State(state): State<AppState>,
     Path(view): Path<String>,
-    Json(request): Json<RebuildViewRequest>,
+    Audited(request): Audited<RebuildViewRequest>,
 ) -> Result<Json<RebuildViewResponse>, (StatusCode, Json<ErrorResponse>)> {
     let view = <RebuildableView as clap::ValueEnum>::from_str(&view, false).map_err(|_| {
         (
@@ -3049,6 +3102,23 @@ struct CompleteCctpMintRequest {
     source_chain: CctpSourceChain,
 }
 
+impl AuditedRequest for CompleteCctpMintRequest {
+    fn audit_targets(&self) -> Vec<String> {
+        vec![
+            self.burn_tx.clone(),
+            cctp_source_chain_wire_name(self.source_chain).to_string(),
+        ]
+    }
+}
+
+/// The kebab-case wire name of a CCTP source chain, as the request spelled it.
+const fn cctp_source_chain_wire_name(source: CctpSourceChain) -> &'static str {
+    match source {
+        CctpSourceChain::Ethereum => "ethereum",
+        CctpSourceChain::Base => "base",
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CompleteCctpMintResponse {
@@ -3120,7 +3190,7 @@ impl From<RecoveredMintAmounts> for CompleteCctpMintAmounts {
 /// Mirrors `stox cctp complete-mint`.
 async fn complete_cctp_mint(
     State(state): State<AppState>,
-    Json(request): Json<CompleteCctpMintRequest>,
+    Audited(request): Audited<CompleteCctpMintRequest>,
 ) -> Result<Json<CompleteCctpMintResponse>, (StatusCode, Json<ErrorResponse>)> {
     let burn_tx: TxHash = request.burn_tx.parse().map_err(|error| {
         (
@@ -3253,6 +3323,19 @@ struct ReconcileEquityRequest {
     superseding_tx: Option<TxHash>,
 }
 
+impl AuditedRequest for ReconcileEquityRequest {
+    fn audit_targets(&self) -> Vec<String> {
+        self.superseding_tx
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    fn audit_reason(&self) -> Option<&str> {
+        Some(&self.reason)
+    }
+}
+
 /// Reconciles an equity mint or redemption stuck in the `Failed` terminal to
 /// `Reconciled` once its residue was handled out-of-band. Pure bookkeeping: it
 /// loads the aggregate and sends `Reconcile`, dispatching no reactor effect and
@@ -3270,7 +3353,7 @@ struct ReconcileEquityRequest {
 async fn reconcile_equity_transfer(
     State(state): State<AppState>,
     Path((kind, id)): Path<(String, String)>,
-    Json(request): Json<ReconcileEquityRequest>,
+    Audited(request): Audited<ReconcileEquityRequest>,
 ) -> Result<Json<TransferOpResponse>, (StatusCode, Json<ErrorResponse>)> {
     let reason = request.reason.trim().to_owned();
     if reason.is_empty() {
@@ -3540,6 +3623,16 @@ struct AdoptWithdrawalReplacementRequest {
     replacement_tx: TxHash,
 }
 
+impl AuditedRequest for AdoptWithdrawalReplacementRequest {
+    fn audit_targets(&self) -> Vec<String> {
+        vec![self.replacement_tx.to_string()]
+    }
+
+    fn audit_reason(&self) -> Option<&str> {
+        Some(&self.reason)
+    }
+}
+
 /// Adopts `replacementTx` as a redemption's vault withdrawal in place of its
 /// signed one, so the redemption finishes instead of waiting on a withdrawal
 /// that can never mine. For a tx that took the withdrawal's nonce but is not a
@@ -3560,7 +3653,7 @@ struct AdoptWithdrawalReplacementRequest {
 async fn adopt_withdrawal_replacement(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(request): Json<AdoptWithdrawalReplacementRequest>,
+    Audited(request): Audited<AdoptWithdrawalReplacementRequest>,
 ) -> Result<Json<TransferOpResponse>, (StatusCode, Json<ErrorResponse>)> {
     let reason = request.reason.trim().to_owned();
     if reason.is_empty() {
@@ -3794,6 +3887,16 @@ struct ReleaseHedgeRequest {
     reason: String,
 }
 
+impl AuditedRequest for ReleaseHedgeRequest {
+    fn audit_targets(&self) -> Vec<String> {
+        vec![self.order_id.clone()]
+    }
+
+    fn audit_reason(&self) -> Option<&str> {
+        Some(&self.reason)
+    }
+}
+
 /// The result of a release-hedge, describing what happened to the pointer and
 /// the orphaned aggregate.
 #[derive(Debug, Serialize)]
@@ -3813,7 +3916,7 @@ struct ReleaseHedgeResponse {
 async fn release_position_hedge(
     State(state): State<AppState>,
     Path(symbol): Path<String>,
-    Json(request): Json<ReleaseHedgeRequest>,
+    Audited(request): Audited<ReleaseHedgeRequest>,
 ) -> Result<Json<ReleaseHedgeResponse>, (StatusCode, Json<ErrorResponse>)> {
     let symbol = Symbol::new(&symbol).map_err(ops_precondition_error)?;
     let order_id = OffchainOrderId::from_str(&request.order_id).map_err(ops_precondition_error)?;
@@ -3843,6 +3946,12 @@ struct SetPositionRequest {
     reason: String,
 }
 
+impl AuditedRequest for SetPositionRequest {
+    fn audit_reason(&self) -> Option<&str> {
+        Some(&self.reason)
+    }
+}
+
 /// The net exposure change a completed set recorded.
 #[derive(Debug, Serialize)]
 struct SetPositionResponse {
@@ -3857,7 +3966,7 @@ struct SetPositionResponse {
 async fn set_position_exposure(
     State(state): State<AppState>,
     Path(symbol): Path<String>,
-    Json(request): Json<SetPositionRequest>,
+    Audited(request): Audited<SetPositionRequest>,
 ) -> Result<Json<SetPositionResponse>, (StatusCode, Json<ErrorResponse>)> {
     let symbol = Symbol::new(&symbol).map_err(ops_precondition_error)?;
     let target_net =
@@ -4066,6 +4175,14 @@ struct ProcessTransactionQuery {
     chain: Option<Chain>,
 }
 
+/// The operator asserts `chain` in the query string, so it identifies what
+/// the processing acted on.
+impl AuditedRequest for ProcessTransactionQuery {
+    fn audit_targets(&self) -> Vec<String> {
+        self.chain.iter().map(ToString::to_string).collect()
+    }
+}
+
 /// What keeps the detached process-tx task accounted for once the request is
 /// gone: the tracker the shutdown drain waits on, and the projection claim a
 /// view rebuild waits on. The workload folds position and offchain order
@@ -4095,7 +4212,7 @@ struct DetachedProcessTx<'a> {
 /// The join future does not borrow `detached_tasks` (`use<..>` leaves its
 /// lifetime out), so a caller that answers before the work ends can hand
 /// the join to a tracked task of its own and keep the failure log.
-fn spawn_detached<Output, Subject, Work>(
+pub(crate) fn spawn_detached<Output, Subject, Work>(
     detached_tasks: &TaskTracker,
     operation: &'static str,
     subject: Subject,
@@ -4259,7 +4376,7 @@ async fn spawn_and_join_process_tx<ChainProvider: alloy::providers::Provider + C
 async fn process_transaction(
     State(state): State<AppState>,
     Path(tx_hash): Path<String>,
-    Query(query): Query<ProcessTransactionQuery>,
+    AuditedQuery(query): AuditedQuery<ProcessTransactionQuery>,
 ) -> Result<Json<ProcessTxResponse>, (StatusCode, Json<ErrorResponse>)> {
     let tx_hash = TxHash::from_str(&tx_hash)
         .map_err(|error| ops_precondition_error(format!("invalid transaction hash: {error}")))?;
@@ -4355,6 +4472,16 @@ struct SetEquityMarkRequest {
     reason: String,
 }
 
+impl AuditedRequest for SetEquityMarkRequest {
+    fn audit_targets(&self) -> Vec<String> {
+        vec![self.day.clone(), self.symbol.clone()]
+    }
+
+    fn audit_reason(&self) -> Option<&str> {
+        Some(&self.reason)
+    }
+}
+
 /// The persisted historical mark.
 #[derive(Debug, Serialize)]
 struct SetEquityMarkResponse {
@@ -4368,7 +4495,7 @@ struct SetEquityMarkResponse {
 /// Mirrors `stox portfolio-snapshot set`.
 async fn set_portfolio_snapshot_mark(
     State(state): State<AppState>,
-    Json(request): Json<SetEquityMarkRequest>,
+    Audited(request): Audited<SetEquityMarkRequest>,
 ) -> Result<Json<SetEquityMarkResponse>, (StatusCode, Json<ErrorResponse>)> {
     let day = request
         .day
@@ -4568,6 +4695,49 @@ define_ops_api_routes! {
     write post "/capital/reset-allowance" => capital::reset_allowance;
 }
 
+const UNKNOWN_MUTATION_ERROR: &str = "unknown operator mutation route";
+
+async fn unknown_operator_mutation() -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: UNKNOWN_MUTATION_ERROR.to_string(),
+        }),
+    )
+}
+
+async fn audit_write_mutation(
+    State(detached_tasks): State<TaskTracker>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    if request.method() == axum::http::Method::POST
+        && matches!(
+            request.uri().path(),
+            "/liquidity-write" | "/liquidity-write/"
+        )
+    {
+        set_audit_route_template(&mut request, "/liquidity-write/{*path}");
+    }
+    audit_request(&detached_tasks, "write", request, next).await
+}
+
+fn is_loopback_mutation(request: &Request) -> bool {
+    request.method() == axum::http::Method::POST
+        && (request.uri().path() == "/transfers" || request.uri().path().starts_with("/transfers/"))
+}
+
+fn is_known_loopback_mutation_route(request: &Request) -> bool {
+    request
+        .extensions()
+        .get::<MatchedPath>()
+        .is_some_and(|path| {
+            LOOPBACK_DECLARED
+                .iter()
+                .any(|route| route.path == path.as_str())
+        })
+}
+
 /// The role gated ops API: the same handlers the dashboard routes use, mounted
 /// under a prefix the load balancer routes to a role specific IAP backend.
 ///
@@ -4582,7 +4752,10 @@ define_ops_api_routes! {
 /// Returns nothing when no audiences are configured: a deployment with no load
 /// balancer in front of it must not expose these paths, and unmounting them is
 /// a stronger guarantee than serving a 401.
-fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
+fn ops_api_routes(
+    ops_api: Option<&OpsApiConfig>,
+    detached_tasks: &TaskTracker,
+) -> Router<AppState> {
     let Some(ops_api) = ops_api else {
         return Router::new();
     };
@@ -4600,7 +4773,7 @@ fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
         .build()
         .expect("static client config cannot fail");
 
-    ops_api_routes_with_verifiers(ops_api, |audience, role| {
+    ops_api_routes_with_verifiers(ops_api, detached_tasks, |audience, role| {
         Arc::new(IapVerifier::new(audience, role, jwks_http.clone()))
     })
 }
@@ -4610,6 +4783,7 @@ fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
 /// can point it at a mock key set while keeping the audience binding.
 fn ops_api_routes_with_verifiers(
     ops_api: &OpsApiConfig,
+    detached_tasks: &TaskTracker,
     verifier: impl Fn(&str, &'static str) -> Arc<IapVerifier>,
 ) -> Router<AppState> {
     let read_verifier = verifier(&ops_api.read_audience, "read");
@@ -4619,10 +4793,20 @@ fn ops_api_routes_with_verifiers(
         let verifier = Arc::clone(&read_verifier);
         async move { require_iap(verifier, request, next).await }
     }));
-    let write = write.layer(axum::middleware::from_fn(move |request, next| {
-        let verifier = Arc::clone(&write_verifier);
-        async move { require_iap(verifier, request, next).await }
-    }));
+    let write = WRITE_CATCHALL_DECLARED
+        .iter()
+        .fold(write, |write, route| {
+            write.route(route.path, post(unknown_operator_mutation))
+        })
+        .layer(axum::middleware::from_fn(capture_audit_path_targets))
+        .layer(axum::middleware::from_fn(move |request, next| {
+            let verifier = Arc::clone(&write_verifier);
+            async move { require_iap(verifier, request, next).await }
+        }))
+        .layer(axum::middleware::from_fn_with_state(
+            detached_tasks.clone(),
+            audit_write_mutation,
+        ));
 
     read.merge(write)
 }
@@ -4666,7 +4850,42 @@ async fn require_loopback(
         ));
     }
 
+    record_principal(&request, "local-loopback");
+
     Ok(next.run(request).await)
+}
+
+async fn capture_loopback_mutation_path_targets(request: Request, next: Next) -> Response {
+    if is_loopback_mutation(&request) {
+        capture_audit_path_targets(request, next).await
+    } else {
+        next.run(request).await
+    }
+}
+
+async fn require_loopback_mutation(request: Request, next: Next) -> Response {
+    if !is_loopback_mutation(&request) {
+        return next.run(request).await;
+    }
+
+    require_loopback(request, next)
+        .await
+        .unwrap_or_else(IntoResponse::into_response)
+}
+
+async fn audit_loopback_mutation(
+    State(detached_tasks): State<TaskTracker>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    if !is_loopback_mutation(&request) {
+        return next.run(request).await;
+    }
+
+    if !is_known_loopback_mutation_route(&request) {
+        set_audit_route_template(&mut request, "/transfers/{*path}");
+    }
+    audit_request(&detached_tasks, "local", request, next).await
 }
 
 macro_rules! define_loopback_routes {
@@ -4758,8 +4977,27 @@ define_service_routes! {
     "/api/ws" => crate::dashboard::ws_endpoint;
 }
 
-const DECLARED_ROUTES: [&[DeclaredRoute]; 4] = [
+/// The write prefix's catch alls: an unknown `POST` under `/liquidity-write`
+/// still passes IAP and the audit before it gets the stable unknown mutation
+/// answer.
+const WRITE_CATCHALL_DECLARED: &[DeclaredRoute] = &[
+    DeclaredRoute {
+        method: Method::POST,
+        path: "/liquidity-write",
+    },
+    DeclaredRoute {
+        method: Method::POST,
+        path: "/liquidity-write/",
+    },
+    DeclaredRoute {
+        method: Method::POST,
+        path: "/liquidity-write/{*path}",
+    },
+];
+
+const DECLARED_ROUTES: [&[DeclaredRoute]; 5] = [
     OPS_API_DECLARED,
+    WRITE_CATCHALL_DECLARED,
     LOOPBACK_DECLARED,
     PUBLIC_DECLARED,
     SERVICE_DECLARED,
@@ -4818,17 +5056,25 @@ fn route_admission(method: &Method, pattern: Option<&str>) -> RouteAdmission {
 /// route gets its guard (IAP on the role prefixes when the ops API is
 /// configured, loopback, or none for the dashboard reads and service routes),
 /// so a route, method, nested service, or fallback mounted any other way fails
-/// closed: an unknown route gets 404 and an undeclared method on a declared
-/// route gets 405.
+/// closed. A `POST` under `/transfers` that no declaration admits gets the
+/// stable unknown mutation answer, after the loopback gate and audit around
+/// this guard. Otherwise an undeclared method on a declared route gets 405, an
+/// undeclared mounted route gets 404 with an error log, and an unknown path
+/// gets a plain 404.
 async fn refuse_undeclared_route(request: Request, next: Next) -> Response {
-    use axum::response::IntoResponse as _;
+    let matched = request.extensions().get::<MatchedPath>();
+    let admission = route_admission(request.method(), matched.map(MatchedPath::as_str));
+    if let (RouteAdmission::UndeclaredRoute, Some(route)) = (&admission, matched) {
+        error!(
+            target: "api",
+            route = route.as_str(),
+            "Refusing a mounted route that no route declaration lists"
+        );
+    }
 
-    let matched = request.extensions().get::<axum::extract::MatchedPath>();
-    match route_admission(
-        request.method(),
-        matched.map(axum::extract::MatchedPath::as_str),
-    ) {
+    match admission {
         RouteAdmission::Declared => next.run(request).await,
+        _ if is_loopback_mutation(&request) => unknown_operator_mutation().await.into_response(),
         RouteAdmission::UndeclaredMethod { allow } => (
             StatusCode::METHOD_NOT_ALLOWED,
             [(axum::http::header::ALLOW, allow)],
@@ -4837,42 +5083,50 @@ async fn refuse_undeclared_route(request: Request, next: Next) -> Response {
             }),
         )
             .into_response(),
-        RouteAdmission::UndeclaredRoute => {
-            // Only a handler mounted outside the declarations gets here with
-            // a matched route; an unknown path has none.
-            if let Some(route) = matched {
-                error!(
-                    target: "api",
-                    route = route.as_str(),
-                    "Refusing a mounted route that no route declaration lists"
-                );
-            }
-            (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: UNDECLARED_ROUTE_ERROR.to_string(),
-                }),
-            )
-                .into_response()
+        RouteAdmission::UndeclaredRoute if matched.is_none() => {
+            StatusCode::NOT_FOUND.into_response()
         }
+        RouteAdmission::UndeclaredRoute => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: UNDECLARED_ROUTE_ERROR.to_string(),
+            }),
+        )
+            .into_response(),
     }
 }
 
 /// Every route the server mounts on its main port.
-pub(crate) fn routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
-    routes_with_ops_api(ops_api_routes(ops_api))
+pub(crate) fn routes(
+    ops_api: Option<&OpsApiConfig>,
+    detached_tasks: &TaskTracker,
+) -> Router<AppState> {
+    routes_with_ops_api(ops_api_routes(ops_api, detached_tasks), detached_tasks)
 }
 
-/// Merges the declared routers and guards the result. The guard must stay the
-/// last call: it wraps only the routes mounted before it, so a route added
-/// after it, here or on the router `routes` returns, would skip the check.
-fn routes_with_ops_api(ops_api: Router<AppState>) -> Router<AppState> {
+/// Merges the declared routers and guards the result. The route guard must be
+/// the first layer after the last route: a layer wraps only the routes mounted
+/// before it, so a route added after it, here or on the router `routes`
+/// returns, would skip the check. The loopback gate and the audit wrap the
+/// guard, so a request it refuses is still gated and audited.
+fn routes_with_ops_api(
+    ops_api: Router<AppState>,
+    detached_tasks: &TaskTracker,
+) -> Router<AppState> {
     Router::new()
         .merge(ops_api)
         .merge(mount_loopback_routes())
         .merge(mount_public_routes())
         .merge(mount_service_routes())
         .layer(axum::middleware::from_fn(refuse_undeclared_route))
+        .layer(axum::middleware::from_fn(
+            capture_loopback_mutation_path_targets,
+        ))
+        .layer(axum::middleware::from_fn(require_loopback_mutation))
+        .layer(axum::middleware::from_fn_with_state(
+            detached_tasks.clone(),
+            audit_loopback_mutation,
+        ))
 }
 
 #[cfg(test)]
@@ -4905,6 +5159,7 @@ mod tests {
     use sqlx::SqlitePool;
     use tokio::sync::{Notify, broadcast};
     use tower::ServiceExt;
+    use tracing_test::traced_test;
     use uuid::uuid;
 
     use st0x_bridge::cctp::CctpError;
@@ -5048,12 +5303,15 @@ mod tests {
     async fn role_test_app() -> (Router, TestKey, MockServer) {
         let key = test_key();
         let jwks = jwks_server(&key);
-        let ops_api = ops_api_routes_with_verifiers(&test_ops_api_config(), |audience, role| {
-            verifier(audience, role, &jwks)
-        });
         let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let ops_api = ops_api_routes_with_verifiers(
+            &test_ops_api_config(),
+            &state.detached_tasks,
+            |audience, role| verifier(audience, role, &jwks),
+        );
+        let detached_tasks = state.detached_tasks.clone();
         (
-            with_route_marker(routes_with_ops_api(ops_api).with_state(state)),
+            with_route_marker(routes_with_ops_api(ops_api, &detached_tasks).with_state(state)),
             key,
             jwks,
         )
@@ -5145,7 +5403,7 @@ mod tests {
         assert_eq!(response.allow.as_deref(), Some(allow), "{context:?}");
     }
 
-    /// The route guard refused a route that no declaration lists.
+    /// The route guard refused a mounted route that no declaration lists.
     fn assert_undeclared_route(response: &RouteResponse, context: &impl std::fmt::Debug) {
         assert_eq!(
             response.status,
@@ -5158,12 +5416,27 @@ mod tests {
         );
     }
 
+    /// The answer to a `POST` under `/transfers` that no declaration admits.
+    fn assert_unknown_operator_mutation(response: &RouteResponse, context: &impl std::fmt::Debug) {
+        assert_eq!(
+            response.status,
+            StatusCode::NOT_FOUND,
+            "{context:?}: {response:?}"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response.body).ok(),
+            Some(serde_json::json!({ "error": UNKNOWN_MUTATION_ERROR })),
+            "{context:?}"
+        );
+    }
+
     /// A refusal from the IAP key loader or the route guard. Both answer with
     /// a status a handler may also use, so only the body tells them apart.
     fn is_guard_refusal(status: u16, body: &str) -> bool {
         (status == StatusCode::SERVICE_UNAVAILABLE.as_u16()
             && body.contains(&IapError::KeysUnavailable.to_string()))
-            || (status == StatusCode::NOT_FOUND.as_u16() && body.contains(UNDECLARED_ROUTE_ERROR))
+            || (status == StatusCode::NOT_FOUND.as_u16()
+                && (body.contains(UNDECLARED_ROUTE_ERROR) || body.contains(UNKNOWN_MUTATION_ERROR)))
     }
 
     /// The request matched a route and passed every access guard. No ops
@@ -6375,7 +6648,13 @@ mod tests {
     }
 
     fn build_app(state: AppState) -> Router {
-        routes(None).with_state(state)
+        let detached_tasks = state.detached_tasks.clone();
+        routes(None, &detached_tasks).with_state(state)
+    }
+
+    fn build_ops_app(state: AppState, ops_api: &st0x_config::OpsApiConfig) -> Router {
+        let detached_tasks = state.detached_tasks.clone();
+        routes(Some(ops_api), &detached_tasks).with_state(state)
     }
 
     async fn body_to_string(response: axum::response::Response) -> String {
@@ -8286,6 +8565,115 @@ mod tests {
         );
     }
 
+    /// `deposit_tx` is an operator-asserted identifier in the query string, so
+    /// the recheck's audit record names it after the path values.
+    #[traced_test]
+    #[tokio::test]
+    async fn recheck_deposit_tx_query_is_an_audit_target() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
+        let deposit_tx = TxHash::repeat_byte(0xab);
+        let request_id = "17171717-1717-1717-1717-171717171717";
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/transfers/recheck/usdc_bridge/some-id?deposit_tx={deposit_tx}"
+                    ))
+                    .header("x-request-id", request_id)
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let expected_target = format!("target_id=\"usdc_bridge:some-id:{deposit_tx}\"");
+        logs_assert(|lines| {
+            lines
+                .iter()
+                .any(|line| {
+                    line.contains("operations_audit: Operations audit event")
+                        && line.contains(request_id)
+                        && line.contains(&expected_target)
+                })
+                .then_some(())
+                .ok_or_else(|| format!("missing deposit_tx audit target: {lines:?}"))
+        });
+    }
+
+    /// Body-only write routes name what they acted on from the wire body the
+    /// CLI sends, in a fixed order; aliased fields never reach the record.
+    #[test]
+    fn body_only_routes_name_their_audit_targets() {
+        let mint: CompleteCctpMintRequest = serde_json::from_value(serde_json::json!({
+            "burnTx": "0xburn",
+            "sourceChain": "base",
+            "burn_tx": "forged alias",
+        }))
+        .unwrap();
+        assert_eq!(mint.audit_targets(), ["0xburn", "base"]);
+
+        let release: ReleaseHedgeRequest = serde_json::from_value(serde_json::json!({
+            "order_id": "order-1",
+            "orderId": "forged alias",
+            "reason": "incident 42",
+        }))
+        .unwrap();
+        assert_eq!(release.audit_targets(), ["order-1"]);
+        assert_eq!(release.audit_reason(), Some("incident 42"));
+
+        let mark: SetEquityMarkRequest = serde_json::from_value(serde_json::json!({
+            "day": "2026-10-09",
+            "symbol": "AAPL",
+            "usd_mark": "190.5",
+            "observed_at": "2026-10-08T20:00:00Z",
+            "source": "exchange close",
+            "reason": "correct close",
+        }))
+        .unwrap();
+        assert_eq!(mark.audit_targets(), ["2026-10-09", "AAPL"]);
+        assert_eq!(mark.audit_reason(), Some("correct close"));
+    }
+
+    /// The audit records spell these enum values by hand. Each spelling must
+    /// equal serde's wire name, so a renamed variant cannot leave the record
+    /// on the old string. The empty matches stop compiling when a variant is
+    /// added, so the lists below cannot fall behind the enums.
+    #[test]
+    fn audit_spellings_match_the_serde_wire_names() {
+        for source in [CctpSourceChain::Ethereum, CctpSourceChain::Base] {
+            match source {
+                CctpSourceChain::Ethereum | CctpSourceChain::Base => {}
+            }
+            assert_eq!(
+                serde_json::json!(cctp_source_chain_wire_name(source)),
+                serde_json::to_value(source).unwrap()
+            );
+        }
+
+        for reason in [
+            ReconcileReasonWire::FundsMovedManually,
+            ReconcileReasonWire::DepositCreditedOffline,
+        ] {
+            match reason {
+                ReconcileReasonWire::FundsMovedManually
+                | ReconcileReasonWire::DepositCreditedOffline => {}
+            }
+            let request = ReconcileUsdcRequest {
+                reason,
+                superseding_tx: None,
+            };
+            assert_eq!(
+                serde_json::json!(request.audit_reason().unwrap()),
+                serde_json::to_value(reason).unwrap()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn fail_transfer_returns_503_before_conductor_ready() {
         let ctx = create_test_ctx_with_order_owner(Address::ZERO);
@@ -8420,6 +8808,114 @@ mod tests {
         }
     }
 
+    #[traced_test]
+    #[tokio::test]
+    async fn unknown_loopback_mutation_is_guarded_and_returns_stable_not_found() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
+
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transfers/not-a-command")
+                    .extension(ConnectInfo(SocketAddr::from(([172, 18, 0, 1], 9))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let denied_request_id = denied.headers()["x-request-id"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        for uri in ["/transfers", "/transfers/interrupted"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9))))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+            let body = body_to_string(response).await;
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                body,
+                serde_json::json!({ "error": "unknown operator mutation route" }),
+                "{uri}"
+            );
+        }
+
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let not_found = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transfers/not-a-command")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let request_id: uuid::Uuid = not_found.headers()["x-request-id"]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(request_id.get_version_num(), 4);
+        assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+        let body = body_to_string(not_found).await;
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({ "error": "unknown operator mutation route" })
+        );
+
+        let public_get = app
+            .oneshot(
+                Request::builder()
+                    .uri("/transfers/interrupted")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(public_get.status(), StatusCode::OK);
+        assert_eq!(public_get.headers().get("x-request-id"), None);
+
+        logs_assert(|lines| {
+            let audited_not_found = lines.iter().any(|line| {
+                line.contains("operations_audit: Operations audit event")
+                    && line.contains(&request_id.to_string())
+                    && line.contains("principal=\"local-loopback\"")
+                    && line.contains("role=\"local\"")
+                    && line.contains("route=\"/transfers/{*path}\"")
+                    && line.contains("target_id=\"not_identified\"")
+                    && line.contains("outcome=\"validation_failure\"")
+            });
+            let audited_denial = lines.iter().any(|line| {
+                line.contains("operations_audit: Operations audit event")
+                    && line.contains(&denied_request_id)
+                    && line.contains("role=\"local\"")
+                    && line.contains("route=\"/transfers/{*path}\"")
+                    && line.contains("outcome=\"denied\"")
+            });
+            (audited_not_found && audited_denial)
+                .then_some(())
+                .ok_or_else(|| format!("missing stable unknown-route audit: {lines:?}"))
+        });
+    }
+
     /// Pins the production serve wiring: `serve_with_peer_info` must record
     /// the TCP peer, or the loopback gate fails closed and the in-container
     /// CLI's recovery verbs 403 in production while every hand-injected
@@ -8459,22 +8955,36 @@ mod tests {
             assert_eq!(response.status, StatusCode::NOT_FOUND, "{route:?}");
             assert!(!response.matched, "{route:?}");
         }
+        for route in WRITE_CATCHALL_DECLARED {
+            let path = concrete_path(route.path);
+            let response = route_response(&app, Method::POST, &path, None, None).await;
+            assert_eq!(response.status, StatusCode::NOT_FOUND, "{path}");
+            assert!(!response.matched, "{path}");
+        }
     }
 
-    /// The production constructor mounts every role route behind IAP: a
-    /// request with no assertion gets 401 from the guard, not a route miss.
+    /// The production constructor mounts every role route, and the write
+    /// prefix's catch alls, behind IAP: a request with no assertion gets 401
+    /// from the guard, not a route miss.
     #[tokio::test]
     async fn role_prefixes_demand_iap_when_configured() {
         let ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        let app = with_route_marker(
-            routes(Some(&test_ops_api_config())).with_state(empty_app_state(ctx).await),
-        );
+        let app = with_route_marker(build_ops_app(
+            empty_app_state(ctx).await,
+            &test_ops_api_config(),
+        ));
 
         for route in OPS_API_ROUTES {
             let path = concrete_path(route.path);
             let response = route_response(&app, route.method.clone(), &path, None, None).await;
             assert_eq!(response.status, StatusCode::UNAUTHORIZED, "{route:?}");
             assert!(response.matched, "{route:?}");
+        }
+        for route in WRITE_CATCHALL_DECLARED {
+            let path = concrete_path(route.path);
+            let response = route_response(&app, Method::POST, &path, None, None).await;
+            assert_eq!(response.status, StatusCode::UNAUTHORIZED, "{path}");
+            assert!(response.matched, "{path}");
         }
     }
 
@@ -8529,11 +9039,13 @@ mod tests {
     }
 
     /// Apart from the four loopback guarded routes, no declared write route is
-    /// also mounted without its role prefix.
+    /// also mounted without its role prefix. Requests come from the container
+    /// so the loopback gate in front of `/transfers` lets them reach routing.
     #[tokio::test]
     async fn write_routes_have_no_unprotected_bare_mount() {
         let ctx = create_test_ctx_with_order_owner(Address::ZERO);
         let app = with_route_marker(build_app(empty_app_state(ctx).await));
+        let loopback = Some(SocketAddr::from(([127, 0, 0, 1], 9)));
 
         for route in OPS_API_ROUTES
             .iter()
@@ -8550,7 +9062,7 @@ mod tests {
                 continue;
             }
             let path = concrete_path(bare_pattern);
-            let response = route_response(&app, route.method.clone(), &path, None, None).await;
+            let response = route_response(&app, route.method.clone(), &path, None, loopback).await;
             assert!(!response.matched, "{route:?}: {response:?}");
             assert_eq!(response.status, StatusCode::NOT_FOUND, "{route:?}");
         }
@@ -8573,12 +9085,15 @@ mod tests {
         assert_eq!(public_routes, read_routes);
     }
 
-    /// Every public and service route serves GET, and the route guard refuses
-    /// every other method on it.
+    /// Every public and service route serves GET, and every other method is
+    /// refused: a `POST` under `/transfers` from the container gets the stable
+    /// unknown mutation answer, and any other method gets the route guard's
+    /// 405.
     #[tokio::test]
     async fn public_and_service_routes_serve_only_get() {
         let ctx = create_test_ctx_with_order_owner(Address::ZERO);
         let app = with_route_marker(build_app(empty_app_state(ctx).await));
+        let loopback = Some(SocketAddr::from(([127, 0, 0, 1], 9)));
 
         for route in PUBLIC_DECLARED
             .iter()
@@ -8593,8 +9108,12 @@ mod tests {
                 .iter()
                 .filter(|method| **method != Method::GET)
             {
-                let response = route_response(&app, method.clone(), &path, None, None).await;
-                assert_undeclared_method(&response, "GET,HEAD", &(method, route));
+                let response = route_response(&app, method.clone(), &path, None, loopback).await;
+                if *method == Method::POST && route.starts_with("/transfers") {
+                    assert_unknown_operator_mutation(&response, &(method, route));
+                } else {
+                    assert_undeclared_method(&response, "GET,HEAD", &(method, route));
+                }
             }
         }
     }
@@ -8622,16 +9141,20 @@ mod tests {
             let built = std::panic::catch_unwind(|| {
                 let undeclared: Router<AppState> =
                     Router::new().route(path, axum::routing::head(|| async { "ran" }));
-                routes_with_ops_api(undeclared.merge(ops_api_routes_with_verifiers(
-                    &test_ops_api_config(),
-                    |audience, role| {
-                        Arc::new(crate::iap_auth::IapVerifier::new(
-                            audience,
-                            role,
-                            reqwest::Client::new(),
-                        ))
-                    },
-                )))
+                routes_with_ops_api(
+                    undeclared.merge(ops_api_routes_with_verifiers(
+                        &test_ops_api_config(),
+                        &TaskTracker::new(),
+                        |audience, role| {
+                            Arc::new(crate::iap_auth::IapVerifier::new(
+                                audience,
+                                role,
+                                reqwest::Client::new(),
+                            ))
+                        },
+                    )),
+                    &TaskTracker::new(),
+                )
             });
             let message = built
                 .err()
@@ -8642,6 +9165,114 @@ mod tests {
                 "{path}: {message}"
             );
         }
+    }
+    #[traced_test]
+    #[tokio::test]
+    async fn exact_write_catchalls_use_the_stable_wildcard_audit_route() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let ops_api = st0x_config::OpsApiConfig {
+            read_audience: "/projects/1/global/backendServices/11".to_string(),
+            write_audience: "/projects/1/global/backendServices/22".to_string(),
+        };
+        let app = build_ops_app(empty_app_state(ctx).await, &ops_api);
+
+        for (uri, request_id) in [
+            ("/liquidity-write", "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"),
+            ("/liquidity-write/", "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("x-request-id", request_id)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
+
+        logs_assert(|lines| {
+            for request_id in [
+                "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+                "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2",
+            ] {
+                if !lines.iter().any(|line| {
+                    line.contains("operations_audit: Operations audit event")
+                        && line.contains(request_id)
+                        && line.contains("route=\"/liquidity-write/{*path}\"")
+                        && line.contains("outcome=\"denied\"")
+                }) {
+                    return Err(format!(
+                        "missing stable-route denial audit for {request_id}: {lines:?}"
+                    ));
+                }
+            }
+            Ok(())
+        });
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn unmatched_write_mutation_is_audited_and_unrelated_paths_are_not() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let ops_api = st0x_config::OpsApiConfig {
+            read_audience: "/projects/1/global/backendServices/11".to_string(),
+            write_audience: "/projects/1/global/backendServices/22".to_string(),
+        };
+        let app = build_ops_app(empty_app_state(ctx).await, &ops_api);
+        let write_request_id = "c3c3c3c3-c3c3-c3c3-c3c3-c3c3c3c3c3c3";
+        let unrelated_request_id = "d4d4d4d4-d4d4-d4d4-d4d4-d4d4d4d4d4d4";
+
+        let write = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/liquidity-write/not-a-command")
+                    .header("x-request-id", write_request_id)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(write.status(), StatusCode::UNAUTHORIZED);
+
+        let unrelated = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/not-an-operator-route")
+                    .header("x-request-id", unrelated_request_id)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unrelated.status(), StatusCode::NOT_FOUND);
+        assert_eq!(unrelated.headers().get("x-request-id"), None);
+
+        logs_assert(|lines| {
+            let audited_write = lines.iter().any(|line| {
+                line.contains("operations_audit: Operations audit event")
+                    && line.contains(write_request_id)
+                    && line.contains("role=\"write\"")
+                    && line.contains("route=\"/liquidity-write/{*path}\"")
+                    && line.contains("outcome=\"denied\"")
+            });
+            let audited_unrelated = lines.iter().any(|line| {
+                line.contains("operations_audit") && line.contains(unrelated_request_id)
+            });
+
+            match (audited_write, audited_unrelated) {
+                (true, false) => Ok(()),
+                (false, _) => Err(format!("missing write catchall audit: {lines:?}")),
+                (true, true) => Err(format!("unrelated path was audited: {lines:?}")),
+            }
+        });
     }
 
     /// A route, method, nested service, or fallback mounted outside every
@@ -8662,7 +9293,9 @@ mod tests {
             .route("/resume-all", post(handler.clone()))
             .route("/liquidity-write/resume-all", post(handler.clone()))
             .route("/status-dump", get(handler.clone()))
+            .route("/transfers/resume-all", post(handler.clone()))
             .route("/transfers/resume", get(handler.clone()))
+            .route("/transfers", post(handler.clone()))
             .route("/health", axum::routing::put(handler.clone()))
             .route(
                 "/liquidity-write/transfers/resume",
@@ -8670,18 +9303,30 @@ mod tests {
             )
             .nest_service("/files", get(handler.clone()).with_state::<()>(()))
             .fallback(handler);
-        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        let app = routes_with_ops_api(undeclared).with_state(empty_app_state(ctx).await);
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let detached_tasks = state.detached_tasks.clone();
+        let app = routes_with_ops_api(undeclared, &detached_tasks).with_state(state);
+        let loopback = Some(SocketAddr::from(([127, 0, 0, 1], 9)));
 
         for (method, path) in [
             (Method::POST, "/resume-all"),
             (Method::POST, "/liquidity-write/resume-all"),
             (Method::GET, "/status-dump"),
+        ] {
+            let response = route_response(&app, method.clone(), path, None, None).await;
+            assert_undeclared_route(&response, &(&method, path));
+        }
+        for (method, path) in [
             (Method::GET, "/files/report"),
             (Method::GET, "/no-such-route"),
         ] {
             let response = route_response(&app, method.clone(), path, None, None).await;
-            assert_undeclared_route(&response, &(&method, path));
+            assert_eq!(response.status, StatusCode::NOT_FOUND, "{method} {path}");
+            assert!(response.body.is_empty(), "{method} {path}: {response:?}");
+        }
+        for path in ["/transfers/resume-all", "/transfers"] {
+            let response = route_response(&app, Method::POST, path, None, loopback).await;
+            assert_unknown_operator_mutation(&response, &path);
         }
         for (method, path, allow) in [
             (Method::GET, "/transfers/resume", "POST"),
@@ -9192,7 +9837,7 @@ mod tests {
         let Err((status, Json(body))) = recheck_transfer(
             State(state),
             Path(("usdc_bridge".to_string(), id.to_string())),
-            Query(RecheckQuery::default()),
+            AuditedQuery(RecheckQuery::default()),
         )
         .await
         else {
@@ -9208,8 +9853,8 @@ mod tests {
 
     fn capital_request<Request: serde::de::DeserializeOwned>(
         body: serde_json::Value,
-    ) -> Json<Request> {
-        Json(serde_json::from_value(body).unwrap())
+    ) -> Audited<Request> {
+        Audited(serde_json::from_value(body).unwrap())
     }
 
     const TEST_OPERATION_ID: &str = "6f1c2a1e-6c39-4a77-9a8e-1f0b7d6e8c11";
@@ -11843,7 +12488,7 @@ mod tests {
         let resp = reconcile_usdc_transfer(
             State(state.clone()),
             Path(id.to_string()),
-            Json(ReconcileUsdcRequest {
+            Audited(ReconcileUsdcRequest {
                 reason: ReconcileReasonWire::FundsMovedManually,
                 superseding_tx: None,
             }),
@@ -11928,7 +12573,7 @@ mod tests {
         let resp = reconcile_usdc_transfer(
             State(state.clone()),
             Path(id.to_string()),
-            Json(ReconcileUsdcRequest {
+            Audited(ReconcileUsdcRequest {
                 reason: ReconcileReasonWire::FundsMovedManually,
                 superseding_tx: None,
             }),
@@ -12106,8 +12751,8 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
-    fn reconcile_usdc_request() -> Json<ReconcileUsdcRequest> {
-        Json(ReconcileUsdcRequest {
+    fn reconcile_usdc_request() -> Audited<ReconcileUsdcRequest> {
+        Audited(ReconcileUsdcRequest {
             reason: ReconcileReasonWire::FundsMovedManually,
             superseding_tx: None,
         })
@@ -12235,7 +12880,7 @@ mod tests {
         let resp = clear_pending_usdc_burn(
             State(state.clone()),
             Path(id.to_string()),
-            Json(ClearPendingBurnRequest {
+            Audited(ClearPendingBurnRequest {
                 reason: "audit: burn dropped".to_string(),
             }),
         )
@@ -12270,7 +12915,7 @@ mod tests {
         let resp = clear_pending_usdc_burn(
             State(state.clone()),
             Path(id.to_string()),
-            Json(ClearPendingBurnRequest {
+            Audited(ClearPendingBurnRequest {
                 reason: "audit: nothing to clear".to_string(),
             }),
         )
@@ -12294,7 +12939,7 @@ mod tests {
         let resp = clear_pending_usdc_burn(
             State(state.clone()),
             Path(id.to_string()),
-            Json(ClearPendingBurnRequest {
+            Audited(ClearPendingBurnRequest {
                 reason: "   ".to_string(),
             }),
         )
@@ -12317,7 +12962,7 @@ mod tests {
         let resp = fail_usdc_transfer(
             State(state.clone()),
             Path(id.to_string()),
-            Json(FailUsdcTransferRequest {
+            Audited(FailUsdcTransferRequest {
                 reason: "audit: pre-burn crash".to_string(),
             }),
         )
@@ -12345,7 +12990,7 @@ mod tests {
         let resp = fail_usdc_transfer(
             State(state.clone()),
             Path(id.to_string()),
-            Json(FailUsdcTransferRequest {
+            Audited(FailUsdcTransferRequest {
                 reason: "   ".to_string(),
             }),
         )
@@ -12357,8 +13002,8 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
-    fn fail_usdc_request() -> Json<FailUsdcTransferRequest> {
-        Json(FailUsdcTransferRequest {
+    fn fail_usdc_request() -> Audited<FailUsdcTransferRequest> {
+        Audited(FailUsdcTransferRequest {
             reason: "audit: pre-burn crash".to_string(),
         })
     }
@@ -12696,7 +13341,7 @@ mod tests {
         let response = rebuild_materialized_view(
             State(state),
             Path("position".to_string()),
-            Json(RebuildViewRequest {
+            Audited(RebuildViewRequest {
                 id: Some("AAPL".to_string()),
                 all: false,
             }),
@@ -12750,7 +13395,7 @@ mod tests {
             rebuild_materialized_view(
                 State(rebuild_state),
                 Path("position".to_string()),
-                Json(RebuildViewRequest {
+                Audited(RebuildViewRequest {
                     id: Some("AAPL".to_string()),
                     all: false,
                 }),
@@ -12813,7 +13458,7 @@ mod tests {
         let resp = rebuild_materialized_view(
             State(state.clone()),
             Path("position".to_string()),
-            Json(RebuildViewRequest {
+            Audited(RebuildViewRequest {
                 id: Some("AAPL".to_string()),
                 all: false,
             }),
@@ -12850,7 +13495,7 @@ mod tests {
         let resp = rebuild_materialized_view(
             State(state.clone()),
             Path("rebalance-timing".to_string()),
-            Json(RebuildViewRequest {
+            Audited(RebuildViewRequest {
                 id: None,
                 all: true,
             }),
@@ -12883,7 +13528,7 @@ mod tests {
             rebuild_materialized_view(
                 State(state.clone()),
                 Path("equity-timing".to_string()),
-                Json(RebuildViewRequest {
+                Audited(RebuildViewRequest {
                     id: Some("x".to_string()),
                     all: false,
                 }),
@@ -12912,7 +13557,7 @@ mod tests {
             rebuild_materialized_view(
                 State(state.clone()),
                 Path("position".to_string()),
-                Json(RebuildViewRequest {
+                Audited(RebuildViewRequest {
                     id: Some(String::new()),
                     all: false,
                 }),
@@ -12947,7 +13592,7 @@ mod tests {
             rebuild_materialized_view(
                 State(state.clone()),
                 Path("position".to_string()),
-                Json(RebuildViewRequest {
+                Audited(RebuildViewRequest {
                     id: Some("aapl".to_string()),
                     all: false,
                 }),
@@ -13002,7 +13647,7 @@ mod tests {
             let resp = rebuild_materialized_view(
                 State(state.clone()),
                 Path(view.to_string()),
-                Json(request),
+                Audited(request),
             )
             .await;
             let Err((status, _)) = resp else {
@@ -13019,7 +13664,7 @@ mod tests {
 
         let resp = complete_cctp_mint(
             State(state.clone()),
-            Json(CompleteCctpMintRequest {
+            Audited(CompleteCctpMintRequest {
                 burn_tx: TxHash::repeat_byte(0x33).to_string(),
                 source_chain: CctpSourceChain::Base,
             }),
@@ -13039,7 +13684,7 @@ mod tests {
 
         let resp = complete_cctp_mint(
             State(state.clone()),
-            Json(CompleteCctpMintRequest {
+            Audited(CompleteCctpMintRequest {
                 burn_tx: "not-a-hash".to_string(),
                 source_chain: CctpSourceChain::Ethereum,
             }),
@@ -13343,7 +13988,7 @@ mod tests {
         let resp = reconcile_equity_transfer(
             State(state.clone()),
             Path(("equity_mint".to_string(), id.to_string())),
-            Json(ReconcileEquityRequest {
+            Audited(ReconcileEquityRequest {
                 reason: "handled out-of-band".to_string(),
                 superseding_tx: None,
             }),
@@ -13404,7 +14049,7 @@ mod tests {
         let resp = reconcile_equity_transfer(
             State(state.clone()),
             Path(("equity_redemption".to_string(), id.to_string())),
-            Json(ReconcileEquityRequest {
+            Audited(ReconcileEquityRequest {
                 reason: "handled out-of-band".to_string(),
                 superseding_tx: None,
             }),
@@ -13439,7 +14084,7 @@ mod tests {
         let resp = reconcile_equity_transfer(
             State(state.clone()),
             Path(("equity_mint".to_string(), id.to_string())),
-            Json(ReconcileEquityRequest {
+            Audited(ReconcileEquityRequest {
                 reason: "handled out-of-band".to_string(),
                 superseding_tx: None,
             }),
@@ -13471,7 +14116,7 @@ mod tests {
         let resp = reconcile_equity_transfer(
             State(state.clone()),
             Path(("equity_redemption".to_string(), id.to_string())),
-            Json(ReconcileEquityRequest {
+            Audited(ReconcileEquityRequest {
                 reason: "withdrawal outrun by fees; verified dead onchain".to_string(),
                 superseding_tx: None,
             }),
@@ -13510,7 +14155,7 @@ mod tests {
         let resp = reconcile_equity_transfer(
             State(state.clone()),
             Path(("equity_redemption".to_string(), id.to_string())),
-            Json(ReconcileEquityRequest {
+            Audited(ReconcileEquityRequest {
                 reason: "send outrun by fees; verified dead onchain".to_string(),
                 superseding_tx: Some(TxHash::repeat_byte(0xCA)),
             }),
@@ -13547,7 +14192,7 @@ mod tests {
         let resp = reconcile_equity_transfer(
             State(state.clone()),
             Path(("equity_redemption".to_string(), id.to_string())),
-            Json(ReconcileEquityRequest {
+            Audited(ReconcileEquityRequest {
                 reason: "handled out-of-band".to_string(),
                 superseding_tx: Some(TxHash::repeat_byte(0xCA)),
             }),
@@ -13596,7 +14241,7 @@ mod tests {
         let resp = reconcile_equity_transfer(
             State(state.clone()),
             Path(("equity_redemption".to_string(), id.to_string())),
-            Json(ReconcileEquityRequest {
+            Audited(ReconcileEquityRequest {
                 reason: "withdrawal cancelled at its nonce".to_string(),
                 superseding_tx: Some(cancel),
             }),
@@ -13651,7 +14296,7 @@ mod tests {
         let resp = reconcile_equity_transfer(
             State(state.clone()),
             Path(("equity_redemption".to_string(), id.to_string())),
-            Json(ReconcileEquityRequest {
+            Audited(ReconcileEquityRequest {
                 reason: "withdrawal reverted onchain".to_string(),
                 superseding_tx: None,
             }),
@@ -13690,7 +14335,7 @@ mod tests {
         let resp = reconcile_equity_transfer(
             State(state.clone()),
             Path(("equity_redemption".to_string(), id.to_string())),
-            Json(ReconcileEquityRequest {
+            Audited(ReconcileEquityRequest {
                 reason: "withdrawal outrun by fees".to_string(),
                 superseding_tx: None,
             }),
@@ -13735,7 +14380,7 @@ mod tests {
         let resp = reconcile_equity_transfer(
             State(state.clone()),
             Path(("equity_redemption".to_string(), id.to_string())),
-            Json(ReconcileEquityRequest {
+            Audited(ReconcileEquityRequest {
                 reason: "withdrawal cancelled at its nonce".to_string(),
                 superseding_tx: Some(TxHash::repeat_byte(0xCA)),
             }),
@@ -13804,7 +14449,7 @@ mod tests {
         adopt_withdrawal_replacement(
             State(state.clone()),
             Path(id.to_string()),
-            Json(AdoptWithdrawalReplacementRequest {
+            Audited(AdoptWithdrawalReplacementRequest {
                 reason: "wallet sped up the withdrawal".to_string(),
                 replacement_tx,
             }),
@@ -13919,7 +14564,7 @@ mod tests {
         let Err((status, Json(body))) = reconcile_equity_transfer(
             State(state.clone()),
             Path(("equity_redemption".to_string(), id.to_string())),
-            Json(ReconcileEquityRequest {
+            Audited(ReconcileEquityRequest {
                 reason: "settled by hand".to_string(),
                 superseding_tx: None,
             }),
@@ -14230,7 +14875,7 @@ mod tests {
         let resp = reconcile_equity_transfer(
             State(state.clone()),
             Path(("equity_mint".to_string(), id.to_string())),
-            Json(ReconcileEquityRequest {
+            Audited(ReconcileEquityRequest {
                 reason: "handled out-of-band".to_string(),
                 superseding_tx: Some(TxHash::repeat_byte(0xCA)),
             }),
@@ -14310,7 +14955,7 @@ mod tests {
         let resp = reconcile_equity_transfer(
             State(state.clone()),
             Path(("equity_mint".to_string(), id.to_string())),
-            Json(ReconcileEquityRequest {
+            Audited(ReconcileEquityRequest {
                 reason: "handled out-of-band".to_string(),
                 superseding_tx: None,
             }),
@@ -14333,7 +14978,7 @@ mod tests {
         let resp = reconcile_equity_transfer(
             State(state.clone()),
             Path(("equity_mint".to_string(), id.to_string())),
-            Json(ReconcileEquityRequest {
+            Audited(ReconcileEquityRequest {
                 reason: "   ".to_string(),
                 superseding_tx: None,
             }),
@@ -14355,7 +15000,7 @@ mod tests {
         let resp = reconcile_equity_transfer(
             State(state.clone()),
             Path(("bogus".to_string(), id.to_string())),
-            Json(ReconcileEquityRequest {
+            Audited(ReconcileEquityRequest {
                 reason: "handled out-of-band".to_string(),
                 superseding_tx: None,
             }),
@@ -14377,7 +15022,7 @@ mod tests {
         let resp = reconcile_equity_transfer(
             State(state.clone()),
             Path(("usdc_bridge".to_string(), id.to_string())),
-            Json(ReconcileEquityRequest {
+            Audited(ReconcileEquityRequest {
                 reason: "handled out-of-band".to_string(),
                 superseding_tx: None,
             }),
@@ -14399,9 +15044,10 @@ mod tests {
         }))
         .unwrap();
 
-        let error = release_position_hedge(State(state), Path("MSTR".to_string()), Json(request))
-            .await
-            .unwrap_err();
+        let error =
+            release_position_hedge(State(state), Path("MSTR".to_string()), Audited(request))
+                .await
+                .unwrap_err();
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
     }
 
@@ -14414,7 +15060,7 @@ mod tests {
         }))
         .unwrap();
 
-        let error = set_position_exposure(State(state), Path("MSTR".to_string()), Json(request))
+        let error = set_position_exposure(State(state), Path("MSTR".to_string()), Audited(request))
             .await
             .unwrap_err();
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
@@ -14433,7 +15079,7 @@ mod tests {
         }))
         .unwrap();
 
-        let error = set_portfolio_snapshot_mark(State(state), Json(request))
+        let error = set_portfolio_snapshot_mark(State(state), Audited(request))
             .await
             .unwrap_err();
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
@@ -14617,7 +15263,7 @@ mod tests {
         .unwrap();
 
         let Json(response) =
-            set_position_exposure(State(state), Path("MSTR".to_string()), Json(request))
+            set_position_exposure(State(state), Path("MSTR".to_string()), Audited(request))
                 .await
                 .unwrap();
         assert_eq!(
@@ -14635,7 +15281,7 @@ mod tests {
             set_position_exposure(
                 State(write_state),
                 Path("MSTR".to_string()),
-                Json(SetPositionRequest {
+                Audited(SetPositionRequest {
                     target_net: "5".to_string(),
                     price_usdc: Some("150".to_string()),
                     reason: "manual correction".to_string(),
@@ -14672,7 +15318,7 @@ mod tests {
             "fail" => fail_transfer(
                 State(state),
                 Path(("equity_mint".to_string(), id)),
-                Json(FailTransferRequest {
+                Audited(FailTransferRequest {
                     reason: "audit".to_string(),
                 }),
             )
@@ -14681,7 +15327,7 @@ mod tests {
             "recheck" => recheck_transfer(
                 State(state),
                 Path(("usdc_bridge".to_string(), id)),
-                Query(RecheckQuery::default()),
+                AuditedQuery(RecheckQuery::default()),
             )
             .await
             .map(|_| ()),
@@ -14747,7 +15393,7 @@ mod tests {
         }))
         .unwrap();
 
-        let Json(response) = set_portfolio_snapshot_mark(State(state), Json(request))
+        let Json(response) = set_portfolio_snapshot_mark(State(state), Audited(request))
             .await
             .unwrap();
         assert_eq!(
@@ -14776,7 +15422,7 @@ mod tests {
         .unwrap();
 
         let Json(response) =
-            release_position_hedge(State(state), Path("MSTR".to_string()), Json(request))
+            release_position_hedge(State(state), Path("MSTR".to_string()), Audited(request))
                 .await
                 .unwrap();
         assert_eq!(
@@ -14803,7 +15449,7 @@ mod tests {
         }))
         .unwrap();
 
-        let error = set_portfolio_snapshot_mark(State(state), Json(request))
+        let error = set_portfolio_snapshot_mark(State(state), Audited(request))
             .await
             .unwrap_err();
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
@@ -14818,9 +15464,10 @@ mod tests {
         }))
         .unwrap();
 
-        let error = release_position_hedge(State(state), Path("MSTR".to_string()), Json(request))
-            .await
-            .unwrap_err();
+        let error =
+            release_position_hedge(State(state), Path("MSTR".to_string()), Audited(request))
+                .await
+                .unwrap_err();
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
     }
 
@@ -15558,7 +16205,7 @@ mod tests {
         let (status, Json(body)) = process_transaction(
             State(state),
             Path(TxHash::repeat_byte(0x11).to_string()),
-            Query(ProcessTransactionQuery {
+            AuditedQuery(ProcessTransactionQuery {
                 chain: Some(Chain::Robinhood),
             }),
         )
@@ -15577,7 +16224,7 @@ mod tests {
         let (status, Json(body)) = process_transaction(
             State(state),
             Path("not-a-hash".to_string()),
-            Query(ProcessTransactionQuery::default()),
+            AuditedQuery(ProcessTransactionQuery::default()),
         )
         .await
         .unwrap_err();
@@ -15602,7 +16249,7 @@ mod tests {
         let (status, Json(body)) = process_transaction(
             State(state),
             Path(tx_hash),
-            Query(ProcessTransactionQuery::default()),
+            AuditedQuery(ProcessTransactionQuery::default()),
         )
         .await
         .unwrap_err();
@@ -15627,7 +16274,7 @@ mod tests {
         let (status, Json(body)) = process_transaction(
             State(state),
             Path(tx_hash),
-            Query(ProcessTransactionQuery::default()),
+            AuditedQuery(ProcessTransactionQuery::default()),
         )
         .await
         .unwrap_err();
