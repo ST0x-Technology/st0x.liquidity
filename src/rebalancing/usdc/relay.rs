@@ -2458,6 +2458,85 @@ mod tests {
         );
     }
 
+    /// A pair that mined while its gas enqueue failed is left at
+    /// `SwapDepositPrepared`; the retry confirms the same pair, queues the gas
+    /// of its approve and deposit once, and reaches `SwapDeposited`.
+    #[tokio::test]
+    async fn mined_pair_left_by_a_failed_gas_enqueue_queues_its_gas_on_the_retry() {
+        let anvil = spawn_anvil(Anvil::new());
+        let (wallet, contracts) = funded_relay_end(&anvil).await;
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let witness = Arc::new(BroadcastWitness::new(
+            wallet.clone(),
+            store.clone(),
+            id.clone(),
+        ));
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let (transfer, closed_pool) = relay_transfer_recording_gas(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            witness.clone(),
+            contracts,
+            store.clone(),
+        )
+        .await;
+        record_quoted(
+            &store,
+            &id,
+            exact_quote(&wallet, contracts, B256::repeat_byte(0x0d)).await,
+        )
+        .await;
+        closed_pool.close().await;
+
+        let error = transfer
+            .resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, UsdcTransferError::BotGasEnqueue(_)),
+            "got {error:?}"
+        );
+        let [approve, deposit] = witness.broadcasts()[..] else {
+            panic!(
+                "expected the approve, then the deposit: {:?}",
+                witness.broadcasts()
+            );
+        };
+        assert_eq!(
+            store.load(&id).await.unwrap().unwrap().state_name(),
+            "SwapDepositPrepared"
+        );
+
+        let (retry, apalis_pool) = relay_transfer_recording_gas(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            witness.clone(),
+            contracts,
+            store.clone(),
+        )
+        .await;
+        retry
+            .resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.load(&id).await.unwrap().unwrap().state_name(),
+            "SwapDeposited"
+        );
+        assert_eq!(
+            queued_gas_costs(&apalis_pool).await,
+            vec![
+                (Chain::Robinhood, approve, "relay_approve".to_string()),
+                (Chain::Robinhood, deposit, "relay_deposit".to_string()),
+            ]
+        );
+    }
+
     /// An approve that went out alone is paid by the bot too: its gas is
     /// queued once the deposit after it confirms, not while it is unconfirmed.
     #[tokio::test]
