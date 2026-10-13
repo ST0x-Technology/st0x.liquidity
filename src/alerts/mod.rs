@@ -165,6 +165,17 @@ alert_kinds! {
         AuditedOperatorCommandTaskFailed => "Audited operator command task failed",
         OperationsAuditRecordingFailed => "Operations audit recording failed",
         InventorySettlementQuarantined => "Inventory settlement quarantined",
+        RelayPairPersistenceUnknown => "Cannot tell whether a signed Relay pair was persisted",
+        RelayApprovePersistenceUnknown => "Cannot tell whether a lone Relay approve was persisted",
+        RelayPairsUnlisted => "Could not list signed Relay pairs at startup",
+        RelayPairIdsUnparseable => "Signed Relay pairs with unparseable transfer ids were not restored",
+        RelayPairTransferUnloadable => "Could not load a transfer with a signed Relay pair",
+        RelayApproveRebroadcastFailed => "Could not rebroadcast a lone Relay approve at startup",
+        RelayPairRebroadcastFailed => "Could not rebroadcast a signed Relay pair at startup",
+        RelayEnvelopeRebroadcastFailed => "Could not rebroadcast a signed Relay envelope at startup",
+        RelayPairPreparePanicked => "The Relay pair prepare task panicked",
+        RelayPairsOnUnservedCorridor => "Signed Relay pairs on a corridor this build does not serve",
+        RelayWithdrawalHoldTimedOut => "moved the stable out of the vault",
     }
 }
 

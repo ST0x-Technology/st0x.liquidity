@@ -40,6 +40,7 @@ use super::{
     RecoverCctpMint, RestorePreparedDepositSends, RestoredDepositSends, ResumeAlpacaToBase,
     ResumeBaseToAlpaca, UsdcRecheckError, UsdcTransferError,
 };
+use crate::alerts::AlertKind;
 use crate::native_gas::TransferGasRoute;
 use crate::rebalancing::equity::RecheckOutcome;
 use crate::usdc_rebalance::{
@@ -333,7 +334,7 @@ impl<Signer: Wallet> RelayHop<Signer> {
             }
             reload => {
                 let reload = reload.map(|state| state.map(|state| state.state_name()));
-                error!(target: "operational_alert", alert = true, %id, deposit = %pair.deposit.tx_hash(), ?reload, "Cannot tell whether a signed Relay pair was persisted; its nonces stay reserved and later sends from the chain wallet wait behind them until a restart");
+                error!(target: "operational_alert", alert = true, kind = AlertKind::RelayPairPersistenceUnknown.as_str(), %id, deposit = %pair.deposit.tx_hash(), ?reload, "Cannot tell whether a signed Relay pair was persisted; its nonces stay reserved and later sends from the chain wallet wait behind them until a restart");
                 Err(error.into())
             }
         }
@@ -378,7 +379,7 @@ impl<Signer: Wallet> RelayHop<Signer> {
             }
             reload => {
                 let reload = reload.map(|state| state.map(|state| state.state_name()));
-                error!(target: "operational_alert", alert = true, %id, approve = %approve.tx_hash(), ?reload, "Cannot tell whether a lone Relay approve was persisted; its nonce stays reserved until a restart");
+                error!(target: "operational_alert", alert = true, kind = AlertKind::RelayApprovePersistenceUnknown.as_str(), %id, approve = %approve.tx_hash(), ?reload, "Cannot tell whether a lone Relay approve was persisted; its nonce stays reserved until a restart");
                 Err(error.into())
             }
         }
@@ -687,13 +688,13 @@ where
         let (ids, unparseable) = match prepared_swap_ids(pool).await {
             Ok(found) => found,
             Err(error) => {
-                error!(target: "operational_alert", alert = true, %chain, ?error, "Could not list signed Relay pairs at startup; their nonces are not reserved until each transfer resumes");
+                error!(target: "operational_alert", alert = true, kind = AlertKind::RelayPairsUnlisted.as_str(), %chain, ?error, "Could not list signed Relay pairs at startup; their nonces are not reserved until each transfer resumes");
                 outcome.unmined += 1;
                 return BTreeMap::from([(chain, outcome)]);
             }
         };
         if !unparseable.is_empty() {
-            error!(target: "operational_alert", alert = true, %chain, ?unparseable, "Signed Relay pairs with unparseable transfer ids were not restored at startup");
+            error!(target: "operational_alert", alert = true, kind = AlertKind::RelayPairIdsUnparseable.as_str(), %chain, ?unparseable, "Signed Relay pairs with unparseable transfer ids were not restored at startup");
             outcome.unmined += unparseable.len();
         }
 
@@ -712,7 +713,7 @@ where
                     warn!(target: "rebalance", %id, "Signed Relay pair has events but no state at startup");
                 }
                 Err(error) => {
-                    error!(target: "operational_alert", alert = true, %id, ?error, "Could not load a transfer with a signed Relay pair at startup; its nonces are not reserved until it resumes");
+                    error!(target: "operational_alert", alert = true, kind = AlertKind::RelayPairTransferUnloadable.as_str(), %id, ?error, "Could not load a transfer with a signed Relay pair at startup; its nonces are not reserved until it resumes");
                     outcome.unmined += 1;
                 }
             }
@@ -775,13 +776,13 @@ where
 
         for approve in split_approves {
             if let Err(error) = self.hop.bridge.broadcast_approve(TO_HUB, approve).await {
-                error!(target: "operational_alert", alert = true, %id, tx = %approve.tx_hash(), nonce = approve.nonce(), ?error, "Could not rebroadcast a lone Relay approve at startup; its nonce stays reserved and the transfer's resume sends it again");
+                error!(target: "operational_alert", alert = true, kind = AlertKind::RelayApproveRebroadcastFailed.as_str(), %id, tx = %approve.tx_hash(), nonce = approve.nonce(), ?error, "Could not rebroadcast a lone Relay approve at startup; its nonce stays reserved and the transfer's resume sends it again");
             }
         }
         if let Some(pair) = &pair
             && let Err(error) = self.hop.bridge.broadcast_deposit(TO_HUB, pair).await
         {
-            error!(target: "operational_alert", alert = true, %id, deposit = %pair.deposit.tx_hash(), nonce = pair.deposit.nonce(), ?error, "Could not rebroadcast a signed Relay pair at startup; its nonces stay reserved and the transfer's resume sends it again");
+            error!(target: "operational_alert", alert = true, kind = AlertKind::RelayPairRebroadcastFailed.as_str(), %id, deposit = %pair.deposit.tx_hash(), nonce = pair.deposit.nonce(), ?error, "Could not rebroadcast a signed Relay pair at startup; its nonces stay reserved and the transfer's resume sends it again");
         }
 
         let restored = split_approves.len()
@@ -798,7 +799,7 @@ where
 /// persist are never released, so later sends from the chain wallet wait
 /// behind them until a restart.
 fn prepare_panicked(id: &UsdcRebalanceId, join_error: &JoinError) -> UsdcTransferError {
-    error!(target: "operational_alert", alert = true, %id, %join_error, "The Relay pair prepare task panicked; nonces it reserved and did not persist stall later sends from the chain wallet until a restart");
+    error!(target: "operational_alert", alert = true, kind = AlertKind::RelayPairPreparePanicked.as_str(), %id, %join_error, "The Relay pair prepare task panicked; nonces it reserved and did not persist stall later sends from the chain wallet until a restart");
     UsdcTransferError::SwapPrepareTaskPanicked { id: id.clone() }
 }
 

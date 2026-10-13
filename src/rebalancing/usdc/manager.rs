@@ -654,6 +654,23 @@ impl std::fmt::Display for MintScanCallSite {
     }
 }
 
+/// A send restored at startup on the Ethereum wallet, so its rebroadcast
+/// page carries its own kind.
+#[derive(Debug, Clone, Copy)]
+enum RestoredSend {
+    AlpacaDepositSend,
+    RelayEnvelope,
+}
+
+impl RestoredSend {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::AlpacaDepositSend => "Alpaca deposit send",
+            Self::RelayEnvelope => "Relay envelope",
+        }
+    }
+}
+
 /// Pages when open transfers recorded the same withdrawal tx: it paid only one
 /// of them. Two transfers confirming it at the same moment can both pass the
 /// check at `ConfirmWithdrawal`.
@@ -2341,7 +2358,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
                     outcome.restored += 1;
 
                     if !self
-                        .rebroadcast_restored_send(&id, prepared, "Alpaca deposit send")
+                        .rebroadcast_restored_send(&id, prepared, RestoredSend::AlpacaDepositSend)
                         .await
                     {
                         outcome.unmined += 1;
@@ -2374,13 +2391,13 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
         let (ids, unparseable) = match prepared_swap_ids(pool).await {
             Ok(found) => found,
             Err(error) => {
-                error!(target: "operational_alert", alert = true, ?error, "Could not list signed Relay pairs at startup; startup skips Ethereum token approvals and allowance revokes");
+                error!(target: "operational_alert", alert = true, kind = AlertKind::RelayPairsUnlisted.as_str(), ?error, "Could not list signed Relay pairs at startup; startup skips Ethereum token approvals and allowance revokes");
                 outcome.unmined += 1;
                 return;
             }
         };
         if !unparseable.is_empty() {
-            error!(target: "operational_alert", alert = true, ?unparseable, "Signed Relay pairs with unparseable transfer ids were not restored at startup, so startup skips Ethereum token approvals and allowance revokes");
+            error!(target: "operational_alert", alert = true, kind = AlertKind::RelayPairIdsUnparseable.as_str(), ?unparseable, "Signed Relay pairs with unparseable transfer ids were not restored at startup, so startup skips Ethereum token approvals and allowance revokes");
             outcome.unmined += unparseable.len();
         }
 
@@ -2393,7 +2410,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
                         outcome.restored += 1;
 
                         if !self
-                            .rebroadcast_restored_send(&id, prepared, "Relay envelope")
+                            .rebroadcast_restored_send(&id, prepared, RestoredSend::RelayEnvelope)
                             .await
                         {
                             outcome.unmined += 1;
@@ -2405,7 +2422,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
                     warn!(target: "rebalance", %id, "Signed Relay pair has events but no state at startup");
                 }
                 Err(error) => {
-                    error!(target: "operational_alert", alert = true, %id, ?error, "Could not load a transfer with a signed Relay pair at startup; startup skips Ethereum token approvals and allowance revokes");
+                    error!(target: "operational_alert", alert = true, kind = AlertKind::RelayPairTransferUnloadable.as_str(), %id, ?error, "Could not load a transfer with a signed Relay pair at startup; startup skips Ethereum token approvals and allowance revokes");
                     outcome.unmined += 1;
                 }
             }
@@ -2440,20 +2457,27 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
         .await
     }
 
-    /// Rebroadcasts a send restored at startup on the Ethereum wallet (`what`
-    /// names it in the logs) and reports whether it is mined. A failed
-    /// rebroadcast pages; a send with no receipt, or whose receipt cannot be
-    /// read, counts as not mined.
+    /// Rebroadcasts a send restored at startup on the Ethereum wallet and
+    /// reports whether it is mined. A failed rebroadcast pages; a send with no
+    /// receipt, or whose receipt cannot be read, counts as not mined.
     async fn rebroadcast_restored_send(
         &self,
         id: &UsdcRebalanceId,
         prepared: &PreparedTransaction,
-        what: &'static str,
+        send: RestoredSend,
     ) -> bool {
         let tx = prepared.tx_hash();
         let nonce = prepared.nonce();
+        let what = send.label();
         if let Err(error) = self.hop.broadcast_usdc_on_ethereum(prepared).await {
-            error!(target: "operational_alert", alert = true, kind = AlertKind::AlpacaDepositSendRebroadcastFailed.as_str(), %id, %tx, nonce, ?error, "Could not rebroadcast a signed {what} at startup; its nonce stays reserved, so startup skips Ethereum token approvals and allowance revokes, and the transfer's resume broadcasts it again");
+            match send {
+                RestoredSend::AlpacaDepositSend => {
+                    error!(target: "operational_alert", alert = true, kind = AlertKind::AlpacaDepositSendRebroadcastFailed.as_str(), %id, %tx, nonce, ?error, "Could not rebroadcast a signed Alpaca deposit send at startup; its nonce stays reserved, so startup skips Ethereum token approvals and allowance revokes, and the transfer's resume broadcasts it again");
+                }
+                RestoredSend::RelayEnvelope => {
+                    error!(target: "operational_alert", alert = true, kind = AlertKind::RelayEnvelopeRebroadcastFailed.as_str(), %id, %tx, nonce, ?error, "Could not rebroadcast a signed Relay envelope at startup; its nonce stays reserved, so startup skips Ethereum token approvals and allowance revokes, and the transfer's resume broadcasts it again");
+                }
+            }
             return false;
         }
 

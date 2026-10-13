@@ -28,6 +28,7 @@ use super::{
     RestorePreparedDepositSends, RestoredDepositSends, ResumeAlpacaToBase, ResumeBaseToAlpaca,
     UsdcRecheckError, UsdcTransferError, unserved_corridor,
 };
+use crate::alerts::AlertKind;
 use crate::rebalancing::equity::RecheckOutcome;
 use crate::usdc_rebalance::{
     RebalanceDirection, UsdcRebalance, UsdcRebalanceId, prepared_swap_ids,
@@ -132,7 +133,7 @@ impl UsdcCorridorTransfers {
             .into_iter()
             .map(|(corridor, ids)| {
                 let chain = corridor.chain();
-                error!(target: "operational_alert", alert = true, %corridor, %chain, ?ids, "Signed Relay pairs on a corridor this build does not serve were not restored at startup; their nonces are not reserved, so startup skips {chain}'s approvals and revokes until a build serving {corridor} restores them");
+                error!(target: "operational_alert", alert = true, kind = AlertKind::RelayPairsOnUnservedCorridor.as_str(), %corridor, %chain, ?ids, "Signed Relay pairs on a corridor this build does not serve were not restored at startup; their nonces are not reserved, so startup skips {chain}'s approvals and revokes until a build serving {corridor} restores them");
                 (chain, ids.len())
             })
             .fold(BTreeMap::new(), |mut by_chain, (chain, count)| {

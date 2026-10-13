@@ -2759,7 +2759,11 @@ impl RebalancingService {
             tracking.corridor,
         );
 
-        if let Err(error) = self.notifier.notify(&message).await {
+        if let Err(error) = self
+            .notifier
+            .notify(AlertKind::RelayWithdrawalHoldTimedOut, &message)
+            .await
+        {
             self.relay_withdrawal_hold_alerted.write().await.remove(id);
             warn!(
                 target: "rebalance",
