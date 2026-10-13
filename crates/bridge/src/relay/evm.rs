@@ -740,7 +740,7 @@ impl<W: Wallet> RelayEnd<W> {
             check_pair_nonces(approve, &prepared.deposit)?;
         }
 
-        let receipt = self.confirmed_receipt(tx).await?;
+        let (receipt, block) = self.confirmed_receipt(tx).await?;
 
         // The deposit is mined at the nonce after its approve's, reverted or
         // not, so that nonce is used: nothing else can mine at it.
@@ -761,10 +761,6 @@ impl<W: Wallet> RelayEnd<W> {
             .filter(|_| self.sent_by_us(&receipt))
             .ok_or(RelayBridgeError::DepositUnverified { tx, order_id })?;
 
-        let block = receipt
-            .block_number
-            .ok_or(RelayBridgeError::DepositUnverified { tx, order_id })?;
-
         Ok(SwapDeposit {
             tx,
             order_id,
@@ -775,7 +771,7 @@ impl<W: Wallet> RelayEnd<W> {
 
     async fn confirm_approve(&self, approve: &PreparedTransaction) -> Result<(), RelayBridgeError> {
         let tx = approve.tx_hash();
-        let receipt = self.confirmed_receipt(tx).await?;
+        let (receipt, _) = self.confirmed_receipt(tx).await?;
 
         if !receipt.status() {
             return Err(RelayBridgeError::ApproveReverted { tx });
@@ -784,10 +780,13 @@ impl<W: Wallet> RelayEnd<W> {
         Ok(())
     }
 
-    /// `tx`'s receipt once it has this end's confirmations in a canonical
-    /// block. The wallet's wait may count fewer confirmations, and a lagging
-    /// node can serve a receipt from a reorged-out block.
-    async fn confirmed_receipt(&self, tx: TxHash) -> Result<TransactionReceipt, RelayBridgeError> {
+    /// `tx`'s receipt and its block once it has this end's confirmations in a
+    /// canonical block. The wallet's wait may count fewer confirmations, and a
+    /// lagging node can serve a receipt from a reorged-out block.
+    async fn confirmed_receipt(
+        &self,
+        tx: TxHash,
+    ) -> Result<(TransactionReceipt, u64), RelayBridgeError> {
         let receipt = self.wallet.await_receipt(tx).await?;
         let head = self.wallet.provider().get_block_number().await?;
 
@@ -813,7 +812,7 @@ impl<W: Wallet> RelayEnd<W> {
 
         self.ensure_canonical(tx, block, block_hash).await?;
 
-        Ok(receipt)
+        Ok((receipt, block))
     }
 
     /// Refuses `tx` as seen in `block_hash` unless that is the canonical
@@ -1009,7 +1008,7 @@ impl<W: Wallet> RelayEnd<W> {
         found: &Transaction,
         order_id: RelayOrderId,
     ) -> Result<U256, ProofError> {
-        let receipt = self.confirmed_receipt(tx).await?;
+        let (receipt, _) = self.confirmed_receipt(tx).await?;
 
         let terms = PaymentTerms {
             stable: self.stable,
