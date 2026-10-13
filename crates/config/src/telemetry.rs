@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tracing_appender::rolling::{InitError, RollingFileAppender, Rotation};
+use tracing_subscriber::filter::{FilterExt, filter_fn};
 use tracing_subscriber::fmt::format::{JsonFields, Writer};
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
@@ -91,6 +92,19 @@ enum ConsoleTextStyle {
     Full,
 }
 
+/// Compose operator-selected diagnostics with the non-negotiable console audit
+/// floor. Keeping this as one per-layer filter emits each audit record once
+/// while field-specific `RUST_LOG` directives can still refine ordinary logs.
+fn console_filter<S>(env_filter: EnvFilter) -> impl tracing_subscriber::layer::Filter<S>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    filter_fn(|metadata| {
+        metadata.target() == "operations_audit" && *metadata.level() <= tracing::Level::INFO
+    })
+    .or(env_filter)
+}
+
 /// Build the console fmt layer for `log_format`, writing to `writer`.
 ///
 /// The JSON arm flattens each event: the message and the event fields are
@@ -118,17 +132,17 @@ where
             ))
             .with_ansi(false)
             .with_writer(writer)
-            .with_filter(env_filter)
+            .with_filter(console_filter::<S>(env_filter))
             .boxed(),
         LogFormat::Text => match style {
             ConsoleTextStyle::Compact => tracing_subscriber::fmt::layer()
                 .compact()
                 .with_writer(writer)
-                .with_filter(env_filter)
+                .with_filter(console_filter::<S>(env_filter))
                 .boxed(),
             ConsoleTextStyle::Full => tracing_subscriber::fmt::layer()
                 .with_writer(writer)
-                .with_filter(env_filter)
+                .with_filter(console_filter::<S>(env_filter))
                 .boxed(),
         },
     }
@@ -690,9 +704,14 @@ fn install_console_only_subscriber(
 }
 
 pub fn mk_env_filter(level: tracing::Level) -> EnvFilter {
-    let fallback_filter = mk_crate_filter(level);
+    let rust_log = std::env::var("RUST_LOG").ok();
+    mk_env_filter_with_rust_log(level, rust_log.as_deref())
+}
 
-    EnvFilter::try_from_default_env().unwrap_or(fallback_filter)
+fn mk_env_filter_with_rust_log(level: tracing::Level, rust_log: Option<&str>) -> EnvFilter {
+    rust_log
+        .and_then(|directives| EnvFilter::try_new(directives).ok())
+        .unwrap_or_else(|| mk_crate_filter(level))
 }
 
 fn mk_crate_filter(level: tracing::Level) -> EnvFilter {
@@ -753,7 +772,11 @@ fn mk_crate_filter(level: tracing::Level) -> EnvFilter {
         .map(|target| format!("{target}={level}"))
         .join(",");
 
-    EnvFilter::from(format!("warn,{our_crates},{domain_targets}"))
+    // Mutation audits are compliance records, not diagnostic verbosity:
+    // successful commands stay visible even when ordinary logs are ERROR-only.
+    EnvFilter::from(format!(
+        "warn,{our_crates},{domain_targets},operations_audit=info"
+    ))
 }
 
 #[cfg(test)]
@@ -802,6 +825,12 @@ mod tests {
                 "domain target {target} is missing from the env filter: {filter}"
             );
         }
+
+        let error_filter = mk_crate_filter(tracing::Level::ERROR).to_string();
+        assert!(
+            error_filter.contains("operations_audit=info"),
+            "operations audits must remain enabled at INFO: {error_filter}"
+        );
     }
 
     /// Captures everything written through a subscriber layer so tests can
@@ -826,6 +855,31 @@ mod tests {
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
         }
+    }
+
+    #[test]
+    fn rust_log_cannot_disable_operations_audit_info() {
+        let writer = SharedWriter::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_filter(console_filter::<Registry>(mk_env_filter_with_rust_log(
+                tracing::Level::TRACE,
+                Some("error,operations_audit[{audit_schema}]=off"),
+            )));
+        let subscriber = Registry::default().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                target: "operations_audit",
+                audit_schema = "st0x.operations.audit.v1",
+                "mandatory audit"
+            );
+            tracing::info!(target: "hedge", "ordinary diagnostic");
+        });
+
+        let output = String::from_utf8(writer.0.lock().clone()).unwrap();
+        assert_eq!(output.matches("mandatory audit").count(), 1);
+        assert!(!output.contains("ordinary diagnostic"));
     }
 
     /// Emits one ERROR alert line inside a span through `layer` and returns

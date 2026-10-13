@@ -65,6 +65,7 @@ mod native_gas;
 mod offchain;
 mod onchain;
 mod onchain_trade;
+mod operations_audit;
 pub mod operator;
 mod performance;
 mod portfolio_snapshot;
@@ -716,9 +717,10 @@ fn spawn_server_supervisor(
 ) -> SupervisorHandle {
     // Read before `state` moves into the router below.
     let ops_api = state.ctx.ops_api.clone();
+    let detached_tasks = state.detached_tasks.clone();
 
     let main_router = Router::new()
-        .merge(api::routes(ops_api.as_ref()))
+        .merge(api::routes(ops_api.as_ref(), &detached_tasks))
         .nest("/api", dashboard::routes())
         .route("/metrics", axum::routing::get(metrics::endpoint))
         .with_state(state);

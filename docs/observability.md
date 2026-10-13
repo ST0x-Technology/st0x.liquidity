@@ -4,11 +4,17 @@ Best practices for logging, tracing, and monitoring in this codebase.
 
 ## Sink levels
 
-`log_level` is the minimum level for stdout and OpenTelemetry exports.
-`RUST_LOG` may refine the stdout filter for an operator session. When local
-daily files are enabled, `log_dir` and `file_log_level` must be configured
-together; neither field has an implicit counterpart. The local file layer uses
-only `file_log_level`, so `RUST_LOG` cannot increase disk usage.
+`log_level` is the minimum level for ordinary stdout and OpenTelemetry log
+records, and `file_log_level` is the minimum for ordinary local-file records.
+`operations_audit` is the deliberate exception: console, OpenTelemetry log, and
+configured local-file sinks all enforce an INFO floor for that target.
+`RUST_LOG` may refine the stdout filter for an operator session, but the console
+filter separately admits `operations_audit` through INFO before combining it
+with the operator filter. Field-specific `RUST_LOG` directives therefore cannot
+hide audit successes. When local daily files are enabled, `log_dir` and
+`file_log_level` must be configured together; neither field has an implicit
+counterpart. The local file layer uses only `file_log_level`, so `RUST_LOG`
+cannot increase disk usage.
 
 Production uses `log_level = "trace"` so Docker's `gcplogs` driver exports full
 diagnostics, while `file_log_level = "info"` limits the rotating files stored
@@ -103,6 +109,7 @@ info!(%symbol, %shares, "Hedging trade");
 | `liq_trade`         | One line per trade at a terminal status                  |
 | `liq_transfer`      | One line per transfer status change                      |
 | `operational_alert` | Operator alerts (ERROR events the log pipeline pages on) |
+| `operations_audit`  | Versioned mutation audit events (mandatory INFO floor)   |
 | `orderbook`         | Onchain orderbook interactions                           |
 | `rebalancing`       | Portfolio rebalancing                                    |
 | `startup`           | Application initialization                               |
@@ -276,6 +283,22 @@ When overriding filtering with `RUST_LOG`, always keep a bare level segment
 (e.g. `RUST_LOG=warn,hedge=trace`): the bare level is what admits targets you
 did not list, so the ERROR-severity `operational_alert` events keep flowing to
 the pipeline that pages operators even while you focus on one subsystem.
+
+## Operations audit delivery
+
+`operations_audit` carries the stable `st0x.operations.audit.v1` fields. The
+event is an ordinary stdout log line in the configured `log_format`, so Docker's
+`gcplogs` driver forwards it to Cloud Logging as message text, like every other
+record. The schema is compatible with VictoriaLogs, but VictoriaLogs receives
+events only when `[telemetry]` configures its OTLP exporter; the deployed
+configs currently rely on stdout and do not invent an OTLP endpoint.
+
+The recorder can synchronously detect that the tracing target is disabled. That
+immediate refusal emits a dimensioned ERROR on `operational_alert` so it remains
+visible without relying on the disabled audit target. Emitting a tracing event
+does not acknowledge per-event delivery by stdout, Cloud Logging, or the
+asynchronous OTLP exporter. Exporter failures are telemetry-pipeline health and
+must be monitored as such; they are not event-correlated recorder failures.
 
 ## Sensitive data
 

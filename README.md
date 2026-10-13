@@ -50,6 +50,18 @@ because it has no CCTP domain.
   directional exposure from onchain fills
 - **Operator Vault Controls**: CLI supports generic ERC20 deposits to and
   withdrawals from Raindex vaults, with a USDC-specific withdrawal shortcut
+- **Shared Operations Audit**: Every operator mutation request that reaches the
+  service emits `st0x.operations.audit.v1` with stable principal, role, matched
+  route template, request UUID, bounded target/reason fields, and outcome.
+  `target_id` is the path values followed by the identifiers the typed request
+  body and query declare, and `reason` is the typed body's reason; an oversized
+  value is refused with `400` before the handler runs. Authentication precedes
+  body capture, so in-service denials use `not_identified`/`not_provided`; Cloud
+  IAP edge rejections never reach the application. The event is an ordinary
+  stdout log line, which Docker's `gcplogs` driver forwards to Cloud Logging as
+  message text. VictoriaLogs receives the compatible event only when
+  `[telemetry]` configures the OTLP log exporter. Responses echo the UUID in
+  `x-request-id`, and the operator CLI prints it when a write fails.
 - **Public Incident Messaging**: The
   [`scripts/turnkey-message`](scripts/turnkey-message/README.md) utility
   prepares, signs, verifies, sends, and reads zero-value Base messages from an
