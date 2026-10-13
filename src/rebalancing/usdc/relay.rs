@@ -1588,6 +1588,9 @@ mod tests {
         /// Another send from this wallet takes the next nonce first, and is
         /// broadcast so no nonce is left as a gap.
         AnotherSendFirst { to: Address },
+        /// Both: another send takes the next nonce first, and the signing
+        /// returns `delay` after the deposit's nonce is taken.
+        AnotherSendFirstThenSlow { to: Address, delay: Duration },
         /// The signing panics before the deposit's nonce is taken.
         Panic,
     }
@@ -1664,7 +1667,11 @@ mod tests {
                 !matches!(hook, Some(OnDepositSigning::Panic)),
                 "the deposit signing panics for the test"
             );
-            if let Some(OnDepositSigning::AnotherSendFirst { to }) = hook {
+            if let Some(
+                OnDepositSigning::AnotherSendFirst { to }
+                | OnDepositSigning::AnotherSendFirstThenSlow { to, .. },
+            ) = hook
+            {
                 let calldata = IERC20::approveCall {
                     spender: Address::repeat_byte(0x99),
                     amount: U256::ZERO,
@@ -1684,7 +1691,11 @@ mod tests {
                 .prepare_pending_with_gas_limit(contract, calldata, unpadded_gas_limit, note)
                 .await?;
 
-            if let Some(OnDepositSigning::SlowAfterSigning(delay)) = hook {
+            if let Some(
+                OnDepositSigning::SlowAfterSigning(delay)
+                | OnDepositSigning::AnotherSendFirstThenSlow { delay, .. },
+            ) = hook
+            {
                 tokio::time::sleep(delay).await;
             }
 
@@ -2646,5 +2657,67 @@ mod tests {
             store.load(&id).await.unwrap().unwrap().state_name(),
             "WithdrawalComplete"
         );
+    }
+
+    /// An approve left alone by a split pair still goes out when its quote
+    /// expires during the signing: another send already holds the nonce
+    /// above it, so releasing the approve's would leave that send behind a
+    /// gap. The expired quote is refused on the next attempt.
+    #[tokio::test]
+    async fn split_approve_still_goes_out_when_its_quote_expires_during_signing() {
+        let anvil = spawn_anvil(Anvil::new());
+        let (wallet, contracts) = funded_relay_end(&anvil).await;
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let witness = Arc::new(
+            BroadcastWitness::new(wallet.clone(), store.clone(), id.clone()).on_deposit_signing(
+                OnDepositSigning::AnotherSendFirstThenSlow {
+                    to: contracts.stable,
+                    delay: Duration::from_secs(3),
+                },
+            ),
+        );
+        let chain_wallet: TestWallet = witness.clone();
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let transfer = relay_transfer(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            chain_wallet,
+            contracts,
+            store.clone(),
+        )
+        .await;
+        let mut quote = exact_quote(&wallet, contracts, B256::repeat_byte(0x0d)).await;
+        quote.deadline = Utc::now() + QUOTE_DEADLINE_HEADROOM + chrono::Duration::seconds(2);
+        record_quoted(&store, &id, quote).await;
+        let first_nonce = wallet
+            .provider()
+            .get_transaction_count(wallet.address())
+            .await
+            .unwrap();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(30),
+            transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends")
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, UsdcTransferError::SwapPairSplit { id: split } if *split == id),
+            "got {error:?}"
+        );
+        let state = store.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::SwapQuoted { split_approves, .. } = &state else {
+            panic!("expected SwapQuoted, got {state:?}");
+        };
+        let [approve] = split_approves.as_slice() else {
+            panic!("expected one split approve, got {split_approves:?}");
+        };
+        assert_eq!(approve.nonce(), first_nonce);
+        assert_eq!(witness.broadcasts(), vec![approve.tx_hash()]);
     }
 }
