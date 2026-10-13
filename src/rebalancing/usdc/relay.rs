@@ -276,9 +276,7 @@ impl<Signer: Wallet> RelayHop<Signer> {
 
     /// Sends again, in nonce order, the approves that went out alone: the
     /// pair's nonces follow theirs, and a node may have dropped them. Each
-    /// is persisted, so a timeout leaves it for the retry. Then waits for
-    /// each to confirm, which releases its nonce and lets the pair signed
-    /// next find the allowance it grants instead of approving again.
+    /// is persisted, so a timeout leaves it for the retry.
     async fn broadcast_split_approves(
         &self,
         id: &UsdcRebalanceId,
@@ -291,18 +289,6 @@ impl<Signer: Wallet> RelayHop<Signer> {
                     .broadcast_approve(TO_HUB, approve)
                     .await
                     .map_err(Box::new)?;
-            }
-
-            for approve in split_approves {
-                match self.bridge.confirm_approve(TO_HUB, approve).await {
-                    Ok(()) => {}
-                    // Its nonce is used all the same; the pair approves
-                    // again when the allowance is short.
-                    Err(RelayBridgeError::ApproveReverted { tx }) => {
-                        warn!(target: "rebalance", %id, %tx, "A split Relay approve reverted; the pair signs its own approve if the allowance is short");
-                    }
-                    Err(error) => return Err(Box::new(error).into()),
-                }
             }
 
             Ok(())
@@ -625,6 +611,7 @@ where
             .confirm_deposit(TO_HUB, RelayOrderId(order_id), &pair)
             .await
             .map_err(Box::new)?;
+        self.release_split_approves(id, TO_HUB).await;
 
         self.cqrs
             .send(
@@ -644,6 +631,35 @@ where
             "Relay deposit confirmed; the transfer waits at SwapDeposited for the fill"
         );
         Ok(())
+    }
+
+    /// Releases the nonces of the approves that went out alone before a
+    /// confirmed deposit: at lower nonces, they are mined at least as deep,
+    /// so each confirms at once. Only housekeeping: a failure leaves the
+    /// reservation until restart, logged.
+    async fn release_split_approves(&self, id: &UsdcRebalanceId, direction: HopDirection) {
+        let split_approves = match self.cqrs.load(id).await {
+            Ok(Some(UsdcRebalance::SwapDepositPrepared { split_approves, .. })) => split_approves,
+            Ok(state) => {
+                warn!(target: "rebalance", %id, state = ?state.as_ref().map(UsdcRebalance::state_name), "Relay deposit confirmed off SwapDepositPrepared; its split approves stay reserved until restart");
+                return;
+            }
+            Err(error) => {
+                warn!(target: "rebalance", %id, ?error, "Could not load the Relay transfer to release its split approves; they stay reserved until restart");
+                return;
+            }
+        };
+
+        for approve in &split_approves {
+            match self.hop.bridge.confirm_approve(direction, approve).await {
+                // A reverted approve is mined all the same, so its nonce is
+                // released too.
+                Ok(()) | Err(RelayBridgeError::ApproveReverted { .. }) => {}
+                Err(error) => {
+                    warn!(target: "rebalance", %id, approve = %approve.tx_hash(), ?error, "Could not confirm a split Relay approve under its confirmed deposit; its nonce stays reserved until restart");
+                }
+            }
+        }
     }
 
     /// The pair to broadcast and its order id, `None` once the deposit is
