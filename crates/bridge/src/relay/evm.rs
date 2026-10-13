@@ -2522,6 +2522,35 @@ mod tests {
         );
     }
 
+    /// A fill is never on the origin chain, so a refund reported as one is
+    /// refused at once, not retried until it has its confirmations.
+    #[tokio::test]
+    async fn unconfirmed_refund_reported_as_fill_is_unverified_at_once() {
+        let harness = Harness::new().await;
+        let order_id = B256::random();
+        harness.chain.mint(harness.chain.solver(), AMOUNT).await;
+        let refund = harness
+            .chain
+            .pay(harness.chain.wallet(), AMOUNT, order_id)
+            .await;
+
+        let error = harness
+            .bridge
+            .verify_fill(
+                HopDirection::ToHub,
+                RelayOrderId(order_id),
+                MINIMUM_OUT,
+                &[refund],
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            unverified_fill(error),
+            (vec![refund], UnverifiedReason::OnOriginChain)
+        );
+    }
+
     #[tokio::test]
     async fn fill_with_two_txs_is_ambiguous() {
         let harness = Harness::new().await;
