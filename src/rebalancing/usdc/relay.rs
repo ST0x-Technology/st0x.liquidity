@@ -2408,4 +2408,64 @@ mod tests {
             .unwrap();
         assert_eq!(next.nonce(), first_nonce, "the pair's nonces are released");
     }
+
+    /// A quote that is still signable when its signing starts but reaches
+    /// its deadline headroom before the signing returns is not persisted or
+    /// broadcast: the pair's nonces are released and the transfer holds at
+    /// `SwapQuoted`.
+    #[tokio::test]
+    async fn quote_expiring_while_its_pair_is_signed_is_not_persisted() {
+        let anvil = spawn_anvil(Anvil::new());
+        let (wallet, contracts) = funded_relay_end(&anvil).await;
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let witness = Arc::new(
+            BroadcastWitness::new(wallet.clone(), store.clone(), id.clone())
+                .on_deposit_signing(OnDepositSigning::SlowAfterSigning(Duration::from_secs(3))),
+        );
+        let chain_wallet: TestWallet = witness.clone();
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let transfer = relay_transfer(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            chain_wallet,
+            contracts,
+            store.clone(),
+        )
+        .await;
+        let mut quote = exact_quote(&wallet, contracts, B256::repeat_byte(0x0d)).await;
+        let approve_step = quote.approve.clone().unwrap();
+        quote.deadline = Utc::now() + QUOTE_DEADLINE_HEADROOM + chrono::Duration::seconds(2);
+        record_quoted(&store, &id, quote).await;
+        let first_nonce = wallet
+            .provider()
+            .get_transaction_count(wallet.address())
+            .await
+            .unwrap();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(30),
+            transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends")
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, UsdcTransferError::SwapQuoteExpired { id: refused, .. } if *refused == id),
+            "got {error:?}"
+        );
+        assert_eq!(
+            store.load(&id).await.unwrap().unwrap().state_name(),
+            "SwapQuoted"
+        );
+        assert_eq!(witness.broadcasts(), Vec::<TxHash>::new());
+        let next = wallet
+            .prepare_pending(contracts.stable, approve_step.data, "next send")
+            .await
+            .unwrap();
+        assert_eq!(next.nonce(), first_nonce, "the pair's nonces are released");
+    }
 }
