@@ -445,8 +445,9 @@ pub trait SwapBridge: Send + Sync + 'static {
     ) -> Result<SwapDeposit<Self::OrderId>, Self::Error>;
 
     /// Waits for the receipt of a [`PreparedSwap::ApproveOnly`] approve with
-    /// the origin chain's confirmations, releasing its nonce's reservation.
-    /// Short of them it fails, to be retried.
+    /// the origin chain's confirmations. The wallet's receipt wait releases
+    /// its nonce's reservation once it is mined. Short of the confirmations
+    /// it fails, to be retried.
     async fn confirm_approve(
         &self,
         direction: HopDirection,
