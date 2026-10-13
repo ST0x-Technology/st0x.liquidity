@@ -1746,6 +1746,107 @@ mod tests {
         held_at_withdrawing(short).await;
     }
 
+    /// A later bot withdraw from the same vault (a manual one, say) does not
+    /// hide the recorded one: the transfer resumed at `Withdrawing` still
+    /// confirms its withdrawal at the recorded amount.
+    #[tokio::test]
+    async fn resume_at_withdrawing_ignores_a_later_withdraw_of_the_vault() {
+        let chain = AnvilRaindexChain::deploy().await;
+        let stable = Chain::Robinhood.settlement_stable();
+        chain
+            .etch_bot_stable(stable.address, U256::from(1_000_000_000_u64))
+            .await;
+        let vault_id = RaindexVaultId(B256::repeat_byte(0x0c));
+        let raindex_contracts = RaindexContracts {
+            inventory: chain.orderbook,
+            orderbook: chain.orderbook,
+        };
+        let vault = RaindexService::new(chain.bot_wallet.clone(), raindex_contracts, chain.bot);
+        let deposit = vault
+            .submit_deposit(
+                stable.address,
+                vault_id,
+                U256::from(500_000_000_u64),
+                stable.decimals,
+            )
+            .await
+            .unwrap();
+        vault.confirm_tx(deposit).await.unwrap();
+
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let quote = relay_api.mock(|when, then| {
+            when.method(POST).path("/quote/v2");
+            then.status(400).json_body(json!({
+                "message": "No routes",
+                "errorCode": "NO_SWAP_ROUTES_FOUND",
+                "requestId": "0x00"
+            }));
+        });
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = relay_transfer_with(
+            &server,
+            &relay_api,
+            chain.bot_wallet.clone(),
+            chain.bot_wallet.clone(),
+            RelayEndContracts {
+                stable: stable.address,
+                depository: Address::repeat_byte(0x52),
+            },
+            store.clone(),
+            RelayTestSetup {
+                raindex: raindex_contracts,
+                ..RelayTestSetup::default()
+            },
+        )
+        .await;
+        let recorded = vault
+            .withdraw(
+                stable.address,
+                vault_id,
+                U256::from(40_000_000_u64),
+                stable.decimals,
+            )
+            .await
+            .unwrap();
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    corridor: ROBINHOOD_RELAY,
+                    amount: Usdc::new(float!(40)),
+                    withdrawal: TransferRef::OnchainTx(recorded),
+                },
+            )
+            .await
+            .unwrap();
+        vault
+            .withdraw(
+                stable.address,
+                vault_id,
+                U256::from(7_000_000_u64),
+                stable.decimals,
+            )
+            .await
+            .unwrap();
+
+        let error = transfer
+            .resume_base_to_alpaca(&id, Usdc::new(float!(40)), ROBINHOOD_RELAY)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, UsdcTransferError::RelayApi(relay)
+                if matches!(**relay, RelayError::QuoteRefused { code: QuoteErrorCode::NoSwapRoutesFound })),
+            "the recorded withdraw moves on to the quote; got {error:?}"
+        );
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "WithdrawalComplete");
+        quote.assert_calls(1);
+    }
+
     /// The Alpaca-to-chain side is refused before any call, and a CCTP mint
     /// recovery is never this service's.
     #[tokio::test]
