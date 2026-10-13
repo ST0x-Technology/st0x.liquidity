@@ -7745,12 +7745,14 @@ effect rather than a generic intent:
   gets its own guard: IAP on the role prefixes when the ops API is configured,
   `require_loopback` on the loopback routes, and none on the dashboard reads and
   service routes. A route guard admits only declared methods and paths, before
-  any handler runs. It sits inside the loopback gate and the operations audit,
-  so a request it refuses is still gated and audited. A `POST` under
-  `/transfers` that no declaration admits gets the stable unknown operator
-  mutation `404`; otherwise an undeclared method on a declared route gets `405`
-  with the declared methods in `Allow`, and an unknown route, nested service, or
-  fallback gets `404`.
+  any handler runs. Both operations audits and the loopback gate wrap it, so
+  every request under the mounted `/liquidity-write` prefix and every `POST`
+  under `/transfers` is audited even when the guard refuses it, and a `POST`
+  under `/transfers` passes the loopback gate first. A `POST` under `/transfers`
+  that no declaration admits gets the stable unknown operator mutation `404`;
+  otherwise an undeclared method on a declared route gets `405` with the
+  declared methods in `Allow`, and an unknown route, nested service, or fallback
+  gets `404`.
 - **Both bot-routed USDC recovery routes quiesce the rebalancing driver first.**
   `transfer resume --kind usdc` and `transfer recheck --kind usdc` send
   transactions from the rebalancing wallet or advance the `UsdcRebalance`

@@ -4706,11 +4706,24 @@ async fn unknown_operator_mutation() -> (StatusCode, Json<ErrorResponse>) {
     )
 }
 
+/// Whether a request matched a route under the mounted `/liquidity-write`
+/// prefix. The prefix's catch alls match every path under it, whatever the
+/// method, and nothing matches when the ops API is not mounted.
+fn is_mounted_write_request(request: &Request) -> bool {
+    let path = request.uri().path();
+    (path == "/liquidity-write" || path.starts_with("/liquidity-write/"))
+        && request.extensions().get::<MatchedPath>().is_some()
+}
+
 async fn audit_write_mutation(
     State(detached_tasks): State<TaskTracker>,
     mut request: Request,
     next: Next,
 ) -> Response {
+    if !is_mounted_write_request(&request) {
+        return next.run(request).await;
+    }
+
     if request.method() == axum::http::Method::POST
         && matches!(
             request.uri().path(),
@@ -4752,10 +4765,7 @@ fn is_known_loopback_mutation_route(request: &Request) -> bool {
 /// Returns nothing when no audiences are configured: a deployment with no load
 /// balancer in front of it must not expose these paths, and unmounting them is
 /// a stronger guarantee than serving a 401.
-fn ops_api_routes(
-    ops_api: Option<&OpsApiConfig>,
-    detached_tasks: &TaskTracker,
-) -> Router<AppState> {
+fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
     let Some(ops_api) = ops_api else {
         return Router::new();
     };
@@ -4773,7 +4783,7 @@ fn ops_api_routes(
         .build()
         .expect("static client config cannot fail");
 
-    ops_api_routes_with_verifiers(ops_api, detached_tasks, |audience, role| {
+    ops_api_routes_with_verifiers(ops_api, |audience, role| {
         Arc::new(IapVerifier::new(audience, role, jwks_http.clone()))
     })
 }
@@ -4783,7 +4793,6 @@ fn ops_api_routes(
 /// can point it at a mock key set while keeping the audience binding.
 fn ops_api_routes_with_verifiers(
     ops_api: &OpsApiConfig,
-    detached_tasks: &TaskTracker,
     verifier: impl Fn(&str, &'static str) -> Arc<IapVerifier>,
 ) -> Router<AppState> {
     let read_verifier = verifier(&ops_api.read_audience, "read");
@@ -4802,11 +4811,7 @@ fn ops_api_routes_with_verifiers(
         .layer(axum::middleware::from_fn(move |request, next| {
             let verifier = Arc::clone(&write_verifier);
             async move { require_iap(verifier, request, next).await }
-        }))
-        .layer(axum::middleware::from_fn_with_state(
-            detached_tasks.clone(),
-            audit_write_mutation,
-        ));
+        }));
 
     read.merge(write)
 }
@@ -5101,14 +5106,16 @@ pub(crate) fn routes(
     ops_api: Option<&OpsApiConfig>,
     detached_tasks: &TaskTracker,
 ) -> Router<AppState> {
-    routes_with_ops_api(ops_api_routes(ops_api, detached_tasks), detached_tasks)
+    routes_with_ops_api(ops_api_routes(ops_api), detached_tasks)
 }
 
 /// Merges the declared routers and guards the result. The route guard must be
 /// the first layer after the last route: a layer wraps only the routes mounted
 /// before it, so a route added after it, here or on the router `routes`
-/// returns, would skip the check. The loopback gate and the audit wrap the
-/// guard, so a request it refuses is still gated and audited.
+/// returns, would skip the check. The loopback gate and both operations audits
+/// wrap the guard, so every request under the mounted `/liquidity-write`
+/// prefix and every `POST` under `/transfers` is audited even when the guard
+/// refuses it.
 fn routes_with_ops_api(
     ops_api: Router<AppState>,
     detached_tasks: &TaskTracker,
@@ -5126,6 +5133,10 @@ fn routes_with_ops_api(
         .layer(axum::middleware::from_fn_with_state(
             detached_tasks.clone(),
             audit_loopback_mutation,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            detached_tasks.clone(),
+            audit_write_mutation,
         ))
 }
 
@@ -5304,11 +5315,9 @@ mod tests {
         let key = test_key();
         let jwks = jwks_server(&key);
         let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
-        let ops_api = ops_api_routes_with_verifiers(
-            &test_ops_api_config(),
-            &state.detached_tasks,
-            |audience, role| verifier(audience, role, &jwks),
-        );
+        let ops_api = ops_api_routes_with_verifiers(&test_ops_api_config(), |audience, role| {
+            verifier(audience, role, &jwks)
+        });
         let detached_tasks = state.detached_tasks.clone();
         (
             with_route_marker(routes_with_ops_api(ops_api, &detached_tasks).with_state(state)),
@@ -9144,7 +9153,6 @@ mod tests {
                 routes_with_ops_api(
                     undeclared.merge(ops_api_routes_with_verifiers(
                         &test_ops_api_config(),
-                        &TaskTracker::new(),
                         |audience, role| {
                             Arc::new(crate::iap_auth::IapVerifier::new(
                                 audience,
@@ -9272,6 +9280,70 @@ mod tests {
                 (false, _) => Err(format!("missing write catchall audit: {lines:?}")),
                 (true, true) => Err(format!("unrelated path was audited: {lines:?}")),
             }
+        });
+    }
+
+    /// A wrong method on a write route is refused by the route guard and still
+    /// emits exactly one write audit event with its request id.
+    #[traced_test]
+    #[tokio::test]
+    async fn write_requests_the_route_guard_refuses_are_audited_once() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_ops_app(empty_app_state(ctx).await, &test_ops_api_config());
+        let cases = [
+            (Method::GET, "e5e5e5e5-e5e5-e5e5-e5e5-e5e5e5e5e5e5"),
+            (Method::DELETE, "f6f6f6f6-f6f6-f6f6-f6f6-f6f6f6f6f6f6"),
+        ];
+
+        for (method, request_id) in &cases {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri("/liquidity-write/transfers/resume")
+                        .header("x-request-id", *request_id)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method}"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-request-id")
+                    .and_then(|id| id.to_str().ok()),
+                Some(*request_id),
+                "{method}"
+            );
+        }
+
+        logs_assert(|lines| {
+            for (method, request_id) in &cases {
+                let events = lines
+                    .iter()
+                    .filter(|line| {
+                        line.contains("operations_audit: Operations audit event")
+                            && line.contains(request_id)
+                    })
+                    .collect::<Vec<_>>();
+                let [event] = events.as_slice() else {
+                    return Err(format!(
+                        "{method}: expected one audit event, got {events:?}"
+                    ));
+                };
+                if !(event.contains("role=\"write\"")
+                    && event.contains("outcome=\"validation_failure\""))
+                {
+                    return Err(format!("{method}: wrong audit event: {event}"));
+                }
+            }
+            Ok(())
         });
     }
 
