@@ -317,8 +317,9 @@ pub enum PreparedSwap {
     /// [`SwapBridge::broadcast_approve`] to fill its nonce; the caller then
     /// prepares the deposit again. The caller must persist and broadcast it:
     /// a dropped approve leaves its nonce as a gap that every later send from
-    /// the wallet waits behind until restart. [`SwapBridge::confirm_approve`]
-    /// releases its nonce once it is mined.
+    /// the wallet waits behind until restart. Its nonce is released when the
+    /// deposit signed after it is confirmed ([`SwapBridge::confirm_deposit`]),
+    /// or by [`SwapBridge::confirm_approve`].
     ApproveOnly {
         approve: PreparedTransaction,
     },
@@ -435,13 +436,15 @@ pub trait SwapBridge: Send + Sync + 'static {
 
     /// Waits for the receipt of the pair's deposit and checks that it funded
     /// `order_id`. Short of the origin chain's confirmations it fails, to be
-    /// retried. Once the deposit is confirmed, its approve's nonce, the one
-    /// before it, is used too, and its reservation is released.
+    /// retried. Once the deposit is confirmed, reverted or not, every nonce
+    /// below it is used: the reservations of its approve and of
+    /// `split_approves`, the approves sent alone before it, are released.
     async fn confirm_deposit(
         &self,
         direction: HopDirection,
         order_id: Self::OrderId,
         prepared: &PreparedSwapDeposit,
+        split_approves: &[PreparedTransaction],
     ) -> Result<SwapDeposit<Self::OrderId>, Self::Error>;
 
     /// Waits for the receipt of a [`PreparedSwap::ApproveOnly`] approve with
