@@ -104,8 +104,9 @@ use crate::unwrapped_equity_recovery::{
     UnwrappedEquityRecoveryJob, UnwrappedEquityRecoveryJobQueue,
 };
 use crate::usdc_rebalance::{
-    CooldownFailure, InterruptedUsdcRebalances, RebalanceDirection, UsdcRebalance,
-    UsdcRebalanceEvent, UsdcRebalanceId, any_rebalance_holds_guard, interrupted_usdc_rebalance_ids,
+    CooldownFailure, InterruptedUsdcRebalances, PreBurnFailEligibility, RebalanceDirection,
+    UsdcRebalance, UsdcRebalanceEvent, UsdcRebalanceId, any_rebalance_holds_guard,
+    interrupted_usdc_rebalance_ids,
 };
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 use crate::wrapped_equity_recovery::aggregate::WrappedEquityRecoveryId;
@@ -3512,6 +3513,24 @@ impl RebalancingService {
                         }));
                     }
                     Ok(Some(state)) => {
+                        // Tracking at a swap stage reads as past the hop, so a
+                        // Relay transfer outside the vault (the states
+                        // `fail-usdc-transfer` refuses for that reason) lands
+                        // here too: it holds with the Relay page, as it has no
+                        // CCTP burn.
+                        if state.pre_burn_fail_eligibility()
+                            == PreBurnFailEligibility::RelayHeldOutsideVault
+                        {
+                            if elapsed < self.config.transfer_timeout {
+                                return Ok(None);
+                            }
+                            return Ok(Some(UsdcTimeoutCleanup::HeldOutsideVault {
+                                tracking,
+                                elapsed,
+                                state: state.state_name(),
+                            }));
+                        }
+
                         // Restart recovery seeds an AlpacaToBase failure with
                         // no burn evidence at `BridgingInitiated`, so it lands
                         // here: hold it with its own page once timed out.
@@ -3606,29 +3625,10 @@ impl RebalancingService {
                 }
                 // Tracking can lag the store, so every chain-to-Alpaca Relay
                 // state after the withdrawal holds: a deposit may be on chain.
-                Ok(Some(
-                    state @ (UsdcRebalance::WithdrawalComplete {
-                        direction: RebalanceDirection::BaseToAlpaca,
-                        corridor:
-                            UsdcCorridor::HubRouted {
-                                hop: HopKind::Relay,
-                                ..
-                            },
-                        ..
-                    }
-                    | UsdcRebalance::SwapQuoted {
-                        direction: RebalanceDirection::BaseToAlpaca,
-                        ..
-                    }
-                    | UsdcRebalance::SwapDepositPrepared {
-                        direction: RebalanceDirection::BaseToAlpaca,
-                        ..
-                    }
-                    | UsdcRebalance::SwapDeposited {
-                        direction: RebalanceDirection::BaseToAlpaca,
-                        ..
-                    }),
-                )) => {
+                Ok(Some(state))
+                    if state.pre_burn_fail_eligibility()
+                        == PreBurnFailEligibility::RelayHeldOutsideVault =>
+                {
                     drop(tracking_guard);
                     return Ok(Some(UsdcTimeoutCleanup::HeldOutsideVault {
                         tracking,
