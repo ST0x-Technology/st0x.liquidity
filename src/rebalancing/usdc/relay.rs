@@ -2287,6 +2287,11 @@ mod tests {
             alloy::consensus::Transaction::nonce(&deposit),
             first_nonce + 2
         );
+        assert_eq!(
+            wallet.transaction_submission(approve.tx_hash()),
+            None,
+            "the mined split approve's nonce is released"
+        );
     }
 
     /// A failed pair write that committed anyway is sent; one that did not
