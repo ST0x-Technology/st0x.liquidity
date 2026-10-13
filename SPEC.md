@@ -5040,6 +5040,7 @@ enum UsdcRebalance {
         direction: RebalanceDirection,
         corridor: UsdcCorridor,
         amount: Usdc,
+        first_deposit: FirstDeposit,
         quote: SwapQuote,
         signed_order_ids: Vec<B256>,
         reverted_quotes: Vec<SwapQuote>,
@@ -5613,7 +5614,8 @@ enum UsdcRebalanceCommand {
     // A fill or refund proven late for a signed order: from `SwapQuoted` a
     // reverted order whose deposit the escrow scan found on chain, from
     // `SwapFailed` the failed order. The same floors as `ConfirmSwapFill` and
-    // `RecordSwapRefund`, against that order's quote.
+    // `RecordSwapRefund`: a fill against that order's quote, a refund against
+    // the transfer's first deposit.
     RecoverSwapCompletion { order_id: B256, deposit_tx: TxHash, payment: RecoveredSwapPayment },
     // Returns the stable to the vault; see "Relay hop" step 9.
     BeginRedeposit { reason: RedepositReason },

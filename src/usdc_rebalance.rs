@@ -1151,7 +1151,8 @@ pub enum RecoveredSwapPayment {
 
 /// A late payment as `SwapCompletionRecovered` records it: a fill with the
 /// fee split `RelayFillVerified` carries, or a refund with the refund floor
-/// of its order when it is below it, as `SwapRefunded` carries.
+/// of the transfer's first deposit when it is below it, as `SwapRefunded`
+/// carries.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SwapRecovery {
     Fill {
@@ -3662,9 +3663,9 @@ impl EventSourced for UsdcRebalance {
     // v16: `refund_requotes` on `SwapQuoted`, `SwapDepositPrepared`,
     // `SwapDeposited`, `SwapRefunded` and `SwapEscrowUnresolved`; older
     // snapshots read it as 0.
-    // v17: `reverted_quotes` on the swap states, `quote` and
-    // `refund_requotes` on `SwapFailed`, and `SwapCompletionRecovered`, whose
-    // refund carries `short_of_floor`.
+    // v17: `reverted_quotes` on the swap states, `quote`, `first_deposit`
+    // and `refund_requotes` on `SwapFailed`, and `SwapCompletionRecovered`,
+    // whose refund carries `short_of_floor`.
     const SCHEMA_VERSION: u64 = 17;
 
     fn originate(event: &Self::Event) -> Option<Self> {
@@ -6589,21 +6590,22 @@ impl UsdcRebalance {
 
     /// Records a late fill or refund of a signed order this state can adopt
     /// one of, against that order's quote: a fill at least its floor, a
-    /// refund more than nothing and at most its input.
+    /// refund more than nothing and at most its input, short below the
+    /// refund floor of the transfer's first deposit.
     fn transition_recover_swap_completion(
         &self,
         order_id: B256,
         deposit_tx: TxHash,
         payment: RecoveredSwapPayment,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        let Some(base) = self.swap_recovery_base() else {
+            return Err(UsdcRebalanceError::InvalidCommand {
+                command: "RecoverSwapCompletion".to_string(),
+                state: self.state_name().to_string(),
+            });
+        };
         let Some(quote) = self.recoverable_order(order_id) else {
-            return match self.swap_recovery_base() {
-                Some(_) => Err(UsdcRebalanceError::SwapOrderNotRecoverable { order_id }),
-                None => Err(UsdcRebalanceError::InvalidCommand {
-                    command: "RecoverSwapCompletion".to_string(),
-                    state: self.state_name().to_string(),
-                }),
-            };
+            return Err(UsdcRebalanceError::SwapOrderNotRecoverable { order_id });
         };
 
         let payment = match payment {
@@ -6626,7 +6628,7 @@ impl UsdcRebalance {
                 amount_refunded,
             } => {
                 let refunded = proven_refund_amount(quote, amount_refunded)?;
-                let floor = FirstDeposit::from(quote).refund_floor()?;
+                let floor = base.first_deposit.refund_floor()?;
                 SwapRecovery::Refund {
                     refund_tx,
                     side,
@@ -8600,6 +8602,65 @@ mod tests {
                 "{refused}: got {error:?}"
             );
         }
+    }
+
+    /// A late refund of a re-quoted order is measured against the first
+    /// deposit: 99.2 clears the reverted 99.6 re-quote's floor of 99.102 but
+    /// not the 100 deposit's floor of 99.5, so it is recorded short.
+    #[tokio::test]
+    async fn late_refund_of_a_requoted_order_is_short_against_the_first_deposit() {
+        let reverted = [
+            deposited(RebalanceDirection::AlpacaToBase),
+            vec![
+                UsdcRebalanceEvent::SwapRefunded {
+                    refund_tx: TxHash::repeat_byte(0xe1),
+                    side: RefundSide::Origin,
+                    amount_refunded: Usdc::new(float!(99.6)),
+                    short_of_floor: None,
+                    refunded_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::SwapRequoted {
+                    quote: Box::new(swap_quote_for_test(
+                        U256::from(99_600_000u64),
+                        B256::repeat_byte(0x1e),
+                    )),
+                    quoted_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::SwapDepositPrepared {
+                    approve: None,
+                    deposit: PreparedTransaction::for_test(TxHash::repeat_byte(0xa3), 7),
+                    prepared_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::SwapDepositReverted {
+                    deposit_tx: TxHash::repeat_byte(0xa3),
+                    reverted_at: Utc::now(),
+                },
+            ],
+        ]
+        .concat();
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(reverted.clone())
+            .when(UsdcRebalanceCommand::RecoverSwapCompletion {
+                order_id: B256::repeat_byte(0x1e),
+                deposit_tx: TxHash::repeat_byte(0xa3),
+                payment: RecoveredSwapPayment::Refund {
+                    refund_tx: TxHash::repeat_byte(0xe2),
+                    side: RefundSide::Origin,
+                    amount_refunded: U256::from(99_200_000u64),
+                },
+            })
+            .await
+            .events();
+        let state = replay::<UsdcRebalance>([reverted, events].concat())
+            .unwrap()
+            .unwrap();
+
+        let UsdcRebalance::SwapRefunded { short_of_floor, .. } = &state else {
+            panic!("expected SwapRefunded, got {state:?}");
+        };
+        assert_eq!(*short_of_floor, Some(U256::from(99_500_000u64)));
+        assert!(state.is_reconcilable_failure());
     }
 
     /// A late refund below its order's refund floor is recorded short: it is
