@@ -2515,7 +2515,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_quote_max_age_above_an_hour_is_refused() {
+    fn relay_quote_max_age_is_capped_at_an_hour() {
         let error = corridor_error(&relay_corridor(
             "robinhood",
             &[("quote_max_age_secs", "9223372036854775807")],
@@ -2542,6 +2542,20 @@ mod tests {
                 RebalancingCtxError::RelayQuoteMaxAgeTooLong { secs: 3601, .. }
             ),
             "got {error:?}"
+        );
+
+        let error = corridor_error(&relay_corridor(
+            "robinhood",
+            &[("quote_max_age_secs", "3600")],
+        ));
+        assert!(
+            matches!(
+                error,
+                RebalancingCtxError::RelayHopNotSwitchedOn {
+                    chain: Chain::Robinhood
+                }
+            ),
+            "an hour exactly passes the table checks; got {error:?}"
         );
     }
 
