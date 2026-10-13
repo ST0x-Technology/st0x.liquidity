@@ -10,16 +10,19 @@ bridge-crate-specific additions and clarifications.
 
 ## Bridge Crate Scope
 
-This is a **standalone library crate** that provides a generic `Bridge` trait
-for cross-chain USDC transfers. When working in this crate:
+This is a **standalone library crate** for cross-chain settlement-stable
+transfers: a generic `Bridge` trait for CCTP's USDC burn and mint, and a Relay
+API client for USDG <-> USDC. When working in this crate:
 
 - **Stay focused on bridge abstractions**: This crate should remain independent
   of the parent application
 - **No parent crate dependencies**: Never add dependencies on `st0x-hedge` or
   other workspace members
 - **Feature-gated implementations**: The default build ships only the `Bridge`
-  trait and shared domain types. CCTP implementation is behind the `cctp`
-  feature
+  trait and shared domain types. Features:
+  - `cctp`: the CCTP implementation
+  - `relay`: the Relay API client (`relay` module, see `docs/relay.md`)
+  - the `corridor` module compiles under either
 
 ## CRITICAL: No Leaky Abstractions
 
@@ -41,6 +44,8 @@ not the CCTP implementation directly. Implementation details must remain hidden.
    implementation)
 4. **Implementation type** - `CctpBridge` (behind `cctp` feature)
 5. **Context type** - `CctpCtx` (behind `cctp` feature)
+6. **Relay client** - `RelayClient`, `RelayApiKey`, the quote, status and
+   quote-acceptance types, and `RelayError` (behind `relay` feature)
 
 **What must remain private:**
 
@@ -68,7 +73,8 @@ not the CCTP implementation directly. Implementation details must remain hidden.
 ## Architecture Constraints
 
 - **Trait-based design**: All functionality goes through the `Bridge` trait
-- **Feature flags**: CCTP implementation behind `cctp` feature flag
+- **Feature flags**: CCTP implementation behind `cctp`, Relay client behind
+  `relay`
 - **No runtime selection**: Implementation choice happens at compile time
   through generics
 - **Associated types**: Error and Attestation types are associated to enable
