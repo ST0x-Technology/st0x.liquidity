@@ -288,13 +288,12 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> RelayBridge<EthWallet, ChainWallet>
         }
     }
 
-    /// Locates the one tx in `txs` and proves it paid `order_id`.
-    async fn verify_payment(
+    /// Locates the one tx in `txs`, with the side it is on.
+    async fn locate_one(
         &self,
         direction: HopDirection,
-        order_id: RelayOrderId,
         txs: &[TxHash],
-    ) -> Result<SwapPayment, ProofError> {
+    ) -> Result<Located, ProofError> {
         let [tx] = txs else {
             return Err(ProofError::Unverified(UnverifiedReason::TxCount {
                 count: txs.len(),
@@ -306,13 +305,23 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> RelayBridge<EthWallet, ChainWallet>
             .await?
             .ok_or(ProofError::NotFound { tx: *tx })?;
 
-        let amount = self.prove(direction, side, *tx, &found, order_id).await?;
-
-        Ok(SwapPayment {
+        Ok(Located {
             tx: *tx,
             side,
-            amount,
+            found,
         })
+    }
+
+    /// Proves the located `tx` paid `order_id` on `side`.
+    async fn verify_payment(
+        &self,
+        direction: HopDirection,
+        order_id: RelayOrderId,
+        Located { tx, side, found }: Located,
+    ) -> Result<SwapPayment, ProofError> {
+        let amount = self.prove(direction, side, tx, &found, order_id).await?;
+
+        Ok(SwapPayment { tx, side, amount })
     }
 }
 
@@ -435,14 +444,21 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> SwapBridge for RelayBridge<EthWalle
             reason,
         };
 
-        let payment = self
-            .verify_payment(direction, order_id, txs)
+        let located = self
+            .locate_one(direction, txs)
             .await
             .map_err(|error| error.into_bridge_error(unverified))?;
 
-        if payment.side == SwapSide::Origin {
+        // Only a refund pays on the origin chain: refused before the proof,
+        // which would wait for its confirmations first.
+        if located.side == SwapSide::Origin {
             return Err(unverified(UnverifiedReason::OnOriginChain));
         }
+
+        let payment = self
+            .verify_payment(direction, order_id, located)
+            .await
+            .map_err(|error| error.into_bridge_error(unverified))?;
 
         if payment.amount < minimum_out {
             return Err(unverified(UnverifiedReason::BelowMinimum {
@@ -469,8 +485,12 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> SwapBridge for RelayBridge<EthWalle
             reason,
         };
 
+        let located = self
+            .locate_one(direction, txs)
+            .await
+            .map_err(|error| error.into_bridge_error(unverified))?;
         let payment = self
-            .verify_payment(direction, order_id, txs)
+            .verify_payment(direction, order_id, located)
             .await
             .map_err(|error| error.into_bridge_error(unverified))?;
 
@@ -1032,6 +1052,13 @@ fn check_pair_nonces(
         approve: approve.nonce(),
         deposit: deposit.nonce(),
     })
+}
+
+/// The tx Relay named, found on one side of the swap.
+struct Located {
+    tx: TxHash,
+    side: SwapSide,
+    found: Transaction,
 }
 
 /// A proof that failed: a tx that is not the payment, or a read that did not

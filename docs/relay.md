@@ -314,10 +314,12 @@ block (`NotCanonical` otherwise), then:
 - exactly one `Transfer` of that stable to our wallet, from the calldata's
   `from`, whose amount equals the calldata amount.
 
-A fill must be on the destination chain and pay at least the quote's
-`minimum_out`. A refund may be on either chain, checked against that chain's
-stable and wallet, and must not exceed the deposited amount (both stables have 6
-decimals, so the amounts compare unit for unit; Relay quotes a refund minimum of
-0). A refund paid on the destination chain looks exactly like a fill, so the
-side alone does not tell them apart: Relay's status does. A failed check is
-`FillUnverified` or `RefundUnverified` with an `UnverifiedReason`.
+A fill must be on the destination chain (a tx on the origin chain is
+`OnOriginChain` at once, before any wait for its confirmations) and pay at least
+the quote's `minimum_out`. A refund may be on either chain, checked against that
+chain's stable and wallet, and must not exceed the deposited amount (both
+stables have 6 decimals, so the amounts compare unit for unit; Relay quotes a
+refund minimum of 0). A refund paid on the destination chain looks exactly like
+a fill, so the side alone does not tell them apart: Relay's status does. A
+failed check is `FillUnverified` or `RefundUnverified` with an
+`UnverifiedReason`.
