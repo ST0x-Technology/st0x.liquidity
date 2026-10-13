@@ -718,9 +718,9 @@ where
                     if state.corridor() == self.corridor
                         && state.direction() == RebalanceDirection::BaseToAlpaca =>
                 {
-                    let restored = self.restore_swap_envelopes(&id, &state).await;
+                    let (restored, unmined) = self.restore_swap_envelopes(&id, &state).await;
                     outcome.restored += restored;
-                    outcome.unmined += restored;
+                    outcome.unmined += unmined;
                 }
                 Ok(Some(_)) => {}
                 Ok(None) => {
@@ -738,8 +738,12 @@ where
 
     /// Restores and sends again the chain-signed envelopes of `state` in
     /// nonce order (lone approves, then the pair), and returns how many it
-    /// restored.
-    async fn restore_swap_envelopes(&self, id: &UsdcRebalanceId, state: &UsdcRebalance) -> usize {
+    /// restored and how many of those have no receipt after the send.
+    async fn restore_swap_envelopes(
+        &self,
+        id: &UsdcRebalanceId,
+        state: &UsdcRebalance,
+    ) -> (usize, usize) {
         let (split_approves, pair) = match state {
             UsdcRebalance::SwapQuoted { split_approves, .. } => (split_approves.as_slice(), None),
             UsdcRebalance::SwapDepositPrepared {
@@ -773,7 +777,7 @@ where
             | UsdcRebalance::DepositFailed { .. }
             | UsdcRebalance::Reconciled { .. } => {
                 warn!(target: "rebalance", %id, state = state.state_name(), "Transfer holds no signed Relay envelope at startup");
-                return 0;
+                return (0, 0);
             }
         };
 
@@ -788,24 +792,64 @@ where
             self.hop.bridge.restore_prepared(TO_HUB, &signed).await;
         }
 
+        let mut unmined = 0;
         for approve in split_approves {
-            if let Err(error) = self.hop.bridge.broadcast_approve(TO_HUB, approve).await {
-                error!(target: "operational_alert", alert = true, kind = AlertKind::RelayApproveRebroadcastFailed.as_str(), %id, tx = %approve.tx_hash(), nonce = approve.nonce(), ?error, "Could not rebroadcast a lone Relay approve at startup; its nonce stays reserved and the transfer's resume sends it again");
+            let sent = match self.hop.bridge.broadcast_approve(TO_HUB, approve).await {
+                Ok(_) => true,
+                Err(error) => {
+                    error!(target: "operational_alert", alert = true, kind = AlertKind::RelayApproveRebroadcastFailed.as_str(), %id, tx = %approve.tx_hash(), nonce = approve.nonce(), ?error, "Could not rebroadcast a lone Relay approve at startup; its nonce stays reserved and the transfer's resume sends it again");
+                    false
+                }
+            };
+            if !sent || !self.restored_envelope_mined(id, approve).await {
+                unmined += 1;
             }
         }
-        if let Some(pair) = &pair
-            && let Err(error) = self.hop.bridge.broadcast_deposit(TO_HUB, pair).await
-        {
-            error!(target: "operational_alert", alert = true, kind = AlertKind::RelayPairRebroadcastFailed.as_str(), %id, deposit = %pair.deposit.tx_hash(), nonce = pair.deposit.nonce(), ?error, "Could not rebroadcast a signed Relay pair at startup; its nonces stay reserved and the transfer's resume sends it again");
+
+        let pair_envelopes = pair
+            .as_ref()
+            .map_or(0, |pair| usize::from(pair.approve.is_some()) + 1);
+        if let Some(pair) = &pair {
+            let sent = match self.hop.bridge.broadcast_deposit(TO_HUB, pair).await {
+                Ok(_) => true,
+                Err(error) => {
+                    error!(target: "operational_alert", alert = true, kind = AlertKind::RelayPairRebroadcastFailed.as_str(), %id, deposit = %pair.deposit.tx_hash(), nonce = pair.deposit.nonce(), ?error, "Could not rebroadcast a signed Relay pair at startup; its nonces stay reserved and the transfer's resume sends it again");
+                    false
+                }
+            };
+            // The deposit's nonce follows its approve's, so a mined deposit
+            // means both mined.
+            if !sent || !self.restored_envelope_mined(id, &pair.deposit).await {
+                unmined += pair_envelopes;
+            }
         }
 
-        let restored = split_approves.len()
-            + pair
-                .as_ref()
-                .map_or(0, |pair| usize::from(pair.approve.is_some()) + 1);
-        info!(target: "rebalance", %id, restored, "Reserved the nonces of the signed Relay envelopes");
+        let restored = split_approves.len() + pair_envelopes;
+        info!(target: "rebalance", %id, restored, unmined, "Reserved the nonces of the signed Relay envelopes");
 
-        restored
+        (restored, unmined)
+    }
+
+    /// Whether a restored envelope has a receipt on the chain; a receipt
+    /// that cannot be read counts as missing.
+    async fn restored_envelope_mined(
+        &self,
+        id: &UsdcRebalanceId,
+        envelope: &PreparedTransaction,
+    ) -> bool {
+        let tx = envelope.tx_hash();
+        let nonce = envelope.nonce();
+        match self.hop.bridge.origin_tx_mined(TO_HUB, tx).await {
+            Ok(true) => true,
+            Ok(false) => {
+                warn!(target: "rebalance", %id, %tx, nonce, "Restored Relay envelope is not mined yet at startup");
+                false
+            }
+            Err(error) => {
+                warn!(target: "rebalance", %id, %tx, nonce, ?error, "Could not read the receipt of a restored Relay envelope at startup; treating it as not mined");
+                false
+            }
+        }
     }
 }
 
