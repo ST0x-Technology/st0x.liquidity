@@ -698,7 +698,6 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         UsdcTransferError::AttestationTimedOut { .. }
         | UsdcTransferError::WithdrawalTxUnderconfirmed { .. }
         | UsdcTransferError::WithdrawalScanTransient { .. }
-        | UsdcTransferError::RecordedWithdrawalUnverified { .. }
         | UsdcTransferError::SettlementCheckTransient { .. }
         | UsdcTransferError::MintRecoveryInconclusive { .. }
         | UsdcTransferError::DepositSendReconciliationPending { .. } => true,
@@ -746,6 +745,7 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::DepositRefMustBeOnchain { .. }
         | UsdcTransferError::ResumeDirectionMismatch { .. }
         | UsdcTransferError::AdoptedWithdrawalAmountMismatch { .. }
+        | UsdcTransferError::RecordedWithdrawalUnverified { .. }
         | UsdcTransferError::ConversionBelowWithdrawalMinimum { .. }
         | UsdcTransferError::ConversionOutcomeUnresolved { .. }
         | UsdcTransferError::PostDepositConversionShortFill { .. }

@@ -1250,7 +1250,8 @@ mod tests {
     use st0x_evm::{Evm, EvmError, IERC20};
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
-        AlpacaBrokerAuth, AlpacaWalletService, Backpressure, Executor as _, TimeInForce,
+        AlpacaBrokerAuth, AlpacaTransferId, AlpacaWalletService, Backpressure, Executor as _,
+        TimeInForce,
     };
     use st0x_float_macro::float;
     use st0x_raindex::{
@@ -1597,8 +1598,8 @@ mod tests {
 
     /// A transfer resumed at `Withdrawing` moves on only once its recorded
     /// vault withdraw's receipt reads back the recorded amount. One that
-    /// realized another amount, or has no receipt yet, stays at `Withdrawing`
-    /// with its guard, and no quote is asked.
+    /// realized another amount, has no receipt yet, or has no tx hash stays at
+    /// `Withdrawing` with its guard, and no quote is asked.
     #[tokio::test]
     async fn resume_at_withdrawing_checks_the_recorded_withdraw() {
         let chain = AnvilRaindexChain::deploy().await;
@@ -1720,6 +1721,32 @@ mod tests {
             "got {error:?}"
         );
         held_at_withdrawing(unmined).await;
+
+        let no_hash = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &no_hash,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    corridor: ROBINHOOD_RELAY,
+                    amount: Usdc::new(float!(40)),
+                    withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                },
+            )
+            .await
+            .unwrap();
+        let error = transfer
+            .resume_base_to_alpaca(&no_hash, Usdc::new(float!(40)), ROBINHOOD_RELAY)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                UsdcTransferError::RecordedWithdrawalUnverified { .. }
+            ),
+            "got {error:?}"
+        );
+        held_at_withdrawing(no_hash).await;
         quote.assert_calls(0);
 
         let exact = initiate(float!(40), withdraw().await).await;

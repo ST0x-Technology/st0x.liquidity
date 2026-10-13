@@ -413,11 +413,13 @@ pub enum UsdcTransferError {
         withdrawn: alloy::primitives::U256,
         requested: alloy::primitives::U256,
     },
-    /// The realized amount of the vault withdraw recorded at `Withdrawing`
-    /// cannot be read yet, so the transfer does not move past it.
+    /// The vault withdraw recorded at `Withdrawing` has no tx hash, so its
+    /// realized amount can never be read and the transfer does not move past
+    /// it. Not redriven: the operator reconciles it.
     #[error(
-        "USDC rebalance {id}: the realized amount of its recorded vault withdrawal \
-         {withdrawal:?} is not known yet; holding at Withdrawing"
+        "USDC rebalance {id}: its recorded vault withdrawal {withdrawal:?} has no \
+         tx hash to read the realized amount from; holding at Withdrawing for \
+         operator reconciliation"
     )]
     RecordedWithdrawalUnverified {
         id: UsdcRebalanceId,
