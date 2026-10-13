@@ -160,7 +160,8 @@ impl<Signer: Wallet> RelayHop<Signer> {
     /// broadcast. Approves that went out alone are sent again first, so the
     /// pair is not signed behind a nonce no node holds. An expired quote is
     /// not signed, and a pair whose quote expired while it was signed is
-    /// released instead of persisted.
+    /// released instead of persisted. A lone approve still goes out: another
+    /// send holds the nonce above it.
     async fn sign_swap_pair(
         self: &Arc<Self>,
         cqrs: &Store<UsdcRebalance>,
@@ -191,17 +192,20 @@ impl<Signer: Wallet> RelayHop<Signer> {
         let relay_quote = relay_quote(id, quote, split_approves.is_empty(), &self.bounds)?;
         let prepared = self.sign_before(id, relay_quote, deadline).await?;
 
-        if quote_expired(quote, quoted_at, self.bounds.quote_max_age, Utc::now()) {
-            warn!(target: "rebalance", %id, %quoted_at, deadline = %quote.deadline, max_age = ?self.bounds.quote_max_age, "Relay quote expired while its pair was signed; releasing its nonces, the transfer holds its guard at SwapQuoted");
-            self.bridge.discard_prepared(TO_HUB, &prepared).await;
-            return Err(UsdcTransferError::SwapQuoteExpired {
-                id: id.clone(),
-                quoted_at,
-                deadline: quote.deadline,
-            });
-        }
-
         match prepared {
+            PreparedSwap::Deposit(pair)
+                if quote_expired(quote, quoted_at, self.bounds.quote_max_age, Utc::now()) =>
+            {
+                warn!(target: "rebalance", %id, %quoted_at, deadline = %quote.deadline, max_age = ?self.bounds.quote_max_age, "Relay quote expired while its pair was signed; releasing its nonces, the transfer holds its guard at SwapQuoted");
+                self.bridge
+                    .discard_prepared(TO_HUB, &PreparedSwap::Deposit(pair))
+                    .await;
+                Err(UsdcTransferError::SwapQuoteExpired {
+                    id: id.clone(),
+                    quoted_at,
+                    deadline: quote.deadline,
+                })
+            }
             PreparedSwap::Deposit(pair) => {
                 self.persist_swap_pair(cqrs, id, &pair).await?;
                 Ok(pair)
