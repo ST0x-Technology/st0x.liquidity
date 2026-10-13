@@ -8284,12 +8284,12 @@ mod tests {
         record_quoted_toward_chain(
             store,
             id,
-            exact_quote(&rig.hub_wallet, rig.hub_contracts, REVERTED_ORDER_ID).await,
+            exact_quote_from_hub(&rig.hub_wallet, rig.hub_contracts, REVERTED_ORDER_ID).await,
         )
         .await;
         let reverted = PreparedTransaction::for_test(TxHash::repeat_byte(0xa7), 40);
         let mut requoted =
-            exact_quote(&rig.hub_wallet, rig.hub_contracts, TOWARD_CHAIN_ORDER_ID).await;
+            exact_quote_from_hub(&rig.hub_wallet, rig.hub_contracts, TOWARD_CHAIN_ORDER_ID).await;
         requoted.request_id = B256::repeat_byte(0x6f);
         for command in [
             UsdcRebalanceCommand::PrepareSwapDeposit {
