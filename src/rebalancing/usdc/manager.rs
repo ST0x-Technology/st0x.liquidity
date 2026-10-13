@@ -190,8 +190,8 @@ pub trait UsdcBridgeHelper: Send + Sync + 'static {
     /// [`CctpError`] for the settlement checks whose source is typed so.
     type HubError: Into<CctpError> + std::error::Error + Send + Sync + 'static;
 
-    /// Reports a failed deposit-send read or send, so a hop without CCTP
-    /// never reports it as a CCTP error.
+    /// Reports a failed deposit-send scan, its tx-block read or its signing,
+    /// so a hop without CCTP never reports those as a CCTP error.
     fn hub_leg_failure(error: Self::HubError) -> UsdcTransferError
     where
         Self: Sized;
@@ -30672,6 +30672,17 @@ mod tests {
             helper.ethereum_tx_block(tx).await.unwrap(),
             helper.ethereum_tx_block(mint_tx).await.unwrap() + 1
         );
+
+        // Anvil automines one block per tx and nothing lands after the send,
+        // so its inclusion block is the head: depth 1.
+        assert_eq!(helper.ethereum_tx_confirmations(tx).await.unwrap(), Some(1));
+        let MinedTx {
+            from,
+            nonce,
+            confirmations,
+            ..
+        } = helper.ethereum_mined_tx(tx).await.unwrap().unwrap();
+        assert_eq!((from, nonce, confirmations), (wallet, prepared.nonce(), 1));
     }
 
     /// A Relay transfer has no CCTP leg, so a failed deposit-send scan on the
