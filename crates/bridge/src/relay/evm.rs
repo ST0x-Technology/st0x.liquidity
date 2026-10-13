@@ -127,8 +127,6 @@ pub enum RelayBridgeError {
     DepositLogIncomplete { order_id: RelayOrderId },
     #[error("deposit log names tx {tx}, whose receipt the node does not have yet")]
     DepositReceiptMissing { tx: TxHash },
-    #[error("deposit scan from block {from_block} is ahead of the head {head}")]
-    ScanAheadOfHead { from_block: u64, head: u64 },
     #[error("tx {tx} is on neither chain yet")]
     TxNotFound { tx: TxHash },
     #[error("fill {txs:?} is unverified: {reason:?}")]
@@ -871,10 +869,6 @@ impl<W: Wallet> RelayEnd<W> {
         pace: ScanPace,
     ) -> Result<DepositScan<RelayOrderId>, RelayBridgeError> {
         let head = self.wallet.provider().get_block_number().await?;
-
-        if from_block > head {
-            return Err(RelayBridgeError::ScanAheadOfHead { from_block, head });
-        }
 
         let confirmed = head.saturating_sub(self.confirmations.saturating_sub(1));
         let scanned_to = confirmed.max(from_block.saturating_sub(1));
