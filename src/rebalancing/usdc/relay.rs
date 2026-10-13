@@ -1704,6 +1704,11 @@ mod tests {
             ),
             "got {error:?}"
         );
+        let message = error.to_string();
+        assert!(
+            message.contains("held at Withdrawing") && !message.contains("failed"),
+            "a held Relay transfer is not reported failed; got {message}"
+        );
         held_at_withdrawing(short.clone()).await;
 
         let unmined = initiate(float!(40), TxHash::repeat_byte(0x77)).await;
