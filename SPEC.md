@@ -5193,8 +5193,9 @@ enum UsdcRebalanceCommand {
     FailBridging { reason: String },
 
     // Relay hop commands (see "Relay hop")
-    // Records the binding quote on `WithdrawalComplete` of a Relay corridor;
-    // its input must equal the withdrawn amount.
+    // Records the binding quote on `WithdrawalComplete` of a Relay corridor.
+    // BaseToAlpaca swaps exactly the withdrawn amount; AlpacaToBase swaps more
+    // than zero and at most the withdrawn amount (Alpaca fees can leave less).
     QuoteSwap { quote: SwapQuote },
     // Persists an approve signed alone after another send split the pair.
     PrepareSwapApprove { approve: PreparedTransaction },
