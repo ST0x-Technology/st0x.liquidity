@@ -5205,14 +5205,15 @@ failure:
    first binding quote's `amount_in` less its `max_quote_loss_bps`, rounded up,
    kept as `first_deposit` through every re-quote), is short (both stables have
    6 decimals and compare unit for unit), and `SwapRefunded` records the floor
-   in `short_of_floor`: on either side it pages with the deposit, the refund,
-   the floor and the shortfall, and holds at `SwapRefunded`, guard kept, on
-   adoption and on every resume, never redeposited, quoted again or released,
-   until the operator settles it with `transfer reconcile`. A short refund so
-   costs at most one deposit, capped by `max_transfer`, and stops the corridor.
-   Otherwise an origin-side refund redeposits (step 9). A destination-side
-   refund leaves the other stable at the other end: the transfer holds its guard
-   at `SwapRefunded`, pages, and is accepted by `transfer reconcile` once the
+   in `short_of_floor`: on either side it pages with the refunded attempt's
+   deposit, the refund and that attempt's shortfall, the first deposit and the
+   floor, and holds at `SwapRefunded`, guard kept, on adoption and on every
+   resume, never redeposited, quoted again or released, until the operator
+   settles it with `transfer reconcile`. A short refund so costs at most one
+   deposit, capped by `max_transfer`, and stops the corridor. Otherwise an
+   origin-side refund redeposits (step 9). A destination-side refund leaves the
+   other stable at the other end: the transfer holds its guard at
+   `SwapRefunded`, pages, and is accepted by `transfer reconcile` once the
    operator has moved it. A `failure`, or a `refund` with a refund fail reason,
    is terminal at Relay with nothing paid back: `FailSwap` -> `SwapFailed`,
    guard held, paged, accepted by `transfer reconcile`. When `fill_timeout_secs`
@@ -5289,8 +5290,8 @@ left a vault:
    and the refund is not short of its refund floor (step 8 above; `RequoteSwap`
    refuses a short one); each such re-quote starts a fresh revert budget but
    keeps `first_deposit`, so the refund of every attempt is measured against the
-   transfer's first deposit and losses never stack across re-quotes. Otherwise
-   the transfer holds at `SwapRefunded`, guard held, paged, for
+   transfer's first deposit and refund losses never stack across re-quotes.
+   Otherwise the transfer holds at `SwapRefunded`, guard held, paged, for
    `transfer reconcile`. A refund paid in the chain's stable (destination side)
    holds the same way: the stable is in the chain wallet, not the vault. A
    failure and an unresolved escrow follow step 8 above.

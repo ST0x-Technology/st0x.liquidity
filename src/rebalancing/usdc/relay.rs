@@ -1410,6 +1410,7 @@ where
     async fn hold_short_refund(&self, id: &UsdcRebalanceId) -> Result<bool, UsdcTransferError> {
         let Some(UsdcRebalance::SwapRefunded {
             first_deposit,
+            quote,
             refund_tx,
             side,
             amount_refunded,
@@ -1424,10 +1425,11 @@ where
             return Ok(false);
         };
 
-        let deposited = first_deposit.amount_in;
+        let deposited = quote.amount_in;
         let refunded = usdc_to_u256(amount_refunded)?;
         let shortfall = deposited.saturating_sub(refunded);
-        error!(target: "operational_alert", alert = true, kind = AlertKind::RelayRefundBelowFloor.as_str(), %id, %refund_tx, ?side, %deposited, %refunded, %floor, %shortfall, "Relay refunded less than the refund floor; the transfer holds its guard at SwapRefunded until the operator settles it and reconciles");
+        let first_deposit = first_deposit.amount_in;
+        error!(target: "operational_alert", alert = true, kind = AlertKind::RelayRefundBelowFloor.as_str(), %id, %refund_tx, ?side, %deposited, %refunded, %first_deposit, %floor, %shortfall, "Relay refunded less than the refund floor; the transfer holds its guard at SwapRefunded until the operator settles it and reconciles");
         Ok(true)
     }
 
@@ -6311,6 +6313,71 @@ mod tests {
         assert!(state.holds_rebalance_guard());
         assert!(state.is_reconcilable_failure());
         assert!(logs_contain("refund floor"));
+    }
+
+    /// A short refund of a re-quoted attempt pages that attempt's deposit and
+    /// shortfall, next to the first deposit its floor is measured against.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn short_refund_of_a_requote_pages_its_own_shortfall() {
+        let anvil = spawn_anvil(Anvil::new());
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let quote = mock_quote_unavailable(&relay_api);
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let contracts = RelayEndContracts {
+            stable: Address::repeat_byte(0x51),
+            depository: Address::repeat_byte(0x52),
+        };
+        let transfer = relay_transfer_with_bounds(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet,
+            contracts,
+            store.clone(),
+            RelayHopCtx {
+                min_transfer: Usdc::new(float!(10)),
+                ..relay_bounds()
+            },
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let refund = |refund_tx: u8, amount_refunded: u64| UsdcRebalanceCommand::RecordSwapRefund {
+            refund_tx: TxHash::repeat_byte(refund_tx),
+            side: RefundSide::Origin,
+            amount_refunded: U256::from(amount_refunded),
+        };
+        record_deposited_toward_chain(&store, &id, TOWARD_CHAIN_ORDER_ID).await;
+        store.send(&id, refund(0xe1, 99_500_000)).await.unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::RequoteSwap {
+                    quote: Box::new(crate::usdc_rebalance::swap_quote_for_test(
+                        U256::from(99_500_000u64),
+                        B256::repeat_byte(0x1e),
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+        record_pair_deposited(&store, &id, 8).await;
+        store.send(&id, refund(0xe2, 99_000_000)).await.unwrap();
+
+        transfer
+            .resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
+            .await
+            .unwrap();
+
+        quote.assert_calls(0);
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "SwapRefunded");
+        assert!(logs_contain(
+            "deposited=99500000 refunded=99000000 first_deposit=100000000 floor=99500000 shortfall=500000"
+        ));
     }
 
     /// After `max_refund_retries` re-quotes that followed a refund, the next
