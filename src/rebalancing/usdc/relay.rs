@@ -1253,7 +1253,9 @@ mod tests {
         AlpacaBrokerAuth, AlpacaWalletService, Backpressure, Executor as _, TimeInForce,
     };
     use st0x_float_macro::float;
-    use st0x_raindex::{Raindex as _, RaindexContracts, RaindexService, RaindexVaultId};
+    use st0x_raindex::{
+        Raindex as _, RaindexContracts, RaindexError, RaindexService, RaindexVaultId,
+    };
 
     use super::*;
     use crate::bot_gas::{
@@ -1594,9 +1596,9 @@ mod tests {
     }
 
     /// A transfer resumed at `Withdrawing` moves on only once its recorded
-    /// vault withdraw is read back at the recorded amount. One that realized
-    /// another amount, has no receipt, or is shadowed by a later withdraw
-    /// stays at `Withdrawing` with its guard, and no quote is asked.
+    /// vault withdraw's receipt reads back the recorded amount. One that
+    /// realized another amount, or has no receipt yet, stays at `Withdrawing`
+    /// with its guard, and no quote is asked.
     #[tokio::test]
     async fn resume_at_withdrawing_checks_the_recorded_withdraw() {
         let chain = AnvilRaindexChain::deploy().await;
@@ -1710,8 +1712,10 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(
-                error,
-                UsdcTransferError::RecordedWithdrawalUnverified { .. }
+                &error,
+                UsdcTransferError::WithdrawalScanTransient { source, .. }
+                    if matches!(**source, RaindexError::WithdrawReceiptNotVisible { withdraw_tx }
+                        if withdraw_tx == TxHash::repeat_byte(0x77))
             ),
             "got {error:?}"
         );
@@ -1739,9 +1743,11 @@ mod tests {
         assert!(
             matches!(
                 error,
-                UsdcTransferError::RecordedWithdrawalUnverified { .. }
+                UsdcTransferError::AdoptedWithdrawalAmountMismatch { withdrawn, requested, .. }
+                    if withdrawn == U256::from(40_000_000_u64)
+                        && requested == U256::from(100_000_000_u64)
             ),
-            "a later withdraw shadows the short one; got {error:?}"
+            "a later exact withdraw does not make the short one pass; got {error:?}"
         );
         held_at_withdrawing(short).await;
     }

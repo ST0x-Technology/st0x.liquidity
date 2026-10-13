@@ -458,43 +458,10 @@ impl<E: Evm> RaindexService<E> {
                     });
                 };
 
-                if topic == IRaindexInventory::OperatorWithdraw::SIGNATURE_HASH {
-                    let decoded = log
-                        .log_decode::<IRaindexInventory::OperatorWithdraw>()
-                        .inspect_err(|error| {
-                            warn!(target: "inventory", %tx_hash, ?error, "Undecodable OperatorWithdraw log during resume scan; failing closed");
-                        })
-                        .map_err(|error| RaindexError::ScanAnomalousLog {
-                            reason: ScanAnomaly::UndecodableOperatorWithdraw(error),
-                        })?;
-                    let event = decoded.data();
-                    if event.operator == self.owner
-                        && event.token == token
-                        && event.vaultId == vault_id
-                    {
-                        return Ok((tx_hash, event.amount));
-                    }
-                } else if topic == IRaindexV6::WithdrawV2::SIGNATURE_HASH {
-                    let decoded = log
-                        .log_decode::<IRaindexV6::WithdrawV2>()
-                        .inspect_err(|error| {
-                            warn!(target: "orderbook", %tx_hash, ?error, "Undecodable WithdrawV2 log during resume scan; failing closed");
-                        })
-                        .map_err(|error| RaindexError::ScanAnomalousLog {
-                            reason: ScanAnomaly::UndecodableWithdrawV2(error),
-                        })?;
-                    let event = decoded.data();
-                    if event.sender == self.owner
-                        && event.token == token
-                        && event.vaultId == vault_id
-                    {
-                        return Ok((tx_hash, event.withdrawAmountUint256));
-                    }
-                } else {
-                    warn!(target: "inventory", %tx_hash, %topic, "Withdrawal-scan log with unrecognized topic0; failing closed");
-                    return Err(RaindexError::ScanAnomalousLog {
-                        reason: ScanAnomaly::UnrecognizedTopic0 { topic0: topic },
-                    });
+                if let Some(amount) =
+                    self.own_withdrawal_amount(log, tx_hash, topic, token, vault_id)?
+                {
+                    return Ok((tx_hash, amount));
                 }
             }
 
@@ -510,6 +477,105 @@ impl<E: Evm> RaindexService<E> {
         }
 
         Err(RaindexError::ScanInconclusive { from_block })
+    }
+
+    /// The amount `withdraw_tx` withdrew from `vault_id` for this bot, read
+    /// from the tx's own receipt logs: an `OperatorWithdraw` by the inventory
+    /// or a legacy `WithdrawV2` by the orderbook, with this bot as operator or
+    /// sender. Zero when the receipt holds no such withdrawal (a revert, or a
+    /// tx of another vault). No receipt yet is
+    /// [`RaindexError::WithdrawReceiptNotVisible`].
+    pub async fn realized_withdrawal(
+        &self,
+        withdraw_tx: TxHash,
+        token: Address,
+        vault_id: RaindexVaultId,
+    ) -> Result<U256, RaindexError> {
+        let Some(receipt) = self
+            .evm
+            .provider()
+            .get_transaction_receipt(withdraw_tx)
+            .await?
+        else {
+            return Err(RaindexError::WithdrawReceiptNotVisible { withdraw_tx });
+        };
+
+        let RaindexVaultId(vault) = vault_id;
+        let mut realized = None;
+        for log in receipt.inner.logs() {
+            let Some(topic) = log.topics().first().copied() else {
+                continue;
+            };
+            let watched = (log.address() == self.inventory_address
+                && topic == IRaindexInventory::OperatorWithdraw::SIGNATURE_HASH)
+                || (log.address() == self.orderbook_address
+                    && topic == IRaindexV6::WithdrawV2::SIGNATURE_HASH);
+            if !watched {
+                continue;
+            }
+
+            if let Some(amount) =
+                self.own_withdrawal_amount(log, withdraw_tx, topic, token, vault)?
+            {
+                if realized.is_some() {
+                    warn!(target: "inventory", %withdraw_tx, "Withdraw receipt holds more than one matching withdrawal; failing closed");
+                    return Err(RaindexError::ScanAnomalousLog {
+                        reason: ScanAnomaly::DuplicateWithdrawal { withdraw_tx },
+                    });
+                }
+                realized = Some(amount);
+            }
+        }
+
+        Ok(realized.unwrap_or(U256::ZERO))
+    }
+
+    /// The amount of `log` when it is a withdrawal of `token` from `vault_id`
+    /// by this bot: an `OperatorWithdraw` with this bot as operator or a
+    /// `WithdrawV2` with this bot as sender. A log under one of those topic0s
+    /// that does not decode, or any other topic0, fails closed.
+    fn own_withdrawal_amount(
+        &self,
+        log: &alloy::rpc::types::Log,
+        tx_hash: TxHash,
+        topic: alloy::primitives::B256,
+        token: Address,
+        vault_id: alloy::primitives::B256,
+    ) -> Result<Option<U256>, RaindexError> {
+        if topic == IRaindexInventory::OperatorWithdraw::SIGNATURE_HASH {
+            let decoded = log
+                .log_decode::<IRaindexInventory::OperatorWithdraw>()
+                .inspect_err(|error| {
+                    warn!(target: "inventory", %tx_hash, ?error, "Undecodable OperatorWithdraw log; failing closed");
+                })
+                .map_err(|error| RaindexError::ScanAnomalousLog {
+                    reason: ScanAnomaly::UndecodableOperatorWithdraw(error),
+                })?;
+            let event = decoded.data();
+            let ours =
+                event.operator == self.owner && event.token == token && event.vaultId == vault_id;
+            return Ok(ours.then_some(event.amount));
+        }
+
+        if topic == IRaindexV6::WithdrawV2::SIGNATURE_HASH {
+            let decoded = log
+                .log_decode::<IRaindexV6::WithdrawV2>()
+                .inspect_err(|error| {
+                    warn!(target: "orderbook", %tx_hash, ?error, "Undecodable WithdrawV2 log; failing closed");
+                })
+                .map_err(|error| RaindexError::ScanAnomalousLog {
+                    reason: ScanAnomaly::UndecodableWithdrawV2(error),
+                })?;
+            let event = decoded.data();
+            let ours =
+                event.sender == self.owner && event.token == token && event.vaultId == vault_id;
+            return Ok(ours.then_some(event.withdrawAmountUint256));
+        }
+
+        warn!(target: "inventory", %tx_hash, %topic, "Withdrawal log with unrecognized topic0; failing closed");
+        Err(RaindexError::ScanAnomalousLog {
+            reason: ScanAnomaly::UnrecognizedTopic0 { topic0: topic },
+        })
     }
 
     /// Returns the current chain head. Captured before submitting an on-chain
@@ -791,6 +857,15 @@ impl<W: Wallet> Raindex for RaindexService<W> {
         from_block: u64,
     ) -> Result<(TxHash, U256), RaindexError> {
         Self::find_recent_withdrawal(self, token, vault_id, from_block).await
+    }
+
+    async fn realized_withdrawal(
+        &self,
+        withdraw_tx: TxHash,
+        token: Address,
+        vault_id: RaindexVaultId,
+    ) -> Result<U256, RaindexError> {
+        Self::realized_withdrawal(self, withdraw_tx, token, vault_id).await
     }
 
     async fn tx_mined(&self, tx_hash: TxHash) -> Result<bool, RaindexError> {
@@ -2126,6 +2201,91 @@ mod tests {
             (withdraw_tx, withdraw_amount),
             "scan must return the real withdrawal's tx and actual on-chain withdrawn amount",
         );
+    }
+
+    /// The realized amount comes from the withdraw's own receipt, so a later
+    /// withdraw from the same vault does not change it, a tx that withdrew
+    /// nothing from the vault reads zero, and an unknown tx is not visible.
+    #[tokio::test]
+    async fn realized_withdrawal_reads_the_withdraw_tx_own_receipt() {
+        let local_evm = LocalEvm::new().await.unwrap();
+        let service = create_test_raindex_service(&local_evm);
+
+        let deposit_amount = U256::from(1000) * U256::from(10).pow(U256::from(18));
+        local_evm
+            .approve_tokens(
+                local_evm.token_address,
+                local_evm.orderbook_address,
+                deposit_amount,
+            )
+            .await
+            .unwrap();
+        let deposit_tx = service
+            .deposit::<NoOpErrorRegistry>(
+                local_evm.token_address,
+                TEST_VAULT_ID,
+                deposit_amount,
+                TEST_TOKEN_DECIMALS,
+            )
+            .await
+            .unwrap();
+
+        let withdraw_amount = U256::from(400) * U256::from(10).pow(U256::from(18));
+        let withdraw_tx = service
+            .withdraw(
+                local_evm.token_address,
+                TEST_VAULT_ID,
+                withdraw_amount,
+                TEST_TOKEN_DECIMALS,
+            )
+            .await
+            .unwrap();
+        service
+            .withdraw(
+                local_evm.token_address,
+                TEST_VAULT_ID,
+                U256::from(7) * U256::from(10).pow(U256::from(18)),
+                TEST_TOKEN_DECIMALS,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            service
+                .realized_withdrawal(withdraw_tx, local_evm.token_address, TEST_VAULT_ID)
+                .await
+                .unwrap(),
+            withdraw_amount
+        );
+
+        let other_vault = RaindexVaultId(b256!(
+            "0x0000000000000000000000000000000000000000000000000000000000000002"
+        ));
+        assert_eq!(
+            service
+                .realized_withdrawal(withdraw_tx, local_evm.token_address, other_vault)
+                .await
+                .unwrap(),
+            U256::ZERO
+        );
+        assert_eq!(
+            service
+                .realized_withdrawal(deposit_tx, local_evm.token_address, TEST_VAULT_ID)
+                .await
+                .unwrap(),
+            U256::ZERO
+        );
+
+        let unknown = TxHash::repeat_byte(0x77);
+        let error = service
+            .realized_withdrawal(unknown, local_evm.token_address, TEST_VAULT_ID)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, RaindexError::WithdrawReceiptNotVisible { withdraw_tx } if withdraw_tx == unknown),
+            "got {error:?}"
+        );
+        assert!(error.is_reconciliation_pending());
     }
 
     #[tokio::test]

@@ -3341,9 +3341,9 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
     }
 
     /// Refuses to move a transfer past `Withdrawing` unless its recorded vault
-    /// withdraw realized `amount`. A Relay transfer whose adopted withdraw
-    /// realized another amount is held there, and must not swap the
-    /// requested amount on a redrive.
+    /// withdraw realized `amount`, read from that tx's own receipt. A Relay
+    /// transfer whose adopted withdraw realized another amount is held there,
+    /// and must not swap the requested amount on a redrive.
     pub(super) async fn require_recorded_withdrawal_amount(
         &self,
         id: &UsdcRebalanceId,
@@ -3351,40 +3351,23 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
         withdrawal: &TransferRef,
         initiated_at: DateTime<Utc>,
     ) -> Result<(), UsdcTransferError> {
-        let unverified = || UsdcTransferError::RecordedWithdrawalUnverified {
-            id: id.clone(),
-            withdrawal: withdrawal.clone(),
-        };
         let TransferRef::OnchainTx(withdraw_tx) = *withdrawal else {
-            warn!(target: "rebalance", %id, ?withdrawal, "Recorded vault withdrawal has no tx hash; holding at Withdrawing");
-            return Err(unverified());
+            error!(target: "rebalance", %id, ?withdrawal, "Recorded vault withdrawal has no tx hash; holding at Withdrawing");
+            return Err(UsdcTransferError::RecordedWithdrawalUnverified {
+                id: id.clone(),
+                withdrawal: withdrawal.clone(),
+            });
         };
 
-        let Some(scan_from) = self
+        let withdrawn = self
             .raindex
-            .tx_receipt(withdraw_tx)
-            .await?
-            .and_then(|receipt| receipt.block_number)
-            .and_then(|block| block.checked_sub(1))
-        else {
-            warn!(target: "rebalance", %id, %withdraw_tx, "Recorded vault withdrawal has no mined receipt yet; holding at Withdrawing");
-            return Err(unverified());
-        };
-
-        let (found_tx, withdrawn) = self
-            .raindex
-            .find_recent_withdrawal(
+            .realized_withdrawal(
+                withdraw_tx,
                 self.corridor.chain().settlement_stable().address,
                 self.vault_id,
-                scan_from,
             )
             .await
             .map_err(|error| classify_vault_withdrawal_scan_error(id, initiated_at, error))?;
-
-        if found_tx != withdraw_tx {
-            warn!(target: "rebalance", %id, %withdraw_tx, %found_tx, "A later vault withdrawal shadows the recorded one; holding at Withdrawing");
-            return Err(unverified());
-        }
 
         let requested = usdc_to_u256(amount)?;
         if withdrawn != requested {

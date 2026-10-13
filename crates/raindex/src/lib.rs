@@ -121,6 +121,11 @@ pub enum RaindexError {
          grant it before enabling rebalancing"
     )]
     MissingOperatorRole { inventory: Address, wallet: Address },
+    /// The node shows no receipt yet for a recorded vault withdraw, so its
+    /// realized amount cannot be read. Retryable: a load-balanced backend
+    /// may not have seen the tx yet.
+    #[error("no receipt visible yet for vault withdraw {withdraw_tx}")]
+    WithdrawReceiptNotVisible { withdraw_tx: TxHash },
 }
 
 /// Whether the `withdraw4` that reverted
@@ -152,6 +157,8 @@ pub enum ScanAnomaly {
     UndecodableOperatorWithdraw(#[source] alloy::sol_types::Error),
     #[error("undecodable WithdrawV2 log")]
     UndecodableWithdrawV2(#[source] alloy::sol_types::Error),
+    #[error("withdraw {withdraw_tx} emitted more than one matching withdrawal")]
+    DuplicateWithdrawal { withdraw_tx: TxHash },
 }
 
 impl RaindexError {
@@ -169,7 +176,8 @@ impl RaindexError {
             | Self::ScanInconclusive { .. }
             | Self::ScanAnomalousLog { .. }
             | Self::InsufficientVaultLiquidity { .. }
-            | Self::MissingOperatorRole { .. } => false,
+            | Self::MissingOperatorRole { .. }
+            | Self::WithdrawReceiptNotVisible { .. } => false,
         }
     }
 
@@ -181,7 +189,7 @@ impl RaindexError {
     /// it cannot improve visibility (see `is_transient_rpc`).
     pub fn is_reconciliation_pending(&self) -> bool {
         match self {
-            Self::ScanInconclusive { .. } => true,
+            Self::ScanInconclusive { .. } | Self::WithdrawReceiptNotVisible { .. } => true,
             Self::RpcTransport(error) => is_transient_rpc(error),
             Self::Evm(error) => error.is_confirmation_pending(),
             // A contract-layer error can carry the same transient transport
@@ -300,6 +308,17 @@ pub trait Raindex: Send + Sync {
         vault_id: RaindexVaultId,
         from_block: u64,
     ) -> Result<(TxHash, U256), RaindexError>;
+
+    /// The amount the mined `withdraw_tx` withdrew of `token` from `vault_id`
+    /// for this bot, read from that tx's own receipt logs; zero when it
+    /// withdrew none. No receipt yet is
+    /// [`RaindexError::WithdrawReceiptNotVisible`]. Does not wait.
+    async fn realized_withdrawal(
+        &self,
+        withdraw_tx: TxHash,
+        token: Address,
+        vault_id: RaindexVaultId,
+    ) -> Result<U256, RaindexError>;
 
     /// Whether `tx_hash` has a receipt now, reverted or not. Does not wait.
     async fn tx_mined(&self, tx_hash: TxHash) -> Result<bool, RaindexError>;
