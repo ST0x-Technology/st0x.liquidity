@@ -1696,6 +1696,31 @@ mod tests {
         );
     }
 
+    /// The audit record spells the transfer direction by hand. It must equal
+    /// serde's wire name, so a renamed variant cannot leave the record on the
+    /// old string. The empty match stops compiling when a variant is added,
+    /// so the list cannot fall behind the enum.
+    #[test]
+    fn transfer_direction_audit_spelling_matches_the_serde_wire_name() {
+        for direction in [
+            TransferDirectionWire::ToRaindex,
+            TransferDirectionWire::ToAlpaca,
+        ] {
+            match direction {
+                TransferDirectionWire::ToRaindex | TransferDirectionWire::ToAlpaca => {}
+            }
+            let request = TransferUsdcRequest {
+                direction,
+                amount: "1".to_owned(),
+                chain: None,
+            };
+            assert_eq!(
+                serde_json::json!(request.audit_targets()[0]),
+                serde_json::to_value(direction).unwrap()
+            );
+        }
+    }
+
     fn dropped() -> RaindexError {
         RaindexError::Evm(EvmError::TransactionDropped {
             tx_hash: TxHash::ZERO,

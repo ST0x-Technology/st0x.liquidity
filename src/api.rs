@@ -2306,6 +2306,7 @@ impl AuditedRequest for ReconcileUsdcRequest {
 /// The fixed `--reason` vocabulary for a USDC reconcile, kebab-cased on the
 /// wire (`funds-moved-manually`, `deposit-credited-offline`).
 #[derive(Deserialize, Clone, Copy)]
+#[cfg_attr(test, derive(Serialize))]
 #[serde(rename_all = "kebab-case")]
 enum ReconcileReasonWire {
     FundsMovedManually,
@@ -8202,6 +8203,41 @@ mod tests {
         .unwrap();
         assert_eq!(mark.audit_targets(), ["2026-10-09", "AAPL"]);
         assert_eq!(mark.audit_reason(), Some("correct close"));
+    }
+
+    /// The audit records spell these enum values by hand. Each spelling must
+    /// equal serde's wire name, so a renamed variant cannot leave the record
+    /// on the old string. The empty matches stop compiling when a variant is
+    /// added, so the lists below cannot fall behind the enums.
+    #[test]
+    fn audit_spellings_match_the_serde_wire_names() {
+        for source in [CctpSourceChain::Ethereum, CctpSourceChain::Base] {
+            match source {
+                CctpSourceChain::Ethereum | CctpSourceChain::Base => {}
+            }
+            assert_eq!(
+                serde_json::json!(cctp_source_chain_wire_name(source)),
+                serde_json::to_value(source).unwrap()
+            );
+        }
+
+        for reason in [
+            ReconcileReasonWire::FundsMovedManually,
+            ReconcileReasonWire::DepositCreditedOffline,
+        ] {
+            match reason {
+                ReconcileReasonWire::FundsMovedManually
+                | ReconcileReasonWire::DepositCreditedOffline => {}
+            }
+            let request = ReconcileUsdcRequest {
+                reason,
+                superseding_tx: None,
+            };
+            assert_eq!(
+                serde_json::json!(request.audit_reason().unwrap()),
+                serde_json::to_value(reason).unwrap()
+            );
+        }
     }
 
     #[tokio::test]
