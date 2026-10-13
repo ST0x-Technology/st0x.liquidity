@@ -3250,6 +3250,18 @@ mod tests {
         quote
     }
 
+    /// [`exact_quote`] for a hop from the hub toward the chain.
+    async fn exact_quote_from_hub(
+        wallet: &TestWallet,
+        contracts: RelayEndContracts,
+        order_id: B256,
+    ) -> SwapQuote {
+        let mut quote = exact_quote(wallet, contracts, order_id).await;
+        quote.origin = Chain::Ethereum;
+        quote.destination = Chain::Robinhood;
+        quote
+    }
+
     /// Records a Robinhood Relay transfer of `AMOUNT_IN` up to `SwapQuoted`.
     async fn record_quoted(store: &Store<UsdcRebalance>, id: &UsdcRebalanceId, quote: SwapQuote) {
         for command in [
@@ -5944,7 +5956,7 @@ mod tests {
         record_quoted_toward_chain(
             &store,
             &id,
-            exact_quote(&rig.hub_wallet, rig.hub_contracts, TOWARD_CHAIN_ORDER_ID).await,
+            exact_quote_from_hub(&rig.hub_wallet, rig.hub_contracts, TOWARD_CHAIN_ORDER_ID).await,
         )
         .await;
 
@@ -5991,7 +6003,7 @@ mod tests {
         record_quoted_toward_chain(
             &store,
             &id,
-            exact_quote(&rig.hub_wallet, rig.hub_contracts, TOWARD_CHAIN_ORDER_ID).await,
+            exact_quote_from_hub(&rig.hub_wallet, rig.hub_contracts, TOWARD_CHAIN_ORDER_ID).await,
         )
         .await;
 
@@ -6061,7 +6073,7 @@ mod tests {
         record_quoted_toward_chain(
             &store,
             &id,
-            exact_quote(&rig.hub_wallet, rig.hub_contracts, TOWARD_CHAIN_ORDER_ID).await,
+            exact_quote_from_hub(&rig.hub_wallet, rig.hub_contracts, TOWARD_CHAIN_ORDER_ID).await,
         )
         .await;
 
@@ -6530,7 +6542,7 @@ mod tests {
         record_quoted_toward_chain(
             &store,
             &id,
-            exact_quote(&rig.hub_wallet, rig.hub_contracts, TOWARD_CHAIN_ORDER_ID).await,
+            exact_quote_from_hub(&rig.hub_wallet, rig.hub_contracts, TOWARD_CHAIN_ORDER_ID).await,
         )
         .await;
 
@@ -6640,7 +6652,7 @@ mod tests {
             .await;
         let id = UsdcRebalanceId(Uuid::new_v4());
         let mut expired =
-            exact_quote(&rig.hub_wallet, rig.hub_contracts, TOWARD_CHAIN_ORDER_ID).await;
+            exact_quote_from_hub(&rig.hub_wallet, rig.hub_contracts, TOWARD_CHAIN_ORDER_ID).await;
         expired.deadline = Utc::now() - chrono::Duration::minutes(1);
         record_quoted_toward_chain(&store, &id, expired).await;
 
@@ -6952,7 +6964,7 @@ mod tests {
         )
         .await;
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let quote = exact_quote(&wallet, contracts, TOWARD_CHAIN_ORDER_ID).await;
+        let quote = exact_quote_from_hub(&wallet, contracts, TOWARD_CHAIN_ORDER_ID).await;
         record_quoted_toward_chain(&store, &id, quote.clone()).await;
         store
             .send(
@@ -7034,7 +7046,7 @@ mod tests {
         )
         .await;
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let mut expired = exact_quote(&wallet, contracts, TOWARD_CHAIN_ORDER_ID).await;
+        let mut expired = exact_quote_from_hub(&wallet, contracts, TOWARD_CHAIN_ORDER_ID).await;
         expired.deadline = Utc::now() - chrono::Duration::minutes(1);
         record_quoted_toward_chain(&store, &id, expired.clone()).await;
         let approve = wallet
