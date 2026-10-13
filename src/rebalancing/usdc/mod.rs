@@ -403,15 +403,24 @@ pub enum UsdcTransferError {
         id: UsdcRebalanceId,
         direction: RebalanceDirection,
     },
+    /// On CCTP the transfer is failed for operator reconciliation; on Relay
+    /// it is held at `Withdrawing` with its guard, since a failure would
+    /// release the guard while the stable sits outside the vault.
     #[error(
         "USDC rebalance {id} adopted a withdrawal that realized {withdrawn} but \
-         {requested} was requested; failed for operator reconciliation rather \
-         than burning more than was withdrawn"
+         {requested} was requested; {}",
+        match hop {
+            HopKind::Cctp => "failed for operator reconciliation rather than burning \
+                              more than was withdrawn",
+            HopKind::Relay => "held at Withdrawing with its guard for operator \
+                               reconciliation rather than swapping more than was withdrawn",
+        }
     )]
     AdoptedWithdrawalAmountMismatch {
         id: UsdcRebalanceId,
         withdrawn: alloy::primitives::U256,
         requested: alloy::primitives::U256,
+        hop: HopKind,
     },
     /// The vault withdraw recorded at `Withdrawing` has no tx hash, so its
     /// realized amount can never be read and the transfer does not move past

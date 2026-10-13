@@ -3318,6 +3318,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
                     id: id.clone(),
                     withdrawn,
                     requested,
+                    hop,
                 });
             }
         }
@@ -3337,6 +3338,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
             id: id.clone(),
             withdrawn,
             requested,
+            hop,
         })
     }
 
@@ -3376,6 +3378,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
                 id: id.clone(),
                 withdrawn,
                 requested,
+                hop: HopKind::Relay,
             });
         }
 
