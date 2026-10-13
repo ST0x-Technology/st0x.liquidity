@@ -6805,6 +6805,7 @@ mod tests {
         assert!(logs_contain(
             "Relay refused the quote for a refund at the hub"
         ));
+        assert!(logs_contain("below the required minimum 99500000"));
     }
 
     /// An expired re-quote of a refund is quoted again within the first
@@ -6882,6 +6883,7 @@ mod tests {
         assert!(state.holds_rebalance_guard());
         assert!(state.is_reconcilable_failure());
         assert!(logs_contain("Relay refused the re-quote from the hub"));
+        assert!(logs_contain("below the required minimum 99500000"));
     }
 
     /// A refund Relay pays in USDG to the chain wallet, proven on the chain,
