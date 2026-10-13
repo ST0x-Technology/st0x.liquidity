@@ -5021,12 +5021,13 @@ runs the chain-to-Alpaca side up to the confirmed deposit:
    broadcast, on a task a job timeout cannot cancel between the two. The RPC
    work under that lock is bounded by `quote_max_age_secs`; a pair signed after
    the bound has its nonces released. A quote within 60 seconds of its deadline
-   or older than `quote_max_age_secs` is not signed: the transfer holds its
-   guard at `SwapQuoted` until the re-quote step that follows. A persist that
-   fails releases both nonces, deposit first, unless a reload shows the pair
-   committed. When another send took the nonce between the two signs, the
-   approve alone is persisted (`SwapApprovePrepared`) and broadcast, and the
-   attempt retries.
+   or older than `quote_max_age_secs` is not signed, and a pair whose quote
+   reached either limit while it was signed is released instead of persisted:
+   the transfer holds its guard at `SwapQuoted` until the re-quote step that
+   follows. A persist that fails releases both nonces, deposit first, unless a
+   reload shows the pair committed. When another send took the nonce between the
+   two signs, the approve alone is persisted (`SwapApprovePrepared`) and
+   broadcast, and the attempt retries.
 5. Broadcast in nonce order; a retry sends the same bytes. The deposit is
    recorded (`ConfirmSwapDeposit` -> `SwapDeposited`) once it has the origin
    chain's confirmations and its receipt names our wallet, the origin stable and
