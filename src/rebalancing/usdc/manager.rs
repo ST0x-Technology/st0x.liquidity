@@ -7756,8 +7756,8 @@ mod tests {
         TestAnvilInstance, persist_event, setup_test_apalis_pool, spawn_anvil, spawn_anvil_pair,
     };
     use crate::usdc_rebalance::{
-        HopEvidence, RebalanceDirection, ReconcileReason, TransferRef, UsdcRebalanceError,
-        UsdcRebalanceEvent,
+        HopEvidence, PreBurnFailEligibility, RebalanceDirection, ReconcileReason, TransferRef,
+        UsdcRebalanceError, UsdcRebalanceEvent,
     };
     use st0x_finance::UsdcConversionError;
 
@@ -27975,6 +27975,76 @@ mod tests {
             matches!(state, UsdcRebalance::WithdrawalSubmitting { .. }),
             "aggregate must remain in WithdrawalSubmitting (un-advanced) so the retry \
              re-attempts Initiate/FailWithdrawal; got: {state:?}"
+        );
+    }
+
+    /// On a Relay corridor the adopted withdraw's stable is outside the vault,
+    /// so a mismatch is held at `Withdrawing` with its guard, never failed:
+    /// a `WithdrawalFailed` would reconcile to source and release the guard.
+    #[tokio::test]
+    async fn fail_adopted_withdrawal_mismatch_holds_a_relay_transfer() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let requested = usdc("2");
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::BeginWithdrawal {
+                corridor: ROBINHOOD_RELAY,
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: requested,
+                from_block: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (manager, apalis_pool, _server) = manager_on_corridor_with_bot_gas_queue(
+            ROBINHOOD_RELAY,
+            cqrs.clone(),
+            wallet,
+            MockBridge::new(),
+        )
+        .await;
+        let existing_tx =
+            fixed_bytes!("0xeeee000000000000000000000000000000000000000000000000000000000003");
+        let requested_u256 = usdc_to_u256(requested).unwrap();
+        let withdrawn_u256 = usdc_to_u256(usdc("1")).unwrap();
+
+        let error = manager
+            .fail_adopted_withdrawal_mismatch(
+                &id,
+                requested,
+                requested_u256,
+                existing_tx,
+                withdrawn_u256,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                UsdcTransferError::AdoptedWithdrawalAmountMismatch { withdrawn, requested, .. }
+                    if withdrawn == withdrawn_u256 && requested == requested_u256
+            ),
+            "got {error:?}"
+        );
+        let jobs = pending_bot_gas_jobs(&apalis_pool).await;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].category, BotGasOperationCategory::VaultWithdraw);
+        assert_eq!(jobs[0].chain, Chain::Robinhood);
+        assert_eq!(jobs[0].tx_hash, existing_tx);
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert_eq!(state.state_name(), "Withdrawing", "got {state:?}");
+        assert!(state.holds_rebalance_guard());
+        assert_eq!(
+            state.pre_burn_fail_eligibility(),
+            PreBurnFailEligibility::RelayHeldOutsideVault
         );
     }
 
