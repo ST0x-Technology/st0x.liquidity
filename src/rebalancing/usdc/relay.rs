@@ -838,7 +838,7 @@ where
         {
             Ok(quote) => quote,
             Err(error) if quote_refused(&error) => {
-                error!(target: "operational_alert", alert = true, %id, %withdrawal_tx, %error, "Relay refused the binding quote from the hub after the Alpaca withdrawal; the transfer holds its guard at WithdrawalComplete with the USDC at the hub until it is resumed, or failed and reconciled");
+                error!(target: "operational_alert", alert = true, kind = AlertKind::RelayHubQuoteRefused.as_str(), %id, %withdrawal_tx, %error, "Relay refused the binding quote from the hub after the Alpaca withdrawal; the transfer holds its guard at WithdrawalComplete with the USDC at the hub until it is resumed, or failed and reconciled");
                 return Ok(());
             }
             Err(error) => {
@@ -971,7 +971,7 @@ where
                 RebalanceDirection::AlpacaToBase => {
                     self.send_split_approves_from_hub(id, &split_approves)
                         .await?;
-                    error!(target: "operational_alert", alert = true, %id, deposit_reverts, max_reverts, "Relay deposits from the hub kept reverting; the transfer holds its guard at SwapQuoted with the USDC at the hub until it is moved by hand and reconciled");
+                    error!(target: "operational_alert", alert = true, kind = AlertKind::RelayHubDepositsKeptReverting.as_str(), %id, deposit_reverts, max_reverts, "Relay deposits from the hub kept reverting; the transfer holds its guard at SwapQuoted with the USDC at the hub until it is moved by hand and reconciled");
                 }
             }
             return Ok(true);
@@ -1018,7 +1018,7 @@ where
                     RebalanceDirection::AlpacaToBase => {
                         self.send_split_approves_from_hub(id, &split_approves)
                             .await?;
-                        error!(target: "operational_alert", alert = true, %id, %error, "Relay refused the re-quote from the hub; the transfer holds its guard at SwapQuoted with the USDC at the hub until it is resumed, or moved by hand and reconciled");
+                        error!(target: "operational_alert", alert = true, kind = AlertKind::RelayHubRequoteRefused.as_str(), %id, %error, "Relay refused the re-quote from the hub; the transfer holds its guard at SwapQuoted with the USDC at the hub until it is resumed, or moved by hand and reconciled");
                     }
                 }
                 Ok(true)
@@ -1416,7 +1416,7 @@ where
                 self.requote_refund_toward_chain(id).await
             }
             (RebalanceDirection::AlpacaToBase, RefundSide::Destination) => {
-                error!(target: "operational_alert", alert = true, %id, refund_tx = %payment.tx, amount = %payment.amount, ?reason, "Relay refunded the deposit in the chain's stable to the chain wallet, not the vault; the transfer holds its guard until the operator moves it and reconciles");
+                error!(target: "operational_alert", alert = true, kind = AlertKind::RelayRefundedToChainWallet.as_str(), %id, refund_tx = %payment.tx, amount = %payment.amount, ?reason, "Relay refunded the deposit in the chain's stable to the chain wallet, not the vault; the transfer holds its guard until the operator moves it and reconciles");
                 Ok(())
             }
         }
@@ -1485,7 +1485,7 @@ where
         } = self.hop.bounds;
         let below_minimum = amount_refunded.lt(&min_transfer)?;
         if refund_requotes >= max_refund_retries || below_minimum {
-            error!(target: "operational_alert", alert = true, %id, %amount_refunded, refund_requotes, max_refund_retries, %min_transfer, "Relay refunded an Alpaca-to-chain deposit at the hub past the corridor's re-quote budget or below its minimum; the transfer holds its guard at SwapRefunded with the USDC at the hub until it is moved by hand and reconciled");
+            error!(target: "operational_alert", alert = true, kind = AlertKind::RelayHubRefundPastBudget.as_str(), %id, %amount_refunded, refund_requotes, max_refund_retries, %min_transfer, "Relay refunded an Alpaca-to-chain deposit at the hub past the corridor's re-quote budget or below its minimum; the transfer holds its guard at SwapRefunded with the USDC at the hub until it is moved by hand and reconciled");
             return Ok(());
         }
 
@@ -1500,7 +1500,7 @@ where
         {
             Ok(quote) => quote,
             Err(error) if quote_refused(&error) => {
-                error!(target: "operational_alert", alert = true, %id, %error, %amount_refunded, "Relay refused the quote for a refund at the hub; the transfer holds its guard at SwapRefunded until it is resumed, or moved by hand and reconciled");
+                error!(target: "operational_alert", alert = true, kind = AlertKind::RelayHubRefundQuoteRefused.as_str(), %id, %error, %amount_refunded, "Relay refused the quote for a refund at the hub; the transfer holds its guard at SwapRefunded until it is resumed, or moved by hand and reconciled");
                 return Ok(());
             }
             Err(error) => {

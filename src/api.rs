@@ -38,6 +38,7 @@ use st0x_registry::SymbolCache;
 use st0x_tokenization::IssuerRequestId;
 
 use crate::AppState;
+use crate::alerts::AlertKind;
 use crate::cctp_burn::{CctpBurnOperation, CctpSourceChain};
 use crate::dashboard::event_lines::{event_step, variant_fields};
 use crate::dashboard::order_loader::{
@@ -2524,7 +2525,7 @@ async fn reconcile_stuck_usdc_transfer(
 
     info!(%id, ?reason, "USDC transfer reconciled via API");
     if rebalance.has_signed_swap_envelopes() {
-        error!(target: "operational_alert", alert = true, %id, "Reconciled a USDC transfer that holds signed Relay envelopes. Restart the bot to release the nonces of its signed Relay envelopes: until then, if one never mined, later sends from the wallet that signed it wait behind it");
+        error!(target: "operational_alert", alert = true, kind = AlertKind::ReconciledTransferHoldsRelayEnvelopes.as_str(), %id, "Reconciled a USDC transfer that holds signed Relay envelopes. Restart the bot to release the nonces of its signed Relay envelopes: until then, if one never mined, later sends from the wallet that signed it wait behind it");
     }
     Ok(Json(TransferOpResponse {
         transfer_id: id.to_string(),
