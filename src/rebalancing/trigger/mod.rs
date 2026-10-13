@@ -46236,4 +46236,57 @@ mod tests {
             "a Relay transfer has no CCTP burn to page about",
         );
     }
+
+    /// A Relay transfer stopped between `Initiate` and `ConfirmWithdrawal`
+    /// sits at `Withdrawing` with the vault withdraw mined: the stable is in
+    /// the chain wallet, so the sweep holds the guard instead of releasing it.
+    #[tokio::test]
+    async fn sweep_holds_a_timed_out_relay_withdrawing() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc(400);
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    corridor: ROBINHOOD_RELAY,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(TxHash::repeat_byte(0x77)),
+                },
+            )
+            .await
+            .unwrap();
+
+        let trigger = sweep_timed_out_relay_transfer(
+            &pool,
+            store,
+            &id,
+            amount,
+            usdc::UsdcRebalanceStage::Initiated,
+        )
+        .await;
+
+        assert!(
+            trigger.usdc_guards.is_held(Chain::Robinhood),
+            "the guard must stay held while the withdrawn stable is outside the vault",
+        );
+        assert!(
+            !trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "the sweep must not tombstone a held transfer",
+        );
+        assert!(
+            trigger
+                .relay_withdrawal_hold_alerted
+                .read()
+                .await
+                .contains(&id),
+            "the sweep must page that the stable is outside the vault",
+        );
+    }
 }

@@ -6038,9 +6038,24 @@ mod tests {
 
     /// A Relay transfer at `WithdrawalComplete` has its withdrawn stable
     /// outside the vault, so `fail-usdc-transfer` must not fail it: only a
-    /// redeposit returns the stable. A CCTP one still fails as before.
+    /// redeposit returns the stable. `Withdrawing` names the same hold, since
+    /// its vault withdraw is mined too. A CCTP one still fails as before.
     #[tokio::test]
     async fn relay_withdrawal_complete_refuses_a_pre_burn_fail() {
+        let withdrawing = replay::<UsdcRebalance>(
+            withdrawn(RebalanceDirection::BaseToAlpaca, ROBINHOOD_RELAY)
+                .into_iter()
+                .take(1)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(withdrawing.state_name(), "Withdrawing");
+        assert_eq!(
+            withdrawing.pre_burn_fail_eligibility(),
+            PreBurnFailEligibility::RelayHeldOutsideVault
+        );
+
         let relay =
             replay::<UsdcRebalance>(withdrawn(RebalanceDirection::BaseToAlpaca, ROBINHOOD_RELAY))
                 .unwrap()
