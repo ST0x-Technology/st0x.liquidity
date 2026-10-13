@@ -281,6 +281,17 @@ receives `(error, id, event)` and can reprocess the event from the errored state
 
 Wire reactors via `Unwired` + `StoreBuilder::wire()`.
 
+A reactor that needs the event's place in its aggregate's stream overrides
+`react_committed(event, committed)` instead. `committed.sequence` is the
+sequence the event store assigned, so `(aggregate type, aggregate id,
+sequence)`
+identifies the event across restarts. The default calls `react`. The store calls
+it only on commit dispatch, never on load, snapshot rebuild, or projection
+catch-up. The dashboard `Broadcaster` uses it to give each `liq_*` log line a
+stable `event_id` (see `docs/observability.md`). A wrapper that forwards to an
+inner reactor must forward `react_committed` too. `Committed::new` exists only
+with event-sorcery's `test-support` feature, for tests.
+
 ## Services Pattern
 
 Inject external dependencies into command handlers:
