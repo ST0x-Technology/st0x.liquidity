@@ -2724,6 +2724,27 @@ mod tests {
         };
         assert_eq!(approve.nonce(), first_nonce);
         assert_eq!(witness.broadcasts(), vec![approve.tx_hash()]);
+        let approve = approve.clone();
+
+        let error = transfer
+            .resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, UsdcTransferError::SwapQuoteExpired { id: refused, .. } if *refused == id),
+            "got {error:?}"
+        );
+        assert_eq!(
+            witness.broadcasts(),
+            vec![approve.tx_hash(), approve.tx_hash()],
+            "the lone approve is sent again before the expired quote is refused"
+        );
+        let state = store.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::SwapQuoted { split_approves, .. } = &state else {
+            panic!("expected SwapQuoted, got {state:?}");
+        };
+        assert_eq!(*split_approves, vec![approve]);
     }
 
     /// A restored pair with no receipt after its rebroadcast counts as
@@ -2753,7 +2774,7 @@ mod tests {
             exact_quote(&wallet, contracts, B256::repeat_byte(0x0d)).await,
         )
         .await;
-        transfer
+        let (pair, _order_id) = transfer
             .prepare_and_persist_swap_pair(&id)
             .await
             .unwrap()
@@ -2775,6 +2796,15 @@ mod tests {
                     unmined: 2,
                 },
             )])
+        );
+        assert!(
+            wallet
+                .provider()
+                .get_transaction_by_hash(pair.deposit.tx_hash())
+                .await
+                .unwrap()
+                .is_some(),
+            "the rebroadcast reached the node; only the receipt is missing"
         );
     }
 }

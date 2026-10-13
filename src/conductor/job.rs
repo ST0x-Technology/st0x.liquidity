@@ -266,13 +266,12 @@ pub(crate) async fn apply_backpressure_step<
     }
 }
 
-/// Finds a classified broker rate-limit response in a job error.
+/// Finds a classified rate-limit (429) response in a job error.
 ///
-/// Walks the `.source()` chain,
-/// broker rate-limit (429) response, checking the error itself before
-/// descending into its sources. Tries each of four known Alpaca error types,
-/// then a Relay API rate limit, in turn, short-circuiting on the first
-/// `Some` -- this is the one place that needs to "know about" all of them.
+/// Walks the `.source()` chain, checking the error itself before descending
+/// into its sources. Tries each of four known Alpaca error types, then a
+/// Relay API rate limit, in turn, short-circuiting on the first `Some` --
+/// this is the one place that needs to "know about" all of them.
 ///
 /// `AlpacaMarketDataError` (market-data 429s, e.g. from
 /// `fetch_latest_trade_price`) is NOT one of the four: it only ever reaches

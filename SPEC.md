@@ -5029,7 +5029,8 @@ runs the chain-to-Alpaca side up to the confirmed deposit:
    step that follows. A persist that fails releases both nonces, deposit first,
    unless a reload shows the pair committed. When another send took the nonce
    between the two signs, the approve alone is persisted (`SwapApprovePrepared`)
-   and broadcast, and the attempt retries.
+   and broadcast, even if its quote expired during the signing, since that send
+   holds the nonce above it, and the attempt retries.
 5. Broadcast in nonce order; a retry sends the same bytes. The deposit is
    recorded (`ConfirmSwapDeposit` -> `SwapDeposited`) once it has the origin
    chain's confirmations and its receipt names our wallet, the origin stable and
