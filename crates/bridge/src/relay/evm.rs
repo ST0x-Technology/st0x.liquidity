@@ -96,6 +96,8 @@ pub enum RelayBridgeError {
     NoDepository { chain: Chain },
     #[error("the corridor chain must not be the Ethereum hub")]
     HubAsCorridorChain,
+    #[error("hub wallet {hub} and corridor chain wallet {chain} differ")]
+    WalletsDiffer { hub: Address, chain: Address },
     #[error("{chain} needs at least one confirmation, or a deposit scan reads the raw head")]
     ZeroConfirmations { chain: Chain },
     /// A step does not match the quote or the end it is signed on.
@@ -1682,6 +1684,36 @@ mod tests {
                 }
             ),
             "{chain:?}"
+        );
+    }
+
+    /// A refund is proven against our wallet on the side it lands on, and a
+    /// quote names one refund address, so both ends need one address.
+    #[test]
+    fn wallets_with_different_addresses_are_refused() {
+        let provider = ProviderBuilder::new()
+            .connect_http("http://127.0.0.1:1".parse().unwrap())
+            .erased();
+        let other = RawPrivateKeyWallet::new(&B256::repeat_byte(0x02), provider, 1).unwrap();
+        let (hub, chain) = (offline_wallet().address(), other.address());
+
+        let error = RelayBridge::try_from_ctx(RelayCtx {
+            chain: Chain::Robinhood,
+            ethereum_wallet: offline_wallet(),
+            chain_wallet: other,
+            ethereum_confirmations: CONFIRMATIONS,
+            chain_confirmations: CONFIRMATIONS,
+        })
+        .err()
+        .unwrap();
+
+        assert!(
+            matches!(
+                error,
+                RelayBridgeError::WalletsDiffer { hub: refused_hub, chain: refused_chain }
+                    if refused_hub == hub && refused_chain == chain
+            ),
+            "{error:?}"
         );
     }
 
