@@ -966,6 +966,12 @@ pub struct SwapQuote {
     pub gas_fee: U256,
     /// Until then the solver may still fill.
     pub deadline: DateTime<Utc>,
+    /// The chains, recipient and refund address the quote was checked
+    /// against, which the bridge checks again before signing it.
+    pub origin: Chain,
+    pub destination: Chain,
+    pub recipient: Address,
+    pub refund_to: Address,
     pub approve: Option<SwapStep>,
     pub deposit: SwapStep,
     /// The origin chain's head read before the quote: no deposit for this
@@ -5456,6 +5462,10 @@ pub(crate) fn swap_quote_for_test(amount_in: U256, order_id: B256) -> SwapQuote 
         relayer_fee: U256::ZERO,
         gas_fee: U256::ZERO,
         deadline: DateTime::<Utc>::UNIX_EPOCH,
+        origin: Chain::Robinhood,
+        destination: Chain::Ethereum,
+        recipient: Address::ZERO,
+        refund_to: Address::ZERO,
         approve: None,
         deposit: SwapStep {
             chain_id: 1,

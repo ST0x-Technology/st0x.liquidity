@@ -215,6 +215,13 @@ pub struct RecordedRelayQuote {
     pub amounts: QuoteAmounts,
     pub deadline: SystemTime,
     pub fees: QuoteFees,
+    /// The chains, recipient and refund address the quote was checked
+    /// against: [`RelayBridge`](super::RelayBridge) signs it only for its
+    /// direction and our wallets.
+    pub origin: Chain,
+    pub destination: Chain,
+    pub recipient: Address,
+    pub refund_to: Address,
     /// `None` when the quote had no approve step, or when the caller leaves
     /// it to the bridge to approve only if the allowance falls short.
     pub approve: Option<StepTransaction>,
@@ -230,6 +237,10 @@ impl RecordedRelayQuote {
             amounts,
             deadline,
             fees,
+            origin,
+            destination,
+            recipient,
+            refund_to,
             approve,
             deposit,
         } = self;
@@ -240,6 +251,10 @@ impl RecordedRelayQuote {
             amounts,
             deadline,
             fees,
+            origin,
+            destination,
+            recipient,
+            refund_to,
             approve,
             deposit,
         }
@@ -1513,6 +1528,10 @@ pub(super) mod tests {
             amounts: quote.amounts,
             deadline: quote.deadline,
             fees: quote.fees,
+            origin: quote.origin,
+            destination: quote.destination,
+            recipient: quote.recipient,
+            refund_to: quote.refund_to,
             approve: quote.approve.clone(),
             deposit: quote.deposit.clone(),
         };

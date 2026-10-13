@@ -4745,6 +4745,12 @@ struct SwapQuote {
     relayer_fee: U256,
     gas_fee: U256,
     deadline: DateTime<Utc>,
+    // What the quote was checked against; the bridge checks them again
+    // before signing: the direction, and our wallets as recipient and refund.
+    origin: Chain,
+    destination: Chain,
+    recipient: Address,
+    refund_to: Address,
     approve: Option<SwapStep>,
     deposit: SwapStep,
     // Origin chain head read before the quote: no deposit for this order can

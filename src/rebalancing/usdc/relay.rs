@@ -608,7 +608,7 @@ where
         let deposit = self
             .hop
             .bridge
-            .confirm_deposit(TO_HUB, RelayOrderId(order_id), deposit_tx)
+            .confirm_deposit(TO_HUB, RelayOrderId(order_id), &pair)
             .await
             .map_err(Box::new)?;
 
@@ -845,6 +845,10 @@ fn swap_quote(quote: &AcceptedRelayQuote, slippage_bps: u16, origin_from_block: 
         relayer_fee: fees.relayer,
         gas_fee: fees.gas,
         deadline: DateTime::<Utc>::from(quote.deadline()),
+        origin: quote.origin(),
+        destination: quote.destination(),
+        recipient: quote.recipient(),
+        refund_to: quote.refund_to(),
         approve: quote.approve().map(swap_step),
         deposit: swap_step(quote.deposit()),
         origin_from_block,
@@ -891,6 +895,10 @@ fn relay_quote(
             relayer: quote.relayer_fee,
             gas: quote.gas_fee,
         },
+        origin: quote.origin,
+        destination: quote.destination,
+        recipient: quote.recipient,
+        refund_to: quote.refund_to,
         approve: quote
             .approve
             .as_ref()
@@ -1708,7 +1716,7 @@ mod tests {
     }
 
     /// A live quote for `AMOUNT_IN` whose approve and deposit call
-    /// `contracts` for `wallet`.
+    /// `contracts` for `wallet`, which the fill and refunds pay.
     async fn exact_quote(
         wallet: &TestWallet,
         contracts: RelayEndContracts,
@@ -1718,6 +1726,8 @@ mod tests {
         let chain_id = wallet.provider().get_chain_id().await.unwrap();
         let mut quote = crate::usdc_rebalance::swap_quote_for_test(amount_in, order_id);
         quote.deadline = Utc::now() + chrono::Duration::hours(1);
+        quote.recipient = wallet.address();
+        quote.refund_to = wallet.address();
         quote.approve = Some(SwapStep {
             chain_id,
             to: contracts.stable,
