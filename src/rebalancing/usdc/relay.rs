@@ -2287,7 +2287,9 @@ mod tests {
     use std::time::Duration;
     use uuid::Uuid;
 
-    use st0x_bridge::relay::{QuoteErrorCode, RelayCtx, RelayEndContracts, RelayError};
+    use st0x_bridge::relay::{
+        QuoteErrorCode, RelayCtx, RelayEndContracts, RelayError, quote_body_for_test,
+    };
     use st0x_event_sorcery::{Store, test_store};
     use st0x_evm::{Evm, EvmError, IERC20};
     use st0x_execution::{
@@ -6670,6 +6672,88 @@ mod tests {
         assert_eq!(state.state_name(), "SwapRefunded", "{state:?}");
         assert!(state.holds_rebalance_guard());
         assert!(state.is_reconcilable_failure());
+    }
+
+    /// A refund at the hub that clears the first deposit's floor is quoted
+    /// again only for a fill that clears it too: 99.5 refunded of 100 at
+    /// 50 bps, a re-quote guaranteeing 99.1 is within its own loss bound but
+    /// would lose past the first deposit's, so it is refused and the transfer
+    /// holds at `SwapRefunded`, guard held, for `transfer reconcile`.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn refund_requote_below_the_first_deposits_floor_holds_at_the_hub() {
+        let anvil = spawn_anvil(Anvil::new());
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let refunded = U256::from(99_500_000_u64);
+        let request = QuoteRequest {
+            origin: Chain::Ethereum,
+            destination: Chain::Robinhood,
+            amount: refunded,
+            user: wallet.address(),
+            recipient: wallet.address(),
+            refund_to: wallet.address(),
+            slippage: BasisPoints::new(relay_bounds().slippage_bps).unwrap(),
+            ttl: relay_bounds().fill_timeout,
+        };
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let quote = relay_api.mock(|when, then| {
+            when.method(POST).path("/quote/v2");
+            then.status(200).json_body(quote_body_for_test(
+                &request,
+                U256::from(99_300_000_u64),
+                U256::from(99_100_000_u64),
+            ));
+        });
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let contracts = RelayEndContracts {
+            stable: Address::repeat_byte(0x51),
+            depository: Address::repeat_byte(0x52),
+        };
+        let transfer = relay_transfer_with_bounds(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet,
+            contracts,
+            store.clone(),
+            RelayHopCtx {
+                min_transfer: Usdc::new(float!(10)),
+                ..relay_bounds()
+            },
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited_toward_chain(&store, &id, TOWARD_CHAIN_ORDER_ID).await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::RecordSwapRefund {
+                    refund_tx: TxHash::repeat_byte(0xe1),
+                    side: RefundSide::Origin,
+                    amount_refunded: refunded,
+                },
+            )
+            .await
+            .unwrap();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends");
+
+        assert!(quote.calls() > 0, "the refund is quoted again");
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "SwapRefunded", "{state:?}");
+        assert!(state.holds_rebalance_guard());
+        assert!(state.is_reconcilable_failure());
+        outcome.unwrap();
+        assert!(logs_contain(
+            "Relay refused the quote for a refund at the hub"
+        ));
     }
 
     /// A refund Relay pays in USDG to the chain wallet, proven on the chain,

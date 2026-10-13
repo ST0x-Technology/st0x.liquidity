@@ -24,6 +24,8 @@ pub use acceptance::{
 pub use evm::RelayEndContracts;
 pub use evm::{RelayBridge, RelayBridgeError, RelayCtx};
 pub use proof::UnverifiedReason;
+#[cfg(feature = "mock")]
+pub use quote::quote_body_for_test;
 pub use quote::{
     AcceptedRelayQuote, QuoteFees, QuoteField, QuoteMismatch, QuoteRequest, QuoteStep,
     QuotedCurrency, RecordedRelayQuote, RelayOrderId, RelayQuote, RelayRequestId, StepTransaction,
