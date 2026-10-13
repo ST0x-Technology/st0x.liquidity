@@ -227,7 +227,9 @@ test ran from a throwaway wallet funded for it, not a bot signer.
 ## RelayBridge
 
 `RelayBridge<EthWallet, ChainWallet>` holds the Ethereum hub and one corridor
-chain, and serves both directions (`HopDirection::ToHub`, `FromHub`).
+chain, and serves both directions (`HopDirection::ToHub`, `FromHub`). Both
+wallets must share one address (`WalletsDiffer` otherwise): a quote names one
+refund address, which must be our wallet on either end.
 
 ### Deposit
 

@@ -153,6 +153,14 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> RelayBridge<EthWallet, ChainWallet>
             return Err(RelayBridgeError::HubAsCorridorChain);
         }
 
+        // A quote names one refund address and a refund is proven against
+        // our wallet on the side it lands on, so a split address would have
+        // every quote refused at signing, after its transfer has started.
+        let (hub, chain) = (ctx.ethereum_wallet.address(), ctx.chain_wallet.address());
+        if hub != chain {
+            return Err(RelayBridgeError::WalletsDiffer { hub, chain });
+        }
+
         Ok(Self {
             hub: RelayEnd::pinned(
                 Chain::Ethereum,
