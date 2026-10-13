@@ -3134,8 +3134,11 @@ mod tests {
         );
     }
 
+    /// A cursor at `scanned_to + 1` passes the head when the chain needs one
+    /// confirmation, or when a lagging node serves an older head: the scan
+    /// reads nothing and leaves the cursor where it was.
     #[tokio::test]
-    async fn deposit_scan_from_beyond_the_head_is_refused() {
+    async fn deposit_scan_from_beyond_the_head_keeps_the_caller_cursor() {
         let harness = Harness::new().await;
         let head = harness
             .bridge
@@ -3143,15 +3146,30 @@ mod tests {
             .await
             .unwrap();
 
-        let error = harness
+        let next = harness
+            .bridge
+            .find_recent_deposits(HopDirection::ToHub, &[], head + 1)
+            .await
+            .unwrap();
+        let far = harness
             .bridge
             .find_recent_deposits(HopDirection::ToHub, &[], head + 10)
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert!(
-            matches!(error, RelayBridgeError::ScanAheadOfHead { from_block, .. } if from_block == head + 10),
-            "{error:?}"
+        assert_eq!(
+            next,
+            DepositScan {
+                deposits: vec![],
+                scanned_to: head,
+            }
+        );
+        assert_eq!(
+            far,
+            DepositScan {
+                deposits: vec![],
+                scanned_to: head + 9,
+            }
         );
     }
 }
