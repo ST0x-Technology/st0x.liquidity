@@ -84,9 +84,12 @@ impl<Signer: Wallet> RelayHop<Signer> {
     /// Signs and persists the pair, or picks up the one already persisted;
     /// `None` once the deposit is confirmed. Read and signed under the chain
     /// wallet's prepare lock: a timed-out attempt's prepare may have
-    /// persisted a pair this one must send instead of signing anew. The RPC
-    /// work under the lock is bounded by `quote_max_age`, past which the
-    /// quote is stale anyway, so a hung RPC cannot hold the lock forever.
+    /// persisted a pair this one must send instead of signing anew. The
+    /// attempt stops waiting on the signing after `quote_max_age`, but the
+    /// signing is not cancelled: it keeps its RPC calls under the wallet's
+    /// send lock, and its pair's nonces are released once it returns. A retry
+    /// does not sign meanwhile, since the quote is older than `quote_max_age`
+    /// by then.
     async fn prepare_swap_pair(
         self: &Arc<Self>,
         cqrs: &Store<UsdcRebalance>,

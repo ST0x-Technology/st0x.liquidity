@@ -5018,16 +5018,18 @@ runs the chain-to-Alpaca side up to the confirmed deposit:
 4. The approve and the deposit are signed together under the origin wallet's
    lock (the Ethereum wallet's deposit-send lock when Ethereum is the origin)
    and persisted in one event (`SwapDepositPrepared`) before either is
-   broadcast, on a task a job timeout cannot cancel between the two. The RPC
-   work under that lock is bounded by `quote_max_age_secs`; a pair signed after
-   the bound has its nonces released. A quote within 60 seconds of its deadline
-   or older than `quote_max_age_secs` is not signed, and a pair whose quote
-   reached either limit while it was signed is released instead of persisted:
-   the transfer holds its guard at `SwapQuoted` until the re-quote step that
-   follows. A persist that fails releases both nonces, deposit first, unless a
-   reload shows the pair committed. When another send took the nonce between the
-   two signs, the approve alone is persisted (`SwapApprovePrepared`) and
-   broadcast, and the attempt retries.
+   broadcast, on a task a job timeout cannot cancel between the two. The attempt
+   stops waiting on the signing after `quote_max_age_secs`, but the signing is
+   not cancelled: it keeps its RPC calls under the wallet's send lock, and its
+   pair's nonces are released once it returns. Its quote is too old to sign by
+   then, so a retry does not sign above those nonces. A quote within 60 seconds
+   of its deadline or older than `quote_max_age_secs` is not signed, and a pair
+   whose quote reached either limit while it was signed is released instead of
+   persisted: the transfer holds its guard at `SwapQuoted` until the re-quote
+   step that follows. A persist that fails releases both nonces, deposit first,
+   unless a reload shows the pair committed. When another send took the nonce
+   between the two signs, the approve alone is persisted (`SwapApprovePrepared`)
+   and broadcast, and the attempt retries.
 5. Broadcast in nonce order; a retry sends the same bytes. The deposit is
    recorded (`ConfirmSwapDeposit` -> `SwapDeposited`) once it has the origin
    chain's confirmations and its receipt names our wallet, the origin stable and
