@@ -5009,8 +5009,13 @@ runs the chain-to-Alpaca side up to the confirmed deposit:
 2. The vault withdraw, as on a CCTP corridor, except that an adopted withdraw
    that realized another amount is not failed: the transfer holds at
    `Withdrawing` with its guard, its stable outside the vault. A resume at
-   `Withdrawing` reads the recorded withdraw back and moves on only at the
-   recorded amount, and `FailWithdrawal` is refused there.
+   `Withdrawing` reads the amount from the recorded withdraw tx's own receipt
+   (its `OperatorWithdraw`, or a legacy `WithdrawV2`, by our wallet for the
+   stable and vault), so a later withdraw from the same vault does not hide it,
+   and moves on only at the recorded amount. A receipt not visible yet, or a
+   transient RPC error, redrives with the inconclusive-scan deadline page. A
+   recorded withdraw without a tx hash is left to the operator. `FailWithdrawal`
+   is refused there.
 3. The binding quote (`QuoteSwap` -> `SwapQuoted`), checked against the bounds
    (`max_quote_loss_bps` and the slippage floor) and against the withdrawn
    amount. The Alpaca deposit sets no minimum here: `min_transfer` sizes the
@@ -5040,7 +5045,8 @@ runs the chain-to-Alpaca side up to the confirmed deposit:
 5. Broadcast in nonce order; a retry sends the same bytes. The deposit is
    recorded (`ConfirmSwapDeposit` -> `SwapDeposited`) once it has the origin
    chain's confirmations and its receipt names our wallet, the origin stable and
-   the quote's order id.
+   the quote's order id. The bot gas of the approves and the deposit is queued
+   before that, and also when the deposit reverted, since it was mined.
 6. The transfer then waits at `SwapDeposited` with its guard held.
 
 A Relay rate limit (429) on either quote is backpressure, as a broker 429 is
