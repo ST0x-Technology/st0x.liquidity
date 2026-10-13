@@ -1638,7 +1638,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pair_split_by_another_send_sends_its_approve_alone_and_a_retry_pairs() {
+    async fn pair_split_by_another_send_sends_its_approve_alone_and_a_retry_signs_only_the_deposit()
+    {
         let harness = Harness::new().await;
         let bridge = pair_bridge(&harness, OnDepositSigning::AnotherSendFirst);
         let quote = accepted(quote(&harness.chain, B256::random(), true));
@@ -1670,11 +1671,13 @@ mod tests {
                 .await,
             AMOUNT
         );
-        let retry_approve = retry.approve.unwrap();
-        check_pair_nonces(&retry_approve, &retry.deposit).unwrap();
         assert_eq!(
-            [retry_approve.nonce(), retry.deposit.nonce()],
-            [2, 3],
+            retry.approve, None,
+            "the approve sent alone already allows the deposit"
+        );
+        assert_eq!(
+            retry.deposit.nonce(),
+            2,
             "the other send still holds nonce 1"
         );
     }
