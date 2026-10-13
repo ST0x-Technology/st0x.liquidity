@@ -7552,7 +7552,7 @@ mod tests {
         TestMintBurnToken, deploy_cctp_on_chain, link_chains, mint_usdc, set_max_burn_amount,
     };
     use st0x_bridge::corridor::HopKind;
-    use st0x_bridge::relay::{RelayCtx, deploy_relay_end};
+    use st0x_bridge::relay::{RelayCtx, RelayEndContracts, deploy_relay_end};
     use st0x_config::{ChainCtx, HedgedChain};
     use st0x_event_sorcery::{AggregateError, LifecycleError, test_store};
     use st0x_evm::local::RawPrivateKeyWallet;
@@ -30618,6 +30618,72 @@ mod tests {
         assert_eq!(
             helper.ethereum_tx_block(tx).await.unwrap(),
             helper.ethereum_tx_block(mint_tx).await.unwrap() + 1
+        );
+    }
+
+    /// A Relay transfer has no CCTP leg, so a failed deposit-send scan on the
+    /// hub must not read as a CCTP error.
+    #[tokio::test]
+    async fn relay_deposit_send_scan_failure_is_not_a_cctp_error() {
+        let chain = deploy_ethereum_usdc_chain_head_at_mint().await;
+        let server = MockServer::start();
+        let _address_mock = mock_alpaca_deposit_address(&server);
+        let mint_block = ProviderBuilder::new()
+            .connect(&chain.endpoint)
+            .await
+            .unwrap()
+            .get_block_number()
+            .await
+            .unwrap();
+
+        let wallet = create_test_wallet(&chain.endpoint, &chain.bot_key);
+        let stable = RelayEndContracts {
+            stable: USDC_ADDRESS,
+            depository: Address::ZERO,
+        };
+        let bridge = RelayBridge::try_from_ctx(RelayCtx {
+            chain: Chain::Robinhood,
+            ethereum_wallet: wallet.clone(),
+            chain_wallet: wallet.clone(),
+            ethereum_confirmations: 1,
+            chain_confirmations: 1,
+        })
+        .unwrap()
+        .with_local_contracts(stable, stable);
+        let (_, vault_service) = create_test_onchain_services(wallet);
+        let manager = CrossVenueCashTransfer::new(
+            InstrumentedAlpacaBroker::new(
+                create_test_broker_service(&server).await,
+                TelemetrySender::disabled(),
+            ),
+            Arc::new(create_test_wallet_service(&server)),
+            Arc::new(bridge),
+            Arc::new(vault_service),
+            create_test_store_instance().await,
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                chain.bot_address,
+                TEST_VAULT_ID,
+            ),
+            &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
+        );
+
+        let error = manager
+            .send_unless_an_unrecorded_send_landed(
+                &UsdcRebalanceId(Uuid::new_v4()),
+                usdc("99.99"),
+                chain.mint_tx,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Ethereum stable error: transfer scan inconclusive: node not caught up past \
+                 block {mint_block}"
+            ),
         );
     }
 }
