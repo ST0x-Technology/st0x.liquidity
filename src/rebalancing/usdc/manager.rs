@@ -30731,6 +30731,15 @@ mod tests {
             .await
             .unwrap_err();
 
+        assert!(
+            matches!(
+                &error,
+                UsdcTransferError::StableEndpoint(source)
+                    if matches!(**source, StableEndpointError::ScanInconclusive { from_block }
+                        if from_block == mint_block)
+            ),
+            "got: {error:?}",
+        );
         assert_eq!(
             error.to_string(),
             format!(
