@@ -4525,3 +4525,111 @@ groups:
           description: >-
             The bot accepted the latest copy of gs://t0-artifacts-tokens/production/tokens.toml and restarted onto it, and that copy failed to start twice. The bot now runs its last good tables, with the listings the failed copy added switched off. It tries the failed copy again after 30 minutes, then after 1h, 2h and so on, and each try costs more restarts. Read the boot error: gcloud logging read '"failed to start twice"' --project t0-liquidity --freshness 1d. Read the lines before it for why the copy crashed. Then fix t0/production.toml in T0Trade/t0.tokens, or publish the previous file again. Production uploads only through a manual publish-t0-tokens run with an approved tokens-production-publish PAM grant. This rule holds for one hour after the last fallback ({{ humanizeDuration $values.E.Value }} ago) and then resolves. That RESOLVED means "no new fallback", not "fixed".
         labels: {service: liquidity, severity: critical}
+
+      # ---- the bot's log tail -----------------------------------------------
+      # Every per-kind rule above counts lines in the bot's log, so a dead log
+      # tail makes all of them go quiet and nothing pages. The Ops Agent on
+      # the VM tails the bot's stdout into Cloud Logging as log
+      # `liquidity-bot` (terraform gcp-bot-vm in T0Trade/t0.devops). This
+      # rule fires when that log has had no entry for 15 minutes. Both bots
+      # log at least once a minute, and the largest gap measured over 3 days
+      # was 1.3 minutes (staging), so 15 minutes is far above a normal gap and
+      # also absorbs the count's ingestion delay of up to 3 minutes.
+      #
+      # Armed only once the log has had an entry in the last 3 days, the same
+      # way scrape-target-down in T0Trade/t0.grafana arms itself. Until the
+      # production VM is replaced onto the Ops Agent tail, the log does not
+      # exist, A has no series, and the rule is NoData, which reads OK. A
+      # real death fires, then goes quiet once the log has been empty for 3
+      # full days (a misleading RESOLVED, the same known trade-off).
+      #
+      # Why one 3-day query and a resample, not a 15-minute query: a quiet
+      # 15-minute window returns no series at all (the count writes a few 0
+      # points after the last entry, then nothing), and Grafana makes the
+      # whole rule NoData when any datasource query returns no series. So A
+      # reads the 3 days the arming needs, B cuts them into 15-minute buckets
+      # that end now, and C replaces an empty last bucket with 0.
+      # execErrState Error, not OK as in the per-kind rules: log_entry_count
+      # is a built-in metric, so its descriptor always exists, and an error
+      # means Cloud Monitoring could not be read. A silent-log rule must not
+      # read that as healthy.
+      #
+      # for: 2m, a pending period like the Error rules in robinhood-inventory
+      # and t0-money: Grafana puts an Error through Pending as well, so one
+      # failed Cloud Monitoring read, armed or not, cannot page critical.
+      # Three failed 1m evaluations in a row page. A quiet log pages after
+      # 17 minutes instead of 15.
+      #
+      # critical, like the per-kind rules: while the log is dead, every one
+      # of them is blind.
+      - uid: t0liqlogquietprd
+        title: liquidity-bot-log-quiet-production
+        condition: D
+        data:
+          - refId: A
+            queryType: timeSeriesList
+            relativeTimeRange: {from: 259200, to: 0}
+            datasourceUid: cloudmon
+            model:
+              datasource: {type: stackdriver, uid: cloudmon}
+              queryType: timeSeriesList
+              refId: A
+              instant: true
+              intervalMs: 60000
+              timeSeriesList:
+                projectName: t0-liquidity
+                filters:
+                  - "metric.type"
+                  - "="
+                  - "logging.googleapis.com/log_entry_count"
+                  - AND
+                  - "metric.labels.log"
+                  - "="
+                  - "liquidity-bot"
+                alignmentPeriod: +60s
+                perSeriesAligner: ALIGN_DELTA
+                crossSeriesReducer: REDUCE_SUM
+                preprocessor: none
+                groupBys: []
+                view: FULL
+          - refId: B
+            queryType: expression
+            relativeTimeRange: {from: 900, to: 0}
+            datasourceUid: __expr__
+            model:
+              datasource: {name: Expression, type: __expr__, uid: __expr__}
+              type: resample
+              expression: A
+              window: 15m
+              downsampler: sum
+              upsampler: fillna
+              refId: B
+          - refId: C
+            queryType: expression
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              datasource: {name: Expression, type: __expr__, uid: __expr__}
+              type: reduce
+              reducer: last
+              settings: {mode: replaceNN, replaceWithValue: 0}
+              expression: B
+              refId: C
+          - refId: D
+            queryType: expression
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              datasource: {name: Expression, type: __expr__, uid: __expr__}
+              type: math
+              expression: "$C < 1"
+              refId: D
+        noDataState: OK
+        execErrState: Error
+        for: 2m
+        annotations:
+          summary: >-
+            Production liquidity bot log has had no entry for 15 minutes, so its operational alerts cannot fire.
+          description: >-
+            Cloud Logging has no entry in log liquidity-bot in t0-liquidity for 15 minutes. Both bots log at least once a minute, so either the bot stopped or the Ops Agent stopped shipping its stdout. While this fires, every per-kind liquidity alert is blind. Check production-service-down first: if the bot is down, fix that. If the bot is up, check the agent over IAP SSH: systemctl is-active google-cloud-ops-agent-opentelemetry-collector google-cloud-ops-agent-fluent-bit (one unit at a time), then docker logs on the bot container. A planned VM replace or stop also fires this. It resolves once the log has entries again.
+        labels: {service: liquidity, severity: critical}
