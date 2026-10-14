@@ -908,11 +908,11 @@ stox transfer resume --kind usdc --id <uuid> --direction to-alpaca
 
 The job takes a fresh binding quote (or re-quotes an expired one) and signs the
 deposit; when Relay refuses the quote it puts the USDG back into the vault
-(`Redepositing` -> `ReturnedToSource`), which releases the guard; Robinhood
-chain-to-Alpaca planning then waits for a fresh vault read and the 30-minute
-withdraw cooldown, also across a restart. A transient quote failure (transport,
-rate limit) leaves the transfer where it was for the next resume. The other
-Relay holds:
+(`Redepositing` -> `ReturnedToSource`), which releases the guard; USDC dispatch
+then waits for a fresh Robinhood vault read, and Robinhood chain-to-Alpaca
+planning for the 30-minute withdraw cooldown, also across a restart. A transient
+quote failure (transport, rate limit) leaves the transfer where it was for the
+next resume. The other Relay holds:
 
 - `SwapEscrowUnresolved` (the fill window passed with no fill or refund) keeps
   the guard and pages, and the bot stops reading Relay. `transfer resume` reads
@@ -928,7 +928,7 @@ Relay holds:
   deposit with Relay. USDG it returns to the Robinhood wallet goes into the
   Robinhood cash vault, and USDC it pays on Ethereum goes to Alpaca and is
   converted, as for the refunds below. Only then run
-  `transfer reconcile --kind usdc`.
+  `transfer reconcile --kind usdc --id <uuid> --reason funds-moved-manually`.
 - `SwapRefunded` on the origin side, at or above its refund floor, that no job
   drives any more (a restart before the redeposit started): the bot does not
   re-arm Relay states at startup, and `transfer reconcile` refuses it. Run
@@ -939,8 +939,8 @@ Relay holds:
   recheck a deposit Alpaca credited, convert the credited USDC by hand with
   `stox alpaca-convert -d to-usd -a <amount>` and check the Alpaca cash balance
   instead, then run
-  `transfer reconcile --kind usdc --reason deposit-credited-offline`, which does
-  not convert.
+  `transfer reconcile --kind usdc --id <uuid> --reason deposit-credited-offline`,
+  which does not convert.
 - `SwapRefunded` paid in USDC on Ethereum: the USDC is in the bot's Ethereum
   wallet. `transfer reconcile` only releases the guard and the Robinhood
   inflight; it credits neither Alpaca nor the vault, and it ends the transfer's
@@ -962,7 +962,8 @@ Relay holds:
   (`st0x-liquidity-client --env <env> capital vault-deposit --amount <amount> --network robinhood --token <usdg> --vault-id <cash-vault-id>`
   with the bot running, or the offline `stox vault-deposit` with the same
   options with it stopped); a refund on Ethereum goes to Alpaca and is converted
-  as in the previous item. Only then run `transfer reconcile --kind usdc`:
+  as in the previous item. Only then run
+  `transfer reconcile --kind usdc --id <uuid> --reason funds-moved-manually`:
   reconciling first leaves the refund outside both venues while the inventory
   counts it as spent.
 - `Redepositing` whose vault deposit does not confirm (paged "The redeposit into
@@ -972,7 +973,8 @@ Relay holds:
   reverted, or has no receipt while another mined tx took its nonce: a deposit
   still pending can mine, and a deposit by hand would then put the USDG in
   twice. Check the vault on chain, deposit the USDG by hand if it is still in
-  the Robinhood wallet, then `transfer reconcile --kind usdc`.
+  the Robinhood wallet, then
+  `transfer reconcile --kind usdc --id <uuid> --reason funds-moved-manually`.
 
 ### Clearing a pre-burn guard latch
 
