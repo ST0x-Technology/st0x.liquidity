@@ -5,7 +5,8 @@ name: release-tag
 # CI already built and attested for that commit, then cuts the GitHub
 # release. It does not build and it does not deploy: production is rolled
 # by ONE manual action, Actions -> production-release -> Run workflow with
-# this version, followed by the app-deploy PAM approval (agreed with Juan
+# this version, followed by the app-deploy PAM approval, or by nothing inside
+# an approved deploy window (deploy-window.yml) (agreed with Juan
 # on 2026-09-08 after RAI-2266; before that the tag itself requested the
 # grant). The full contract (refusals, idempotence, prerequisites) lives in
 # the reusable workflow below; the identity is minted by t0.devops
@@ -27,7 +28,7 @@ jobs:
       id-token: write
       # write: release-label cuts the GitHub release for the tag.
       contents: write
-    uses: ST0x-Technology/.github/.github/workflows/release-label.yml@99e02ccfeea6ace62853858f3a8d8c10c8d798c5  # release-label @ .github main
+    uses: ST0x-Technology/.github/.github/workflows/release-label.yml@4a1d2d28716072aa77c3038f9cf6d58bea5a2e9c  # release-label @ .github main
     with:
       service_account: liquidity-labeler@t0-artifacts.iam.gserviceaccount.com
       ar_repo: europe-west3-docker.pkg.dev/t0-artifacts/t0-liquidity

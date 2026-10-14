@@ -1,7 +1,9 @@
 name: production-release
 
 # THE production release for this repo, and the only way to roll it. One
-# manual action plus the app-deploy PAM approval in t0-liquidity:
+# manual action plus the app-deploy PAM approval in t0-liquidity, or none
+# inside an approved deploy window (deploy-window.yml, at least 30 minutes
+# left):
 #   Actions -> production-release -> Run workflow
 #     version = vX.Y.Z  : images AND config/prod/st0x-hedge.toml from that
 #                         tag (new version, re-deploy or rollback);
@@ -13,7 +15,8 @@ name: production-release
 # for every tag; RAI-2266). Either way the file is validated inside the
 # exact bot image it will run on before the grant is requested, published
 # as a liquidity-runtime-config version, and images.env is rewritten with
-# the digests + CONFIG_VERSION once an approver activates the grant; the VM
+# the digests + CONFIG_VERSION once an approver activates the grant (or at
+# once inside an approved deploy window); the VM
 # verifies attestations, restarts the stack and publishes deployed.env,
 # which the job waits for.
 
@@ -35,7 +38,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    uses: ST0x-Technology/.github/.github/workflows/app-release.yml@99e02ccfeea6ace62853858f3a8d8c10c8d798c5  # app-release @ .github main
+    uses: ST0x-Technology/.github/.github/workflows/app-release.yml@4a1d2d28716072aa77c3038f9cf6d58bea5a2e9c  # app-release @ .github main
     with:
       environment: production
       runtime: bot-vm

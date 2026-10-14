@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       start:
-        description: "Window start in UTC, like 2026-10-22T13:00:00Z (at most 7 days ahead)"
+        description: "Window start in UTC, like 2026-10-22T13:00:00Z (5 minutes to 7 days ahead)"
         required: true
         type: string
       hours:
@@ -29,7 +29,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    uses: ST0x-Technology/.github/.github/workflows/deploy-window.yml@99e02ccfeea6ace62853858f3a8d8c10c8d798c5  # deploy-window @ .github main
+    uses: ST0x-Technology/.github/.github/workflows/deploy-window.yml@4a1d2d28716072aa77c3038f9cf6d58bea5a2e9c  # deploy-window @ .github main
     with:
       project: t0-liquidity
       service_account: liquidity-releaser@t0-artifacts.iam.gserviceaccount.com
