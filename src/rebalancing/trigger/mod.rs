@@ -38967,6 +38967,10 @@ mod tests {
             inventory.onchain_usdc_available_at(Chain::Robinhood),
             Some(usdc(400))
         );
+        assert_eq!(
+            inventory.usdc_available(Venue::Hedging),
+            Some(Usdc::new(float!(600.2)))
+        );
         drop(inventory);
     }
 

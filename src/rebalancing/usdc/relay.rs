@@ -1117,12 +1117,15 @@ where
             .broadcast_split_approves(id, split_approves, deadline)
             .await?;
         for approve in split_approves {
-            self.hop
-                .bridge
-                .confirm_approve(TO_HUB, approve)
-                .await
-                .inspect_err(|error| warn!(target: "rebalance", %id, approve = %approve.tx_hash(), %error, "A lone Relay approve is not confirmed; the redeposit waits for the retry to send it again"))
-                .map_err(Box::new)?;
+            match self.hop.bridge.confirm_approve(TO_HUB, approve).await {
+                // A reverted approve is mined: its nonce is used, so the vault
+                // deposit does not wait behind it.
+                Ok(()) | Err(RelayBridgeError::ApproveReverted { .. }) => {}
+                Err(error) => {
+                    warn!(target: "rebalance", %id, approve = %approve.tx_hash(), %error, "A lone Relay approve is not confirmed; the redeposit waits for the retry to send it again");
+                    return Err(Box::new(error).into());
+                }
+            }
         }
         self.redeposit(id, reason).await
     }
@@ -3611,8 +3614,13 @@ mod tests {
         );
 
         tokio::time::sleep(Duration::from_secs(3)).await;
-        let _released = attempt().await.expect("the retry ends");
+        attempt().await.expect("the retry ends").unwrap_err();
         requote.assert_calls(1);
+        assert_eq!(
+            store.load(&id).await.unwrap().unwrap().state_name(),
+            "Redepositing",
+            "once the nonces are released the refused re-quote starts the redeposit"
+        );
     }
 
     /// A pair persisted after an approve went out alone is resumed in
