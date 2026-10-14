@@ -452,7 +452,7 @@ async fn intercept_relay_wait<Ctx, TaskJob>(
 ) -> ControlFlow<Result<(), TaskJob::Error>, Result<(), UsdcTransferError>>
 where
     Ctx: Send + Sync + 'static,
-    TaskJob: Job<Ctx> + Clone + Sync + Unpin,
+    TaskJob: Job<Ctx> + ResetBackpressureStreak + Clone + Sync + Unpin,
     TaskJob::Error: From<QueuePushError>,
 {
     let delay = match &result {
@@ -482,9 +482,36 @@ where
     };
 
     let mut job_queue = job_queue.clone();
-    match job_queue.push_with_delay(job.clone(), delay).await {
+    match job_queue
+        .push_with_delay(job.with_reset_backpressure_streak(), delay)
+        .await
+    {
         Ok(()) => ControlFlow::Break(Ok(())),
         Err(error) => ControlFlow::Break(Err(TaskJob::Error::from(error))),
+    }
+}
+
+/// A copy of a transfer job with its broker 429 streak reset, for a requeue
+/// whose cause is not backpressure: the next unrelated 429 starts a new streak.
+trait ResetBackpressureStreak {
+    fn with_reset_backpressure_streak(&self) -> Self;
+}
+
+impl ResetBackpressureStreak for TransferUsdcToHedging {
+    fn with_reset_backpressure_streak(&self) -> Self {
+        Self {
+            backpressure_streak: BackpressureStreak::default(),
+            ..self.clone()
+        }
+    }
+}
+
+impl ResetBackpressureStreak for TransferUsdcToMarketMaking {
+    fn with_reset_backpressure_streak(&self) -> Self {
+        Self {
+            backpressure_streak: BackpressureStreak::default(),
+            ..self.clone()
+        }
     }
 }
 
@@ -3347,7 +3374,7 @@ mod tests {
                 requeued.revert_redrive_attempts,
                 job.revert_redrive_attempts
             );
-            assert_eq!(requeued.backpressure_streak, job.backpressure_streak);
+            assert_eq!(requeued.backpressure_streak, BackpressureStreak::default());
             let delay = i64::try_from(delay.as_secs()).unwrap();
             assert!(
                 run_at >= before + delay - 1 && run_at <= after + delay + 1,
