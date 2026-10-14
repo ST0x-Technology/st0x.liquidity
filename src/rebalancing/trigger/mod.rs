@@ -47580,7 +47580,7 @@ mod tests {
     #[tokio::test]
     async fn reconciled_chain_wallet_refund_frees_the_corridor_after_a_restart() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
         let id = UsdcRebalanceId(Uuid::new_v4());
         let held = relay_withdrawn(RebalanceDirection::AlpacaToBase)
             .into_iter()
@@ -47635,19 +47635,12 @@ mod tests {
             .with_withdrawable_cash_cents(90_000);
         let inventory = with_onchain_usdc(inventory, Chain::Robinhood, usdc(100));
         let trigger = make_trigger_with_inventory_config(inventory, config).await;
-        trigger
-            .set_stores(
-                Arc::new(test_store::<TokenizedEquityMint>(
-                    pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
-                )),
-                Arc::new(test_store::<EquityRedemption>(
-                    pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
-                )),
-                store.clone(),
-            )
-            .await;
+        attach_stores(
+            &trigger,
+            pool.clone(),
+            test_store::<UsdcRebalance>(pool.clone(), ()),
+        )
+        .await;
 
         trigger.recover_usdc_guard(&pool, &store).await.unwrap();
         assert!(trigger.usdc_guards.is_held(Chain::Robinhood));
@@ -47673,9 +47666,15 @@ mod tests {
 
         trigger.check_and_trigger_usdc().await;
 
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            1
+        );
         let job = pending_transfer_usdc_to_market_making_job(&trigger).await;
         assert_ne!(job.id, id, "a new transfer, not the reconciled one");
         assert_eq!(job.corridor, ROBINHOOD_RELAY);
+        assert_eq!(job.amount, usdc(200));
+        assert!(trigger.usdc_guards.is_held(Chain::Robinhood));
     }
 
     /// A Relay transfer whose job apalis still owns is not re-armed again:

@@ -2629,7 +2629,7 @@ impl UsdcRebalance {
     /// Returns the data needed to reconstruct an in-memory tracking entry
     /// during startup guard recovery.
     ///
-    /// Returns `Some((direction, amount, last_progress_at))` for the three
+    /// Returns `Some((direction, amount, last_progress_at))` for the
     /// manually-reconcilable guard-holding terminal states that cannot
     /// self-recover via the reactor/apalis:
     ///
@@ -9459,37 +9459,39 @@ mod tests {
                     reason: "Relay reported Failure".to_string(),
                     failed_at: Utc::now(),
                 }),
-                true,
+                Some(RebalanceDirection::BaseToAlpaca),
             ),
-            (after(refunded(RefundSide::Destination)), true),
+            (
+                after(refunded(RefundSide::Destination)),
+                Some(RebalanceDirection::BaseToAlpaca),
+            ),
             (
                 toward(
                     RebalanceDirection::AlpacaToBase,
                     refunded(RefundSide::Destination),
                 ),
-                true,
+                Some(RebalanceDirection::AlpacaToBase),
             ),
-            (redepositing, true),
-            (after(refunded(RefundSide::Origin)), false),
+            (redepositing, Some(RebalanceDirection::BaseToAlpaca)),
+            (after(refunded(RefundSide::Origin)), None),
             (
                 toward(
                     RebalanceDirection::AlpacaToBase,
                     refunded(RefundSide::Origin),
                 ),
-                false,
+                None,
             ),
             (
                 after(UsdcRebalanceEvent::SwapEscrowUnresolved {
                     unresolved_at: Utc::now(),
                 }),
-                false,
+                None,
             ),
         ] {
             let state = replay::<UsdcRebalance>(events).unwrap().unwrap();
             let seed = state.guard_recovery_tracking_data();
-            assert_eq!(seed.is_some(), seeded, "{state:?}");
-            if let Some((direction, amount, _)) = seed {
-                assert_eq!(direction, state.direction());
+            assert_eq!(seed.map(|(direction, ..)| direction), seeded, "{state:?}");
+            if let Some((_, amount, _)) = seed {
                 assert_eq!(amount, Usdc::new(float!(100)));
             }
         }
