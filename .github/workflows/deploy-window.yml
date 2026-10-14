@@ -1,0 +1,38 @@
+name: deploy-window
+# Asks PAM for a production deploy window on t0-liquidity: two approvers
+# approve it ahead of time, and every release inside it rolls without a new
+# approval (ST0x-Technology/.github deploy-window.yml). Loopyloupe starts
+# this with the GitHub sign-in of whoever asked, so the run names them;
+# anyone with write access can start it by hand (Actions > deploy-window >
+# Run workflow, on master).
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "Window start in UTC, like 2026-10-22T13:00:00Z (5 minutes to 7 days ahead)"
+        required: true
+        type: string
+      hours:
+        description: "Window length in whole hours, 1 to 12"
+        required: true
+        type: string
+      reason:
+        description: "Why, in one line"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  request:
+    permissions:
+      id-token: write
+      contents: read
+    uses: ST0x-Technology/.github/.github/workflows/deploy-window.yml@aa0b5e84363e4bfd9f36c8a95ba1edb7e4ff34b7  # deploy-window @ .github main
+    with:
+      project: t0-liquidity
+      service_account: liquidity-releaser@t0-artifacts.iam.gserviceaccount.com
+      start: ${{ inputs.start }}
+      hours: ${{ inputs.hours }}
+      reason: ${{ inputs.reason }}
