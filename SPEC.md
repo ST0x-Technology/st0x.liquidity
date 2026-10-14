@@ -5145,19 +5145,19 @@ proven fill or the stable back in the vault, never in a guard-freeing failure:
    stops waiting on the signing after `quote_max_age_secs`, but the signing is
    not cancelled: it keeps its RPC calls under the wallet's send lock, and its
    pair's nonces are released once it returns. It keeps the corridor's prepare
-   lock until then, and a retry's re-quote, signing or redeposit waits for that
-   lock up to `quote_max_age_secs` (the attempt ends for the next retry
-   otherwise), so nothing is signed or sent above those nonces. A quote within
-   60 seconds of its deadline or older than `quote_max_age_secs`, or whose order
-   id a deposit was already signed for, is not signed, and a pair whose quote
-   reached either limit while it was signed is released instead of persisted:
-   the attempt first re-quotes (`RequoteSwap` -> `SwapRequoted`, same input, a
-   fresh order id), and a refused re-quote redeposits (step 9). A persist that
-   fails releases both nonces, deposit first, unless a reload shows the pair
-   committed. When another send took the nonce between the two signs, the
-   approve alone is persisted (`SwapApprovePrepared`) and broadcast, even if its
-   quote expired during the signing, since that send holds the nonce above it,
-   and the attempt retries.
+   lock until then, and a retry's re-quote, signing or redeposit from
+   `SwapQuoted` waits for that lock up to `quote_max_age_secs` (the attempt ends
+   for the next retry otherwise), so nothing is signed or sent above those
+   nonces. A quote within 60 seconds of its deadline or older than
+   `quote_max_age_secs`, or whose order id a deposit was already signed for, is
+   not signed, and a pair whose quote reached either limit while it was signed
+   is released instead of persisted: the attempt first re-quotes (`RequoteSwap`
+   -> `SwapRequoted`, same input, a fresh order id), and a refused re-quote
+   redeposits (step 9). A persist that fails releases both nonces, deposit
+   first, unless a reload shows the pair committed. When another send took the
+   nonce between the two signs, the approve alone is persisted
+   (`SwapApprovePrepared`) and broadcast, even if its quote expired during the
+   signing, since that send holds the nonce above it, and the attempt retries.
 5. Broadcast in nonce order; a retry sends the same bytes. The deposit is
    recorded (`ConfirmSwapDeposit` -> `SwapDeposited`) once it has the origin
    chain's confirmations and its receipt names our wallet, the origin stable and

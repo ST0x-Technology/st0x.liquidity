@@ -908,9 +908,10 @@ stox transfer resume --kind usdc --id <uuid> --direction to-alpaca
 
 The job takes a fresh binding quote (or re-quotes an expired one) and signs the
 deposit; when Relay refuses the quote it puts the USDG back into the vault
-(`Redepositing` -> `ReturnedToSource`), which releases the guard. A transient
-quote failure (transport, rate limit) leaves the transfer where it was for the
-next resume. The other Relay holds:
+(`Redepositing` -> `ReturnedToSource`), which releases the guard; Robinhood
+chain-to-Alpaca planning then waits out the 30-minute withdraw cooldown, also
+across a restart. A transient quote failure (transport, rate limit) leaves the
+transfer where it was for the next resume. The other Relay holds:
 
 - `SwapEscrowUnresolved` (the fill window passed with no fill or refund) keeps
   the guard and pages, and the bot stops reading Relay. `transfer resume` reads
@@ -936,7 +937,9 @@ next resume. The other Relay holds:
   Relay transfers in this build. Where "Base->Alpaca deposit send pages" says to
   recheck a deposit Alpaca credited, convert the credited USDC by hand with
   `stox alpaca-convert -d to-usd -a <amount>` and check the Alpaca cash balance
-  instead, then run `transfer reconcile --kind usdc`, which does not convert.
+  instead, then run
+  `transfer reconcile --kind usdc --reason deposit-credited-offline`, which does
+  not convert.
 - `SwapRefunded` paid in USDC on Ethereum: the USDC is in the bot's Ethereum
   wallet. `transfer reconcile` only releases the guard and the Robinhood
   inflight; it credits neither Alpaca nor the vault, and it ends the transfer's
@@ -945,7 +948,10 @@ next resume. The other Relay holds:
   send the refunded amount to Alpaca with `stox alpaca-deposit -a <amount>`,
   wait for Alpaca to credit it, convert it with
   `stox alpaca-convert -d to-usd -a <amount>`, and check the Alpaca cash
-  balance. Only then run `transfer reconcile --kind usdc`.
+  balance. Only then run the offline `stox transfer reconcile --kind usdc`,
+  before you start the bot again: until the reconcile the transfer still counts
+  the refund as held credit on the Ethereum wallet, and the next deposit send
+  pages a false shortfall.
 - `SwapRefunded` below its refund floor (paged "Relay refunded less than the
   refund floor"), on either side: the bot never redeposits or quotes it again.
   Take up the shortfall with Relay. Then put the refund where the transfer would

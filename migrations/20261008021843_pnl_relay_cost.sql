@@ -1,7 +1,7 @@
 -- Relay hop costs for the P&L ledger, one row per `UsdcRebalance` event that
 -- books them: a Relay fill (`RelayFillVerified`: the quote's relayer fee and
--- the rest of the swap's cost) or a redeposit after a refund that kept
--- something back (`ReturnedToSource`: its shortfall). `swap_cost_usd` is
+-- the rest of the swap's cost) or a proven refund that kept something back
+-- (`SwapRefunded`: its shortfall). `swap_cost_usd` is
 -- signed: a fill above the fee-adjusted input is a gain. A table of its own
 -- leaves `pnl_cost_entry` and its one-row-per-event key unchanged.
 

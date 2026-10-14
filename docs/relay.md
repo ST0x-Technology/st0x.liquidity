@@ -309,8 +309,9 @@ no shorter window is assumed.
 (`IntentStatusReport::txs`) and require exactly one. The tx is looked up on both
 chains; a tx on neither is `RelayBridgeError::TxNotFound` (retry later, the node
 may lag). The bridge reads the receipt once, never waiting for it, and requires
-that chain's confirmations from `RelayCtx` (`Unconfirmed` until it has them, or
-has a receipt) in the canonical block (`NotCanonical` otherwise), then:
+that chain's confirmations from `RelayCtx` (`Unconfirmed` while it has no
+receipt or fewer confirmations) in the canonical block (`NotCanonical`
+otherwise), then:
 
 - receipt success;
 - the tx calls that side's stable, with exactly `transferFrom` + one trailing
