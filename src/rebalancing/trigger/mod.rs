@@ -44757,6 +44757,90 @@ mod tests {
         assert_eq!(job.corridor, ROBINHOOD_RELAY);
     }
 
+    /// An Alpaca-to-chain Relay transfer held at `WithdrawalComplete` after a
+    /// refused binding quote: its job ends with nothing to retry, so the
+    /// timeout sweep re-arms it, but at the hold cadence, not on every tick
+    /// (each run quotes Relay again).
+    #[tokio::test]
+    async fn sweep_rearms_a_relay_transfer_held_at_the_hub_at_the_hold_cadence() {
+        let config = RebalancingServiceConfig {
+            usdc: UsdcCorridors::for_test(
+                OperationMode::Enabled,
+                [active_corridor(Chain::Robinhood, HopKind::Relay)],
+            )
+            .with_relay_hop(Chain::Robinhood, relay_bounds(1, 50_000)),
+            ..with_cash_on(
+                test_config_with_timeout(Duration::from_secs(1)),
+                &[Chain::Robinhood],
+            )
+        };
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc(400);
+        seed_withdrawing_alpaca_to_base_on(&store, &id, amount, ROBINHOOD_RELAY).await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: Some(TxHash::repeat_byte(0x78)),
+                },
+            )
+            .await
+            .unwrap();
+        let trigger = make_trigger_with_inventory_config(InventoryView::default(), config).await;
+        trigger
+            .set_stores(
+                Arc::new(test_store::<TokenizedEquityMint>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                store.clone(),
+            )
+            .await;
+        trigger
+            .usdc_guards
+            .hold(Chain::Robinhood, &id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                corridor: ROBINHOOD_RELAY,
+                direction: RebalanceDirection::AlpacaToBase,
+                initiated_amount: amount,
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::WithdrawalConfirmed,
+                last_progress_at: Utc::now() - ChronoDuration::minutes(31),
+            },
+        );
+
+        let before = Utc::now().timestamp();
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        assert!(trigger.usdc_guards.is_held(Chain::Robinhood));
+        let job = pending_transfer_usdc_to_market_making_job(&trigger).await;
+        assert_eq!(job.id, id);
+        assert_eq!(job.corridor, ROBINHOOD_RELAY);
+        let run_at: i64 = sqlx_apalis::query_scalar(
+            "SELECT run_at FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+        .fetch_one(trigger.transfer_usdc_to_market_making_queue.pool())
+        .await
+        .unwrap();
+        // The hold cadence is 30 minutes.
+        assert!(
+            run_at >= before + 30 * 60 - 1,
+            "the re-armed job runs at {run_at}, not 30 minutes after {before}"
+        );
+    }
+
     const ROBINHOOD_RELAY: UsdcCorridor = UsdcCorridor::HubRouted {
         chain: Chain::Robinhood,
         hop: HopKind::Relay,
