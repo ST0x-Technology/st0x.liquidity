@@ -392,7 +392,7 @@ pub enum Commands {
     /// twice. Run this direct database path only while the bot is stopped
     /// anyway: its writes reach none of the bot's live reactors, and its placer
     /// has no admission gate. Against a running bot, call the bot's
-    /// `POST /liquidity-write/transactions/{tx_hash}/process` route instead.
+    /// `POST /liquidity-debug/transactions/{tx_hash}/process` route instead.
     /// `--network` selects the hedged chain the transaction is read from;
     /// without it the configured primary chain is used.
     ProcessTx {

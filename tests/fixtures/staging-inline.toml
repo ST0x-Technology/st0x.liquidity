@@ -389,7 +389,7 @@ url = "https://api.st0x.io"
 
 # IAP audiences for the role-gated ops API, from the ops_api_audiences output
 # of ops-api-iap.tf. The bot pins the audience per path prefix, so a token IAP
-# minted for the read backend is refused on the write path even though its
+# minted for the read backend is refused on the debug path even though its
 # signature is valid.
 #
 # Not secrets: an audience names an IAM-gated backend and is useless without an
@@ -397,7 +397,7 @@ url = "https://api.st0x.io"
 # routes entirely.
 [ops_api]
 read_audience = "/projects/819265953297/global/backendServices/6620592880358364228"
-write_audience = "/projects/819265953297/global/backendServices/6816788502563099716"
+debug_audience = "/projects/819265953297/global/backendServices/6816788502563099716"
 
 # Low-gas balance alerting for the bot wallet. Telegram bot_token lives in the
 # encrypted secrets file under [alerts]. Every field is required (no defaults).

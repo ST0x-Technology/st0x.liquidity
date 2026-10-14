@@ -1,6 +1,7 @@
-//! The capital group of the ops write API: typed routes for the capital verbs
-//! of `st0x-cli`, run inside the bot so they sign with its own wallets and
-//! share their nonce state instead of building a second signer.
+//! The capital tier of the ops API (`/liquidity-capital/*`): typed routes for
+//! the capital verbs of `st0x-cli`, run inside the bot so they sign with its
+//! own wallets and share their nonce state instead of building a second
+//! signer.
 //!
 //! No route waits on CCTP attestation, on USDC settlement, or on the
 //! confirmations of the transaction it answers with, since the ops load

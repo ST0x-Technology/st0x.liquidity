@@ -63,9 +63,9 @@ pub trait TokenSource {
 /// A fixed bearer token that has already been minted.
 ///
 /// The desktop OAuth flow yields one ID token whose audience is the OAuth
-/// client id, and IAP admits both the read and write prefixes on that single
-/// identity. The Workspace group decides which paths succeed, so the same
-/// token backs both roles.
+/// client id, and IAP admits the read, debug and capital prefixes on that
+/// single identity. The Workspace group decides which paths succeed, so the
+/// same token backs every role.
 pub struct StaticToken(pub String);
 
 impl TokenSource for StaticToken {

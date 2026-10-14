@@ -128,7 +128,8 @@ let
         # /transfers/recheck/{kind}/{id} are POST mutation endpoints and now
         # carry their own guards (src/api.rs): the bare mounts admit only
         # loopback peers (the in-container st0x-cli via docker exec), and
-        # network operators use the IAP-verified /liquidity-write mount.
+        # network operators use the IAP-verified /liquidity-debug mount
+        # (and /liquidity-capital for the capital verbs).
         # This proxy still refuses the method as defense in depth. An IAP
         # tunnel to the bot port can no longer invoke them: the peer is the
         # bridge interface, not loopback, and the bot answers 403.
@@ -159,12 +160,18 @@ let
         # that keeps a prefix from carrying verbs its role never intended,
         # the same way the dashboard locations do.
         #
-        # /liquidity-write is the one location in this file that admits POST.
-        # It stays a single exact-ish prefix for that reason: widening it, or
-        # adding another writable location, hands the method past the point
-        # where the audience check can distinguish roles.
-        location /liquidity-read/  { limit_except GET  { deny all; } proxy_pass http://$bot_upstream; }
-        location /liquidity-write/ { limit_except POST { deny all; } proxy_pass http://$bot_upstream; }
+        # /liquidity-debug and /liquidity-capital are the only locations in
+        # this file that admit POST, one per mutation tier: debug repairs
+        # state, capital starts new fund movements, and each has its own IAP
+        # backend and pinned audience. Each stays a single exact-ish prefix
+        # for that reason: widening one, or adding another writable location,
+        # hands the method past the point where the audience check can
+        # distinguish roles. The bot does not mount /liquidity-capital until
+        # its capital_audience is configured, so before then this location
+        # forwards to a 404.
+        location /liquidity-read/    { limit_except GET  { deny all; } proxy_pass http://$bot_upstream; }
+        location /liquidity-debug/   { limit_except POST { deny all; } proxy_pass http://$bot_upstream; }
+        location /liquidity-capital/ { limit_except POST { deny all; } proxy_pass http://$bot_upstream; }
       }
     }
   '';

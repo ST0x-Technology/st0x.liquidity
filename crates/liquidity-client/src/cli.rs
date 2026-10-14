@@ -40,8 +40,8 @@ pub(crate) enum Command {
     /// Safe recovery operations (debug tier).
     #[command(subcommand)]
     Debug(Debug),
-    /// Capital movement operations, signed by the bot's own wallets (write
-    /// tier, the same IAP group as debug).
+    /// Capital movement operations, signed by the bot's own wallets (capital
+    /// tier, its own IAP group, separate from debug).
     #[command(subcommand)]
     Capital(Capital),
 }

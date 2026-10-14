@@ -17,7 +17,7 @@
 //! The audience is the load-bearing claim. IAP binds the token it mints to the
 //! backend service that admitted the caller, so a token issued for the read
 //! backend carries the read backend's audience. Pinning the expected audience
-//! per prefix therefore turns a replay of a read-tier token against the write
+//! per prefix therefore turns a replay of a read-tier token against the debug
 //! path into a rejection, even if the URL map were misconfigured to route it
 //! there. Checking only the signature would miss exactly that case.
 //!
@@ -25,7 +25,8 @@
 //! is group membership, evaluated by IAP against the backend's IAM policy.
 //! Duplicating it here as an email allowlist would create a second source of
 //! truth that drifts, and would defeat the point of the pilot, which is that
-//! granting an operator write access is a Workspace admin console change.
+//! granting an operator debug or capital access is a Workspace admin console
+//! change.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -432,7 +433,8 @@ pub(crate) mod test_support {
 
     pub(crate) const TEST_KID: &str = "test-key";
     pub(crate) const READ_AUDIENCE: &str = "/projects/1/global/backendServices/11";
-    pub(crate) const WRITE_AUDIENCE: &str = "/projects/1/global/backendServices/22";
+    pub(crate) const DEBUG_AUDIENCE: &str = "/projects/1/global/backendServices/22";
+    pub(crate) const CAPITAL_AUDIENCE: &str = "/projects/1/global/backendServices/33";
     pub(crate) const TEST_SUBJECT: &str = "accounts.google.com:1234";
     pub(crate) const TEST_EMAIL: &str = "operator@t0trade.com";
     pub(crate) const TEST_ISSUER: &str = IAP_ISSUER;
@@ -590,7 +592,7 @@ mod tests {
 
     /// The property the whole design rests on: IAP binds a token to the
     /// backend that admitted it, so a read-tier caller replaying their token
-    /// against the write path must be refused even though the signature is
+    /// against the debug path must be refused even though the signature is
     /// perfectly valid.
     #[tokio::test]
     async fn rejects_a_token_minted_for_another_role() {
@@ -598,7 +600,7 @@ mod tests {
         let jwks = jwks_server(&key);
 
         let status = call(
-            verifier(WRITE_AUDIENCE, "test", &jwks),
+            verifier(DEBUG_AUDIENCE, "test", &jwks),
             Some(&token(&key, READ_AUDIENCE, IAP_ISSUER, 300)),
         )
         .await;

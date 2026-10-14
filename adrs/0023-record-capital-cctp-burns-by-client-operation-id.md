@@ -5,14 +5,14 @@
 
 ## Context
 
-`POST /liquidity-write/capital/cctp-bridge` (`cctp_bridge` in
-`src/api/capital.rs`) burned USDC on every call. It answered at the broadcast,
-but nothing recorded the burn, so a retried request burned again. An approve,
-the burn and its required confirmations can outlast the 60 second ops proxy cut,
-and a receipt timeout reports an unclear outcome, so a retry is the natural
-operator reaction. The second burn is recoverable (`debug cctp complete-mint`
-mints it into the bot wallet on the other chain), but the funds sit in the wrong
-place until someone notices.
+`POST /liquidity-capital/cctp-bridge` (`cctp_bridge` in `src/api/capital.rs`)
+burned USDC on every call. It answered at the broadcast, but nothing recorded
+the burn, so a retried request burned again. An approve, the burn and its
+required confirmations can outlast the 60 second ops proxy cut, and a receipt
+timeout reports an unclear outcome, so a retry is the natural operator reaction.
+The second burn is recoverable (`debug cctp complete-mint` mints it into the bot
+wallet on the other chain), but the funds sit in the wrong place until someone
+notices.
 
 The route answers from a detached task that holds the resume lock and the USDC
 driver pause until the burn confirms, so a request dropped by the proxy does not
@@ -123,7 +123,7 @@ side effect (`docs/cqrs.md`, "Persist intent with one command").
    cannot be listed or loaded, joins the chains whose startup approvals and
    revokes are skipped. Nothing here fails startup.
 6. **Settling a burn that will never mine.**
-   `POST /liquidity-write/capital/cctp-burn-supersede` (`operationId`,
+   `POST /liquidity-capital/cctp-burn-supersede` (`operationId`,
    `supersedingTx`; client `capital cctp-burn-supersede`) mirrors
    `verify_withdrawal_superseded`: the burn must be unmined; the named tx must
    be a different tx from the burn's own signer (read from its signed bytes, so
