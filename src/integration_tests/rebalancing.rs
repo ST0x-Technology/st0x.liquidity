@@ -29,9 +29,7 @@ use st0x_bridge::cctp::{
     CIRCLE_API_BASE, CctpCorridor, MESSAGE_TRANSMITTER_V2, TOKEN_MESSENGER_V2,
 };
 use st0x_bridge::corridor::{HopKind, UsdcCorridor};
-use st0x_bridge::relay::{
-    BasisPoints, QuoteRequest, TestQuote, deploy_relay_end, quote_body_for_test,
-};
+use st0x_bridge::relay::{BasisPoints, QuoteRequest, TestQuote, quote_body_for_test};
 use st0x_config::{
     AllocationCtx, ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, DeviationBand,
     ExecutionThreshold, OperationMode, RebalancingMode, RelayHopCtx, TargetShare, UsdcCorridors,
@@ -95,8 +93,8 @@ use crate::rebalancing::{
 use crate::telemetry::TelemetrySender;
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::test_utils::{
-    AnvilRaindexChain, TestAnvilInstance, anvil_wallet, erc20_balance, relay_test_client,
-    setup_test_pools, spawn_anvil,
+    AnvilRaindexChain, TestAnvilInstance, anvil_wallet, erc20_balance, etch_relay_end,
+    relay_test_client, setup_test_pools, spawn_anvil,
 };
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintCommand};
 use crate::unwrapped_equity_recovery::aggregate::{
@@ -4579,10 +4577,10 @@ impl RelayCorridorRig {
     async fn deploy() -> Self {
         let chain =
             AnvilRaindexChain::deploy_on(Anvil::new().chain_id(Chain::Robinhood.chain_id())).await;
-        Self::etch_relay_end(&chain.deployer(), Chain::Robinhood).await;
+        etch_relay_end(&chain.deployer(), Chain::Robinhood).await;
 
         let hub = spawn_anvil(Anvil::new().chain_id(Chain::Ethereum.chain_id()));
-        Self::etch_relay_end(&Self::solver_on(&hub), Chain::Ethereum).await;
+        etch_relay_end(&Self::solver_on(&hub), Chain::Ethereum).await;
         let hub_wallet = anvil_wallet(
             hub.endpoint_url(),
             &B256::from_slice(&hub.keys()[0].to_bytes()),
@@ -4592,19 +4590,6 @@ impl RelayCorridorRig {
             chain,
             hub,
             hub_wallet,
-        }
-    }
-
-    /// Deploys Relay's stand-in stable and depository through `provider` and
-    /// moves their code to `chain`'s pinned stable and depository.
-    async fn etch_relay_end(provider: &impl Provider, chain: Chain) {
-        let local = deploy_relay_end(provider).await.unwrap();
-        for (deployed, pinned) in [
-            (local.stable, chain.settlement_stable().address),
-            (local.depository, chain.relay_depository().unwrap()),
-        ] {
-            let code = provider.get_code_at(deployed).await.unwrap();
-            provider.anvil_set_code(pinned, code).await.unwrap();
         }
     }
 

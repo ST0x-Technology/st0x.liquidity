@@ -1955,6 +1955,21 @@ fn replay_refusal(error: &MintError) -> Option<&TokenizedEquityMintError> {
     }
 }
 
+/// A Relay read worth repeating later: a transient failure, or a rate limit.
+fn relay_read_retryable(error: &RelayError) -> bool {
+    match error {
+        RelayError::RateLimited { .. } => true,
+        RelayError::Transport(_)
+        | RelayError::Decode { .. }
+        | RelayError::QuoteRefused { .. }
+        | RelayError::HttpStatus { .. }
+        | RelayError::QuoteMismatch(_)
+        | RelayError::ApiKeyHeader(_)
+        | RelayError::NoApiKey
+        | RelayError::Unauthorized { .. } => error.is_transient(),
+    }
+}
+
 /// Maps a [`UsdcRecheckError`] to an HTTP status and operator-facing message,
 /// with the same recoverability split as [`recheck_error_response`]: the
 /// not-recoverable refusals carry the typed error's message (they only
@@ -1991,14 +2006,10 @@ fn usdc_recheck_error_response(error: &UsdcRecheckError) -> (StatusCode, String)
                 (StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
             }
             // A Relay status read that failed is inconclusive, not unpaid.
-            UsdcTransferError::RelayApi(relay)
-                if relay.is_transient() || matches!(**relay, RelayError::RateLimited { .. }) =>
-            {
-                (
-                    StatusCode::BAD_GATEWAY,
-                    "Relay unavailable; retry later".to_string(),
-                )
-            }
+            UsdcTransferError::RelayApi(relay) if relay_read_retryable(relay) => (
+                StatusCode::BAD_GATEWAY,
+                "Relay unavailable; retry later".to_string(),
+            ),
             _ => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to recheck transfer".to_string(),

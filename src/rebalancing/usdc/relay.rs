@@ -203,10 +203,10 @@ const fn hop_direction(direction: RebalanceDirection) -> HopDirection {
     }
 }
 
-/// What a `SwapQuoted` attempt does once its checks before signing ran.
+/// What an attempt does once a `SwapQuoted`'s checks before signing ran.
 enum BeforeSigning {
-    /// Sign and send the quoted pair.
-    Sign,
+    /// Go on to sign and send the pair, or to the pair already persisted.
+    Proceed,
     /// The attempt ends: the stable goes back to the vault, or holds.
     Ended,
     /// A reverted order's late payment was adopted, to move on once the
@@ -1079,7 +1079,7 @@ where
             ..
         }) = self.cqrs.load(id).await?
         else {
-            return Ok(BeforeSigning::Sign);
+            return Ok(BeforeSigning::Proceed);
         };
 
         // A reverted deposit a reorg landed must be settled before anything
@@ -1115,7 +1115,7 @@ where
         let signed = signed_order_ids.contains(&quote.order_id);
         let expired = quote_expired(&quote, quoted_at, self.hop.bounds.quote_max_age, Utc::now());
         if !signed && !expired {
-            return Ok(BeforeSigning::Sign);
+            return Ok(BeforeSigning::Proceed);
         }
 
         info!(target: "rebalance", %id, signed, expired, order_id = %quote.order_id, "Re-quoting the Relay swap before signing");
@@ -1137,7 +1137,7 @@ where
                         },
                     )
                     .await?;
-                Ok(BeforeSigning::Sign)
+                Ok(BeforeSigning::Proceed)
             }
             Err(error) if quote_refused(&error) => {
                 match direction {
@@ -1241,7 +1241,7 @@ where
             self.requote_or_redeposit(id).await?
         };
         match before_signing {
-            BeforeSigning::Sign => {}
+            BeforeSigning::Proceed => {}
             BeforeSigning::Ended => return Ok(()),
             // Past the lock: a refund at the hub is quoted again and its
             // next pair signed under the same lock.
@@ -2696,9 +2696,8 @@ where
     /// proves is adopted (`Recovered`) and left for the escrow's job, or a
     /// `transfer resume`, to move on; otherwise nothing changes, and a
     /// payment not provable yet or a failed status read is reported apart
-    /// from an unpaid order. Every other
-    /// state, and an operator deposit tx, is refused: a Relay `DepositFailed`
-    /// is settled with `transfer reconcile`.
+    /// from an unpaid order. Every other state, and an operator deposit tx, is
+    /// refused: a Relay `DepositFailed` is settled with `transfer reconcile`.
     async fn recheck_deposit(
         &self,
         id: &UsdcRebalanceId,
@@ -2897,8 +2896,8 @@ mod tests {
     use crate::telemetry::TelemetrySender;
     use crate::telemetry::broker::InstrumentedAlpacaBroker;
     use crate::test_utils::{
-        AnvilRaindexChain, TestAnvilInstance, anvil_wallet, erc20_balance, relay_test_client,
-        setup_test_apalis_pool, setup_test_db, setup_test_pools, spawn_anvil,
+        AnvilRaindexChain, TestAnvilInstance, anvil_wallet, erc20_balance, etch_relay_end,
+        relay_test_client, setup_test_apalis_pool, setup_test_db, setup_test_pools, spawn_anvil,
     };
     use crate::usdc_rebalance::HopEvidence;
 
@@ -5453,21 +5452,11 @@ mod tests {
                 hub_anvil.endpoint_url(),
                 &B256::from_slice(&hub_anvil.keys()[0].to_bytes()),
             );
-            let hub_deployer = Self::signer_on(&hub_anvil);
-            let hub_mocks = st0x_bridge::relay::deploy_relay_end(&hub_deployer)
-                .await
-                .unwrap();
+            etch_relay_end(&Self::signer_on(&hub_anvil), Chain::Ethereum).await;
             let hub_contracts = RelayEndContracts {
                 stable: Chain::Ethereum.settlement_stable().address,
                 depository: Chain::Ethereum.relay_depository().unwrap(),
             };
-            for (mock, pinned) in [
-                (hub_mocks.stable, hub_contracts.stable),
-                (hub_mocks.depository, hub_contracts.depository),
-            ] {
-                let code = hub_deployer.get_code_at(mock).await.unwrap();
-                hub_deployer.anvil_set_code(pinned, code).await.unwrap();
-            }
 
             Self {
                 chain,
