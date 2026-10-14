@@ -4766,8 +4766,9 @@ enum RecoveredSwapPayment {
 }
 
 // The same payment as `SwapCompletionRecovered` records it; a fill carries the
-// fee split `RelayFillVerified` does, a refund the first deposit's refund floor
-// when it is below it and its shortfall, as `SwapRefunded` does.
+// fee split `RelayFillVerified` does; a refund carries, as `SwapRefunded` does,
+// the first deposit's refund floor when the refund is below it, and the
+// shortfall.
 enum SwapRecovery {
     Fill { fill_tx: TxHash, amount_received: Usdc, fee_collected: Usdc, relayer_fee: Usdc },
     Refund {
