@@ -10,15 +10,20 @@ use alloy::rpc::client::RpcClient;
 use alloy::transports::layers::RetryBackoffLayer;
 use serde::Deserialize;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::info;
 use url::Url;
 
 use st0x_evm::{Chain, Wallet, WalletCtx as EvmWalletCtx, WalletKind};
+use st0x_rpc::JwtEnv;
+
+use crate::chain_rpc::{ChainRpcError, ChainRpcTimeouts, chain_rpc_client};
+use crate::loader::StartupNotice;
 
 const RPC_MAX_RETRIES: u32 = 10;
 const RPC_INITIAL_BACKOFF_MS: u64 = 1000;
 const RPC_COMPUTE_UNITS_PER_SECOND: u64 = 100;
-const RPC_REQUEST_TIMEOUT_SECS: u64 = 20;
+const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Extracts just the `kind` discriminant from the wallet TOML table,
 /// ignoring backend-specific fields that vary by wallet type.
@@ -46,8 +51,12 @@ impl st0x_evm::Parser for TomlValue {
 pub enum WalletCtxError {
     #[error("invalid wallet config: {0}")]
     WalletConfig(#[from] toml::de::Error),
-    #[error("failed to build the wallet RPC HTTP client: {0}")]
-    HttpClient(#[from] reqwest::Error),
+    #[error("failed to build the {chain} wallet RPC client")]
+    ChainRpc {
+        chain: Chain,
+        #[source]
+        source: ChainRpcError,
+    },
     #[error(
         "[chains.{chain}] rpc_url must use https; http is allowed only for loopback \
          hosts (local test nodes)"
@@ -115,6 +124,41 @@ pub struct SigningChains {
     pub robinhood: Option<SigningChain>,
 }
 
+impl SigningChains {
+    /// How each signer reaches its chain RPC under `jwt`. Wallets are built
+    /// before logging is up, so `st0x-rpc`'s own log lines for them are lost.
+    pub(crate) fn rpc_transport_notices(&self, jwt: &JwtEnv) -> Vec<StartupNotice> {
+        let chains = [
+            (Chain::Base, Some(&self.base)),
+            (Chain::Ethereum, Some(&self.ethereum)),
+            (Chain::HyperEvm, Some(&self.hyperevm)),
+            (Chain::Robinhood, self.robinhood.as_ref()),
+        ];
+
+        let mut notices: Vec<StartupNotice> = chains
+            .into_iter()
+            .filter_map(|(chain, signing_chain)| {
+                let transport = if st0x_rpc::uses_alchemy_jwt(signing_chain?.rpc_url.as_str()) {
+                    "Alchemy with a KMS-signed JWT"
+                } else {
+                    "plain HTTP"
+                };
+                Some(StartupNotice::info(format!(
+                    "{chain} wallet RPC: {transport}"
+                )))
+            })
+            .collect();
+
+        if let JwtEnv::Partial { missing } = jwt {
+            notices.push(StartupNotice::warning(format!(
+                "Alchemy JWT settings are incomplete and unused: {missing} is not set"
+            )));
+        }
+
+        notices
+    }
+}
+
 impl OnchainWalletCtx {
     /// Build one signing wallet per chain from raw TOML config/secrets and the
     /// registry's RPC endpoints.
@@ -152,6 +196,7 @@ impl OnchainWalletCtx {
                 &kind,
                 wallet_config.clone(),
                 wallet_secrets.clone(),
+                Chain::Base,
                 base.rpc_url,
                 base.required_confirmations,
             ),
@@ -159,6 +204,7 @@ impl OnchainWalletCtx {
                 &kind,
                 wallet_config.clone(),
                 wallet_secrets.clone(),
+                Chain::Ethereum,
                 ethereum.rpc_url,
                 ethereum.required_confirmations,
             ),
@@ -166,6 +212,7 @@ impl OnchainWalletCtx {
                 &kind,
                 wallet_config.clone(),
                 wallet_secrets.clone(),
+                Chain::HyperEvm,
                 hyperevm.rpc_url,
                 hyperevm.required_confirmations,
             ),
@@ -176,6 +223,7 @@ impl OnchainWalletCtx {
                     &kind,
                     wallet_config,
                     wallet_secrets,
+                    Chain::Robinhood,
                     robinhood.rpc_url,
                     robinhood.required_confirmations,
                 )
@@ -221,40 +269,39 @@ impl OnchainWalletCtx {
     }
 }
 
-/// Creates an HTTP RPC client with a retry layer for transient errors.
+/// Creates a chain RPC client with a retry layer for transient errors.
 ///
-/// Redirects are disabled: the RPC URL is validated at config load (https or
-/// loopback), and following a redirect would let the server route signing
+/// Redirects are not followed: the RPC URL is validated at config load (https
+/// or loopback), and following a redirect would let the server route signing
 /// traffic to a destination that never passed that validation. The request
 /// timeout bounds a hung endpoint; the retry layer above it handles the
 /// resulting failures.
-fn http_client_with_retry(url: Url) -> Result<RpcClient, reqwest::Error> {
+async fn http_client_with_retry(url: &Url) -> Result<RpcClient, ChainRpcError> {
     let retry_layer = RetryBackoffLayer::new(
         RPC_MAX_RETRIES,
         RPC_INITIAL_BACKOFF_MS,
         RPC_COMPUTE_UNITS_PER_SECOND,
     );
-    let http_client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(RPC_REQUEST_TIMEOUT_SECS))
-        .build()?;
-    // Same heuristic ClientBuilder::http applies, so local nodes keep
-    // alloy's faster polling defaults.
-    let is_local = alloy::transports::utils::guess_local_url(url.as_str());
-    let transport = alloy::transports::http::Http::with_client(http_client, url);
-    Ok(RpcClient::builder()
-        .layer(retry_layer)
-        .transport(transport, is_local))
+    let timeouts = ChainRpcTimeouts {
+        connect: None,
+        request: Some(RPC_REQUEST_TIMEOUT),
+    };
+
+    chain_rpc_client(url, timeouts, retry_layer).await
 }
 
 pub async fn build_wallet(
     kind: &WalletKind,
     wallet_config: toml::Value,
     wallet_secrets: toml::Value,
+    chain: Chain,
     rpc_url: Url,
     required_confirmations: u64,
 ) -> Result<Arc<dyn Wallet<Provider = RootProvider>>, WalletCtxError> {
-    let provider = RootProvider::new(http_client_with_retry(rpc_url)?);
+    let rpc_client = http_client_with_retry(&rpc_url)
+        .await
+        .map_err(|source| WalletCtxError::ChainRpc { chain, source })?;
+    let provider = RootProvider::new(rpc_client);
 
     Ok(kind
         .try_into_wallet(EvmWalletCtx {
@@ -316,5 +363,121 @@ impl OnchainWalletCtx {
             hyperevm: hyperevm_wallet,
             robinhood: Some(robinhood_wallet),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use httpmock::{HttpMockRequest, HttpMockResponse, MockServer};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::loader::StartupNoticeLevel;
+
+    use super::*;
+
+    fn signing_chain(rpc_url: &str) -> SigningChain {
+        SigningChain {
+            rpc_url: rpc_url.parse().unwrap(),
+            required_confirmations: 1,
+        }
+    }
+
+    #[test]
+    fn rpc_transport_notices_name_each_signer_transport() {
+        let chains = SigningChains {
+            base: signing_chain("https://base-mainnet.g.alchemy.com/v2"),
+            ethereum: signing_chain("https://eth-mainnet.g.alchemy.com/v2/api-key"),
+            hyperevm: signing_chain("https://rpc.hyperliquid.xyz/evm"),
+            robinhood: None,
+        };
+
+        let messages: Vec<String> = chains
+            .rpc_transport_notices(&JwtEnv::Unset)
+            .into_iter()
+            .map(|notice| {
+                assert_eq!(notice.level, StartupNoticeLevel::Info);
+                notice.message
+            })
+            .collect();
+
+        assert_eq!(
+            messages,
+            [
+                format!("{} wallet RPC: Alchemy with a KMS-signed JWT", Chain::Base),
+                format!("{} wallet RPC: plain HTTP", Chain::Ethereum),
+                format!("{} wallet RPC: plain HTTP", Chain::HyperEvm),
+            ]
+        );
+    }
+
+    #[test]
+    fn rpc_transport_notices_warn_about_half_set_jwt_env() {
+        let chains = SigningChains {
+            base: signing_chain("https://rpc.example.com"),
+            ethereum: signing_chain("https://rpc.example.com"),
+            hyperevm: signing_chain("https://rpc.example.com"),
+            robinhood: Some(signing_chain("https://rpc.example.com")),
+        };
+
+        let notices = chains.rpc_transport_notices(&JwtEnv::Partial {
+            missing: st0x_rpc::KID_VAR,
+        });
+
+        assert_eq!(notices.len(), 5, "{notices:?}");
+        assert_eq!(
+            notices[4],
+            StartupNotice::warning(
+                "Alchemy JWT settings are incomplete and unused: ALCHEMY_JWT_KID is not set"
+            )
+        );
+    }
+
+    #[test]
+    fn bare_alchemy_wallet_rpc_url_without_jwt_env_is_refused() {
+        temp_env::with_vars_unset(["ALCHEMY_JWT_KMS_KEY_VERSION", "ALCHEMY_JWT_KID"], || {
+            let error = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(http_client_with_retry(
+                    &"https://base-mainnet.g.alchemy.com/v2".parse().unwrap(),
+                ))
+                .unwrap_err();
+
+            assert!(
+                matches!(error, ChainRpcError::MissingJwtConfig { .. }),
+                "{error:?}"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn wallet_rpc_client_retries_rate_limited_calls() {
+        let server = MockServer::start_async().await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let responder_attempts = Arc::clone(&attempts);
+        let rpc = server.mock(|when, then| {
+            when.method("POST").path("/rpc");
+            then.respond_with(move |_: &HttpMockRequest| {
+                if responder_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return HttpMockResponse::builder()
+                        .status(429)
+                        .body("rate limited")
+                        .build();
+                }
+
+                HttpMockResponse::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(r#"{"jsonrpc":"2.0","id":0,"result":"0x2105"}"#)
+                    .build()
+            });
+        });
+        let client = http_client_with_retry(&server.url("/rpc").parse().unwrap())
+            .await
+            .unwrap();
+
+        let chain_id: String = client.request_noparams("eth_chainId").await.unwrap();
+
+        assert_eq!(chain_id, "0x2105");
+        rpc.assert_calls(2);
     }
 }

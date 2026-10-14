@@ -35718,6 +35718,7 @@ mod tests {
             &st0x_evm::WalletKind::PrivateKey,
             wallet_config.into(),
             wallet_secrets.into(),
+            st0x_evm::Chain::Base,
             "https://example.com".parse().unwrap(),
             1,
         )

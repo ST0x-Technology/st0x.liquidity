@@ -70,7 +70,8 @@ pub(crate) async fn validate_registry_candidate_contracts(
                 || newly_selected(symbol, row)
         });
         if !probes.assets.equities.symbols.is_empty() {
-            let rpc = bounded_rpc_client(chain.rpc_url.clone())
+            let rpc = bounded_rpc_client(&chain.rpc_url)
+                .await
                 .map_err(CandidateContractError::Deferred)?;
             let provider = ProviderBuilder::new().connect_client(rpc);
             confirm_configured_assets_respond(&provider, &probes)

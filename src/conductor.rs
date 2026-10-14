@@ -21,7 +21,7 @@ use alloy::providers::fillers::{
     BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
 };
 use alloy::providers::{Identity, Provider, ProviderBuilder, RootProvider};
-use alloy::rpc::client::{ClientBuilder, RpcClient};
+use alloy::rpc::client::RpcClient;
 use anyhow::Context;
 use apalis::prelude::Status;
 use apalis_core::error::BoxDynError;
@@ -45,9 +45,10 @@ use url::Url;
 use st0x_bridge::corridor::UsdcCorridor;
 use st0x_bridge::relay::RelayClient;
 use st0x_config::{
-    AlertsCtx, BrokerCtx, ChainAssets, ChainRegistry, ChainRole, Ctx, CtxError, ExecutionThreshold,
-    HedgedChain, HedgingAssets, InventoryMode, IssuanceStatusCtx, OnchainWalletCtx, OperationMode,
-    OrchestratorAddresses, RebalancingCtx, RebalancingMode,
+    AlertsCtx, BrokerCtx, ChainAssets, ChainRegistry, ChainRole, ChainRpcTimeouts, Ctx, CtxError,
+    ExecutionThreshold, HedgedChain, HedgingAssets, InventoryMode, IssuanceStatusCtx,
+    OnchainWalletCtx, OperationMode, OrchestratorAddresses, RebalancingCtx, RebalancingMode,
+    chain_rpc_client,
 };
 use st0x_dto::Statement;
 use st0x_event_sorcery::{
@@ -888,8 +889,10 @@ pub(crate) type HttpProvider = FillProvider<
 /// contract calls) with no error surfaced (RAI-2218). 30s accommodates the
 /// heavy eth_getLogs range scans backfill issues; the wallet transport uses
 /// 20s for its smaller payloads.
-const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const RPC_TIMEOUTS: ChainRpcTimeouts = ChainRpcTimeouts {
+    connect: Some(Duration::from_secs(10)),
+    request: Some(Duration::from_secs(30)),
+};
 
 /// The hedged chains beyond the primary: the ones needing their own
 /// providers, watchers, and accounting entries.
@@ -901,43 +904,29 @@ fn hedged_secondaries(ctx: &Ctx) -> Vec<HedgedChain> {
         .collect()
 }
 
-/// The HTTP transport every chain RPC client shares, bounded by the RPC
-/// timeouts, paired with whether the endpoint looks local.
-fn bounded_http_transport(
-    rpc_url: Url,
-) -> anyhow::Result<(alloy::transports::http::Http<reqwest::Client>, bool)> {
-    let http_client = reqwest::Client::builder()
-        .connect_timeout(RPC_CONNECT_TIMEOUT)
-        .timeout(RPC_REQUEST_TIMEOUT)
-        .build()
-        .context("Failed to build the chain RPC HTTP client")?;
-    // Same heuristic ClientBuilder::http applies, so local nodes keep
-    // alloy's faster polling defaults.
-    let is_local = alloy::transports::utils::guess_local_url(rpc_url.as_str());
-    let transport = alloy::transports::http::Http::with_client(http_client, rpc_url);
-
-    Ok((transport, is_local))
-}
-
-/// An RPC client over the bounded HTTP transport without the telemetry layer,
-/// for the `process-tx` CLI, which has no telemetry writer.
-pub fn bounded_rpc_client(rpc_url: Url) -> anyhow::Result<RpcClient> {
-    let (transport, is_local) = bounded_http_transport(rpc_url)?;
-
-    Ok(ClientBuilder::default().transport(transport, is_local))
+/// A chain RPC client bounded by the RPC timeouts, without the telemetry
+/// layer: for the `process-tx` CLI, which has no telemetry writer, and the
+/// one-off registry candidate probes.
+pub async fn bounded_rpc_client(rpc_url: &Url) -> anyhow::Result<RpcClient> {
+    chain_rpc_client(rpc_url, RPC_TIMEOUTS, tower::layer::util::Identity::new())
+        .await
+        .context("Failed to build the chain RPC client")
 }
 
 /// An HTTP provider whose transport is wrapped by the telemetry layer (every
 /// JSON-RPC call from any handle is timed) and bounded by the RPC timeouts,
 /// so a hung endpoint surfaces as an error instead of a silent park.
-fn bounded_http_provider(
+async fn bounded_http_provider(
     rpc_url: &Url,
     telemetry: &TelemetrySender,
 ) -> anyhow::Result<HttpProvider> {
-    let (transport, is_local) = bounded_http_transport(rpc_url.clone())?;
-    let rpc_client = ClientBuilder::default()
-        .layer(RpcTelemetryLayer::new(telemetry.clone()))
-        .transport(transport, is_local);
+    let rpc_client = chain_rpc_client(
+        rpc_url,
+        RPC_TIMEOUTS,
+        RpcTelemetryLayer::new(telemetry.clone()),
+    )
+    .await
+    .context("Failed to build the chain RPC client")?;
 
     Ok(ProviderBuilder::new().connect_client(rpc_client))
 }
@@ -973,18 +962,20 @@ where
     // Single HTTP transport per chain: drives continuous eth_getLogs fill
     // polling (via the OrderFillMonitor + backfill worker) and all read-only
     // contract calls. No WebSocket -- see `monitor::order_fills`.
-    let provider = bounded_http_provider(&primary_chain.rpc_url, &telemetry)?;
+    let provider = bounded_http_provider(&primary_chain.rpc_url, &telemetry)
+        .await
+        .with_context(|| format!("{} RPC", primary_chain.chain))?;
 
     // One provider per hedged non-primary chain, bounded and timed exactly
     // like the primary's: a hung secondary RPC must fail its own watcher,
     // not park it.
-    let watch_providers = hedged_secondaries
-        .iter()
-        .map(|hedged| {
-            bounded_http_provider(&hedged.rpc_url, &telemetry)
-                .map(|provider| (hedged.chain, provider))
-        })
-        .collect::<anyhow::Result<BTreeMap<Chain, HttpProvider>>>()?;
+    let mut watch_providers = BTreeMap::new();
+    for hedged in &hedged_secondaries {
+        let provider = bounded_http_provider(&hedged.rpc_url, &telemetry)
+            .await
+            .with_context(|| format!("{} RPC", hedged.chain))?;
+        watch_providers.insert(hedged.chain, provider);
+    }
 
     // Spawn the writer before returning the sender: the executor, RPC layer,
     // and the returned sender each hold a clone. When all three are dropped,
@@ -23633,5 +23624,60 @@ mod tests {
             error.to_string().contains("[relay] api_key"),
             "got {error:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn chain_provider_records_rpc_telemetry() {
+        let server = MockServer::start_async().await;
+        let rpc = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/rpc");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"jsonrpc":"2.0","id":0,"result":"0x10"}"#);
+        });
+        let pool = setup_test_db().await;
+        let (telemetry, receiver) = TelemetrySender::channel();
+        let writer = spawn_dependency_call_writer(pool.clone(), receiver);
+
+        let provider = bounded_http_provider(&server.url("/rpc").parse().unwrap(), &telemetry)
+            .await
+            .unwrap();
+        assert_eq!(provider.get_block_number().await.unwrap(), 16);
+
+        drop(provider);
+        drop(telemetry);
+        writer.await.unwrap();
+        rpc.assert_calls(1);
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT operation, outcome FROM dependency_call_samples")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![("eth_blockNumber".to_string(), "ok".to_string())]
+        );
+    }
+
+    #[test]
+    fn bare_alchemy_rpc_url_without_jwt_env_is_refused() {
+        temp_env::with_vars_unset(["ALCHEMY_JWT_KMS_KEY_VERSION", "ALCHEMY_JWT_KID"], || {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let url: Url = "https://base-mainnet.g.alchemy.com/v2".parse().unwrap();
+            let (telemetry, _receiver) = TelemetrySender::channel();
+
+            let provider_error = runtime
+                .block_on(bounded_http_provider(&url, &telemetry))
+                .unwrap_err();
+            let client_error = runtime.block_on(bounded_rpc_client(&url)).unwrap_err();
+
+            for error in [provider_error, client_error] {
+                let rendered = format!("{error:#}");
+                assert!(
+                    rendered.contains("ALCHEMY_JWT_KMS_KEY_VERSION or ALCHEMY_JWT_KID is not set"),
+                    "{rendered}"
+                );
+            }
+        });
     }
 }

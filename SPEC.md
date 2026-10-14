@@ -2705,6 +2705,14 @@ _Configuration management_:
   table once the config carries the identity. The shims and this tolerance are
   removed next release, together with the `[alerts]` shims described under
   Operational Alerting.)
+- Every chain RPC client, the bot's providers and the signing wallets alike, is
+  built through `st0x-rpc`. An `rpc_url` that is a bare
+  `https://<network>.g.alchemy.com/v2` carries no API key: each request sends an
+  ES256 JWT signed by the Cloud KMS key version in the process env
+  `ALCHEMY_JWT_KMS_KEY_VERSION`, under the Alchemy key id `ALCHEMY_JWT_KID`.
+  With either missing, startup fails; with both set, startup fails unless an
+  authenticated `eth_chainId` call succeeds. Any other `rpc_url` is called as
+  given. Redirects are never followed, and RPC errors never carry the URL.
 
 _Infrastructure_:
 

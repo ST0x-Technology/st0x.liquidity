@@ -2178,7 +2178,7 @@ async fn run_provider_command<W: Write + Send>(
             // instead of parking the process-tx call indefinitely, with the
             // same timeouts as the bot's own chain providers.
             let provider = ProviderBuilder::new()
-                .connect_client(bounded_rpc_client(trading_chain.rpc_url.clone())?);
+                .connect_client(bounded_rpc_client(&trading_chain.rpc_url).await?);
             info!("Processing transaction: tx_hash={tx_hash}, chain={chain}");
             let cache = SymbolCache::default();
             trading::process_tx_with_provider(

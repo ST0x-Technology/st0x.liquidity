@@ -39,6 +39,7 @@ st0x-execution.workspace = true
 st0x-finance.workspace = true
 st0x-float-macro.workspace = true
 st0x-float-serde.workspace = true
+st0x-rpc.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true
@@ -53,6 +54,7 @@ sha2 = "0.10"
 md-5 = "0.10"
 base64.workspace = true
 serde_json.workspace = true
+tower = { version = "0.5.3", default-features = false }
 
 [dev-dependencies]
 httpmock.workspace = true
@@ -63,6 +65,7 @@ st0x-bridge = { workspace = true, features = ["test-support"] }
 st0x-evm = { workspace = true, features = ["test-support"] }
 st0x-execution = { workspace = true, features = ["mock"] }
 st0x-finance = { workspace = true, features = ["test-support"] }
+temp-env.workspace = true
 tempfile.workspace = true
 
 [lints]

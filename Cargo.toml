@@ -113,6 +113,7 @@ st0x-hedge = { path = ".", default-features = false }
 st0x-liquidity-client = { path = "crates/liquidity-client" }
 st0x-raindex = { path = "crates/raindex" }
 st0x-registry = { path = "crates/registry" }
+st0x-rpc = { git = "https://github.com/ST0x-Technology/st0x.rpc", tag = "v0.1.0", version = "0.1.0" }
 st0x-tokenization = { path = "crates/tokenization" }
 st0x-wrapper = { path = "crates/wrapper" }
 temp-env = "0.3.6"

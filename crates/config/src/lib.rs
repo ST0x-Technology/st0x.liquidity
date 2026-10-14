@@ -9,6 +9,7 @@ mod allocation;
 mod assets;
 mod bot_gas_valuation;
 mod chain;
+mod chain_rpc;
 mod enablement;
 mod imbalance_threshold;
 mod loader;
@@ -40,6 +41,7 @@ pub use chain::{
     ChainSecrets, HedgedChain, IngestionCutoff, InventoryAdapter, InventoryAdapterVenue,
     InventoryAdapters, InventoryMode, InventoryModeTag, TradingConfig,
 };
+pub use chain_rpc::{ChainRpcError, ChainRpcTimeouts, chain_rpc_client};
 pub use enablement::{
     ChainCapability, ChainEnablementError, ChainLifecycle, MissingCapabilities,
     provided_capabilities, required_capabilities,
