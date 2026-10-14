@@ -3356,6 +3356,34 @@ mod tests {
         }
     }
 
+    /// A Relay wait is not a broker 429: the requeued job starts a fresh
+    /// backpressure streak, so a later unrelated 429 does not inherit an old
+    /// count and exhaust the consecutive-429 limit.
+    #[tokio::test]
+    async fn relay_wait_requeue_resets_the_backpressure_streak() {
+        let pool = setup_queue_pool().await;
+        let ctx = hedging_ctx(Arc::new(RelayFillPendingBaseToAlpaca(Utc::now())), &pool);
+        let job = TransferUsdcToHedging {
+            corridor: UsdcCorridor::HubRouted {
+                chain: Chain::Robinhood,
+                hop: HopKind::Relay,
+            },
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 1,
+            backpressure_streak: BackpressureStreak(BACKPRESSURE_RESCHEDULE_LIMIT - 1),
+        };
+
+        Job::perform(&job, &ctx)
+            .await
+            .expect("an unpaid fill re-queues without failing the attempt");
+
+        let (payload, _run_at) = pending_job_row::<TransferUsdcToHedging>(&pool).await;
+        let requeued: TransferUsdcToHedging = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(requeued.id, job.id);
+        assert_eq!(requeued.backpressure_streak, BackpressureStreak::default());
+    }
+
     struct UnwiredGasReadinessBaseToAlpaca;
 
     #[async_trait]
