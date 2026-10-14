@@ -1973,8 +1973,8 @@ where
         (restored, unmined)
     }
 
-    /// Whether a restored envelope has a receipt on the chain; a receipt
-    /// that cannot be read counts as missing.
+    /// Whether a restored envelope has its confirmations in a canonical
+    /// block; a receipt that cannot be read counts as missing.
     async fn restored_envelope_mined(
         &self,
         id: &UsdcRebalanceId,

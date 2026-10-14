@@ -435,23 +435,17 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> SwapBridge for RelayBridge<EthWalle
         tx: TxHash,
     ) -> Result<bool, RelayBridgeError> {
         let receipt = match direction {
-            HopDirection::ToHub => {
-                self.chain
-                    .wallet
-                    .provider()
-                    .get_transaction_receipt(tx)
-                    .await?
-            }
-            HopDirection::FromHub => {
-                self.hub
-                    .wallet
-                    .provider()
-                    .get_transaction_receipt(tx)
-                    .await?
-            }
+            HopDirection::ToHub => self.chain.read_confirmed_receipt(tx).await,
+            HopDirection::FromHub => self.hub.read_confirmed_receipt(tx).await,
         };
 
-        Ok(receipt.is_some())
+        match receipt {
+            Ok(_) => Ok(true),
+            Err(RelayBridgeError::Unconfirmed { .. } | RelayBridgeError::NotCanonical { .. }) => {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn find_recent_deposits(
