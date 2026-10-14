@@ -278,10 +278,20 @@ pub enum VerificationError {
     ScratchDir(#[from] std::io::Error),
 }
 
+/// Where the scratch copy goes: beside the source, not in the system temp
+/// directory. The bot image has no /tmp, and the roll gate mounts only the
+/// database directory writable. It also keeps the full copy on the data disk.
+fn scratch_parent(source_db_path: &Path) -> &Path {
+    source_db_path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
 /// Verifies migrations and event replay against a copy of `source_db_path`.
 ///
 /// `source_db_path` is opened read-only and copied via `VACUUM INTO` into a
-/// scratch temp file before anything runs against it -- the source is never
+/// scratch file beside it before anything runs against it -- the source is never
 /// modified. Safe to point at a live database (after its writer is stopped)
 /// or a downloaded snapshot.
 pub async fn verify_migrations(
@@ -298,7 +308,7 @@ pub async fn verify_migrations(
             source,
         })?;
 
-    let scratch_dir = tempfile::tempdir()?;
+    let scratch_dir = tempfile::tempdir_in(scratch_parent(source_db_path))?;
     let scratch_path = scratch_dir.path().join("verify-migrations-scratch.db");
 
     sqlx::query("VACUUM INTO ?1")
@@ -1514,5 +1524,14 @@ mod tests {
 
         assert!(report.has_failures());
         assert!(report.to_string().contains("no durable reference"));
+    }
+
+    #[test]
+    fn scratch_copy_goes_beside_the_source_database() {
+        assert_eq!(
+            scratch_parent(Path::new("/mnt/data/st0x-hedge.db")),
+            Path::new("/mnt/data")
+        );
+        assert_eq!(scratch_parent(Path::new("st0x-hedge.db")), Path::new("."));
     }
 }
