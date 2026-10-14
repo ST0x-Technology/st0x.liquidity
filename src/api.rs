@@ -18,6 +18,7 @@ use rain_math_float::Float;
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Deserialize, Serialize};
 use st0x_bridge::BridgeDirection;
+use st0x_bridge::relay::RelayError;
 use tokio::sync::Mutex;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
@@ -1990,10 +1991,14 @@ fn usdc_recheck_error_response(error: &UsdcRecheckError) -> (StatusCode, String)
                 (StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
             }
             // A Relay status read that failed is inconclusive, not unpaid.
-            UsdcTransferError::RelayApi(relay) if relay.is_transient() => (
-                StatusCode::BAD_GATEWAY,
-                "Relay unavailable; retry later".to_string(),
-            ),
+            UsdcTransferError::RelayApi(relay)
+                if relay.is_transient() || matches!(**relay, RelayError::RateLimited { .. }) =>
+            {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "Relay unavailable; retry later".to_string(),
+                )
+            }
             _ => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to recheck transfer".to_string(),
@@ -5307,7 +5312,7 @@ mod tests {
 
     use st0x_bridge::cctp::CctpError;
     use st0x_bridge::corridor::{HopKind, UsdcCorridor};
-    use st0x_bridge::relay::{RelayEndpoint, RelayError};
+    use st0x_bridge::relay::RelayEndpoint;
     use st0x_config::{
         BrokerCtx, ChainCashAsset, Ctx, ExecutionThreshold, FileLogging, HedgedChain, LogLevel,
         OperationMode, RebalancingMode, RestApiCtx, UsdcCorridors,
@@ -12148,6 +12153,11 @@ mod tests {
         )));
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(message, "Relay unavailable; retry later");
+
+        let (status, _) = usdc_recheck_error_response(&UsdcRecheckError::Transfer(Box::new(
+            UsdcTransferError::RelayApi(Box::new(RelayError::RateLimited { retry_after: None })),
+        )));
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
     }
 
     /// Seeds a `UsdcRebalance` (BaseToAlpaca) into a post-burn `BridgingFailed`
