@@ -2616,6 +2616,8 @@ mod tests {
         /// Where the service's vault lives.
         raindex: RaindexContracts,
         bot_gas: BotGasReceiptCostEnqueuer,
+        /// The depth an Ethereum tx needs to count as confirmed.
+        ethereum_confirmations: u64,
     }
 
     impl Default for RelayTestSetup {
@@ -2627,6 +2629,7 @@ mod tests {
                     orderbook: Address::repeat_byte(0x0b),
                 },
                 bot_gas: BotGasReceiptCostEnqueuer::Disabled,
+                ethereum_confirmations: 1,
             }
         }
     }
@@ -2644,13 +2647,14 @@ mod tests {
             bounds,
             raindex,
             bot_gas,
+            ethereum_confirmations,
         } = setup;
         let hub_wallet = ethereum_wallet.address();
         let bridge = RelayBridge::try_from_ctx(RelayCtx {
             chain: Chain::Robinhood,
             ethereum_wallet,
             chain_wallet: chain_wallet.clone(),
-            ethereum_confirmations: 1,
+            ethereum_confirmations,
             chain_confirmations: 1,
         })
         .unwrap()
@@ -2677,7 +2681,7 @@ mod tests {
             &UsdcSettlementParams {
                 attestation_retry_deadline: Duration::from_secs(3600),
                 settlement_retry_deadline: Duration::from_secs(3600),
-                ethereum_required_confirmations: Some(1),
+                ethereum_required_confirmations: Some(ethereum_confirmations),
                 reserved_cash: None,
                 circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
                 token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
@@ -4874,6 +4878,66 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "the rebroadcast reached the node; only the receipt is missing"
+        );
+    }
+
+    /// A restored pair from the hub whose receipts are shallower than
+    /// Ethereum's confirmations counts as unmined, as a corridor-origin pair
+    /// does: startup skips the Ethereum approvals and revokes that could
+    /// take a nonce behind it if a reorg drops it.
+    #[tokio::test]
+    async fn restored_pair_from_the_hub_short_of_its_confirmations_is_counted_unmined() {
+        let anvil = spawn_anvil(Anvil::new());
+        let (wallet, contracts) = funded_relay_end(&anvil).await;
+        let pool = setup_test_db().await;
+        let store = Arc::new(test_store(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let transfer = relay_transfer_with(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet.clone(),
+            contracts,
+            store.clone(),
+            RelayTestSetup {
+                ethereum_confirmations: 3,
+                ..RelayTestSetup::default()
+            },
+        )
+        .await;
+        record_quoted_toward_chain(
+            &store,
+            &id,
+            exact_quote_from_hub(&wallet, contracts, TOWARD_CHAIN_ORDER_ID).await,
+        )
+        .await;
+        let PersistedPair { pair, .. } = transfer
+            .prepare_and_persist_swap_pair(&id, HopDirection::FromHub)
+            .await
+            .unwrap()
+            .unwrap();
+        transfer
+            .hop
+            .bridge
+            .broadcast_deposit(HopDirection::FromHub, &pair)
+            .await
+            .unwrap();
+        wallet.await_receipt(pair.deposit.tx_hash()).await.unwrap();
+        assert_eq!(
+            store.load(&id).await.unwrap().unwrap().state_name(),
+            "SwapDepositPrepared"
+        );
+
+        let restored = transfer.restore_prepared_deposit_sends(&pool).await;
+
+        assert_eq!(
+            restored,
+            RestoredDepositSends {
+                restored: 2,
+                unmined: 2,
+            }
         );
     }
 
