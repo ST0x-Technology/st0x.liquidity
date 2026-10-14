@@ -45225,6 +45225,102 @@ mod tests {
         );
     }
 
+    /// Queues a Base to Alpaca job row for `id` and sets its status with
+    /// `status_update` (a `SET` clause), as a restart finds it.
+    async fn hedging_job_row(
+        service: &RebalancingService,
+        id: &UsdcRebalanceId,
+        corridor: UsdcCorridor,
+        amount: Usdc,
+        status_update: &str,
+    ) {
+        service
+            .transfer_usdc_to_hedging_queue
+            .clone()
+            .push(TransferUsdcToHedging {
+                id: id.clone(),
+                amount,
+                corridor,
+                revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
+            })
+            .await
+            .unwrap();
+        sqlx_apalis::query(&format!(
+            "UPDATE Jobs SET {status_update} \
+             WHERE json_extract(CAST(job AS TEXT), '$.id') = ?"
+        ))
+        .bind(id.to_string())
+        .execute(service.transfer_usdc_to_hedging_queue.pool())
+        .await
+        .unwrap();
+    }
+
+    /// Startup holds a live job row's corridor with its amount, though the
+    /// transfer has recorded nothing yet. A zombie row (its transfer already
+    /// ended) and a done row hold nothing.
+    #[tokio::test]
+    async fn recover_usdc_guard_holds_live_job_rows_with_their_amount() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        let zombie = UsdcRebalanceId(Uuid::new_v4());
+        seed_terminal_usdc_aggregate(&store, &zombie).await;
+
+        let pending = UsdcRebalanceId(Uuid::new_v4());
+        hedging_job_row(
+            &service,
+            &pending,
+            UsdcCorridor::BASE_CCTP,
+            usdc(50),
+            "status = 'Pending'",
+        )
+        .await;
+        let retryable = UsdcRebalanceId(Uuid::new_v4());
+        hedging_job_row(
+            &service,
+            &retryable,
+            ETHEREUM_CCTP,
+            usdc(30),
+            "status = 'Failed', attempts = max_attempts - 1",
+        )
+        .await;
+        hedging_job_row(
+            &service,
+            &zombie,
+            UsdcCorridor::BASE_CCTP,
+            usdc(1000),
+            "status = 'Failed', attempts = max_attempts - 1",
+        )
+        .await;
+        let done = UsdcRebalanceId(Uuid::new_v4());
+        hedging_job_row(
+            &service,
+            &done,
+            ETHEREUM_CCTP,
+            usdc(700),
+            "status = 'Done', done_at = strftime('%s','now')",
+        )
+        .await;
+
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert_eq!(service.usdc_guards.held_chain(&pending), Some(Chain::Base));
+        assert_eq!(
+            service.usdc_guards.held_chain(&retryable),
+            Some(Chain::Ethereum)
+        );
+        assert_eq!(service.usdc_guards.held_chain(&zombie), None);
+        assert_eq!(service.usdc_guards.held_chain(&done), None);
+        assert_eq!(
+            service
+                .usdc_guards
+                .inbound_elsewhere(Chain::Robinhood)
+                .unwrap(),
+            usdc(80)
+        );
+    }
+
     /// An Alpaca-outbound transfer marks Alpaca's cash inflight from its
     /// first event, so no other corridor sizes against that balance until
     /// it ends.
