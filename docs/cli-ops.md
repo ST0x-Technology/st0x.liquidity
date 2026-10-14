@@ -909,9 +909,10 @@ stox transfer resume --kind usdc --id <uuid> --direction to-alpaca
 The job takes a fresh binding quote (or re-quotes an expired one) and signs the
 deposit; when Relay refuses the quote it puts the USDG back into the vault
 (`Redepositing` -> `ReturnedToSource`), which releases the guard; Robinhood
-chain-to-Alpaca planning then waits out the 30-minute withdraw cooldown, also
-across a restart. A transient quote failure (transport, rate limit) leaves the
-transfer where it was for the next resume. The other Relay holds:
+chain-to-Alpaca planning then waits for a fresh vault read and the 30-minute
+withdraw cooldown, also across a restart. A transient quote failure (transport,
+rate limit) leaves the transfer where it was for the next resume. The other
+Relay holds:
 
 - `SwapEscrowUnresolved` (the fill window passed with no fill or refund) keeps
   the guard and pages, and the bot stops reading Relay. `transfer resume` reads
@@ -948,7 +949,8 @@ transfer where it was for the next resume. The other Relay holds:
   send the refunded amount to Alpaca with `stox alpaca-deposit -a <amount>`,
   wait for Alpaca to credit it, convert it with
   `stox alpaca-convert -d to-usd -a <amount>`, and check the Alpaca cash
-  balance. Only then run the offline `stox transfer reconcile --kind usdc`,
+  balance. Only then run the offline
+  `stox transfer reconcile --kind usdc --id <uuid> --reason funds-moved-manually`,
   before you start the bot again: until the reconcile the transfer still counts
   the refund as held credit on the Ethereum wallet, and the next deposit send
   pages a false shortfall.
