@@ -150,7 +150,11 @@ and the system proves market fit.
     shared balance: with a target t a corridor's chain rests at t/(1-t) of the
     Alpaca balance, so Alpaca's share of all cash is 1/(1 + sum of t_i/(1-t_i))
     over the active corridors (40% with one corridor at 0.6, 25% with two), and
-    a transfer on one corridor moves every other corridor's ratio.
+    a transfer on one corridor moves every other corridor's ratio. The corridors
+    are sized one after another in chain order, so a corridor sized first does
+    not count what a later one sends in the same check; with uneven chain
+    balances it can land below its band, and cash moves back out of Alpaca for a
+    few checks.
 - **Complete Audit Trail**: All rebalancing operations tracked as events
   (CrossVenueEquityTransfer, CrossVenueCashTransfer)
 - **Integration**: Uses Alpaca for share/USDC management, Circle CCTP for
