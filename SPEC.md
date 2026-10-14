@@ -2643,19 +2643,25 @@ systemd unit:
   wraps in its role: trading enabled or rebalancing enabled or paused on the
   primary, rebalancing enabled or paused on a secondary) is covered by an allow
   policy whose consensus the authenticated API user can satisfy alone and whose
-  target condition provably applies on that chain's id. Applicable deny policies
-  take precedence; unknown allow or deny applicability, unsupported consensus, a
-  hedged chain with no pinned settlement stable, and missing coverage fail
-  closed, naming the chain, symbol, token contract, and spender. Only after both
-  gates pass may activation stop the old process and install the candidate
-  files, so a policy or config failure leaves the running bot untouched; a
-  failed stop aborts before candidate files are installed. It then verifies
-  migrations, chowns data files, writes the git-rev marker, touches the
-  activation marker, and restarts the unit. The server writes its PID to a
-  systemd-managed runtime-directory file only after Conductor has completed
-  startup initialization and every essential supervised runtime task has reached
-  a pending run state. Activation waits for that PID to match the unit's live
-  main process with a bounded startup timeout. If the process exits, readiness
+  target condition provably applies on that chain's id. It proves the same for
+  every call each served cash corridor's hop signs, on the corridor chain and on
+  the Ethereum hub, each on its own chain id: for CCTP the settlement stable's
+  approve to `TokenMessengerV2`, `depositForBurn` on it and `receiveMessage` on
+  `MessageTransmitterV2`; for Relay the settlement stable's approve to the
+  depository and `depositErc20` on it, with our wallet as depositor. Applicable
+  deny policies take precedence; unknown allow or deny applicability,
+  unsupported consensus, a hedged chain with no pinned settlement stable, and
+  missing coverage fail closed, naming the chain, symbol, token contract, and
+  spender, or the corridor, chain, function and contract. Only after both gates
+  pass may activation stop the old process and install the candidate files, so a
+  policy or config failure leaves the running bot untouched; a failed stop
+  aborts before candidate files are installed. It then verifies migrations,
+  chowns data files, writes the git-rev marker, touches the activation marker,
+  and restarts the unit. The server writes its PID to a systemd-managed
+  runtime-directory file only after Conductor has completed startup
+  initialization and every essential supervised runtime task has reached a
+  pending run state. Activation waits for that PID to match the unit's live main
+  process with a bounded startup timeout. If the process exits, readiness
   reporting fails, or the timeout expires first, activation prints the unit
   status and recent journal, exits non-zero, and deploy-rs rolls the profile
   back. The unit remains `Type=simple` so automatic rollback stays compatible
@@ -2828,14 +2834,19 @@ The deploy-time Turnkey verifier never signs or submits an activity. It uses the
 same deterministic approval-target builder as server startup, identifies the
 authenticated API user, and lists policies. It accepts only allow policies whose
 consensus that user can satisfy alone and whose condition it can prove applies
-to `SIGN_TRANSACTION` V2 ERC20 `approve` calls for the target token. It trusts
-the raw `0x095ea7b3` selector, not ABI-derived function fields whose smart
-contract interface registration it cannot prove, and rejects applicable or
-unprovable deny policies. This check is intentionally conservative because
-Turnkey does not expose a policy-simulation endpoint. Condition and consensus
-matching ignores syntax whitespace only outside single-quoted literals; literal
-contents remain byte-for-byte significant so a policy with extra literal
-whitespace cannot be certified as covering the runtime activity.
+to `SIGN_TRANSACTION` V2 calls to the target contract with the target's
+selector: ERC20 `approve` for every startup and hop approve, the hop's own
+selector for its contract calls. It trusts raw selectors (`0x095ea7b3` for
+`approve`), not ABI-derived function fields whose smart contract interface
+registration it cannot prove. A condition on the first argument word
+(`eth.tx.data[34..74]`) is proven only where that word is an address the gate
+knows (an approve's spender, a Relay deposit's depositor); on any other call it
+is unprovable. It rejects applicable or unprovable deny policies. This check is
+intentionally conservative because Turnkey does not expose a policy-simulation
+endpoint. Condition and consensus matching ignores syntax whitespace only
+outside single-quoted literals; literal contents remain byte-for-byte
+significant so a policy with extra literal whitespace cannot be certified as
+covering the runtime activity.
 
 ## Crate Architecture
 

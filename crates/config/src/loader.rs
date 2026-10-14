@@ -17,6 +17,8 @@ use std::sync::LazyLock;
 use tracing::{Level, info, warn};
 use url::Url;
 
+#[cfg(feature = "wallet-turnkey")]
+use st0x_bridge::corridor::UsdcCorridor;
 use st0x_evm::Chain;
 #[cfg(any(test, feature = "test-support"))]
 use st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS;
@@ -221,9 +223,10 @@ pub struct ChainApprovalInputs {
     pub assets: crate::ChainAssets,
 }
 
-/// Validated, network-free inputs required by the deploy-time Turnkey approval
+/// Validated, network-free inputs required by the deploy-time Turnkey
 /// policy coverage check: one approval surface per hedged chain, since
-/// startup grants approvals on every one of them.
+/// startup grants approvals on every one of them, and every served cash
+/// corridor, since its hop signs on both of its ends.
 #[cfg(feature = "wallet-turnkey")]
 #[derive(Clone, Debug)]
 pub struct TurnkeyApprovalPolicyInputs {
@@ -232,6 +235,7 @@ pub struct TurnkeyApprovalPolicyInputs {
     pub api_private_key: Option<st0x_evm::turnkey::TurnkeyApiPrivateKey>,
     pub wallet_address: Address,
     pub hedged: Vec<ChainApprovalInputs>,
+    pub corridors: BTreeSet<UsdcCorridor>,
 }
 
 /// Non-secret settings deserialized from the plaintext config TOML.
@@ -2945,6 +2949,7 @@ impl Ctx {
                     assets: hedged.assets.clone(),
                 })
                 .collect(),
+            corridors: parts.rebalancing.usdc.served().clone(),
         }))
     }
 
@@ -12420,6 +12425,10 @@ mod tests {
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
 
+            [chains.base.trading.assets.cash]
+            vault_id = "0xfab"
+            rebalancing = "disabled"
+
             [pricing]
             ws_url = "wss://pricing.test/ws"
 
@@ -12562,6 +12571,11 @@ mod tests {
             inputs.hedged[0]
                 .assets
                 .is_trading_enabled(&Symbol::new("AAPL").unwrap())
+        );
+        assert_eq!(
+            inputs.corridors,
+            BTreeSet::from([UsdcCorridor::BASE_CCTP]),
+            "Base's cash vault is served via CCTP, so the gate must check its hop"
         );
         assert!(inputs.kms_api_key.is_none());
         assert_eq!(format!("{:?}", inputs.api_private_key), "Some([REDACTED])");
