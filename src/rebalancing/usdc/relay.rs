@@ -2094,11 +2094,7 @@ mod tests {
         let relay_api = MockServer::start();
         let quote = relay_api.mock(|when, then| {
             when.method(POST).path("/quote/v2");
-            then.status(400).json_body(json!({
-                "message": "No routes",
-                "errorCode": "NO_SWAP_ROUTES_FOUND",
-                "requestId": "0x00"
-            }));
+            then.status(404);
         });
         let store = Arc::new(test_store(setup_test_db().await, ()));
         let transfer = relay_transfer_with(
@@ -2227,7 +2223,7 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(&error, UsdcTransferError::RelayApi(relay)
-                if matches!(**relay, RelayError::QuoteRefused { code: QuoteErrorCode::NoSwapRoutesFound })),
+                if matches!(**relay, RelayError::HttpStatus { status: 404, .. })),
             "the exact withdraw moves on to the quote; got {error:?}"
         );
         let state = store.load(&exact).await.unwrap().unwrap();
@@ -2281,11 +2277,7 @@ mod tests {
         let relay_api = MockServer::start();
         let quote = relay_api.mock(|when, then| {
             when.method(POST).path("/quote/v2");
-            then.status(400).json_body(json!({
-                "message": "No routes",
-                "errorCode": "NO_SWAP_ROUTES_FOUND",
-                "requestId": "0x00"
-            }));
+            then.status(404);
         });
         let store = Arc::new(test_store(setup_test_db().await, ()));
         let transfer = relay_transfer_with(
@@ -2343,7 +2335,7 @@ mod tests {
 
         assert!(
             matches!(&error, UsdcTransferError::RelayApi(relay)
-                if matches!(**relay, RelayError::QuoteRefused { code: QuoteErrorCode::NoSwapRoutesFound })),
+                if matches!(**relay, RelayError::HttpStatus { status: 404, .. })),
             "the recorded withdraw moves on to the quote; got {error:?}"
         );
         let state = store.load(&id).await.unwrap().unwrap();
@@ -2840,10 +2832,11 @@ mod tests {
         )
         .await;
 
-        transfer
-            .resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
-            .await
-            .unwrap();
+        assert_fill_pending(
+            &transfer
+                .resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
+                .await,
+        );
 
         let [approve, deposit] = witness.broadcasts()[..] else {
             panic!(
@@ -2912,8 +2905,8 @@ mod tests {
             );
         };
         assert!(
-            matches!(&error, UsdcTransferError::RelayBridge(bridge)
-                if matches!(**bridge, RelayBridgeError::DepositReverted { tx } if tx == deposit)),
+            matches!(&error, UsdcTransferError::SwapDepositReverted { deposit_tx, .. }
+                if *deposit_tx == deposit),
             "got {error:?}"
         );
         assert_eq!(
@@ -3048,10 +3041,11 @@ mod tests {
             store.clone(),
         )
         .await;
-        retry
-            .resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
-            .await
-            .unwrap();
+        assert_fill_pending(
+            &retry
+                .resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
+                .await,
+        );
 
         assert_eq!(
             store.load(&id).await.unwrap().unwrap().state_name(),
@@ -3109,13 +3103,14 @@ mod tests {
         );
         assert_eq!(queued_gas_costs(&apalis_pool).await, vec![]);
 
-        tokio::time::timeout(
-            Duration::from_secs(30),
-            transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
-        )
-        .await
-        .expect("the deposit mines")
-        .unwrap();
+        assert_fill_pending(
+            &tokio::time::timeout(
+                Duration::from_secs(30),
+                transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+            )
+            .await
+            .expect("the deposit mines"),
+        );
 
         let UsdcRebalance::SwapDeposited { deposit_tx, .. } =
             store.load(&id).await.unwrap().unwrap()
@@ -3924,7 +3919,7 @@ mod tests {
     /// An approve left alone by a split pair still goes out when its quote
     /// expires during the signing: another send already holds the nonce
     /// above it, so releasing the approve's would leave that send behind a
-    /// gap. The expired quote is refused on the next attempt.
+    /// gap. The next attempt re-quotes the expired quote first.
     #[tokio::test]
     async fn split_approve_still_goes_out_when_its_quote_expires_during_signing() {
         let anvil = spawn_anvil(Anvil::new());
@@ -3983,19 +3978,25 @@ mod tests {
         assert_eq!(witness.broadcasts(), vec![approve.tx_hash()]);
         let approve = approve.clone();
 
+        let requote = relay_api.mock(|when, then| {
+            when.method(POST).path("/quote/v2");
+            then.status(404);
+        });
         let error = transfer
             .resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
             .await
             .unwrap_err();
 
         assert!(
-            matches!(&error, UsdcTransferError::SwapQuoteExpired { id: refused, .. } if *refused == id),
+            matches!(&error, UsdcTransferError::RelayApi(relay)
+                if matches!(**relay, RelayError::HttpStatus { status: 404, .. })),
             "got {error:?}"
         );
+        requote.assert_calls(1);
         assert_eq!(
             witness.broadcasts(),
-            vec![approve.tx_hash(), approve.tx_hash()],
-            "the lone approve is sent again before the expired quote is refused"
+            vec![approve.tx_hash()],
+            "the expired quote is re-quoted before the lone approve is sent again"
         );
         let state = store.load(&id).await.unwrap().unwrap();
         let UsdcRebalance::SwapQuoted { split_approves, .. } = &state else {
