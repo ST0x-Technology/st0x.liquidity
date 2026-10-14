@@ -544,7 +544,7 @@ fn trim_grouping_parentheses(mut term: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
 
     use st0x_config::{
         ChainAssets, ChainEquities, ChainEquityAsset, ChainRole, InventoryMode, OperationMode,
@@ -552,6 +552,8 @@ mod tests {
     };
     use st0x_evm::turnkey::{TurnkeyPolicy, TurnkeyPolicyEffect, TurnkeyPolicySnapshot};
     use st0x_evm::{USDC_BASE, USDC_ETHEREUM, USDC_HYPEREVM};
+
+    use st0x_bridge::corridor::{HopKind, UsdcCorridor};
 
     use super::*;
     use crate::onchain::approvals::{ApprovalPurpose, ApprovalTarget};
@@ -1220,6 +1222,51 @@ mod tests {
             )
             .unwrap(),
             3
+        );
+    }
+
+    const ROBINHOOD_RELAY: UsdcCorridor = UsdcCorridor::HubRouted {
+        chain: Chain::Robinhood,
+        hop: HopKind::Relay,
+    };
+
+    /// A policy that covers both Relay approves (USDG on Robinhood, USDC on
+    /// Ethereum, each to the depository) but no call to the depository itself.
+    #[test]
+    fn relay_corridor_end_without_policy_for_its_deposit_is_refused() {
+        let depository = Chain::Robinhood.relay_depository().unwrap();
+        let usdg = Chain::Robinhood.settlement_stable().address;
+        let approvals_only = tag_allow(&format!(
+            "activity.type == 'ACTIVITY_TYPE_SIGN_TRANSACTION_V2' && \
+             eth.tx.to in ['{usdg:#x}', '{USDC_ETHEREUM:#x}'] && \
+             eth.tx.data[2..10] == '095ea7b3' && \
+             eth.tx.data[34..74] == '{}'",
+            &format!("{depository:#x}")[2..]
+        ));
+        let wallet_address = address!("0x52908400098527886E0F7030069857D2E4169EE7");
+
+        let error = verify_corridor_ends(
+            &BTreeSet::from([ROBINHOOD_RELAY]),
+            &snapshot(vec![approvals_only]),
+            wallet_address,
+        )
+        .unwrap_err();
+        let ChainCoverageError::MissingCorridorCoverage(missing) = error else {
+            panic!("expected missing corridor coverage, got {error:?}");
+        };
+
+        assert_eq!(missing.corridor, ROBINHOOD_RELAY);
+        assert_eq!(
+            missing
+                .missing
+                .iter()
+                .map(|call| (call.chain, call.to, call.function))
+                .collect::<Vec<_>>(),
+            vec![
+                (Chain::Robinhood, depository, "depositErc20"),
+                (Chain::Ethereum, depository, "depositErc20"),
+            ],
+            "both Relay ends must be refused for their uncovered deposit"
         );
     }
 }
