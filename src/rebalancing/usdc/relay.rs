@@ -1725,11 +1725,12 @@ where
     /// Scans the origin chain for our deposits of `reverted` orders, which a
     /// reorg may have landed: `false` when none is on chain. Once one is
     /// found, the approves that went out alone are sent again, confirmed and
-    /// their gas queued, since a reconcile ending the hold drops them. A lone
-    /// found deposit is adopted once its payment proves, and `true` is
-    /// returned for the caller to move it on; until then, and for good when
-    /// several are found, the attempt ends with `RevertedSwapDepositLive`,
-    /// signing and redepositing nothing.
+    /// their gas queued, since a reconcile ending the hold drops them; a hold
+    /// that cannot confirm them holds anyway, for the next read. A lone found
+    /// deposit is adopted once its payment proves, and `true` is returned for
+    /// the caller to move it on; until then, and for good when several are
+    /// found, the attempt ends with `RevertedSwapDepositLive`, signing and
+    /// redepositing nothing.
     async fn adopt_reverted_deposit(
         &self,
         id: &UsdcRebalanceId,
@@ -1791,8 +1792,9 @@ where
                     })
                     .join(", ");
                 error!(target: "operational_alert", alert = true, kind = AlertKind::RevertedRelayOrderDepositsOnChain.as_str(), %id, %deposits, "Deposits of several reverted Relay orders are on chain; the transfer adopts none and holds its guard at SwapQuoted for the operator: check each listed request with `stox relay status`");
-                self.confirm_split_approves(id, split_approves, side)
-                    .await?;
+                if let Err(error) = self.confirm_split_approves(id, split_approves, side).await {
+                    warn!(target: "rebalance", %id, %error, "Holding with lone Relay approves unconfirmed; the next read confirms them again");
+                }
                 return Err(UsdcTransferError::RevertedSwapDepositLive {
                     id: id.clone(),
                     order_id: quote.order_id,
@@ -1804,14 +1806,19 @@ where
 
         let order_id = quote.order_id;
         error!(target: "operational_alert", alert = true, kind = AlertKind::RevertedRelayOrderDepositOnChain.as_str(), %id, deposit_tx = %deposit.tx, %order_id, block = deposit.block, "A deposit of a reverted Relay order is on chain; the transfer signs and redeposits nothing until its payment proves");
-        self.confirm_split_approves(id, split_approves, side)
-            .await?;
+        let confirmed = self.confirm_split_approves(id, split_approves, side).await;
         let payment = match self.proven_order_payment(id, side, quote).await? {
-            OrderPaymentRead::Proven(payment) => payment,
+            OrderPaymentRead::Proven(payment) => {
+                confirmed?;
+                payment
+            }
             OrderPaymentRead::NotProvableYet
             | OrderPaymentRead::Unpaid
             | OrderPaymentRead::StatusUnread(_)
             | OrderPaymentRead::ChainUnread(_) => {
+                if let Err(error) = confirmed {
+                    warn!(target: "rebalance", %id, %error, "Holding with lone Relay approves unconfirmed; the next read confirms them again");
+                }
                 return Err(UsdcTransferError::RevertedSwapDepositLive {
                     id: id.clone(),
                     order_id,
