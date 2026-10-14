@@ -223,10 +223,11 @@ pub struct ChainApprovalInputs {
     pub assets: crate::ChainAssets,
 }
 
-/// Validated, network-free inputs required by the deploy-time Turnkey
-/// policy coverage check: one approval surface per hedged chain, since
-/// startup grants approvals on every one of them, and every served cash
-/// corridor, since its hop signs on both of its ends.
+/// Validated, network-free inputs for the deploy-time Turnkey policy check.
+///
+/// One approval surface per hedged chain, since startup grants approvals on
+/// every one of them, and every served cash corridor, since it signs on both
+/// of its ends.
 #[cfg(feature = "wallet-turnkey")]
 #[derive(Clone, Debug)]
 pub struct TurnkeyApprovalPolicyInputs {

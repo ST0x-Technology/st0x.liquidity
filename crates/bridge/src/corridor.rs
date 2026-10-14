@@ -161,6 +161,8 @@ pub enum FirstArgument {
     Address(Address),
     /// The signing wallet's own address.
     Signer,
+    /// An address only a run knows, such as a deposit address it fetches.
+    ChosenAtRunTime,
     /// An amount, an offset, or anything else that is not an address.
     NotAnAddress,
 }
