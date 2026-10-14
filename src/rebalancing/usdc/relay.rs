@@ -7721,4 +7721,63 @@ mod tests {
             "the split approve is sent before the hold"
         );
     }
+
+    /// A hold at the hub queues the gas of the approves that went out alone:
+    /// the bot paid for them on Ethereum, and a transfer the operator
+    /// reconciles from the hold never deposits to queue them.
+    #[tokio::test]
+    async fn hold_at_the_hub_queues_the_gas_of_its_split_approves() {
+        let anvil = spawn_anvil(Anvil::new());
+        let (wallet, contracts) = funded_relay_end(&anvil).await;
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_quote_refused(&relay_api);
+        let (transfer, apalis_pool) = relay_transfer_recording_gas(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet.clone(),
+            contracts,
+            store.clone(),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let mut expired = exact_quote_from_hub(&wallet, contracts, TOWARD_CHAIN_ORDER_ID).await;
+        expired.deadline = Utc::now() - chrono::Duration::minutes(1);
+        record_quoted_toward_chain(&store, &id, expired.clone()).await;
+        let approve = wallet
+            .prepare_pending(
+                contracts.stable,
+                expired.approve.unwrap().data,
+                "split approve",
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::PrepareSwapApprove {
+                    approve: approve.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer
+            .resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
+            .await
+            .unwrap();
+
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "SwapQuoted", "{state:?}");
+        assert_eq!(
+            queued_gas_costs(&apalis_pool).await,
+            vec![(
+                Chain::Ethereum,
+                approve.tx_hash(),
+                "relay_approve".to_string()
+            )]
+        );
+    }
 }
