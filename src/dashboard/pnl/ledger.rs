@@ -641,6 +641,13 @@ async fn ingest_rebalance(
         } => {
             return insert_relay_cost(tx, rowid, &id, Usdc::ZERO, shortfall, &refunded_at).await;
         }
+        UsdcRebalanceEvent::SwapCompletionRecovered {
+            payment: SwapRecovery::Refund { shortfall, .. },
+            recovered_at,
+            ..
+        } => {
+            return insert_relay_cost(tx, rowid, &id, Usdc::ZERO, shortfall, &recovered_at).await;
+        }
         UsdcRebalanceEvent::Bridged {
             fee_collected,
             minted_at,
@@ -674,10 +681,6 @@ async fn ingest_rebalance(
         | UsdcRebalanceEvent::ReturnedToSource { .. }
         | UsdcRebalanceEvent::SwapEscrowUnresolved { .. }
         | UsdcRebalanceEvent::SwapFailed { .. }
-        | UsdcRebalanceEvent::SwapCompletionRecovered {
-            payment: SwapRecovery::Refund { .. },
-            ..
-        }
         | UsdcRebalanceEvent::RedepositStarted { .. }
         | UsdcRebalanceEvent::RedepositSubmitted { .. }
         | UsdcRebalanceEvent::AttestationTimedOut { .. }

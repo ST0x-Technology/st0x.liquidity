@@ -1383,11 +1383,11 @@ async fn relay_costs_reach_the_report_from_persisted_events() {
     );
 }
 
-/// A late Relay fill adopted after the transfer stopped waiting books its
-/// relayer fee and swap cost as a first-time fill does; a late refund books
-/// nothing.
+/// A late Relay fill or refund adopted after the transfer stopped waiting
+/// books its costs as a first-time one does: the fill its relayer fee and
+/// swap cost, the refund what it kept back.
 #[tokio::test]
-async fn late_relay_fill_books_its_costs_and_a_late_refund_none() {
+async fn late_relay_fill_and_refund_book_their_costs() {
     let late_fill = UsdcRebalanceEvent::SwapCompletionRecovered {
         order_id: B256::random(),
         deposit_tx: TxHash::random(),
@@ -1407,6 +1407,7 @@ async fn late_relay_fill_books_its_costs_and_a_late_refund_none() {
             side: RefundSide::Origin,
             amount_refunded: Usdc::new(float!(99)),
             short_of_floor: None,
+            shortfall: Usdc::new(float!(1)),
         },
         recovered_at: parse_timestamp("2026-05-15T12:02:00Z").unwrap(),
     };
@@ -1431,7 +1432,11 @@ async fn late_relay_fill_books_its_costs_and_a_late_refund_none() {
     entries.sort_unstable();
     assert_eq!(
         entries,
-        vec![("relay_fee", "cost", "0.3"), ("relay_swap", "cost", "0.2")]
+        vec![
+            ("relay_fee", "cost", "0.3"),
+            ("relay_swap", "cost", "0.2"),
+            ("relay_swap", "cost", "1"),
+        ]
     );
 }
 

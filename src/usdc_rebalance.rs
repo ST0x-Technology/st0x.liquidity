@@ -1151,8 +1151,8 @@ pub enum RecoveredSwapPayment {
 
 /// A late payment as `SwapCompletionRecovered` records it: a fill with the
 /// fee split `RelayFillVerified` carries, or a refund with the refund floor
-/// of the transfer's first deposit when it is below it, as `SwapRefunded`
-/// carries.
+/// of the transfer's first deposit when it is below it and the shortfall, as
+/// `SwapRefunded` carries.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SwapRecovery {
     Fill {
@@ -1166,6 +1166,7 @@ pub enum SwapRecovery {
         side: RefundSide,
         amount_refunded: Usdc,
         short_of_floor: Option<U256>,
+        shortfall: Usdc,
     },
 }
 
@@ -6629,11 +6630,19 @@ impl UsdcRebalance {
             } => {
                 let refunded = proven_refund_amount(quote, amount_refunded)?;
                 let floor = base.first_deposit.refund_floor()?;
+                let deposited = swap_input(quote)?;
+                let shortfall = (deposited - refunded).map_err(|_| {
+                    UsdcRebalanceError::RefundShortfallUncomputable {
+                        deposited,
+                        refunded,
+                    }
+                })?;
                 SwapRecovery::Refund {
                     refund_tx,
                     side,
                     amount_refunded: refunded,
                     short_of_floor: (amount_refunded < floor).then_some(floor),
+                    shortfall,
                 }
             }
         };
@@ -6691,6 +6700,7 @@ impl UsdcRebalance {
                 side,
                 amount_refunded,
                 short_of_floor,
+                ..
             } => Self::SwapRefunded {
                 direction: base.direction,
                 corridor: base.corridor,
@@ -8617,6 +8627,7 @@ mod tests {
                     side: RefundSide::Origin,
                     amount_refunded: Usdc::new(float!(99.6)),
                     short_of_floor: None,
+                    shortfall: Usdc::new(float!(0.4)),
                     refunded_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::SwapRequoted {
@@ -8841,6 +8852,7 @@ mod tests {
                         side,
                         amount_refunded: Usdc::new(float!(99)),
                         short_of_floor: None,
+                        shortfall: Usdc::new(float!(1)),
                         refunded_at: Utc::now(),
                     }],
                 ]
