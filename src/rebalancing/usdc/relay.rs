@@ -6178,6 +6178,50 @@ mod tests {
         assert_eq!(rig.hub_usdc().await, U256::from(AMOUNT_IN));
     }
 
+    /// A binding quote from the hub that Relay keeps refusing pages once per
+    /// transfer: every re-armed run quotes again, but only the first refusal
+    /// pages.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn binding_quote_refused_toward_chain_pages_once() {
+        let rig = RelayRig::deploy().await;
+        let withdrawal_tx = rig.withdraw_to_hub(U256::from(AMOUNT_IN)).await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let quote = mock_quote_refused(&relay_api);
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_withdrawn_toward_chain(&store, &id, withdrawal_tx).await;
+
+        for _ in 0..2 {
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+            )
+            .await
+            .expect("the attempt ends")
+            .unwrap();
+        }
+
+        quote.assert_calls(2);
+        logs_assert(|lines| {
+            let pages = lines
+                .iter()
+                .filter(|line| line.contains("Relay refused the binding quote from the hub"))
+                .count();
+            (pages == 1)
+                .then_some(())
+                .ok_or_else(|| format!("{pages} pages of the refused quote"))
+        });
+        assert_eq!(
+            store.load(&id).await.unwrap().unwrap().state_name(),
+            "WithdrawalComplete"
+        );
+    }
+
     /// A refund paid in USDC at the hub is quoted again, for the refunded
     /// amount, from the hub to the chain.
     #[tokio::test]
