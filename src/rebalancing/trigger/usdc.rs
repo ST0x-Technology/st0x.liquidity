@@ -231,6 +231,14 @@ pub(super) enum UsdcSettlementOutcome {
     HeldByWithdrawCooldown,
 }
 
+/// What a Relay redeposit put back into the vault its transfer left: the
+/// amount, and the block of the vault deposit (`None` when not captured).
+#[derive(Debug, Clone, Copy)]
+struct ReturnedToVault {
+    amount: Usdc,
+    deposit_block: Option<u64>,
+}
+
 /// Whether a terminal event (USDC, mint or redemption) left the in-memory
 /// cash ledger reconciled, or stale until the next snapshot poll heals it.
 #[derive(Debug, Clone, Copy)]
@@ -1268,14 +1276,22 @@ impl RebalancingService {
                 self.warn_if_post_burn_tracking_missing(id).await;
                 UsdcSettlementOutcome::Reconciled
             }
-            // The stable is back in the vault it left: credit what came back
-            // and drop what a refund kept, and leave the next check to the
-            // snapshot poll, which reads the vault itself.
+            // The stable is back in the vault it left: credit what came back,
+            // drop what a refund kept, hold checks for a vault read pinned at
+            // the redeposit, and leave the next check to the snapshot poll.
             ReturnedToSource {
-                redeposit_amount, ..
+                redeposit_amount,
+                deposit_block,
+                ..
             } => {
-                self.settle_tracked_usdc_rebalance(id, Some(*redeposit_amount))
-                    .await?;
+                self.settle_tracked_usdc_rebalance(
+                    id,
+                    Some(ReturnedToVault {
+                        amount: *redeposit_amount,
+                        deposit_block: *deposit_block,
+                    }),
+                )
+                .await?;
                 UsdcSettlementOutcome::DeferredToSnapshot
             }
             // Operator reconciliation of a post-burn `DepositFailed`: the minted
@@ -1583,12 +1599,12 @@ impl RebalancingService {
     }
 
     /// Returns a stopped transfer's source inflight to available: all of it,
-    /// or only `returned` of it when the transfer put less back (a Relay
-    /// refund that kept fees), the rest released without a credit.
+    /// or only what a Relay redeposit put back (a refund that kept fees),
+    /// the rest released without a credit.
     async fn settle_tracked_usdc_rebalance(
         &self,
         id: &UsdcRebalanceId,
-        returned: Option<Usdc>,
+        returned: Option<ReturnedToVault>,
     ) -> Result<UsdcSettlementOutcome, RebalancingServiceError> {
         let Some(tracking) = self.usdc_tracking.read().await.get(id).cloned() else {
             debug!(
@@ -1612,20 +1628,34 @@ impl RebalancingService {
                 None => Inventory::transfer(source_venue, TransferOp::Cancel, initiated_amount)(
                     inventory, chain,
                 )?,
-                Some(returned) => {
-                    let cancelled =
-                        Inventory::transfer(source_venue, TransferOp::Cancel, returned)(
-                            inventory, chain,
-                        )?;
+                Some(ReturnedToVault { amount, .. }) => {
+                    let cancelled = Inventory::transfer(source_venue, TransferOp::Cancel, amount)(
+                        inventory, chain,
+                    )?;
                     Inventory::set_inflight(source_venue, Usdc::ZERO)(cancelled, chain)?
                 }
             };
             Inventory::with_last_rebalancing(now)(settled, chain)
         });
 
+        // A redeposit is a vault credit: it requests a pinned read under the
+        // same inventory write, as `complete_usdc_rebalance` does.
+        let deposit_block = returned.and_then(|returned| returned.deposit_block);
+        let cash_engagement = match deposit_block {
+            Some(_) => Some(self.divergence_gate.lock_cash_engagement().await),
+            None => None,
+        };
         let mut inventory = self.inventory.write().await;
         let outcome = match inventory.clone().update_usdc_at(chain, update, now) {
             Ok(updated) => {
+                if let (Some(block_number), Some(cash_engagement)) =
+                    (deposit_block, &cash_engagement)
+                {
+                    let minimum_block = updated
+                        .onchain_usdc_block_watermark(chain)
+                        .map_or(block_number, |watermark| watermark.max(block_number));
+                    cash_engagement.request_onchain_cash_reconcile(chain, Some(minimum_block));
+                }
                 *inventory = updated;
                 UsdcSettlementOutcome::Reconciled
             }
@@ -1662,6 +1692,7 @@ impl RebalancingService {
             Err(error) => return Err(error.into()),
         };
         drop(inventory);
+        drop(cash_engagement);
 
         Ok(outcome)
     }
