@@ -12187,16 +12187,26 @@ mod tests {
             .to_string()
         );
 
-        let (status, _) = usdc_recheck_error_response(&UsdcRecheckError::Transfer(Box::new(
-            UsdcTransferError::SwapPaymentUnverified {
-                id,
+        let unverified =
+            UsdcRecheckError::Transfer(Box::new(UsdcTransferError::SwapPaymentUnverified {
+                id: id.clone(),
                 source: Box::new(RelayBridgeError::RefundUnverified {
                     txs: vec![TxHash::repeat_byte(0xe1)],
                     reason: UnverifiedReason::Reverted,
                 }),
-            },
-        )));
+            }));
+        let (status, message) = usdc_recheck_error_response(&unverified);
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(message, unverified.to_string());
+
+        let (status, message) = usdc_recheck_error_response(&UsdcRecheckError::Transfer(Box::new(
+            UsdcTransferError::RelayApi(Box::new(RelayError::HttpStatus {
+                endpoint: RelayEndpoint::Status,
+                status: 404,
+            })),
+        )));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(message, "Failed to recheck transfer");
     }
 
     /// Seeds a `UsdcRebalance` (BaseToAlpaca) into a post-burn `BridgingFailed`

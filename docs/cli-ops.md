@@ -964,10 +964,10 @@ To move a Relay refund, or what Relay returns of a failed order, by hand:
 `recovered` when it adopted a payment, `left_unchanged` when Relay reports
 nothing paid, and `not_detected_yet` when Relay names a payment the chain does
 not show yet: recheck again later. A Relay read that fails answers an error (a
-502 when it is transient). An error exit, also a payment the chain contradicts
-(paged "The Relay payment does not prove on chain"), is never the reconcile
-branch: do not reconcile on it. It does not move the payment on: the escrow's
-job does at its next read, and after a `SwapFailed` run
+502 when it is transient or rate-limited). An error exit, also a payment the
+chain contradicts (paged "The Relay payment does not prove on chain"), is never
+the reconcile branch: do not reconcile on it. It does not move the payment on:
+the escrow's job does at its next read, and after a `SwapFailed` run
 `transfer resume --kind usdc`. A transfer reconciled while it holds signed Relay
 envelopes keeps their nonces reserved: restart the bot, as the reconcile output
 asks, or later sends from that wallet may wait behind a nonce that never mined.
