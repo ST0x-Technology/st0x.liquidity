@@ -6462,7 +6462,7 @@ mod tests {
         let requote = relay_api.mock(|when, then| {
             when.method(POST).path("/quote/v2");
             then.status(200)
-                .json_body(quote_body_for_test(&request, refunded, refunded));
+                .json_body(quote_body_for_test(&request, refunded, refunded).unwrap());
         });
         let store = Arc::new(test_store(setup_test_db().await, ()));
         let transfer = relay_transfer_with_bounds(
@@ -7217,11 +7217,14 @@ mod tests {
 
         relay_api.mock(|when, then| {
             when.method(POST).path("/quote/v2");
-            then.status(200).json_body(quote_body_for_test(
-                &request,
-                U256::from(99_300_000_u64),
-                U256::from(99_100_000_u64),
-            ));
+            then.status(200).json_body(
+                quote_body_for_test(
+                    &request,
+                    U256::from(99_300_000_u64),
+                    U256::from(99_100_000_u64),
+                )
+                .unwrap(),
+            );
         })
     }
 

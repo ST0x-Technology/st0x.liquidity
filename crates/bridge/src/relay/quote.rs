@@ -1256,10 +1256,27 @@ mod decimal {
     }
 }
 
-/// A quote body Relay could send for `request`: the solver expects to pay
-/// `expected_out` and guarantees `minimum_out`, with a refund on the origin
-/// chain and an order id derived from the order, as [`RelayClient::quote`]
+/// Why [`quote_body_for_test`] could not build a quote body.
+#[cfg(any(test, feature = "mock"))]
+#[derive(Debug, thiserror::Error)]
+pub enum TestQuoteError {
+    #[error("{chain} has no Relay chain name")]
+    NoRelayName { chain: Chain },
+    #[error("{origin} has no pinned Relay depository")]
+    NoDepository { origin: Chain },
+    #[error("the clock is before the Unix epoch: {0}")]
+    Clock(#[from] std::time::SystemTimeError),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Order(#[from] QuoteMismatch),
+}
+
+/// A quote body Relay could send for `request`, as [`RelayClient::quote`]
 /// checks it.
+///
+/// The solver expects to pay `expected_out` and guarantees `minimum_out`,
+/// with a refund on the origin chain and an order id derived from the order.
 ///
 /// [`RelayClient::quote`]: super::RelayClient::quote
 #[cfg(any(test, feature = "mock"))]
@@ -1267,25 +1284,23 @@ pub fn quote_body_for_test(
     request: &QuoteRequest,
     expected_out: U256,
     minimum_out: U256,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, TestQuoteError> {
     use serde_json::json;
 
     let origin = request.origin;
     let destination = request.destination;
-    let origin_name = origin.relay_name().expect("origin has a Relay name");
+    let origin_name = origin
+        .relay_name()
+        .ok_or(TestQuoteError::NoRelayName { chain: origin })?;
     let destination_name = destination
         .relay_name()
-        .expect("destination has a Relay name");
+        .ok_or(TestQuoteError::NoRelayName { chain: destination })?;
     let depository = origin
         .relay_depository()
-        .expect("origin has a Relay depository");
+        .ok_or(TestQuoteError::NoDepository { origin })?;
     let stable_in = origin.settlement_stable().address;
     let stable_out = destination.settlement_stable().address;
-    let deadline = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock after the epoch")
-        .as_secs()
-        + 3600;
+    let deadline = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + 3600;
     let amount = request.amount.to_string();
     let currency = |chain: Chain| {
         let stable = chain.settlement_stable();
@@ -1322,11 +1337,8 @@ pub fn quote_body_for_test(
             "extraData": "0x",
         },
     });
-    let order: RawOrderData =
-        serde_json::from_value(order_data.clone()).expect("the test order parses");
-    let order_id = eip712_order(&order)
-        .expect("the test order hashes")
-        .eip712_hash_struct();
+    let order: RawOrderData = serde_json::from_value(order_data.clone())?;
+    let order_id = eip712_order(&order)?.eip712_hash_struct();
 
     let step = |id: &str, to: Address, data: Vec<u8>| {
         json!({
@@ -1352,7 +1364,7 @@ pub fn quote_body_for_test(
     }
     .abi_encode();
 
-    json!({
+    Ok(json!({
         "requestId": B256::repeat_byte(0x7e),
         "steps": [step("approve", stable_in, approve), step("deposit", depository, deposit)],
         "fees": {
@@ -1386,7 +1398,7 @@ pub fn quote_body_for_test(
                 "amount": amount,
             },
         }},
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -1595,7 +1607,8 @@ pub(super) mod tests {
         let request = dead_request(Chain::Ethereum, Chain::Robinhood, 30);
 
         let quote = validate(
-            &quote_body_for_test(&request, U256::from(999_000_000), U256::from(996_000_000)),
+            &quote_body_for_test(&request, U256::from(999_000_000), U256::from(996_000_000))
+                .unwrap(),
             &request,
         )
         .unwrap();
