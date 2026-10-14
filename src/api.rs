@@ -1989,6 +1989,11 @@ fn usdc_recheck_error_response(error: &UsdcRecheckError) -> (StatusCode, String)
             | UsdcTransferError::SwapPaymentUnverified { .. } => {
                 (StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
             }
+            // A Relay status read that failed is inconclusive, not unpaid.
+            UsdcTransferError::RelayApi(relay) if relay.is_transient() => (
+                StatusCode::BAD_GATEWAY,
+                "Relay unavailable; retry later".to_string(),
+            ),
             _ => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to recheck transfer".to_string(),
@@ -5302,6 +5307,7 @@ mod tests {
 
     use st0x_bridge::cctp::CctpError;
     use st0x_bridge::corridor::{HopKind, UsdcCorridor};
+    use st0x_bridge::relay::{RelayEndpoint, RelayError};
     use st0x_config::{
         BrokerCtx, ChainCashAsset, Ctx, ExecutionThreshold, FileLogging, HedgedChain, LogLevel,
         OperationMode, RebalancingMode, RestApiCtx, UsdcCorridors,
@@ -12133,6 +12139,15 @@ mod tests {
             message.starts_with("USDC transfer corridor mismatch"),
             "got {message}"
         );
+
+        let (status, message) = usdc_recheck_error_response(&UsdcRecheckError::Transfer(Box::new(
+            UsdcTransferError::RelayApi(Box::new(RelayError::HttpStatus {
+                endpoint: RelayEndpoint::Status,
+                status: 503,
+            })),
+        )));
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(message, "Relay unavailable; retry later");
     }
 
     /// Seeds a `UsdcRebalance` (BaseToAlpaca) into a post-burn `BridgingFailed`

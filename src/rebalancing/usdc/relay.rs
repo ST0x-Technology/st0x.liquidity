@@ -1767,13 +1767,18 @@ where
 
         let order_id = quote.order_id;
         error!(target: "operational_alert", alert = true, kind = AlertKind::RevertedRelayOrderDepositOnChain.as_str(), %id, deposit_tx = %deposit.tx, %order_id, block = deposit.block, "A deposit of a reverted Relay order is on chain; the transfer signs and redeposits nothing until its payment proves");
-        let Some(payment) = self.proven_order_payment(id, side, quote).await? else {
-            return Err(UsdcTransferError::RevertedSwapDepositLive {
-                id: id.clone(),
-                order_id,
-                request_id: quote.request_id,
-                deposit_tx: deposit.tx,
-            });
+        let payment = match self.proven_order_payment(id, side, quote).await? {
+            OrderPaymentRead::Proven(payment) => payment,
+            OrderPaymentRead::NotProvableYet
+            | OrderPaymentRead::Unpaid
+            | OrderPaymentRead::StatusUnread(_) => {
+                return Err(UsdcTransferError::RevertedSwapDepositLive {
+                    id: id.clone(),
+                    order_id,
+                    request_id: quote.request_id,
+                    deposit_tx: deposit.tx,
+                });
+            }
         };
 
         let deadline = Instant::now() + self.hop.bounds.quote_max_age;
@@ -1797,14 +1802,14 @@ where
     }
 
     /// The fill or refund of `quote`'s order that Relay reports and the chain
-    /// proves, `None` while Relay reports none or it is not provable yet. A
-    /// payment the chain contradicts pages and is `SwapPaymentUnverified`.
+    /// proves, or why there is none yet. A payment the chain contradicts
+    /// pages and is `SwapPaymentUnverified`.
     async fn proven_order_payment(
         &self,
         id: &UsdcRebalanceId,
         side: HopDirection,
         quote: &SwapQuote,
-    ) -> Result<Option<RecoveredSwapPayment>, UsdcTransferError> {
+    ) -> Result<OrderPaymentRead, UsdcTransferError> {
         let order_id = RelayOrderId(quote.order_id);
         let report = match self
             .hop
@@ -1815,7 +1820,7 @@ where
             Ok(report) => report,
             Err(error) => {
                 warn!(target: "rebalance", %id, order_id = %quote.order_id, %error, "Relay status read failed; reading it again later");
-                return Ok(None);
+                return Ok(OrderPaymentRead::StatusUnread(error));
             }
         };
 
@@ -1843,22 +1848,23 @@ where
             | IntentStatus::NotIncluded
             | IntentStatus::Unknown(_)) => {
                 info!(target: "rebalance", %id, order_id = %quote.order_id, ?status, "Relay reports no payment of the order");
-                return Ok(None);
+                return Ok(OrderPaymentRead::Unpaid);
             }
         };
 
-        Ok(Self::proven_payment(id, proof, false)?.map(|payment| {
-            if fill {
-                RecoveredSwapPayment::Fill {
-                    fill_tx: payment.tx,
-                    amount_received: payment.amount,
-                }
-            } else {
-                RecoveredSwapPayment::Refund {
-                    refund_tx: payment.tx,
-                    side: refund_side(payment.side),
-                    amount_refunded: payment.amount,
-                }
+        let Some(payment) = Self::proven_payment(id, proof, false)? else {
+            return Ok(OrderPaymentRead::NotProvableYet);
+        };
+        Ok(OrderPaymentRead::Proven(if fill {
+            RecoveredSwapPayment::Fill {
+                fill_tx: payment.tx,
+                amount_received: payment.amount,
+            }
+        } else {
+            RecoveredSwapPayment::Refund {
+                refund_tx: payment.tx,
+                side: refund_side(payment.side),
+                amount_refunded: payment.amount,
             }
         }))
     }
@@ -2277,6 +2283,18 @@ enum RecheckAdoption {
     FailedOrder { deposit_tx: TxHash },
 }
 
+/// What Relay and the chain say of a signed order's payment.
+enum OrderPaymentRead {
+    /// A fill or refund that proves on chain.
+    Proven(RecoveredSwapPayment),
+    /// Relay names a payment the chain does not prove yet.
+    NotProvableYet,
+    /// Relay reports no payment of the order.
+    Unpaid,
+    /// Relay's status read failed.
+    StatusUnread(RelayError),
+}
+
 /// What a deposit with no payment adopted is waiting within.
 #[derive(Clone, Copy)]
 enum PaymentWait {
@@ -2636,7 +2654,9 @@ where
     /// Reads Relay's status of a held escrow's order again: the deposited
     /// order of an unresolved escrow, or the failed one. A payment that
     /// proves is adopted (`Recovered`) and left for the escrow's job, or a
-    /// `transfer resume`, to move on; otherwise nothing changes. Every other
+    /// `transfer resume`, to move on; otherwise nothing changes, and a
+    /// payment not provable yet or a failed status read is reported apart
+    /// from an unpaid order. Every other
     /// state, and an operator deposit tx, is refused: a Relay `DepositFailed`
     /// is settled with `transfer reconcile`.
     async fn recheck_deposit(
@@ -2683,12 +2703,17 @@ where
             }
         };
 
-        let Some(payment) = self
+        let payment = match self
             .proven_order_payment(id, hop_direction(direction), &quote)
             .await
             .map_err(Box::new)?
-        else {
-            return Ok(RecheckOutcome::LeftUnchanged);
+        {
+            OrderPaymentRead::Proven(payment) => payment,
+            OrderPaymentRead::NotProvableYet => return Ok(RecheckOutcome::NotDetectedYet),
+            OrderPaymentRead::Unpaid => return Ok(RecheckOutcome::LeftUnchanged),
+            OrderPaymentRead::StatusUnread(error) => {
+                return Err(Box::new(UsdcTransferError::RelayApi(Box::new(error))).into());
+            }
         };
         let command = match (adopt, payment) {
             (

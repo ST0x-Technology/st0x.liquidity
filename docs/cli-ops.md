@@ -960,12 +960,16 @@ To move a Relay refund, or what Relay returns of a failed order, by hand:
 
 `transfer recheck --kind usdc` on a Relay transfer reads only
 `SwapEscrowUnresolved` and `SwapFailed`, and refuses `--deposit-tx`. It prints
-`recovered` when it adopted a payment and `left_unchanged` otherwise. It does
-not move the payment on: the escrow's job does at its next read, and after a
-`SwapFailed` run `transfer resume --kind usdc`. A transfer reconciled while it
-holds signed Relay envelopes keeps their nonces reserved: restart the bot, as
-the reconcile output asks, or later sends from that wallet may wait behind a
-nonce that never mined.
+`recovered` when it adopted a payment, `left_unchanged` when Relay reports
+nothing paid, and `not_detected_yet` when Relay names a payment the chain does
+not show yet: recheck again later. A Relay read that fails answers an error (a
+502 when it is transient). An error exit, also a payment the chain contradicts
+(paged "The Relay payment does not prove on chain"), is never the reconcile
+branch: do not reconcile on it. It does not move the payment on: the escrow's
+job does at its next read, and after a `SwapFailed` run
+`transfer resume --kind usdc`. A transfer reconciled while it holds signed Relay
+envelopes keeps their nonces reserved: restart the bot, as the reconcile output
+asks, or later sends from that wallet may wait behind a nonce that never mined.
 
 A transient quote failure (transport, a Relay 5xx, a transient error code) is
 quoted again by the job 30 seconds later, and pages once if that lasts 30
