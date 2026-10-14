@@ -4841,6 +4841,76 @@ mod tests {
         );
     }
 
+    /// A startup that cannot list the signed Alpaca deposit sends still
+    /// reserves the Relay envelopes signed on the Ethereum wallet: the two
+    /// listings are independent.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn ethereum_relay_envelopes_are_restored_when_deposit_sends_cannot_be_listed() {
+        let anvil = spawn_anvil(Anvil::new());
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let pool = setup_test_db().await;
+        let store = Arc::new(test_store(pool.clone(), ()));
+        let contracts = RelayEndContracts {
+            stable: Address::repeat_byte(0x51),
+            depository: Address::repeat_byte(0x52),
+        };
+        let transfer = relay_transfer(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet,
+            contracts,
+            store.clone(),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_quoted_toward_chain(
+            &store,
+            &id,
+            crate::usdc_rebalance::swap_quote_for_test(
+                U256::from(AMOUNT_IN),
+                TOWARD_CHAIN_ORDER_ID,
+            ),
+        )
+        .await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::PrepareSwapDeposit {
+                    approve: None,
+                    deposit: PreparedTransaction::for_test(TxHash::repeat_byte(0xd7), 7),
+                },
+            )
+            .await
+            .unwrap();
+        // A signed deposit send whose transfer id is stored as a blob: the
+        // deposit-send listing cannot decode it and fails.
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, \
+             metadata) \
+             VALUES ('UsdcRebalance', x'01', 1, 'UsdcRebalanceEvent::DepositSendPrepared', \
+             '1', '{}', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let restored = transfer.restore_prepared_deposit_sends(&pool).await;
+
+        assert_eq!(restored.restored, 1, "{restored:?}");
+        assert!(logs_contain(
+            "Could not list signed Alpaca deposit sends at startup"
+        ));
+        assert!(logs_contain(
+            "Reserved the nonce of a signed Relay envelope on the Ethereum wallet"
+        ));
+    }
+
     /// A Robinhood stand-in with a Raindex orderbook and a hub stand-in, on two
     /// Anvil nodes, so a payment proof finds each tx on one chain only. The
     /// chain's stable is a Relay `MockStable` etched at the pinned USDG
