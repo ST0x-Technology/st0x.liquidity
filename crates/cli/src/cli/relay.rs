@@ -7,8 +7,9 @@ use std::io::Write;
 use st0x_bridge::relay::{IntentStatusReport, RelayClient, RelayRequestId};
 
 /// Prints Relay's status of `request_id`: the parsed status, whether it is
-/// terminal, Relay's refund fail reason, and every deposit and payment tx Relay lists. A status is not
-/// proof of a payment; the bot adopts one only once it proves on chain.
+/// terminal, Relay's refund fail reason, and every deposit and payment tx Relay
+/// lists. A status is not proof of a payment; the bot adopts one only once it
+/// proves on chain.
 pub(super) async fn relay_status_command<Writer: Write>(
     stdout: &mut Writer,
     client: &RelayClient,

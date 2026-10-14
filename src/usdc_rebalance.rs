@@ -8572,7 +8572,7 @@ mod tests {
         assert_eq!(*signed_order_ids, vec![B256::repeat_byte(0x0a)]);
         assert_eq!(*amount_refunded, Usdc::new(float!(99)));
 
-        for (command, refused) in [
+        for (command, refused, expected) in [
             (
                 UsdcRebalanceCommand::RecoverSwapCompletion {
                     order_id: B256::repeat_byte(0x0b),
@@ -8583,6 +8583,9 @@ mod tests {
                     },
                 },
                 "the current order was never deposited",
+                (|error: &UsdcRebalanceError| {
+                    matches!(error, UsdcRebalanceError::SwapOrderNotRecoverable { .. })
+                }) as fn(&UsdcRebalanceError) -> bool,
             ),
             (
                 UsdcRebalanceCommand::RecoverSwapCompletion {
@@ -8594,6 +8597,9 @@ mod tests {
                     },
                 },
                 "below the floor",
+                |error: &UsdcRebalanceError| {
+                    matches!(error, UsdcRebalanceError::SwapFillBelowMinimum { .. })
+                },
             ),
         ] {
             let error = TestHarness::<UsdcRebalance>::with(())
@@ -8602,13 +8608,7 @@ mod tests {
                 .await
                 .then_expect_error();
             assert!(
-                matches!(
-                    error,
-                    LifecycleError::Apply(
-                        UsdcRebalanceError::SwapOrderNotRecoverable { .. }
-                            | UsdcRebalanceError::SwapFillBelowMinimum { .. }
-                    )
-                ),
+                matches!(&error, LifecycleError::Apply(inner) if expected(inner)),
                 "{refused}: got {error:?}"
             );
         }

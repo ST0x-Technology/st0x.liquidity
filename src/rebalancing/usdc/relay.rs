@@ -2846,6 +2846,7 @@ mod tests {
     use alloy::sol_types::SolCall;
     use httpmock::prelude::*;
     use serde_json::json;
+    use std::collections::BTreeSet;
     use std::sync::Arc;
     use std::time::Duration;
     use uuid::Uuid;
@@ -9408,13 +9409,10 @@ mod tests {
         .expect("the attempt ends");
 
         assert_fill_pending(&resumed);
-        assert!(
-            restarted
-                .broadcasts()
-                .iter()
-                .all(|tx| *tx == approve.tx_hash() || *tx == deposit.tx_hash()),
-            "only the persisted envelopes are sent: {:?}",
-            restarted.broadcasts()
+        assert_eq!(
+            restarted.broadcasts().into_iter().collect::<BTreeSet<_>>(),
+            BTreeSet::from([approve.tx_hash(), deposit.tx_hash()]),
+            "the persisted envelopes, and only they, are sent again"
         );
         let state = store.load(&id).await.unwrap().unwrap();
         let UsdcRebalance::SwapDeposited {
