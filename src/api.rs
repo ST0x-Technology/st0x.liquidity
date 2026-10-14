@@ -5308,6 +5308,7 @@ mod tests {
     use alloy::signers::SignerSync as _;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::SolCall;
+    use alloy::transports::TransportErrorKind;
     use async_trait::async_trait;
     use axum::body::{Body, to_bytes};
     use axum::extract::ConnectInfo;
@@ -5331,7 +5332,7 @@ mod tests {
     };
     use st0x_dto::{Trade, TradeOutcome, TradingVenue};
     use st0x_event_sorcery::{ReactorHarness, StoreBuilder};
-    use st0x_evm::{Chain, MinedTx, PreparedTransaction};
+    use st0x_evm::{Chain, EvmError, MinedTx, PreparedTransaction};
     use st0x_execution::alpaca_broker_api::AlpacaBrokerMock;
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaWalletError,
@@ -12169,6 +12170,17 @@ mod tests {
             UsdcTransferError::RelayApi(Box::new(RelayError::RateLimited { retry_after: None })),
         )));
         assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+        for unread in [
+            RelayBridgeError::Rpc(TransportErrorKind::backend_gone()),
+            RelayBridgeError::Evm(EvmError::Transport(TransportErrorKind::backend_gone())),
+        ] {
+            let (status, message) = usdc_recheck_error_response(&UsdcRecheckError::Transfer(
+                Box::new(UsdcTransferError::RelayBridge(Box::new(unread))),
+            ));
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert_eq!(message, "Chain RPC unavailable; retry later");
+        }
 
         let (status, message) =
             usdc_recheck_error_response(&UsdcRecheckError::DepositTxNotApplicable {
