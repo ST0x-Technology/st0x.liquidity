@@ -5427,15 +5427,15 @@ signing a second deposit while an earlier one may still land:
 - **Late adoption.** `SwapCompletionRecovered` adopts a proven late payment of a
   signed order: from `SwapQuoted`, a reverted order whose deposit the scan
   found, which leaves `reverted_quotes`; from `SwapFailed`, through
-  `transfer recheck`, the failed order itself, keeping the reverted quotes
-  watched. A fill continues as any `Bridged`, and the other reverted orders are
-  no longer watched; a refund continues as any `SwapRefunded` of that order
-  (redeposited, re-quoted or held). `transfer
-  recheck` of an unresolved escrow
-  records a proven payment of its deposited order with `ConfirmSwapFill` or
-  `RecordSwapRefund`. Approves that went out alone are sent again before a
-  `SwapQuoted` adopts one. Superseding an order adds its id to
-  `signed_order_ids` and never drops one.
+  `transfer recheck`, the failed order itself, keeping the reverted quotes for
+  the escrow scan, which reads them again once the transfer is back at
+  `SwapQuoted`; while it is `SwapFailed` nothing scans them. A fill continues as
+  any `Bridged`, and the other reverted orders are no longer watched; a refund
+  continues as any `SwapRefunded` of that order (redeposited, re-quoted or
+  held). `transfer recheck` of an unresolved escrow records a proven payment of
+  its deposited order with `ConfirmSwapFill` or `RecordSwapRefund`. Approves
+  that went out alone are sent again before a `SwapQuoted` adopts one.
+  Superseding an order adds its id to `signed_order_ids` and never drops one.
 
 ##### Crash-safe resume
 
