@@ -2554,12 +2554,26 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
         pool: &SqlitePool,
     ) -> RestoredDepositSends {
         let mut outcome = RestoredDepositSends::default();
+        self.restore_alpaca_deposit_sends(pool, &mut outcome).await;
+        // Independent of the deposit sends' listing, which may have failed.
+        self.restore_ethereum_signed_swaps(pool, &mut outcome).await;
+
+        outcome
+    }
+
+    /// Reserves and rebroadcasts the signed Alpaca deposit sends, counting
+    /// each into `outcome`.
+    async fn restore_alpaca_deposit_sends(
+        &self,
+        pool: &SqlitePool,
+        outcome: &mut RestoredDepositSends,
+    ) {
         let (ids, unparseable) = match prepared_deposit_send_ids(pool).await {
             Ok(found) => found,
             Err(error) => {
                 error!(target: "operational_alert", alert = true, kind = AlertKind::AlpacaDepositSendsUnlisted.as_str(), ?error, "Could not list signed Alpaca deposit sends at startup; their nonces are not reserved until each transfer resumes, so startup skips Ethereum token approvals and allowance revokes");
                 outcome.unmined += 1;
-                return outcome;
+                return;
             }
         };
         if !unparseable.is_empty() {
@@ -2594,10 +2608,6 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
                 }
             }
         }
-
-        self.restore_ethereum_signed_swaps(pool, &mut outcome).await;
-
-        outcome
     }
 
     /// Reserves and rebroadcasts the Relay envelopes signed on the Ethereum
@@ -19469,9 +19479,10 @@ mod tests {
 
         assert_eq!(
             manager.restore_prepared_deposit_sends(&pool).await,
+            // Both listings fail: the deposit sends' and the Relay pairs'.
             RestoredDepositSends {
                 restored: 0,
-                unmined: 1,
+                unmined: 2,
             }
         );
 
