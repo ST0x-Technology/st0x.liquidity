@@ -2131,6 +2131,65 @@ mod tests {
         );
     }
 
+    /// A payment that is mined but short of the end's confirmations proves
+    /// `Unconfirmed` at once, even when the wallet's receipt wait would
+    /// hold out for that depth: the caller redrives the read later.
+    #[tokio::test]
+    async fn payment_short_of_the_confirmations_is_unconfirmed_without_waiting() {
+        let harness = Harness::new().await;
+        let deep_wallet = |chain: &RelayChain| {
+            let provider = ProviderBuilder::new()
+                .connect_http(chain.endpoint().parse().unwrap())
+                .erased();
+            RawPrivateKeyWallet::new(&chain.wallet_key(), provider, CONFIRMATIONS).unwrap()
+        };
+        let bridge = RelayBridge::try_from_ctx(RelayCtx {
+            chain: Chain::Robinhood,
+            ethereum_wallet: deep_wallet(&harness.hub),
+            chain_wallet: deep_wallet(&harness.chain),
+            ethereum_confirmations: CONFIRMATIONS,
+            chain_confirmations: CONFIRMATIONS,
+        })
+        .unwrap()
+        .with_local_contracts(contracts(&harness.hub), contracts(&harness.chain))
+        .without_scan_backoff();
+        let order_id = RelayOrderId(B256::random());
+        harness.hub.mint(harness.hub.solver(), MINIMUM_OUT).await;
+        let fill = harness
+            .hub
+            .pay(harness.hub.wallet(), MINIMUM_OUT, order_id.0)
+            .await;
+        harness.chain.mint(harness.chain.solver(), AMOUNT).await;
+        let refund = harness
+            .chain
+            .pay(harness.chain.wallet(), AMOUNT, order_id.0)
+            .await;
+
+        let (fill_proof, refund_proof) = tokio::time::timeout(Duration::from_secs(10), async {
+            (
+                bridge
+                    .verify_fill(HopDirection::ToHub, order_id, MINIMUM_OUT, &[fill])
+                    .await,
+                bridge
+                    .verify_refund(HopDirection::ToHub, order_id, AMOUNT, &[refund])
+                    .await,
+            )
+        })
+        .await
+        .expect("a payment proof reads the chain once, never waiting for the depth");
+
+        for (proof, tx) in [(fill_proof, fill), (refund_proof, refund)] {
+            assert!(
+                matches!(
+                    proof,
+                    Err(RelayBridgeError::Unconfirmed { tx: unconfirmed, confirmations: 1, required: CONFIRMATIONS })
+                        if unconfirmed == tx
+                ),
+                "{proof:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn receipt_from_a_reorged_out_block_is_not_canonical() {
         let harness = Harness::new().await;
