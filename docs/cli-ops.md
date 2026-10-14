@@ -917,8 +917,11 @@ next resume. The other Relay holds:
   Relay's status once more: a fill or refund it can prove is adopted, a Relay
   failure becomes `SwapFailed`, anything else leaves it held. Resume again
   later; the solver may fill until the order's deadline, about a week.
+  `transfer reconcile` refuses it in this build: if Relay never reports a
+  terminal status, escalate.
 - `SwapDeposited` with a fill or refund that does not prove on chain keeps the
   guard and pages every 30 minutes; check the order with Relay's status API.
+  `transfer reconcile` refuses it too.
 - `SwapFailed` (Relay failed the order with nothing paid back): recover the
   deposit with Relay. USDG it returns to the Robinhood wallet goes into the
   Robinhood cash vault, and USDC it pays on Ethereum goes to Alpaca and is
@@ -954,9 +957,14 @@ next resume. The other Relay holds:
   as in the previous item. Only then run `transfer reconcile --kind usdc`:
   reconciling first leaves the refund outside both venues while the inventory
   counts it as spent.
-- `Redepositing` whose vault deposit does not confirm (dropped or reverted):
-  check the recorded deposit tx and the vault on chain, deposit the USDG by hand
-  if it is still in the Robinhood wallet, then `transfer reconcile --kind usdc`.
+- `Redepositing` whose vault deposit does not confirm (paged "The redeposit into
+  the vault was dropped, reverted or refused"): `transfer reconcile` accepts
+  every `Redepositing` in this build, also one whose vault deposit is still
+  confirming, so act only on that page, and only once the recorded deposit tx
+  reverted, or has no receipt while another mined tx took its nonce: a deposit
+  still pending can mine, and a deposit by hand would then put the USDG in
+  twice. Check the vault on chain, deposit the USDG by hand if it is still in
+  the Robinhood wallet, then `transfer reconcile --kind usdc`.
 
 ### Clearing a pre-burn guard latch
 
