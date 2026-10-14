@@ -8416,6 +8416,150 @@ mod tests {
         quotes.assert_calls(0);
     }
 
+    /// Adopting a reverted order's late fill drops the transfer's lone
+    /// approves, so they are confirmed and their gas queued first: nothing
+    /// sends them again or books their gas once the transfer is `Bridged`.
+    #[tokio::test]
+    async fn adopted_late_fill_queues_the_gas_of_a_split_approve() {
+        let rig = RelayRig::deploy().await;
+        rig.withdraw_to_hub(U256::from(AMOUNT_IN)).await;
+        let late_deposit = rig.deposit_on_hub(REVERTED_ORDER_ID).await;
+        let fill_tx = rig
+            .fill_on_chain(U256::from(AMOUNT_IN), REVERTED_ORDER_ID)
+            .await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_status_of(
+            &relay_api,
+            B256::repeat_byte(0x5e),
+            json!({"status": "success", "inTxHashes": [late_deposit], "txHashes": [fill_tx]}),
+        );
+        let quotes = mock_quote_unavailable(&relay_api);
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let transfer = rig
+            .transfer_through(
+                &server,
+                &relay_api,
+                store.clone(),
+                relay_bounds(),
+                rig.chain.bot_wallet.clone(),
+                BotGasReceiptCostEnqueuer::Enabled(RecordBotGasReceiptCostJobQueue::new(
+                    &apalis_pool,
+                )),
+            )
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_reverted_and_requoted_toward_chain(&rig, &store, &id).await;
+        let approve_step =
+            exact_quote_from_hub(&rig.hub_wallet, rig.hub_contracts, TOWARD_CHAIN_ORDER_ID)
+                .await
+                .approve
+                .unwrap();
+        let approve = rig
+            .hub_wallet
+            .prepare_pending(approve_step.to, approve_step.data, "split approve")
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::PrepareSwapApprove {
+                    approve: approve.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends")
+        .unwrap();
+
+        assert_eq!(
+            store.load(&id).await.unwrap().unwrap().state_name(),
+            "DepositConfirmed"
+        );
+        let queued = queued_gas_costs(&apalis_pool).await;
+        assert!(
+            queued.contains(&(
+                Chain::Ethereum,
+                approve.tx_hash(),
+                "relay_approve".to_string()
+            )),
+            "{queued:?}"
+        );
+        quotes.assert_calls(0);
+    }
+
+    /// A reverted order's deposit held for its payment sends again the
+    /// approves that went out alone: a node may have dropped them, and every
+    /// later send from the wallet waits behind their nonces.
+    #[tokio::test]
+    async fn live_reverted_deposit_hold_sends_its_split_approves_again() {
+        let rig = RelayRig::deploy().await;
+        rig.withdraw_to_hub(U256::from(AMOUNT_IN)).await;
+        let late_deposit = rig.deposit_on_hub(REVERTED_ORDER_ID).await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_status_of(
+            &relay_api,
+            B256::repeat_byte(0x5e),
+            json!({"status": "pending", "inTxHashes": [late_deposit], "txHashes": []}),
+        );
+        mock_quote_unavailable(&relay_api);
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_reverted_and_requoted_toward_chain(&rig, &store, &id).await;
+        let approve_step =
+            exact_quote_from_hub(&rig.hub_wallet, rig.hub_contracts, TOWARD_CHAIN_ORDER_ID)
+                .await
+                .approve
+                .unwrap();
+        let approve = rig
+            .hub_wallet
+            .prepare_pending(approve_step.to, approve_step.data, "split approve")
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::PrepareSwapApprove {
+                    approve: approve.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(60),
+            transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends")
+        .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::RevertedSwapDepositLive { .. }),
+            "got {error:?}"
+        );
+        assert!(
+            rig.hub_wallet
+                .provider()
+                .get_transaction_receipt(approve.tx_hash())
+                .await
+                .unwrap()
+                .is_some(),
+            "the split approve is sent before the hold"
+        );
+    }
+
     /// A reverted order's deposit found on chain with no payment proven yet
     /// holds the transfer at `SwapQuoted`: nothing is signed for the new
     /// order, and the attempt ends for a slow re-read.
