@@ -1135,6 +1135,11 @@ type EquityInventoryUpdate = Box<
 >;
 
 const TIMEOUT_TOMBSTONE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Delay of the sweep's re-arm of an Alpaca-to-chain Relay transfer held at
+/// `WithdrawalComplete`: its job ends after a refused binding quote, and each
+/// re-armed run quotes Relay and reads the withdrawal again.
+const RELAY_HUB_HOLD_REARM_DELAY: Duration = Duration::from_secs(30 * 60);
 const TERMINAL_RESERVATION_RELEASE_RETRY_DELAY: Duration = Duration::from_millis(25);
 const TERMINAL_RESERVATION_RELEASE_ATTEMPTS: u32 = 5;
 
@@ -1159,6 +1164,9 @@ enum UsdcTimeoutCleanup {
         elapsed: Duration,
         corridor: UsdcCorridor,
         amount: Usdc,
+        /// When the job runs: at once, or after the hold cadence for a
+        /// Relay transfer held at the hub, whose run quotes Relay again.
+        delay: Option<Duration>,
     },
     /// An AlpacaToBase transfer stopped after its Alpaca withdrawal with no
     /// confirmed burn (see [`alpaca_to_base_hold_without_confirmed_burn`]).
@@ -2618,6 +2626,7 @@ impl RebalancingService {
                     elapsed,
                     corridor,
                     amount,
+                    delay,
                 } => {
                     // An Alpaca-to-Base pre-burn state timed out with no live job:
                     // re-arm a fresh `TransferUsdcToMarketMaking` redrive instead
@@ -2628,19 +2637,22 @@ impl RebalancingService {
                         aggregate_id = %id,
                         direction = ?tracking.direction,
                         ?elapsed,
+                        ?delay,
                         "AlpacaToBase withdrawal state timed out with no live job; \
                          re-arming TransferUsdcToMarketMaking redrive (guard preserved)"
                     );
-                    self.transfer_usdc_to_market_making_queue
-                        .clone()
-                        .push(TransferUsdcToMarketMaking {
-                            id: id.clone(),
-                            amount,
-                            corridor,
-                            revert_redrive_attempts: 0,
-                            backpressure_streak: BackpressureStreak::default(),
-                        })
-                        .await?;
+                    let job = TransferUsdcToMarketMaking {
+                        id: id.clone(),
+                        amount,
+                        corridor,
+                        revert_redrive_attempts: 0,
+                        backpressure_streak: BackpressureStreak::default(),
+                    };
+                    let mut queue = self.transfer_usdc_to_market_making_queue.clone();
+                    match delay {
+                        Some(delay) => queue.push_with_delay(job, delay).await?,
+                        None => queue.push(job).await?,
+                    }
                     self.usdc_guards
                         .hold(corridor.chain(), &id, tracking.direction);
                 }
@@ -3612,26 +3624,42 @@ impl RebalancingService {
         let usdc_store = self.usdc_store.read().await.as_ref().map(Arc::clone);
         if let Some(store) = usdc_store {
             match store.load(id).await {
-                Ok(Some(
-                    UsdcRebalance::Withdrawing {
-                        direction: RebalanceDirection::AlpacaToBase,
-                        corridor,
-                        amount,
-                        ..
-                    }
-                    | UsdcRebalance::WithdrawalComplete {
-                        direction: RebalanceDirection::AlpacaToBase,
-                        corridor,
-                        amount,
-                        ..
-                    },
-                )) => {
+                Ok(Some(UsdcRebalance::Withdrawing {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    corridor,
+                    amount,
+                    ..
+                })) => {
                     drop(tracking_guard);
                     return Ok(Some(UsdcTimeoutCleanup::ReArmAlpacaToBaseWithdrawal {
                         tracking,
                         elapsed,
                         corridor,
                         amount,
+                        delay: None,
+                    }));
+                }
+                // A Relay transfer here is held at the hub after a refused
+                // binding quote, or its job was lost: re-armed slowly, as
+                // each run quotes Relay again.
+                Ok(Some(UsdcRebalance::WithdrawalComplete {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    corridor,
+                    amount,
+                    ..
+                })) => {
+                    drop(tracking_guard);
+                    let UsdcCorridor::HubRouted { hop, .. } = corridor;
+                    let delay = match hop {
+                        HopKind::Relay => Some(RELAY_HUB_HOLD_REARM_DELAY),
+                        HopKind::Cctp => None,
+                    };
+                    return Ok(Some(UsdcTimeoutCleanup::ReArmAlpacaToBaseWithdrawal {
+                        tracking,
+                        elapsed,
+                        corridor,
+                        amount,
+                        delay,
                     }));
                 }
                 // Tracking can lag the store, so every Relay state after the

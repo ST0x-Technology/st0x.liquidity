@@ -5262,8 +5262,8 @@ left a vault:
    reconciliation, as on CCTP).
 3. The binding quote for the credited amount (`QuoteSwap` -> `SwapQuoted`). A
    refusal pages and leaves the transfer at `WithdrawalComplete`, guard held:
-   once it times out the sweep re-arms its job on every tick, which quotes and
-   pages again, until a quote is accepted or the operator fails it
+   once it times out the sweep re-arms its job 30 minutes out, so it quotes
+   again at that cadence, until a quote is accepted or the operator fails it
    (`fail-usdc-transfer`) and reconciles the USDC at the hub. A transient
    failure is retried.
 4. Before the pair is signed the shared Ethereum wallet's credit ledger is
