@@ -8917,6 +8917,19 @@ handled differently:
     recording intent until after a successful placement, or have the resume path
     re-place idempotently by `client_order_id` instead of only looking the order
     up) and is a documented follow-up, not part of this mechanism.
+  - **Exception -- tokenization and conversion status polls**: a 429 on a status
+    read inside the mint, redemption, or USDC conversion poll is waited out
+    inside the poll (`st0x-alpaca`'s default `BackpressurePolicy`), not returned
+    to the job. Each wait follows `Retry-After`, capped at five minutes, and the
+    poll's own deadline still applies. The reason: these jobs fail the transfer
+    on any poll error, so a returned 429 would fail a mint that Alpaca accepted,
+    a redemption whose tokens were already sent, or a conversion order that can
+    still fill. The cost is that a throttled poll holds its `concurrency(1)`
+    worker, so other symbols' transfers wait behind it. Moving these polls to
+    `BackpressurePolicy::Return` first needs their jobs to keep the aggregate
+    non-terminal on a typed 429 and reschedule (for a conversion, after
+    reconciling the order with `find_conversion_order`). The Alpaca wallet polls
+    do return the 429: the USDC job keeps `DepositInitiated` and reschedules.
 - **Synchronous (CLI) call sites**: no queue row and no sibling job waiting on a
   shared worker, so a classified 429 is retried in place with a small bounded
   attempt budget instead.

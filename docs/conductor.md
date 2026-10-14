@@ -357,6 +357,13 @@ whole backoff window, blocking every other pending item behind it -- the same
 "one item monopolizes the worker" failure shape, just invisible instead of a
 loud fail-stop.
 
+**Exception -- tokenization and conversion status polls**: the mint, redemption,
+and USDC conversion polls do wait out a 429 in place, bounded by the five-minute
+`Retry-After` cap and the poll deadline. Their jobs fail the transfer on any
+poll error, so a returned 429 would fail a transfer that Alpaca is still
+processing. SPEC.md ("Broker rate-limit (429) backpressure") records the cost
+and the follow-up that moves them to a reschedule.
+
 **Mechanism**: a 429 is intercepted _before_ `perform()` returns `Err` at all.
 The job classifies the error, computes a delay, pushes a fresh copy of itself
 onto its own queue after that delay via `push_with_delay`, and returns `Ok(())`.

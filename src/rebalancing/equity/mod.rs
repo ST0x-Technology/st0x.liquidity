@@ -2279,7 +2279,12 @@ fn alpaca_resume_failure_kind(error: &AlpacaTokenizationError) -> ResumeFailureK
         }
         AlpacaTokenizationError::Reqwest(_)
         | AlpacaTokenizationError::Auth(_)
-        | AlpacaTokenizationError::PollTimeout { .. } => Retryable,
+        | AlpacaTokenizationError::PollTimeout { .. }
+        // Only a gateway client or a `gated` scope builds these, and this
+        // crate uses neither. If one ever shows up, the request did not
+        // complete, so retry the resume rather than give up on the transfer.
+        | AlpacaTokenizationError::Gateway(_)
+        | AlpacaTokenizationError::NotSent(_) => Retryable,
         AlpacaTokenizationError::ApiError { .. }
         | AlpacaTokenizationError::PrivateKeyJwtUnsupported
         | AlpacaTokenizationError::JsonParse(_)

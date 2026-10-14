@@ -465,14 +465,15 @@ mod tests {
         let server = MockServer::start();
         let broker = make_broker(&server).await;
 
-        // HTTP 500 produces a transport-level error in the poll GET.
+        // A 400 is permanent, so the poll returns it at once. A 5xx would be
+        // retried until the poll deadline.
         let _poll_mock = server.mock(|when, then| {
             when.method(GET).path(format!(
                 "/v1/trading/accounts/{TEST_ACCOUNT_ID}/orders/{TEST_ORDER_ID}"
             ));
-            then.status(500)
+            then.status(400)
                 .header("content-type", "application/json")
-                .json_body(json!({"message": "internal server error"}));
+                .json_body(json!({"message": "bad request"}));
         });
 
         let (sender, receiver) = TelemetrySender::channel();
@@ -490,7 +491,7 @@ mod tests {
         assert_eq!(rows[0].outcome, "error");
         assert_eq!(
             rows[0].error.as_deref(),
-            Some("Alpaca API error (500 Internal Server Error): internal server error")
+            Some("Alpaca API error (400 Bad Request): bad request")
         );
     }
 
