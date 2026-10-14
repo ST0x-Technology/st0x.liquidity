@@ -44896,11 +44896,11 @@ mod tests {
         assert_eq!(robinhood.amount, usdc(20));
     }
 
-    /// A resumed chain-to-Alpaca transfer on Base counts for Robinhood with
-    /// its persisted amount.
-    #[tokio::test]
-    async fn manual_resume_hold_projects_into_the_trigger() {
-        let trigger = robinhood_trigger_beside_a_base_transfer().await;
+    /// Persists a resumable chain-to-Alpaca transfer of 50 on Base and wires
+    /// the stores into `trigger`.
+    async fn seed_resumable_base_inbound(
+        trigger: &RebalancingService,
+    ) -> (SqlitePool, UsdcRebalanceId) {
         let pool = crate::test_utils::setup_test_db().await;
         let store = test_store::<UsdcRebalance>(pool.clone(), ());
         let base = UsdcRebalanceId(Uuid::new_v4());
@@ -44916,7 +44916,17 @@ mod tests {
             )
             .await
             .unwrap();
-        attach_stores(&trigger, pool.clone(), store).await;
+        attach_stores(trigger, pool.clone(), store).await;
+
+        (pool, base)
+    }
+
+    /// A resumed chain-to-Alpaca transfer on Base counts for Robinhood with
+    /// its persisted amount.
+    #[tokio::test]
+    async fn manual_resume_hold_projects_into_the_trigger() {
+        let trigger = robinhood_trigger_beside_a_base_transfer().await;
+        let (pool, base) = seed_resumable_base_inbound(&trigger).await;
 
         trigger
             .resume_usdc_transfer(&pool, &base, RebalanceDirection::BaseToAlpaca)
@@ -44926,6 +44936,38 @@ mod tests {
 
         let robinhood = pending_transfer_usdc_to_hedging_job_on(&trigger, ROBINHOOD_RELAY).await;
         assert_eq!(robinhood.amount, usdc(20));
+    }
+
+    /// The resume awaits its job-row count and its push after claiming
+    /// Base's guard; the other corridors must count its amount throughout.
+    #[tokio::test]
+    async fn manual_resume_claim_carries_its_amount_before_the_push() {
+        let trigger = robinhood_trigger_beside_a_base_transfer().await;
+        let (pool, base) = seed_resumable_base_inbound(&trigger).await;
+
+        let resuming = Arc::clone(&trigger);
+        let resume = tokio::spawn(async move {
+            resuming
+                .resume_usdc_transfer(&pool, &base, RebalanceDirection::BaseToAlpaca)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !trigger.usdc_guards.is_held(Chain::Base) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the resume must claim Base's guard");
+
+        assert_eq!(
+            trigger
+                .usdc_guards
+                .inbound_elsewhere(Chain::Robinhood)
+                .unwrap(),
+            usdc(50),
+            "a claimed inbound resume must count before its job row is written"
+        );
+        resume.await.unwrap().unwrap();
     }
 
     /// Startup rebuilds the hold of a persisted chain-to-Alpaca transfer
