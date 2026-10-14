@@ -5271,8 +5271,10 @@ left a vault:
    once it times out the sweep re-arms its job 30 minutes out, so it quotes
    again at that cadence (the refusal pages once per transfer and process),
    until a quote is accepted or the operator fails it (`fail-usdc-transfer`) and
-   reconciles the USDC at the hub. A transient failure is quoted again 30
-   seconds later, as in step 3 of the chain-to-Alpaca side.
+   reconciles the USDC at the hub. While that re-arm is queued,
+   `transfer resume` answers `AlreadyInFlight`: the job quotes again within 30
+   minutes. A transient failure is quoted again 30 seconds later, as in step 3
+   of the chain-to-Alpaca side.
 4. Before the pair is signed the shared Ethereum wallet's credit ledger is
    checked against the swap's input, as before a CCTP burn: a shortfall pages
    and does not stop the transfer. The pair is signed on the shared Ethereum
@@ -5323,10 +5325,14 @@ reconcilable in either direction. On the chain-to-Alpaca side only `SwapFailed`,
 `Redepositing` and a destination-side `SwapRefunded` are also reconcilable; on
 the Alpaca-to-chain side `SwapFailed`, `SwapQuoted` and `SwapRefunded` are, as
 each holds the stable at the hub or in the chain wallet with no automated step
-left once paged. The operator exit of a chain-to-Alpaca transfer held at
-`WithdrawalComplete` or `SwapQuoted` is
-`transfer resume --kind usdc --direction to-alpaca`: the job re-quotes and
-signs, or redeposits on a refusal, as the bot's own retry does. An
+left once paged. The predicate reads no hold marker, so it also accepts an
+Alpaca-to-chain `SwapQuoted` or `SwapRefunded` whose job still drives it (a
+fresh quote, a revert's redrive, a refund being quoted again): the operator
+reconciles one only after its hold's page. A reconcile that lands while the job
+runs ends it there, since `Reconciled` refuses every later swap command. The
+operator exit of a chain-to-Alpaca transfer held at `WithdrawalComplete` or
+`SwapQuoted` is `transfer resume --kind usdc --direction to-alpaca`: the job
+re-quotes and signs, or redeposits on a refusal, as the bot's own retry does. An
 Alpaca-to-chain transfer held at `WithdrawalComplete` after a refused binding
 quote resumes the same way, `--direction to-raindex`, or is failed with
 `fail-usdc-transfer` and reconciled. On the shared Ethereum wallet's credit
@@ -5334,7 +5340,11 @@ ledger an Ethereum-origin `SwapQuoted` is held credit, a persisted Ethereum pair
 is in flight, and a refund paid in Ethereum USDC (`SwapRefunded` on the Ethereum
 side) is held credit, so a Base deposit send that would spend the USDC a Relay
 swap is about to deposit or was refunded pages a shortfall. The ledger only
-pages: it reserves nothing and does not block the send.
+pages: it reserves nothing and does not block the send. A persisted pair has no
+operator exit in this build (`transfer reconcile` and `fail-usdc-transfer`
+refuse `SwapDepositPrepared`, and a resume only sends the same bytes again), so
+a pending Relay approve or deposit is never cancelled or replaced at its nonce
+by hand: the transfer would keep its guard with nothing to move it on.
 `transfer recheck --kind usdc` refuses Relay transfers in this build: a Relay
 `DepositFailed` is settled with `transfer reconcile`.
 
@@ -7691,12 +7701,14 @@ a post-burn BaseToAlpaca `BridgingFailed`. Startup never re-arms
 `WithdrawalComplete` or `BridgingSubmitting`: a re-drive there can submit a
 second burn. Reconcilable failures (`DepositFailed`, a `BridgingFailed` with
 burn evidence or in the AlpacaToBase direction, a BaseToAlpaca
-`ConversionFailed`, and the Relay holds `SwapFailed`, `Redepositing`, and a
-`SwapRefunded` below its refund floor or paid on Ethereum) keep the guard held
-until the operator settles them with `transfer reconcile --kind usdc`. All other
-guarded states keep the guard held and page the operator for manual recovery. A
-candidate that cannot be loaded or parsed at boot, or a post-burn failure whose
-corridor the running bot cannot read, latches every corridor until a restart.
+`ConversionFailed`, and the Relay holds (see "Relay hop"): `SwapFailed`, a
+`SwapRefunded` below its refund floor, a chain-to-Alpaca `Redepositing` or
+`SwapRefunded` paid on Ethereum, and an Alpaca-to-chain `SwapQuoted` or
+`SwapRefunded`) keep the guard held until the operator settles them with
+`transfer reconcile --kind usdc`. All other guarded states keep the guard held
+and page the operator for manual recovery. A candidate that cannot be loaded or
+parsed at boot, or a post-burn failure whose corridor the running bot cannot
+read, latches every corridor until a restart.
 
 **Operator recovery of a pre-burn stranded guard latch**: A USDC rebalance can
 become stranded in `WithdrawalComplete` (pre-bridging, no burn intent recorded)
@@ -7801,16 +7813,20 @@ tick, finds `Reconciled`, applies the source-venue inflight reconciliation with
 **post-burn semantics** (zeroing source-venue inflight WITHOUT crediting
 `available`, because the funds already left the source venue -- it is NOT a
 cancel, which would wrongly credit available), and clears the guard. No restart
-is required. The command is valid ONLY from a terminal failure that strands the
-guard: `DepositFailed` (the CCTP mint landed but the destination deposit
-failed), a `BridgingFailed` with burn evidence (a `burn_tx_hash` is recorded),
-any `AlpacaToBase` `BridgingFailed` (post-withdrawal, so the funds are off
-Alpaca even without burn evidence -- the settlement-retry-deadline terminal), or
-a `BaseToAlpaca` `ConversionFailed` (the post-deposit USDC->USD leg), or one of
-the Relay holds `SwapFailed`, `Redepositing`, and a `SwapRefunded` below its
-refund floor or paid on Ethereum (see "Relay hop"). Every other state is
-rejected -- an in-progress transfer must be resumed, and a failure whose funds
-never left the source venue reconciles to source on its own. Because
+is required, except for a transfer that still holds signed Relay envelopes (an
+Alpaca-to-chain `SwapQuoted` whose approves went out alone): the running bot
+keeps their nonces reserved until a restart, and the reconcile pages and says
+so. The command is valid ONLY from a terminal failure that strands the guard:
+`DepositFailed` (the CCTP mint landed but the destination deposit failed), a
+`BridgingFailed` with burn evidence (a `burn_tx_hash` is recorded), any
+`AlpacaToBase` `BridgingFailed` (post-withdrawal, so the funds are off Alpaca
+even without burn evidence -- the settlement-retry-deadline terminal), or a
+`BaseToAlpaca` `ConversionFailed` (the post-deposit USDC->USD leg), or one of
+the Relay holds (see "Relay hop"): `SwapFailed`, a `SwapRefunded` below its
+refund floor, a chain-to-Alpaca `Redepositing` or `SwapRefunded` paid on
+Ethereum, and an Alpaca-to-chain `SwapQuoted` or `SwapRefunded`. Every other
+state is rejected -- an in-progress transfer must be resumed, and a failure
+whose funds never left the source venue reconciles to source on its own. Because
 `Reconciled` is a clearable terminal, a restart does not re-latch the guard, and
 automatic USDC rebalancing resumes.
 
