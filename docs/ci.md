@@ -12,13 +12,23 @@ feature-branch push and its pull request would create two check sets for one
 commit. A skipped or stale duplicate could then hide the result that branch
 protection was meant to require.
 
-Retargeting a PR emits an `edited` event and reruns CI against the new base.
-GitHub emits the same event for title and body edits, which change no code. All
-subscribed events for a pull request share one concurrency group, so a later
+CI does not subscribe to the `edited` event. GitHub emits it for title and body
+edits, which change no code, and each such event would cancel the running CI and
+restart the full suite. GitHub also emits `edited` when a PR's base is
+retargeted, for example when the parent of a stacked PR merges. That case needs
+no extra run: the `master` ruleset requires branches to be up to date with the
+required `backend`, `dashboard`, and `hooks` checks, so a retargeted PR whose
+head lacks the new base tip cannot merge until a new push (the Graphite restack
+and `gt submit`) emits `synchronize`. Graphite merge queue draft PRs open
+against the previous `gtmq_spec_*` branch and are later retargeted to `master`;
+their `opened` run already tests the same tree, because each speculative branch
+builds on the one before it.
+
+All subscribed events for a pull request share one concurrency group, so a later
 event cancels and replaces an older run. The replacement performs the same
-validation even when only PR metadata changed. This avoids a race where a head
-or base update is cancelled and the surviving run reports the required jobs as
-skipped, which GitHub treats as successful.
+validation. This avoids a race where a head update is cancelled and the
+surviving run reports the required jobs as skipped, which GitHub treats as
+successful.
 
 The required checks are never gated by the Graphite CI optimizer. In particular,
 middle-of-stack PRs run their own backend validation rather than relying on a
