@@ -1101,9 +1101,11 @@ where
         Ok(())
     }
 
-    /// Sends again the approves of a `SwapQuoted` that went out alone, then
-    /// returns the stable to the vault: the vault deposit takes the nonce
-    /// after theirs, and a node may have dropped them.
+    /// Sends again the approves of a `SwapQuoted` that went out alone and
+    /// confirms them, then returns the stable to the vault: the vault deposit
+    /// takes the nonce after theirs, a node may have dropped them, and
+    /// `BeginRedeposit` drops them from the transfer, so nothing would send
+    /// them again.
     async fn redeposit_after_split_approves(
         &self,
         id: &UsdcRebalanceId,
@@ -1114,6 +1116,14 @@ where
         self.hop
             .broadcast_split_approves(id, split_approves, deadline)
             .await?;
+        for approve in split_approves {
+            self.hop
+                .bridge
+                .confirm_approve(TO_HUB, approve)
+                .await
+                .inspect_err(|error| warn!(target: "rebalance", %id, approve = %approve.tx_hash(), %error, "A lone Relay approve is not confirmed; the redeposit waits for the retry to send it again"))
+                .map_err(Box::new)?;
+        }
         self.redeposit(id, reason).await
     }
 
