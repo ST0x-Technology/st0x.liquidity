@@ -46555,7 +46555,14 @@ mod tests {
                 expected
             );
 
-            let trigger = sweep_stale_relay_transfer(&pool, store, &id, usdc(100)).await;
+            let trigger = sweep_timed_out_relay_transfer(
+                &pool,
+                store,
+                &id,
+                usdc(100),
+                usdc::UsdcRebalanceStage::WithdrawalConfirmed,
+            )
+            .await;
 
             assert!(
                 trigger.usdc_guards.is_held(Chain::Robinhood),
@@ -46597,7 +46604,14 @@ mod tests {
             store.send(&id, command).await.unwrap();
         }
 
-        let trigger = sweep_stale_relay_transfer(&pool, store, &id, amount).await;
+        let trigger = sweep_timed_out_relay_transfer(
+            &pool,
+            store,
+            &id,
+            amount,
+            usdc::UsdcRebalanceStage::WithdrawalConfirmed,
+        )
+        .await;
 
         assert!(
             trigger.usdc_guards.is_held(Chain::Robinhood),
