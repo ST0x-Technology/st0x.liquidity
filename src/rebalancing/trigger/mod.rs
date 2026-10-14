@@ -7251,12 +7251,16 @@ impl RebalancingService {
         // 2. Another holder on this corridor does not: gate 2 proved it holds
         // nothing durably (a racing trigger claim, or one a separate process
         // already made terminal), so this id joins it as a holder once the
-        // push succeeds.
+        // push succeeds. A claim records its amount at once, so the other
+        // corridors count it through the awaits below.
         let claim = match self
             .usdc_guards
             .try_claim(state.corridor().chain(), id, direction)
         {
-            Ok(claim) => Some(claim),
+            Ok(claim) => {
+                self.usdc_guards.record_amount(id, state.amount());
+                Some(claim)
+            }
             Err(ClaimRefusal::CorridorHeld) => None,
             Err(
                 refusal @ (ClaimRefusal::AlpacaOutboundElsewhere | ClaimRefusal::CorridorUnread),
