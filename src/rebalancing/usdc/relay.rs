@@ -6411,6 +6411,131 @@ mod tests {
         assert!(state.holds_rebalance_guard());
     }
 
+    /// A refund at the hub that Relay quotes again within the first
+    /// deposit's floor is re-quoted and its next pair signed and sent:
+    /// `RequoteSwap` counts the re-quote and keeps the refunded order id
+    /// among the signed ones, and the new order's deposit moves the
+    /// refunded USDC from the hub.
+    #[tokio::test]
+    async fn refund_toward_chain_requote_signs_the_next_pair() {
+        // The quote names Ethereum's chain id, stable and depository, which
+        // the signer checks: the mocks' code is set at the pinned addresses.
+        let anvil = spawn_anvil(Anvil::new().chain_id(1));
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let contracts = RelayEndContracts {
+            stable: Chain::Ethereum.settlement_stable().address,
+            depository: Chain::Ethereum.relay_depository().unwrap(),
+        };
+        let deployer = RelayRig::signer_on(&anvil);
+        let mocks = st0x_bridge::relay::deploy_relay_end(&deployer)
+            .await
+            .unwrap();
+        for (mock, pinned) in [
+            (mocks.stable, contracts.stable),
+            (mocks.depository, contracts.depository),
+        ] {
+            let code = deployer.get_code_at(mock).await.unwrap();
+            deployer.anvil_set_code(pinned, code).await.unwrap();
+        }
+        let refunded = U256::from(99_500_000_u64);
+        MintableStable::new(contracts.stable, &deployer)
+            .mint(wallet.address(), refunded)
+            .send()
+            .await
+            .unwrap()
+            .watch()
+            .await
+            .unwrap();
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let request = QuoteRequest {
+            origin: Chain::Ethereum,
+            destination: Chain::Robinhood,
+            amount: refunded,
+            user: wallet.address(),
+            recipient: wallet.address(),
+            refund_to: wallet.address(),
+            slippage: BasisPoints::new(relay_bounds().slippage_bps).unwrap(),
+            ttl: relay_bounds().fill_timeout,
+        };
+        let requote = relay_api.mock(|when, then| {
+            when.method(POST).path("/quote/v2");
+            then.status(200)
+                .json_body(quote_body_for_test(&request, refunded, refunded));
+        });
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = relay_transfer_with_bounds(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet.clone(),
+            contracts,
+            store.clone(),
+            RelayHopCtx {
+                min_transfer: Usdc::new(float!(10)),
+                ..relay_bounds()
+            },
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited_toward_chain(&store, &id, TOWARD_CHAIN_ORDER_ID).await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::RecordSwapRefund {
+                    refund_tx: TxHash::repeat_byte(0xe1),
+                    side: RefundSide::Origin,
+                    amount_refunded: refunded,
+                },
+            )
+            .await
+            .unwrap();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends");
+
+        requote.assert_calls(1);
+        let state = store.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::SwapDeposited {
+            quote,
+            refund_requotes,
+            signed_order_ids,
+            deposit_tx,
+            ..
+        } = &state
+        else {
+            panic!("expected SwapDeposited, got {state:?} after {outcome:?}");
+        };
+        assert_eq!(*refund_requotes, 1);
+        assert_eq!(quote.amount_in, refunded);
+        assert_ne!(quote.order_id, TOWARD_CHAIN_ORDER_ID);
+        assert_eq!(
+            signed_order_ids,
+            &vec![TOWARD_CHAIN_ORDER_ID, quote.order_id],
+            "the refunded order id stays signed"
+        );
+        let receipt = wallet
+            .provider()
+            .get_transaction_receipt(*deposit_tx)
+            .await
+            .unwrap()
+            .expect("the new deposit is mined");
+        assert!(receipt.status());
+        assert_eq!(receipt.to, Some(contracts.depository));
+        assert_eq!(
+            erc20_balance(&wallet, contracts.stable, wallet.address()).await,
+            U256::ZERO,
+            "the refunded USDC went to Relay"
+        );
+        assert!(state.holds_rebalance_guard());
+        assert_fill_pending(&outcome);
+    }
+
     /// A Relay 5xx on the quote for a refund at the hub ends the job's
     /// attempt with a re-queue at no retry cost: apalis's few quick retries
     /// would otherwise dead-letter the job within seconds and leave nothing
