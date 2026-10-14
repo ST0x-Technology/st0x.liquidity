@@ -191,10 +191,11 @@ projection errs high (a landed transfer counted for a moment, a stuck one until
 resolved) and must only shrink a transfer, never grow a withdrawal. The amounts
 stay in memory: startup records them from the persisted transfers it holds and
 from the live job rows whose transfer has not written its first event yet, so a
-job queued just before a restart still counts. With a cash reserve, the stale
-gross Alpaca figure after a landed transfer reads low until RAI-3398. Corridors
-are still sized one after another in chain order, so with uneven chain balances
-the first one can land below its band once a later one's transfer lands, and
-cash moves back through Alpaca for a few checks; this coupling is accepted as a
-risk on RAI-3385, to revisit with a joint cash allocation if it shows up in
-production.
+job queued just before a restart still counts. Two cases read low: a live job
+row whose payload or transfer cannot be read, which only the queue check counts,
+and, with a cash reserve, the stale gross Alpaca figure after a landed transfer
+until RAI-3398. Corridors are still sized one after another in chain order, so
+with uneven chain balances the first one can land below its band once a later
+one's transfer lands, and cash moves back through Alpaca for a few checks; this
+coupling is accepted as a risk on RAI-3385, to revisit with a joint cash
+allocation if it shows up in production.

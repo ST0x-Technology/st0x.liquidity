@@ -8912,16 +8912,16 @@ impl RebalancingService {
         let stranded_after_exhaustion = self.rearm_stranded_transfers(rearm_candidates).await?;
         stranded_held_ids.extend(stranded_after_exhaustion);
 
-        // An unparseable candidate aggregate_id cannot be loaded or classified,
-        // so it joins the unresolved set: hold the guard rather than risk leaving
-        // a possibly-post-burn rebalance unguarded. Same fail-closed direction as
-        // a missing or unloadable aggregate above.
         for (id, corridor, direction, amount) in &held {
             self.usdc_guards
                 .hold(corridor.chain(), id, *direction, *amount);
         }
         self.hold_live_usdc_job_rows(usdc_store).await?;
 
+        // An unparseable candidate aggregate_id cannot be loaded or classified,
+        // so it joins the unresolved set: hold the guard rather than risk leaving
+        // a possibly-post-burn rebalance unguarded. Same fail-closed direction as
+        // a missing or unloadable aggregate above.
         if held.is_empty() && unresolved_ids.is_empty() && unparseable.is_empty() {
             return Ok(());
         }
@@ -8969,15 +8969,11 @@ impl RebalancingService {
         Ok(())
     }
 
-    /// Holds the corridor of each live job row whose transfer has recorded
-    /// nothing yet, with its amount: startup rebuilds every other hold from
-    /// the persisted transfer, and a job queued just before the restart has
-    /// none until its first event. A row whose transfer has recorded events,
-    /// a zombie included, is left to that transfer's state, and so is one
-    /// whose transfer cannot be read: a hold nothing would release is worse
-    /// than the queue check alone. The hold is released like any other: by
-    /// the transfer's terminal event, or by the job's last attempt when it
-    /// records nothing.
+    /// Holds, with its amount, the corridor of each live job row whose
+    /// transfer has recorded nothing yet: a job queued just before the
+    /// restart has no persisted transfer to rebuild from. A row whose transfer
+    /// has events (a zombie included) or cannot be read gets no hold, since
+    /// nothing might ever release it; the queue check still counts the row.
     async fn hold_live_usdc_job_rows(
         &self,
         usdc_store: &Store<UsdcRebalance>,
@@ -45354,7 +45350,7 @@ mod tests {
 
     /// Queues a Base to Alpaca job row for `id` and sets its status with
     /// `status_update` (a `SET` clause), as a restart finds it.
-    async fn hedging_job_row(
+    async fn queue_hedging_job_row(
         service: &RebalancingService,
         id: &UsdcRebalanceId,
         corridor: UsdcCorridor,
@@ -45386,7 +45382,7 @@ mod tests {
     /// Startup holds a live job row's corridor with its amount, though the
     /// transfer has recorded nothing yet; an Alpaca to chain row holds its
     /// corridor but adds nothing inbound. A zombie row (its transfer already
-    /// ended) and a done row hold nothing.
+    /// ended), an exhausted row and a done row hold nothing.
     #[tokio::test]
     async fn recover_usdc_guard_holds_live_job_rows_with_their_amount() {
         let pool = crate::test_utils::setup_test_db().await;
@@ -45396,7 +45392,7 @@ mod tests {
         seed_terminal_usdc_aggregate(&store, &zombie).await;
 
         let pending = UsdcRebalanceId(Uuid::new_v4());
-        hedging_job_row(
+        queue_hedging_job_row(
             &service,
             &pending,
             UsdcCorridor::BASE_CCTP,
@@ -45405,7 +45401,7 @@ mod tests {
         )
         .await;
         let retryable = UsdcRebalanceId(Uuid::new_v4());
-        hedging_job_row(
+        queue_hedging_job_row(
             &service,
             &retryable,
             ETHEREUM_CCTP,
@@ -45413,7 +45409,7 @@ mod tests {
             "status = 'Failed', attempts = max_attempts - 1",
         )
         .await;
-        hedging_job_row(
+        queue_hedging_job_row(
             &service,
             &zombie,
             UsdcCorridor::BASE_CCTP,
@@ -45421,8 +45417,17 @@ mod tests {
             "status = 'Failed', attempts = max_attempts - 1",
         )
         .await;
+        let exhausted = UsdcRebalanceId(Uuid::new_v4());
+        queue_hedging_job_row(
+            &service,
+            &exhausted,
+            ETHEREUM_CCTP,
+            usdc(600),
+            "status = 'Failed', attempts = max_attempts",
+        )
+        .await;
         let done = UsdcRebalanceId(Uuid::new_v4());
-        hedging_job_row(
+        queue_hedging_job_row(
             &service,
             &done,
             ETHEREUM_CCTP,
@@ -45455,6 +45460,7 @@ mod tests {
             Some(Chain::Ethereum)
         );
         assert_eq!(service.usdc_guards.held_chain(&zombie), None);
+        assert_eq!(service.usdc_guards.held_chain(&exhausted), None);
         assert_eq!(service.usdc_guards.held_chain(&done), None);
         assert_eq!(
             service.usdc_guards.held_chain(&outbound),
@@ -45475,7 +45481,7 @@ mod tests {
     async fn startup_hold_of_a_live_job_row_is_freed_when_the_job_dies_unrecorded() {
         let (trigger, pool, store) = make_resume_trigger().await;
         let id = UsdcRebalanceId(Uuid::new_v4());
-        hedging_job_row(
+        queue_hedging_job_row(
             &trigger,
             &id,
             UsdcCorridor::BASE_CCTP,
@@ -45485,6 +45491,13 @@ mod tests {
         .await;
         trigger.recover_usdc_guard(&pool, &store).await.unwrap();
         assert_eq!(trigger.usdc_guards.held_chain(&id), Some(Chain::Base));
+        assert_eq!(
+            trigger
+                .usdc_guards
+                .inbound_elsewhere(Chain::Robinhood)
+                .unwrap(),
+            usdc(50)
+        );
 
         run_hedging_job_until_dead_letter(&trigger, &store).await;
 
