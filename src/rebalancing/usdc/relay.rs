@@ -24,8 +24,10 @@
 use alloy::primitives::{Address, B256, TxHash, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use itertools::Itertools as _;
 use sqlx::SqlitePool;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 use std::sync::{Arc, PoisonError};
 use std::time::{Duration, SystemTime};
 use tokio::sync::{Mutex, OwnedMutexGuard};
@@ -1782,9 +1784,13 @@ where
                 // Relay.
                 let deposits = found
                     .iter()
-                    .map(|(deposit, quote)| (deposit.tx, quote.order_id))
-                    .collect::<Vec<_>>();
-                error!(target: "operational_alert", alert = true, kind = AlertKind::RevertedRelayOrderDepositsOnChain.as_str(), %id, ?deposits, "Deposits of several reverted Relay orders are on chain; the transfer adopts none and holds its guard at SwapQuoted for the operator");
+                    .map(|(deposit, quote)| PagedDeposit {
+                        request_id: quote.request_id,
+                        order_id: quote.order_id,
+                        deposit_tx: deposit.tx,
+                    })
+                    .join(", ");
+                error!(target: "operational_alert", alert = true, kind = AlertKind::RevertedRelayOrderDepositsOnChain.as_str(), %id, %deposits, "Deposits of several reverted Relay orders are on chain; the transfer adopts none and holds its guard at SwapQuoted for the operator: check each listed request with `stox relay status`");
                 self.confirm_split_approves(id, split_approves, side)
                     .await?;
                 return Err(UsdcTransferError::RevertedSwapDepositLive {
@@ -2332,6 +2338,28 @@ struct PairSigning {
 enum RecheckAdoption {
     DepositedOrder,
     FailedOrder { deposit_tx: TxHash },
+}
+
+/// A deposit of a reverted order, as a page lists it: `request_id` is the
+/// key `stox relay status` takes.
+struct PagedDeposit {
+    request_id: B256,
+    order_id: B256,
+    deposit_tx: TxHash,
+}
+
+impl fmt::Display for PagedDeposit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            request_id,
+            order_id,
+            deposit_tx,
+        } = self;
+        write!(
+            formatter,
+            "request {request_id} (order {order_id}, deposit {deposit_tx})"
+        )
+    }
 }
 
 /// What Relay and the chain say of a signed order's payment.
