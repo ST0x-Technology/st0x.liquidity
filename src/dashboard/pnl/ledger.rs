@@ -755,14 +755,15 @@ async fn ingest_bot_gas(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, TxHash, U256};
+    use alloy::primitives::{Address, B256, TxHash, U256};
     use chrono::TimeZone;
     use serde_json::Value;
     use uuid::Uuid;
 
+    use st0x_bridge::corridor::{HopKind, UsdcCorridor};
     use st0x_config::ExecutionThreshold;
-    use st0x_event_sorcery::{StoreBuilder, compact_events};
-    use st0x_evm::Chain;
+    use st0x_event_sorcery::{StoreBuilder, compact_events, test_store};
+    use st0x_evm::{Chain, PreparedTransaction};
     use st0x_execution::{ExecutorOrderId, SupportedExecutor};
     use st0x_finance::{FractionalShares, Positive, Symbol, Usd, Usdc};
     use st0x_float_macro::float;
@@ -772,7 +773,10 @@ mod tests {
     use crate::offchain::order::OffchainOrderId;
     use crate::position::{PositionCommand, TradeId, TriggerReason};
     use crate::test_utils::{persist_event, pool_migrated_up_to, setup_test_db};
-    use crate::usdc_rebalance::UsdcRebalanceId;
+    use crate::usdc_rebalance::{
+        RebalanceDirection, ReconcileReason, RedepositReason, RefundSide, TransferRef,
+        UsdcRebalanceCommand, UsdcRebalanceId, swap_quote_for_test,
+    };
 
     use super::*;
 
@@ -877,6 +881,92 @@ mod tests {
             assert_eq!(row, (relayer_fee.to_string(), swap_cost.to_string()));
         }
         assert_eq!(count(&pool, "pnl_cost_entry").await, 0);
+    }
+
+    /// A proven refund books what it kept back on either side, so a refund
+    /// the operator reconciles shows its loss, and the redeposit after an
+    /// origin refund does not book it a second time.
+    #[tokio::test]
+    async fn relay_refund_books_its_shortfall_once_on_either_path() {
+        let pool = setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let reconciled = UsdcRebalanceId(Uuid::new_v4());
+        let redeposited = UsdcRebalanceId(Uuid::new_v4());
+
+        for (id, side) in [
+            (&reconciled, RefundSide::Destination),
+            (&redeposited, RefundSide::Origin),
+        ] {
+            let deposit = PreparedTransaction::for_test(TxHash::random(), 7);
+            let mut commands = vec![
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    corridor: UsdcCorridor::HubRouted {
+                        chain: Chain::Robinhood,
+                        hop: HopKind::Relay,
+                    },
+                    amount: Usdc::new(float!(100)),
+                    withdrawal: TransferRef::OnchainTx(TxHash::random()),
+                },
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+                UsdcRebalanceCommand::QuoteSwap {
+                    quote: Box::new(swap_quote_for_test(
+                        U256::from(100_000_000u64),
+                        B256::random(),
+                    )),
+                },
+                UsdcRebalanceCommand::PrepareSwapDeposit {
+                    approve: None,
+                    deposit: deposit.clone(),
+                },
+                UsdcRebalanceCommand::ConfirmSwapDeposit {
+                    deposit_tx: deposit.tx_hash(),
+                    deposit_block: 9,
+                },
+                UsdcRebalanceCommand::RecordSwapRefund {
+                    refund_tx: TxHash::random(),
+                    side,
+                    amount_refunded: U256::from(99_600_000u64),
+                },
+            ];
+            let redeposit = TxHash::random();
+            commands.extend(match side {
+                RefundSide::Destination => vec![UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: ReconcileReason::FundsMovedManually,
+                }],
+                RefundSide::Origin => vec![
+                    UsdcRebalanceCommand::BeginRedeposit {
+                        reason: RedepositReason::Refunded,
+                    },
+                    UsdcRebalanceCommand::RecordRedeposit {
+                        deposit_tx: redeposit,
+                    },
+                    UsdcRebalanceCommand::ConfirmRedeposit {
+                        deposit_tx: redeposit,
+                        deposit_block: Some(12),
+                    },
+                ],
+            });
+            for command in commands {
+                store.send(id, command).await.unwrap();
+            }
+        }
+
+        PnlLedger::new(pool.clone()).catch_up().await.unwrap();
+
+        for id in [reconciled, redeposited] {
+            let rows: Vec<(String, String)> = sqlx::query_as(
+                "SELECT relayer_fee_usd, swap_cost_usd FROM pnl_relay_cost \
+                 WHERE aggregate_id = ?1",
+            )
+            .bind(id.to_string())
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(rows, vec![("0".to_string(), "0.4".to_string())], "{id}");
+        }
     }
 
     #[tokio::test]
