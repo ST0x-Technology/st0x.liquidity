@@ -352,7 +352,7 @@ paged, guard kept.
 ## Operator lookup
 
 `stox relay status <request_id>` reads `GET /intents/status/v3` once with the
-same client the bot uses and prints the parsed status, its reasons and every tx
-Relay lists. What the bot does with each state, and the operator action for
-every hold, is in `docs/cli-ops.md` ("Robinhood Relay transfer runbook") and
+bot's client, without its API key, and prints the parsed status, its reasons and
+every tx Relay lists. What the bot does with each state, and the operator action
+for every hold, is in `docs/cli-ops.md` ("Robinhood Relay transfer runbook") and
 SPEC.md ("Relay recovery").

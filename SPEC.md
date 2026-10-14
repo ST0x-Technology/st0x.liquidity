@@ -4766,10 +4766,17 @@ enum RecoveredSwapPayment {
 }
 
 // The same payment as `SwapCompletionRecovered` records it; a fill carries the
-// fee split `RelayFillVerified` does.
+// fee split `RelayFillVerified` does, a refund the first deposit's refund floor
+// when it is below it and its shortfall, as `SwapRefunded` does.
 enum SwapRecovery {
     Fill { fill_tx: TxHash, amount_received: Usdc, fee_collected: Usdc, relayer_fee: Usdc },
-    Refund { refund_tx: TxHash, side: RefundSide, amount_refunded: Usdc },
+    Refund {
+        refund_tx: TxHash,
+        side: RefundSide,
+        amount_refunded: Usdc,
+        short_of_floor: Option<U256>,
+        shortfall: Usdc,
+    },
 }
 
 // The accepted Relay quote a swap deposit funds, persisted whole so a resume
@@ -5402,7 +5409,11 @@ signing a second deposit while an earlier one may still land:
   quote) and never reaches a CCTP burn. A short or destination-side
   `SwapRefunded` and a `SwapFailed` are holds for the operator and are not
   re-armed; a short late refund adopted by the escrow scan or by
-  `transfer recheck` (which pages it) holds the same way.
+  `transfer recheck` (which pages it) holds the same way. The vault deposit of a
+  `Redepositing` is recorded only after its broadcast, so a crash between the
+  two leaves no tx to confirm, and the re-armed job sends a second deposit: it
+  reverts and pages when the first one already took the USDG, or, with more USDG
+  in the wallet, lands too.
 - **Re-broadcast, never re-sign.** The persisted envelopes are restored before
   any other send from their wallet (see "Relay hop"), and a resume of
   `SwapDepositPrepared` broadcasts exactly those bytes. A new pair is signed
