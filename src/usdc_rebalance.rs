@@ -363,12 +363,9 @@ pub enum UsdcRebalanceError {
     /// The redeposit's vault deposit is already recorded.
     #[error("the redeposit {deposit_tx} is already recorded")]
     RedepositAlreadySubmitted { deposit_tx: TxHash },
-    /// The withdrawn amount less the redeposited one does not compute.
-    #[error("redeposit of {redeposit_amount} against {amount} withdrawn does not compute")]
-    RedepositShortfallUncomputable {
-        amount: Usdc,
-        redeposit_amount: Usdc,
-    },
+    /// The deposit less the refund does not compute.
+    #[error("refund of {refunded} against {deposited} deposited does not compute")]
+    RefundShortfallUncomputable { deposited: Usdc, refunded: Usdc },
     /// The confirmed redeposit is not the recorded one, or none is recorded.
     #[error("redeposit {confirmed} is not the recorded redeposit {recorded:?}")]
     RedepositHashMismatch {
@@ -882,12 +879,14 @@ pub enum UsdcRebalanceEvent {
         filled_at: DateTime<Utc>,
     },
     /// Relay's refund of the deposit, proven on `side`. `short_of_floor` is
-    /// the first deposit's refund floor when the refund is below it.
+    /// the first deposit's refund floor when the refund is below it;
+    /// `shortfall` is the deposit less the refund: what the refund kept back.
     SwapRefunded {
         refund_tx: TxHash,
         side: RefundSide,
         amount_refunded: Usdc,
         short_of_floor: Option<U256>,
+        shortfall: Usdc,
         refunded_at: DateTime<Utc>,
     },
     /// The fill window passed with no fill and no refund.
@@ -909,13 +908,10 @@ pub enum UsdcRebalanceEvent {
         submitted_at: DateTime<Utc>,
     },
     /// The redeposit is mined: the stable is back in the vault.
-    /// `shortfall` is the withdrawn amount less `redeposit_amount`: what a
-    /// refund kept back.
     ReturnedToSource {
         deposit_tx: TxHash,
         deposit_block: Option<u64>,
         redeposit_amount: Usdc,
-        shortfall: Usdc,
         returned_at: DateTime<Utc>,
     },
     /// Bridging failed. Preserves burn data when available for debugging.
@@ -4184,6 +4180,7 @@ impl EventSourced for UsdcRebalance {
                     amount_refunded,
                     short_of_floor,
                     refunded_at,
+                    ..
                 },
                 Self::SwapDeposited {
                     direction,
@@ -6239,12 +6236,20 @@ impl UsdcRebalance {
             .map_err(|_| UsdcRebalanceError::SwapInputUnconvertible {
                 amount_in: amount_refunded,
             })?;
+        let deposited = swap_input(quote)?;
+        let shortfall = (deposited - amount_refunded).map_err(|_| {
+            UsdcRebalanceError::RefundShortfallUncomputable {
+                deposited,
+                refunded: amount_refunded,
+            }
+        })?;
 
         Ok(vec![UsdcRebalanceEvent::SwapRefunded {
             refund_tx,
             side,
             amount_refunded,
             short_of_floor,
+            shortfall,
             refunded_at: Utc::now(),
         }])
     }
@@ -6341,7 +6346,6 @@ impl UsdcRebalance {
         deposit_block: Option<u64>,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         let Self::Redepositing {
-            amount,
             redeposit_amount,
             deposit_tx: recorded,
             ..
@@ -6360,18 +6364,10 @@ impl UsdcRebalance {
             });
         }
 
-        let shortfall = (*amount - *redeposit_amount).map_err(|_| {
-            UsdcRebalanceError::RedepositShortfallUncomputable {
-                amount: *amount,
-                redeposit_amount: *redeposit_amount,
-            }
-        })?;
-
         Ok(vec![UsdcRebalanceEvent::ReturnedToSource {
             deposit_tx,
             deposit_block,
             redeposit_amount: *redeposit_amount,
-            shortfall,
             returned_at: Utc::now(),
         }])
     }
@@ -7384,6 +7380,7 @@ mod tests {
                 side: RefundSide::Destination,
                 amount_refunded: Usdc::new(float!(99.5)),
                 short_of_floor: None,
+                shortfall: Usdc::new(float!(0.5)),
                 refunded_at: Utc::now(),
             }),
             after_deposit(UsdcRebalanceEvent::SwapEscrowUnresolved {
@@ -7619,6 +7616,7 @@ mod tests {
                 side: RefundSide::Destination,
                 amount_refunded: Usdc::new(float!(99.5)),
                 short_of_floor: None,
+                shortfall: Usdc::new(float!(0.5)),
                 refunded_at: Utc::now(),
             }],
         ]
@@ -7756,6 +7754,7 @@ mod tests {
                     side,
                     amount_refunded: Usdc::new(float!(99.5)),
                     short_of_floor: None,
+                    shortfall: Usdc::new(float!(0.5)),
                     refunded_at: Utc::now(),
                 }],
             ]
@@ -8038,6 +8037,7 @@ mod tests {
             side,
             amount_refunded: Usdc::new(float!(99.5)),
             short_of_floor: None,
+            shortfall: Usdc::new(float!(0.5)),
             refunded_at: Utc::now(),
         };
         let redepositing = [

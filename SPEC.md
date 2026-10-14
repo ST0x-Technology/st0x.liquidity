@@ -5551,6 +5551,9 @@ enum UsdcRebalanceEvent {
         side: RefundSide,
         amount_refunded: Usdc,
         short_of_floor: Option<U256>,
+        // The deposit less the refund: what the refund kept back, booked by
+        // the P&L as the swap's cost.
+        shortfall: Usdc,
         refunded_at: DateTime<Utc>,
     },
     SwapEscrowUnresolved { unresolved_at: DateTime<Utc> },
@@ -5561,13 +5564,10 @@ enum UsdcRebalanceEvent {
         started_at: DateTime<Utc>,
     },
     RedepositSubmitted { deposit_tx: TxHash, submitted_at: DateTime<Utc> },
-    // `shortfall` is the withdrawn amount less `redeposit_amount`: what a
-    // refund kept back, booked by the P&L as the swap's cost.
     ReturnedToSource {
         deposit_tx: TxHash,
         deposit_block: Option<u64>,
         redeposit_amount: Usdc,
-        shortfall: Usdc,
         returned_at: DateTime<Utc>,
     },
     BridgingFailed {

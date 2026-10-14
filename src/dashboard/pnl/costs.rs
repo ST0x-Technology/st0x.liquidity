@@ -381,7 +381,7 @@ fn cost_summary_to_dto(
                 relay_effect,
                 included_when_observed(summary.relay_entry_count),
                 summary.relay_costs_usd,
-                "Read from UsdcRebalance Relay fills (the quote's relayer fee, and the rest of the input less the proven fill, a gain when the fill exceeds it) and from redeposits after a refund (what the refund kept back).",
+                "Read from UsdcRebalance Relay fills (the quote's relayer fee, and the rest of the input less the proven fill, a gain when the fill exceeds it) and from proven refunds (what the refund kept back).",
             )?,
             coverage(
                 "USD/USDC reporting basis",

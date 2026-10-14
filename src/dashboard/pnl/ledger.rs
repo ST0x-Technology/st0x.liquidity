@@ -619,13 +619,14 @@ async fn ingest_rebalance(
             let swap_cost = (fee_collected - relayer_fee)?;
             return insert_relay_cost(tx, rowid, &id, relayer_fee, swap_cost, &filled_at).await;
         }
-        // What a refund kept back is the swap's cost too.
-        UsdcRebalanceEvent::ReturnedToSource {
+        // What a refund kept back is the swap's cost too, booked once the
+        // refund is proven, whether it is redeposited or reconciled.
+        UsdcRebalanceEvent::SwapRefunded {
             shortfall,
-            returned_at,
+            refunded_at,
             ..
         } => {
-            return insert_relay_cost(tx, rowid, &id, Usdc::ZERO, shortfall, &returned_at).await;
+            return insert_relay_cost(tx, rowid, &id, Usdc::ZERO, shortfall, &refunded_at).await;
         }
         UsdcRebalanceEvent::Bridged {
             fee_collected,
@@ -657,7 +658,7 @@ async fn ingest_rebalance(
         | UsdcRebalanceEvent::SwapDeposited { .. }
         | UsdcRebalanceEvent::SwapRequoted { .. }
         | UsdcRebalanceEvent::SwapDepositReverted { .. }
-        | UsdcRebalanceEvent::SwapRefunded { .. }
+        | UsdcRebalanceEvent::ReturnedToSource { .. }
         | UsdcRebalanceEvent::SwapEscrowUnresolved { .. }
         | UsdcRebalanceEvent::SwapFailed { .. }
         | UsdcRebalanceEvent::RedepositStarted { .. }
@@ -833,7 +834,7 @@ mod tests {
 
     /// A Relay fill books its relayer fee and the rest of its cost in one
     /// row, the swap's signed (a fill above the fee-adjusted input is a
-    /// gain), and a redeposit books what a refund kept back.
+    /// gain), and a proven refund books what it kept back.
     #[tokio::test]
     async fn relay_fill_and_refund_book_their_relay_costs() {
         let pool = setup_test_db().await;
@@ -853,12 +854,13 @@ mod tests {
             &pool,
             &refunded,
             1,
-            &UsdcRebalanceEvent::ReturnedToSource {
-                deposit_tx: TxHash::repeat_byte(0xd1),
-                deposit_block: None,
-                redeposit_amount: Usdc::new(float!(99.4)),
+            &UsdcRebalanceEvent::SwapRefunded {
+                refund_tx: TxHash::repeat_byte(0xe1),
+                side: RefundSide::Origin,
+                amount_refunded: Usdc::new(float!(99.4)),
+                short_of_floor: None,
                 shortfall: Usdc::new(float!(0.6)),
-                returned_at: timestamp(8),
+                refunded_at: timestamp(8),
             },
         )
         .await;

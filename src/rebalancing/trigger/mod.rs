@@ -38675,6 +38675,7 @@ mod tests {
                 side: RefundSide::Origin,
                 amount_refunded: usdc(99),
                 short_of_floor: None,
+                shortfall: usdc(1),
                 refunded_at: Utc::now(),
             },
             UsdcRebalanceEvent::RedepositStarted {
@@ -38691,7 +38692,6 @@ mod tests {
             deposit_tx: TxHash::repeat_byte(0xd1),
             deposit_block: Some(3),
             redeposit_amount: usdc(99),
-            shortfall: usdc(1),
             returned_at: Utc::now(),
         };
         let failed = UsdcRebalanceEvent::SwapFailed {
@@ -38783,6 +38783,7 @@ mod tests {
                 side: RefundSide::Origin,
                 amount_refunded: usdc(99),
                 short_of_floor: None,
+                shortfall: usdc(1),
                 refunded_at: Utc::now(),
             },
             UsdcRebalanceEvent::RedepositStarted {
@@ -38798,7 +38799,6 @@ mod tests {
                 deposit_tx: TxHash::repeat_byte(0xd1),
                 deposit_block: Some(deposit_block),
                 redeposit_amount: usdc(99),
-                shortfall: usdc(1),
                 returned_at: Utc::now(),
             },
         ]);

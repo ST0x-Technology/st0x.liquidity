@@ -51,7 +51,7 @@ use crate::portfolio_snapshot::EtDayRange;
 use crate::position::{Position, PositionEvent, TradeId};
 use crate::test_utils::{persist_event, setup_test_db};
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
-use crate::usdc_rebalance::{UsdcRebalance, UsdcRebalanceEvent, UsdcRebalanceId};
+use crate::usdc_rebalance::{RefundSide, UsdcRebalance, UsdcRebalanceEvent, UsdcRebalanceId};
 
 fn seed_rebalance(fee: &str, timestamp: &str) -> SeedEvent {
     SeedEvent::Rebalance(
@@ -1332,21 +1332,19 @@ async fn relay_costs_reach_the_report_from_persisted_events() {
         relayer_fee: Usdc::new(float!(0.3)),
         filled_at: parse_timestamp("2026-05-15T12:01:00Z").unwrap(),
     };
-    let refund_redeposited = UsdcRebalanceEvent::ReturnedToSource {
-        deposit_tx: TxHash::random(),
-        deposit_block: None,
-        redeposit_amount: Usdc::new(float!(99.4)),
+    let refund = UsdcRebalanceEvent::SwapRefunded {
+        refund_tx: TxHash::random(),
+        side: RefundSide::Origin,
+        amount_refunded: Usdc::new(float!(99.4)),
+        short_of_floor: None,
         shortfall: Usdc::new(float!(0.6)),
-        returned_at: parse_timestamp("2026-05-15T12:02:00Z").unwrap(),
+        refunded_at: parse_timestamp("2026-05-15T12:02:00Z").unwrap(),
     };
     let pool = pnl_test_pool(
         vec![
             seed_rebalance("1.5", "2026-05-15T12:00:00Z"),
             SeedEvent::Rebalance(UsdcRebalanceId(Uuid::new_v4()).to_string(), relay_fill),
-            SeedEvent::Rebalance(
-                UsdcRebalanceId(Uuid::new_v4()).to_string(),
-                refund_redeposited,
-            ),
+            SeedEvent::Rebalance(UsdcRebalanceId(Uuid::new_v4()).to_string(), refund),
         ],
         position_rows(),
     )
