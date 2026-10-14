@@ -71,9 +71,9 @@ impl UsdcCashGuards {
         state.amounts.remove(id);
     }
 
-    /// Records `id`'s initiated amount next to its hold. Startup and the
-    /// sweep record the same value again; the one legitimate change is the
-    /// trigger's re-size under its claim, before the job is queued.
+    /// Records `id`'s amount next to its hold. Startup and the sweep record
+    /// the persisted amount; the one legitimate change is the trigger's
+    /// re-size under its claim, before the job is queued.
     pub(super) fn record_amount(&self, id: &UsdcRebalanceId, amount: Usdc) {
         self.state().amounts.insert(id.clone(), amount);
     }

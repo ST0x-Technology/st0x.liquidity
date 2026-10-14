@@ -44792,11 +44792,11 @@ mod tests {
         assert_eq!(amounts, vec![usdc(500), usdc(500)]);
     }
 
-    /// Jakub's sequence through the real event path: Base's 50 lands, its
-    /// guard and its projected amount go, and the next checks find both
-    /// corridors in their band, before and after Robinhood's 20 lands.
+    /// Both corridors over their band through the real event path: Base's 50
+    /// lands, its guard and its projected amount go, and the next checks find
+    /// both corridors in their band, before and after Robinhood's 20 lands.
     #[tokio::test]
-    async fn inbound_corridor_sizes_against_the_landed_balance_after_the_first_transfer_settles() {
+    async fn a_landed_inbound_transfer_stops_counting_for_the_other_corridor() {
         let inventory = InventoryView::default().with_usdc(usdc(200), usdc(50));
         let inventory = with_onchain_usdc(inventory, Chain::Robinhood, usdc(200));
         let trigger =
@@ -44853,8 +44853,8 @@ mod tests {
         );
         assert_eq!(count_pending_usdc_check_jobs(&trigger).await, 1);
 
-        // Base reads Alpaca as 100 plus Robinhood's 20 on its way: 150 of
-        // 270, inside its band. Robinhood's own hold refuses its corridor.
+        // Neither corridor sends again: Base is inside its band and
+        // Robinhood's own hold refuses its corridor.
         trigger.check_and_trigger_usdc().await;
         assert_eq!(
             count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
@@ -45027,7 +45027,61 @@ mod tests {
         trigger.check_and_trigger_usdc().await;
 
         let base = pending_transfer_usdc_to_hedging_job_on(&trigger, UsdcCorridor::BASE_CCTP).await;
-        assert_eq!(base.corridor, UsdcCorridor::BASE_CCTP);
+        assert_eq!(base.amount, usdc(700));
+    }
+
+    /// A post-burn failure keeps its guard with the tracked amount, so the
+    /// other corridors keep counting cash that is still on its way.
+    #[tokio::test]
+    async fn post_burn_failure_keeps_its_inbound_amount() {
+        let trigger =
+            make_trigger_with_inventory(InventoryView::default().with_usdc(usdc(900), usdc(100)))
+                .await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(50)),
+            )
+            .await
+            .unwrap();
+        harness
+            .receive::<UsdcRebalance>(id, make_usdc_bridging_failed())
+            .await
+            .unwrap();
+
+        assert!(trigger.usdc_guards.is_held(Chain::Base));
+        assert_eq!(
+            trigger
+                .usdc_guards
+                .inbound_elsewhere(Chain::Robinhood)
+                .unwrap(),
+            usdc(50)
+        );
+    }
+
+    /// A transfer whose aggregate failed to load records its amount when the
+    /// sweep reads it: startup could not, so this is the only record.
+    #[tokio::test]
+    async fn unread_transfer_records_its_amount_once_read() {
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
+        let (_pool, store) = attach_usdc_store(&trigger).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        seed_bridging_submitting_base_to_alpaca(&store, &id, usdc(50), TxHash::random()).await;
+        trigger.usdc_guards.block_unread(&id);
+
+        trigger.read_unread_corridors().await;
+
+        assert!(trigger.usdc_guards.is_held(Chain::Base));
+        assert_eq!(
+            trigger
+                .usdc_guards
+                .inbound_elsewhere(Chain::Robinhood)
+                .unwrap(),
+            usdc(50)
+        );
     }
 
     /// A corridor table on a chain other than Base is looked up by its own
