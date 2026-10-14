@@ -1569,8 +1569,8 @@ impl TransferUsdcToHedging {
                 "USDC transfer {id}: vault-withdrawal scan has stayed inconclusive for \
                  {elapsed:?} since the transfer started (>{WITHDRAWAL_SCAN_ALERT_DEADLINE:?}); \
                  the withdrawal's on-chain fate is still unknown ({source}). Transfer stays \
-                 latched at WithdrawalSubmitting (guard held); automatic redrive continues at a \
-                 slower cadence. Verify the vault withdrawal on-chain; use `stox transfer resume \
+                 latched at WithdrawalSubmitting or Withdrawing (guard held); automatic \
+                 redrive continues at a slower cadence. Verify the vault withdrawal on-chain; use `stox transfer resume \
                  --kind usdc --id {id} --direction to-alpaca` if the automatic redrive appears \
                  stuck."
             );

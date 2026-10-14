@@ -185,7 +185,11 @@ slippage floor rounds down: Relay rounds its own `minimumAmount` down (999303522
 at 50 bps is 994307004.39, and Relay quotes 994307004), so a floor rounded up
 would refuse an honest quote. Only the `AcceptedRelayQuote` it returns exposes
 the steps, and `RelayBridge` signs nothing else; `RelayQuote`'s fields are
-private, so no caller builds or edits one outside `RelayClient::quote`.
+private, so no caller builds or edits one outside `RelayClient::quote`. A caller
+that recorded an accepted quote, to sign it after a restart, rebuilds it as a
+`RecordedRelayQuote`, which becomes signable only through the same `accept`. It
+carries the chains, recipient and refund address the quote was checked against,
+so the bridge checks them again before signing it.
 
 - `minimum_out >= amount_in * (10000 - max_loss) / 10000`, else
   `QuoteLossExceedsBound`: a fill only guarantees `minimum_out`, so the loss

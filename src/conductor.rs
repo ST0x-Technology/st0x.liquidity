@@ -43,6 +43,7 @@ use tracing::{debug, error, info, warn};
 use url::Url;
 
 use st0x_bridge::corridor::UsdcCorridor;
+use st0x_bridge::relay::RelayClient;
 use st0x_config::{
     AlertsCtx, BrokerCtx, ChainAssets, ChainRegistry, ChainRole, Ctx, CtxError, ExecutionThreshold,
     HedgedChain, HedgingAssets, InventoryMode, IssuanceStatusCtx, OnchainWalletCtx, OperationMode,
@@ -148,8 +149,8 @@ use crate::rebalancing::usdc::{
 };
 use crate::rebalancing::{
     BaseWallet, ChainRebalancingConfig, ChainWallets, EthereumWallet, RebalancerServices,
-    RebalancingSchedulers, RebalancingService, RebalancingServiceConfig, UsdcCorridorEndpoints,
-    to_wrapped_equities, usdc_gas_readiness_by_chain,
+    RebalancingSchedulers, RebalancingService, RebalancingServiceConfig, RelayHopSetup,
+    UsdcCorridorEndpoints, to_wrapped_equities, usdc_gas_readiness_by_chain,
 };
 use crate::startup::StartupToken;
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
@@ -3478,7 +3479,38 @@ async fn build_rebalancer_services<Signer: Wallet + Clone>(
         ethereum_wallet,
         rebalancing_ctx.cctp_corridor,
         UsdcSettlementParams::for_chains(rebalancing_ctx, chains, reserved_cash),
+        relay_hop_setups(rebalancing_ctx, chains)?,
     ))
+}
+
+/// Each Relay corridor's hop setup, its client carrying the Relay API key
+/// from the secrets file.
+fn relay_hop_setups(
+    rebalancing_ctx: &RebalancingCtx,
+    chains: &ChainRegistry,
+) -> anyhow::Result<BTreeMap<Chain, RelayHopSetup>> {
+    let usdc = &rebalancing_ctx.usdc;
+
+    usdc.relay_hops()
+        .iter()
+        .map(|(chain, bounds)| {
+            let chain_confirmations = chains.required_confirmations(*chain).with_context(|| {
+                format!("the {chain} Relay corridor needs a [chains.{chain}] table")
+            })?;
+            let api_key = usdc.relay_api_key().cloned().with_context(|| {
+                format!("the {chain} Relay corridor needs [relay] api_key in the secrets file")
+            })?;
+
+            Ok((
+                *chain,
+                RelayHopSetup {
+                    bounds: *bounds,
+                    chain_confirmations,
+                    client: RelayClient::new(Some(api_key))?,
+                },
+            ))
+        })
+        .collect()
 }
 
 /// The vault-registry lookup for one hedged chain. Every id is qualified by
@@ -3999,6 +4031,18 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         );
         if unmined > 0 {
             unmined_restore_chains.insert(Chain::Ethereum);
+        }
+
+        // Each Relay corridor's pairs signed on its own chain's wallet.
+        for (chain, RestoredDepositSends { restored, unmined }) in usdc_handles
+            .restore_deposit_sends
+            .restore_chain_signed_swaps(&deps.pool)
+            .await
+        {
+            info!(target: "rebalance", %chain, restored, unmined, "Restored and rebroadcast the signed Relay pairs");
+            if unmined > 0 {
+                unmined_restore_chains.insert(chain);
+            }
         }
 
         // Likewise for the signed burns of the capital `cctp-bridge` route:
@@ -7915,6 +7959,8 @@ mod tests {
     use alloy::rpc::json_rpc::{RequestPacket, Response, ResponsePacket, ResponsePayload};
     use alloy::sol_types::SolCall;
     use apalis::prelude::Status;
+    use httpmock::Method::GET;
+    use httpmock::MockServer;
     use rain_math_float::Float;
     use sqlx::{ConnectOptions, SqlitePool};
     use std::future::pending;
@@ -7927,10 +7973,12 @@ mod tests {
     use uuid::uuid;
 
     use st0x_bridge::corridor::UsdcCorridor;
+    use st0x_bridge::relay::{RelayApiKey, RelayRequestId};
     use st0x_config::{
         AllocationCtx, BotGasValuationConfig, ChainAssets, ChainCashAsset, ChainEquities,
         ChainEquityAsset, ChainRegistry, ExecutionThreshold, OperationMode, OrchestratorConfig,
-        RebalancingMode, UsdcCorridors, create_test_ctx_with_order_owner, test_issuance_status_ctx,
+        RebalancingMode, RelayHopCtx, UsdcCorridors, create_test_ctx_with_order_owner,
+        test_issuance_status_ctx,
     };
     use st0x_dto::Statement;
     use st0x_event_sorcery::{DomainEvent, Reconciler, StoreBuilder, test_store};
@@ -23516,5 +23564,68 @@ mod tests {
         ));
         assert!(logs_contain("chain=ethereum"));
         assert!(logs_contain("symbol=AAPL"));
+    }
+
+    fn robinhood_relay_rebalancing_ctx(api_key: Option<RelayApiKey>) -> RebalancingCtx {
+        let mut rebalancing_ctx = RebalancingCtx::stub().call();
+        let usdc = UsdcCorridors::base_cctp_disabled().with_relay_hop(
+            Chain::Robinhood,
+            RelayHopCtx {
+                slippage_bps: 30,
+                max_quote_loss_bps: 50,
+                min_transfer: Usdc::new(float!(500)),
+                max_transfer: Usdc::new(float!(50000)),
+                quote_max_age: Duration::from_secs(60),
+                fill_timeout: Duration::from_secs(1800),
+                max_refund_retries: 3,
+                max_deposit_revert_redrives: 5,
+            },
+        );
+        rebalancing_ctx.usdc = match api_key {
+            Some(api_key) => usdc.with_relay_api_key(api_key),
+            None => usdc,
+        };
+        rebalancing_ctx
+    }
+
+    fn robinhood_chains() -> ChainRegistry {
+        ChainRegistry::single_hedged_chain(HedgedChain::test().chain(Chain::Robinhood).call())
+    }
+
+    #[tokio::test]
+    async fn relay_hop_client_sends_the_secrets_file_api_key() {
+        let relay_api = MockServer::start();
+        let status = relay_api.mock(|when, then| {
+            when.method(GET)
+                .path("/intents/status/v3")
+                .header("x-api-key", "relay-secret-key");
+            then.status(404);
+        });
+        let rebalancing_ctx =
+            robinhood_relay_rebalancing_ctx(Some(RelayApiKey::from("relay-secret-key".to_owned())));
+
+        let setups = relay_hop_setups(&rebalancing_ctx, &robinhood_chains()).unwrap();
+        let client = setups[&Chain::Robinhood]
+            .client
+            .clone()
+            .with_api_base(relay_api.base_url());
+        client
+            .status(RelayRequestId(B256::repeat_byte(0x01)))
+            .await
+            .unwrap_err();
+
+        status.assert();
+    }
+
+    #[test]
+    fn relay_hop_without_api_key_fails_startup() {
+        let rebalancing_ctx = robinhood_relay_rebalancing_ctx(None);
+
+        let error = relay_hop_setups(&rebalancing_ctx, &robinhood_chains()).unwrap_err();
+
+        assert!(
+            error.to_string().contains("[relay] api_key"),
+            "got {error:#}"
+        );
     }
 }

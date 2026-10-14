@@ -114,11 +114,18 @@ and the system proves market fit.
   - Every cash transfer runs on a named **USDC corridor**: the chain whose cash
     vault it serves and the **hop** that moves USDC between that chain and the
     bot's Ethereum wallet, where Alpaca deposits and withdraws (the **hub**).
-    Hop kinds: `cctp` (Circle burn and mint) and `relay` (reserved for
-    Robinhood; no build wires it yet). Each corridor is a table under
+    Hop kinds: `cctp` (Circle burn and mint) and `relay` (Robinhood's USDG
+    swapped for USDC through Relay's depository, see "Relay hop" under the
+    `UsdcRebalance` aggregate). Each corridor is a table under
     `[rebalancing.usdc.corridors.<chain>]` with its `hop`, `target` and
-    `deviation`; the chain's cash vault, per-transfer limit and confirmations
-    come from the chain's own tables. Today the only corridor is Base via CCTP.
+    `deviation`, and a `relay` sub-table when the hop is `relay`; the chain's
+    cash vault, per-transfer limit and confirmations come from the chain's own
+    tables. Today the only corridor that loads is Base via CCTP: a `relay` hop
+    is parsed and validated but still refused at load (rule 6 of the cash
+    corridor rules).
+  - On a `relay` corridor the trigger caps a transfer at the smaller of the
+    chain's operational limit and the sub-table's `max_transfer`, and declines a
+    transfer below its `min_transfer`.
   - Each corridor's transfers run on its own chain's orderbook, vault, wallet
     and gas check, and the USDC check runs every active corridor in chain order,
     each against its own band.
@@ -1519,13 +1526,14 @@ migration files in `migrations/`.
 #### Bot-Paid Gas Cost Recording
 
 - After each bot-signed on-chain transaction mines successfully -- vault
-  deposit, vault withdraw, wrap, unwrap, CCTP burn, CCTP mint, or the USDC
-  transfer to the Alpaca deposit address -- the confirming service enqueues a
-  durable `RecordBotGasReceiptCost` job identifying the chain, transaction hash,
-  operation category, and symbol (when known). Each CCTP burn that mines but
-  reverts is also enqueued: the confirming or recovery path records that attempt
-  before retrying the burn, because a reverted transaction still consumes real
-  gas
+  deposit, vault withdraw, wrap, unwrap, CCTP burn, CCTP mint, the USDC transfer
+  to the Alpaca deposit address, or a Relay approve or deposit (each approve
+  queued once the deposit after it confirms) -- the confirming service enqueues
+  a durable `RecordBotGasReceiptCost` job identifying the chain, transaction
+  hash, operation category, and symbol (when known). Each CCTP burn that mines
+  but reverts is also enqueued: the confirming or recovery path records that
+  attempt before retrying the burn, because a reverted transaction still
+  consumes real gas
 - The recorded native cost is `gas_used * effective_gas_price` from the
   transaction receipt, plus the receipt's `l1Fee` on Base. The Base fee is
   required and decoded from the OP-Stack receipt shape; a missing or malformed
@@ -1723,8 +1731,9 @@ hedging decisions.
 
 - **USDC rebalance stage timing**: per-stage durations of USDC rebalances
   (withdrawal, CCTP burn -> attestation -> mint, deposit, conversion) derived
-  from `UsdcRebalanceEvent` timestamps, including attestation-time trends. Shown
-  on its own dashboard chart, clearly labeled as USDC-specific.
+  from `UsdcRebalanceEvent` timestamps, including attestation-time trends. The
+  Relay swap events open no stage. Shown on its own dashboard chart, clearly
+  labeled as USDC-specific.
 - **Equity rebalance stage timing**: per-stage durations of equity mints
   (acceptance, token receipt, wrap, vault deposit) and redemptions (vault
   withdraw, unwrap, send, detection, completion), derived from
@@ -2421,13 +2430,17 @@ rule fails startup with a named error:
 
 1. USDC mode enabled with no corridor table.
 2. A corridor table missing `hop`, `target` or `deviation`, or carrying an
-   unknown key. There are no defaults.
+   unknown key. There are no defaults. A `relay` hop needs a `relay` sub-table,
+   and a `cctp` hop must not carry one.
 3. A corridor keyed by a chain that is not configured, not enabled, or has no
    trading cash table with a vault id.
 4. A corridor keyed `ethereum`: the direct Ethereum corridor is not built.
 5. `hop = "cctp"` on a chain whose settlement stable is not Circle's USDC
    (Robinhood), or on a chain this build has no CCTP domain for (HyperEVM).
-6. `hop = "relay"` on any chain: this build has no Relay hop.
+6. `hop = "relay"` on any chain, once its sub-table is valid: the Relay hop is
+   switched on by RAI-2986, which adds the fill, refund and redeposit steps,
+   Robinhood's cash capability, two-corridor sizing and the deploy gate's Relay
+   targets. Until then a config naming it does not load.
 7. USDC mode enabled and a chain that is not disabled, whose cash table enables
    rebalancing, has no corridor table: there is no implicit corridor.
 8. No served corridor while a hedged chain has a cash table. The build serves
@@ -2443,6 +2456,34 @@ rule fails startup with a named error:
    later release refuses them by name.
 10. Corridor tables are validated when USDC mode is disabled too, so a typo is
     caught on the day it is written, not on the day the mode is enabled.
+11. A `relay` sub-table missing a key, carrying an unknown one, or out of
+    bounds: `slippage_bps <= max_quote_loss_bps <= 10000`,
+    `min_transfer < max_transfer`, `min_transfer` less `max_quote_loss_bps`
+    still at least the Alpaca-to-Base minimum transfer (53 USDC), non-zero
+    `quote_max_age_secs`, `fill_timeout_secs`, `max_refund_retries` and
+    `max_deposit_revert_redrives`, and `quote_max_age_secs` at most an hour. A
+    `relay` hop on a chain with no Relay depository pinned in code is refused
+    too.
+
+The `relay` sub-table:
+
+```toml
+[rebalancing.usdc.corridors.robinhood.relay]
+slippage_bps = 30               # sent with each quote; Relay's floor below it
+max_quote_loss_bps = 50         # most the quote's minimum may lose to the input
+min_transfer = 500              # USDC; the trigger declines below it
+max_transfer = 50000            # USDC; the trigger caps at it
+quote_max_age_secs = 60         # a persisted quote older than this is re-quoted
+fill_timeout_secs = 1800        # the fill window, also sent as the quote's ttl
+max_refund_retries = 3          # Alpaca-to-chain re-quotes after a refund
+max_deposit_revert_redrives = 5 # reverted deposits before the transfer holds
+```
+
+The Relay API key is a secret: `[relay] api_key` in the secrets file. Relay
+refuses every quote without one, so a Relay corridor with no key fails at config
+load; without a Relay corridor the key is optional. A build older than this
+table refuses it as an unknown field, so the deployed secrets gain it only once
+every environment runs a build that reads it.
 
 The hub (the Ethereum wallet), the CCTP domains and the USDC addresses are
 pinned in code per chain, never configured.
@@ -2647,20 +2688,21 @@ _Configuration management_:
 - `st0x`-kind binaries use `--config` + `--secrets` flags; `plain`-kind units
   invoke their package binary with declared `args`
 - The secrets file carries only actual secrets: per-chain `rpc_url` entries, the
-  `[rest_api]` key pair, the `[issuance]` `api_key`, and (legacy Alpaca only)
-  the `[broker]` `api_key`/`api_secret` pair under its `type` tag. Everything
-  else that once lived there is identity, not credentials, and belongs in the
-  plaintext config: the broker `type`, `mode`, `account_id` and (keyless
-  variant) `client_id`/`kms_key_version` in the config `[broker]` section, and
-  the issuance `base_url` in the config `[issuance]` section. (Migration note,
-  one release: the deprecated secrets-file copies of these identity fields are
-  still accepted with a warning, because deployed secret versions carry them; a
-  field set differently in both files is refused at startup rather than silently
-  resolved. The keyless alpaca-broker-api-kms `[broker]` table migrates
-  all-or-nothing: while it remains in the secrets file its fields stay required
-  there, and the migration step is to delete the whole table once the config
-  carries the identity. The shims and this tolerance are removed next release,
-  together with the `[alerts]` shims described under Operational Alerting.)
+  `[rest_api]` key pair, the `[issuance]` `api_key`, the `[relay]` `api_key`,
+  and (legacy Alpaca only) the `[broker]` `api_key`/`api_secret` pair under its
+  `type` tag. Everything else that once lived there is identity, not
+  credentials, and belongs in the plaintext config: the broker `type`, `mode`,
+  `account_id` and (keyless variant) `client_id`/`kms_key_version` in the config
+  `[broker]` section, and the issuance `base_url` in the config `[issuance]`
+  section. (Migration note, one release: the deprecated secrets-file copies of
+  these identity fields are still accepted with a warning, because deployed
+  secret versions carry them; a field set differently in both files is refused
+  at startup rather than silently resolved. The keyless alpaca-broker-api-kms
+  `[broker]` table migrates all-or-nothing: while it remains in the secrets file
+  its fields stay required there, and the migration step is to delete the whole
+  table once the config carries the identity. The shims and this tolerance are
+  removed next release, together with the `[alerts]` shims described under
+  Operational Alerting.)
 
 _Infrastructure_:
 
@@ -4686,6 +4728,48 @@ enum TransferRef {
     OnchainTx(TxHash),
 }
 
+// What moved the cash across the hop, kept on every post-hop state. Only
+// CCTP today; the Relay variant arrives with the Relay fill.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+enum HopEvidence {
+    Cctp { burn_tx: TxHash, mint_tx: TxHash },
+}
+
+// The accepted Relay quote a swap deposit funds, persisted whole so a resume
+// signs exactly what was accepted. Amounts are in the stables' smallest unit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SwapQuote {
+    request_id: B256,
+    order_id: B256,
+    amount_in: U256,
+    expected_out: U256,
+    minimum_out: U256,
+    slippage_bps: u16,
+    relayer_fee: U256,
+    gas_fee: U256,
+    deadline: DateTime<Utc>,
+    // What the quote was checked against; the bridge checks them again
+    // before signing: the direction, and our wallets as recipient and refund.
+    origin: Chain,
+    destination: Chain,
+    recipient: Address,
+    refund_to: Address,
+    approve: Option<SwapStep>,
+    deposit: SwapStep,
+    // Origin chain head read before the quote: no deposit for this order can
+    // sit below it.
+    origin_from_block: u64,
+}
+
+// One transaction a quote asks the origin wallet to send.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SwapStep {
+    chain_id: u64,
+    to: Address,
+    data: Bytes,
+    value: U256,
+}
+
 // Typed (not opaque-string) reason an operator reconciled a stranded post-burn
 // rebalance, recorded on `OperatorReconciled` / `Reconciled` for the audit trail.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -4702,6 +4786,13 @@ enum ReconcileReason {
 Every state carries the transfer's `corridor`, set by the event that originates
 it and kept by every later transition. A state or snapshot recorded before the
 field existed reads as Base via CCTP.
+
+The post-hop states (`Bridged`, `DepositInitiated`, `DepositConfirmed`,
+`DepositFailed`) carry the hop's evidence as `hop: HopEvidence` rather than a
+burn and a mint hash. The events are unchanged: a CCTP `Bridged` or
+`BridgingCompletionRecovered` builds `HopEvidence::Cctp` from the recorded burn
+and the mint it confirms, so every transfer recorded before the field replays
+into it.
 
 ```rust
 enum UsdcRebalance {
@@ -4795,14 +4886,53 @@ enum UsdcRebalance {
         initiated_at: DateTime<Utc>,
         attested_at: DateTime<Utc>,
     },
+    // Relay hop, chain side first (see "Relay hop"). `signed_order_ids`
+    // holds every order id a deposit was ever signed for and never shrinks.
+    SwapQuoted {
+        direction: RebalanceDirection,
+        corridor: UsdcCorridor,
+        amount: Usdc,
+        quote: SwapQuote,
+        signed_order_ids: Vec<B256>,
+        // Approves signed alone when another send split a pair; each is
+        // broadcast again before a pair is signed.
+        split_approves: Vec<PreparedTransaction>,
+        initiated_at: DateTime<Utc>,
+        quoted_at: DateTime<Utc>,
+    },
+    SwapDepositPrepared {
+        direction: RebalanceDirection,
+        corridor: UsdcCorridor,
+        amount: Usdc,
+        quote: SwapQuote,
+        signed_order_ids: Vec<B256>,
+        split_approves: Vec<PreparedTransaction>,
+        // Both envelopes, signed at consecutive nonces and persisted in one
+        // event before either is broadcast. `None` when the standing
+        // allowance covered the deposit.
+        approve: Option<PreparedTransaction>,
+        deposit: PreparedTransaction,
+        initiated_at: DateTime<Utc>,
+        prepared_at: DateTime<Utc>,
+    },
+    SwapDeposited {
+        direction: RebalanceDirection,
+        corridor: UsdcCorridor,
+        amount: Usdc,
+        quote: SwapQuote,
+        signed_order_ids: Vec<B256>,
+        deposit_tx: TxHash,
+        deposit_block: u64,
+        initiated_at: DateTime<Utc>,
+        deposited_at: DateTime<Utc>,
+    },
     Bridged {
         direction: RebalanceDirection,
         corridor: UsdcCorridor,
         amount: Usdc,
         amount_received: Usdc,
         fee_collected: Usdc,
-        burn_tx_hash: TxHash,
-        mint_tx_hash: TxHash,
+        hop: HopEvidence,
         initiated_at: DateTime<Utc>,
         minted_at: DateTime<Utc>,
         // BaseToAlpaca deposit send: NotStarted or Prepared (signed and
@@ -4826,8 +4956,7 @@ enum UsdcRebalance {
         direction: RebalanceDirection,
         corridor: UsdcCorridor,
         amount: Usdc,
-        burn_tx_hash: TxHash,
-        mint_tx_hash: TxHash,
+        hop: HopEvidence,
         deposit_ref: TransferRef,
         initiated_at: DateTime<Utc>,
         deposit_initiated_at: DateTime<Utc>,
@@ -4836,8 +4965,7 @@ enum UsdcRebalance {
         direction: RebalanceDirection,
         corridor: UsdcCorridor,
         amount: Usdc,
-        burn_tx_hash: TxHash,
-        mint_tx_hash: TxHash,
+        hop: HopEvidence,
         initiated_at: DateTime<Utc>,
         deposit_confirmed_at: DateTime<Utc>,
     },
@@ -4845,8 +4973,7 @@ enum UsdcRebalance {
         direction: RebalanceDirection,
         corridor: UsdcCorridor,
         amount: Usdc,
-        burn_tx_hash: TxHash,
-        mint_tx_hash: TxHash,
+        hop: HopEvidence,
         deposit_ref: Option<TransferRef>,
         reason: String,
         initiated_at: DateTime<Utc>,
@@ -4867,6 +4994,78 @@ enum UsdcRebalance {
     },
 }
 ```
+
+##### Relay hop
+
+A Relay corridor (Robinhood) swaps the chain's USDG for the hub's USDC: we
+approve and deposit into Relay's depository on the origin chain, and Relay's
+solver pays us on the destination chain from its own funds, or refunds us. The
+swap states sit between `WithdrawalComplete` and the post-hop states. This build
+runs the chain-to-Alpaca side up to the confirmed deposit:
+
+1. A pre-flight quote at dispatch, never persisted. A refusal, or a quote
+   outside the sub-table's bounds, ends the attempt before anything is recorded,
+   so nothing moves and the guard frees through the dead-letter path.
+2. The vault withdraw, as on a CCTP corridor, except that an adopted withdraw
+   that realized another amount is not failed: the transfer holds at
+   `Withdrawing` with its guard, its stable outside the vault. A resume at
+   `Withdrawing` reads the amount from the recorded withdraw tx's own receipt
+   (its `OperatorWithdraw`, or a legacy `WithdrawV2`, by our wallet for the
+   stable and vault), so a later withdraw from the same vault does not hide it,
+   and moves on only at the recorded amount. A receipt not visible yet, or a
+   transient RPC error, redrives with the inconclusive-scan deadline page. A
+   recorded withdraw without a tx hash is left to the operator. `FailWithdrawal`
+   is refused there.
+3. The binding quote (`QuoteSwap` -> `SwapQuoted`), checked against the bounds
+   (`max_quote_loss_bps` and the slippage floor) and against the withdrawn
+   amount. The Alpaca deposit sets no minimum here: `min_transfer` sizes the
+   transfer against it at the trigger. A refusal here leaves the transfer at
+   `WithdrawalComplete` with its guard held: the USDG is in the wallet, and only
+   the redeposit step that follows may return it. The timeout sweep holds that
+   guard and pages, there, at `Withdrawing` before it (recorded once the vault
+   withdraw is mined) and at every swap state after it, whatever stage its
+   tracking reads, and `fail-usdc-transfer` refuses the transfer there with a
+   Relay-specific reason.
+4. The approve and the deposit are signed together under the origin wallet's
+   lock (the Ethereum wallet's deposit-send lock when Ethereum is the origin)
+   and persisted in one event (`SwapDepositPrepared`) before either is
+   broadcast, on a task a job timeout cannot cancel between the two. The attempt
+   stops waiting on the signing after `quote_max_age_secs`, but the signing is
+   not cancelled: it keeps its RPC calls under the wallet's send lock, and its
+   pair's nonces are released once it returns. Its quote is too old to sign by
+   then, so a retry does not sign above those nonces. A quote within 60 seconds
+   of its deadline or older than `quote_max_age_secs` is not signed, and a pair
+   whose quote reached either limit while it was signed is released instead of
+   persisted: the transfer holds its guard at `SwapQuoted` until the re-quote
+   step that follows. A persist that fails releases both nonces, deposit first,
+   unless a reload shows the pair committed. When another send took the nonce
+   between the two signs, the approve alone is persisted (`SwapApprovePrepared`)
+   and broadcast, even if its quote expired during the signing, since that send
+   holds the nonce above it, and the attempt retries.
+5. Broadcast in nonce order; a retry sends the same bytes. The deposit is
+   recorded (`ConfirmSwapDeposit` -> `SwapDeposited`) once it has the origin
+   chain's confirmations and its receipt names our wallet, the origin stable and
+   the quote's order id. The bot gas of the approves and the deposit is queued
+   before that, and also when the deposit reverted, since it was mined.
+6. The transfer then waits at `SwapDeposited` with its guard held.
+
+A Relay rate limit (429) on either quote is backpressure, as a broker 429 is
+(see "Broker rate-limit (429) backpressure"): the job reschedules after Relay's
+`Retry-After` instead of spending its retries, and the resume quotes again from
+the recorded state.
+
+At startup the persisted pairs are restored before any other send from their
+wallet: pairs signed on the Ethereum wallet once, by the hub service, together
+with the Alpaca deposit sends; pairs signed on a corridor chain by that
+corridor's own service. A pair on a corridor no service carries pages, and
+startup skips that chain's approvals and revokes.
+
+The swap states hold the corridor guard, are never reconcilable failures, and
+refuse `fail-usdc-transfer` (a deposit may be on chain). On the shared Ethereum
+wallet's credit ledger an Ethereum-origin `SwapQuoted` is held credit and a
+persisted Ethereum pair is in flight, so a Base deposit send that would spend
+the USDC a Relay swap is about to deposit pages a shortfall. The ledger only
+pages: it reserves nothing and does not block the send.
 
 ##### Crash-safe resume
 
@@ -5016,6 +5215,20 @@ enum UsdcRebalanceCommand {
     ConfirmBridging { mint_tx: TxHash, amount_received: Usdc, fee_collected: Usdc },
     FailBridging { reason: String },
 
+    // Relay hop commands (see "Relay hop")
+    // Records the binding quote on `WithdrawalComplete` of a Relay corridor.
+    // BaseToAlpaca swaps exactly the withdrawn amount; AlpacaToBase swaps more
+    // than zero and at most the withdrawn amount (Alpaca fees can leave less).
+    QuoteSwap { quote: SwapQuote },
+    // Persists an approve signed alone after another send split the pair.
+    PrepareSwapApprove { approve: PreparedTransaction },
+    // Persists the signed approve and deposit in one event, before either is
+    // broadcast. Refused once a pair is persisted.
+    PrepareSwapDeposit { approve: Option<PreparedTransaction>, deposit: PreparedTransaction },
+    // Records the persisted deposit once it has the origin chain's
+    // confirmations; refused for any other tx.
+    ConfirmSwapDeposit { deposit_tx: TxHash, deposit_block: u64 },
+
     // Deposit commands
     // Persists the signed BaseToAlpaca deposit send on `Bridged`, before its
     // first broadcast. Refused when a send was already signed.
@@ -5112,6 +5325,15 @@ enum UsdcRebalanceEvent {
     // BaseToAlpaca deposit send signed and persisted, before its first
     // broadcast.
     DepositSendPrepared { prepared: PreparedTransaction, prepared_at: DateTime<Utc> },
+    // Relay hop events
+    SwapQuoted { quote: SwapQuote, quoted_at: DateTime<Utc> },
+    SwapApprovePrepared { approve: PreparedTransaction, prepared_at: DateTime<Utc> },
+    SwapDepositPrepared {
+        approve: Option<PreparedTransaction>,
+        deposit: PreparedTransaction,
+        prepared_at: DateTime<Utc>,
+    },
+    SwapDeposited { deposit_tx: TxHash, deposit_block: u64, deposited_at: DateTime<Utc> },
     BridgingFailed {
         burn_tx_hash: Option<TxHash>,
         cctp_nonce: Option<B256>,
@@ -7209,22 +7431,27 @@ from `BridgingSubmitting`, `WithdrawalComplete`, or a BaseToAlpaca
 `WithdrawalSubmitting` (above) -- it is refused for all post-burn states
 (`Bridging`, `AwaitingAttestation`, `Attested`, `Bridged`, `DepositInitiated`,
 `DepositConfirmed`, `DepositFailed`, `Reconciled`, or any `BridgingFailed` with
-a recorded `burn_tx_hash`). The two surfaces differ in how the in-memory guard
-is reconciled. The live route sends `FailBridging` through the conductor-built
-wired store, so the rebalancing reactor runs in process and keeps the transfer's
-corridor guard held for the AlpacaToBase outcome, matching the reported
-`guardHeld`. The timeout sweep never clears the guard of an AlpacaToBase
-transfer past its withdrawal with no confirmed burn (`BridgingSubmitting`, or
-`BridgingFailed` with no burn): it holds the guard without a tombstone and pages
-once that the transfer has no confirmed burn and its funds are off Alpaca,
-naming the recovery step, until the operator reconciles. Neither state proves
-that no burn was broadcast: a crash between a burn's broadcast and its record
-leaves the same state. So before reconciling the operator verifies on chain that
-no burn left the market maker wallet. The offline CLI writes through a
-standalone store the (stopped) bot's reactor never observes, so its outcome is
-reconciled on the next startup: `recover_usdc_guard` clears a non-guard-holding
-aggregate and re-latches an AlpacaToBase one until the operator reconciles.
-Either way, once the guard is released automatic USDC rebalancing resumes.
+a recorded `burn_tx_hash`) and for the swap states (`SwapQuoted`,
+`SwapDepositPrepared`, `SwapDeposited`). On a Relay corridor a BaseToAlpaca
+transfer at `Withdrawing` or `WithdrawalComplete` is refused too, with a
+Relay-specific reason: the withdrawn stable is outside the vault, and only the
+swap or a redeposit settles it (see "Relay hop"). The two surfaces differ in how
+the in-memory guard is reconciled. The live route sends `FailBridging` through
+the conductor-built wired store, so the rebalancing reactor runs in process and
+keeps the transfer's corridor guard held for the AlpacaToBase outcome, matching
+the reported `guardHeld`. The timeout sweep never clears the guard of an
+AlpacaToBase transfer past its withdrawal with no confirmed burn
+(`BridgingSubmitting`, or `BridgingFailed` with no burn): it holds the guard
+without a tombstone and pages once that the transfer has no confirmed burn and
+its funds are off Alpaca, naming the recovery step, until the operator
+reconciles. Neither state proves that no burn was broadcast: a crash between a
+burn's broadcast and its record leaves the same state. So before reconciling the
+operator verifies on chain that no burn left the market maker wallet. The
+offline CLI writes through a standalone store the (stopped) bot's reactor never
+observes, so its outcome is reconciled on the next startup: `recover_usdc_guard`
+clears a non-guard-holding aggregate and re-latches an AlpacaToBase one until
+the operator reconciles. Either way, once the guard is released automatic USDC
+rebalancing resumes.
 
 **Operator reconciliation of a stranded post-burn failure**: A USDC rebalance
 that fails after the CCTP burn holds the rebalancing guard, blocking further

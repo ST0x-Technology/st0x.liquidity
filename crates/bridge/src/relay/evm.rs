@@ -429,6 +429,31 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> SwapBridge for RelayBridge<EthWalle
         Ok(head)
     }
 
+    async fn origin_tx_mined(
+        &self,
+        direction: HopDirection,
+        tx: TxHash,
+    ) -> Result<bool, RelayBridgeError> {
+        let receipt = match direction {
+            HopDirection::ToHub => {
+                self.chain
+                    .wallet
+                    .provider()
+                    .get_transaction_receipt(tx)
+                    .await?
+            }
+            HopDirection::FromHub => {
+                self.hub
+                    .wallet
+                    .provider()
+                    .get_transaction_receipt(tx)
+                    .await?
+            }
+        };
+
+        Ok(receipt.is_some())
+    }
+
     async fn find_recent_deposits(
         &self,
         direction: HopDirection,

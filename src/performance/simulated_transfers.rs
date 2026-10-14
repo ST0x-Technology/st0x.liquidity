@@ -952,6 +952,15 @@ impl Raindex for FixtureRaindex {
             .ok_or(RaindexError::ScanInconclusive { from_block })
     }
 
+    async fn realized_withdrawal(
+        &self,
+        _withdraw_tx: TxHash,
+        _token: Address,
+        _vault_id: RaindexVaultId,
+    ) -> Result<U256, RaindexError> {
+        unimplemented!("FixtureRaindex: redemption fixture never runs a Relay hop")
+    }
+
     async fn tx_mined(&self, _tx_hash: TxHash) -> Result<bool, RaindexError> {
         unimplemented!("FixtureRaindex: redemption fixture never restores at startup")
     }

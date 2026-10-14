@@ -9,6 +9,7 @@ mod corridors;
 mod driver_pause;
 mod job;
 mod manager;
+mod relay;
 
 pub(crate) use corridors::{CorridorTransfer, UsdcCorridorTransfers};
 pub(crate) use driver_pause::{
@@ -23,13 +24,15 @@ pub(crate) use job::{
 pub(crate) use manager::RecoveredCctpMint;
 pub(crate) use manager::{
     CctpMintRecoveryError, RecheckUsdcDeposit, RecoverCctpMint, RecoveredMintAmounts,
-    RestorePreparedDepositSends, RestoredDepositSends, UsdcRecheckError, u256_to_usdc,
+    RestorePreparedDepositSends, RestoredDepositSends, UsdcBridgeHelper, UsdcRecheckError,
+    u256_to_usdc,
 };
 pub use manager::{
     CrossVenueCashTransfer, DepositSendNotSuperseded, EthereumChainMissing,
     MarketMakingUsdcEndpoints, UsdcSettlementParams, deposit_send_required_confirmations,
     verify_deposit_send_superseded,
 };
+pub(crate) use relay::RelayHop;
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -42,7 +45,10 @@ use thiserror::Error;
 use tracing::error;
 
 use st0x_bridge::cctp::CctpError;
-use st0x_bridge::corridor::UsdcCorridor;
+use st0x_bridge::corridor::{HopKind, UsdcCorridor};
+use st0x_bridge::relay::{
+    BasisPointsOutOfRange, QuoteAcceptanceError, RelayBridgeError, RelayError,
+};
 use st0x_bridge::stable_endpoint::StableEndpointError;
 use st0x_event_sorcery::SendError;
 use st0x_execution::{
@@ -55,7 +61,7 @@ use crate::bot_gas::redrive::BotGasFailureClassifier;
 use crate::inventory::InventoryViewError;
 use crate::native_gas::GasReadinessFailure;
 use crate::usdc_rebalance::{
-    BurnTxOwnershipLookupError, RebalanceDirection, UsdcRebalance, UsdcRebalanceId,
+    BurnTxOwnershipLookupError, RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceId,
 };
 
 #[derive(Debug, Error)]
@@ -303,6 +309,64 @@ pub enum UsdcTransferError {
     },
     #[error("USDC rebalance {id} cannot resume: aggregate is in terminal failure state")]
     PreviouslyFailedAggregate { id: UsdcRebalanceId },
+    /// A state the service's hop never reaches (a swap state on CCTP, a
+    /// burn state on Relay): the corridor check passed, so the store holds a
+    /// state its corridor cannot reach. Refused before any call.
+    #[error("USDC rebalance {id} is in {state}, which the {hop} hop never reaches")]
+    StateOffHop {
+        id: UsdcRebalanceId,
+        state: &'static str,
+        hop: HopKind,
+    },
+    #[error(transparent)]
+    BasisPoints(#[from] BasisPointsOutOfRange),
+    /// The Relay hop runs chain-to-Alpaca only in this build; refused before
+    /// any call.
+    #[error("USDC rebalance {id}: the Relay hop does not run {direction} yet; nothing was sent")]
+    SwapDirectionNotBuilt {
+        id: UsdcRebalanceId,
+        direction: RebalanceDirection,
+    },
+    #[error("Relay API error: {0}")]
+    RelayApi(#[from] Box<RelayError>),
+    #[error("Relay bridge error: {0}")]
+    RelayBridge(#[from] Box<RelayBridgeError>),
+    /// Relay's quote is outside the corridor's bounds.
+    #[error("USDC rebalance {id}: Relay quote refused: {source}")]
+    SwapQuoteOutOfBounds {
+        id: UsdcRebalanceId,
+        #[source]
+        source: QuoteAcceptanceError,
+    },
+    /// Another send took a nonce between the swap's approve and deposit: the
+    /// approve went out alone and the next attempt signs the deposit again.
+    #[error("USDC rebalance {id}: another send split the swap's approve and deposit; retrying")]
+    SwapPairSplit { id: UsdcRebalanceId },
+    /// The task that signs and persists the swap pair panicked. A pair it
+    /// persisted is sent by the retry; nonces it reserved and did not persist
+    /// stall later sends from the chain wallet until a restart.
+    #[error("USDC rebalance {id}: the Relay pair prepare task panicked")]
+    SwapPrepareTaskPanicked { id: UsdcRebalanceId },
+    /// The work before and around the swap pair's persist outlasted the
+    /// corridor's `quote_max_age`, so the chain wallet's prepare lock is
+    /// released. A pair signed after it is discarded when its signing returns.
+    #[error("USDC rebalance {id}: the Relay pair prepare outlasted {timeout:?}; retrying")]
+    SwapPrepareTimedOut {
+        id: UsdcRebalanceId,
+        timeout: std::time::Duration,
+    },
+    /// The recorded quote is past its deadline or older than the corridor's
+    /// `quote_max_age`: nothing was signed and the transfer holds its guard
+    /// at `SwapQuoted`.
+    #[error(
+        "USDC rebalance {id}: Relay quote from {quoted_at} (deadline {deadline}) expired; \
+         nothing was signed"
+    )]
+    SwapQuoteExpired {
+        id: UsdcRebalanceId,
+        quoted_at: DateTime<Utc>,
+        deadline: DateTime<Utc>,
+    },
     #[error(
         "USDC transfer corridor mismatch: transfer {id} runs on the {recorded} corridor, \
          this service serves {}; left untouched for the operator",
@@ -339,15 +403,36 @@ pub enum UsdcTransferError {
         id: UsdcRebalanceId,
         direction: RebalanceDirection,
     },
+    /// On CCTP the transfer is failed for operator reconciliation; on Relay
+    /// it is held at `Withdrawing` with its guard, since a failure would
+    /// release the guard while the stable sits outside the vault.
     #[error(
         "USDC rebalance {id} adopted a withdrawal that realized {withdrawn} but \
-         {requested} was requested; failed for operator reconciliation rather \
-         than burning more than was withdrawn"
+         {requested} was requested; {}",
+        match hop {
+            HopKind::Cctp => "failed for operator reconciliation rather than burning \
+                              more than was withdrawn",
+            HopKind::Relay => "held at Withdrawing with its guard for operator \
+                               reconciliation rather than swapping more than was withdrawn",
+        }
     )]
     AdoptedWithdrawalAmountMismatch {
         id: UsdcRebalanceId,
         withdrawn: alloy::primitives::U256,
         requested: alloy::primitives::U256,
+        hop: HopKind,
+    },
+    /// The vault withdraw recorded at `Withdrawing` has no tx hash, so its
+    /// realized amount can never be read and the transfer does not move past
+    /// it. Not redriven: the operator reconciles it.
+    #[error(
+        "USDC rebalance {id}: its recorded vault withdrawal {withdrawal:?} has no \
+         tx hash to read the realized amount from; holding at Withdrawing for \
+         operator reconciliation"
+    )]
+    RecordedWithdrawalUnverified {
+        id: UsdcRebalanceId,
+        withdrawal: TransferRef,
     },
     /// The USD->USDC conversion settled below Alpaca's withdrawal minimum,
     /// which the trigger can only enforce on the amount it *requests*: a
@@ -727,6 +812,7 @@ impl UsdcTransferError {
             | Self::DepositRefMustBeOnchain { .. }
             | Self::ResumeDirectionMismatch { .. }
             | Self::AdoptedWithdrawalAmountMismatch { .. }
+            | Self::RecordedWithdrawalUnverified { .. }
             | Self::WithdrawalRefMustBeAlpacaId { .. }
             | Self::WithdrawalTxMissing { .. }
             | Self::WithdrawalCreditMismatch { .. }
@@ -745,6 +831,16 @@ impl UsdcTransferError {
             | Self::DepositSendReconciliationPending { .. }
             | Self::DepositSendTaskPanicked { .. }
             | Self::DepositSendLookup { .. }
+            | Self::StateOffHop { .. }
+            | Self::BasisPoints(_)
+            | Self::SwapDirectionNotBuilt { .. }
+            | Self::RelayApi(_)
+            | Self::RelayBridge(_)
+            | Self::SwapQuoteOutOfBounds { .. }
+            | Self::SwapPairSplit { .. }
+            | Self::SwapPrepareTaskPanicked { .. }
+            | Self::SwapPrepareTimedOut { .. }
+            | Self::SwapQuoteExpired { .. }
             | Self::EthereumChainMissing(_) => None,
         }
     }
@@ -795,6 +891,7 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::DepositRefMustBeOnchain { .. }
             | Self::ResumeDirectionMismatch { .. }
             | Self::AdoptedWithdrawalAmountMismatch { .. }
+            | Self::RecordedWithdrawalUnverified { .. }
             | Self::WithdrawalRefMustBeAlpacaId { .. }
             | Self::WithdrawalTxMissing { .. }
             | Self::WithdrawalCreditMismatch { .. }
@@ -814,6 +911,16 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::DepositSendReconciliationPending { .. }
             | Self::DepositSendTaskPanicked { .. }
             | Self::DepositSendLookup { .. }
+            | Self::StateOffHop { .. }
+            | Self::BasisPoints(_)
+            | Self::SwapDirectionNotBuilt { .. }
+            | Self::RelayApi(_)
+            | Self::RelayBridge(_)
+            | Self::SwapQuoteOutOfBounds { .. }
+            | Self::SwapPairSplit { .. }
+            | Self::SwapPrepareTaskPanicked { .. }
+            | Self::SwapPrepareTimedOut { .. }
+            | Self::SwapQuoteExpired { .. }
             | Self::EthereumChainMissing(_) => false,
         }
     }

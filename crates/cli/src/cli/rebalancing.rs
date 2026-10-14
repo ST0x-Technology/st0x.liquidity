@@ -745,6 +745,7 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::DepositRefMustBeOnchain { .. }
         | UsdcTransferError::ResumeDirectionMismatch { .. }
         | UsdcTransferError::AdoptedWithdrawalAmountMismatch { .. }
+        | UsdcTransferError::RecordedWithdrawalUnverified { .. }
         | UsdcTransferError::ConversionBelowWithdrawalMinimum { .. }
         | UsdcTransferError::ConversionOutcomeUnresolved { .. }
         | UsdcTransferError::PostDepositConversionShortFill { .. }
@@ -765,6 +766,16 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::DepositSendUnresolved { .. }
         | UsdcTransferError::DepositSendTaskPanicked { .. }
         | UsdcTransferError::DepositSendLookup { .. }
+        | UsdcTransferError::StateOffHop { .. }
+        | UsdcTransferError::BasisPoints(_)
+        | UsdcTransferError::SwapDirectionNotBuilt { .. }
+        | UsdcTransferError::RelayApi(_)
+        | UsdcTransferError::RelayBridge(_)
+        | UsdcTransferError::SwapQuoteOutOfBounds { .. }
+        | UsdcTransferError::SwapPairSplit { .. }
+        | UsdcTransferError::SwapPrepareTaskPanicked { .. }
+        | UsdcTransferError::SwapPrepareTimedOut { .. }
+        | UsdcTransferError::SwapQuoteExpired { .. }
         | UsdcTransferError::EthereumChainMissing(_) => false,
     }
 }
@@ -1166,6 +1177,9 @@ fn classify_fail_bridging_reload(state: Option<&UsdcRebalance>) -> FailBridgingO
             | UsdcRebalance::Bridging { .. }
             | UsdcRebalance::AwaitingAttestation { .. }
             | UsdcRebalance::Attested { .. }
+            | UsdcRebalance::SwapQuoted { .. }
+            | UsdcRebalance::SwapDepositPrepared { .. }
+            | UsdcRebalance::SwapDeposited { .. }
             | UsdcRebalance::Bridged { .. }
             | UsdcRebalance::DepositInitiated { .. }
             | UsdcRebalance::DepositConfirmed { .. }
@@ -1292,6 +1306,15 @@ pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
                  (BridgingSubmitting with a recorded tx), `clear-pending-burn` if the \
                  recorded burn was dropped and verified absent on-chain, or \
                  `transfer reconcile` for a confirmed post-burn failure."
+            );
+        }
+        PreBurnFailEligibility::RelayHeldOutsideVault => {
+            anyhow::bail!(
+                "fail-usdc-transfer: transfer {id} is a Relay transfer in {state:?}: the vault \
+                 withdrawal moved the stable outside the vault, to the chain wallet or to \
+                 Relay, and no failure path settles it. Refusing to act -- resume it with \
+                 `transfer resume` to finish the swap; only a redeposit returns the stable to \
+                 the vault."
             );
         }
         // Already the pre-burn failed terminal, so there is nothing to fail
@@ -1471,6 +1494,9 @@ pub(super) async fn clear_pending_burn_command<Writer: Write>(
         | UsdcRebalance::Bridging { .. }
         | UsdcRebalance::AwaitingAttestation { .. }
         | UsdcRebalance::Attested { .. }
+        | UsdcRebalance::SwapQuoted { .. }
+        | UsdcRebalance::SwapDepositPrepared { .. }
+        | UsdcRebalance::SwapDeposited { .. }
         | UsdcRebalance::Bridged { .. }
         | UsdcRebalance::BridgingFailed { .. }
         | UsdcRebalance::DepositInitiated { .. }
@@ -2708,6 +2734,18 @@ mod tests {
             "a backpressure-classified poll error stays in the bounded retry \
              budget rather than handing off"
         );
+    }
+
+    /// A recorded vault withdrawal with no tx hash never gains one, so the
+    /// worker does not redrive it and the CLI must not hand it off.
+    #[test]
+    fn recorded_withdrawal_without_tx_hash_is_not_a_bot_resumable_wait() {
+        assert!(!is_bot_resumable_wait(
+            &UsdcTransferError::RecordedWithdrawalUnverified {
+                id: UsdcRebalanceId(Uuid::from_u128(7)),
+                withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::from_u128(1))),
+            }
+        ));
     }
 
     #[test]
@@ -4706,6 +4744,46 @@ mod tests {
             err_msg.contains("post-burn"),
             "Bridging state must be rejected as post-burn; got: {err_msg}"
         );
+    }
+
+    /// A chain-to-Alpaca Relay transfer at `WithdrawalComplete` is refused
+    /// with the Relay hold, not the CCTP post-burn steps, which refuse it too.
+    #[tokio::test]
+    async fn fail_usdc_transfer_names_the_relay_withdrawal_hold() {
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xBEEF_0002_00AA);
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        for command in [
+            UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::HubRouted {
+                    chain: Chain::Robinhood,
+                    hop: HopKind::Relay,
+                },
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(100)),
+                withdrawal: TransferRef::OnchainTx(B256::repeat_byte(0x01)),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+        ] {
+            store.send(&UsdcRebalanceId(id), command).await.unwrap();
+        }
+
+        let mut stdout = Vec::new();
+        let err_msg =
+            fail_usdc_transfer_command(&mut stdout, id, &"should fail".parse().unwrap(), &pool)
+                .await
+                .unwrap_err()
+                .to_string();
+
+        assert!(err_msg.contains("WithdrawalComplete"), "{err_msg}");
+        assert!(err_msg.contains("outside the vault"), "{err_msg}");
+        assert!(err_msg.contains("redeposit"), "{err_msg}");
+        assert!(!err_msg.contains("clear-pending-burn"), "{err_msg}");
     }
 
     #[tokio::test]

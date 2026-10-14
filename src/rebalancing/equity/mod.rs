@@ -1683,6 +1683,15 @@ impl Raindex for PanickingRaindex {
         unimplemented!("PanickingRaindex: not available in CLI context")
     }
 
+    async fn realized_withdrawal(
+        &self,
+        _: TxHash,
+        _: Address,
+        _: RaindexVaultId,
+    ) -> Result<U256, RaindexError> {
+        unimplemented!("PanickingRaindex: not available in CLI context")
+    }
+
     async fn tx_mined(&self, _: TxHash) -> Result<bool, RaindexError> {
         unimplemented!("PanickingRaindex: not available in CLI context")
     }

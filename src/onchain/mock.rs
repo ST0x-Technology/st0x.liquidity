@@ -531,6 +531,21 @@ impl Raindex for MockRaindex {
             .ok_or(RaindexError::ScanInconclusive { from_block })
     }
 
+    async fn realized_withdrawal(
+        &self,
+        withdraw_tx: TxHash,
+        _token: Address,
+        _vault_id: RaindexVaultId,
+    ) -> Result<U256, RaindexError> {
+        let Ok(recent_withdrawal) = self.recent_withdrawal.lock() else {
+            panic!("mock recent-withdrawal mutex poisoned");
+        };
+        recent_withdrawal
+            .filter(|(tx_hash, _)| *tx_hash == withdraw_tx)
+            .map(|(_, amount)| amount)
+            .ok_or(RaindexError::WithdrawReceiptNotVisible { withdraw_tx })
+    }
+
     async fn tx_mined(&self, _tx_hash: TxHash) -> Result<bool, RaindexError> {
         Ok(self.withdrawals_mined)
     }

@@ -1451,7 +1451,8 @@ fn vault_tx_fate(
         | RaindexError::SolType(_)
         | RaindexError::ScanInconclusive { .. }
         | RaindexError::ScanAnomalousLog { .. }
-        | RaindexError::MissingOperatorRole { .. } => VaultTxFate::Unknown,
+        | RaindexError::MissingOperatorRole { .. }
+        | RaindexError::WithdrawReceiptNotVisible { .. } => VaultTxFate::Unknown,
     }
 }
 

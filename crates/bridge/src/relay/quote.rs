@@ -205,6 +205,63 @@ impl RelayQuote {
     }
 }
 
+/// A quote as its caller recorded it once accepted, to sign it after a
+/// restart: [`Self::accept`] checks its amounts again, and
+/// [`RelayBridge`](super::RelayBridge) checks its steps before signing them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedRelayQuote {
+    pub request_id: RelayRequestId,
+    pub order_id: RelayOrderId,
+    pub amounts: QuoteAmounts,
+    pub deadline: SystemTime,
+    pub fees: QuoteFees,
+    /// The chains, recipient and refund address the quote was checked
+    /// against: [`RelayBridge`](super::RelayBridge) signs it only for its
+    /// direction and our wallets.
+    pub origin: Chain,
+    pub destination: Chain,
+    pub recipient: Address,
+    pub refund_to: Address,
+    /// `None` when the quote had no approve step, or when the caller leaves
+    /// it to the bridge to approve only if the allowance falls short.
+    pub approve: Option<StepTransaction>,
+    pub deposit: StepTransaction,
+}
+
+impl RecordedRelayQuote {
+    /// The recorded quote, ready to sign, if its amounts clear `bounds`.
+    pub fn accept(self, bounds: &QuoteBounds) -> Result<AcceptedRelayQuote, QuoteAcceptanceError> {
+        let Self {
+            request_id,
+            order_id,
+            amounts,
+            deadline,
+            fees,
+            origin,
+            destination,
+            recipient,
+            refund_to,
+            approve,
+            deposit,
+        } = self;
+
+        RelayQuote {
+            request_id,
+            order_id,
+            amounts,
+            deadline,
+            fees,
+            origin,
+            destination,
+            recipient,
+            refund_to,
+            approve,
+            deposit,
+        }
+        .accept(bounds)
+    }
+}
+
 /// A [`RelayQuote`] whose amounts cleared the caller's bounds: the only form
 /// whose steps [`RelayBridge`](super::RelayBridge) signs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1459,6 +1516,41 @@ pub(super) mod tests {
 
             quote.accept(&bounds).unwrap();
         }
+    }
+
+    /// A recorded quote clears the same bounds as the quote it records.
+    #[test]
+    fn recorded_quote_is_accepted_as_the_quote_it_records() {
+        let quote = validate(&funded_body(), &funded_request()).unwrap();
+        let recorded = RecordedRelayQuote {
+            request_id: quote.request_id,
+            order_id: quote.order_id,
+            amounts: quote.amounts,
+            deadline: quote.deadline,
+            fees: quote.fees,
+            origin: quote.origin,
+            destination: quote.destination,
+            recipient: quote.recipient,
+            refund_to: quote.refund_to,
+            approve: quote.approve.clone(),
+            deposit: quote.deposit.clone(),
+        };
+        let bounds = |max_loss| QuoteBounds {
+            max_loss: BasisPoints::new(max_loss).unwrap(),
+            downstream_minimum: U256::ZERO,
+        };
+
+        assert_eq!(
+            recorded.clone().accept(&bounds(600)).unwrap(),
+            quote.accept(&bounds(600)).unwrap()
+        );
+        assert_eq!(
+            recorded.accept(&bounds(50)).unwrap_err(),
+            QuoteAcceptanceError::QuoteLossExceedsBound {
+                minimum: U256::from(4_749_464),
+                bound: U256::from(4_975_000),
+            }
+        );
     }
 
     /// The fixed relayer fee is 4.7% of the funded 5 dollar transfer.

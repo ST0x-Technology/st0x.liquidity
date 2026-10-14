@@ -31,7 +31,7 @@ use crate::InventoryAdapters;
 #[cfg(any(test, feature = "test-support"))]
 use crate::chain::HedgedChain;
 use crate::pricing::PricingSecrets;
-use crate::rebalancing::BaseCashVault;
+use crate::rebalancing::{BaseCashVault, RelaySecrets};
 use crate::registry::{self, RegistryLive, RegistrySource, TokenFile};
 use crate::registry_state::{self, BootClaim, RegistryStateError};
 use crate::wallet::{SigningChain, SigningChains};
@@ -682,6 +682,8 @@ struct Secrets {
     wallet: Option<toml::Value>,
     rest_api: Option<RestApiSecrets>,
     issuance: Option<IssuanceSecretsToml>,
+    /// Required when a Relay corridor is configured.
+    relay: Option<RelaySecrets>,
 }
 
 /// The `[broker]` table of the secrets TOML.
@@ -2446,10 +2448,10 @@ fn parse_and_validate_with(
         return Err(CtxError::MissingRebalancing);
     };
 
-    let rebalancing = Box::new(RebalancingCtx::new(
-        &rebalancing_config,
-        base_cash_vault(&config.chains),
-    )?);
+    let mut rebalancing =
+        RebalancingCtx::new(&rebalancing_config, base_cash_vault(&config.chains))?;
+    rebalancing.usdc = rebalancing.usdc.with_relay_secrets(secrets.relay)?;
+    let rebalancing = Box::new(rebalancing);
     rebalancing_config.allocation()?.validate(&config.chains)?;
 
     let log_format = config.log_format.unwrap_or(LogFormat::Text);
@@ -6740,6 +6742,9 @@ mod tests {
             ctx.order_owner(),
             address!("0xfcad0b19bb29d4674531d6f115237e16afce377c")
         );
+
+        // The example's [relay] key loads with no Relay corridor configured.
+        ctx.rebalancing.usdc.relay_api_key().unwrap();
     }
 
     /// Config with the broker identity in the config file's `[broker]`

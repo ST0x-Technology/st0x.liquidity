@@ -37,6 +37,8 @@ use std::time::Duration;
 #[cfg(test)]
 #[cfg(feature = "test-support")]
 use st0x_bridge::cctp::{deploy_cctp_on_chain, link_chains, mint_usdc};
+#[cfg(test)]
+use st0x_bridge::relay::{RelayApiKey, RelayClient};
 use st0x_config::{BrokerCtx, ChainEquities, ChainEquityAsset, OperationMode, RebalancingMode};
 #[cfg(any(test, feature = "test-support"))]
 use st0x_event_sorcery::{DomainEvent, EventSourced};
@@ -128,6 +130,15 @@ fn acquire_anvil_permits(count: usize) -> Vec<AnvilPermit> {
     *in_use += count;
     drop(in_use);
     (0..count).map(|_| AnvilPermit).collect()
+}
+
+/// A Relay client at `api_base` with a placeholder API key: Relay refuses
+/// every quote without one.
+#[cfg(test)]
+pub(crate) fn relay_test_client(api_base: String) -> RelayClient {
+    RelayClient::new(Some(RelayApiKey::from("relay-test-key".to_owned())))
+        .unwrap()
+        .with_api_base(api_base)
 }
 
 #[cfg(test)]

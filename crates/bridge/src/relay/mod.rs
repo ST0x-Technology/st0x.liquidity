@@ -26,7 +26,7 @@ pub use evm::{RelayBridge, RelayBridgeError, RelayCtx};
 pub use proof::UnverifiedReason;
 pub use quote::{
     AcceptedRelayQuote, QuoteFees, QuoteField, QuoteMismatch, QuoteRequest, QuoteStep,
-    QuotedCurrency, RelayOrderId, RelayQuote, RelayRequestId, StepTransaction,
+    QuotedCurrency, RecordedRelayQuote, RelayOrderId, RelayQuote, RelayRequestId, StepTransaction,
 };
 pub use status::{FailReason, InFlightStage, IntentStatus, IntentStatusReport};
 #[cfg(feature = "mock")]
