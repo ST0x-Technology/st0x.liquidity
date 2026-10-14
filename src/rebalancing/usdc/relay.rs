@@ -8954,6 +8954,72 @@ mod tests {
         });
     }
 
+    /// `transfer recheck` tells an inconclusive read from an unpaid order: a
+    /// payment Relay names that the chain does not show yet is
+    /// `NotDetectedYet`, and a failed status read is an error, not
+    /// `LeftUnchanged`.
+    #[tokio::test]
+    async fn recheck_reports_an_inconclusive_read_apart_from_an_unpaid_order() {
+        let anvil = spawn_anvil(Anvil::new());
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let contracts = RelayEndContracts {
+            stable: Address::repeat_byte(0x51),
+            depository: Address::repeat_byte(0x52),
+        };
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let mut unseen_fill = mock_status(
+            &relay_api,
+            json!({"status": "success", "inTxHashes": [], "txHashes": [TxHash::repeat_byte(0xf9)]}),
+        );
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = relay_transfer(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet,
+            contracts,
+            store.clone(),
+        )
+        .await;
+        let failed = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited(&store, &failed).await;
+        store
+            .send(
+                &failed,
+                UsdcRebalanceCommand::FailSwap {
+                    reason: "Relay reported Failure".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            transfer.recheck_deposit(&failed, None).await.unwrap(),
+            RecheckOutcome::NotDetectedYet
+        );
+        unseen_fill.delete();
+
+        relay_api.mock(|when, then| {
+            when.method(GET).path("/intents/status/v3");
+            then.status(503);
+        });
+        let error = transfer.recheck_deposit(&failed, None).await.unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                UsdcRecheckError::Transfer(transfer_error)
+                    if matches!(transfer_error.as_ref(), UsdcTransferError::RelayApi(_))
+            ),
+            "got {error:?}"
+        );
+        assert_eq!(
+            store.load(&failed).await.unwrap().unwrap().state_name(),
+            "SwapFailed"
+        );
+    }
+
     /// `transfer recheck` of a failed order Relay still reports unpaid
     /// changes nothing; it refuses an operator deposit tx and a Relay state
     /// that is not a held escrow.
