@@ -14,12 +14,19 @@ protection was meant to require.
 
 CI does not subscribe to the `edited` event. GitHub emits it for title and body
 edits, which change no code, and each such event would cancel the running CI and
-restart the full suite. GitHub also emits `edited` when a PR's base is
-retargeted, for example when the parent of a stacked PR merges. That case needs
-no extra run: the `master` ruleset requires branches to be up to date with the
-required `backend`, `dashboard`, and `hooks` checks, so a retargeted PR whose
-head lacks the new base tip cannot merge until a new push (the Graphite restack
-and `gt submit`) emits `synchronize`. Graphite merge queue draft PRs open
+restart the full suite. Filtering `edited` at job level does not help, because a
+filtered run still cancels the real run in the shared concurrency group. GitHub
+also emits `edited` when a PR's base is retargeted, for example when the parent
+of a stacked PR merges. A retarget without a new push keeps the earlier run's
+result, and that result is not always valid for the new base: the `changes` job
+diffs against the base at run time, so if B is stacked on A, changes only docs
+relative to A, and is retargeted to `master` by hand before A merges, B keeps a
+docs-only pass while A's code would merge through it. GitHub also runs no
+`pull_request` workflow while a PR conflicts with its base; if a retarget
+removes the conflict, no run starts and the required checks stay missing. After
+a manual retarget, push or close and reopen the PR to validate it against the
+new base. The Graphite flow does this automatically: the restack and `gt submit`
+push a new head, which emits `synchronize`. Graphite merge queue draft PRs open
 against the previous `gtmq_spec_*` branch and are later retargeted to `master`;
 their `opened` run already tests the same tree, because each speculative branch
 builds on the one before it.
