@@ -38830,6 +38830,68 @@ mod tests {
         ));
     }
 
+    /// A transfer back in its vault leaves the imbalance that planned it, so
+    /// the chain's withdraw cooldown holds chain-to-Alpaca planning there,
+    /// live and after a restart, instead of paying for the same round trip
+    /// on every snapshot.
+    #[tokio::test]
+    async fn relay_returned_to_source_starts_the_chain_withdraw_cooldown() {
+        let trigger = make_trigger_with_inventory(with_onchain_usdc(
+            InventoryView::default().with_usdc(usdc(500), usdc(500)),
+            Chain::Robinhood,
+            usdc(500),
+        ))
+        .await;
+        relay_transfer_returned_to_source(&trigger, &UsdcRebalanceId(Uuid::new_v4()), 30).await;
+
+        assert!(
+            trigger
+                .usdc_withdraw_cooling_down(Chain::Robinhood, Utc::now())
+                .await
+        );
+        assert!(
+            !trigger
+                .usdc_withdraw_cooling_down(Chain::Base, Utc::now())
+                .await
+        );
+
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let deposit_tx = TxHash::repeat_byte(0xd1);
+        for command in [
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor: ROBINHOOD_RELAY,
+                amount: usdc(100),
+                withdrawal: TransferRef::OnchainTx(TxHash::repeat_byte(0x77)),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceCommand::BeginRedeposit {
+                reason: RedepositReason::QuoteRefused,
+            },
+            UsdcRebalanceCommand::RecordRedeposit { deposit_tx },
+            UsdcRebalanceCommand::ConfirmRedeposit {
+                deposit_tx,
+                deposit_block: Some(30),
+            },
+        ] {
+            store.send(&id, command).await.unwrap();
+        }
+
+        let restarted = make_trigger_with_inventory(InventoryView::default()).await;
+        restarted.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert!(
+            restarted
+                .usdc_withdraw_cooling_down(Chain::Robinhood, Utc::now())
+                .await,
+            "a restart must not lift the cooldown of a recent redeposit"
+        );
+    }
+
     #[tokio::test]
     async fn usdc_terminal_clears_active_rebalance_id() {
         let reactor =
