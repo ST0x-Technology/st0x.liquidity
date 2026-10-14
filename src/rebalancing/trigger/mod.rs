@@ -44707,8 +44707,8 @@ mod tests {
         }
     }
 
-    /// Robinhood at 200 and Alpaca at 50, with Base already holding its
-    /// guard for a 50 transfer to Alpaca.
+    /// Base at 150 after sending 50 to Alpaca, Robinhood at 200 and Alpaca
+    /// at 50; the caller holds Base's guard.
     async fn robinhood_trigger_beside_a_base_transfer() -> Arc<RebalancingService> {
         let inventory = InventoryView::default().with_usdc(usdc(150), usdc(50));
         let inventory = with_onchain_usdc(inventory, Chain::Robinhood, usdc(200));
@@ -45030,6 +45030,39 @@ mod tests {
             .unwrap();
         harness
             .receive::<UsdcRebalance>(id, make_usdc_bridging_failed())
+            .await
+            .unwrap();
+
+        assert!(trigger.usdc_guards.is_held(Chain::Base));
+        assert_eq!(
+            trigger
+                .usdc_guards
+                .inbound_elsewhere(Chain::Robinhood)
+                .unwrap(),
+            usdc(50)
+        );
+    }
+
+    /// The sweep's post-burn hold records the tracked amount, so a hold it
+    /// rebuilds keeps counting for the other corridors.
+    #[tokio::test]
+    async fn sweep_post_burn_hold_records_its_inbound_amount() {
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        trigger.usdc_tracking.write().await.insert(
+            id,
+            usdc::UsdcRebalanceTracking {
+                corridor: UsdcCorridor::BASE_CCTP,
+                direction: RebalanceDirection::BaseToAlpaca,
+                initiated_amount: usdc(50),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                last_progress_at: Utc::now() - ChronoDuration::minutes(31),
+            },
+        );
+
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
             .await
             .unwrap();
 

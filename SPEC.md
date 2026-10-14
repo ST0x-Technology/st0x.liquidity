@@ -143,13 +143,14 @@ and the system proves market fit.
     against the plain balance: cash in flight is not cash Alpaca can pay out,
     and the projection errs high (a landed transfer counted twice for a moment,
     a stuck one for as long as it is stuck), so it may only shrink a transfer.
-    The one low error is a transfer queued just before a restart that has not
-    written its first event: startup does not count it yet. The corridors remain
-    coupled through the shared balance: with a target t a corridor's chain rests
-    at t/(1-t) of the Alpaca balance, so Alpaca's share of all cash is 1/(1 +
-    sum of t_i/(1-t_i)) over the active corridors (40% with one corridor at 0.6,
-    25% with two), and a transfer on one corridor moves every other corridor's
-    ratio.
+    It errs low in two cases: a transfer queued just before a restart that has
+    not written its first event, which startup does not count yet, and, with a
+    cash reserve, the stale gross Alpaca figure between a landed transfer's
+    release and the next balance poll. The corridors remain coupled through the
+    shared balance: with a target t a corridor's chain rests at t/(1-t) of the
+    Alpaca balance, so Alpaca's share of all cash is 1/(1 + sum of t_i/(1-t_i))
+    over the active corridors (40% with one corridor at 0.6, 25% with two), and
+    a transfer on one corridor moves every other corridor's ratio.
 - **Complete Audit Trail**: All rebalancing operations tracked as events
   (CrossVenueEquityTransfer, CrossVenueCashTransfer)
 - **Integration**: Uses Alpaca for share/USDC management, Circle CCTP for

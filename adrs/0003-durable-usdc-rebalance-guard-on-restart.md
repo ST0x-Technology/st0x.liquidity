@@ -190,4 +190,5 @@ projection errs high (a landed transfer counted for a moment, a stuck one until
 resolved) and must only shrink a transfer, never grow a withdrawal. The amounts
 stay in memory: startup records them from the persisted transfers it holds, and
 a job queued before a restart that has not written its first event is not
-counted until RAI-3397.
+counted until RAI-3397. With a cash reserve, the stale gross Alpaca figure after
+a landed transfer also reads low until RAI-3398.
