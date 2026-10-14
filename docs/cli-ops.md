@@ -861,7 +861,10 @@ One in-memory guard per corridor chain (`usdc_guards`) serializes USDC
 rebalancing on that corridor: at most one transfer, either direction, moves
 funds through the corridor's vault at a time, and at most one Alpaca-outbound
 transfer runs across all corridors (Alpaca's withdrawable cash is shared). Each
-guard records the transfers that hold it. Who touches it, and when:
+guard records the transfers that hold it and each transfer's amount. A held or
+stuck chain-to-Alpaca transfer makes the other corridors send less to Alpaca,
+because they count its amount as already on its way; it never blocks them. Who
+touches it, and when:
 
 - **Claim**: the automatic trigger claims its corridor's guard for the new
   transfer's id before it enqueues the job (RAII: a failed enqueue releases the

@@ -5,11 +5,18 @@
 //! corridors, because Alpaca's withdrawable cash and its USDC inflight are
 //! shared. A release removes only its own transfer, so it never frees a guard
 //! another transfer still holds.
+//!
+//! A hold may carry its transfer's initiated amount; chain-to-Alpaca sizing
+//! on the other corridors reads the sum of inbound amounts as cash on its
+//! way to Alpaca.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use rain_math_float::FloatError;
+
 use st0x_evm::Chain;
+use st0x_finance::{HasZero, Usdc};
 
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceId};
 
@@ -56,10 +63,35 @@ impl UsdcCashGuards {
 
     /// Frees whatever `id` holds; other holders keep their guards.
     pub(crate) fn release(&self, id: &UsdcRebalanceId) {
-        self.state().holders.retain(|_, holders| {
+        let mut state = self.state();
+        state.holders.retain(|_, holders| {
             holders.remove(id);
             !holders.is_empty()
         });
+        state.amounts.remove(id);
+    }
+
+    /// Records `id`'s initiated amount next to its hold. Startup and the
+    /// sweep record the same value again; the one legitimate change is the
+    /// trigger's re-size under its claim, before the job is queued.
+    pub(super) fn record_amount(&self, id: &UsdcRebalanceId, amount: Usdc) {
+        self.state().amounts.insert(id.clone(), amount);
+    }
+
+    /// The recorded amounts of chain-to-Alpaca transfers holding a corridor
+    /// other than `chain`: cash on its way to Alpaca that `chain`'s sizing
+    /// has not seen land yet. A hold with no recorded amount adds nothing.
+    pub(super) fn inbound_elsewhere(&self, chain: Chain) -> Result<Usdc, FloatError> {
+        let state = self.state();
+
+        state
+            .holders
+            .iter()
+            .filter(|(held_chain, _)| **held_chain != chain)
+            .flat_map(|(_, holders)| holders.iter())
+            .filter(|(_, direction)| **direction == RebalanceDirection::BaseToAlpaca)
+            .filter_map(|(id, _)| state.amounts.get(id))
+            .try_fold(Usdc::ZERO, |sum, amount| sum + *amount)
     }
 
     /// Blocks every corridor until a restart: a transfer whose corridor
@@ -113,7 +145,9 @@ impl UsdcCashGuards {
     /// Stands in for every holder's terminal event.
     #[cfg(test)]
     pub(crate) fn release_every_holder(&self) {
-        self.state().holders.clear();
+        let mut state = self.state();
+        state.holders.clear();
+        state.amounts.clear();
     }
 
     fn state(&self) -> MutexGuard<'_, CashGuardState> {
@@ -181,6 +215,8 @@ impl Drop for CashGuardClaim {
 #[derive(Debug, Default)]
 struct CashGuardState {
     holders: BTreeMap<Chain, HashMap<UsdcRebalanceId, RebalanceDirection>>,
+    /// Initiated amounts by holder, for the inbound projection.
+    amounts: HashMap<UsdcRebalanceId, Usdc>,
     unclassified: bool,
     unread: HashSet<UsdcRebalanceId>,
 }
@@ -252,6 +288,8 @@ impl CashGuardState {
 #[cfg(test)]
 mod tests {
     use uuid::Uuid;
+
+    use st0x_float_macro::float;
 
     use super::*;
 
@@ -382,5 +420,65 @@ mod tests {
         else {
             panic!("the other holder must keep the corridor held");
         };
+    }
+
+    #[test]
+    fn inbound_elsewhere_sums_other_corridors_inbound_amounts() {
+        let guards = Arc::new(UsdcCashGuards::default());
+        let base = new_id();
+        guards.hold(Chain::Base, &base, RebalanceDirection::BaseToAlpaca);
+        guards.record_amount(&base, Usdc::new(float!(50)));
+        let hyperevm = new_id();
+        guards.hold(Chain::HyperEvm, &hyperevm, RebalanceDirection::AlpacaToBase);
+        guards.record_amount(&hyperevm, Usdc::new(float!(30)));
+        guards.hold(
+            Chain::Robinhood,
+            &new_id(),
+            RebalanceDirection::BaseToAlpaca,
+        );
+
+        assert_eq!(
+            guards.inbound_elsewhere(Chain::Robinhood).unwrap(),
+            Usdc::new(float!(50)),
+            "an outbound hold and a hold with no recorded amount add nothing"
+        );
+        assert_eq!(
+            guards.inbound_elsewhere(Chain::Base).unwrap(),
+            Usdc::ZERO,
+            "a corridor's own hold is not cash on its way from elsewhere"
+        );
+    }
+
+    #[test]
+    fn release_drops_the_recorded_amount() {
+        let guards = Arc::new(UsdcCashGuards::default());
+        let id = new_id();
+        guards.hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        guards.record_amount(&id, Usdc::new(float!(50)));
+
+        guards.release(&id);
+        guards.hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+
+        assert_eq!(
+            guards.inbound_elsewhere(Chain::Robinhood).unwrap(),
+            Usdc::ZERO
+        );
+    }
+
+    /// The trigger records its first size at the claim and the re-sized one
+    /// before the enqueue: the latest record is the one that counts.
+    #[test]
+    fn recording_an_amount_again_replaces_it() {
+        let guards = Arc::new(UsdcCashGuards::default());
+        let id = new_id();
+        guards.hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        guards.record_amount(&id, Usdc::new(float!(50)));
+
+        guards.record_amount(&id, Usdc::new(float!(40)));
+
+        assert_eq!(
+            guards.inbound_elsewhere(Chain::Robinhood).unwrap(),
+            Usdc::new(float!(40))
+        );
     }
 }

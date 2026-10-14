@@ -38,6 +38,12 @@ impl UsdcRebalanceOperation {
             Self::BaseToAlpaca { .. } => RebalanceDirection::BaseToAlpaca,
         }
     }
+
+    pub(super) const fn amount(self) -> Usdc {
+        match self {
+            Self::AlpacaToBase { amount } | Self::BaseToAlpaca { amount } => amount,
+        }
+    }
 }
 
 /// Internal decision built inside the inventory read-lock, coupling each
@@ -156,6 +162,7 @@ enum DurableCorridor {
     Found {
         corridor: UsdcCorridor,
         direction: RebalanceDirection,
+        amount: Usdc,
         holds_guard: bool,
     },
     /// The aggregate has events but no state, or none at all.
@@ -441,18 +448,20 @@ pub(crate) enum UsdcTriggerSkip {
 /// Returns `UsdcRebalanceOperation::AlpacaToBase` if there's too much USDC in
 /// Alpaca that needs to be bridged to Base, or `BaseToAlpaca` if there's too
 /// much USDC on Base that needs to be bridged to Alpaca. `chain` is the
-/// corridor's chain.
+/// corridor's chain; `inbound_elsewhere` is the cash other corridors are
+/// already sending to Alpaca, which only the chain-to-Alpaca side counts.
 pub(super) async fn check_imbalance_and_build_operation(
     chain: Chain,
     threshold: &ImbalanceThreshold,
     inventory: &Arc<BroadcastingInventory>,
     usdc_limit: Option<Usdc>,
     reserved: Option<Usd>,
+    inbound_elsewhere: Usdc,
 ) -> Result<UsdcRebalanceOperation, UsdcTriggerSkip> {
     let decision = {
         let inventory = inventory.read().await;
         let imbalance = inventory
-            .check_usdc_imbalance_with_gross_offchain(chain, threshold, reserved)
+            .check_usdc_imbalance_with_gross_offchain(chain, threshold, reserved, inbound_elsewhere)
             .map_err(|error| {
                 warn!(
                     target: "rebalance",
@@ -839,20 +848,22 @@ impl RebalancingService {
     /// missing aggregate latches every corridor until a restart; a load
     /// error blocks every corridor until the sweep reads it (fail closed).
     async fn keep_corridor_guard(&self, id: &UsdcRebalanceId) {
-        let tracked = self
-            .usdc_tracking
-            .read()
-            .await
-            .get(id)
-            .map(|tracking| (tracking.corridor, tracking.direction));
-        let (corridor, direction) = match tracked {
+        let tracked = self.usdc_tracking.read().await.get(id).map(|tracking| {
+            (
+                tracking.corridor,
+                tracking.direction,
+                tracking.initiated_amount,
+            )
+        });
+        let (corridor, direction, amount) = match tracked {
             Some(holder) => holder,
             None => match self.durable_corridor(id).await {
                 DurableCorridor::Found {
                     corridor,
                     direction,
+                    amount,
                     ..
-                } => (corridor, direction),
+                } => (corridor, direction, amount),
                 DurableCorridor::Unread => {
                     self.block_unread_corridor(id).await;
                     return;
@@ -865,6 +876,7 @@ impl RebalancingService {
         };
 
         self.usdc_guards.hold(corridor.chain(), id, direction);
+        self.usdc_guards.record_amount(id, amount);
     }
 
     /// Latches every corridor until a restart for a post-burn failure whose
@@ -926,10 +938,14 @@ impl RebalancingService {
                 DurableCorridor::Found {
                     corridor,
                     direction,
+                    amount,
                     holds_guard,
                 } => {
                     let holder = holds_guard.then_some((corridor.chain(), direction));
                     self.usdc_guards.resolve_unread(&id, holder);
+                    if holds_guard {
+                        self.usdc_guards.record_amount(&id, amount);
+                    }
                     let mut inventory = self.inventory.write().await;
                     if inventory.active_usdc_rebalance_entry(&id).is_none() {
                         continue;
@@ -979,6 +995,7 @@ impl RebalancingService {
             Ok(Some(entity)) => DurableCorridor::Found {
                 corridor: entity.corridor(),
                 direction: entity.direction(),
+                amount: entity.amount(),
                 holds_guard: entity.holds_rebalance_guard(),
             },
             Ok(None) => DurableCorridor::Missing,
@@ -2206,9 +2223,15 @@ mod tests {
             deviation: float!(0.2),
         };
 
-        let result =
-            check_imbalance_and_build_operation(Chain::Base, &threshold, &inventory, None, None)
-                .await;
+        let result = check_imbalance_and_build_operation(
+            Chain::Base,
+            &threshold,
+            &inventory,
+            None,
+            None,
+            Usdc::ZERO,
+        )
+        .await;
 
         assert_eq!(result, Err(UsdcTriggerSkip::NoImbalance));
     }
@@ -2364,9 +2387,15 @@ mod tests {
             deviation: float!(0.2),
         };
 
-        let result =
-            check_imbalance_and_build_operation(Chain::Base, &threshold, &inventory, None, None)
-                .await;
+        let result = check_imbalance_and_build_operation(
+            Chain::Base,
+            &threshold,
+            &inventory,
+            None,
+            None,
+            Usdc::ZERO,
+        )
+        .await;
 
         assert!(
             matches!(result, Err(UsdcTriggerSkip::BelowMinimumTransfer { excess }) if excess.inner().lt(float!(53)).unwrap_or(false)),
@@ -2389,9 +2418,15 @@ mod tests {
             deviation: float!(0.2),
         };
 
-        let result =
-            check_imbalance_and_build_operation(Chain::Base, &threshold, &inventory, None, None)
-                .await;
+        let result = check_imbalance_and_build_operation(
+            Chain::Base,
+            &threshold,
+            &inventory,
+            None,
+            None,
+            Usdc::ZERO,
+        )
+        .await;
 
         assert_eq!(
             result,
@@ -2425,6 +2460,7 @@ mod tests {
             &inventory,
             None,
             None,
+            Usdc::ZERO,
         )
         .await;
 
@@ -2453,9 +2489,15 @@ mod tests {
             deviation: float!(0.2),
         };
 
-        let result =
-            check_imbalance_and_build_operation(Chain::Base, &threshold, &inventory, None, None)
-                .await;
+        let result = check_imbalance_and_build_operation(
+            Chain::Base,
+            &threshold,
+            &inventory,
+            None,
+            None,
+            Usdc::ZERO,
+        )
+        .await;
 
         assert_eq!(
             result,
@@ -2482,9 +2524,15 @@ mod tests {
             deviation: float!(0.2),
         };
 
-        let result =
-            check_imbalance_and_build_operation(Chain::Base, &threshold, &inventory, None, None)
-                .await;
+        let result = check_imbalance_and_build_operation(
+            Chain::Base,
+            &threshold,
+            &inventory,
+            None,
+            None,
+            Usdc::ZERO,
+        )
+        .await;
 
         assert_eq!(
             result,
@@ -2514,6 +2562,7 @@ mod tests {
             &inventory,
             usdc_limit,
             None,
+            Usdc::ZERO,
         )
         .await;
 
@@ -2549,6 +2598,7 @@ mod tests {
             &inventory,
             usdc_limit,
             None,
+            Usdc::ZERO,
         )
         .await;
         assert_eq!(
@@ -2575,6 +2625,7 @@ mod tests {
             &after_first,
             usdc_limit,
             None,
+            Usdc::ZERO,
         )
         .await;
         assert_eq!(
@@ -2599,6 +2650,7 @@ mod tests {
             &partially_resolved,
             usdc_limit,
             None,
+            Usdc::ZERO,
         )
         .await;
         assert_eq!(
@@ -2632,6 +2684,7 @@ mod tests {
             &inventory,
             usdc_limit,
             None,
+            Usdc::ZERO,
         )
         .await;
 
@@ -2670,6 +2723,7 @@ mod tests {
             &inventory,
             usdc_limit,
             None,
+            Usdc::ZERO,
         )
         .await;
 
@@ -2704,6 +2758,7 @@ mod tests {
             &inventory,
             None,
             Some(Usd::new(float!(25000))),
+            Usdc::ZERO,
         )
         .await;
 
@@ -2736,6 +2791,7 @@ mod tests {
             &inventory,
             None,
             Some(Usd::new(float!(250))),
+            Usdc::ZERO,
         )
         .await;
 
@@ -2765,6 +2821,7 @@ mod tests {
             &inventory,
             None,
             Some(Usd::new(float!(250))),
+            Usdc::ZERO,
         )
         .await;
 
@@ -2799,6 +2856,7 @@ mod tests {
             &inventory,
             None,
             Some(Usd::new(float!(25000))),
+            Usdc::ZERO,
         )
         .await;
 
@@ -2833,6 +2891,7 @@ mod tests {
             &inventory,
             None,
             Some(Usd::new(float!(25000))),
+            Usdc::ZERO,
         )
         .await;
 
@@ -2869,6 +2928,7 @@ mod tests {
             &inventory,
             None,
             reserved,
+            Usdc::ZERO,
         )
         .await;
         assert_eq!(
@@ -2895,6 +2955,7 @@ mod tests {
             &inventory,
             None,
             reserved,
+            Usdc::ZERO,
         )
         .await;
         assert_eq!(
@@ -2928,6 +2989,7 @@ mod tests {
             &inventory,
             None,
             Some(Usd::new(float!(25000))),
+            Usdc::ZERO,
         )
         .await;
 
@@ -2958,6 +3020,7 @@ mod tests {
             &inventory,
             None,
             Some(Usd::new(float!(100000))),
+            Usdc::ZERO,
         )
         .await;
 
@@ -2988,9 +3051,15 @@ mod tests {
             deviation: float!(0.2),
         };
 
-        let result =
-            check_imbalance_and_build_operation(Chain::Base, &threshold, &inventory, None, None)
-                .await;
+        let result = check_imbalance_and_build_operation(
+            Chain::Base,
+            &threshold,
+            &inventory,
+            None,
+            None,
+            Usdc::ZERO,
+        )
+        .await;
 
         assert_eq!(
             result,
@@ -3021,9 +3090,15 @@ mod tests {
             deviation: float!(0.2),
         };
 
-        let result =
-            check_imbalance_and_build_operation(Chain::Base, &threshold, &inventory, None, None)
-                .await;
+        let result = check_imbalance_and_build_operation(
+            Chain::Base,
+            &threshold,
+            &inventory,
+            None,
+            None,
+            Usdc::ZERO,
+        )
+        .await;
 
         assert_eq!(
             result,
@@ -3054,9 +3129,15 @@ mod tests {
             deviation: float!(0.2),
         };
 
-        let result =
-            check_imbalance_and_build_operation(Chain::Base, &threshold, &inventory, None, None)
-                .await;
+        let result = check_imbalance_and_build_operation(
+            Chain::Base,
+            &threshold,
+            &inventory,
+            None,
+            None,
+            Usdc::ZERO,
+        )
+        .await;
 
         assert_eq!(
             result,
@@ -3092,6 +3173,7 @@ mod tests {
             &inventory,
             usdc_limit,
             None,
+            Usdc::ZERO,
         )
         .await;
 
@@ -3119,9 +3201,15 @@ mod tests {
             deviation: float!(0.2),
         };
 
-        let result =
-            check_imbalance_and_build_operation(Chain::Base, &threshold, &inventory, None, None)
-                .await;
+        let result = check_imbalance_and_build_operation(
+            Chain::Base,
+            &threshold,
+            &inventory,
+            None,
+            None,
+            Usdc::ZERO,
+        )
+        .await;
 
         assert_eq!(
             result,
@@ -3148,9 +3236,15 @@ mod tests {
             deviation: float!(0.2),
         };
 
-        let result =
-            check_imbalance_and_build_operation(Chain::Base, &threshold, &inventory, None, None)
-                .await;
+        let result = check_imbalance_and_build_operation(
+            Chain::Base,
+            &threshold,
+            &inventory,
+            None,
+            None,
+            Usdc::ZERO,
+        )
+        .await;
 
         assert_eq!(
             result,
@@ -3181,9 +3275,15 @@ mod tests {
             deviation: float!(0.2),
         };
 
-        let result =
-            check_imbalance_and_build_operation(Chain::Base, &threshold, &inventory, None, None)
-                .await;
+        let result = check_imbalance_and_build_operation(
+            Chain::Base,
+            &threshold,
+            &inventory,
+            None,
+            None,
+            Usdc::ZERO,
+        )
+        .await;
 
         assert_eq!(
             result,

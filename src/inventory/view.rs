@@ -1098,11 +1098,18 @@ impl InventoryView {
     /// or compensate a real venue imbalance. Suppression based on wallet
     /// residue is tracked separately by a broader orphan-state detection
     /// mechanism.
+    ///
+    /// `inbound_elsewhere` is cash other corridors are already sending to
+    /// Alpaca. Only the chain-to-Alpaca decision adds it to the Alpaca
+    /// balance: the projection can only be too high (a landed transfer
+    /// counted twice for a moment, a stuck one for as long as it is stuck),
+    /// so it may shrink a transfer to Alpaca but never grow one out of it.
     pub(crate) fn check_usdc_imbalance_with_gross_offchain(
         &self,
         chain: Chain,
         threshold: &ImbalanceThreshold,
         reserved: Option<Usd>,
+        inbound_elsewhere: Usdc,
     ) -> Result<Option<Imbalance<Usdc>>, InventoryViewError> {
         let Some(onchain_venue) = self.usdc.onchain.get(&chain) else {
             return Ok(None);
@@ -1136,8 +1143,12 @@ impl InventoryView {
             return Ok(None);
         }
 
+        let projected_total = (total + inbound_elsewhere)?;
+        let projected_total_float: Float = projected_total.into();
+
         let onchain_float: Float = onchain.into();
         let ratio = (onchain_float / total_float)?;
+        let projected_ratio = (onchain_float / projected_total_float)?;
         let lower = (threshold.target - threshold.deviation)?;
         let upper = (threshold.target + threshold.deviation)?;
 
@@ -1146,8 +1157,8 @@ impl InventoryView {
             let excess = (target_onchain - onchain)?;
 
             Ok(Some(Imbalance::TooMuchOffchain { excess }))
-        } else if ratio.gt(upper)? {
-            let target_onchain = (total * threshold.target)?;
+        } else if projected_ratio.gt(upper)? {
+            let target_onchain = (projected_total * threshold.target)?;
             let excess = (onchain - target_onchain)?;
 
             Ok(Some(Imbalance::TooMuchOnchain { excess }))
@@ -5145,7 +5156,12 @@ mod tests {
     fn wallet_balances_do_not_enter_imbalance_math() {
         let now = Utc::now();
         let imbalance_without_wallet = make_usdc_view(900, 0, 100, 0)
-            .check_usdc_imbalance_with_gross_offchain(Chain::Base, &threshold("0.5", "0.3"), None)
+            .check_usdc_imbalance_with_gross_offchain(
+                Chain::Base,
+                &threshold("0.5", "0.3"),
+                None,
+                Usdc::ZERO,
+            )
             .unwrap();
         assert!(
             matches!(
@@ -5165,12 +5181,78 @@ mod tests {
             )
             .unwrap();
         let imbalance_with_wallet = with_huge_wallet
-            .check_usdc_imbalance_with_gross_offchain(Chain::Base, &threshold("0.5", "0.3"), None)
+            .check_usdc_imbalance_with_gross_offchain(
+                Chain::Base,
+                &threshold("0.5", "0.3"),
+                None,
+                Usdc::ZERO,
+            )
             .unwrap();
         assert_eq!(
             imbalance_without_wallet, imbalance_with_wallet,
             "wallet readings must not alter the imbalance answer",
         );
+    }
+
+    /// Chain 200 / Alpaca 50 at 0.6 +/- 0.05 sends 50 to Alpaca alone; with
+    /// 50 already on its way from another corridor it sends 20 (200 of 300).
+    #[test]
+    fn chain_to_alpaca_sizing_projects_other_corridors_inbound_cash() {
+        let view = make_usdc_view(200, 0, 50, 0);
+        let band = threshold("0.6", "0.05");
+
+        let alone = view
+            .check_usdc_imbalance_with_gross_offchain(Chain::Base, &band, None, Usdc::ZERO)
+            .unwrap();
+        assert_eq!(
+            alone,
+            Some(Imbalance::TooMuchOnchain {
+                excess: Usdc::new(float!(50)),
+            })
+        );
+
+        let projected = view
+            .check_usdc_imbalance_with_gross_offchain(
+                Chain::Base,
+                &band,
+                None,
+                Usdc::new(float!(50)),
+            )
+            .unwrap();
+        assert_eq!(
+            projected,
+            Some(Imbalance::TooMuchOnchain {
+                excess: Usdc::new(float!(20)),
+            })
+        );
+    }
+
+    /// Cash on its way to Alpaca is not cash Alpaca can pay out: an
+    /// Alpaca-to-chain transfer sizes against the plain balance.
+    #[test]
+    fn alpaca_to_chain_sizing_ignores_the_projection() {
+        let view = make_usdc_view(20, 0, 100, 0);
+        let band = threshold("0.6", "0.05");
+
+        let plain = view
+            .check_usdc_imbalance_with_gross_offchain(Chain::Base, &band, None, Usdc::ZERO)
+            .unwrap();
+        let projected = view
+            .check_usdc_imbalance_with_gross_offchain(
+                Chain::Base,
+                &band,
+                None,
+                Usdc::new(float!(500)),
+            )
+            .unwrap();
+
+        assert_eq!(
+            plain,
+            Some(Imbalance::TooMuchOffchain {
+                excess: Usdc::new(float!(52)),
+            })
+        );
+        assert_eq!(projected, plain);
     }
 
     /// `force_apply_snapshot_event` must wire the same wallet-read events

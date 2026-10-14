@@ -1185,6 +1185,7 @@ enum UsdcTimeoutCleanup {
     HeldForUnservedCorridor {
         corridor: UsdcCorridor,
         direction: RebalanceDirection,
+        amount: Usdc,
     },
     /// A Relay transfer stopped after its withdrawal, at a chain-to-Alpaca
     /// `Withdrawing` or `WithdrawalComplete` or a swap state that holds the
@@ -2627,6 +2628,8 @@ impl RebalancingService {
                 UsdcTimeoutCleanup::PreservedPostBurn { tracking, elapsed } => {
                     self.usdc_guards
                         .hold(tracking.corridor.chain(), &id, tracking.direction);
+                    self.usdc_guards
+                        .record_amount(&id, tracking.initiated_amount);
 
                     // The preserved entry keeps its original `last_progress_at`,
                     // so every subsequent sweep re-selects it. Log once per stuck
@@ -2725,8 +2728,10 @@ impl RebalancingService {
                 UsdcTimeoutCleanup::HeldForUnservedCorridor {
                     corridor,
                     direction,
+                    amount,
                 } => {
                     self.usdc_guards.hold(corridor.chain(), &id, direction);
+                    self.usdc_guards.record_amount(&id, amount);
                     self.page_unserved_corridor_once(&id, corridor, direction)
                         .await;
                 }
@@ -2737,6 +2742,8 @@ impl RebalancingService {
                 } => {
                     self.usdc_guards
                         .hold(tracking.corridor.chain(), &id, tracking.direction);
+                    self.usdc_guards
+                        .record_amount(&id, tracking.initiated_amount);
                     self.page_relay_withdrawal_hold_once(&id, &tracking, elapsed, &state)
                         .await;
                 }
@@ -3601,6 +3608,7 @@ impl RebalancingService {
                         return Ok(Some(UsdcTimeoutCleanup::HeldForUnservedCorridor {
                             corridor: state.corridor(),
                             direction: state.direction(),
+                            amount: tracking.initiated_amount,
                         }));
                     }
                     Ok(Some(state)) => {
@@ -6398,6 +6406,21 @@ impl RebalancingService {
             }
         };
 
+        // Read on every sizing, so the re-size under the claim also sees a
+        // hold another route added since the first read.
+        let inbound_elsewhere = match self.usdc_guards.inbound_elsewhere(usdc.corridor.chain()) {
+            Ok(inbound) => inbound,
+            Err(error) => {
+                warn!(
+                    target: "rebalance",
+                    corridor = %usdc.corridor,
+                    ?error,
+                    "Skipped USDC trigger: summing other corridors' inbound transfers failed"
+                );
+                return None;
+            }
+        };
+
         let sized = async {
             let usdc_limit = match relay {
                 Some(relay) => Some(usdc::cap_to_relay_maximum(usdc_limit, relay)?),
@@ -6409,6 +6432,7 @@ impl RebalancingService {
                 &self.inventory,
                 usdc_limit,
                 reserved,
+                inbound_elsewhere,
             )
             .await?;
 
@@ -6571,6 +6595,7 @@ impl RebalancingService {
                 return;
             }
         };
+        self.usdc_guards.record_amount(&id, sized.amount());
 
         self.dispatch_claimed_usdc_operation(
             usdc, usdc_limit, reserved, admission, sized, id, guard,
@@ -6608,6 +6633,7 @@ impl RebalancingService {
             );
             return;
         }
+        self.usdc_guards.record_amount(&id, operation.amount());
 
         // Again under the claim: a conversion that failed after the read
         // above holds before its guard is released, so a claim taken on that
@@ -7303,6 +7329,7 @@ impl RebalancingService {
                     claim.defuse();
                 }
                 self.usdc_guards.hold(corridor.chain(), id, direction);
+                self.usdc_guards.record_amount(id, amount);
                 // An operator resuming a USDC transfer re-arms the under-funded page.
                 self.underfunded_alerts.reset_all();
                 info!(
@@ -7432,6 +7459,7 @@ impl RebalancingService {
                     | ClaimRefusal::CorridorUnread => UsdcResumeError::GuardHeldElsewhere,
                 }
             })?;
+        self.usdc_guards.record_amount(&id, amount);
 
         // Redeem the admission and hold the gate through the push, like the
         // trigger's dispatch: a cash engagement during the awaits above
@@ -8648,11 +8676,16 @@ impl RebalancingService {
                             last_progress_at: Utc::now(),
                         },
                     ));
-                    held.push((id, entity.corridor(), entity.direction()));
+                    held.push((id, entity.corridor(), entity.direction(), entity.amount()));
                 }
                 Ok(Some(entity)) => {
                     if entity.holds_rebalance_guard() {
-                        held.push((id.clone(), entity.corridor(), entity.direction()));
+                        held.push((
+                            id.clone(),
+                            entity.corridor(),
+                            entity.direction(),
+                            entity.amount(),
+                        ));
 
                         // Reconstruct an in-memory tracking entry for the
                         // manually-reconcilable guard-holding terminal states
@@ -8832,8 +8865,9 @@ impl RebalancingService {
             return Ok(());
         }
 
-        for (id, corridor, direction) in &held {
+        for (id, corridor, direction, amount) in &held {
             self.usdc_guards.hold(corridor.chain(), id, *direction);
+            self.usdc_guards.record_amount(id, *amount);
         }
         let unclassified = !unresolved_ids.is_empty() || !unparseable.is_empty();
         if unclassified {
@@ -8883,7 +8917,7 @@ impl RebalancingService {
     /// unresolved or unparseable.
     async fn page_startup_latch(
         &self,
-        held: &[(UsdcRebalanceId, UsdcCorridor, RebalanceDirection)],
+        held: &[(UsdcRebalanceId, UsdcCorridor, RebalanceDirection, Usdc)],
         stranded_held_ids: &[UsdcRebalanceId],
         unresolved_ids: &[UsdcRebalanceId],
         unparseable: &[String],
@@ -8904,8 +8938,8 @@ impl RebalancingService {
         } else {
             let latched = held
                 .iter()
-                .filter(|(id, _, _)| stranded_held_ids.contains(id))
-                .map(|(_, corridor, _)| corridor.to_string())
+                .filter(|(id, ..)| stranded_held_ids.contains(id))
+                .map(|(_, corridor, ..)| corridor.to_string())
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>()
@@ -44641,20 +44675,10 @@ mod tests {
     /// and sends 20, not the 50 it would send against Alpaca's current 50.
     #[tokio::test]
     async fn second_inbound_corridor_sizes_against_the_projected_alpaca_balance() {
-        let config = RebalancingServiceConfig {
-            usdc: UsdcCorridors::for_test(
-                OperationMode::Enabled,
-                [
-                    corridor_with_band(Chain::Base, HopKind::Cctp, float!(0.6), float!(0.05)),
-                    corridor_with_band(Chain::Robinhood, HopKind::Relay, float!(0.6), float!(0.05)),
-                ],
-            )
-            .with_relay_hop(Chain::Robinhood, relay_bounds(1, 50_000)),
-            ..with_cash_on(test_config(), &[Chain::Robinhood])
-        };
         let inventory = InventoryView::default().with_usdc(usdc(200), usdc(50));
         let inventory = with_onchain_usdc(inventory, Chain::Robinhood, usdc(200));
-        let trigger = make_trigger_with_inventory_config(inventory, config).await;
+        let trigger =
+            make_trigger_with_inventory_config(inventory, base_and_robinhood_at_prod_band()).await;
 
         trigger.check_and_trigger_usdc().await;
 
@@ -44666,6 +44690,344 @@ mod tests {
             usdc(20),
             "Robinhood must size against Alpaca's 50 plus Base's 50 on its way"
         );
+    }
+
+    /// Base via CCTP and Robinhood via Relay, both at the production band.
+    fn base_and_robinhood_at_prod_band() -> RebalancingServiceConfig {
+        RebalancingServiceConfig {
+            usdc: UsdcCorridors::for_test(
+                OperationMode::Enabled,
+                [
+                    corridor_with_band(Chain::Base, HopKind::Cctp, float!(0.6), float!(0.05)),
+                    corridor_with_band(Chain::Robinhood, HopKind::Relay, float!(0.6), float!(0.05)),
+                ],
+            )
+            .with_relay_hop(Chain::Robinhood, relay_bounds(1, 50_000)),
+            ..with_cash_on(test_config(), &[Chain::Robinhood])
+        }
+    }
+
+    async fn attach_usdc_store(
+        trigger: &RebalancingService,
+    ) -> (sqlx::SqlitePool, Arc<Store<UsdcRebalance>>) {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        trigger
+            .set_stores(
+                Arc::new(test_store::<TokenizedEquityMint>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                store.clone(),
+            )
+            .await;
+
+        (pool, store)
+    }
+
+    /// Robinhood at 200 and Alpaca at 50, with Base already holding its
+    /// guard for a 50 transfer to Alpaca.
+    async fn robinhood_trigger_beside_a_base_transfer() -> Arc<RebalancingService> {
+        let inventory = InventoryView::default().with_usdc(usdc(150), usdc(50));
+        let inventory = with_onchain_usdc(inventory, Chain::Robinhood, usdc(200));
+
+        make_trigger_with_inventory_config(inventory, base_and_robinhood_at_prod_band()).await
+    }
+
+    /// A dispatched transfer that has not written `Initiated` yet is known
+    /// only to its corridor guard; the other corridor still counts it.
+    #[tokio::test]
+    async fn inbound_corridor_counts_another_corridors_dispatched_transfer_before_its_first_event()
+    {
+        let trigger = robinhood_trigger_beside_a_base_transfer().await;
+        let base = UsdcRebalanceId(Uuid::new_v4());
+        trigger
+            .usdc_guards
+            .hold(Chain::Base, &base, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.record_amount(&base, usdc(50));
+
+        trigger.check_and_trigger_usdc().await;
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            1
+        );
+        let robinhood = pending_transfer_usdc_to_hedging_job_on(&trigger, ROBINHOOD_RELAY).await;
+        assert_eq!(robinhood.amount, usdc(20));
+    }
+
+    /// Cash on its way to Alpaca is not cash Alpaca can pay out: an inbound
+    /// hold on Robinhood leaves Base's Alpaca-to-chain transfer as it is.
+    #[tokio::test]
+    async fn inbound_hold_elsewhere_does_not_grow_an_alpaca_to_chain_transfer() {
+        let mut amounts = Vec::new();
+        for inbound_elsewhere in [None, Some(usdc(500))] {
+            let inventory = InventoryView::default()
+                .with_usdc(usdc(100), usdc(900))
+                .with_withdrawable_cash_cents(90_000);
+            let trigger =
+                make_trigger_with_inventory_config(inventory, base_and_robinhood_at_prod_band())
+                    .await;
+            if let Some(amount) = inbound_elsewhere {
+                let robinhood = UsdcRebalanceId(Uuid::new_v4());
+                trigger.usdc_guards.hold(
+                    Chain::Robinhood,
+                    &robinhood,
+                    RebalanceDirection::BaseToAlpaca,
+                );
+                trigger.usdc_guards.record_amount(&robinhood, amount);
+            }
+
+            trigger.check_and_trigger_usdc().await;
+
+            let job = pending_transfer_usdc_to_market_making_job(&trigger).await;
+            assert_eq!(job.corridor, UsdcCorridor::BASE_CCTP);
+            amounts.push(job.amount);
+        }
+
+        assert_eq!(amounts, vec![usdc(500), usdc(500)]);
+    }
+
+    /// Jakub's sequence through the real event path: Base's 50 lands, its
+    /// guard and its projected amount go, and the next checks find both
+    /// corridors in their band, before and after Robinhood's 20 lands.
+    #[tokio::test]
+    async fn inbound_corridor_sizes_against_the_landed_balance_after_the_first_transfer_settles() {
+        let inventory = InventoryView::default().with_usdc(usdc(200), usdc(50));
+        let inventory = with_onchain_usdc(inventory, Chain::Robinhood, usdc(200));
+        let trigger =
+            make_trigger_with_inventory_config(inventory, base_and_robinhood_at_prod_band()).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        trigger.check_and_trigger_usdc().await;
+
+        let base = pending_transfer_usdc_to_hedging_job_on(&trigger, UsdcCorridor::BASE_CCTP).await;
+        assert_eq!(base.amount, usdc(50));
+        let robinhood = pending_transfer_usdc_to_hedging_job_on(&trigger, ROBINHOOD_RELAY).await;
+        assert_eq!(robinhood.amount, usdc(20));
+        take_pending_usdc_transfer_jobs(&trigger).await;
+
+        harness
+            .receive::<UsdcRebalance>(
+                base.id.clone(),
+                make_usdc_initiated_on(
+                    UsdcCorridor::BASE_CCTP,
+                    RebalanceDirection::BaseToAlpaca,
+                    usdc(50),
+                ),
+            )
+            .await
+            .unwrap();
+        harness
+            .receive::<UsdcRebalance>(
+                base.id,
+                make_usdc_conversion_confirmed(
+                    RebalanceDirection::BaseToAlpaca,
+                    usdc(50),
+                    usdc(50),
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert!(!trigger.usdc_guards.is_held(Chain::Base));
+        assert_eq!(
+            trigger
+                .usdc_guards
+                .inbound_elsewhere(Chain::Robinhood)
+                .unwrap(),
+            Usdc::ZERO,
+            "a landed transfer must stop counting as cash on its way"
+        );
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .usdc_available(Venue::Hedging),
+            Some(usdc(100))
+        );
+        assert_eq!(count_pending_usdc_check_jobs(&trigger).await, 1);
+
+        // Base reads Alpaca as 100 plus Robinhood's 20 on its way: 150 of
+        // 270, inside its band. Robinhood's own hold refuses its corridor.
+        trigger.check_and_trigger_usdc().await;
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            0
+        );
+        assert!(trigger.usdc_guards.is_held(Chain::Robinhood));
+
+        // Robinhood's 20 lands: Base at 150 of 270, Robinhood at 180 of 300.
+        trigger.usdc_guards.release_every_holder();
+        {
+            let now = Utc::now();
+            let mut inventory = trigger.inventory.write().await;
+            let landed = inventory
+                .clone()
+                .apply_snapshot_event(
+                    &InventorySnapshotEvent::OffchainUsd {
+                        usd_balance_cents: 12_000,
+                        gross_usd_cents: None,
+                        fetched_at: now,
+                    },
+                    now,
+                )
+                .unwrap();
+            *inventory = with_onchain_usdc(landed, Chain::Robinhood, usdc(180));
+        }
+        trigger.check_and_trigger_usdc().await;
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            0
+        );
+    }
+
+    /// An operator's chain-to-Alpaca transfer on Base counts for Robinhood
+    /// from the moment the route claims Base's guard.
+    #[tokio::test]
+    async fn manual_transfer_hold_projects_into_the_trigger() {
+        let trigger = robinhood_trigger_beside_a_base_transfer().await;
+        let (pool, _store) = attach_usdc_store(&trigger).await;
+
+        trigger
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::BaseToAlpaca,
+                Positive::new(usdc(50)).unwrap(),
+                Some(Chain::Base),
+            )
+            .await
+            .unwrap();
+        trigger.check_and_trigger_usdc().await;
+
+        let robinhood = pending_transfer_usdc_to_hedging_job_on(&trigger, ROBINHOOD_RELAY).await;
+        assert_eq!(robinhood.amount, usdc(20));
+    }
+
+    /// A resumed chain-to-Alpaca transfer on Base counts for Robinhood with
+    /// its persisted amount.
+    #[tokio::test]
+    async fn manual_resume_hold_projects_into_the_trigger() {
+        let trigger = robinhood_trigger_beside_a_base_transfer().await;
+        let (pool, store) = attach_usdc_store(&trigger).await;
+        let base = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &base,
+                UsdcRebalanceCommand::BeginWithdrawal {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    amount: usdc(50),
+                    from_block: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+        trigger
+            .resume_usdc_transfer(&pool, &base, RebalanceDirection::BaseToAlpaca)
+            .await
+            .unwrap();
+        trigger.check_and_trigger_usdc().await;
+
+        let robinhood = pending_transfer_usdc_to_hedging_job_on(&trigger, ROBINHOOD_RELAY).await;
+        assert_eq!(robinhood.amount, usdc(20));
+    }
+
+    /// Startup rebuilds the hold of a persisted chain-to-Alpaca transfer
+    /// with its amount, so the other corridors keep counting it.
+    #[tokio::test]
+    async fn recover_usdc_guard_records_the_persisted_amount() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        seed_bridging_submitting_base_to_alpaca(&store, &id, usdc(50), TxHash::random()).await;
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert!(service.usdc_guards.is_held(Chain::Base));
+        assert_eq!(
+            service
+                .usdc_guards
+                .inbound_elsewhere(Chain::Robinhood)
+                .unwrap(),
+            usdc(50)
+        );
+    }
+
+    /// An Alpaca-outbound transfer marks Alpaca's cash inflight from its
+    /// first event, so no other corridor sizes against that balance until
+    /// it ends.
+    #[tokio::test]
+    async fn alpaca_outbound_first_event_makes_the_other_corridors_check_skip() {
+        let config = RebalancingServiceConfig {
+            usdc: UsdcCorridors::for_test(
+                OperationMode::Enabled,
+                [
+                    active_corridor(Chain::Base, HopKind::Cctp),
+                    active_corridor(Chain::Robinhood, HopKind::Relay),
+                ],
+            )
+            .with_relay_hop(Chain::Robinhood, relay_bounds(1, 50_000)),
+            ..with_cash_on(test_config(), &[Chain::Robinhood])
+        };
+        let inventory = InventoryView::default().with_usdc(usdc(1800), usdc(500));
+        let inventory = with_onchain_usdc(inventory, Chain::Robinhood, usdc(100));
+        let trigger = make_trigger_with_inventory_config(inventory, config).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let outbound = UsdcRebalanceId(Uuid::new_v4());
+
+        harness
+            .receive::<UsdcRebalance>(
+                outbound.clone(),
+                make_usdc_initiated_on(
+                    ROBINHOOD_RELAY,
+                    RebalanceDirection::AlpacaToBase,
+                    usdc(100),
+                ),
+            )
+            .await
+            .unwrap();
+        trigger.check_and_trigger_usdc().await;
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0,
+            "Base must not size against an Alpaca balance with cash leaving it"
+        );
+
+        harness
+            .receive::<UsdcRebalance>(
+                outbound.clone(),
+                make_usdc_bridged_with_amounts(usdc(100), Usdc::ZERO),
+            )
+            .await
+            .unwrap();
+        harness
+            .receive::<UsdcRebalance>(
+                outbound,
+                make_usdc_deposit_confirmed(RebalanceDirection::AlpacaToBase),
+            )
+            .await
+            .unwrap();
+        trigger.check_and_trigger_usdc().await;
+
+        let base = pending_transfer_usdc_to_hedging_job_on(&trigger, UsdcCorridor::BASE_CCTP).await;
+        assert_eq!(base.corridor, UsdcCorridor::BASE_CCTP);
     }
 
     /// A corridor table on a chain other than Base is looked up by its own
