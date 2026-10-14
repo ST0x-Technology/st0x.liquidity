@@ -8879,31 +8879,7 @@ mod tests {
             .transfer(&server, &relay_api, store.clone(), relay_bounds())
             .await;
         let id = UsdcRebalanceId(Uuid::new_v4());
-        record_reverted_and_requoted_toward_chain(&rig, &store, &id).await;
-        let mut second =
-            exact_quote_from_hub(&rig.hub_wallet, rig.hub_contracts, second_order_id).await;
-        second.request_id = B256::repeat_byte(0x5f);
-        let mut last =
-            exact_quote_from_hub(&rig.hub_wallet, rig.hub_contracts, TOWARD_CHAIN_ORDER_ID).await;
-        last.request_id = B256::repeat_byte(0x6f);
-        let reverted = PreparedTransaction::for_test(TxHash::repeat_byte(0xa8), 41);
-        for command in [
-            UsdcRebalanceCommand::RequoteSwap {
-                quote: Box::new(second),
-            },
-            UsdcRebalanceCommand::PrepareSwapDeposit {
-                approve: None,
-                deposit: reverted.clone(),
-            },
-            UsdcRebalanceCommand::RecordSwapDepositReverted {
-                deposit_tx: reverted.tx_hash(),
-            },
-            UsdcRebalanceCommand::RequoteSwap {
-                quote: Box::new(last),
-            },
-        ] {
-            store.send(&id, command).await.unwrap();
-        }
+        record_two_reverted_and_requoted_toward_chain(&rig, &store, &id, second_order_id).await;
 
         let error = tokio::time::timeout(
             Duration::from_secs(60),
@@ -8937,6 +8913,127 @@ mod tests {
         );
         assert!(state.holds_rebalance_guard());
         quotes.assert_calls(0);
+    }
+
+    /// Records [`record_reverted_and_requoted_toward_chain`], then a deposit
+    /// for `second_order_id` (request `0x5f..`) that reverted too, re-quoted
+    /// under `TOWARD_CHAIN_ORDER_ID` (request `0x6f..`).
+    async fn record_two_reverted_and_requoted_toward_chain(
+        rig: &RelayRig,
+        store: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        second_order_id: B256,
+    ) {
+        record_reverted_and_requoted_toward_chain(rig, store, id).await;
+        let mut second =
+            exact_quote_from_hub(&rig.hub_wallet, rig.hub_contracts, second_order_id).await;
+        second.request_id = B256::repeat_byte(0x5f);
+        let mut last =
+            exact_quote_from_hub(&rig.hub_wallet, rig.hub_contracts, TOWARD_CHAIN_ORDER_ID).await;
+        last.request_id = B256::repeat_byte(0x6f);
+        let reverted = PreparedTransaction::for_test(TxHash::repeat_byte(0xa8), 41);
+        for command in [
+            UsdcRebalanceCommand::RequoteSwap {
+                quote: Box::new(second),
+            },
+            UsdcRebalanceCommand::PrepareSwapDeposit {
+                approve: None,
+                deposit: reverted.clone(),
+            },
+            UsdcRebalanceCommand::RecordSwapDepositReverted {
+                deposit_tx: reverted.tx_hash(),
+            },
+            UsdcRebalanceCommand::RequoteSwap {
+                quote: Box::new(last),
+            },
+        ] {
+            store.send(id, command).await.unwrap();
+        }
+    }
+
+    /// A hold on deposits of several reverted orders confirms the approves
+    /// that went out alone and queues their gas: every later attempt holds
+    /// the same way, and the reconcile that ends the hold drops them.
+    #[tokio::test]
+    async fn hold_on_several_reverted_deposits_queues_the_gas_of_its_split_approves() {
+        let rig = RelayRig::deploy().await;
+        rig.withdraw_to_hub(U256::from(2 * AMOUNT_IN)).await;
+        let second_order_id = B256::repeat_byte(0x0b);
+        let first_deposit = rig.deposit_on_hub(REVERTED_ORDER_ID).await;
+        let second_deposit = rig.deposit_on_hub(second_order_id).await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_status_of(
+            &relay_api,
+            B256::repeat_byte(0x5e),
+            json!({"status": "pending", "inTxHashes": [first_deposit], "txHashes": []}),
+        );
+        mock_status_of(
+            &relay_api,
+            B256::repeat_byte(0x5f),
+            json!({"status": "pending", "inTxHashes": [second_deposit], "txHashes": []}),
+        );
+        mock_quote_unavailable(&relay_api);
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let transfer = rig
+            .transfer_through(
+                &server,
+                &relay_api,
+                store.clone(),
+                relay_bounds(),
+                rig.chain.bot_wallet.clone(),
+                BotGasReceiptCostEnqueuer::Enabled(RecordBotGasReceiptCostJobQueue::new(
+                    &apalis_pool,
+                )),
+            )
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_two_reverted_and_requoted_toward_chain(&rig, &store, &id, second_order_id).await;
+        let approve_step =
+            exact_quote_from_hub(&rig.hub_wallet, rig.hub_contracts, TOWARD_CHAIN_ORDER_ID)
+                .await
+                .approve
+                .unwrap();
+        let approve = rig
+            .hub_wallet
+            .prepare_pending(approve_step.to, approve_step.data, "split approve")
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::PrepareSwapApprove {
+                    approve: approve.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(60),
+            transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends")
+        .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::RevertedSwapDepositLive { .. }),
+            "got {error:?}"
+        );
+        assert_eq!(
+            store.load(&id).await.unwrap().unwrap().state_name(),
+            "SwapQuoted"
+        );
+        assert_eq!(
+            queued_gas_costs(&apalis_pool).await,
+            vec![(
+                Chain::Ethereum,
+                approve.tx_hash(),
+                "relay_approve".to_string()
+            )]
+        );
     }
 
     /// An escrow left unresolved past its fill window adopts a refund Relay
