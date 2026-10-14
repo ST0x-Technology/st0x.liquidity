@@ -38745,6 +38745,91 @@ mod tests {
         }
     }
 
+    /// Drives a Robinhood Relay transfer of 100 USDG on `trigger` through an
+    /// origin refund of 99 back into its vault, the redeposit mined at
+    /// `deposit_block`.
+    async fn relay_transfer_returned_to_source(
+        trigger: &RebalancingService,
+        id: &UsdcRebalanceId,
+        deposit_block: u64,
+    ) {
+        trigger
+            .usdc_guards
+            .try_claim(Chain::Robinhood, id, RebalanceDirection::BaseToAlpaca)
+            .unwrap()
+            .defuse();
+        let mut history = vec![make_usdc_initiated_on(
+            ROBINHOOD_RELAY,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(100),
+        )];
+        history.extend(relay_swap_deposited());
+        history.extend([
+            UsdcRebalanceEvent::SwapRefunded {
+                refund_tx: TxHash::repeat_byte(0xe1),
+                side: RefundSide::Origin,
+                amount_refunded: usdc(99),
+                short_of_floor: None,
+                refunded_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::RedepositStarted {
+                redeposit_amount: usdc(99),
+                reason: RedepositReason::Refunded,
+                started_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::RedepositSubmitted {
+                deposit_tx: TxHash::repeat_byte(0xd1),
+                submitted_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::ReturnedToSource {
+                deposit_tx: TxHash::repeat_byte(0xd1),
+                deposit_block: Some(deposit_block),
+                redeposit_amount: usdc(99),
+                shortfall: usdc(1),
+                returned_at: Utc::now(),
+            },
+        ]);
+        for event in history {
+            trigger.on_usdc_rebalance(id.clone(), event).await.unwrap();
+        }
+    }
+
+    /// The redeposit credits the vault before the order fill reader may have
+    /// delivered a fill that spent it, so every USDC check waits for a vault
+    /// read pinned at or past the redeposit's block (ADR 0024).
+    #[tokio::test]
+    async fn relay_returned_to_source_requests_a_vault_read_pinned_at_the_redeposit() {
+        let trigger = make_trigger_with_inventory(with_onchain_usdc(
+            InventoryView::default().with_usdc(usdc(500), usdc(500)),
+            Chain::Robinhood,
+            usdc(500),
+        ))
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        relay_transfer_returned_to_source(&trigger, &id, 30).await;
+
+        let gate = trigger.divergence_gate();
+        let generation = gate
+            .claim_pending_onchain_cash_reconcile(Chain::Robinhood)
+            .expect("the redeposit must request a vault read");
+        assert!(
+            !gate.accepts_onchain_cash_reconcile(
+                Chain::Robinhood,
+                generation,
+                Utc::now(),
+                Some(29)
+            ),
+            "a read below the redeposit block must not replace the credited balance"
+        );
+        assert!(gate.accepts_onchain_cash_reconcile(
+            Chain::Robinhood,
+            generation,
+            Utc::now(),
+            Some(30)
+        ));
+    }
+
     #[tokio::test]
     async fn usdc_terminal_clears_active_rebalance_id() {
         let reactor =
