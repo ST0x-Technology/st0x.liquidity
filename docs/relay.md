@@ -308,9 +308,10 @@ no shorter window is assumed.
 `verify_fill` and `verify_refund` take the txs Relay names
 (`IntentStatusReport::txs`) and require exactly one. The tx is looked up on both
 chains; a tx on neither is `RelayBridgeError::TxNotFound` (retry later, the node
-may lag). The bridge waits for the receipt and requires that chain's
-confirmations from `RelayCtx` (`Unconfirmed` until it has them) in the canonical
-block (`NotCanonical` otherwise), then:
+may lag). The bridge reads the receipt once, never waiting for it, and requires
+that chain's confirmations from `RelayCtx` (`Unconfirmed` while it has no
+receipt or fewer confirmations) in the canonical block (`NotCanonical`
+otherwise), then:
 
 - receipt success;
 - the tx calls that side's stable, with exactly `transferFrom` + one trailing
@@ -324,11 +325,18 @@ block (`NotCanonical` otherwise), then:
   `from`, whose amount equals the calldata amount.
 
 A fill must be on the destination chain (a tx on the origin chain is
-`OnOriginChain` at once, before any wait for its confirmations) and pay at least
-the quote's `minimum_out`. A refund may be on either chain, checked against that
+`OnOriginChain` at once, before its receipt is read) and pay at least the
+quote's `minimum_out`. A refund may be on either chain, checked against that
 chain's stable and wallet, and must not exceed the deposited amount (both
 stables have 6 decimals, so the amounts compare unit for unit; Relay quotes a
 refund minimum of 0). A refund paid on the destination chain looks exactly like
 a fill, so the side alone does not tell them apart: Relay's status does. A
 failed check is `FillUnverified` or `RefundUnverified` with an
 `UnverifiedReason`.
+
+The bridge proves any refund from one unit up to the deposit; bounding it from
+below is the hedge's job. A refund under the refund floor, measured against the
+transfer's first deposit (the first binding quote's `amount_in` less its
+`max_quote_loss_bps`, rounded up, whatever attempt the refund pays), is recorded
+at `SwapRefunded` and held there, paged, guard kept, instead of being
+redeposited or quoted again (SPEC.md, Relay hop step 8).

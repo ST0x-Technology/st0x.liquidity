@@ -174,6 +174,33 @@ const DEPOSIT_SEND_RECONCILIATION_POST_DEADLINE_REDRIVE_DELAY: Duration =
 /// serve. The job stays queued so a build that serves the corridor resumes it.
 const UNSERVED_CORRIDOR_REDRIVE_DELAY: Duration = Duration::from_secs(10 * 60);
 
+/// Relay status reads come back after `RELAY_FILL_EARLY_POLL_DELAY` for the
+/// first `RELAY_FILL_EARLY_WINDOW` after the deposit, when fills land (the
+/// funded test's took 32 and 59 s), and after `RELAY_FILL_POLL_DELAY` later.
+const RELAY_FILL_EARLY_WINDOW: Duration = Duration::from_secs(60);
+const RELAY_FILL_EARLY_POLL_DELAY: Duration = Duration::from_secs(5);
+const RELAY_FILL_POLL_DELAY: Duration = Duration::from_secs(30);
+
+/// Delay before reading Relay's status again after a payment that does not
+/// prove on chain: it pages on every read, so slowly.
+const SWAP_PAYMENT_UNVERIFIED_REDRIVE_DELAY: Duration = Duration::from_secs(30 * 60);
+
+/// When to read Relay's status again for a deposit confirmed at
+/// `deposited_at`. A deposit stamped after `now` (clock skew) counts as
+/// fresh.
+fn relay_fill_poll_delay(deposited_at: DateTime<Utc>, now: DateTime<Utc>) -> Duration {
+    let fresh = now
+        .signed_duration_since(deposited_at)
+        .to_std()
+        .map_or(true, |age| age < RELAY_FILL_EARLY_WINDOW);
+
+    if fresh {
+        RELAY_FILL_EARLY_POLL_DELAY
+    } else {
+        RELAY_FILL_POLL_DELAY
+    }
+}
+
 /// Returns the warn-threshold attempt count at which an early operator alert
 /// fires, or `None` when there is no room for a distinct early warning.
 ///
@@ -408,6 +435,83 @@ where
             }
         }
         other => ControlFlow::Continue(other),
+    }
+}
+
+/// Re-queues, with no retry cost, a Relay transfer that is waiting on Relay
+/// or on the chain: the fill not paid yet (`RelayFillPending`), a reverted
+/// deposit the next attempt re-quotes (`SwapDepositReverted`), or a payment
+/// that does not prove (`SwapPaymentUnverified`, paged on every read). Each
+/// attempt reads Relay's status once, so the single-concurrency worker never
+/// blocks on a fill.
+async fn intercept_relay_wait<Ctx, TaskJob>(
+    job: &TaskJob,
+    job_queue: &JobQueue<TaskJob>,
+    notifier: &Arc<dyn Notifier>,
+    result: Result<(), UsdcTransferError>,
+) -> ControlFlow<Result<(), TaskJob::Error>, Result<(), UsdcTransferError>>
+where
+    Ctx: Send + Sync + 'static,
+    TaskJob: Job<Ctx> + ResetBackpressureStreak + Clone + Sync + Unpin,
+    TaskJob::Error: From<QueuePushError>,
+{
+    let delay = match &result {
+        Err(UsdcTransferError::RelayFillPending { id, deposited_at }) => {
+            let delay = relay_fill_poll_delay(*deposited_at, Utc::now());
+            info!(target: "rebalance", %id, %deposited_at, ?delay, "Relay deposit not paid yet; reading its status again later");
+            delay
+        }
+        Err(UsdcTransferError::SwapDepositReverted { id, deposit_tx }) => {
+            warn!(target: "rebalance", %id, %deposit_tx, delay = ?BURN_REVERT_REDRIVE_DELAY, "Relay deposit reverted; re-quoting on the next attempt");
+            BURN_REVERT_REDRIVE_DELAY
+        }
+        Err(error @ UsdcTransferError::SwapPaymentUnverified { .. }) => {
+            let message = format!(
+                "{error}. The transfer holds its guard; check the order with Relay's status API. \
+                 The status is read again in {SWAP_PAYMENT_UNVERIFIED_REDRIVE_DELAY:?}."
+            );
+            if let Err(notify_error) = notifier
+                .notify(AlertKind::RelaySwapPaymentUnverified, &message)
+                .await
+            {
+                warn!(target: "rebalance", error = ?notify_error, "Failed to deliver the Relay payment page");
+            }
+            SWAP_PAYMENT_UNVERIFIED_REDRIVE_DELAY
+        }
+        Ok(()) | Err(_) => return ControlFlow::Continue(result),
+    };
+
+    let mut job_queue = job_queue.clone();
+    match job_queue
+        .push_with_delay(job.with_reset_backpressure_streak(), delay)
+        .await
+    {
+        Ok(()) => ControlFlow::Break(Ok(())),
+        Err(error) => ControlFlow::Break(Err(TaskJob::Error::from(error))),
+    }
+}
+
+/// A copy of a transfer job with its broker 429 streak reset, for a requeue
+/// whose cause is not backpressure: the next unrelated 429 starts a new streak.
+trait ResetBackpressureStreak {
+    fn with_reset_backpressure_streak(&self) -> Self;
+}
+
+impl ResetBackpressureStreak for TransferUsdcToHedging {
+    fn with_reset_backpressure_streak(&self) -> Self {
+        Self {
+            backpressure_streak: BackpressureStreak::default(),
+            ..self.clone()
+        }
+    }
+}
+
+impl ResetBackpressureStreak for TransferUsdcToMarketMaking {
+    fn with_reset_backpressure_streak(&self) -> Self {
+        Self {
+            backpressure_streak: BackpressureStreak::default(),
+            ..self.clone()
+        }
     }
 }
 
@@ -934,6 +1038,10 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
             ControlFlow::Continue(result) => result,
         };
         let result = match intercept_unserved_corridor(self, &ctx.job_queue, result).await {
+            ControlFlow::Break(outcome) => return outcome,
+            ControlFlow::Continue(result) => result,
+        };
+        let result = match intercept_relay_wait(self, &ctx.job_queue, &ctx.notifier, result).await {
             ControlFlow::Break(outcome) => return outcome,
             ControlFlow::Continue(result) => result,
         };
@@ -3206,6 +3314,101 @@ mod tests {
             run_at >= before + i64::try_from(retry_interval.as_secs()).unwrap() - 5
                 && run_at <= after + i64::try_from(retry_interval.as_secs()).unwrap() + 5
         );
+    }
+
+    /// Ends every attempt with a Relay deposit not paid yet, confirmed at
+    /// `self.0`.
+    struct RelayFillPendingBaseToAlpaca(DateTime<Utc>);
+
+    #[async_trait]
+    impl ResumeBaseToAlpaca for RelayFillPendingBaseToAlpaca {
+        async fn resume_base_to_alpaca(
+            &self,
+            id: &UsdcRebalanceId,
+            _amount: Usdc,
+            _corridor: UsdcCorridor,
+        ) -> Result<(), UsdcTransferError> {
+            Err(UsdcTransferError::RelayFillPending {
+                id: id.clone(),
+                deposited_at: self.0,
+            })
+        }
+    }
+
+    /// A Relay fill not paid yet ends the attempt at once and queues the next
+    /// status read for later, at no retry or redrive cost: the worker never
+    /// blocks on the fill.
+    #[tokio::test]
+    async fn relay_fill_pending_requeues_the_job_after_the_poll_delay() {
+        for (deposited_ago, delay) in [
+            (chrono::Duration::seconds(10), RELAY_FILL_EARLY_POLL_DELAY),
+            (chrono::Duration::minutes(5), RELAY_FILL_POLL_DELAY),
+        ] {
+            let pool = setup_queue_pool().await;
+            let ctx = hedging_ctx(
+                Arc::new(RelayFillPendingBaseToAlpaca(Utc::now() - deposited_ago)),
+                &pool,
+            );
+            let job = TransferUsdcToHedging {
+                corridor: UsdcCorridor::HubRouted {
+                    chain: Chain::Robinhood,
+                    hop: HopKind::Relay,
+                },
+                id: UsdcRebalanceId(Uuid::new_v4()),
+                amount: Usdc::new(float!(100)),
+                revert_redrive_attempts: 1,
+                backpressure_streak: BackpressureStreak(2),
+            };
+
+            let before = Utc::now().timestamp();
+            tokio::time::timeout(Duration::from_secs(5), Job::perform(&job, &ctx))
+                .await
+                .expect("an unpaid fill must not block the worker")
+                .expect("an unpaid fill re-queues without failing the attempt");
+            let after = Utc::now().timestamp();
+
+            let (payload, run_at) = pending_job_row::<TransferUsdcToHedging>(&pool).await;
+            let requeued: TransferUsdcToHedging = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(requeued.id, job.id);
+            assert_eq!(
+                requeued.revert_redrive_attempts,
+                job.revert_redrive_attempts
+            );
+            assert_eq!(requeued.backpressure_streak, BackpressureStreak::default());
+            let delay = i64::try_from(delay.as_secs()).unwrap();
+            assert!(
+                run_at >= before + delay - 1 && run_at <= after + delay + 1,
+                "run_at {run_at} is not {delay}s after {before}..{after}"
+            );
+        }
+    }
+
+    /// A Relay wait is not a broker 429: the requeued job starts a fresh
+    /// backpressure streak, so a later unrelated 429 does not inherit an old
+    /// count and exhaust the consecutive-429 limit.
+    #[tokio::test]
+    async fn relay_wait_requeue_resets_the_backpressure_streak() {
+        let pool = setup_queue_pool().await;
+        let ctx = hedging_ctx(Arc::new(RelayFillPendingBaseToAlpaca(Utc::now())), &pool);
+        let job = TransferUsdcToHedging {
+            corridor: UsdcCorridor::HubRouted {
+                chain: Chain::Robinhood,
+                hop: HopKind::Relay,
+            },
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 1,
+            backpressure_streak: BackpressureStreak(BACKPRESSURE_RESCHEDULE_LIMIT - 1),
+        };
+
+        Job::perform(&job, &ctx)
+            .await
+            .expect("an unpaid fill re-queues without failing the attempt");
+
+        let (payload, _run_at) = pending_job_row::<TransferUsdcToHedging>(&pool).await;
+        let requeued: TransferUsdcToHedging = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(requeued.id, job.id);
+        assert_eq!(requeued.backpressure_streak, BackpressureStreak::default());
     }
 
     struct UnwiredGasReadinessBaseToAlpaca;

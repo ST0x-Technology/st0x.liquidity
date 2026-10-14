@@ -34,19 +34,20 @@ use st0x_event_sorcery::{
     EntityList, EventSourced, EventsSinceError, IdempotentReactor, Reactor, Sequenced, deps,
     events_since, head_rowid,
 };
-use st0x_execution::Direction;
+use st0x_execution::{Direction, HasZero};
+use st0x_finance::Usdc;
 use st0x_float_serde::format_float;
 
 use crate::bot_gas::{BotGasReceiptCost, BotGasReceiptCostEvent};
 use crate::position::{Position, PositionEvent, TradeId};
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
-use crate::usdc_rebalance::{UsdcRebalance, UsdcRebalanceEvent};
+use crate::usdc_rebalance::{UsdcRebalance, UsdcRebalanceEvent, UsdcRebalanceId};
 
 /// Bumped when the ledger schema or the event-to-row mapping changes. A
 /// mismatch against the persisted `pnl_ledger_checkpoint.ledger_version`
 /// truncates every ledger table and resets the checkpoint to zero, making
 /// rebuild the same code path as first-deploy backfill.
-pub(crate) const LEDGER_VERSION: i64 = 2;
+pub(crate) const LEDGER_VERSION: i64 = 3;
 
 /// Rows fetched per entity per ingest batch. Bounds peak memory during
 /// backfill; each batch's rows and checkpoint advance commit atomically, so
@@ -182,6 +183,9 @@ impl PnlLedger {
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM pnl_cost_entry")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM pnl_relay_cost")
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM pnl_bot_gas_cost")
@@ -606,6 +610,24 @@ async fn ingest_rebalance(
         rowid, id, event, ..
     } = event;
     let (fee_collected, occurred_at) = match event {
+        UsdcRebalanceEvent::RelayFillVerified {
+            fee_collected,
+            relayer_fee,
+            filled_at,
+            ..
+        } => {
+            let swap_cost = (fee_collected - relayer_fee)?;
+            return insert_relay_cost(tx, rowid, &id, relayer_fee, swap_cost, &filled_at).await;
+        }
+        // What a refund kept back is the swap's cost too, booked once the
+        // refund is proven, whether it is redeposited or reconciled.
+        UsdcRebalanceEvent::SwapRefunded {
+            shortfall,
+            refunded_at,
+            ..
+        } => {
+            return insert_relay_cost(tx, rowid, &id, Usdc::ZERO, shortfall, &refunded_at).await;
+        }
         UsdcRebalanceEvent::Bridged {
             fee_collected,
             minted_at,
@@ -634,6 +656,13 @@ async fn ingest_rebalance(
         | UsdcRebalanceEvent::SwapApprovePrepared { .. }
         | UsdcRebalanceEvent::SwapDepositPrepared { .. }
         | UsdcRebalanceEvent::SwapDeposited { .. }
+        | UsdcRebalanceEvent::SwapRequoted { .. }
+        | UsdcRebalanceEvent::SwapDepositReverted { .. }
+        | UsdcRebalanceEvent::ReturnedToSource { .. }
+        | UsdcRebalanceEvent::SwapEscrowUnresolved { .. }
+        | UsdcRebalanceEvent::SwapFailed { .. }
+        | UsdcRebalanceEvent::RedepositStarted { .. }
+        | UsdcRebalanceEvent::RedepositSubmitted { .. }
         | UsdcRebalanceEvent::AttestationTimedOut { .. }
         | UsdcRebalanceEvent::BridgeAttestationReceived { .. }
         | UsdcRebalanceEvent::BridgingFailed { .. }
@@ -660,6 +689,38 @@ async fn ingest_rebalance(
     .bind(id.to_string())
     .bind(format_float(&fee_collected.inner())?)
     .bind(canonical_timestamp(&occurred_at))
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
+/// Writes the Relay hop costs of one `UsdcRebalance` event: the quote's
+/// relayer fee and the rest of the swap's cost, signed (a fill above the
+/// fee-adjusted input is a gain). Nothing to book produces no row.
+async fn insert_relay_cost(
+    tx: &mut Transaction<'_, Sqlite>,
+    rowid: i64,
+    id: &UsdcRebalanceId,
+    relayer_fee: Usdc,
+    swap_cost: Usdc,
+    occurred_at: &DateTime<Utc>,
+) -> Result<(), PnlLedgerError> {
+    if relayer_fee.inner().is_zero()? && swap_cost.inner().is_zero()? {
+        return Ok(());
+    }
+
+    sqlx::query(
+        "INSERT INTO pnl_relay_cost \
+         (event_rowid, aggregate_id, relayer_fee_usd, swap_cost_usd, occurred_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(event_rowid) DO NOTHING",
+    )
+    .bind(rowid)
+    .bind(id.to_string())
+    .bind(format_float(&relayer_fee.inner())?)
+    .bind(format_float(&swap_cost.inner())?)
+    .bind(canonical_timestamp(occurred_at))
     .execute(&mut **tx)
     .await?;
 
@@ -695,14 +756,15 @@ async fn ingest_bot_gas(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, TxHash, U256};
+    use alloy::primitives::{Address, B256, TxHash, U256};
     use chrono::TimeZone;
     use serde_json::Value;
     use uuid::Uuid;
 
+    use st0x_bridge::corridor::{HopKind, UsdcCorridor};
     use st0x_config::ExecutionThreshold;
-    use st0x_event_sorcery::{StoreBuilder, compact_events};
-    use st0x_evm::Chain;
+    use st0x_event_sorcery::{StoreBuilder, compact_events, test_store};
+    use st0x_evm::{Chain, PreparedTransaction};
     use st0x_execution::{ExecutorOrderId, SupportedExecutor};
     use st0x_finance::{FractionalShares, Positive, Symbol, Usd, Usdc};
     use st0x_float_macro::float;
@@ -712,7 +774,10 @@ mod tests {
     use crate::offchain::order::OffchainOrderId;
     use crate::position::{PositionCommand, TradeId, TriggerReason};
     use crate::test_utils::{persist_event, pool_migrated_up_to, setup_test_db};
-    use crate::usdc_rebalance::UsdcRebalanceId;
+    use crate::usdc_rebalance::{
+        RebalanceDirection, ReconcileReason, RedepositReason, RefundSide, TransferRef,
+        UsdcRebalanceCommand, UsdcRebalanceId, swap_quote_for_test,
+    };
 
     use super::*;
 
@@ -765,6 +830,145 @@ mod tests {
             .fetch_one(pool)
             .await
             .unwrap()
+    }
+
+    /// A Relay fill books its relayer fee and the rest of its cost in one
+    /// row, the swap's signed (a fill above the fee-adjusted input is a
+    /// gain), and a proven refund books what it kept back.
+    #[tokio::test]
+    async fn relay_fill_and_refund_book_their_relay_costs() {
+        let pool = setup_test_db().await;
+        let gain = UsdcRebalanceId(Uuid::new_v4()).to_string();
+        let cost = UsdcRebalanceId(Uuid::new_v4()).to_string();
+        let refunded = UsdcRebalanceId(Uuid::new_v4()).to_string();
+        let fill = |fee_collected| UsdcRebalanceEvent::RelayFillVerified {
+            fill_tx: TxHash::repeat_byte(0xf1),
+            amount_received: Usdc::new(float!(99.5)),
+            fee_collected: Usdc::new(fee_collected),
+            relayer_fee: Usdc::new(float!(0.3)),
+            filled_at: timestamp(7),
+        };
+        persist_event::<UsdcRebalance>(&pool, &cost, 1, &fill(float!(0.5))).await;
+        persist_event::<UsdcRebalance>(&pool, &gain, 1, &fill(float!(0.1))).await;
+        persist_event::<UsdcRebalance>(
+            &pool,
+            &refunded,
+            1,
+            &UsdcRebalanceEvent::SwapRefunded {
+                refund_tx: TxHash::repeat_byte(0xe1),
+                side: RefundSide::Origin,
+                amount_refunded: Usdc::new(float!(99.4)),
+                short_of_floor: None,
+                shortfall: Usdc::new(float!(0.6)),
+                refunded_at: timestamp(8),
+            },
+        )
+        .await;
+
+        PnlLedger::new(pool.clone()).catch_up().await.unwrap();
+
+        for (id, relayer_fee, swap_cost) in [
+            (cost, "0.3", "0.2"),
+            (gain, "0.3", "-0.2"),
+            (refunded, "0", "0.6"),
+        ] {
+            let row: (String, String) = sqlx::query_as(
+                "SELECT relayer_fee_usd, swap_cost_usd FROM pnl_relay_cost \
+                 WHERE aggregate_id = ?1",
+            )
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(row, (relayer_fee.to_string(), swap_cost.to_string()));
+        }
+        assert_eq!(count(&pool, "pnl_cost_entry").await, 0);
+    }
+
+    /// A proven refund books what it kept back on either side, so a refund
+    /// the operator reconciles shows its loss, and the redeposit after an
+    /// origin refund does not book it a second time.
+    #[tokio::test]
+    async fn relay_refund_books_its_shortfall_once_on_either_path() {
+        let pool = setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let reconciled = UsdcRebalanceId(Uuid::new_v4());
+        let redeposited = UsdcRebalanceId(Uuid::new_v4());
+
+        for (id, side) in [
+            (&reconciled, RefundSide::Destination),
+            (&redeposited, RefundSide::Origin),
+        ] {
+            let deposit = PreparedTransaction::for_test(TxHash::random(), 7);
+            let mut commands = vec![
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    corridor: UsdcCorridor::HubRouted {
+                        chain: Chain::Robinhood,
+                        hop: HopKind::Relay,
+                    },
+                    amount: Usdc::new(float!(100)),
+                    withdrawal: TransferRef::OnchainTx(TxHash::random()),
+                },
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+                UsdcRebalanceCommand::QuoteSwap {
+                    quote: Box::new(swap_quote_for_test(
+                        U256::from(100_000_000u64),
+                        B256::random(),
+                    )),
+                },
+                UsdcRebalanceCommand::PrepareSwapDeposit {
+                    approve: None,
+                    deposit: deposit.clone(),
+                },
+                UsdcRebalanceCommand::ConfirmSwapDeposit {
+                    deposit_tx: deposit.tx_hash(),
+                    deposit_block: 9,
+                },
+                UsdcRebalanceCommand::RecordSwapRefund {
+                    refund_tx: TxHash::random(),
+                    side,
+                    amount_refunded: U256::from(99_600_000u64),
+                },
+            ];
+            let redeposit = TxHash::random();
+            commands.extend(match side {
+                RefundSide::Destination => vec![UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: ReconcileReason::FundsMovedManually,
+                }],
+                RefundSide::Origin => vec![
+                    UsdcRebalanceCommand::BeginRedeposit {
+                        reason: RedepositReason::Refunded,
+                    },
+                    UsdcRebalanceCommand::RecordRedeposit {
+                        deposit_tx: redeposit,
+                    },
+                    UsdcRebalanceCommand::ConfirmRedeposit {
+                        deposit_tx: redeposit,
+                        deposit_block: Some(12),
+                    },
+                ],
+            });
+            for command in commands {
+                store.send(id, command).await.unwrap();
+            }
+        }
+
+        PnlLedger::new(pool.clone()).catch_up().await.unwrap();
+
+        for id in [reconciled, redeposited] {
+            let rows: Vec<(String, String)> = sqlx::query_as(
+                "SELECT relayer_fee_usd, swap_cost_usd FROM pnl_relay_cost \
+                 WHERE aggregate_id = ?1",
+            )
+            .bind(id.to_string())
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(rows, vec![("0".to_string(), "0.4".to_string())], "{id}");
+        }
     }
 
     #[tokio::test]
@@ -997,6 +1201,20 @@ mod tests {
 
     const WRAPPED_RATIO: u64 = 1_010_000_000_000_000_000;
 
+    /// A pool on the schema before unique event rowids, plus the Relay cost
+    /// table this release's ledger writes: the ledger never runs on a schema
+    /// without it, but these tests checkpoint it before the rowid upgrade.
+    async fn pool_before_unique_event_rowids() -> SqlitePool {
+        let pool = pool_migrated_up_to(LAST_MIGRATION_BEFORE_UNIQUE_EVENT_ROWIDS).await;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/20261008021843_pnl_relay_cost.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
     /// Writes an `InventorySnapshot` event row and a snapshot covering it, so
     /// `compact_events` deletes it. Raw rows: the ledger never reads this
     /// aggregate and compaction only looks at type, id and sequence.
@@ -1102,7 +1320,7 @@ mod tests {
     /// number above that checkpoint, which no surviving row reaches.
     #[tokio::test]
     async fn upgrade_keeps_rowids_and_starts_above_a_checkpoint_on_deleted_rows() {
-        let pool = pool_migrated_up_to(LAST_MIGRATION_BEFORE_UNIQUE_EVENT_ROWIDS).await;
+        let pool = pool_before_unique_event_rowids().await;
         persist_event::<Position>(&pool, "AAPL", 1, &onchain_fill(1, 0)).await;
         persist_compactable_inventory_event(&pool, 1).await;
         persist_event::<Position>(&pool, "AAPL", 2, &onchain_fill(2, 0)).await;
@@ -1125,10 +1343,10 @@ mod tests {
 
     /// A ledger that already skipped an event below its checkpoint is
     /// rebuilt after the upgrade, by this release or by the previous one
-    /// after a rollback: both run `LEDGER_VERSION` 2.
+    /// after a rollback: both run `LEDGER_VERSION` 2 or later.
     #[tokio::test]
     async fn upgrade_rebuilds_a_ledger_that_skipped_an_event() {
-        let pool = pool_migrated_up_to(LAST_MIGRATION_BEFORE_UNIQUE_EVENT_ROWIDS).await;
+        let pool = pool_before_unique_event_rowids().await;
         let ledger = PnlLedger::new(pool.clone());
         persist_wrapped_fill(&pool, 7, 1).await;
         ledger.catch_up().await.unwrap();

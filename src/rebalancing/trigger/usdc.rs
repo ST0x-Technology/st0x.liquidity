@@ -8,9 +8,10 @@ use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, trace, warn};
 
-use st0x_bridge::corridor::UsdcCorridor;
+use st0x_bridge::corridor::{HopKind, UsdcCorridor};
 use st0x_config::RelayHopCtx;
 use st0x_evm::Chain;
+use st0x_execution::HasZero;
 use st0x_finance::{Usd, Usdc};
 
 use super::{RebalancingService, RebalancingServiceError};
@@ -174,7 +175,8 @@ pub(super) enum UsdcTerminalAction {
 /// planning on its chain. The plan came from an inventory balance the vault
 /// could not cover, and a fresh vault read need not fix that, so the read
 /// alone cannot lift the hold. This bounds a persistent cause to one rejected
-/// withdraw per chain per period, matching the scan redrive cadence. Startup
+/// withdraw per chain per period, matching the scan redrive cadence. A Relay
+/// transfer back in its vault (`ReturnedToSource`) starts it too. Startup
 /// restores it from durable state (`restore_withdrawal_rejection_cooldowns`).
 pub(crate) const USDC_WITHDRAW_REJECTION_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 
@@ -230,6 +232,14 @@ pub(super) enum UsdcSettlementOutcome {
     HeldByWithdrawCooldown,
 }
 
+/// What a Relay redeposit put back into the vault its transfer left: the
+/// amount, and the block of the vault deposit (`None` when not captured).
+#[derive(Debug, Clone, Copy)]
+struct ReturnedToVault {
+    amount: Usdc,
+    deposit_block: Option<u64>,
+}
+
 /// Whether a terminal event (USDC, mint or redemption) left the in-memory
 /// cash ledger reconciled, or stale until the next snapshot poll heals it.
 #[derive(Debug, Clone, Copy)]
@@ -259,6 +269,9 @@ pub(super) enum UsdcRebalanceStage {
     SwapQuoted,
     SwapDepositPrepared,
     SwapDeposited,
+    SwapRefunded,
+    SwapEscrowUnresolved,
+    Redepositing,
     Bridged,
     DepositInitiated,
     DepositConfirmed,
@@ -276,6 +289,9 @@ impl std::fmt::Display for UsdcRebalanceStage {
             Self::SwapQuoted => write!(formatter, "SwapQuoted"),
             Self::SwapDepositPrepared => write!(formatter, "SwapDepositPrepared"),
             Self::SwapDeposited => write!(formatter, "SwapDeposited"),
+            Self::SwapRefunded => write!(formatter, "SwapRefunded"),
+            Self::SwapEscrowUnresolved => write!(formatter, "SwapEscrowUnresolved"),
+            Self::Redepositing => write!(formatter, "Redepositing"),
             Self::Bridged => write!(formatter, "Bridged"),
             Self::DepositInitiated => write!(formatter, "DepositInitiated"),
             Self::DepositConfirmed => write!(formatter, "DepositConfirmed"),
@@ -297,10 +313,17 @@ impl UsdcRebalanceStage {
             WithdrawalConfirmed { .. } => Some(Self::WithdrawalConfirmed),
             BridgingInitiated { .. } => Some(Self::BridgingInitiated),
             BridgeAttestationReceived { .. } => Some(Self::BridgeAttestationReceived),
-            SwapQuoted { .. } => Some(Self::SwapQuoted),
+            SwapQuoted { .. } | SwapRequoted { .. } | SwapDepositReverted { .. } => {
+                Some(Self::SwapQuoted)
+            }
             SwapDepositPrepared { .. } => Some(Self::SwapDepositPrepared),
             SwapDeposited { .. } => Some(Self::SwapDeposited),
-            Bridged { .. } | BridgingCompletionRecovered { .. } => Some(Self::Bridged),
+            SwapRefunded { .. } => Some(Self::SwapRefunded),
+            SwapEscrowUnresolved { .. } => Some(Self::SwapEscrowUnresolved),
+            RedepositStarted { .. } | RedepositSubmitted { .. } => Some(Self::Redepositing),
+            Bridged { .. } | BridgingCompletionRecovered { .. } | RelayFillVerified { .. } => {
+                Some(Self::Bridged)
+            }
             DepositInitiated { .. } => Some(Self::DepositInitiated),
             DepositConfirmed { .. } | DepositCompletionRecovered { .. } => {
                 Some(Self::DepositConfirmed)
@@ -320,6 +343,8 @@ impl UsdcRebalanceStage {
             | WithdrawalFailed { .. }
             | BridgingFailed { .. }
             | DepositFailed { .. }
+            | SwapFailed { .. }
+            | ReturnedToSource { .. }
             | OperatorReconciled { .. } => None,
         }
     }
@@ -342,7 +367,17 @@ impl UsdcRebalanceStage {
             (Self::BridgeAttestationReceived, BridgeAttestationReceived { attested_at, .. }) => {
                 Some(*attested_at)
             }
-            (Self::SwapQuoted, SwapQuoted { quoted_at, .. }) => Some(*quoted_at),
+            (Self::SwapQuoted, SwapQuoted { quoted_at, .. } | SwapRequoted { quoted_at, .. }) => {
+                Some(*quoted_at)
+            }
+            (Self::SwapQuoted, SwapDepositReverted { reverted_at, .. }) => Some(*reverted_at),
+            (Self::SwapRefunded, SwapRefunded { refunded_at, .. }) => Some(*refunded_at),
+            (Self::SwapEscrowUnresolved, SwapEscrowUnresolved { unresolved_at }) => {
+                Some(*unresolved_at)
+            }
+            (Self::Redepositing, RedepositStarted { started_at, .. }) => Some(*started_at),
+            (Self::Redepositing, RedepositSubmitted { submitted_at, .. }) => Some(*submitted_at),
+            (Self::Bridged, RelayFillVerified { filled_at, .. }) => Some(*filled_at),
             (Self::SwapDepositPrepared, SwapDepositPrepared { prepared_at, .. }) => {
                 Some(*prepared_at)
             }
@@ -1007,7 +1042,7 @@ impl RebalancingService {
         //   - `WithdrawalFailed` is always pre-burn (nothing left the source),
         //     so absent tracking correctly clears.
         match event {
-            DepositFailed { .. } => true,
+            DepositFailed { .. } | SwapFailed { .. } => true,
             ConversionFailed { .. } => match self.usdc_tracking.read().await.get(id) {
                 Some(tracking) => tracking.is_post_burn(),
                 None => self.durable_guard_hold(id).await,
@@ -1104,8 +1139,14 @@ impl RebalancingService {
             | BridgingInitiated { .. }
             | BridgeAttestationReceived { .. }
             | SwapQuoted { .. }
+            | SwapRequoted { .. }
+            | SwapDepositReverted { .. }
             | SwapDepositPrepared { .. }
             | SwapDeposited { .. }
+            | SwapRefunded { .. }
+            | SwapEscrowUnresolved { .. }
+            | RedepositStarted { .. }
+            | RedepositSubmitted { .. }
             | DepositInitiated { .. }
             | DepositConfirmed {
                 direction: RebalanceDirection::BaseToAlpaca,
@@ -1129,6 +1170,9 @@ impl RebalancingService {
                 amount_received, ..
             }
             | BridgingCompletionRecovered {
+                amount_received, ..
+            }
+            | RelayFillVerified {
                 amount_received, ..
             } => {
                 // `BridgingCompletionRecovered` un-fails a post-burn
@@ -1226,6 +1270,31 @@ impl RebalancingService {
                 } else {
                     self.cancel_tracked_usdc_rebalance(id).await?
                 }
+            }
+            // A Relay failure holds its guard like a post-burn failure: the
+            // classifier always preserves it.
+            SwapFailed { .. } => {
+                self.warn_if_post_burn_tracking_missing(id).await;
+                UsdcSettlementOutcome::Reconciled
+            }
+            // The stable is back in the vault it left: credit what came back,
+            // drop what a refund kept, hold checks for a vault read pinned at
+            // the redeposit, and start the chain's withdraw cooldown.
+            ReturnedToSource {
+                redeposit_amount,
+                deposit_block,
+                returned_at,
+                ..
+            } => {
+                self.settle_tracked_usdc_rebalance(
+                    id,
+                    Some(ReturnedToVault {
+                        amount: *redeposit_amount,
+                        deposit_block: *deposit_block,
+                    }),
+                )
+                .await?;
+                self.hold_after_redeposit(id, *returned_at).await
             }
             // Operator reconciliation of a post-burn `DepositFailed`: the minted
             // USDC left the source venue, so reconcile inflight with post-burn
@@ -1528,6 +1597,17 @@ impl RebalancingService {
         &self,
         id: &UsdcRebalanceId,
     ) -> Result<UsdcSettlementOutcome, RebalancingServiceError> {
+        self.settle_tracked_usdc_rebalance(id, None).await
+    }
+
+    /// Returns a stopped transfer's source inflight to available: all of it,
+    /// or only what a Relay redeposit put back (a refund that kept fees),
+    /// the rest released without a credit.
+    async fn settle_tracked_usdc_rebalance(
+        &self,
+        id: &UsdcRebalanceId,
+        returned: Option<ReturnedToVault>,
+    ) -> Result<UsdcSettlementOutcome, RebalancingServiceError> {
         let Some(tracking) = self.usdc_tracking.read().await.get(id).cloned() else {
             debug!(
                 target: "rebalance",
@@ -1546,16 +1626,38 @@ impl RebalancingService {
         let initiated_amount = tracking.initiated_amount;
         let now = Utc::now();
         let update = Box::new(move |inventory, chain| {
-            let cancelled =
-                Inventory::transfer(source_venue, TransferOp::Cancel, initiated_amount)(
+            let settled = match returned {
+                None => Inventory::transfer(source_venue, TransferOp::Cancel, initiated_amount)(
                     inventory, chain,
-                )?;
-            Inventory::with_last_rebalancing(now)(cancelled, chain)
+                )?,
+                Some(ReturnedToVault { amount, .. }) => {
+                    let cancelled = Inventory::transfer(source_venue, TransferOp::Cancel, amount)(
+                        inventory, chain,
+                    )?;
+                    Inventory::set_inflight(source_venue, Usdc::ZERO)(cancelled, chain)?
+                }
+            };
+            Inventory::with_last_rebalancing(now)(settled, chain)
         });
 
+        // A redeposit is a vault credit: it requests a pinned read under the
+        // same inventory write, as `complete_usdc_rebalance` does.
+        let deposit_block = returned.and_then(|returned| returned.deposit_block);
+        let cash_engagement = match deposit_block {
+            Some(_) => Some(self.divergence_gate.lock_cash_engagement().await),
+            None => None,
+        };
         let mut inventory = self.inventory.write().await;
         let outcome = match inventory.clone().update_usdc_at(chain, update, now) {
             Ok(updated) => {
+                if let (Some(block_number), Some(cash_engagement)) =
+                    (deposit_block, &cash_engagement)
+                {
+                    let minimum_block = updated
+                        .onchain_usdc_block_watermark(chain)
+                        .map_or(block_number, |watermark| watermark.max(block_number));
+                    cash_engagement.request_onchain_cash_reconcile(chain, Some(minimum_block));
+                }
                 *inventory = updated;
                 UsdcSettlementOutcome::Reconciled
             }
@@ -1592,6 +1694,7 @@ impl RebalancingService {
             Err(error) => return Err(error.into()),
         };
         drop(inventory);
+        drop(cash_engagement);
 
         Ok(outcome)
     }
@@ -1628,6 +1731,30 @@ impl RebalancingService {
         let rejected_at = Utc::now();
         self.hold_after_withdraw_rejection(chain, rejected_at).await;
         self.enqueue_cooldown_expiry_check(rejected_at, USDC_WITHDRAW_REJECTION_COOLDOWN)
+            .await;
+
+        UsdcSettlementOutcome::HeldByWithdrawCooldown
+    }
+
+    /// A Relay transfer back in its vault leaves the imbalance that planned
+    /// it, so the next check would plan the same round trip: the chain's
+    /// withdraw cooldown holds Base->Alpaca planning there, so a cause that
+    /// persists (an origin refund, deposits that keep reverting, a binding
+    /// quote refused after the pre-flight one) costs at most one withdraw and
+    /// redeposit per period. An unknown chain holds every chain.
+    async fn hold_after_redeposit(
+        &self,
+        id: &UsdcRebalanceId,
+        returned_at: DateTime<Utc>,
+    ) -> UsdcSettlementOutcome {
+        let chain = match self.active_usdc_rebalance(id).await {
+            ActiveUsdcRebalance::Known { chain, .. } => Some(chain),
+            ActiveUsdcRebalance::Unknown => None,
+        };
+
+        warn!(target: "rebalance", %id, ?chain, "Relay transfer returned to its vault: holding Base->Alpaca planning for the withdraw cooldown (every chain when the chain is unknown)");
+        self.hold_after_withdraw_rejection(chain, returned_at).await;
+        self.enqueue_cooldown_expiry_check(returned_at, USDC_WITHDRAW_REJECTION_COOLDOWN)
             .await;
 
         UsdcSettlementOutcome::HeldByWithdrawCooldown
@@ -1786,8 +1913,20 @@ impl RebalancingService {
         let chain = tracking.corridor.chain();
         let source_venue = tracking.source_venue();
         let initiated_amount = tracking.initiated_amount;
+        // A Relay transfer settles at what it received, with no ceiling: the
+        // fill proof bounds it only from below, and the USD a chain-to-Alpaca
+        // conversion receives can exceed the fill.
+        let settles_above_input = match tracking.corridor {
+            UsdcCorridor::HubRouted {
+                hop: HopKind::Relay,
+                ..
+            } => true,
+            UsdcCorridor::HubRouted {
+                hop: HopKind::Cctp, ..
+            } => false,
+        };
 
-        if settled_amount.gt(&initiated_amount)? {
+        if !settles_above_input && settled_amount.gt(&initiated_amount)? {
             warn!(
                 target: "rebalance",
                 id = %id,

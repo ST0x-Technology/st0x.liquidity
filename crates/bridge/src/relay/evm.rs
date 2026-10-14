@@ -491,8 +491,8 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> SwapBridge for RelayBridge<EthWalle
             .await
             .map_err(|error| error.into_bridge_error(unverified))?;
 
-        // Only a refund pays on the origin chain: refused before the proof,
-        // which would wait for its confirmations first.
+        // Only a refund pays on the origin chain: refused before the proof
+        // reads its receipt.
         if located.side == SwapSide::Origin {
             return Err(unverified(UnverifiedReason::OnOriginChain));
         }
@@ -838,6 +838,33 @@ impl<W: Wallet> RelayEnd<W> {
         tx: TxHash,
     ) -> Result<(TransactionReceipt, u64), RelayBridgeError> {
         let receipt = self.wallet.await_receipt(tx).await?;
+        self.check_confirmed(tx, receipt).await
+    }
+
+    /// [`Self::confirmed_receipt`] from one receipt read: a payment proof
+    /// never waits in process, so a tx with no receipt yet is `Unconfirmed`.
+    async fn read_confirmed_receipt(
+        &self,
+        tx: TxHash,
+    ) -> Result<(TransactionReceipt, u64), RelayBridgeError> {
+        let Some(receipt) = self.wallet.provider().get_transaction_receipt(tx).await? else {
+            return Err(RelayBridgeError::Unconfirmed {
+                tx,
+                confirmations: 0,
+                required: self.confirmations,
+            });
+        };
+
+        self.check_confirmed(tx, receipt).await
+    }
+
+    /// `receipt` and its block when it has this end's confirmations in a
+    /// canonical block.
+    async fn check_confirmed(
+        &self,
+        tx: TxHash,
+        receipt: TransactionReceipt,
+    ) -> Result<(TransactionReceipt, u64), RelayBridgeError> {
         let head = self.wallet.provider().get_block_number().await?;
 
         let (Some(block), Some(block_hash)) = (receipt.block_number, receipt.block_hash) else {
@@ -1058,7 +1085,7 @@ impl<W: Wallet> RelayEnd<W> {
         found: &Transaction,
         order_id: RelayOrderId,
     ) -> Result<U256, ProofError> {
-        let (receipt, _) = self.confirmed_receipt(tx).await?;
+        let (receipt, _) = self.read_confirmed_receipt(tx).await?;
 
         let terms = PaymentTerms {
             stable: self.stable,
@@ -1159,7 +1186,7 @@ mod tests {
     use alloy::consensus::TxEnvelope;
     use alloy::eips::Decodable2718;
     use alloy::primitives::Signature;
-    use alloy::providers::{DynProvider, ProviderBuilder, RootProvider};
+    use alloy::providers::{DynProvider, ProviderBuilder, ProviderCall, RootProvider};
     use alloy::transports::TransportResult;
 
     use st0x_evm::Evm;
@@ -1318,6 +1345,32 @@ mod tests {
         }
     }
 
+    /// A lagging node that serves every receipt from a block a reorg removed.
+    struct OrphanReceipts {
+        inner: DynProvider,
+    }
+
+    #[async_trait]
+    impl Provider for OrphanReceipts {
+        fn root(&self) -> &RootProvider {
+            self.inner.root()
+        }
+
+        fn get_transaction_receipt(
+            &self,
+            hash: TxHash,
+        ) -> ProviderCall<(TxHash,), Option<TransactionReceipt>> {
+            let inner = self.inner.clone();
+            ProviderCall::BoxedFuture(Box::pin(async move {
+                let receipt = inner.get_transaction_receipt(hash).await?;
+                Ok(receipt.map(|mut receipt| {
+                    receipt.block_hash = Some(B256::repeat_byte(0xee));
+                    receipt
+                }))
+            }))
+        }
+    }
+
     /// Our wallet on `chain`, behind a node whose logs name reorged-out blocks.
     fn stale_logs_wallet(chain: &RelayChain) -> TestWallet {
         let inner = ProviderBuilder::new()
@@ -1425,14 +1478,11 @@ mod tests {
             .unwrap()
     }
 
-    /// Our corridor-chain wallet, with a hook on its first deposit signing, and
-    /// with `orphan_receipts` serving every receipt as a lagging node would
-    /// from a reorged-out block.
+    /// Our corridor-chain wallet, with a hook on its first deposit signing.
     struct PairWallet {
         inner: TestWallet,
         on_deposit: Mutex<Option<OnDepositSigning>>,
         stable: Address,
-        orphan_receipts: bool,
     }
 
     enum OnDepositSigning {
@@ -1543,13 +1593,7 @@ mod tests {
         }
 
         async fn await_receipt(&self, tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
-            let mut receipt = self.inner.await_receipt(tx_hash).await?;
-
-            if self.orphan_receipts {
-                receipt.block_hash = Some(B256::repeat_byte(0xee));
-            }
-
-            Ok(receipt)
+            self.inner.await_receipt(tx_hash).await
         }
 
         async fn send(
@@ -1571,19 +1615,30 @@ mod tests {
         hooked_bridge(harness, Some(on_deposit), false)
     }
 
+    /// `orphan_receipts` puts the corridor-chain wallet behind a node that
+    /// serves every receipt from a reorged-out block.
     fn hooked_bridge(
         harness: &Harness,
         on_deposit: Option<OnDepositSigning>,
         orphan_receipts: bool,
     ) -> RelayBridge<TestWallet, PairWallet> {
+        let inner = if orphan_receipts {
+            let provider = ProviderBuilder::new()
+                .connect_http(harness.chain.endpoint().parse().unwrap())
+                .erased();
+            let provider = OrphanReceipts { inner: provider }.erased();
+            RawPrivateKeyWallet::new(&harness.chain.wallet_key(), provider, 1).unwrap()
+        } else {
+            wallet(&harness.chain)
+        };
+
         RelayBridge::try_from_ctx(RelayCtx {
             chain: Chain::Robinhood,
             ethereum_wallet: wallet(&harness.hub),
             chain_wallet: PairWallet {
-                inner: wallet(&harness.chain),
+                inner,
                 on_deposit: Mutex::new(on_deposit),
                 stable: harness.chain.stable,
-                orphan_receipts,
             },
             ethereum_confirmations: CONFIRMATIONS,
             chain_confirmations: CONFIRMATIONS,
@@ -2129,6 +2184,65 @@ mod tests {
             ),
             "{verify:?}"
         );
+    }
+
+    /// A payment that is mined but short of the end's confirmations proves
+    /// `Unconfirmed` at once, even when the wallet's receipt wait would
+    /// hold out for that depth: the caller redrives the read later.
+    #[tokio::test]
+    async fn payment_short_of_the_confirmations_is_unconfirmed_without_waiting() {
+        let harness = Harness::new().await;
+        let deep_wallet = |chain: &RelayChain| {
+            let provider = ProviderBuilder::new()
+                .connect_http(chain.endpoint().parse().unwrap())
+                .erased();
+            RawPrivateKeyWallet::new(&chain.wallet_key(), provider, CONFIRMATIONS).unwrap()
+        };
+        let bridge = RelayBridge::try_from_ctx(RelayCtx {
+            chain: Chain::Robinhood,
+            ethereum_wallet: deep_wallet(&harness.hub),
+            chain_wallet: deep_wallet(&harness.chain),
+            ethereum_confirmations: CONFIRMATIONS,
+            chain_confirmations: CONFIRMATIONS,
+        })
+        .unwrap()
+        .with_local_contracts(contracts(&harness.hub), contracts(&harness.chain))
+        .without_scan_backoff();
+        let order_id = RelayOrderId(B256::random());
+        harness.hub.mint(harness.hub.solver(), MINIMUM_OUT).await;
+        let fill = harness
+            .hub
+            .pay(harness.hub.wallet(), MINIMUM_OUT, order_id.0)
+            .await;
+        harness.chain.mint(harness.chain.solver(), AMOUNT).await;
+        let refund = harness
+            .chain
+            .pay(harness.chain.wallet(), AMOUNT, order_id.0)
+            .await;
+
+        let (fill_proof, refund_proof) = tokio::time::timeout(Duration::from_secs(10), async {
+            (
+                bridge
+                    .verify_fill(HopDirection::ToHub, order_id, MINIMUM_OUT, &[fill])
+                    .await,
+                bridge
+                    .verify_refund(HopDirection::ToHub, order_id, AMOUNT, &[refund])
+                    .await,
+            )
+        })
+        .await
+        .expect("a payment proof reads the chain once, never waiting for the depth");
+
+        for (proof, tx) in [(fill_proof, fill), (refund_proof, refund)] {
+            assert!(
+                matches!(
+                    proof,
+                    Err(RelayBridgeError::Unconfirmed { tx: unconfirmed, confirmations: 1, required: CONFIRMATIONS })
+                        if unconfirmed == tx
+                ),
+                "{proof:?}"
+            );
+        }
     }
 
     #[tokio::test]

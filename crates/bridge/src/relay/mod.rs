@@ -312,7 +312,7 @@ impl QuoteErrorCode {
     }
 
     /// The codes Relay's docs call transient.
-    const fn is_transient(&self) -> bool {
+    pub const fn is_transient(&self) -> bool {
         match self {
             Self::PriceFetchFailed
             | Self::ServiceUnavailable

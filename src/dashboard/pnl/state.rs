@@ -268,6 +268,9 @@ pub(crate) struct PositionViewRow {
 pub(crate) enum CostSource {
     TokenizationFee,
     CctpFee,
+    RelayFee,
+    /// Signed: a fill above the fee-adjusted input is a gain.
+    RelaySwap,
 }
 
 /// One `pnl_cost_entry` row. `amount_usd` `None` is the persisted "provider

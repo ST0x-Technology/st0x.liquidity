@@ -347,9 +347,10 @@ pub enum UsdcTransferError {
     /// stall later sends from the chain wallet until a restart.
     #[error("USDC rebalance {id}: the Relay pair prepare task panicked")]
     SwapPrepareTaskPanicked { id: UsdcRebalanceId },
-    /// The work before and around the swap pair's persist outlasted the
-    /// corridor's `quote_max_age`, so the chain wallet's prepare lock is
-    /// released. A pair signed after it is discarded when its signing returns.
+    /// The work before and around the swap pair's persist, or the wait for
+    /// the chain wallet's prepare lock, outlasted the corridor's
+    /// `quote_max_age`. A pair signed after it is discarded when its signing
+    /// returns, and keeps the lock until then.
     #[error("USDC rebalance {id}: the Relay pair prepare outlasted {timeout:?}; retrying")]
     SwapPrepareTimedOut {
         id: UsdcRebalanceId,
@@ -366,6 +367,29 @@ pub enum UsdcTransferError {
         id: UsdcRebalanceId,
         quoted_at: DateTime<Utc>,
         deadline: DateTime<Utc>,
+    },
+    /// Relay has not paid the deposit yet, or its payment is not on chain
+    /// with its confirmations yet: the job reads the status again later.
+    #[error("USDC rebalance {id}: the Relay deposit of {deposited_at} is not paid yet")]
+    RelayFillPending {
+        id: UsdcRebalanceId,
+        deposited_at: DateTime<Utc>,
+    },
+    /// The persisted swap deposit mined and reverted, moving nothing; the
+    /// next attempt re-quotes, or redeposits once the corridor's budget of
+    /// reverted deposits is spent.
+    #[error("USDC rebalance {id}: Relay deposit {deposit_tx} reverted")]
+    SwapDepositReverted {
+        id: UsdcRebalanceId,
+        deposit_tx: TxHash,
+    },
+    /// The fill or refund Relay names does not prove on chain: the transfer
+    /// holds its guard and the status is read again later.
+    #[error("USDC rebalance {id}: the Relay payment does not prove on chain: {source}")]
+    SwapPaymentUnverified {
+        id: UsdcRebalanceId,
+        #[source]
+        source: Box<RelayBridgeError>,
     },
     #[error(
         "USDC transfer corridor mismatch: transfer {id} runs on the {recorded} corridor, \
@@ -841,6 +865,9 @@ impl UsdcTransferError {
             | Self::SwapPrepareTaskPanicked { .. }
             | Self::SwapPrepareTimedOut { .. }
             | Self::SwapQuoteExpired { .. }
+            | Self::RelayFillPending { .. }
+            | Self::SwapDepositReverted { .. }
+            | Self::SwapPaymentUnverified { .. }
             | Self::EthereumChainMissing(_) => None,
         }
     }
@@ -921,6 +948,9 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::SwapPrepareTaskPanicked { .. }
             | Self::SwapPrepareTimedOut { .. }
             | Self::SwapQuoteExpired { .. }
+            | Self::RelayFillPending { .. }
+            | Self::SwapDepositReverted { .. }
+            | Self::SwapPaymentUnverified { .. }
             | Self::EthereumChainMissing(_) => false,
         }
     }
