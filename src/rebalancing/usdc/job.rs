@@ -3531,25 +3531,37 @@ mod tests {
     /// An escrow unresolved past its fill window, and a reverted order's
     /// deposit found on chain, re-queue the job after the slow re-check
     /// delay at no retry or redrive cost: the job keeps reading Relay
-    /// instead of ending with the guard held and nothing driving it.
+    /// instead of ending with the guard held and nothing driving it. The
+    /// found deposit pages on every read; the escrow paged once, when it was
+    /// recorded.
     #[tokio::test]
     async fn unresolved_escrow_and_live_reverted_deposit_are_read_again_slowly() {
-        let held: [fn(&UsdcRebalanceId) -> UsdcTransferError; 2] = [
-            |id| UsdcTransferError::SwapEscrowUnresolved {
-                id: id.clone(),
-                deposit_tx: TxHash::repeat_byte(0xd1),
-            },
-            |id| UsdcTransferError::RevertedSwapDepositLive {
-                id: id.clone(),
-                order_id: B256::repeat_byte(0x0a),
-                request_id: B256::repeat_byte(0x5e),
-                deposit_tx: TxHash::repeat_byte(0xd2),
-            },
+        let held: [(fn(&UsdcRebalanceId) -> UsdcTransferError, Vec<AlertKind>); 2] = [
+            (
+                |id| UsdcTransferError::SwapEscrowUnresolved {
+                    id: id.clone(),
+                    deposit_tx: TxHash::repeat_byte(0xd1),
+                },
+                vec![],
+            ),
+            (
+                |id| UsdcTransferError::RevertedSwapDepositLive {
+                    id: id.clone(),
+                    order_id: B256::repeat_byte(0x0a),
+                    request_id: B256::repeat_byte(0x5e),
+                    deposit_tx: TxHash::repeat_byte(0xd2),
+                },
+                vec![AlertKind::RevertedRelayDepositLive],
+            ),
         ];
 
-        for end in held {
+        for (end, pages) in held {
             let pool = setup_queue_pool().await;
-            let ctx = hedging_ctx(Arc::new(EndsWith(end)), &pool);
+            let notifier = Arc::new(CapturingNotifier::default());
+            let ctx = TransferUsdcToHedgingCtx {
+                notifier: notifier.clone(),
+                ..hedging_ctx(Arc::new(EndsWith(end)), &pool)
+            };
             let job = TransferUsdcToHedging {
                 corridor: UsdcCorridor::HubRouted {
                     chain: Chain::Robinhood,
@@ -3579,6 +3591,7 @@ mod tests {
                 run_at >= before + delay - 1 && run_at <= after + delay + 1,
                 "run_at {run_at} is not {delay}s after {before}..{after}"
             );
+            assert_eq!(notifier.kinds(), pages);
         }
     }
 

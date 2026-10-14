@@ -5323,7 +5323,7 @@ mod tests {
 
     use st0x_bridge::cctp::CctpError;
     use st0x_bridge::corridor::{HopKind, UsdcCorridor};
-    use st0x_bridge::relay::RelayEndpoint;
+    use st0x_bridge::relay::{RelayBridgeError, RelayEndpoint, UnverifiedReason};
     use st0x_config::{
         BrokerCtx, ChainCashAsset, Ctx, ExecutionThreshold, FileLogging, HedgedChain, LogLevel,
         OperationMode, RebalancingMode, RestApiCtx, UsdcCorridors,
@@ -12145,7 +12145,7 @@ mod tests {
 
         let (status, message) = usdc_recheck_error_response(&UsdcRecheckError::Transfer(Box::new(
             UsdcTransferError::CorridorNotServed {
-                id,
+                id: id.clone(),
                 requested: relay,
                 served: BTreeSet::from([UsdcCorridor::BASE_CCTP]),
             },
@@ -12169,6 +12169,34 @@ mod tests {
             UsdcTransferError::RelayApi(Box::new(RelayError::RateLimited { retry_after: None })),
         )));
         assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+        let (status, message) =
+            usdc_recheck_error_response(&UsdcRecheckError::DepositTxNotApplicable {
+                id: id.clone(),
+                tx: TxHash::repeat_byte(0xd1),
+                state: "SwapFailed",
+            });
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            message,
+            UsdcRecheckError::DepositTxNotApplicable {
+                id: id.clone(),
+                tx: TxHash::repeat_byte(0xd1),
+                state: "SwapFailed",
+            }
+            .to_string()
+        );
+
+        let (status, _) = usdc_recheck_error_response(&UsdcRecheckError::Transfer(Box::new(
+            UsdcTransferError::SwapPaymentUnverified {
+                id,
+                source: Box::new(RelayBridgeError::RefundUnverified {
+                    txs: vec![TxHash::repeat_byte(0xe1)],
+                    reason: UnverifiedReason::Reverted,
+                }),
+            },
+        )));
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     /// Seeds a `UsdcRebalance` (BaseToAlpaca) into a post-burn `BridgingFailed`

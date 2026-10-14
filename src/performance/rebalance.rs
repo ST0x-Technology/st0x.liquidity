@@ -1050,7 +1050,7 @@ mod tests {
         replay_after_competing_writer, setup_file_backed_test_db, setup_test_db,
     };
     use crate::usdc_rebalance::{
-        ConversionAmounts, ReconcileReason, TransferRef, UsdcRebalanceCommand,
+        ConversionAmounts, ReconcileReason, SwapRecovery, TransferRef, UsdcRebalanceCommand,
     };
 
     fn timestamp(seconds: i64) -> DateTime<Utc> {
@@ -2066,6 +2066,33 @@ mod tests {
         let mint = stage(&operation, RebalanceStageName::Mint);
         assert_eq!(mint.duration_ms, None);
         assert_eq!(mint.outcome, StageOutcome::Unmeasured);
+    }
+
+    #[test]
+    fn relay_failure_then_late_payment_returns_to_in_progress() {
+        let events = vec![
+            UsdcRebalanceEvent::SwapFailed {
+                reason: "Relay reported Failure".to_string(),
+                failed_at: timestamp(100),
+            },
+            UsdcRebalanceEvent::SwapCompletionRecovered {
+                order_id: B256::random(),
+                deposit_tx: TxHash::random(),
+                payment: SwapRecovery::Fill {
+                    fill_tx: TxHash::random(),
+                    amount_received: Usdc::new(float!(99.9)),
+                    fee_collected: Usdc::new(float!(0.1)),
+                    relayer_fee: Usdc::new(float!(0.1)),
+                },
+                recovered_at: timestamp(200),
+            },
+        ];
+
+        let failed = fold_operation("op-relay", &events[..1]).unwrap();
+        assert_eq!(failed.status, RebalanceTimingStatus::Failed);
+
+        let recovered = fold_operation("op-relay", &events).unwrap();
+        assert_eq!(recovered.status, RebalanceTimingStatus::InProgress);
     }
 
     #[test]

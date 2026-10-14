@@ -5671,12 +5671,26 @@ mod tests {
         /// `order_id`, mined past the hub's confirmations, as a reverted
         /// deposit a reorg landed would be. Returns the deposit tx.
         async fn deposit_on_hub(&self, order_id: B256) -> TxHash {
+            Self::deposit_from(&self.hub_wallet, self.hub_contracts, order_id).await
+        }
+
+        /// [`Self::deposit_on_hub`] of `AMOUNT_IN` USDG from the bot's
+        /// wallet on the chain.
+        async fn deposit_on_chain(&self, order_id: B256) -> TxHash {
+            Self::deposit_from(&self.chain.bot_wallet, self.chain_contracts, order_id).await
+        }
+
+        async fn deposit_from(
+            wallet: &TestWallet,
+            contracts: RelayEndContracts,
+            order_id: B256,
+        ) -> TxHash {
             let amount = U256::from(AMOUNT_IN);
-            self.hub_wallet
+            wallet
                 .send(
-                    self.hub_contracts.stable,
+                    contracts.stable,
                     IERC20::approveCall {
-                        spender: self.hub_contracts.depository,
+                        spender: contracts.depository,
                         amount,
                     }
                     .abi_encode()
@@ -5685,13 +5699,12 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let deposit = self
-                .hub_wallet
+            let deposit = wallet
                 .send(
-                    self.hub_contracts.depository,
+                    contracts.depository,
                     depositErc20Call {
-                        depositor: self.hub_wallet.address(),
-                        token: self.hub_contracts.stable,
+                        depositor: wallet.address(),
+                        token: contracts.stable,
                         amount,
                         id: order_id,
                     }
@@ -5701,11 +5714,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            self.hub_wallet
-                .provider()
-                .anvil_mine(Some(2), None)
-                .await
-                .unwrap();
+            wallet.provider().anvil_mine(Some(2), None).await.unwrap();
             deposit.transaction_hash
         }
 
@@ -8636,6 +8645,83 @@ mod tests {
         );
         assert_eq!(rig.hub_usdc().await, U256::ZERO, "the refund went to Relay");
         assert_fill_pending(&outcome);
+    }
+
+    /// A reorg landed the deposit of a reverted Robinhood-to-Alpaca order,
+    /// and Relay refunded it on Robinhood: the escrow scan adopts the refund
+    /// and returns it to the vault. Nothing is quoted or signed.
+    #[tokio::test]
+    async fn adopted_late_refund_on_the_chain_returns_to_the_vault() {
+        let rig = RelayRig::deploy().await;
+        let late_deposit = rig.deposit_on_chain(REVERTED_ORDER_ID).await;
+        let refund_tx = rig
+            .refund_on_chain(U256::from(AMOUNT_IN), REVERTED_ORDER_ID)
+            .await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_status_of(
+            &relay_api,
+            B256::repeat_byte(0x5e),
+            json!({
+                "status": "refund",
+                "inTxHashes": [late_deposit],
+                "txHashes": [refund_tx],
+                "failReason": "SOLVER_CAPACITY_EXCEEDED"
+            }),
+        );
+        let quotes = mock_quote_unavailable(&relay_api);
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_quoted(
+            &store,
+            &id,
+            exact_quote(
+                &rig.chain.bot_wallet,
+                rig.chain_contracts,
+                REVERTED_ORDER_ID,
+            )
+            .await,
+        )
+        .await;
+        let reverted = PreparedTransaction::for_test(TxHash::repeat_byte(0xa7), 40);
+        let mut requoted = exact_quote(
+            &rig.chain.bot_wallet,
+            rig.chain_contracts,
+            B256::repeat_byte(0x0f),
+        )
+        .await;
+        requoted.request_id = B256::repeat_byte(0x6f);
+        for command in [
+            UsdcRebalanceCommand::PrepareSwapDeposit {
+                approve: None,
+                deposit: reverted.clone(),
+            },
+            UsdcRebalanceCommand::RecordSwapDepositReverted {
+                deposit_tx: reverted.tx_hash(),
+            },
+            UsdcRebalanceCommand::RequoteSwap {
+                quote: Box::new(requoted),
+            },
+        ] {
+            store.send(&id, command).await.unwrap();
+        }
+
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends")
+        .unwrap();
+
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "ReturnedToSource", "{state:?}");
+        assert!(!state.holds_rebalance_guard());
+        assert_eq!(rig.vault_usdg().await, U256::from(AMOUNT_IN));
+        quotes.assert_calls(0);
     }
 
     /// A reverted order's deposit held for its payment sends again the
