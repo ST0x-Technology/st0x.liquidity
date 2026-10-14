@@ -1118,9 +1118,12 @@ where
             .await?;
         for approve in split_approves {
             match self.hop.bridge.confirm_approve(TO_HUB, approve).await {
-                // A reverted approve is mined: its nonce is used, so the vault
-                // deposit does not wait behind it.
-                Ok(()) | Err(RelayBridgeError::ApproveReverted { .. }) => {}
+                Ok(()) => {}
+                // Mined, so its nonce is used: the vault deposit does not wait
+                // behind it.
+                Err(RelayBridgeError::ApproveReverted { tx }) => {
+                    warn!(target: "rebalance", %id, approve = %tx, "A lone Relay approve reverted; returning the stable to the vault anyway");
+                }
                 Err(error) => {
                     warn!(target: "rebalance", %id, approve = %approve.tx_hash(), %error, "A lone Relay approve is not confirmed; the redeposit waits for the retry to send it again");
                     return Err(Box::new(error).into());

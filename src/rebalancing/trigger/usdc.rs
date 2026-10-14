@@ -1913,11 +1913,9 @@ impl RebalancingService {
         let chain = tracking.corridor.chain();
         let source_venue = tracking.source_venue();
         let initiated_amount = tracking.initiated_amount;
-        // A Relay fill can pay more than its input: the quote and the fill
-        // proof bound it only from below, so the transfer settles at what it
-        // received. No ceiling: a chain-to-Alpaca settlement is the USD the
-        // conversion received, which a USDC/USD price above 1 puts above the
-        // proven fill too.
+        // A Relay transfer settles at what it received, with no ceiling: the
+        // fill proof bounds it only from below, and the USD a chain-to-Alpaca
+        // conversion receives can exceed the fill.
         let settles_above_input = match tracking.corridor {
             UsdcCorridor::HubRouted {
                 hop: HopKind::Relay,
