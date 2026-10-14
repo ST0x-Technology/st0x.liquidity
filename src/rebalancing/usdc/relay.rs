@@ -1804,7 +1804,8 @@ where
             OrderPaymentRead::Proven(payment) => payment,
             OrderPaymentRead::NotProvableYet
             | OrderPaymentRead::Unpaid
-            | OrderPaymentRead::StatusUnread(_) => {
+            | OrderPaymentRead::StatusUnread(_)
+            | OrderPaymentRead::ChainUnread(_) => {
                 return Err(UsdcTransferError::RevertedSwapDepositLive {
                     id: id.clone(),
                     order_id,
@@ -1879,6 +1880,13 @@ where
             }
         };
 
+        let proof = match proof {
+            Err(error @ (RelayBridgeError::Rpc(_) | RelayBridgeError::Evm(_))) => {
+                warn!(target: "rebalance", %id, order_id = %quote.order_id, %error, "Could not read the chain for the Relay payment; reading it again later");
+                return Ok(OrderPaymentRead::ChainUnread(error));
+            }
+            proof => proof,
+        };
         let Some(payment) = Self::proven_payment(id, proof, false)? else {
             return Ok(OrderPaymentRead::NotProvableYet);
         };
@@ -2336,6 +2344,8 @@ enum OrderPaymentRead {
     Unpaid,
     /// Relay's status read failed.
     StatusUnread(RelayError),
+    /// The chain read for the payment Relay names failed.
+    ChainUnread(RelayBridgeError),
 }
 
 /// What a deposit with no payment adopted is waiting within.
@@ -2698,8 +2708,8 @@ where
     /// order of an unresolved escrow, or the failed one. A payment that
     /// proves is adopted (`Recovered`) and left for the escrow's job, or a
     /// `transfer resume`, to move on; otherwise nothing changes, and a
-    /// payment not provable yet or a failed status read is reported apart
-    /// from an unpaid order. Every other state, and an operator deposit tx, is
+    /// payment not provable yet or a failed status or chain read is reported
+    /// apart from an unpaid order. Every other state, and an operator deposit tx, is
     /// refused: a Relay `DepositFailed` is settled with `transfer reconcile`.
     async fn recheck_deposit(
         &self,
@@ -2755,6 +2765,9 @@ where
             OrderPaymentRead::Unpaid => return Ok(RecheckOutcome::LeftUnchanged),
             OrderPaymentRead::StatusUnread(error) => {
                 return Err(Box::new(UsdcTransferError::RelayApi(Box::new(error))).into());
+            }
+            OrderPaymentRead::ChainUnread(error) => {
+                return Err(Box::new(UsdcTransferError::RelayBridge(Box::new(error))).into());
             }
         };
         let command = match (adopt, payment) {

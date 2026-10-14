@@ -8182,12 +8182,13 @@ named exemptions defined after the list:**
   adopting a fill or refund that proves on chain (`recovered`) and changing
   nothing otherwise: `left_unchanged` when Relay reports nothing paid,
   `not_detected_yet` when Relay names a payment the chain does not show yet, and
-  an error (`502` when transient or rate-limited) when the status read fails; it
-  refuses a `--deposit-tx` and every other Relay state. It does not move an
-  adopted payment on: the escrow's job does at its next read, and after a
-  `SwapFailed` the operator's `transfer resume --kind usdc` does, as for any
-  `Bridged` or `SwapRefunded`. A transfer Alpaca still reports pending or failed
-  refuses without touching the aggregate. A send tx that is absent from Alpaca's
+  an error (`502` when transient or rate-limited) when the status read fails,
+  and a `502` when the chain read for the payment fails; it refuses a
+  `--deposit-tx` and every other Relay state. It does not move an adopted
+  payment on: the escrow's job does at its next read, and after a `SwapFailed`
+  the operator's `transfer resume --kind usdc` does, as for any `Bridged` or
+  `SwapRefunded`. A transfer Alpaca still reports pending or failed refuses
+  without touching the aggregate. A send tx that is absent from Alpaca's
   account-wide transfer list is a separate, INCONCLUSIVE result: the list may be
   capped, so absence is not proof the deposit never settled. The recheck reports
   `not_detected_yet`, changes nothing, and the operator retries later. Other

@@ -18,7 +18,7 @@ use rain_math_float::Float;
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Deserialize, Serialize};
 use st0x_bridge::BridgeDirection;
-use st0x_bridge::relay::RelayError;
+use st0x_bridge::relay::{RelayBridgeError, RelayError};
 use tokio::sync::Mutex;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
@@ -1970,6 +1970,30 @@ fn relay_read_retryable(error: &RelayError) -> bool {
     }
 }
 
+/// Whether a Relay bridge error is a chain read that failed, not an answer.
+fn relay_chain_unread(error: &RelayBridgeError) -> bool {
+    match error {
+        RelayBridgeError::Rpc(_) | RelayBridgeError::Evm(_) => true,
+        RelayBridgeError::NoDepository { .. }
+        | RelayBridgeError::HubAsCorridorChain
+        | RelayBridgeError::WalletsDiffer { .. }
+        | RelayBridgeError::ZeroConfirmations { .. }
+        | RelayBridgeError::Quote(_)
+        | RelayBridgeError::DirectionMismatch { .. }
+        | RelayBridgeError::PairNonces { .. }
+        | RelayBridgeError::Unconfirmed { .. }
+        | RelayBridgeError::NotCanonical { .. }
+        | RelayBridgeError::DepositReverted { .. }
+        | RelayBridgeError::ApproveReverted { .. }
+        | RelayBridgeError::DepositUnverified { .. }
+        | RelayBridgeError::DepositLogIncomplete { .. }
+        | RelayBridgeError::DepositReceiptMissing { .. }
+        | RelayBridgeError::TxNotFound { .. }
+        | RelayBridgeError::FillUnverified { .. }
+        | RelayBridgeError::RefundUnverified { .. } => false,
+    }
+}
+
 /// Maps a [`UsdcRecheckError`] to an HTTP status and operator-facing message,
 /// with the same recoverability split as [`recheck_error_response`]: the
 /// not-recoverable refusals carry the typed error's message (they only
@@ -2009,6 +2033,11 @@ fn usdc_recheck_error_response(error: &UsdcRecheckError) -> (StatusCode, String)
             UsdcTransferError::RelayApi(relay) if relay_read_retryable(relay) => (
                 StatusCode::BAD_GATEWAY,
                 "Relay unavailable; retry later".to_string(),
+            ),
+            // So is a chain read for the payment Relay names.
+            UsdcTransferError::RelayBridge(bridge) if relay_chain_unread(bridge) => (
+                StatusCode::BAD_GATEWAY,
+                "Chain RPC unavailable; retry later".to_string(),
             ),
             _ => (
                 StatusCode::INTERNAL_SERVER_ERROR,
