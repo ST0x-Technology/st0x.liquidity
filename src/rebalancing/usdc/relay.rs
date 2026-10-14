@@ -18,7 +18,7 @@ use sqlx::SqlitePool;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::Instant;
 use tracing::{error, info, warn};
@@ -64,7 +64,9 @@ pub(crate) struct RelayHop<Signer> {
     bounds: RelayHopCtx,
     /// Where the solver pays: our wallet at the Ethereum hub.
     hub_wallet: Address,
-    chain_send_prepare: Mutex<()>,
+    /// Held by a signing, and by a re-quote or redeposit, so none of them
+    /// sends from the chain wallet above nonces a late signing still holds.
+    chain_send_prepare: Arc<Mutex<()>>,
 }
 
 impl<Signer> RelayHop<Signer> {
@@ -79,7 +81,7 @@ impl<Signer> RelayHop<Signer> {
             client,
             bounds,
             hub_wallet,
-            chain_send_prepare: Mutex::new(()),
+            chain_send_prepare: Arc::new(Mutex::new(())),
         }
     }
 }
@@ -88,21 +90,40 @@ impl<Signer> RelayHop<Signer> {
 const TO_HUB: HopDirection = HopDirection::ToHub;
 
 impl<Signer: Wallet> RelayHop<Signer> {
+    /// The chain wallet's prepare lock, waited for up to `quote_max_age`: a
+    /// signing that outlasted its attempt holds it until its nonces are
+    /// released.
+    async fn lock_prepare(
+        &self,
+        id: &UsdcRebalanceId,
+    ) -> Result<OwnedMutexGuard<()>, UsdcTransferError> {
+        let timeout = self.bounds.quote_max_age;
+        tokio::time::timeout(timeout, Arc::clone(&self.chain_send_prepare).lock_owned())
+            .await
+            .map_err(|_elapsed| {
+                warn!(target: "rebalance", %id, ?timeout, "A late Relay pair signing still holds the chain wallet's prepare lock; the retry waits for its nonces");
+                UsdcTransferError::SwapPrepareTimedOut {
+                    id: id.clone(),
+                    timeout,
+                }
+            })
+    }
+
     /// Signs and persists the pair, or picks up the one already persisted;
     /// `None` once the deposit is confirmed. Read and signed under the chain
     /// wallet's prepare lock: a timed-out attempt's prepare may have
     /// persisted a pair this one must send instead of signing anew. A
-    /// signing that outlasts `quote_max_age` is not cancelled; a retry does
-    /// not sign above its nonces, as the quote is too old by then.
+    /// signing that outlasts `quote_max_age` is not cancelled: it keeps the
+    /// lock until its nonces are released, so no retry signs above them.
     async fn prepare_swap_pair(
         self: &Arc<Self>,
         cqrs: &Store<UsdcRebalance>,
         id: &UsdcRebalanceId,
     ) -> Result<Option<(PreparedSwapDeposit, B256)>, UsdcTransferError> {
-        let _prepare = self.chain_send_prepare.lock().await;
+        let mut prepare = Some(self.lock_prepare(id).await?);
         let deadline = Instant::now() + self.bounds.quote_max_age;
 
-        match cqrs.load(id).await? {
+        let prepared = match cqrs.load(id).await? {
             Some(UsdcRebalance::SwapQuoted {
                 quote,
                 split_approves,
@@ -110,7 +131,15 @@ impl<Signer: Wallet> RelayHop<Signer> {
                 ..
             }) => {
                 let pair = self
-                    .sign_swap_pair(cqrs, id, &quote, quoted_at, &split_approves, deadline)
+                    .sign_swap_pair(
+                        cqrs,
+                        id,
+                        &quote,
+                        quoted_at,
+                        &split_approves,
+                        deadline,
+                        &mut prepare,
+                    )
                     .await?;
                 Ok(Some((pair, quote.order_id)))
             }
@@ -162,7 +191,10 @@ impl<Signer: Wallet> RelayHop<Signer> {
                 state: state.state_name(),
                 hop: HopKind::Relay,
             }),
-        }
+        };
+        drop(prepare);
+
+        prepared
     }
 
     /// Signs the approve and deposit and persists both before either is
@@ -179,6 +211,7 @@ impl<Signer: Wallet> RelayHop<Signer> {
         quoted_at: DateTime<Utc>,
         split_approves: &[PreparedTransaction],
         deadline: Instant,
+        prepare: &mut Option<OwnedMutexGuard<()>>,
     ) -> Result<PreparedSwapDeposit, UsdcTransferError> {
         self.broadcast_split_approves(id, split_approves, deadline)
             .await?;
@@ -197,7 +230,7 @@ impl<Signer: Wallet> RelayHop<Signer> {
         // After a split the allowance may already cover the deposit: the
         // bridge reads it and signs an approve only when it falls short.
         let relay_quote = relay_quote(id, quote, split_approves.is_empty(), &self.bounds)?;
-        let prepared = self.sign_before(id, relay_quote, deadline).await?;
+        let prepared = self.sign_before(id, relay_quote, deadline, prepare).await?;
 
         match prepared {
             PreparedSwap::Deposit(pair)
@@ -235,12 +268,14 @@ impl<Signer: Wallet> RelayHop<Signer> {
 
     /// Signs the pair on a task of its own, so a timeout does not drop a
     /// signing that holds nonces: a pair signed after `deadline` has its
-    /// nonces released, as an unpersisted pair's are, once it returns.
+    /// nonces released, as an unpersisted pair's are, once it returns, and
+    /// the prepare lock in `prepare` is held until then.
     async fn sign_before(
         self: &Arc<Self>,
         id: &UsdcRebalanceId,
         quote: AcceptedRelayQuote,
         deadline: Instant,
+        prepare: &mut Option<OwnedMutexGuard<()>>,
     ) -> Result<PreparedSwap, UsdcTransferError> {
         let hop = Arc::clone(self);
         let mut signing =
@@ -252,7 +287,11 @@ impl<Signer: Wallet> RelayHop<Signer> {
             Err(_elapsed) => {
                 let hop = Arc::clone(self);
                 let late_id = id.clone();
-                tokio::spawn(async move { hop.discard_late_signing(&late_id, signing).await });
+                let held = prepare.take();
+                tokio::spawn(async move {
+                    let _held = held;
+                    hop.discard_late_signing(&late_id, signing).await;
+                });
                 Err(self.prepare_timed_out(id))
             }
         }
@@ -293,7 +332,7 @@ impl<Signer: Wallet> RelayHop<Signer> {
 
     fn prepare_timed_out(&self, id: &UsdcRebalanceId) -> UsdcTransferError {
         let timeout = self.bounds.quote_max_age;
-        warn!(target: "rebalance", %id, ?timeout, "Relay pair prepare timed out; releasing the chain wallet's prepare lock");
+        warn!(target: "rebalance", %id, ?timeout, "Relay pair prepare timed out; a late signing keeps the chain wallet's prepare lock until its nonces are released");
         UsdcTransferError::SwapPrepareTimedOut {
             id: id.clone(),
             timeout,
@@ -736,7 +775,13 @@ where
     /// then broadcasts it, records the confirmed deposit and reads Relay's
     /// status once.
     async fn send_swap_deposit(&self, id: &UsdcRebalanceId) -> Result<(), UsdcTransferError> {
-        if self.requote_or_redeposit(id).await? {
+        // Under the prepare lock: a re-quoted pair or a redeposit sent above
+        // the nonces of a late signing would wait behind their release.
+        let redeposited = {
+            let _prepare = self.hop.lock_prepare(id).await?;
+            self.requote_or_redeposit(id).await?
+        };
+        if redeposited {
             return Ok(());
         }
 
@@ -3380,8 +3425,8 @@ mod tests {
     }
 
     /// A signing that outlasts the corridor's `quote_max_age` ends the
-    /// attempt instead of holding the chain wallet's prepare lock, and the
-    /// pair it signs late is discarded, so its nonces go to the next send.
+    /// attempt at that bound, and the pair it signs late is discarded, so its
+    /// nonces go to the next send.
     #[tokio::test]
     async fn hung_swap_signing_times_out_and_releases_its_nonces() {
         let anvil = spawn_anvil(Anvil::new());

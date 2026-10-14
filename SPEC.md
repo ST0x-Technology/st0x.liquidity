@@ -5144,14 +5144,16 @@ proven fill or the stable back in the vault, never in a guard-freeing failure:
    broadcast, on a task a job timeout cannot cancel between the two. The attempt
    stops waiting on the signing after `quote_max_age_secs`, but the signing is
    not cancelled: it keeps its RPC calls under the wallet's send lock, and its
-   pair's nonces are released once it returns. Its quote is too old to sign by
-   then, so a retry does not sign above those nonces. A quote within 60 seconds
-   of its deadline or older than `quote_max_age_secs`, or whose order id a
-   deposit was already signed for, is not signed, and a pair whose quote reached
-   either limit while it was signed is released instead of persisted: the
-   attempt first re-quotes (`RequoteSwap` -> `SwapRequoted`, same input, a fresh
-   order id), and a refused re-quote redeposits (step 9). A persist that fails
-   releases both nonces, deposit first, unless a reload shows the pair
+   pair's nonces are released once it returns. It keeps the corridor's prepare
+   lock until then, and a retry's re-quote, signing or redeposit waits for that
+   lock up to `quote_max_age_secs` (the attempt ends for the next retry
+   otherwise), so nothing is signed or sent above those nonces. A quote within
+   60 seconds of its deadline or older than `quote_max_age_secs`, or whose order
+   id a deposit was already signed for, is not signed, and a pair whose quote
+   reached either limit while it was signed is released instead of persisted:
+   the attempt first re-quotes (`RequoteSwap` -> `SwapRequoted`, same input, a
+   fresh order id), and a refused re-quote redeposits (step 9). A persist that
+   fails releases both nonces, deposit first, unless a reload shows the pair
    committed. When another send took the nonce between the two signs, the
    approve alone is persisted (`SwapApprovePrepared`) and broadcast, even if its
    quote expired during the signing, since that send holds the nonce above it,

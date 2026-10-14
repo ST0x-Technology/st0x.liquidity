@@ -347,9 +347,10 @@ pub enum UsdcTransferError {
     /// stall later sends from the chain wallet until a restart.
     #[error("USDC rebalance {id}: the Relay pair prepare task panicked")]
     SwapPrepareTaskPanicked { id: UsdcRebalanceId },
-    /// The work before and around the swap pair's persist outlasted the
-    /// corridor's `quote_max_age`, so the chain wallet's prepare lock is
-    /// released. A pair signed after it is discarded when its signing returns.
+    /// The work before and around the swap pair's persist, or the wait for
+    /// the chain wallet's prepare lock, outlasted the corridor's
+    /// `quote_max_age`. A pair signed after it is discarded when its signing
+    /// returns, and keeps the lock until then.
     #[error("USDC rebalance {id}: the Relay pair prepare outlasted {timeout:?}; retrying")]
     SwapPrepareTimedOut {
         id: UsdcRebalanceId,
