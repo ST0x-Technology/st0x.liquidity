@@ -918,9 +918,17 @@ next resume. The other Relay holds:
   later; the solver may fill until the order's deadline, about a week.
 - `SwapDeposited` with a fill or refund that does not prove on chain keeps the
   guard and pages every 30 minutes; check the order with Relay's status API.
-- `SwapFailed` (Relay failed the order with nothing paid back) and a
-  `SwapRefunded` paid in USDC on Ethereum: settle the funds with Relay or move
-  the USDC by hand, then `transfer reconcile --kind usdc`.
+- `SwapFailed` (Relay failed the order with nothing paid back): settle the funds
+  with Relay, then `transfer reconcile --kind usdc`.
+- `SwapRefunded` paid in USDC on Ethereum: the USDC is in the bot's Ethereum
+  wallet. `transfer reconcile` only releases the guard and the Robinhood
+  inflight; it credits neither Alpaca nor the vault, and it ends the transfer's
+  held credit on the Ethereum wallet. So finish the transfer by hand first, with
+  the bot stopped (`stox alpaca-deposit` sends from the bot's Ethereum wallet):
+  send the refunded amount to Alpaca with `stox alpaca-deposit -a <amount>`,
+  wait for Alpaca to credit it, convert it with
+  `stox alpaca-convert -d to-usd -a <amount>`, and check the Alpaca cash
+  balance. Only then run `transfer reconcile --kind usdc`.
 - `Redepositing` whose vault deposit does not confirm (dropped or reverted):
   check the recorded deposit tx and the vault on chain, deposit the USDG by hand
   if it is still in the Robinhood wallet, then `transfer reconcile --kind usdc`.
