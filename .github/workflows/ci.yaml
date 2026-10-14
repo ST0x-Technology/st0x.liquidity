@@ -5,11 +5,13 @@ on:
   push:
     branches: [master]
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, edited]
+    types: [opened, synchronize, reopened, ready_for_review]
 
-# Pull request events for the same merge ref share a group. A later head, base,
-# title, or body update may replace an older run, but every replacement performs
-# the same validation, so cancellation cannot leave behind a green no-op run.
+# Pull request events for the same merge ref share a group. A later push,
+# reopen, or ready-for-review event may replace an older run, but every
+# replacement performs the same validation, so cancellation cannot leave behind
+# a green no-op run. `edited` is not subscribed because title and body edits
+# change no code; docs/ci.md explains how base retargets are still validated.
 # Master keeps one group per SHA so independent post-merge runs do not cancel.
 concurrency:
   group: ${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}-${{ github.ref == 'refs/heads/master' && github.sha || ''}}

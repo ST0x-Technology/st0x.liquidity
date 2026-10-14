@@ -43,7 +43,7 @@ assert_absent() {
 # named required checks.
 assert_count 1 '    branches: [master]'
 assert_line '  pull_request:'
-assert_line '    types: [opened, synchronize, reopened, ready_for_review, edited]'
+assert_line '    types: [opened, synchronize, reopened, ready_for_review]'
 
 # Every subscribed pull request event must leave behind a run that executes the
 # required checks. An optimizer-controlled job-level skip is unsafe because
@@ -62,6 +62,22 @@ require "open3"
 workflow = YAML.safe_load(File.read(ARGV.fetch(0)), aliases: true)
 jobs = workflow.fetch("jobs")
 concurrency = workflow.fetch("concurrency")
+
+# Psych reads the bare `on:` key as boolean true. Title and body edits emit
+# `edited` and change no code, so subscribing to it would restart the full
+# suite on every description edit. `pull_request_target` would run untrusted
+# code with repository secrets.
+triggers = workflow["on"] || workflow[true]
+pull_request_types = triggers.fetch("pull_request").fetch("types")
+unless pull_request_types == %w[opened synchronize reopened ready_for_review]
+  warn "pull_request types must be opened, synchronize, reopened, ready_for_review, got #{pull_request_types.inspect}"
+  exit 1
+end
+
+if triggers.key?("pull_request_target")
+  warn "CI must not run on pull_request_target"
+  exit 1
+end
 
 expected_group = "${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}-${{ github.ref == 'refs/heads/master' && github.sha || ''}}"
 unless concurrency["group"] == expected_group && concurrency["cancel-in-progress"] == true
