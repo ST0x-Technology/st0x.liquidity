@@ -4990,11 +4990,13 @@ mod tests {
                 store,
                 bounds,
                 self.chain.bot_wallet.clone(),
+                BotGasReceiptCostEnqueuer::Disabled,
             )
             .await
         }
 
-        /// [`Self::transfer`], sending on the chain through `chain_wallet`.
+        /// [`Self::transfer`], sending on the chain through `chain_wallet`
+        /// and queueing bot gas through `bot_gas`.
         async fn transfer_through(
             &self,
             server: &MockServer,
@@ -5002,6 +5004,7 @@ mod tests {
             store: Arc<Store<UsdcRebalance>>,
             bounds: RelayHopCtx,
             chain_wallet: TestWallet,
+            bot_gas: BotGasReceiptCostEnqueuer,
         ) -> CrossVenueCashTransfer<TestWallet, RelayHop<TestWallet>> {
             let bridge = RelayBridge::try_from_ctx(RelayCtx {
                 chain: Chain::Robinhood,
@@ -5048,7 +5051,7 @@ mod tests {
                     token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
                     message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
                 },
-                BotGasReceiptCostEnqueuer::Disabled,
+                bot_gas,
             )
         }
 
@@ -5624,6 +5627,85 @@ mod tests {
         assert_eq!(rig.vault_usdg().await, U256::from(AMOUNT_IN));
     }
 
+    /// An approve that went out alone and mined has its gas queued when the
+    /// transfer redeposits instead of depositing into Relay: the bot paid
+    /// for it, and the redeposit drops it from the transfer.
+    #[tokio::test]
+    async fn redeposit_queues_the_gas_of_a_split_approve() {
+        let rig = RelayRig::deploy().await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        relay_api.mock(|when, then| {
+            when.method(POST).path("/quote/v2");
+            then.status(400).json_body(json!({
+                "message": "No routes",
+                "errorCode": "NO_SWAP_ROUTES_FOUND",
+                "requestId": "0x00"
+            }));
+        });
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let transfer = rig
+            .transfer_through(
+                &server,
+                &relay_api,
+                store.clone(),
+                relay_bounds(),
+                rig.chain.bot_wallet.clone(),
+                BotGasReceiptCostEnqueuer::Enabled(RecordBotGasReceiptCostJobQueue::new(
+                    &apalis_pool,
+                )),
+            )
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let mut quote = exact_quote(
+            &rig.chain.bot_wallet,
+            rig.chain_contracts,
+            B256::repeat_byte(0x0d),
+        )
+        .await;
+        let approve_step = quote.approve.clone().unwrap();
+        quote.deadline = Utc::now() - chrono::Duration::minutes(1);
+        record_quoted(&store, &id, quote).await;
+        let approve = rig
+            .chain
+            .bot_wallet
+            .prepare_pending(approve_step.to, approve_step.data, "split approve")
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::PrepareSwapApprove {
+                    approve: approve.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends")
+        .unwrap();
+
+        assert_eq!(
+            store.load(&id).await.unwrap().unwrap().state_name(),
+            "ReturnedToSource"
+        );
+        let queued = queued_gas_costs(&apalis_pool).await;
+        assert!(
+            queued.contains(&(
+                Chain::Robinhood,
+                approve.tx_hash(),
+                "relay_approve".to_string()
+            )),
+            "{queued:?}"
+        );
+    }
+
     /// A split approve the node accepted and then dropped is confirmed
     /// before the redeposit starts, so the attempt ends at `SwapQuoted` and
     /// the retry sends it again; the vault deposit never waits behind its
@@ -5678,6 +5760,7 @@ mod tests {
                 store.clone(),
                 relay_bounds(),
                 chain_wallet,
+                BotGasReceiptCostEnqueuer::Disabled,
             )
             .await;
         let attempt = || {
