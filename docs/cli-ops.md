@@ -929,6 +929,17 @@ next resume. The other Relay holds:
   wait for Alpaca to credit it, convert it with
   `stox alpaca-convert -d to-usd -a <amount>`, and check the Alpaca cash
   balance. Only then run `transfer reconcile --kind usdc`.
+- `SwapRefunded` below its refund floor (paged "Relay refunded less than the
+  refund floor"), on either side: the bot never redeposits or quotes it again.
+  Take up the shortfall with Relay. Then put the refund where the transfer would
+  have: a refund on the origin side is USDG in the Robinhood wallet, outside the
+  vault, so deposit it into the Robinhood cash vault
+  (`st0x-liquidity-client --env <env> capital vault-deposit --amount <amount> --network robinhood --token <usdg> --vault-id <cash-vault-id>`
+  with the bot running, or the offline `stox vault-deposit` with the same
+  options with it stopped); a refund on Ethereum goes to Alpaca and is converted
+  as in the previous item. Only then run `transfer reconcile --kind usdc`:
+  reconciling first leaves the refund outside both venues while the inventory
+  counts it as spent.
 - `Redepositing` whose vault deposit does not confirm (dropped or reverted):
   check the recorded deposit tx and the vault on chain, deposit the USDG by hand
   if it is still in the Robinhood wallet, then `transfer reconcile --kind usdc`.
@@ -1167,12 +1178,12 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   can lose an unrecorded one), a `BaseToAlpaca` `ConversionFailed`, and a
   `BaseToAlpaca` `Bridged` with a signed deposit send whose nonce you verified
   on chain is taken by a different mined tx (see "Base->Alpaca deposit send
-  pages"), a Relay `SwapFailed`, a Relay `SwapRefunded` paid on Ethereum, and a
-  Relay `Redepositing` (see "Robinhood Relay transfer held after its vault
-  withdrawal"). Its `--reason` must be one of `funds-moved-manually` or
-  `deposit-credited-offline`; any other value is rejected. Every other state is
-  rejected, including `WithdrawalFailed` and an `AlpacaToBase`
-  `ConversionFailed`, whose funds never left Alpaca.
+  pages"), a Relay `SwapFailed`, a Relay `SwapRefunded` paid on Ethereum or
+  below its refund floor on either side, and a Relay `Redepositing` (see
+  "Robinhood Relay transfer held after its vault withdrawal"). Its `--reason`
+  must be one of `funds-moved-manually` or `deposit-credited-offline`; any other
+  value is rejected. Every other state is rejected, including `WithdrawalFailed`
+  and an `AlpacaToBase` `ConversionFailed`, whose funds never left Alpaca.
 - `--kind usdc` is bookkeeping only: it moves no funds. Before you reconcile a
   post-burn `BridgingFailed`, finish the transfer by hand.
 
