@@ -29,7 +29,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    uses: ST0x-Technology/.github/.github/workflows/deploy-window.yml@4a1d2d28716072aa77c3038f9cf6d58bea5a2e9c  # deploy-window @ .github main
+    uses: ST0x-Technology/.github/.github/workflows/deploy-window.yml@aa0b5e84363e4bfd9f36c8a95ba1edb7e4ff34b7  # deploy-window @ .github main
     with:
       project: t0-liquidity
       service_account: liquidity-releaser@t0-artifacts.iam.gserviceaccount.com

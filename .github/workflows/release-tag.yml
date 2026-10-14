@@ -28,7 +28,7 @@ jobs:
       id-token: write
       # write: release-label cuts the GitHub release for the tag.
       contents: write
-    uses: ST0x-Technology/.github/.github/workflows/release-label.yml@4a1d2d28716072aa77c3038f9cf6d58bea5a2e9c  # release-label @ .github main
+    uses: ST0x-Technology/.github/.github/workflows/release-label.yml@aa0b5e84363e4bfd9f36c8a95ba1edb7e4ff34b7  # release-label @ .github main
     with:
       service_account: liquidity-labeler@t0-artifacts.iam.gserviceaccount.com
       ar_repo: europe-west3-docker.pkg.dev/t0-artifacts/t0-liquidity
