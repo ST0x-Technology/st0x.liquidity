@@ -7798,18 +7798,21 @@ it. The `holds_rebalance_guard` classifier decides this at boot; it is a
 separate, more defensive rule than the `is_reconcilable_failure` predicate that
 gates operator reconciliation. Startup re-arms idempotent transfer jobs only for
 states with a recorded burn: `Bridging`, `AwaitingAttestation`, `Attested`, and
-a post-burn BaseToAlpaca `BridgingFailed`. Startup never re-arms
+a post-burn BaseToAlpaca `BridgingFailed`. Startup never re-arms a CCTP
 `WithdrawalComplete` or `BridgingSubmitting`: a re-drive there can submit a
-second burn. Reconcilable failures (`DepositFailed`, a `BridgingFailed` with
-burn evidence or in the AlpacaToBase direction, a BaseToAlpaca
-`ConversionFailed`, and the Relay holds (see "Relay hop"): `SwapFailed`, a
-`SwapRefunded` below its refund floor, a chain-to-Alpaca `Redepositing` or
-`SwapRefunded` paid on Ethereum, and an Alpaca-to-chain `SwapQuoted` or
-`SwapRefunded`) keep the guard held until the operator settles them with
-`transfer reconcile --kind usdc`. All other guarded states keep the guard held
-and page the operator for manual recovery. A candidate that cannot be loaded or
-parsed at boot, or a post-burn failure whose corridor the running bot cannot
-read, latches every corridor until a restart.
+second burn. A Relay transfer past its withdrawal is re-armed whenever it has no
+live job row (`RearmPolicy::RelayResume`, see "Relay recovery"), also at a
+chain-to-Alpaca `WithdrawalComplete`: its resume quotes, re-broadcasts or reads
+Relay and never burns. Reconcilable failures (`DepositFailed`, a
+`BridgingFailed` with burn evidence or in the AlpacaToBase direction, a
+BaseToAlpaca `ConversionFailed`, and the Relay holds (see "Relay hop"):
+`SwapFailed`, a `SwapRefunded` below its refund floor, a chain-to-Alpaca
+`Redepositing` or `SwapRefunded` paid on Ethereum, and an Alpaca-to-chain
+`SwapQuoted` or `SwapRefunded`) keep the guard held until the operator settles
+them with `transfer reconcile --kind usdc`. All other guarded states keep the
+guard held and page the operator for manual recovery. A candidate that cannot be
+loaded or parsed at boot, or a post-burn failure whose corridor the running bot
+cannot read, latches every corridor until a restart.
 
 **Operator recovery of a pre-burn stranded guard latch**: A USDC rebalance can
 become stranded in `WithdrawalComplete` (pre-bridging, no burn intent recorded)
