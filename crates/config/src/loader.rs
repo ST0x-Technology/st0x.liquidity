@@ -13479,6 +13479,82 @@ mod tests {
         );
     }
 
+    /// The example config with Robinhood active and its USDG rebalanced over
+    /// a `relay` corridor next to Base's CCTP one.
+    fn robinhood_relay_corridor_config() -> toml::Table {
+        let mut config: toml::Table =
+            toml::from_str(include_str!("../../../example.config.toml")).unwrap();
+
+        let robinhood = &mut config["chains"]["robinhood"];
+        robinhood["lifecycle"] = toml::Value::String("active".into());
+        robinhood["trading"]["assets"]["cash"]["rebalancing"] =
+            toml::Value::String("enabled".into());
+
+        let corridor: toml::Table = toml::from_str(
+            r#"
+            hop = "relay"
+            target = 0.5
+            deviation = 0.05
+
+            [relay]
+            slippage_bps = 30
+            max_quote_loss_bps = 50
+            min_transfer = 500
+            max_transfer = 50000
+            quote_max_age_secs = 60
+            fill_timeout_secs = 1800
+            max_refund_retries = 3
+            max_deposit_revert_redrives = 5
+            "#,
+        )
+        .unwrap();
+        config["rebalancing"]["usdc"]["corridors"]
+            .as_table_mut()
+            .unwrap()
+            .insert("robinhood".into(), toml::Value::Table(corridor));
+
+        config
+    }
+
+    fn load_with_example_secrets(config: &toml::Table) -> Result<ValidatedParts, CtxError> {
+        parse_and_validate(
+            &config.to_string(),
+            Path::new("config.toml"),
+            include_str!("../../../example.secrets.toml"),
+            Path::new("secrets.toml"),
+        )
+    }
+
+    #[test]
+    fn robinhood_relay_corridor_loads_and_rebalances_cash() {
+        let parts = load_with_example_secrets(&robinhood_relay_corridor_config()).unwrap();
+
+        let usdc = &parts.rebalancing.usdc;
+        let active: Vec<UsdcCorridor> = usdc.active().map(|ctx| ctx.corridor).collect();
+        assert_eq!(
+            active,
+            vec![
+                UsdcCorridor::BASE_CCTP,
+                UsdcCorridor::HubRouted {
+                    chain: Chain::Robinhood,
+                    hop: HopKind::Relay,
+                },
+            ]
+        );
+        let relay = usdc.relay_hop(Chain::Robinhood).unwrap();
+        assert_eq!(relay.max_transfer, Usdc::new(float!(50000)));
+        usdc.relay_api_key().unwrap();
+
+        assert_eq!(
+            parts
+                .alerts
+                .unwrap()
+                .low_balance_threshold_wei(Chain::Robinhood),
+            Some(U256::from(1_000_000_000_000_000_u64)),
+            "the corridor's Robinhood sends are gated on the example's 0.001 ETH"
+        );
+    }
+
     /// A corridor runs on its own chain's orderbook, vault and depth, so the
     /// corridor check accepts a corridor off the primary chain.
     #[test]
