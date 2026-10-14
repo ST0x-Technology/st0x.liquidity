@@ -441,9 +441,13 @@ impl From<st0x_alpaca::broker::AlpacaBrokerApiError> for AlpacaBrokerApiError {
             },
             Shared::LatestTrade(source) => Self::LatestTrade(source),
             Shared::LatestQuote(source) => Self::LatestQuote(source),
-            error @ (Shared::HttpClient(_) | Shared::InvalidEndpoint(_)) => {
-                Self::Shared(Box::new(error))
-            }
+            // `Gateway` and `NotSent` only come from a gateway client or a
+            // `gated` scope, which this crate never uses. They keep the
+            // shared crate's own classification.
+            error @ (Shared::HttpClient(_)
+            | Shared::InvalidEndpoint(_)
+            | Shared::Gateway(_)
+            | Shared::NotSent(_)) => Self::Shared(Box::new(error)),
         }
     }
 }
@@ -650,7 +654,9 @@ fn market_data_permanence(error: &AlpacaMarketDataError) -> Permanence {
         | AlpacaMarketDataError::Entitlement { .. }
         | AlpacaMarketDataError::MissingPrice { .. }
         | AlpacaMarketDataError::NonPositivePrice { .. }
-        | AlpacaMarketDataError::Float(_) => Permanence::Permanent,
+        | AlpacaMarketDataError::Float(_)
+        // The request never left, so a retry of it would be held back too.
+        | AlpacaMarketDataError::NotSent(_) => Permanence::Permanent,
     }
 }
 

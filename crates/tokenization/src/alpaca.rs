@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use tracing::info;
 
 use st0x_alpaca::core::Network as AlpacaChain;
-use st0x_alpaca::tokenization::AlpacaTokenizationService as SharedService;
+use st0x_alpaca::tokenization::{AlpacaTokenizationService as SharedService, BackpressurePolicy};
 use st0x_evm::{
     Chain, EvmError, IERC20, IntoErrorRegistry, NODE_SYNC_MAX_ATTEMPTS, NODE_SYNC_POLL_INTERVAL,
     OpenChainErrorRegistry, PreparedTransaction, Wallet, wait_for_node_sync,
@@ -55,6 +55,18 @@ impl<W: Wallet> AlpacaTokenizationService<W> {
             wallet,
             redemption_wallet,
         })
+    }
+
+    /// Sets what the mint and redemption polls do with a throttled lookup.
+    /// The bot keeps the default, which waits out the `Retry-After` inside
+    /// the poll: its mint and redemption jobs fail the transfer on any poll
+    /// error, so a 429 handed back would end a transfer that Alpaca still
+    /// processes. Only a caller that retries on the 429 sets
+    /// [`BackpressurePolicy::Return`].
+    #[must_use]
+    pub fn with_backpressure_policy(mut self, policy: BackpressurePolicy) -> Self {
+        self.client = self.client.with_backpressure_policy(policy);
+        self
     }
 
     #[must_use]
@@ -625,6 +637,84 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(redemption_wallet_balance(&endpoint, token).await, amount);
+    }
+
+    /// The bot's mint and redemption jobs fail the transfer on any poll
+    /// error, so the service keeps the default policy: a throttled lookup is
+    /// waited out inside the poll, and the poll still finds the request.
+    #[tokio::test]
+    async fn redemption_poll_waits_out_a_429_by_default() {
+        let server = MockServer::start_async().await;
+        let requests_path = format!("/v1/accounts/{TEST_ACCOUNT_ID}/tokenization/requests");
+        let tx_hash =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        let throttled = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path(requests_path.clone());
+                then.status(429)
+                    .header("content-type", "application/json")
+                    .header("Retry-After", "0")
+                    .json_body(serde_json::json!({ "message": "rate limited" }));
+            })
+            .await;
+
+        let service = AlpacaTokenizationService::new(
+            server.base_url(),
+            TEST_ACCOUNT_ID,
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_api_key".to_string(),
+                api_secret: "test_api_secret".to_string(),
+            },
+            st0x_evm::StubWallet::stub(Address::ZERO),
+            Chain::Base,
+            None,
+        )
+        .expect("basic-auth tokenization client")
+        .with_polling_config(PollingConfig {
+            interval: std::time::Duration::from_millis(10),
+            timeout: std::time::Duration::from_secs(5),
+            ..PollingConfig::default()
+        });
+
+        // The answering mock goes in before the 429 mock comes out, so no
+        // read lands in a gap where httpmock answers a permanent 404.
+        let lift_throttle = async {
+            while throttled.calls_async().await == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            let found = server
+                .mock_async(|when, then| {
+                    when.method(httpmock::Method::GET)
+                        .path(requests_path.clone());
+                    then.status(200)
+                        .header("content-type", "application/json")
+                        .json_body(serde_json::json!([{
+                            "tokenization_request_id": "redeem_after_429",
+                            "type": "redeem",
+                            "status": "pending",
+                            "underlying_symbol": "AAPL",
+                            "token_symbol": "tAAPL",
+                            "qty": "30.0",
+                            "issuer": "st0x",
+                            "network": "base",
+                            "tx_hash": tx_hash,
+                            "created_at": "2024-01-15T10:30:00Z"
+                        }]));
+                })
+                .await;
+            throttled.delete_async().await;
+            found
+        };
+
+        let (polled, _found) = tokio::join!(
+            Tokenizer::poll_for_redemption(&service, &tx_hash),
+            lift_throttle
+        );
+
+        let request = polled.expect("the poll must wait out the 429 and find the request");
+        assert_eq!(request.tx_hash, Some(tx_hash));
     }
 
     #[tokio::test]

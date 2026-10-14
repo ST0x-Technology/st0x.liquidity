@@ -19,8 +19,8 @@ use st0x_evm::{
     Chain, Evm, IERC20, OpenChainErrorRegistry, PreparedTransaction, ReadOnlyEvm, Wallet,
 };
 use st0x_execution::{
-    AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaWalletService, Executor,
-    FractionalShares, Positive, Symbol, TimeInForce,
+    AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaWalletService,
+    BackpressurePolicy, Executor, FractionalShares, Positive, Symbol, TimeInForce,
 };
 use st0x_finance::Usdc;
 use st0x_hedge::operator::api::ResumeResponse;
@@ -1039,11 +1039,15 @@ async fn run_usdc_transfer<Writer: Write>(
         TelemetrySender::disabled(),
     );
 
-    let alpaca_wallet = Arc::new(AlpacaWalletService::new(
-        broker_auth.base_url().to_string(),
-        alpaca_auth.account_id,
-        alpaca_auth.auth.clone(),
-    )?);
+    // Matches the bot: a throttled poll read comes back at once.
+    let alpaca_wallet = Arc::new(
+        AlpacaWalletService::new(
+            broker_auth.base_url().to_string(),
+            alpaca_auth.account_id,
+            alpaca_auth.auth.clone(),
+        )?
+        .with_backpressure_policy(BackpressurePolicy::Return),
+    );
 
     let bridge = Arc::new(CctpBridge::try_from_ctx(CctpCtx {
         corridor: rebalancing_ctx.cctp_corridor,
@@ -1817,7 +1821,10 @@ pub(super) async fn alpaca_tokenize_command<Writer: Write>(
         wallet,
         chain,
         None,
-    )?;
+    )?
+    // `retry_on_backpressure` below retries the mint on a 429, so the poll
+    // hands the 429 back instead of waiting it out.
+    .with_backpressure_policy(BackpressurePolicy::Return);
 
     writeln!(stdout, "   Sending mint request to Alpaca...")?;
 
@@ -1947,7 +1954,10 @@ pub(super) async fn alpaca_redeem_command<Writer: Write>(
         wallet,
         chain,
         Some(redemption_wallet),
-    )?;
+    )?
+    // `retry_on_backpressure` below retries the redemption on a 429, so the
+    // poll hands the 429 back instead of waiting it out.
+    .with_backpressure_policy(BackpressurePolicy::Return);
 
     let amount = quantity.to_u256_18_decimals()?;
     writeln!(stdout, "   Amount (wei): {amount}")?;
@@ -6151,7 +6161,8 @@ mod tests {
             Chain::Base,
             None,
         )
-        .expect("basic-auth tokenization service");
+        .expect("basic-auth tokenization service")
+        .with_backpressure_policy(BackpressurePolicy::Return);
         let tx_hash = alloy::primitives::TxHash::ZERO;
 
         let error = retry_on_backpressure(

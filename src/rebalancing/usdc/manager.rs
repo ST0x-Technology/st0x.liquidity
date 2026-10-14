@@ -7902,7 +7902,9 @@ mod tests {
     use st0x_evm::{
         AbiDecodedErrorType, Evm, EvmError, IERC20, NoOpErrorRegistry, USDC_BASE, Wallet,
     };
-    use st0x_execution::{AlpacaTransferId, AlpacaWalletClient, AlpacaWalletError, PollingConfig};
+    use st0x_execution::{
+        AlpacaTransferId, AlpacaWalletClient, AlpacaWalletError, BackpressurePolicy, PollingConfig,
+    };
     use st0x_raindex::{RaindexContracts, RaindexService};
 
     use super::*;
@@ -9627,6 +9629,7 @@ mod tests {
         .unwrap();
 
         AlpacaWalletService::new_with_client(client, None)
+            .with_backpressure_policy(BackpressurePolicy::Return)
     }
 
     fn create_test_wallet(
@@ -14100,12 +14103,25 @@ mod tests {
     /// own request timeouts -- never engages. The real sleep between bursts
     /// leaves the poll far more time than a mock round trip needs, so bursts
     /// land while it is parked between reads.
+    ///
+    /// The tests stop it with `abort()`, which can land inside `advance`. The
+    /// guard resumes the clock when the frozen section is dropped, so the
+    /// test's later database reads never run under a frozen clock (where the
+    /// pool's acquire timeout fires at once).
     async fn skip_conversion_poll_deadlines() {
+        struct ResumeOnDrop;
+
+        impl Drop for ResumeOnDrop {
+            fn drop(&mut self) {
+                tokio::time::resume();
+            }
+        }
+
         loop {
             tokio::time::sleep(Duration::from_millis(20)).await;
             tokio::time::pause();
+            let _frozen = ResumeOnDrop;
             tokio::time::advance(CONVERSION_DEADLINE_STEP).await;
-            tokio::time::resume();
         }
     }
 
@@ -17555,6 +17571,7 @@ mod tests {
         };
 
         AlpacaWalletService::new_with_client(client, Some(polling))
+            .with_backpressure_policy(BackpressurePolicy::Return)
     }
 
     const ALPACA_DEPOSIT_ADDRESS: Address = address!("0x000000000000000000000000000000000000A1BC");

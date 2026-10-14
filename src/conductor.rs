@@ -58,10 +58,10 @@ use st0x_evm::{
     Chain, Evm, IERC20, OpenChainErrorRegistry, PreparedTransaction, ReadOnlyEvm, Wallet,
 };
 use st0x_execution::{
-    AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaWalletService, BuyingPowerReservationCents,
-    ClientOrderId, CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason,
-    Direction, ExecutionError, Executor, FractionalShares, HasZero, MarketOrder, MarketSession,
-    Positive, SupportedExecutor, Symbol, TryIntoExecutor, Usd,
+    AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaWalletService, BackpressurePolicy,
+    BuyingPowerReservationCents, ClientOrderId, CounterTradePreflight, CounterTradeReservation,
+    CounterTradeSkipReason, Direction, ExecutionError, Executor, FractionalShares, HasZero,
+    MarketOrder, MarketSession, Positive, SupportedExecutor, Symbol, TryIntoExecutor, Usd,
 };
 use st0x_issuance_client::IssuanceClient;
 use st0x_issuance_dto::VaultModeTag;
@@ -3462,11 +3462,17 @@ async fn build_rebalancer_services<Signer: Wallet + Clone>(
     reserved_cash: Option<Usd>,
     telemetry: TelemetrySender,
 ) -> anyhow::Result<RebalancerServices<Signer>> {
-    let alpaca_wallet = Arc::new(AlpacaWalletService::new(
-        alpaca_auth.base_url().to_string(),
-        alpaca_auth.account_id,
-        alpaca_auth.auth.clone(),
-    )?);
+    // A throttled transfer or deposit read comes back at once, so the
+    // transfer job can reschedule and free its worker instead of waiting out
+    // the `Retry-After` inside the poll.
+    let alpaca_wallet = Arc::new(
+        AlpacaWalletService::new(
+            alpaca_auth.base_url().to_string(),
+            alpaca_auth.account_id,
+            alpaca_auth.auth.clone(),
+        )?
+        .with_backpressure_policy(BackpressurePolicy::Return),
+    );
 
     let broker = InstrumentedAlpacaBroker::new(
         AlpacaBrokerApi::try_from_ctx(alpaca_auth.clone()).await?,

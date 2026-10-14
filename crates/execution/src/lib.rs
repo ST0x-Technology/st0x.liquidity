@@ -48,8 +48,9 @@ pub use st0x_alpaca::broker::AlpacaMarketDataError;
 #[cfg(any(test, feature = "test-support"))]
 pub use alpaca_wallet::AlpacaWalletClient;
 pub use alpaca_wallet::{
-    AlpacaTransferId, AlpacaWalletError, AlpacaWalletService, Network, PollingConfig, TokenSymbol,
-    Transfer, TransferStatus, TravelRuleInfo, WhitelistEntry, WhitelistStatus,
+    AlpacaTransferId, AlpacaWalletError, AlpacaWalletService, BackpressurePolicy, Network,
+    PollingConfig, TokenSymbol, Transfer, TransferStatus, TravelRuleInfo, WhitelistEntry,
+    WhitelistStatus,
 };
 
 pub use st0x_finance::{
