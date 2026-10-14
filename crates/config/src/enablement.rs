@@ -124,7 +124,7 @@ pub fn provided_capabilities(chain: Chain) -> BTreeSet<ChainCapability> {
     use ChainCapability::*;
 
     match chain {
-        Chain::Base => BTreeSet::from([
+        Chain::Base | Chain::Robinhood => BTreeSet::from([
             FillIngestion,
             Hedging,
             WalletSigning,
@@ -140,14 +140,6 @@ pub fn provided_capabilities(chain: Chain) -> BTreeSet<ChainCapability> {
             GasValuation,
         ]),
         Chain::HyperEvm => BTreeSet::from([FillIngestion, Hedging, WalletSigning]),
-        Chain::Robinhood => BTreeSet::from([
-            FillIngestion,
-            Hedging,
-            WalletSigning,
-            EquityRebalancing,
-            CashRebalancing,
-            GasValuation,
-        ]),
     }
 }
 
