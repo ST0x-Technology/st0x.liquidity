@@ -5242,12 +5242,12 @@ failure:
    imbalance that planned the transfer is unchanged, and a refund, deposits that
    keep reverting or a refused binding quote can persist. No redeposit starts
    while a signed deposit may still be on chain (`SwapDepositPrepared`), and
-   approves that went out alone are sent again and confirmed first: their nonces
-   precede the vault deposit's, and `BeginRedeposit` drops them from the
-   transfer, so an approve a node dropped would leave the vault deposit waiting
-   behind its nonce with nothing to send it again. A redeposit that does not
-   confirm pages and keeps the guard; the operator settles the stable by hand
-   and reconciles it.
+   approves that went out alone are sent again and confirmed first, and their
+   gas queued: their nonces precede the vault deposit's, and `BeginRedeposit`
+   drops them from the transfer, so an approve a node dropped would leave the
+   vault deposit waiting behind its nonce with nothing to send it again. A
+   redeposit that does not confirm pages and keeps the guard; the operator
+   settles the stable by hand and reconciles it.
 
 A Relay rate limit (429) on either quote is backpressure, as a broker 429 is
 (see "Broker rate-limit (429) backpressure"): the job reschedules after Relay's

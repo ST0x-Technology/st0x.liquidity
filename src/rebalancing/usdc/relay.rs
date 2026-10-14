@@ -1686,6 +1686,14 @@ where
                     return Err(Box::new(error).into());
                 }
             }
+            // Mined and paid for, and no deposit will queue it once
+            // `BeginRedeposit` drops it.
+            self.enqueue_bot_gas_cost(
+                self.corridor.chain(),
+                approve.tx_hash(),
+                BotGasOperationCategory::RelayApprove,
+            )
+            .await?;
         }
         self.redeposit(id, reason).await
     }
