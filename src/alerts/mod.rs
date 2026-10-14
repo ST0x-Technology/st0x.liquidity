@@ -193,6 +193,7 @@ alert_kinds! {
         ReconciledTransferHoldsRelayEnvelopes => "Reconciled a USDC transfer that holds signed Relay envelopes",
         RelayQuoteKeepsFailing => "Relay quotes keep failing transiently for a transfer past its withdrawal",
         RevertedRelayOrderDepositOnChain => "A deposit of a reverted Relay order is on chain",
+        RevertedRelayOrderDepositsOnChain => "Deposits of several reverted Relay orders are on chain",
         RecheckAdoptedRelayRefund => "Recheck adopted a Relay refund paid at the other end",
         RevertedRelayDepositLive => "check the order with `stox relay status <request>`",
     }

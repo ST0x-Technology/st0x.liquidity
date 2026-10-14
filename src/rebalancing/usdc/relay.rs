@@ -1702,11 +1702,12 @@ where
         Err(unresolved())
     }
 
-    /// Scans the origin chain for our deposits of `reverted` orders, one of
-    /// which a reorg may have landed: `false` when none is on chain. A found
+    /// Scans the origin chain for our deposits of `reverted` orders, which a
+    /// reorg may have landed: `false` when none is on chain. A lone found
     /// deposit is adopted once its payment proves, after the approves that
-    /// went out alone are sent again; until then the attempt ends with
-    /// `RevertedSwapDepositLive`, signing and redepositing nothing.
+    /// went out alone are sent again; until then, and for good when several
+    /// are found, the attempt ends with `RevertedSwapDepositLive`, signing
+    /// and redepositing nothing.
     async fn adopt_reverted_deposit(
         &self,
         id: &UsdcRebalanceId,
@@ -1729,15 +1730,39 @@ where
             .find_recent_deposits(side, &order_ids, from_block)
             .await
             .map_err(Box::new)?;
-        let Some((deposit, quote)) = scan.deposits.iter().find_map(|deposit| {
-            let RelayOrderId(order_id) = deposit.order_id;
-            reverted
-                .iter()
-                .find(|quote| quote.order_id == order_id)
-                .map(|quote| (deposit, quote))
-        }) else {
-            info!(target: "rebalance", %id, from_block, scanned_to = scan.scanned_to, reverted = reverted.len(), "No deposit of a reverted Relay order is on chain");
-            return Ok(false);
+        let found = scan
+            .deposits
+            .iter()
+            .filter_map(|deposit| {
+                let RelayOrderId(order_id) = deposit.order_id;
+                reverted
+                    .iter()
+                    .find(|quote| quote.order_id == order_id)
+                    .map(|quote| (deposit, quote))
+            })
+            .collect::<Vec<_>>();
+        let (deposit, quote) = match found.as_slice() {
+            [] => {
+                info!(target: "rebalance", %id, from_block, scanned_to = scan.scanned_to, reverted = reverted.len(), "No deposit of a reverted Relay order is on chain");
+                return Ok(false);
+            }
+            [(deposit, quote)] => (*deposit, *quote),
+            [(deposit, quote), ..] => {
+                // Each deposit holds the transfer's amount, so adopting one
+                // payment would release the guard with the other still at
+                // Relay.
+                let deposits = found
+                    .iter()
+                    .map(|(deposit, quote)| (deposit.tx, quote.order_id))
+                    .collect::<Vec<_>>();
+                error!(target: "operational_alert", alert = true, kind = AlertKind::RevertedRelayOrderDepositsOnChain.as_str(), %id, ?deposits, "Deposits of several reverted Relay orders are on chain; the transfer adopts none and holds its guard at SwapQuoted for the operator");
+                return Err(UsdcTransferError::RevertedSwapDepositLive {
+                    id: id.clone(),
+                    order_id: quote.order_id,
+                    request_id: quote.request_id,
+                    deposit_tx: deposit.tx,
+                });
+            }
         };
 
         let order_id = quote.order_id;

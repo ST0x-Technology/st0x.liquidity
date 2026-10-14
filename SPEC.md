@@ -5419,8 +5419,11 @@ signing a second deposit while an earlier one may still land:
   deposit found is never left behind: its order's status is read, and a fill or
   refund that proves is adopted (`RecoverSwapCompletion` ->
   `SwapCompletionRecovered`). Until then the transfer signs nothing, pages, and
-  reads it again every 30 minutes. A scan that fails is retried and signs
-  nothing either.
+  reads it again every 30 minutes. Deposits of several reverted orders found
+  together are never adopted: each holds the transfer's amount, so adopting one
+  payment would release the guard with the other still at Relay; the transfer
+  pages and holds at `SwapQuoted` for the operator. A scan that fails is retried
+  and signs nothing either.
 - **Late adoption.** `SwapCompletionRecovered` adopts a proven late payment of a
   signed order: from `SwapQuoted`, a reverted order whose deposit the scan
   found, which leaves `reverted_quotes`; from `SwapFailed`, through
