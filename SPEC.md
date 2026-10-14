@@ -5443,10 +5443,13 @@ signing a second deposit while an earlier one may still land:
   `SwapQuoted`; while it is `SwapFailed` nothing scans them. A fill continues as
   any `Bridged`, and the other reverted orders are no longer watched; a refund
   continues as any `SwapRefunded` of that order (redeposited, re-quoted or
-  held). `transfer recheck` of an unresolved escrow records a proven payment of
-  its deposited order with `ConfirmSwapFill` or `RecordSwapRefund`. Approves
-  that went out alone are sent again before a `SwapQuoted` adopts one.
-  Superseding an order adds its id to `signed_order_ids` and never drops one.
+  held). Only an Alpaca-to-chain refund's re-quote goes back to `SwapQuoted`: a
+  chain-to-Alpaca refund is redeposited with no scan first, so, as after a fill,
+  a deposit of another reverted order that lands later is left to the operator.
+  `transfer recheck` of an unresolved escrow records a proven payment of its
+  deposited order with `ConfirmSwapFill` or `RecordSwapRefund`. Approves that
+  went out alone are sent again before a `SwapQuoted` adopts one. Superseding an
+  order adds its id to `signed_order_ids` and never drops one.
 
 ##### Crash-safe resume
 
