@@ -8391,32 +8391,45 @@ impl RebalancingService {
     /// checks make this idempotent with apalis's own re-pick of still-owned rows.
     /// See ADR 2.
     /// Restores the withdraw cooldown, and the forced onchain cash reconcile,
-    /// for a Base->Alpaca withdrawal rejected before broadcast within the
-    /// cooldown before this start: the offline `fail-usdc-transfer`, or a
-    /// rejection the previous process recorded, never reached this process's
-    /// reactor. An aggregate that cannot be loaded holds every chain, as an
-    /// unknown chain does at runtime.
+    /// for a Base->Alpaca withdrawal rejected before broadcast, or a Relay
+    /// transfer returned to its vault, within the cooldown before this start:
+    /// the offline `fail-usdc-transfer`, or an event the previous process
+    /// recorded, never reached this process's reactor. An aggregate that
+    /// cannot be loaded holds every chain, as an unknown chain does at
+    /// runtime.
     async fn restore_withdrawal_rejection_cooldowns(
         &self,
         pool: &SqlitePool,
         usdc_store: &Store<UsdcRebalance>,
     ) -> Result<(), RebalancingServiceError> {
-        let recent = crate::usdc_rebalance::recent_failures(
-            pool,
-            CooldownFailure::Withdrawal,
-            Utc::now(),
-            usdc::USDC_WITHDRAW_REJECTION_COOLDOWN,
-        )
-        .await?;
+        let mut recent = Vec::new();
+        for failure in [CooldownFailure::Withdrawal, CooldownFailure::Redeposit] {
+            recent.extend(
+                crate::usdc_rebalance::recent_failures(
+                    pool,
+                    failure,
+                    Utc::now(),
+                    usdc::USDC_WITHDRAW_REJECTION_COOLDOWN,
+                )
+                .await?,
+            );
+        }
         for id in recent {
             match usdc_store.load(&id).await {
-                Ok(Some(UsdcRebalance::WithdrawalFailed {
-                    direction: RebalanceDirection::BaseToAlpaca,
-                    withdrawal_ref: None,
-                    corridor,
-                    failed_at,
-                    ..
-                })) => {
+                Ok(Some(
+                    UsdcRebalance::WithdrawalFailed {
+                        direction: RebalanceDirection::BaseToAlpaca,
+                        withdrawal_ref: None,
+                        corridor,
+                        failed_at,
+                        ..
+                    }
+                    | UsdcRebalance::ReturnedToSource {
+                        corridor,
+                        returned_at: failed_at,
+                        ..
+                    },
+                )) => {
                     let chain = corridor.chain();
                     self.hold_after_withdraw_rejection(Some(chain), failed_at)
                         .await;
@@ -8425,7 +8438,7 @@ impl RebalancingService {
                         usdc::USDC_WITHDRAW_REJECTION_COOLDOWN,
                     )
                     .await;
-                    info!(target: "rebalance", %id, %chain, %failed_at, "Restored the withdraw cooldown of a recent rejected withdrawal");
+                    info!(target: "rebalance", %id, %chain, %failed_at, "Restored the withdraw cooldown of a recent rejected withdrawal or redeposit");
                 }
                 Ok(_) => {}
                 Err(error) => {

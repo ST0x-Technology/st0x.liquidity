@@ -175,7 +175,8 @@ pub(super) enum UsdcTerminalAction {
 /// planning on its chain. The plan came from an inventory balance the vault
 /// could not cover, and a fresh vault read need not fix that, so the read
 /// alone cannot lift the hold. This bounds a persistent cause to one rejected
-/// withdraw per chain per period, matching the scan redrive cadence. Startup
+/// withdraw per chain per period, matching the scan redrive cadence. A Relay
+/// transfer back in its vault (`ReturnedToSource`) starts it too. Startup
 /// restores it from durable state (`restore_withdrawal_rejection_cooldowns`).
 pub(crate) const USDC_WITHDRAW_REJECTION_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 
@@ -1278,10 +1279,11 @@ impl RebalancingService {
             }
             // The stable is back in the vault it left: credit what came back,
             // drop what a refund kept, hold checks for a vault read pinned at
-            // the redeposit, and leave the next check to the snapshot poll.
+            // the redeposit, and start the chain's withdraw cooldown.
             ReturnedToSource {
                 redeposit_amount,
                 deposit_block,
+                returned_at,
                 ..
             } => {
                 self.settle_tracked_usdc_rebalance(
@@ -1292,7 +1294,7 @@ impl RebalancingService {
                     }),
                 )
                 .await?;
-                UsdcSettlementOutcome::DeferredToSnapshot
+                self.hold_after_redeposit(id, *returned_at).await
             }
             // Operator reconciliation of a post-burn `DepositFailed`: the minted
             // USDC left the source venue, so reconcile inflight with post-burn
@@ -1729,6 +1731,30 @@ impl RebalancingService {
         let rejected_at = Utc::now();
         self.hold_after_withdraw_rejection(chain, rejected_at).await;
         self.enqueue_cooldown_expiry_check(rejected_at, USDC_WITHDRAW_REJECTION_COOLDOWN)
+            .await;
+
+        UsdcSettlementOutcome::HeldByWithdrawCooldown
+    }
+
+    /// A Relay transfer back in its vault leaves the imbalance that planned
+    /// it, so the next check would plan the same round trip: the chain's
+    /// withdraw cooldown holds Base->Alpaca planning there, so a cause that
+    /// persists (an origin refund, deposits that keep reverting, a binding
+    /// quote refused after the pre-flight one) costs at most one withdraw and
+    /// redeposit per period. An unknown chain holds every chain.
+    async fn hold_after_redeposit(
+        &self,
+        id: &UsdcRebalanceId,
+        returned_at: DateTime<Utc>,
+    ) -> UsdcSettlementOutcome {
+        let chain = match self.active_usdc_rebalance(id).await {
+            ActiveUsdcRebalance::Known { chain, .. } => Some(chain),
+            ActiveUsdcRebalance::Unknown => None,
+        };
+
+        warn!(target: "rebalance", %id, ?chain, "Relay transfer returned to its vault: holding Base->Alpaca planning for the withdraw cooldown (every chain when the chain is unknown)");
+        self.hold_after_withdraw_rejection(chain, returned_at).await;
+        self.enqueue_cooldown_expiry_check(returned_at, USDC_WITHDRAW_REJECTION_COOLDOWN)
             .await;
 
         UsdcSettlementOutcome::HeldByWithdrawCooldown

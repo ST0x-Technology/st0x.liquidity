@@ -2887,6 +2887,8 @@ pub(crate) enum CooldownFailure {
     Withdrawal,
     /// `ConversionFailed`, which starts the conversion cooldown.
     Conversion,
+    /// `ReturnedToSource`, which starts the withdraw cooldown too.
+    Redeposit,
 }
 
 impl CooldownFailure {
@@ -2894,6 +2896,7 @@ impl CooldownFailure {
         match self {
             Self::Withdrawal => "UsdcRebalanceEvent::WithdrawalFailed",
             Self::Conversion => "UsdcRebalanceEvent::ConversionFailed",
+            Self::Redeposit => "UsdcRebalanceEvent::ReturnedToSource",
         }
     }
 
@@ -2901,6 +2904,7 @@ impl CooldownFailure {
         match self {
             Self::Withdrawal => "$.WithdrawalFailed.failed_at",
             Self::Conversion => "$.ConversionFailed.failed_at",
+            Self::Redeposit => "$.ReturnedToSource.returned_at",
         }
     }
 }

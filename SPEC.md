@@ -5213,11 +5213,14 @@ proven fill or the stable back in the vault, never in a guard-freeing failure:
    is a guard-clearing terminal: the inventory credits the vault with what came
    back and releases what a refund kept, every USDC check waits for a vault read
    pinned at or past the redeposit's block, as after any vault credit, and the
-   next USDC check waits for the snapshot poll. No redeposit starts while a
-   signed deposit may still be on chain (`SwapDepositPrepared`), and approves
-   that went out alone are sent again first, as their nonces precede the vault
-   deposit's. A redeposit that does not confirm pages and keeps the guard; the
-   operator settles the stable by hand and reconciles it.
+   chain's withdraw cooldown, restored at startup as after a vault withdraw that
+   failed without starting, holds chain-to-Alpaca planning on the chain: the
+   imbalance that planned the transfer is unchanged, and a refund, deposits that
+   keep reverting or a refused binding quote can persist. No redeposit starts
+   while a signed deposit may still be on chain (`SwapDepositPrepared`), and
+   approves that went out alone are sent again first, as their nonces precede
+   the vault deposit's. A redeposit that does not confirm pages and keeps the
+   guard; the operator settles the stable by hand and reconciles it.
 
 A Relay rate limit (429) on either quote is backpressure, as a broker 429 is
 (see "Broker rate-limit (429) backpressure"): the job reschedules after Relay's
