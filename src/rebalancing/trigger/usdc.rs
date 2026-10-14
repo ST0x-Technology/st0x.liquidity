@@ -1915,26 +1915,27 @@ impl RebalancingService {
         let initiated_amount = tracking.initiated_amount;
         // A Relay fill can pay more than its input: the quote and the fill
         // proof bound it only from below, so the transfer settles at what it
-        // received, up to the proven fill.
-        let ceiling = match tracking.corridor {
+        // received. No ceiling: a chain-to-Alpaca settlement is the USD the
+        // conversion received, which a USDC/USD price above 1 puts above the
+        // proven fill too.
+        let settles_above_input = match tracking.corridor {
             UsdcCorridor::HubRouted {
                 hop: HopKind::Relay,
                 ..
-            } => tracking.bridged_amount_received.unwrap_or(initiated_amount),
+            } => true,
             UsdcCorridor::HubRouted {
                 hop: HopKind::Cctp, ..
-            } => initiated_amount,
+            } => false,
         };
 
-        if settled_amount.gt(&ceiling)? {
+        if !settles_above_input && settled_amount.gt(&initiated_amount)? {
             warn!(
                 target: "rebalance",
                 id = %id,
                 ?event,
                 ?initiated_amount,
-                ?ceiling,
                 ?settled_amount,
-                "Settled USDC amount exceeds what the transfer moved"
+                "Settled USDC amount exceeds initiated amount"
             );
             return Err(RebalancingServiceError::SettledUsdcExceedsInitiatedAmount {
                 id: id.clone(),
