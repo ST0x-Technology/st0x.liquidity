@@ -44712,7 +44712,7 @@ mod tests {
     }
 
     /// Base at 150 after sending 50 to Alpaca, Robinhood at 200 and Alpaca
-    /// at 50; the caller holds Base's guard.
+    /// at 50; nothing holds Base's guard until the caller holds or claims it.
     async fn robinhood_trigger_beside_a_base_transfer() -> Arc<RebalancingService> {
         let inventory = InventoryView::default().with_usdc(usdc(150), usdc(50));
         let inventory = with_onchain_usdc(inventory, Chain::Robinhood, usdc(200));
