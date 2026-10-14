@@ -1706,9 +1706,11 @@ where
         self.redeposit(id, reason).await
     }
 
-    /// Sends again, before a hold at the hub, the approves of a `SwapQuoted`
-    /// that went out alone: a node may have dropped them, and every later
-    /// send from the shared Ethereum wallet waits behind their nonces.
+    /// Sends again and confirms, before a hold at the hub, the approves of a
+    /// `SwapQuoted` that went out alone, and queues their gas: a node may
+    /// have dropped them, every later send from the shared Ethereum wallet
+    /// waits behind their nonces, and a hold the operator reconciles never
+    /// deposits to queue it.
     async fn send_split_approves_from_hub(
         &self,
         id: &UsdcRebalanceId,
@@ -1717,7 +1719,31 @@ where
         let deadline = Instant::now() + self.hop.bounds.quote_max_age;
         self.hop
             .broadcast_split_approves(id, split_approves, HopDirection::FromHub, deadline)
-            .await
+            .await?;
+        for approve in split_approves {
+            match self
+                .hop
+                .bridge
+                .confirm_approve(HopDirection::FromHub, approve)
+                .await
+            {
+                Ok(()) => {}
+                Err(RelayBridgeError::ApproveReverted { tx }) => {
+                    warn!(target: "rebalance", %id, approve = %tx, "A lone Relay approve from the hub reverted; holding at the hub anyway");
+                }
+                Err(error) => {
+                    warn!(target: "rebalance", %id, approve = %approve.tx_hash(), %error, "A lone Relay approve from the hub is not confirmed; the hold waits for the retry to send it again");
+                    return Err(Box::new(error).into());
+                }
+            }
+            self.enqueue_bot_gas_cost(
+                Chain::Ethereum,
+                approve.tx_hash(),
+                BotGasOperationCategory::RelayApprove,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// Starts returning the stable to the vault, then finishes it.
