@@ -7861,7 +7861,7 @@ The `fail-usdc-transfer` operation sends `FailBridging { reason }`, which emits
 offline `stox fail-usdc-transfer` CLI operates directly on the local CQRS state
 with the bot stopped -- the bot must be stopped to eliminate the race where a
 worker advances the transfer to `Bridging` between the preflight and the send.
-The live ops-API route `POST /liquidity-write/transfers/usdc/{id}/fail` (client:
+The live ops-API route `POST /liquidity-debug/transfers/usdc/{id}/fail` (client:
 `st0x-liquidity-client --env <env> debug fail-usdc-transfer <id> --reason ...`)
 runs in the bot process and does NOT require stopping it: it holds the shared
 resume lock (so it cannot race `/transfers/usdc/resume` or `/transfers/recheck`)
@@ -8046,7 +8046,7 @@ the redemption in `VaultWithdrawSubmitted` with the adopted hash, no signed
 bytes and the original submitted time, so the reconciliation deadline keeps
 running. The command is pure: the bot's route
 `POST
-/liquidity-write/transfers/equity_redemption/{id}/adopt-withdrawal`
+/liquidity-debug/transfers/equity_redemption/{id}/adopt-withdrawal`
 (client: `debug adopt-withdrawal`; `stox` has no adopt verb) first checks on the
 redemption's chain, through that chain's raindex and bot wallet, that the tx is
 mined in the canonical chain from the bot wallet, at the withdrawal's nonce, is
@@ -8266,13 +8266,13 @@ effect rather than a generic intent:
   caveat is the bot concurrently driving the same on-chain mint); or the running
   bot (REST). `fail`, `recheck`, `transfer resume --kind equity`, and
   `transfer resume --kind usdc` require the bot. `cctp complete-mint`,
-  `process-tx`, `view rebuild`, and the capital verbs also have running bot
-  routes under the IAP-verified `/liquidity-write/` prefix (client:
-  `st0x-liquidity-client`), which remove the stop the bot precondition of their
-  direct paths; their contracts are the next four bullets and the `process-tx`
-  bullet below.
+  `process-tx` and `view rebuild` also have running bot routes under the
+  IAP-verified `/liquidity-debug/` prefix, and the capital verbs under the
+  IAP-verified `/liquidity-capital/` prefix (client: `st0x-liquidity-client`),
+  which remove the stop the bot precondition of their direct paths; their
+  contracts are the next four bullets and the `process-tx` bullet below.
 - **`cctp complete-mint` through the running bot is two phase and never waits on
-  Circle.** `POST /liquidity-write/cctp/complete-mint` fetches the burn's
+  Circle.** `POST /liquidity-debug/cctp/complete-mint` fetches the burn's
   attestation with a single request, holding no lock: a burn Circle has not
   attested yet, or a transient transport error, returns a retryable `502` at
   once instead of polling inside the request, so the route cannot keep working
@@ -8293,7 +8293,7 @@ effect rather than a generic intent:
   a `500`. The route touches no aggregate; bring the stuck `UsdcRebalance` back
   in sync afterwards with `resume` or `reconcile`.
 - **`view rebuild` through the running bot pauses every projection writer.**
-  `POST /liquidity-write/views/{view}/rebuild` refuses with `503` until startup
+  `POST /liquidity-debug/views/{view}/rebuild` refuses with `503` until startup
   completes and fully validates the request first (an unknown view, a malformed
   id, or an id with no event stream is a `400`), so a bad request never pauses
   anything. It then pauses projection maintenance, the one gate every in process
@@ -8314,7 +8314,7 @@ effect rather than a generic intent:
   while the bot is stopped.
 - **The capital verbs through the running bot sign with the bot's own wallets
   and never wait on settlement.** `st0x-liquidity-client capital` posts to
-  `POST /liquidity-write/capital/{verb}` for `transfer-usdc`, `vault-deposit`,
+  `POST /liquidity-capital/{verb}` for `transfer-usdc`, `vault-deposit`,
   `vault-withdraw`, `vault-withdraw-usdc`, `cctp-bridge` and `reset-allowance`,
   the network counterparts of the `st0x-cli` verbs of the same names, and for
   `cctp-burn-supersede`, which settles a `cctp-bridge` burn and has no
@@ -8405,7 +8405,7 @@ effect rather than a generic intent:
   source wallet, and later sends from that wallet queue behind it, until it
   mines or the operator cancels it with a plain 0 value transfer to the wallet
   itself, with no calldata and a higher fee, at the burn's nonce, then settles
-  it with `POST /liquidity-write/capital/cctp-burn-supersede` (`operationId`,
+  it with `POST /liquidity-capital/cctp-burn-supersede` (`operationId`,
   `supersedingTx`). The named tx must be mined from the burn's signer at the
   burn's nonce with the source chain's required confirmations, and the burn
   itself unmined. The signer is read from the burn's signed bytes, so a burn
@@ -8492,22 +8492,47 @@ effect rather than a generic intent:
   it automatically. Like the whole `server_port` recovery surface
   (`/transfers/resume`, `/transfers/recheck`, `/transfers/fail`), its bare path
   is restricted to loopback callers for the in-container CLI. Network operators
-  use the IAP-verified `/liquidity-write/transfers/*` mounts.
+  use the IAP-verified `/liquidity-debug/transfers/*` mounts.
 - **Every main port route comes from a route declaration.** `src/api.rs`
-  declares each route's method and path: the role gated ops routes and the write
-  prefix's catch alls, the loopback recovery routes, the unauthenticated
-  dashboard reads, and the `/metrics` and `/api/ws` service routes. Each group
-  gets its own guard: IAP on the role prefixes when the ops API is configured,
-  `require_loopback` on the loopback routes, and none on the dashboard reads and
-  service routes. A route guard admits only declared methods and paths, before
-  any handler runs. Both operations audits and the loopback gate wrap it, so
-  every request under the mounted `/liquidity-write` prefix and every `POST`
-  under `/transfers` is audited even when the guard refuses it, and a `POST`
-  under `/transfers` passes the loopback gate first. A `POST` under `/transfers`
-  that no declaration admits gets the stable unknown operator mutation `404`;
-  otherwise an undeclared method on a declared route gets `405` with the
-  declared methods in `Allow`, and an unknown route, nested service, or fallback
-  gets `404`.
+  declares each route's method and path: the role-gated ops routes and the debug
+  and capital prefixes' catch alls, the loopback recovery routes, the
+  unauthenticated dashboard reads, and the `/metrics` and `/api/ws` service
+  routes. Each group gets its own guard: IAP on the role prefixes when the ops
+  API is configured, `require_loopback` on the loopback routes, and none on the
+  dashboard reads and service routes. A route guard admits only declared methods
+  and paths, before any handler runs. Both operations audits and the loopback
+  gate wrap it, so every request under the mounted `/liquidity-debug` and
+  `/liquidity-capital` prefixes and every `POST` under `/transfers` is audited
+  even when the guard refuses it, and a `POST` under `/transfers` passes the
+  loopback gate first. A `POST` under `/transfers` that no declaration admits
+  gets the stable unknown operator mutation `404`; otherwise an undeclared
+  method on a declared route gets `405` with the declared methods in `Allow`,
+  and an unknown route, nested service, or fallback gets `404`.
+- **The ops API has three IAP tiers, one prefix each: read, debug and capital,**
+  the same tier names as the issuance ops API. `/liquidity-read/*` serves the
+  GET reads, `/liquidity-debug/*` the state repairs (transfer resume, recheck,
+  fail, reconcile, adopt-withdrawal and clear-pending-burn, position set and
+  release-hedge, portfolio marks, `process-tx`, `cctp complete-mint` and view
+  rebuilds), and `/liquidity-capital/*` the capital verbs, the only routes that
+  start a new fund movement. The load balancer sends each prefix to its own
+  backend service with its own IAP policy and Workspace group. A debug identity
+  can still continue or settle a movement that already exists (resume, recheck,
+  and `cctp complete-mint` send transactions from the bot's wallets) and repair
+  state, but it cannot start a new movement. The bot verifies
+  `x-goog-iap-jwt-assertion` on every prefix and pins one audience per prefix
+  (`[ops_api]` `read_audience`, `debug_audience`, `capital_audience`), so a
+  token minted for one tier is refused on the others. The audiences must be
+  non-blank, unpadded and pairwise distinct, or the config is refused at load.
+  Without `[ops_api]` no prefix is mounted. `capital_audience` is optional:
+  without it the read and debug prefixes are served and `/liquidity-capital/*`
+  is not mounted at all (`404`), so the bot starts before the capital backend
+  exists. The capital routes are not on the debug prefix, so a `POST` to a
+  `/liquidity-debug/capital/*` path gets the debug prefix's stable unknown
+  operator mutation `404`. The debug tier was called write: the old
+  `/liquidity-write/*` prefix has no alias and is not mounted (`404`), and a
+  config that still names `write_audience` fails to parse, with an error that
+  names `debug_audience`. Every request under the mounted debug and capital
+  prefixes is audited with role `debug` or `capital`.
 - **Both bot-routed USDC recovery routes quiesce the rebalancing driver first.**
   `transfer resume --kind usdc` and `transfer recheck --kind usdc` send
   transactions from the rebalancing wallet or advance the `UsdcRebalance`
@@ -8590,7 +8615,7 @@ effect rather than a generic intent:
   none of the bot's live reactors, and its placer has no admission gate (see
   below). The file locks are defense in depth, not a supported concurrent mode.
   The **in bot REST route**
-  (`POST /liquidity-write/transactions/{tx_hash}/process`) removes that
+  (`POST /liquidity-debug/transactions/{tx_hash}/process`) removes that
   requirement: it runs inside the live bot and serializes its position claim and
   broker placement against the trading loop through the shared counter trade
   submission lock (ADR 0014), so it does **not** require stopping the bot. It
@@ -8646,20 +8671,21 @@ effect rather than a generic intent:
 
 Every request that reaches a service on a mutation-capable operator route emits
 exactly one structured audit event, including denied requests and requests
-rejected before a handler runs. Liquidity covers every matched and unknown
-`POST` under its mounted `/liquidity-write` prefix and loopback `/transfers`
-mutation namespace. A rejection performed by Cloud IAP at the load-balancer edge
-never reaches the process and is therefore outside this application audit
-contract. The liquidity and issuance bots use the same versioned event contract
-so Cloud Logging and, when OTLP telemetry is configured, VictoriaLogs queries do
-not depend on service-specific log messages:
+rejected before a handler runs. Liquidity covers every request, whatever the
+method, under its mounted `/liquidity-debug` and `/liquidity-capital` prefixes,
+and every matched and unknown `POST` under the loopback `/transfers` mutation
+namespace. A rejection performed by Cloud IAP at the load-balancer edge never
+reaches the process and is therefore outside this application audit contract.
+The liquidity and issuance bots use the same versioned event contract so Cloud
+Logging and, when OTLP telemetry is configured, VictoriaLogs queries do not
+depend on service-specific log messages:
 
 | Field          | Contract                                                                                                                                                            |
 | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `audit_schema` | Constant `st0x.operations.audit.v1`.                                                                                                                                |
 | `service`      | `issuance` or `liquidity`.                                                                                                                                          |
 | `principal`    | Verified IAP subject; `local-loopback` for the liquidity bot's in-container CLI routes; `unauthenticated` when no identity was verified.                            |
-| `role`         | The admitted operator tier (`debug`, `capital`, `breakglass`, or `write`); `local` for loopback-only routes.                                                        |
+| `role`         | The admitted operator tier (`debug`, `capital`, or `breakglass`); `local` for loopback-only routes.                                                                 |
 | `route`        | Stable matched route template, including a fixed wildcard template for an unknown mutation; never the raw unmatched URI.                                            |
 | `request_id`   | Caller-supplied UUID from `x-request-id`, or a server-generated UUID returned in the same response header.                                                          |
 | `target_id`    | Colon-separated dynamic path values, then the identifiers the typed request body and query declare, each at most 256 bytes; `not_identified` when none is captured. |

@@ -55,8 +55,10 @@ pub async fn dispatch_args<A: TokenSource + Sync>(
 pub enum CommandRole {
     /// A GET under `/liquidity-read`.
     Read,
-    /// A POST under `/liquidity-write`.
-    Write,
+    /// A POST under `/liquidity-debug`.
+    Debug,
+    /// A POST under `/liquidity-capital`.
+    Capital,
 }
 
 /// One complete command used to prove client and server route agreement.
@@ -103,14 +105,14 @@ pub fn command_cases() -> Vec<CommandCase> {
             CommandRole::Read,
             &["read", "transfer-events", "mint", "abc"],
         ),
-        case(CommandRole::Write, &["debug", "resume"]),
-        case(CommandRole::Write, &["debug", "recheck", "mint", "abc"]),
+        case(CommandRole::Debug, &["debug", "resume"]),
+        case(CommandRole::Debug, &["debug", "recheck", "mint", "abc"]),
         case(
-            CommandRole::Write,
+            CommandRole::Debug,
             &["debug", "resume-usdc", "base-to-alpaca", "abc"],
         ),
         case(
-            CommandRole::Write,
+            CommandRole::Debug,
             &[
                 "debug",
                 "reconcile-usdc",
@@ -120,7 +122,7 @@ pub fn command_cases() -> Vec<CommandCase> {
             ],
         ),
         case(
-            CommandRole::Write,
+            CommandRole::Debug,
             &[
                 "debug",
                 "reconcile-equity",
@@ -131,7 +133,7 @@ pub fn command_cases() -> Vec<CommandCase> {
             ],
         ),
         case(
-            CommandRole::Write,
+            CommandRole::Debug,
             &[
                 "debug",
                 "adopt-withdrawal",
@@ -143,15 +145,15 @@ pub fn command_cases() -> Vec<CommandCase> {
             ],
         ),
         case(
-            CommandRole::Write,
+            CommandRole::Debug,
             &["debug", "clear-pending-burn", "abc", "--reason", "dropped"],
         ),
         case(
-            CommandRole::Write,
+            CommandRole::Debug,
             &["debug", "fail-usdc-transfer", "abc", "--reason", "incident"],
         ),
         case(
-            CommandRole::Write,
+            CommandRole::Debug,
             &[
                 "debug",
                 "fail-equity-transfer",
@@ -162,7 +164,7 @@ pub fn command_cases() -> Vec<CommandCase> {
             ],
         ),
         case(
-            CommandRole::Write,
+            CommandRole::Debug,
             &[
                 "debug",
                 "position",
@@ -175,7 +177,7 @@ pub fn command_cases() -> Vec<CommandCase> {
             ],
         ),
         case(
-            CommandRole::Write,
+            CommandRole::Debug,
             &[
                 "debug",
                 "position",
@@ -188,7 +190,7 @@ pub fn command_cases() -> Vec<CommandCase> {
             ],
         ),
         case(
-            CommandRole::Write,
+            CommandRole::Debug,
             &[
                 "debug",
                 "portfolio-snapshot",
@@ -207,13 +209,13 @@ pub fn command_cases() -> Vec<CommandCase> {
                 "correction",
             ],
         ),
-        case(CommandRole::Write, &["debug", "process-tx", "0xabc"]),
+        case(CommandRole::Debug, &["debug", "process-tx", "0xabc"]),
         case(
-            CommandRole::Write,
+            CommandRole::Debug,
             &["debug", "view", "rebuild", "position", "--id", "AAPL"],
         ),
         case(
-            CommandRole::Write,
+            CommandRole::Debug,
             &[
                 "debug",
                 "cctp",
@@ -236,7 +238,7 @@ fn capital_command_cases() -> [CommandCase; 7] {
 
     [
         case(
-            CommandRole::Write,
+            CommandRole::Capital,
             &[
                 "capital",
                 "transfer-usdc",
@@ -247,7 +249,7 @@ fn capital_command_cases() -> [CommandCase; 7] {
             ],
         ),
         case(
-            CommandRole::Write,
+            CommandRole::Capital,
             &[
                 "capital",
                 "vault-deposit",
@@ -260,7 +262,7 @@ fn capital_command_cases() -> [CommandCase; 7] {
             ],
         ),
         case(
-            CommandRole::Write,
+            CommandRole::Capital,
             &[
                 "capital",
                 "vault-withdraw",
@@ -273,11 +275,11 @@ fn capital_command_cases() -> [CommandCase; 7] {
             ],
         ),
         case(
-            CommandRole::Write,
+            CommandRole::Capital,
             &["capital", "vault-withdraw-usdc", "--amount", "1"],
         ),
         case(
-            CommandRole::Write,
+            CommandRole::Capital,
             &[
                 "capital",
                 "cctp-bridge",
@@ -290,7 +292,7 @@ fn capital_command_cases() -> [CommandCase; 7] {
             ],
         ),
         case(
-            CommandRole::Write,
+            CommandRole::Capital,
             &[
                 "capital",
                 "cctp-burn-supersede",
@@ -300,7 +302,7 @@ fn capital_command_cases() -> [CommandCase; 7] {
                 "0xabc",
             ],
         ),
-        case(CommandRole::Write, &["capital", "reset-allowance"]),
+        case(CommandRole::Capital, &["capital", "reset-allowance"]),
     ]
 }
 

@@ -143,6 +143,7 @@ async fn execute(cli: Cli) -> Result<(), Failure> {
     let client = Client::new(
         target.base_url,
         StaticToken(token.clone()),
+        StaticToken(token.clone()),
         StaticToken(token),
         target.request_timeout,
         target.connect_timeout,
@@ -229,7 +230,7 @@ async fn dispatch_value<A: TokenSource + Sync>(
     }
 }
 
-/// Sends one operator write through the write prefix and returns the bot's
+/// Sends one operator write through the debug prefix and returns the bot's
 /// response for `dispatch` to print.
 async fn send_debug<A: TokenSource + Sync>(
     client: &Client<A>,
@@ -426,7 +427,7 @@ async fn send_debug<A: TokenSource + Sync>(
     Ok(value)
 }
 
-/// Sends one `capital` verb through the write prefix and returns the bot's
+/// Sends one `capital` verb through the capital prefix and returns the bot's
 /// response for `dispatch` to print, like `send_debug` for the debug verbs.
 async fn dispatch_capital<A: TokenSource + Sync>(
     client: &Client<A>,
@@ -439,8 +440,8 @@ async fn dispatch_capital<A: TokenSource + Sync>(
             chain,
         } => {
             client
-                .post_json(
-                    "/capital/transfer-usdc",
+                .post_capital_json(
+                    "/transfer-usdc",
                     &wire::TransferUsdcRequest {
                         direction,
                         amount,
@@ -451,18 +452,18 @@ async fn dispatch_capital<A: TokenSource + Sync>(
         }
         Capital::VaultDeposit(args) => {
             client
-                .post_json("/capital/vault-deposit", &vault_request(args))
+                .post_capital_json("/vault-deposit", &vault_request(args))
                 .await
         }
         Capital::VaultWithdraw(args) => {
             client
-                .post_json("/capital/vault-withdraw", &vault_request(args))
+                .post_capital_json("/vault-withdraw", &vault_request(args))
                 .await
         }
         Capital::VaultWithdrawUsdc { amount, network } => {
             client
-                .post_json(
-                    "/capital/vault-withdraw-usdc",
+                .post_capital_json(
+                    "/vault-withdraw-usdc",
                     &wire::VaultWithdrawUsdcRequest {
                         chain: network.wire_name(),
                         amount,
@@ -485,8 +486,8 @@ async fn dispatch_capital<A: TokenSource + Sync>(
                  (only against a bot that records operation ids, see below)"
             );
             let answer = client
-                .post_json(
-                    "/capital/cctp-bridge",
+                .post_capital_json(
+                    "/cctp-bridge",
                     &wire::CctpBridgeRequest {
                         operation_id,
                         from: from.wire_name(),
@@ -510,8 +511,8 @@ async fn dispatch_capital<A: TokenSource + Sync>(
             superseding_tx,
         } => {
             client
-                .post_json(
-                    "/capital/cctp-burn-supersede",
+                .post_capital_json(
+                    "/cctp-burn-supersede",
                     &wire::CctpBurnSupersedeRequest {
                         operation_id,
                         superseding_tx,
@@ -521,8 +522,8 @@ async fn dispatch_capital<A: TokenSource + Sync>(
         }
         Capital::ResetAllowance { network } => {
             client
-                .post_json(
-                    "/capital/reset-allowance",
+                .post_capital_json(
+                    "/reset-allowance",
                     &wire::ResetAllowanceRequest {
                         chain: network.wire_name(),
                     },
@@ -614,7 +615,8 @@ mod tests {
         Ok(Client::new(
             base,
             StaticToken("read".to_owned()),
-            StaticToken("write".to_owned()),
+            StaticToken("debug".to_owned()),
+            StaticToken("capital".to_owned()),
             Duration::from_secs(5),
             Duration::from_secs(5),
         )?)
@@ -711,7 +713,7 @@ mod tests {
         let request = request_for(Command::Debug(Debug::Resume)).await?;
         assert_eq!(
             request_line(&request),
-            "POST /liquidity-write/transfers/resume HTTP/1.1"
+            "POST /liquidity-debug/transfers/resume HTTP/1.1"
         );
         Ok(())
     }
@@ -731,7 +733,7 @@ mod tests {
             .await?;
             assert_eq!(
                 request_line(&request),
-                format!("POST /liquidity-write/transfers/recheck/{segment}/abc HTTP/1.1")
+                format!("POST /liquidity-debug/transfers/recheck/{segment}/abc HTTP/1.1")
             );
         }
         Ok(())
@@ -750,7 +752,7 @@ mod tests {
         .await?;
         assert_eq!(
             request_line(&request),
-            "POST /liquidity-write/transfers/recheck/usdc_bridge/abc?deposit_tx=0xdeposit HTTP/1.1"
+            "POST /liquidity-debug/transfers/recheck/usdc_bridge/abc?deposit_tx=0xdeposit HTTP/1.1"
         );
         Ok(())
     }
@@ -764,7 +766,7 @@ mod tests {
         .await?;
         assert_eq!(
             request_line(&request),
-            "POST /liquidity-write/transfers/usdc/resume/base_to_alpaca/r%2F1 HTTP/1.1"
+            "POST /liquidity-debug/transfers/usdc/resume/base_to_alpaca/r%2F1 HTTP/1.1"
         );
         Ok(())
     }
@@ -780,7 +782,7 @@ mod tests {
         .await?;
         assert_eq!(
             request_line(&request),
-            "POST /liquidity-write/transfers/usdc/abc/reconcile HTTP/1.1"
+            "POST /liquidity-debug/transfers/usdc/abc/reconcile HTTP/1.1"
         );
         assert_eq!(
             request_body(&request),
@@ -822,7 +824,7 @@ mod tests {
         .await?;
         assert_eq!(
             request_line(&request),
-            "POST /liquidity-write/transfers/equity_redemption/abc/reconcile HTTP/1.1"
+            "POST /liquidity-debug/transfers/equity_redemption/abc/reconcile HTTP/1.1"
         );
         assert_eq!(
             request_body(&request),
@@ -866,7 +868,7 @@ mod tests {
         .await?;
         assert_eq!(
             request_line(&request),
-            "POST /liquidity-write/transfers/equity_redemption/abc/adopt-withdrawal HTTP/1.1"
+            "POST /liquidity-debug/transfers/equity_redemption/abc/adopt-withdrawal HTTP/1.1"
         );
         assert_eq!(
             request_body(&request),
@@ -887,7 +889,7 @@ mod tests {
         .await?;
         assert_eq!(
             request_line(&request),
-            "POST /liquidity-write/transfers/usdc/abc/clear-pending-burn HTTP/1.1"
+            "POST /liquidity-debug/transfers/usdc/abc/clear-pending-burn HTTP/1.1"
         );
         assert_eq!(
             request_body(&request),
@@ -905,7 +907,7 @@ mod tests {
         .await?;
         assert_eq!(
             request_line(&request),
-            "POST /liquidity-write/transfers/usdc/abc/fail HTTP/1.1"
+            "POST /liquidity-debug/transfers/usdc/abc/fail HTTP/1.1"
         );
         assert_eq!(
             request_body(&request),
@@ -927,7 +929,7 @@ mod tests {
         .await?;
         assert_eq!(
             request_line(&request),
-            "POST /liquidity-write/positions/AAPL/set HTTP/1.1"
+            "POST /liquidity-debug/positions/AAPL/set HTTP/1.1"
         );
         assert_eq!(
             request_body(&request),
@@ -970,7 +972,7 @@ mod tests {
         .await?;
         assert_eq!(
             request_line(&request),
-            "POST /liquidity-write/positions/AAPL/release-hedge HTTP/1.1"
+            "POST /liquidity-debug/positions/AAPL/release-hedge HTTP/1.1"
         );
         assert_eq!(
             request_body(&request),
@@ -994,7 +996,7 @@ mod tests {
         .await?;
         assert_eq!(
             request_line(&request),
-            "POST /liquidity-write/portfolio-snapshot/marks HTTP/1.1"
+            "POST /liquidity-debug/portfolio-snapshot/marks HTTP/1.1"
         );
         assert_eq!(
             request_body(&request),
@@ -1025,7 +1027,7 @@ mod tests {
             .await?;
             assert_eq!(
                 request_line(&request),
-                format!("POST /liquidity-write/transfers/fail/{segment}/abc HTTP/1.1")
+                format!("POST /liquidity-debug/transfers/fail/{segment}/abc HTTP/1.1")
             );
             assert_eq!(
                 request_body(&request),
@@ -1047,7 +1049,7 @@ mod tests {
         .await?;
         assert_eq!(
             request_line(&primary),
-            "POST /liquidity-write/transactions/0xabc/process HTTP/1.1"
+            "POST /liquidity-debug/transactions/0xabc/process HTTP/1.1"
         );
 
         let secondary = request_for(Command::Debug(Debug::ProcessTx {
@@ -1057,7 +1059,7 @@ mod tests {
         .await?;
         assert_eq!(
             request_line(&secondary),
-            "POST /liquidity-write/transactions/0xabc/process?chain=ethereum HTTP/1.1"
+            "POST /liquidity-debug/transactions/0xabc/process?chain=ethereum HTTP/1.1"
         );
         Ok(())
     }
@@ -1072,7 +1074,7 @@ mod tests {
         .await?;
         assert_eq!(
             request_line(&request),
-            "POST /liquidity-write/cctp/complete-mint HTTP/1.1"
+            "POST /liquidity-debug/cctp/complete-mint HTTP/1.1"
         );
         assert_eq!(
             request_body(&request),
@@ -1093,7 +1095,7 @@ mod tests {
         .await?;
         assert_eq!(
             request_line(&request),
-            "POST /liquidity-write/views/position/rebuild HTTP/1.1"
+            "POST /liquidity-debug/views/position/rebuild HTTP/1.1"
         );
         assert_eq!(
             request_body(&request),
@@ -1115,7 +1117,7 @@ mod tests {
         .await?;
         assert_eq!(
             request_line(&request),
-            "POST /liquidity-write/views/rebalance-timing/rebuild HTTP/1.1"
+            "POST /liquidity-debug/views/rebalance-timing/rebuild HTTP/1.1"
         );
         assert_eq!(request_body(&request), serde_json::json!({ "all": true }));
         Ok(())
@@ -1136,7 +1138,7 @@ mod tests {
             .await?;
             assert_eq!(
                 request_line(&request),
-                "POST /liquidity-write/capital/transfer-usdc HTTP/1.1"
+                "POST /liquidity-capital/transfer-usdc HTTP/1.1"
             );
             assert_eq!(
                 request_body(&request),
@@ -1175,7 +1177,7 @@ mod tests {
             let request = request_for(Command::Capital(command)).await?;
             assert_eq!(
                 request_line(&request),
-                format!("POST /liquidity-write/capital/{route} HTTP/1.1")
+                format!("POST /liquidity-capital/{route} HTTP/1.1")
             );
             assert_eq!(
                 request_body(&request),
@@ -1200,7 +1202,7 @@ mod tests {
         .await?;
         assert_eq!(
             request_line(&request),
-            "POST /liquidity-write/capital/vault-withdraw-usdc HTTP/1.1"
+            "POST /liquidity-capital/vault-withdraw-usdc HTTP/1.1"
         );
         assert_eq!(
             request_body(&request),
@@ -1223,7 +1225,7 @@ mod tests {
         .await?;
         assert_eq!(
             request_line(&amount),
-            "POST /liquidity-write/capital/cctp-bridge HTTP/1.1"
+            "POST /liquidity-capital/cctp-bridge HTTP/1.1"
         );
         let mut body = request_body(&amount);
         let generated = body
@@ -1263,7 +1265,7 @@ mod tests {
         .await?;
         assert_eq!(
             request_line(&request),
-            "POST /liquidity-write/capital/cctp-burn-supersede HTTP/1.1"
+            "POST /liquidity-capital/cctp-burn-supersede HTTP/1.1"
         );
         assert_eq!(
             request_body(&request),
@@ -1280,7 +1282,7 @@ mod tests {
         .await?;
         assert_eq!(
             request_line(&request),
-            "POST /liquidity-write/capital/reset-allowance HTTP/1.1"
+            "POST /liquidity-capital/reset-allowance HTTP/1.1"
         );
         assert_eq!(
             request_body(&request),

@@ -1,4 +1,4 @@
-//! Typed request bodies for the write routes. Each is a hand-written mirror
+//! Typed request bodies for the debug and capital routes. Each is a hand-written mirror
 //! of the bot's request contract in `src/api.rs`; nothing links the two at
 //! compile time, so a contract change on the bot must be reflected here by
 //! hand. The request-body tests in `main.rs` pin the JSON each body produces.
@@ -179,7 +179,7 @@ pub(crate) struct SetEquityMarkRequest {
     pub(crate) reason: String,
 }
 
-/// Body of `POST /capital/transfer-usdc`.
+/// Body of `POST /liquidity-capital/transfer-usdc`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TransferUsdcRequest {
@@ -201,7 +201,8 @@ pub(crate) enum TransferUsdcDirection {
     ToAlpaca,
 }
 
-/// Body of `POST /capital/vault-deposit` and `POST /capital/vault-withdraw`.
+/// Body of `POST /liquidity-capital/vault-deposit` and
+/// `POST /liquidity-capital/vault-withdraw`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct VaultTransferRequest {
@@ -211,7 +212,7 @@ pub(crate) struct VaultTransferRequest {
     pub(crate) amount: DecimalAmount,
 }
 
-/// Body of `POST /capital/vault-withdraw-usdc`.
+/// Body of `POST /liquidity-capital/vault-withdraw-usdc`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct VaultWithdrawUsdcRequest {
@@ -219,7 +220,7 @@ pub(crate) struct VaultWithdrawUsdcRequest {
     pub(crate) amount: DecimalAmount,
 }
 
-/// Body of `POST /capital/cctp-bridge`: the run's operation id and exactly
+/// Body of `POST /liquidity-capital/cctp-bridge`: the run's operation id and exactly
 /// one of `amount` or `all`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -234,7 +235,7 @@ pub(crate) struct CctpBridgeRequest {
     pub(crate) all: bool,
 }
 
-/// Body of `POST /capital/cctp-burn-supersede`.
+/// Body of `POST /liquidity-capital/cctp-burn-supersede`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CctpBurnSupersedeRequest {
@@ -242,7 +243,7 @@ pub(crate) struct CctpBurnSupersedeRequest {
     pub(crate) superseding_tx: String,
 }
 
-/// Body of `POST /capital/reset-allowance`.
+/// Body of `POST /liquidity-capital/reset-allowance`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ResetAllowanceRequest {

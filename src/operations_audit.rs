@@ -584,8 +584,8 @@ mod tests {
     fn event(outcome: AuditOutcome) -> OperationsAuditEvent {
         OperationsAuditEvent {
             principal: "accounts.google.com:1234".to_string(),
-            role: "write",
-            route: "/liquidity-write/transfers/{kind}/{id}/reconcile".to_string(),
+            role: "debug",
+            route: "/liquidity-debug/transfers/{kind}/{id}/reconcile".to_string(),
             request_id: uuid!("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
             target_id: "mint:mint-9".to_string(),
             reason: "incident 42".to_string(),
@@ -617,8 +617,8 @@ mod tests {
     fn wildcard_paths_do_not_create_raw_uri_cardinality() {
         assert_eq!(
             dynamic_path_values(
-                "/liquidity-write/{*path}",
-                "/liquidity-write/arbitrary/unmatched/path"
+                "/liquidity-debug/{*path}",
+                "/liquidity-debug/arbitrary/unmatched/path"
             )
             .unwrap(),
             Vec::<String>::new()
@@ -629,16 +629,16 @@ mod tests {
     fn path_targets_use_axum_compatible_percent_decoding() {
         assert_eq!(
             dynamic_path_values(
-                "/liquidity-write/positions/{symbol}/set",
-                "/liquidity-write/positions/%41APL/set"
+                "/liquidity-debug/positions/{symbol}/set",
+                "/liquidity-debug/positions/%41APL/set"
             )
             .unwrap(),
             ["AAPL"]
         );
         assert_eq!(
             dynamic_path_values(
-                "/liquidity-write/positions/{symbol}/set",
-                "/liquidity-write/positions/%FF/set"
+                "/liquidity-debug/positions/{symbol}/set",
+                "/liquidity-debug/positions/%FF/set"
             ),
             Err(AuditValueError::InvalidPathUtf8)
         );
@@ -663,7 +663,7 @@ mod tests {
                         && line.contains("audit_schema=\"st0x.operations.audit.v1\"")
                         && line.contains("service=\"liquidity\"")
                         && line.contains("principal=\"accounts.google.com:1234\"")
-                        && line.contains("role=\"write\"")
+                        && line.contains("role=\"debug\"")
                         && line.contains("request_id=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
                         && line.contains("target_id=\"mint:mint-9\"")
                         && line.contains("reason=\"incident 42\"")
@@ -773,13 +773,13 @@ mod tests {
             .layer(axum::middleware::from_fn(test_authentication))
             .layer(axum::middleware::from_fn(move |request, next| {
                 let detached_tasks = detached_tasks.clone();
-                async move { audit_request(&detached_tasks, "write", request, next).await }
+                async move { audit_request(&detached_tasks, "debug", request, next).await }
             }))
     }
 
     fn audited_router() -> Router {
         with_audit_layers(Router::new().route(
-            "/liquidity-write/transfers/{kind}/{id}/reconcile",
+            "/liquidity-debug/transfers/{kind}/{id}/reconcile",
             post(command),
         ))
     }
@@ -808,7 +808,7 @@ mod tests {
         let cases = [
             (
                 request(
-                    "/liquidity-write/transfers/success/widget-1/reconcile",
+                    "/liquidity-debug/transfers/success/widget-1/reconcile",
                     "11111111-1111-1111-1111-111111111111",
                     Some("accounts.google.com:1234"),
                     r#"{"supersedingTx":"op-1","reason":"incident 42"}"#,
@@ -817,7 +817,7 @@ mod tests {
             ),
             (
                 request(
-                    "/liquidity-write/transfers/success/widget-2/reconcile",
+                    "/liquidity-debug/transfers/success/widget-2/reconcile",
                     "22222222-2222-2222-2222-222222222222",
                     None,
                     r#"{"supersedingTx":"op-2","reason":"incident 42"}"#,
@@ -826,7 +826,7 @@ mod tests {
             ),
             (
                 request(
-                    "/liquidity-write/transfers/success/widget-3/reconcile",
+                    "/liquidity-debug/transfers/success/widget-3/reconcile",
                     "33333333-3333-3333-3333-333333333333",
                     Some("accounts.google.com:1234"),
                     "{",
@@ -835,7 +835,7 @@ mod tests {
             ),
             (
                 request(
-                    "/liquidity-write/transfers/failure/widget-4/reconcile",
+                    "/liquidity-debug/transfers/failure/widget-4/reconcile",
                     "44444444-4444-4444-4444-444444444444",
                     Some("accounts.google.com:1234"),
                     r#"{"supersedingTx":"op-4","reason":"incident 42"}"#,
@@ -911,7 +911,7 @@ mod tests {
     async fn newlines_in_path_targets_and_reasons_cannot_forge_a_record() {
         let response = audited_router()
             .oneshot(request(
-                "/liquidity-write/transfers/success/x%0Aoperations_audit:%20forged/reconcile",
+                "/liquidity-debug/transfers/success/x%0Aoperations_audit:%20forged/reconcile",
                 "55555555-5555-5555-5555-555555555555",
                 Some("accounts.google.com:1234"),
                 r#"{"reason":"ok\noperations_audit: forged"}"#,
@@ -946,7 +946,7 @@ mod tests {
         let called = Arc::new(AtomicBool::new(false));
         let handler_called = Arc::clone(&called);
         let app = with_audit_layers(Router::new().route(
-            "/liquidity-write/transfers/{kind}/{id}/reconcile",
+            "/liquidity-debug/transfers/{kind}/{id}/reconcile",
             post(move |Audited(_body): Audited<ReconcileCommand>| {
                 let called = Arc::clone(&handler_called);
                 async move {
@@ -978,7 +978,7 @@ mod tests {
             let response = app
                 .clone()
                 .oneshot(request(
-                    "/liquidity-write/transfers/mint/mint-9/reconcile",
+                    "/liquidity-debug/transfers/mint/mint-9/reconcile",
                     request_id,
                     Some("accounts.google.com:1234"),
                     &body.to_string(),
@@ -1032,7 +1032,7 @@ mod tests {
 
         let response = audited_router()
             .oneshot(request(
-                "/liquidity-write/transfers/success/widget-1/reconcile",
+                "/liquidity-debug/transfers/success/widget-1/reconcile",
                 request_id,
                 Some("accounts.google.com:1234"),
                 &body,
@@ -1070,7 +1070,7 @@ mod tests {
         let called = Arc::new(AtomicBool::new(false));
         let handler_called = Arc::clone(&called);
         let app = with_audit_layers(Router::new().route(
-            "/liquidity-write/transfers/recheck/{kind}/{id}",
+            "/liquidity-debug/transfers/recheck/{kind}/{id}",
             post(move |AuditedQuery(_query): AuditedQuery<RecheckProbe>| {
                 let called = Arc::clone(&handler_called);
                 async move {
@@ -1084,7 +1084,7 @@ mod tests {
             .clone()
             .oneshot(request(
                 &format!(
-                    "/liquidity-write/transfers/recheck/usdc_deposit/transfer-1?deposit_tx={}",
+                    "/liquidity-debug/transfers/recheck/usdc_deposit/transfer-1?deposit_tx={}",
                     "d".repeat(TARGET_VALUE_LIMIT + 1)
                 ),
                 "14141414-1414-1414-1414-141414141414",
@@ -1099,7 +1099,7 @@ mod tests {
         let request_id = "15151515-1515-1515-1515-151515151515";
         let response = app
             .oneshot(request(
-                "/liquidity-write/transfers/recheck/usdc_deposit/transfer-1?deposit_tx=0xabc",
+                "/liquidity-debug/transfers/recheck/usdc_deposit/transfer-1?deposit_tx=0xabc",
                 request_id,
                 Some("accounts.google.com:1234"),
                 "",
@@ -1134,7 +1134,7 @@ mod tests {
 
         let response = app
             .oneshot(request(
-                "/liquidity-write/transfers/success/widget/reconcile",
+                "/liquidity-debug/transfers/success/widget/reconcile",
                 request_id,
                 Some("accounts.google.com:1234"),
                 &body,
@@ -1174,7 +1174,7 @@ mod tests {
         let denied = app
             .clone()
             .oneshot(request(
-                "/liquidity-write/transfers/success/%FF/reconcile",
+                "/liquidity-debug/transfers/success/%FF/reconcile",
                 "57575757-5757-5757-5757-575757575757",
                 None,
                 "{}",
@@ -1185,7 +1185,7 @@ mod tests {
 
         let rejected = app
             .oneshot(request(
-                "/liquidity-write/transfers/success/%FF/reconcile",
+                "/liquidity-debug/transfers/success/%FF/reconcile",
                 "58585858-5858-5858-5858-585858585858",
                 Some("accounts.google.com:1234"),
                 "{}",
@@ -1205,12 +1205,12 @@ mod tests {
     #[tokio::test]
     async fn handler_task_failure_returns_and_audits_one_command_failure() {
         let app = with_audit_layers(
-            Router::new().route("/liquidity-write/panic", post(panicking_command)),
+            Router::new().route("/liquidity-debug/panic", post(panicking_command)),
         );
         let request_id = "88888888-8888-8888-8888-888888888888";
         let response = app
             .oneshot(request(
-                "/liquidity-write/panic",
+                "/liquidity-debug/panic",
                 request_id,
                 Some("accounts.google.com:1234"),
                 "{}",
@@ -1245,13 +1245,13 @@ mod tests {
     #[tokio::test]
     async fn task_join_failure_answers_with_the_generic_body() {
         let app = with_audit_layers(Router::new().route(
-            "/liquidity-write/escaping-panic",
+            "/liquidity-debug/escaping-panic",
             post(panic_escaping_the_unwind_guard),
         ));
         let request_id = "16161616-1616-1616-1616-161616161616";
         let response = app
             .oneshot(request(
-                "/liquidity-write/escaping-panic",
+                "/liquidity-debug/escaping-panic",
                 request_id,
                 Some("accounts.google.com:1234"),
                 "{}",
@@ -1299,7 +1299,7 @@ mod tests {
         let handler_started = Arc::clone(&started);
         let handler_release = Arc::clone(&release);
         let app = with_audit_layers(Router::new().route(
-            "/liquidity-write/transfers/resume",
+            "/liquidity-debug/transfers/resume",
             post(move || {
                 let started = Arc::clone(&handler_started);
                 let release = Arc::clone(&handler_release);
@@ -1313,7 +1313,7 @@ mod tests {
         let request_id = "99999999-9999-9999-9999-999999999999";
         let completion = Arc::new(Notify::new());
         let mut audited_request = request(
-            "/liquidity-write/transfers/resume",
+            "/liquidity-debug/transfers/resume",
             request_id,
             Some("accounts.google.com:1234"),
             "{}",
@@ -1357,14 +1357,14 @@ mod tests {
         let handler_started = Arc::clone(&started);
         let handler_release = Arc::clone(&release);
         let app = with_audit_layers(Router::new().route(
-            "/liquidity-write/panic-after-cancel",
+            "/liquidity-debug/panic-after-cancel",
             post(move || {
                 wait_then_panic(Arc::clone(&handler_started), Arc::clone(&handler_release))
             }),
         ));
         let request_id = "abababab-abab-abab-abab-abababababab";
         let mut audited_request = request(
-            "/liquidity-write/panic-after-cancel",
+            "/liquidity-debug/panic-after-cancel",
             request_id,
             Some("accounts.google.com:1234"),
             "{}",
@@ -1412,7 +1412,7 @@ mod tests {
         let handler_release = Arc::clone(&release);
         let app = with_tracked_audit_layers(
             Router::new().route(
-                "/liquidity-write/transfers/resume",
+                "/liquidity-debug/transfers/resume",
                 post(move || {
                     let started = Arc::clone(&handler_started);
                     let release = Arc::clone(&handler_release);
@@ -1427,7 +1427,7 @@ mod tests {
         );
         let in_flight_id = "cdcdcdcd-cdcd-cdcd-cdcd-cdcdcdcdcdcd";
         let in_flight = tokio::spawn(app.clone().oneshot(request(
-            "/liquidity-write/transfers/resume",
+            "/liquidity-debug/transfers/resume",
             in_flight_id,
             Some("accounts.google.com:1234"),
             "{}",
@@ -1448,7 +1448,7 @@ mod tests {
         let refused_id = "efefefef-efef-efef-efef-efefefefefef";
         let refused = app
             .oneshot(request(
-                "/liquidity-write/transfers/resume",
+                "/liquidity-debug/transfers/resume",
                 refused_id,
                 Some("accounts.google.com:1234"),
                 "{}",

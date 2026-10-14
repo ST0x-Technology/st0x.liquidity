@@ -89,8 +89,10 @@ impl std::error::Error for TransportError {
 
 /// Role prefix the load balancer routes to the read IAP backend.
 const READ_PREFIX: &str = "/liquidity-read";
-/// Role prefix the load balancer routes to the write IAP backend.
-const WRITE_PREFIX: &str = "/liquidity-write";
+/// Role prefix the load balancer routes to the debug IAP backend.
+const DEBUG_PREFIX: &str = "/liquidity-debug";
+/// Role prefix the load balancer routes to the capital IAP backend.
+const CAPITAL_PREFIX: &str = "/liquidity-capital";
 
 /// HTTP wrapper over the liquidity bot ops API.
 ///
@@ -98,14 +100,16 @@ const WRITE_PREFIX: &str = "/liquidity-write";
 /// prefix, sends it, and returns decoded JSON or a mapped error. It holds no
 /// domain logic.
 ///
-/// Reads go to `/liquidity-read/*` and writes to `/liquidity-write/*`. In the
-/// shipped desktop OAuth flow both roles carry the same token; IAP admits each
-/// prefix by the caller's Workspace group.
+/// Reads go to `/liquidity-read/*`, debug writes to `/liquidity-debug/*`, and
+/// capital moves to `/liquidity-capital/*`. In the shipped desktop OAuth flow
+/// every role carries the same token; IAP admits each prefix by the caller's
+/// Workspace group.
 pub struct Client<A> {
     http: reqwest::Client,
     base_url: Url,
     read_auth: A,
-    write_auth: A,
+    debug_auth: A,
+    capital_auth: A,
     /// Sent as `x-request-id`. One CLI invocation sends one request, so this
     /// names the audit event of the write it performed.
     pub(crate) request_id: Uuid,
@@ -115,7 +119,8 @@ impl<A: TokenSource + Sync> Client<A> {
     pub fn new(
         base_url: Url,
         read_auth: A,
-        write_auth: A,
+        debug_auth: A,
+        capital_auth: A,
         request_timeout: std::time::Duration,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<Self> {
@@ -128,7 +133,8 @@ impl<A: TokenSource + Sync> Client<A> {
             http,
             base_url,
             read_auth,
-            write_auth,
+            debug_auth,
+            capital_auth,
             request_id: Uuid::new_v4(),
         })
     }
@@ -166,10 +172,10 @@ impl<A: TokenSource + Sync> Client<A> {
         path: &str,
         params: &[(String, String)],
     ) -> Result<serde_json::Value, TransportError> {
-        let url = self.url(WRITE_PREFIX, path, params);
+        let url = self.url(DEBUG_PREFIX, path, params);
         let target = url.to_string();
         let token = self
-            .write_auth
+            .debug_auth
             .bearer()
             .await
             .map_err(TransportError::Auth)?;
@@ -183,20 +189,38 @@ impl<A: TokenSource + Sync> Client<A> {
         .await
     }
 
-    /// Posts a typed JSON body under the write prefix. The body types live in
+    /// Posts a typed JSON body under the debug prefix. The body types live in
     /// `wire.rs` and mirror the bot's request contracts field for field.
     pub async fn post_json<Body: serde::Serialize + Sync>(
         &self,
         path: &str,
         body: &Body,
     ) -> Result<serde_json::Value, TransportError> {
-        let url = self.url(WRITE_PREFIX, path, &[]);
-        let target = url.to_string();
-        let token = self
-            .write_auth
-            .bearer()
+        self.post_json_as(DEBUG_PREFIX, &self.debug_auth, path, body)
             .await
-            .map_err(TransportError::Auth)?;
+    }
+
+    /// Posts a typed JSON body under the capital prefix, the only routes that
+    /// start a new fund movement.
+    pub async fn post_capital_json<Body: serde::Serialize + Sync>(
+        &self,
+        path: &str,
+        body: &Body,
+    ) -> Result<serde_json::Value, TransportError> {
+        self.post_json_as(CAPITAL_PREFIX, &self.capital_auth, path, body)
+            .await
+    }
+
+    async fn post_json_as<Body: serde::Serialize + Sync>(
+        &self,
+        prefix: &str,
+        auth: &A,
+        path: &str,
+        body: &Body,
+    ) -> Result<serde_json::Value, TransportError> {
+        let url = self.url(prefix, path, &[]);
+        let target = url.to_string();
+        let token = auth.bearer().await.map_err(TransportError::Auth)?;
         self.dispatch(self.http.post(url).json(body), target, token)
             .await
     }
@@ -358,7 +382,8 @@ mod tests {
         Ok(Client::new(
             base,
             FakeToken("read-token"),
-            FakeToken("write-token"),
+            FakeToken("debug-token"),
+            FakeToken("capital-token"),
             std::time::Duration::from_secs(5),
             std::time::Duration::from_secs(5),
         )?)
@@ -387,7 +412,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_uses_write_prefix_and_write_token() -> Result<(), Box<dyn std::error::Error>> {
+    async fn debug_write_uses_debug_prefix_and_debug_token()
+    -> Result<(), Box<dyn std::error::Error>> {
         let (port, requests) = capture_server()?;
         let client = fake_client(port)?;
 
@@ -397,11 +423,38 @@ mod tests {
         let request = requests.recv()?;
         assert_eq!(
             request_line(&request),
-            "POST /liquidity-write/transfers/recheck/mint/abc HTTP/1.1"
+            "POST /liquidity-debug/transfers/recheck/mint/abc HTTP/1.1"
         );
         assert_eq!(
             header(&request, "authorization"),
-            Some("Bearer write-token")
+            Some("Bearer debug-token")
+        );
+        assert_eq!(
+            header(&request, "x-request-id"),
+            Some(client.request_id.to_string().as_str())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn capital_uses_capital_prefix_and_capital_token()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (port, requests) = capture_server()?;
+        let client = fake_client(port)?;
+
+        let value = client
+            .post_capital_json("/reset-allowance", &serde_json::json!({ "chain": "base" }))
+            .await?;
+        assert_eq!(value, serde_json::json!({}));
+
+        let request = requests.recv()?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-capital/reset-allowance HTTP/1.1"
+        );
+        assert_eq!(
+            header(&request, "authorization"),
+            Some("Bearer capital-token")
         );
         assert_eq!(
             header(&request, "x-request-id"),

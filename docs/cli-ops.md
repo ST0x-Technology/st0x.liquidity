@@ -332,8 +332,14 @@ mint at `MintRequested` with its reservation. Confirm with the issuer that it
 never received the request, then use `transfer fail --kind mint`.
 
 Without container access, the capital verbs run in the bot through IAP with
-`st0x-liquidity-client --env <env> capital <verb>`, which needs the write tier
-Workspace group and signs with the bot's own wallets:
+`st0x-liquidity-client --env <env> capital <verb>`, which posts to the
+`/liquidity-capital/*` prefix, needs the capital tier Workspace group (the debug
+tier group is not enough), and signs with the bot's own wallets. A deployment
+with no `capital_audience` in `[ops_api]` does not serve that prefix and answers
+`404`. There, run the `st0x-cli` capital verbs only with the bot stopped, as
+[Offline commands on GCP](#offline-commands-on-gcp) describes: they build their
+own signer and nonce state, so running them next to the live bot can reuse a
+nonce the bot has pending. The `/liquidity-capital/*` commands are:
 
 ```bash
 st0x-liquidity-client --env <env> capital vault-deposit --amount 10 --token <wrapped-token> --vault-id <vault-id> --network ethereum
@@ -698,8 +704,8 @@ race `/transfers/resume` into a double on-chain wrap).
 > (`docker exec`), which connects to `127.0.0.1`. Reaching `server_port` over
 > the network (an IAP tunnel to the port, a VPC-internal curl) gets `403` with
 > an `{"error": ...}` body: that is the guard working, not the bot broken. The
-> network route for operators is the IAP-verified `/liquidity-write/*` mount
-> behind the load balancer, which requires membership in the write-tier
+> network route for operators is the IAP-verified `/liquidity-debug/*` mount
+> behind the load balancer, which requires membership in the debug-tier
 > Workspace group.
 
 Recoverable cases:
@@ -1016,7 +1022,7 @@ the direction:
 **Stop the bot before running the offline `stox fail-usdc-transfer`** to
 eliminate the race where the bot advances the transfer to `Bridging` between the
 preflight and the send. For AlpacaToBase the same operation is available against
-the live bot as `POST /liquidity-write/transfers/usdc/{id}/fail` (client:
+the live bot as `POST /liquidity-debug/transfers/usdc/{id}/fail` (client:
 `st0x-liquidity-client --env <env> debug fail-usdc-transfer <id> --reason ...`);
 that path runs under the resume lock with the USDC driver quiesced, so it does
 not need the bot stopped. It sends through the conductor's wired store, whose
@@ -1343,7 +1349,7 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
     withdrawal instead, against the live bot:
     `st0x-liquidity-client --env <env> debug adopt-withdrawal <id> --replacement-tx <tx> --reason <reason>`
     (the API is
-    `POST /liquidity-write/transfers/equity_redemption/{id}/adopt-withdrawal`
+    `POST /liquidity-debug/transfers/equity_redemption/{id}/adopt-withdrawal`
     with `replacementTx` and `reason` in the body; `stox` has no adopt verb).
     The bot refuses (the API with `409`, naming the failed check) unless `<tx>`
     is mined from the bot wallet, at the withdrawal's nonce, is not the

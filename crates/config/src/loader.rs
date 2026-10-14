@@ -6,6 +6,7 @@
 
 use alloy::primitives::{Address, B256};
 use clap::Parser;
+use itertools::Itertools as _;
 use serde::Deserialize;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode};
@@ -408,7 +409,13 @@ impl std::fmt::Debug for IssuanceStatusCtx {
 /// prefix (`terraform/staging-liquidity/ops-api-iap.tf`, published as the
 /// `ops_api_audiences` output). IAP binds the token it mints to the backend
 /// that admitted the caller, so pinning the audience per prefix is what makes
-/// a read-tier token useless against the write path.
+/// a read-tier token useless against the debug path, and a debug-tier token
+/// useless against the capital path.
+///
+/// The debug tier was called write, with `write_audience` and the
+/// `/liquidity-write/*` prefix. A config that still names `write_audience` is
+/// refused at parse time, with an error that names `debug_audience`, so a
+/// stale config cannot quietly drop the debug tier.
 ///
 /// Not a secret: these name IAM-gated backends and are worthless without an
 /// identity Google will sign for. Absent from config means the role-gated
@@ -419,8 +426,24 @@ impl std::fmt::Debug for IssuanceStatusCtx {
 pub struct OpsApiConfig {
     /// Audience of the backend serving `/liquidity-read/*`.
     pub read_audience: String,
-    /// Audience of the backend serving `/liquidity-write/*`.
-    pub write_audience: String,
+    /// Audience of the backend serving `/liquidity-debug/*`.
+    pub debug_audience: String,
+    /// Audience of the backend serving `/liquidity-capital/*`, the routes that
+    /// start new fund movements. Absent means the capital routes are not
+    /// mounted, so a deployment whose load balancer has no capital backend yet
+    /// serves the read and debug tiers and no capital route at all.
+    pub capital_audience: Option<String>,
+}
+
+impl OpsApiConfig {
+    /// Every configured audience: read, debug, then capital when present.
+    fn audiences(&self) -> impl Iterator<Item = &str> {
+        [Some(&self.read_audience), Some(&self.debug_audience)]
+            .into_iter()
+            .chain([self.capital_audience.as_ref()])
+            .flatten()
+            .map(String::as_str)
+    }
 }
 
 /// Combined REST API runtime context assembled from config + secrets.
@@ -1905,25 +1928,29 @@ fn validate_config(
         });
     }
 
-    // The audiences are what keep the read and write tiers apart: each role
-    // prefix's verifier pins the audience IAP minted for that prefix's
-    // backend. Equal (or blank) audiences would make a read-tier assertion
-    // verify on the write path, silently collapsing the tiers, so a config
-    // that says that is refused outright.
+    // The audiences are what keep the read, debug and capital tiers apart:
+    // each role prefix's verifier pins the audience IAP minted for that
+    // prefix's backend. Equal (or blank) audiences would make a lower-tier
+    // assertion verify on a higher-tier path, silently collapsing the tiers,
+    // so a config that says that is refused outright.
     if let Some(ops_api) = &config.ops_api {
-        if ops_api.read_audience.trim().is_empty() || ops_api.write_audience.trim().is_empty() {
+        if ops_api
+            .audiences()
+            .any(|audience| audience.trim().is_empty())
+        {
             return Err(CtxError::OpsApiAudienceBlank);
         }
         // The verifier pins the audience byte for byte (jsonwebtoken compares
         // `aud` exactly), so a copy-pasted trailing space would pass a
         // trimmed-only validation here and then 401 every real token at
         // runtime with no startup signal. Refuse padding outright.
-        if ops_api.read_audience.trim() != ops_api.read_audience
-            || ops_api.write_audience.trim() != ops_api.write_audience
+        if ops_api
+            .audiences()
+            .any(|audience| audience.trim() != audience)
         {
             return Err(CtxError::OpsApiAudiencePadded);
         }
-        if ops_api.read_audience == ops_api.write_audience {
+        if !ops_api.audiences().all_unique() {
             return Err(CtxError::OpsApiAudiencesEqual);
         }
     }
@@ -3149,8 +3176,9 @@ pub enum CtxError {
     )]
     OpsApiAudiencePadded,
     #[error(
-        "[ops_api] read_audience and write_audience must differ: equal audiences let a \
-         read-tier IAP assertion pass the write verifier, collapsing the role tiers"
+        "[ops_api] read_audience, debug_audience and capital_audience must all differ: \
+         equal audiences let one tier's IAP assertion pass another tier's verifier, \
+         collapsing the role tiers"
     )]
     OpsApiAudiencesEqual,
     #[error(
@@ -6126,83 +6154,59 @@ mod tests {
         );
     }
 
-    /// Equal audiences would let a read-tier IAP assertion pass the write
+    const OPS_READ: &str = "/projects/1/global/backendServices/11";
+    const OPS_DEBUG: &str = "/projects/1/global/backendServices/22";
+    const OPS_CAPITAL: &str = "/projects/1/global/backendServices/33";
+
+    /// Validates the minimal config with `ops_api` appended and returns the
+    /// `[ops_api]` table that reaches the context.
+    fn validate_with_ops_api(ops_api: &str) -> Result<Option<OpsApiConfig>, CtxError> {
+        let config: Config = toml::from_str(&format!(
+            "{}\n{ops_api}",
+            String::from_utf8_lossy(minimal_config_toml_bytes())
+        ))
+        .unwrap();
+        validate_config(
+            &config,
+            Path::new("config.toml"),
+            TokenFile::Skipped,
+            &mut Vec::new(),
+        )?;
+        Ok(config.ops_api)
+    }
+
+    /// Equal audiences would let one tier's IAP assertion pass another tier's
     /// verifier, and a blank audience pins nothing at all -- both are refused
-    /// at load so the collapse cannot reach the verifiers.
-    #[tokio::test]
-    async fn ops_api_audiences_must_differ_and_be_non_blank() {
-        for (read, write, expect) in [
+    /// at load so the collapse cannot reach the verifiers. The optional
+    /// capital audience is held to the same rules when it is present.
+    #[test]
+    fn ops_api_audiences_must_differ_and_be_non_blank() {
+        for (read, debug, capital, expect) in [
+            (OPS_READ, OPS_READ, None, "equal"),
+            ("", OPS_DEBUG, None, "blank"),
+            (OPS_READ, "  ", None, "blank"),
             (
-                "/projects/1/global/backendServices/11",
-                "/projects/1/global/backendServices/11",
-                "equal",
-            ),
-            ("", "/projects/1/global/backendServices/22", "blank"),
-            ("/projects/1/global/backendServices/11", "  ", "blank"),
-            (
-                "/projects/1/global/backendServices/11",
+                OPS_READ,
                 "/projects/1/global/backendServices/22 ",
+                None,
+                "padded",
+            ),
+            (OPS_READ, OPS_DEBUG, Some(OPS_DEBUG), "equal"),
+            (OPS_READ, OPS_DEBUG, Some(OPS_READ), "equal"),
+            (OPS_READ, OPS_DEBUG, Some(""), "blank"),
+            (
+                OPS_READ,
+                OPS_DEBUG,
+                Some(" /projects/1/global/backendServices/33"),
                 "padded",
             ),
         ] {
-            let config = toml_file(&format!(
-                r#"
-                database_url = ":memory:"
-            log_level = "debug"
-                server_port = 8080
-                board_port = 8081
-                apalis_finished_job_cleanup_interval_secs = 3600
-                inventory_divergence_threshold = 10
-                hedge_order_gate_reconciliation_timeout_secs = 10
-
-                [ops_api]
-                read_audience = "{read}"
-                write_audience = "{write}"
-
-                [chains.base.trading.assets.equities]
-
-                [chains.base]
-                lifecycle = "active"
-                required_confirmations = 3
-
-                [chains.base.trading]
-                orderbook = "0x1111111111111111111111111111111111111111"
-                inventory_mode = "managed"
-                inventory_adapters = []
-                inventory = "0x2222222222222222222222222222222222222222"
-                vault_owner = "0x3333333333333333333333333333333333333333"
-                deployment_block = 1
-                ingestion_cutoff = "safe"
-            order_fill_poll_interval_secs = 1
-            primary = true
-
-                [chains.ethereum]
-                lifecycle = "active"
-                required_confirmations = 12
-
-                [chains.hyperevm]
-                lifecycle = "observe-only"
-                required_confirmations = 1
-
-                [chains.robinhood]
-                lifecycle = "observe-only"
-                required_confirmations = 1
-
-                [wallet]
-                kind = "private-key"
-                address = "0x0000000000000000000000000000000000000001"
-            "#
-            ));
-            let secrets = alpaca_secrets_toml();
-            let error = Ctx::load_files(
-                config.path(),
-                secrets.path(),
-                TokenSource::Running {
-                    registry_file: None,
-                    registry_state: None,
-                },
-            )
-            .await
+            let capital_line = capital
+                .map(|capital| format!(r#"capital_audience = "{capital}""#))
+                .unwrap_or_default();
+            let error = validate_with_ops_api(&format!(
+                "[ops_api]\nread_audience = \"{read}\"\ndebug_audience = \"{debug}\"\n{capital_line}"
+            ))
             .unwrap_err();
 
             let matched = match expect {
@@ -6213,6 +6217,62 @@ mod tests {
             };
             assert!(matched, "expected {expect} audience error, got: {error:#}");
         }
+    }
+
+    /// The debug tier's audience was `write_audience`. A config that still
+    /// names it fails to parse, whether or not it also has `debug_audience`,
+    /// and the error names the new key.
+    #[test]
+    fn ops_api_write_audience_is_refused_with_the_new_key_name() {
+        for ops_api in [
+            format!(
+                "[ops_api]\nread_audience = \"{OPS_READ}\"\nwrite_audience = \"{OPS_DEBUG}\"\n"
+            ),
+            format!(
+                "[ops_api]\nread_audience = \"{OPS_READ}\"\ndebug_audience = \"{OPS_DEBUG}\"\n\
+                 write_audience = \"{OPS_CAPITAL}\"\n"
+            ),
+        ] {
+            let Err(error) = toml::from_str::<Config>(&format!(
+                "{}\n{ops_api}",
+                String::from_utf8_lossy(minimal_config_toml_bytes())
+            )) else {
+                panic!("{ops_api}: a config naming write_audience must not parse");
+            };
+            assert!(
+                error.to_string().contains("debug_audience"),
+                "{ops_api}: {error}"
+            );
+        }
+    }
+
+    /// A config with only the read and debug audiences still loads, with no
+    /// capital audience, so the bot starts before the capital backend exists;
+    /// a configured capital audience is kept verbatim.
+    #[test]
+    fn ops_api_capital_audience_is_optional() {
+        let without = validate_with_ops_api(&format!(
+            "[ops_api]\nread_audience = \"{OPS_READ}\"\ndebug_audience = \"{OPS_DEBUG}\"\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            without,
+            Some(OpsApiConfig {
+                read_audience: OPS_READ.to_owned(),
+                debug_audience: OPS_DEBUG.to_owned(),
+                capital_audience: None,
+            })
+        );
+
+        let with = validate_with_ops_api(&format!(
+            "[ops_api]\nread_audience = \"{OPS_READ}\"\ndebug_audience = \"{OPS_DEBUG}\"\n\
+             capital_audience = \"{OPS_CAPITAL}\"\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            with.and_then(|ops_api| ops_api.capital_audience),
+            Some(OPS_CAPITAL.to_owned())
+        );
     }
 
     #[tokio::test]
