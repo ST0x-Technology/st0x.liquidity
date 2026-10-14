@@ -12189,7 +12189,7 @@ mod tests {
 
         let unverified =
             UsdcRecheckError::Transfer(Box::new(UsdcTransferError::SwapPaymentUnverified {
-                id: id.clone(),
+                id,
                 source: Box::new(RelayBridgeError::RefundUnverified {
                     txs: vec![TxHash::repeat_byte(0xe1)],
                     reason: UnverifiedReason::Reverted,

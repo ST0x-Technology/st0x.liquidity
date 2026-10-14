@@ -3536,7 +3536,8 @@ mod tests {
     /// recorded.
     #[tokio::test]
     async fn unresolved_escrow_and_live_reverted_deposit_are_read_again_slowly() {
-        let held: [(fn(&UsdcRebalanceId) -> UsdcTransferError, Vec<AlertKind>); 2] = [
+        type HeldEnd = fn(&UsdcRebalanceId) -> UsdcTransferError;
+        let held: [(HeldEnd, Vec<AlertKind>); 2] = [
             (
                 |id| UsdcTransferError::SwapEscrowUnresolved {
                     id: id.clone(),
