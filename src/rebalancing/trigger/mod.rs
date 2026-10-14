@@ -15745,6 +15745,32 @@ mod tests {
         serde_json::from_slice(&payload).expect("deserialize TransferUsdcToHedging")
     }
 
+    /// The pending `TransferUsdcToHedging` job on `corridor`. Rows from one
+    /// check can share a `run_at` second, so the lookup is by corridor, not
+    /// by order.
+    async fn pending_transfer_usdc_to_hedging_job_on(
+        service: &RebalancingService,
+        corridor: UsdcCorridor,
+    ) -> TransferUsdcToHedging {
+        let job_type = std::any::type_name::<TransferUsdcToHedging>();
+        let payloads: Vec<Vec<u8>> = sqlx_apalis::query_scalar(
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(job_type)
+        .fetch_all(service.transfer_usdc_to_hedging_queue.pool())
+        .await
+        .expect("fetch pending TransferUsdcToHedging jobs");
+
+        payloads
+            .iter()
+            .map(|payload| {
+                serde_json::from_slice::<TransferUsdcToHedging>(payload)
+                    .expect("deserialize TransferUsdcToHedging")
+            })
+            .find(|job| job.corridor == corridor)
+            .unwrap_or_else(|| panic!("no pending TransferUsdcToHedging job on {corridor}"))
+    }
+
     async fn pending_transfer_usdc_to_market_making_job(
         service: &RebalancingService,
     ) -> TransferUsdcToMarketMaking {
@@ -44595,6 +44621,50 @@ mod tests {
         assert!(
             !trigger.usdc_guards.is_held(Chain::Robinhood),
             "a second Alpaca-outbound corridor must be refused while one runs"
+        );
+    }
+
+    fn corridor_with_band(
+        chain: Chain,
+        hop: HopKind,
+        target: Float,
+        deviation: Float,
+    ) -> UsdcCorridorCtx {
+        UsdcCorridorCtx {
+            corridor: UsdcCorridor::HubRouted { chain, hop },
+            threshold: ImbalanceThreshold { target, deviation },
+        }
+    }
+
+    /// Two corridors over their band in one check share one Alpaca balance:
+    /// Base sends 50 (Alpaca will hold 100), so Robinhood reads 200 of 300
+    /// and sends 20, not the 50 it would send against Alpaca's current 50.
+    #[tokio::test]
+    async fn second_inbound_corridor_sizes_against_the_projected_alpaca_balance() {
+        let config = RebalancingServiceConfig {
+            usdc: UsdcCorridors::for_test(
+                OperationMode::Enabled,
+                [
+                    corridor_with_band(Chain::Base, HopKind::Cctp, float!(0.6), float!(0.05)),
+                    corridor_with_band(Chain::Robinhood, HopKind::Relay, float!(0.6), float!(0.05)),
+                ],
+            )
+            .with_relay_hop(Chain::Robinhood, relay_bounds(1, 50_000)),
+            ..with_cash_on(test_config(), &[Chain::Robinhood])
+        };
+        let inventory = InventoryView::default().with_usdc(usdc(200), usdc(50));
+        let inventory = with_onchain_usdc(inventory, Chain::Robinhood, usdc(200));
+        let trigger = make_trigger_with_inventory_config(inventory, config).await;
+
+        trigger.check_and_trigger_usdc().await;
+
+        let base = pending_transfer_usdc_to_hedging_job_on(&trigger, UsdcCorridor::BASE_CCTP).await;
+        assert_eq!(base.amount, usdc(50));
+        let robinhood = pending_transfer_usdc_to_hedging_job_on(&trigger, ROBINHOOD_RELAY).await;
+        assert_eq!(
+            robinhood.amount,
+            usdc(20),
+            "Robinhood must size against Alpaca's 50 plus Base's 50 on its way"
         );
     }
 
