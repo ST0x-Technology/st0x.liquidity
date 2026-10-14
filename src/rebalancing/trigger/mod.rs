@@ -929,6 +929,25 @@ enum ZombieJobKillOutcome {
     StillInFlight,
 }
 
+/// A USDC transfer job row the scheduler may still run.
+struct LiveUsdcJobRow {
+    row_id: String,
+    age_secs: i64,
+    status: String,
+    job_payload: Vec<u8>,
+    job_type: String,
+}
+
+/// The fields both USDC transfer job payloads carry at the top level
+/// (apalis's JsonCodec serializes the job struct directly).
+#[derive(serde::Deserialize)]
+struct UsdcJobKey {
+    id: UsdcRebalanceId,
+    #[serde(default = "legacy_base_cctp")]
+    corridor: UsdcCorridor,
+    amount: Usdc,
+}
+
 struct SnapshotReconciliation {
     protected_onchain_equity_symbols: BTreeSet<Symbol>,
     protected_offchain_equity_symbols: BTreeSet<Symbol>,
@@ -6738,37 +6757,18 @@ impl RebalancingService {
         chain: Chain,
         direction: RebalanceDirection,
     ) -> Result<Option<(String, i64)>, sqlx_apalis::Error> {
-        // Both job types carry `id` and `corridor` at the top level of their
-        // JSON payload (apalis JsonCodec serializes the struct directly).
-        #[derive(serde::Deserialize)]
-        struct UsdcJobKey {
-            id: UsdcRebalanceId,
-            #[serde(default = "legacy_base_cctp")]
-            corridor: UsdcCorridor,
-        }
-
         let outbound_job_type = std::any::type_name::<TransferUsdcToMarketMaking>();
-        let rows: Vec<(String, i64, String, Vec<u8>, String)> = sqlx_apalis::query_as(
-            "SELECT id, \
-                    CAST(strftime('%s', 'now') AS INTEGER) - run_at AS age_secs, \
-                    status, \
-                    job, \
-                    job_type \
-             FROM Jobs \
-             WHERE job_type IN (?, ?) \
-             AND (status IN ('Pending', 'Queued', 'Running') \
-                  OR (status = 'Failed' AND attempts < max_attempts)) \
-             ORDER BY run_at ASC",
-        )
-        .bind(std::any::type_name::<TransferUsdcToHedging>())
-        .bind(outbound_job_type)
-        .fetch_all(pool)
-        .await?;
-
         let counts_outbound_elsewhere = direction == RebalanceDirection::AlpacaToBase;
-        for (row_id, age_secs, status, job_payload, job_type) in rows {
+        for LiveUsdcJobRow {
+            row_id,
+            age_secs,
+            status,
+            job_payload,
+            job_type,
+        } in Self::live_usdc_job_rows(pool).await?
+        {
             let aggregate_id = match serde_json::from_slice::<UsdcJobKey>(&job_payload) {
-                Ok(UsdcJobKey { id, corridor })
+                Ok(UsdcJobKey { id, corridor, .. })
                     if corridor.chain() == chain
                         || (counts_outbound_elsewhere && job_type == outbound_job_type) =>
                 {
@@ -6800,6 +6800,42 @@ impl RebalancingService {
         }
 
         Ok(None)
+    }
+
+    /// The USDC transfer job rows the scheduler may still run, oldest first:
+    /// `Pending`, `Queued`, `Running`, and `Failed` with retries left.
+    async fn live_usdc_job_rows(
+        pool: &apalis_sqlite::SqlitePool,
+    ) -> Result<Vec<LiveUsdcJobRow>, sqlx_apalis::Error> {
+        let rows: Vec<(String, i64, String, Vec<u8>, String)> = sqlx_apalis::query_as(
+            "SELECT id, \
+                    CAST(strftime('%s', 'now') AS INTEGER) - run_at AS age_secs, \
+                    status, \
+                    job, \
+                    job_type \
+             FROM Jobs \
+             WHERE job_type IN (?, ?) \
+             AND (status IN ('Pending', 'Queued', 'Running') \
+                  OR (status = 'Failed' AND attempts < max_attempts)) \
+             ORDER BY run_at ASC",
+        )
+        .bind(std::any::type_name::<TransferUsdcToHedging>())
+        .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(row_id, age_secs, status, job_payload, job_type)| LiveUsdcJobRow {
+                    row_id,
+                    age_secs,
+                    status,
+                    job_payload,
+                    job_type,
+                },
+            )
+            .collect())
     }
 
     /// Whether a retryable `Failed` USDC job row still drives a live
@@ -8880,14 +8916,16 @@ impl RebalancingService {
         // so it joins the unresolved set: hold the guard rather than risk leaving
         // a possibly-post-burn rebalance unguarded. Same fail-closed direction as
         // a missing or unloadable aggregate above.
-        if held.is_empty() && unresolved_ids.is_empty() && unparseable.is_empty() {
-            return Ok(());
-        }
-
         for (id, corridor, direction, amount) in &held {
             self.usdc_guards
                 .hold(corridor.chain(), id, *direction, *amount);
         }
+        self.hold_queued_usdc_jobs(usdc_store).await?;
+
+        if held.is_empty() && unresolved_ids.is_empty() && unparseable.is_empty() {
+            return Ok(());
+        }
+
         let unclassified = !unresolved_ids.is_empty() || !unparseable.is_empty();
         if unclassified {
             self.usdc_guards.latch_unclassified();
@@ -8926,6 +8964,80 @@ impl RebalancingService {
         if has_stranded {
             self.page_startup_latch(&held, &stranded_held_ids, &unresolved_ids, &unparseable)
                 .await;
+        }
+
+        Ok(())
+    }
+
+    /// Holds the corridor of each live job row whose transfer has recorded
+    /// nothing yet, with its amount: startup rebuilds every other hold from
+    /// the persisted transfer, and a job queued just before the restart has
+    /// none until its first event. A recorded transfer, a zombie row's
+    /// included, is left to its state. The hold is released like any other:
+    /// by the transfer's terminal event, or by the job's last attempt when
+    /// it records nothing.
+    async fn hold_queued_usdc_jobs(
+        &self,
+        usdc_store: &Store<UsdcRebalance>,
+    ) -> Result<(), sqlx_apalis::Error> {
+        let hedging_job_type = std::any::type_name::<TransferUsdcToHedging>();
+        let rows = Self::live_usdc_job_rows(self.transfer_usdc_to_hedging_queue.pool()).await?;
+        for LiveUsdcJobRow {
+            row_id,
+            job_payload,
+            job_type,
+            ..
+        } in rows
+        {
+            let UsdcJobKey {
+                id,
+                corridor,
+                amount,
+            } = match serde_json::from_slice(&job_payload) {
+                Ok(key) => key,
+                Err(error) => {
+                    warn!(
+                        target: "rebalance",
+                        %row_id,
+                        ?error,
+                        "Failed to parse a live USDC job payload on startup; holding no corridor \
+                         for it, the queue check counts it on every corridor"
+                    );
+                    continue;
+                }
+            };
+            if self.usdc_guards.held_chain(&id).is_some() {
+                continue;
+            }
+            match usdc_store.load(&id).await {
+                Ok(Some(_)) => continue,
+                Ok(None) => {}
+                Err(error) => warn!(
+                    target: "rebalance",
+                    %row_id,
+                    %id,
+                    ?error,
+                    "Failed to load the transfer of a live USDC job row on startup; holding its \
+                     corridor"
+                ),
+            }
+
+            let direction = if job_type == hedging_job_type {
+                RebalanceDirection::BaseToAlpaca
+            } else {
+                RebalanceDirection::AlpacaToBase
+            };
+            self.usdc_guards
+                .hold(corridor.chain(), &id, direction, amount);
+            info!(
+                target: "rebalance",
+                %row_id,
+                %id,
+                %corridor,
+                ?direction,
+                %amount,
+                "Held the corridor of a live USDC job row with no recorded transfer on startup"
+            );
         }
 
         Ok(())
@@ -22649,22 +22761,13 @@ mod tests {
         }
     }
 
-    /// The hedging direction's terminal attempt frees the guard of a transfer
-    /// that recorded nothing, like the market making one.
-    #[tokio::test]
-    async fn a_base_to_alpaca_job_dead_before_its_first_event_frees_the_corridor_guard() {
-        let (trigger, pool, store) = make_resume_trigger().await;
-        let first = trigger
-            .start_manual_usdc_transfer(
-                &pool,
-                RebalanceDirection::BaseToAlpaca,
-                positive_usdc(75),
-                None,
-            )
-            .await
-            .unwrap();
-        assert!(trigger.usdc_guards.is_held(Chain::Base));
-
+    /// Runs the hedging worker over [`FailingBaseToAlpaca`], with the release
+    /// wired to `trigger`'s guards and `store`, until its one job row is a
+    /// dead letter.
+    async fn run_hedging_job_until_dead_letter(
+        trigger: &RebalancingService,
+        store: &Arc<Store<UsdcRebalance>>,
+    ) {
         let queue = trigger.transfer_usdc_to_hedging_queue.clone();
         let notifier: Arc<dyn crate::alerts::Notifier> = Arc::new(LogNotifier);
         let ctx = Arc::new(TransferUsdcToHedgingCtx {
@@ -22676,7 +22779,7 @@ mod tests {
             driver_gate: crate::rebalancing::usdc::UsdcDriverGate::unpaused(),
             unrecorded_guards: Some(UnrecordedGuardRelease {
                 guards: Arc::clone(&trigger.usdc_guards),
-                store: Arc::clone(&store),
+                store: Arc::clone(store),
             }),
             underfunded_alerts: crate::rebalancing::usdc::UnderfundedAlertLatch::default(),
         });
@@ -22696,6 +22799,25 @@ mod tests {
         let monitor_handle = tokio::spawn(async move { monitor.run().await });
         crate::test_utils::wait_for_terminal_job::<TransferUsdcToHedging>(queue.pool()).await;
         monitor_handle.abort();
+    }
+
+    /// The hedging direction's terminal attempt frees the guard of a transfer
+    /// that recorded nothing, like the market making one.
+    #[tokio::test]
+    async fn a_base_to_alpaca_job_dead_before_its_first_event_frees_the_corridor_guard() {
+        let (trigger, pool, store) = make_resume_trigger().await;
+        let first = trigger
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::BaseToAlpaca,
+                positive_usdc(75),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(trigger.usdc_guards.is_held(Chain::Base));
+
+        run_hedging_job_until_dead_letter(&trigger, &store).await;
 
         assert_eq!(store.load(&first).await.unwrap(), None);
         assert!(
@@ -45318,6 +45440,36 @@ mod tests {
                 .inbound_elsewhere(Chain::Robinhood)
                 .unwrap(),
             usdc(80)
+        );
+    }
+
+    /// A job row held at startup whose job then fails for good without
+    /// recording anything frees its corridor and stops counting elsewhere.
+    #[tokio::test]
+    async fn startup_hold_of_a_live_job_row_is_freed_when_the_job_dies_unrecorded() {
+        let (trigger, pool, store) = make_resume_trigger().await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        hedging_job_row(
+            &trigger,
+            &id,
+            UsdcCorridor::BASE_CCTP,
+            usdc(50),
+            "status = 'Pending'",
+        )
+        .await;
+        trigger.recover_usdc_guard(&pool, &store).await.unwrap();
+        assert_eq!(trigger.usdc_guards.held_chain(&id), Some(Chain::Base));
+
+        run_hedging_job_until_dead_letter(&trigger, &store).await;
+
+        assert_eq!(store.load(&id).await.unwrap(), None);
+        assert_eq!(trigger.usdc_guards.held_chain(&id), None);
+        assert_eq!(
+            trigger
+                .usdc_guards
+                .inbound_elsewhere(Chain::Robinhood)
+                .unwrap(),
+            Usdc::ZERO
         );
     }
 
