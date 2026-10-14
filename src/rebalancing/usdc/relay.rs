@@ -8776,8 +8776,9 @@ mod tests {
     }
 
     /// A reverted order's deposit held for its payment sends again the
-    /// approves that went out alone: a node may have dropped them, and every
-    /// later send from the wallet waits behind their nonces.
+    /// approves that went out alone and queues their gas: a node may have
+    /// dropped them, every later send from the wallet waits behind their
+    /// nonces, and the reconcile that ends the hold drops them.
     #[tokio::test]
     async fn live_reverted_deposit_hold_sends_its_split_approves_again() {
         let rig = RelayRig::deploy().await;
@@ -8792,8 +8793,18 @@ mod tests {
         );
         mock_quote_unavailable(&relay_api);
         let store = Arc::new(test_store(setup_test_db().await, ()));
+        let (_pool, apalis_pool) = setup_test_pools().await;
         let transfer = rig
-            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .transfer_through(
+                &server,
+                &relay_api,
+                store.clone(),
+                relay_bounds(),
+                rig.chain.bot_wallet.clone(),
+                BotGasReceiptCostEnqueuer::Enabled(RecordBotGasReceiptCostJobQueue::new(
+                    &apalis_pool,
+                )),
+            )
             .await;
         let id = UsdcRebalanceId(Uuid::new_v4());
         record_reverted_and_requoted_toward_chain(&rig, &store, &id).await;
@@ -8837,6 +8848,14 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "the split approve is sent before the hold"
+        );
+        assert_eq!(
+            queued_gas_costs(&apalis_pool).await,
+            vec![(
+                Chain::Ethereum,
+                approve.tx_hash(),
+                "relay_approve".to_string()
+            )]
         );
     }
 
@@ -9027,20 +9046,10 @@ mod tests {
         let rig = RelayRig::deploy().await;
         rig.withdraw_to_hub(U256::from(2 * AMOUNT_IN)).await;
         let second_order_id = B256::repeat_byte(0x0b);
-        let first_deposit = rig.deposit_on_hub(REVERTED_ORDER_ID).await;
-        let second_deposit = rig.deposit_on_hub(second_order_id).await;
+        rig.deposit_on_hub(REVERTED_ORDER_ID).await;
+        rig.deposit_on_hub(second_order_id).await;
         let server = MockServer::start();
         let relay_api = MockServer::start();
-        mock_status_of(
-            &relay_api,
-            B256::repeat_byte(0x5e),
-            json!({"status": "pending", "inTxHashes": [first_deposit], "txHashes": []}),
-        );
-        mock_status_of(
-            &relay_api,
-            B256::repeat_byte(0x5f),
-            json!({"status": "pending", "inTxHashes": [second_deposit], "txHashes": []}),
-        );
         mock_quote_unavailable(&relay_api);
         let store = Arc::new(test_store(setup_test_db().await, ()));
         let (_pool, apalis_pool) = setup_test_pools().await;
@@ -9587,9 +9596,12 @@ mod tests {
     /// names is an error, not `NotDetectedYet`: nothing was read.
     #[tokio::test]
     async fn recheck_that_cannot_read_the_chain_is_an_error() {
-        let anvil = spawn_anvil(Anvil::new());
-        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
-        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let rpc = MockServer::start();
+        rpc.mock(|when, then| {
+            when.method(POST);
+            then.status(500);
+        });
+        let wallet = anvil_wallet(rpc.base_url().parse().unwrap(), &B256::repeat_byte(0x01));
         let contracts = RelayEndContracts {
             stable: Address::repeat_byte(0x51),
             depository: Address::repeat_byte(0x52),
@@ -9621,7 +9633,6 @@ mod tests {
             )
             .await
             .unwrap();
-        drop(anvil);
 
         let error = transfer.recheck_deposit(&failed, None).await.unwrap_err();
 

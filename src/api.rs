@@ -12211,6 +12211,12 @@ mod tests {
             assert_eq!(message, "Chain RPC unavailable; retry later");
         }
 
+        let (status, message) = usdc_recheck_error_response(&UsdcRecheckError::Transfer(Box::new(
+            UsdcTransferError::RelayBridge(Box::new(RelayBridgeError::TxNotFound { tx })),
+        )));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(message, "Failed to recheck transfer");
+
         let (status, message) =
             usdc_recheck_error_response(&UsdcRecheckError::DepositTxNotApplicable {
                 id: id.clone(),
