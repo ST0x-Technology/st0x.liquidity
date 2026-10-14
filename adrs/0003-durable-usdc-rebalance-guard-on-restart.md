@@ -189,11 +189,12 @@ stuck hold or the fixed chain order would otherwise block every other corridor's
 transfers to Alpaca. Only the chain-to-Alpaca side projects, because the
 projection errs high (a landed transfer counted for a moment, a stuck one until
 resolved) and must only shrink a transfer, never grow a withdrawal. The amounts
-stay in memory: startup records them from the persisted transfers it holds, and
-a job queued before a restart that has not written its first event is not
-counted until RAI-3397. With a cash reserve, the stale gross Alpaca figure after
-a landed transfer also reads low until RAI-3398. Corridors are still sized one
-after another in chain order, so with uneven chain balances the first one can
-land below its band once a later one's transfer lands, and cash moves back
-through Alpaca for a few checks; this coupling is accepted as a risk on
-RAI-3385, to revisit with a joint cash allocation if it shows up in production.
+stay in memory: startup records them from the persisted transfers it holds and
+from the live job rows whose transfer has not written its first event yet, so a
+job queued just before a restart still counts. With a cash reserve, the stale
+gross Alpaca figure after a landed transfer reads low until RAI-3398. Corridors
+are still sized one after another in chain order, so with uneven chain balances
+the first one can land below its band once a later one's transfer lands, and
+cash moves back through Alpaca for a few checks; this coupling is accepted as a
+risk on RAI-3385, to revisit with a joint cash allocation if it shows up in
+production.
