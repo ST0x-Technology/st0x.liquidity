@@ -189,7 +189,7 @@ alert_kinds! {
         RelayHubDepositsKeptReverting => "Relay deposits from the hub kept reverting",
         RelayHubRequoteRefused => "Relay refused the re-quote from the hub",
         RelayRefundedToChainWallet => "Relay refunded the deposit in the chain's stable to the chain wallet",
-        RelayHubRefundPastBudget => "Relay refunded an Alpaca-to-chain deposit at the hub past",
+        RelayHubRefundPastBudget => "Relay refunded an Alpaca-to-chain deposit at the hub past the corridor's re-quote budget or below its minimum",
         RelayHubRefundQuoteRefused => "Relay refused the quote for a refund at the hub",
         ReconciledTransferHoldsRelayEnvelopes => "Reconciled a USDC transfer that holds signed Relay envelopes",
         RelayQuoteKeepsFailing => "Relay quotes keep failing transiently for a transfer past its withdrawal",
