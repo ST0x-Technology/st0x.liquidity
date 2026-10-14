@@ -38905,6 +38905,71 @@ mod tests {
         );
     }
 
+    /// A proven Relay fill may pay more than its input, which the quote and
+    /// the fill proof bound only from below: the transfer settles at the
+    /// amount Alpaca converted, releasing the whole source reservation.
+    #[tokio::test]
+    async fn relay_fill_above_its_input_settles_the_received_amount() {
+        let trigger = make_trigger_with_inventory(with_onchain_usdc(
+            InventoryView::default().with_usdc(usdc(500), usdc(500)),
+            Chain::Robinhood,
+            usdc(500),
+        ))
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        trigger
+            .usdc_guards
+            .try_claim(Chain::Robinhood, &id, RebalanceDirection::BaseToAlpaca)
+            .unwrap()
+            .defuse();
+        let received = Usdc::new(float!(100.2));
+        let mut history = vec![make_usdc_initiated_on(
+            ROBINHOOD_RELAY,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(100),
+        )];
+        history.extend(relay_swap_deposited());
+        history.extend([
+            UsdcRebalanceEvent::RelayFillVerified {
+                fill_tx: TxHash::repeat_byte(0xf1),
+                amount_received: received,
+                fee_collected: Usdc::new(float!(-0.2)),
+                relayer_fee: Usdc::ZERO,
+                filled_at: Utc::now(),
+            },
+            make_usdc_deposit_initiated(),
+            make_usdc_deposit_confirmed(RebalanceDirection::BaseToAlpaca),
+        ]);
+        for event in history {
+            trigger.on_usdc_rebalance(id.clone(), event).await.unwrap();
+        }
+
+        trigger
+            .on_usdc_rebalance(
+                id.clone(),
+                make_usdc_conversion_confirmed(
+                    RebalanceDirection::BaseToAlpaca,
+                    received,
+                    received,
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert!(!trigger.usdc_tracking.read().await.contains_key(&id));
+        assert!(!trigger.usdc_guards.is_held(Chain::Robinhood));
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.onchain_usdc_inflight_at(Chain::Robinhood),
+            Some(Usdc::ZERO)
+        );
+        assert_eq!(
+            inventory.onchain_usdc_available_at(Chain::Robinhood),
+            Some(usdc(400))
+        );
+        drop(inventory);
+    }
+
     #[tokio::test]
     async fn usdc_terminal_clears_active_rebalance_id() {
         let reactor =
