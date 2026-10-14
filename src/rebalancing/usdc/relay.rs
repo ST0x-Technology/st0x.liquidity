@@ -203,6 +203,17 @@ const fn hop_direction(direction: RebalanceDirection) -> HopDirection {
     }
 }
 
+/// What a `SwapQuoted` attempt does once its checks before signing ran.
+enum BeforeSigning {
+    /// Sign and send the quoted pair.
+    Sign,
+    /// The attempt ends: the stable goes back to the vault, or holds.
+    Ended,
+    /// A reverted order's late payment was adopted, to move on once the
+    /// origin wallet's prepare lock is released.
+    Adopted,
+}
+
 impl<Signer: Wallet> RelayHop<Signer> {
     /// The origin wallet's prepare `lock`, waited for up to `quote_max_age`:
     /// a signing that outlasted its attempt holds it until its nonces are
@@ -1051,8 +1062,11 @@ where
     /// reverted deposits the stable goes back to the vault (or, from the hub,
     /// the transfer holds); an expired quote, or one whose order id a deposit
     /// was already signed for, is replaced, and a refused replacement returns
-    /// the stable to the vault (or holds). `true` when the attempt ends here.
-    async fn requote_or_redeposit(&self, id: &UsdcRebalanceId) -> Result<bool, UsdcTransferError> {
+    /// the stable to the vault (or holds).
+    async fn requote_or_redeposit(
+        &self,
+        id: &UsdcRebalanceId,
+    ) -> Result<BeforeSigning, UsdcTransferError> {
         let Some(UsdcRebalance::SwapQuoted {
             direction,
             first_deposit,
@@ -1065,7 +1079,7 @@ where
             ..
         }) = self.cqrs.load(id).await?
         else {
-            return Ok(false);
+            return Ok(BeforeSigning::Sign);
         };
 
         // A reverted deposit a reorg landed must be settled before anything
@@ -1074,7 +1088,7 @@ where
             .adopt_reverted_deposit(id, direction, &reverted_quotes, &split_approves)
             .await?
         {
-            return Ok(true);
+            return Ok(BeforeSigning::Adopted);
         }
 
         let max_reverts = self.hop.bounds.max_deposit_revert_redrives;
@@ -1095,13 +1109,13 @@ where
                     error!(target: "operational_alert", alert = true, kind = AlertKind::RelayHubDepositsKeptReverting.as_str(), %id, deposit_reverts, max_reverts, "Relay deposits from the hub kept reverting; the transfer holds its guard at SwapQuoted with the USDC at the hub until it is moved by hand and reconciled");
                 }
             }
-            return Ok(true);
+            return Ok(BeforeSigning::Ended);
         }
 
         let signed = signed_order_ids.contains(&quote.order_id);
         let expired = quote_expired(&quote, quoted_at, self.hop.bounds.quote_max_age, Utc::now());
         if !signed && !expired {
-            return Ok(false);
+            return Ok(BeforeSigning::Sign);
         }
 
         info!(target: "rebalance", %id, signed, expired, order_id = %quote.order_id, "Re-quoting the Relay swap before signing");
@@ -1123,7 +1137,7 @@ where
                         },
                     )
                     .await?;
-                Ok(false)
+                Ok(BeforeSigning::Sign)
             }
             Err(error) if quote_refused(&error) => {
                 match direction {
@@ -1142,7 +1156,7 @@ where
                         error!(target: "operational_alert", alert = true, kind = AlertKind::RelayHubRequoteRefused.as_str(), %id, %error, "Relay refused the re-quote from the hub; the transfer holds its guard at SwapQuoted with the USDC at the hub until it is resumed, or moved by hand and reconciled");
                     }
                 }
-                Ok(true)
+                Ok(BeforeSigning::Ended)
             }
             Err(error) => {
                 warn!(target: "rebalance", %id, %error, "Relay re-quote failed transiently; the transfer holds its guard at SwapQuoted for the retry");
@@ -1219,15 +1233,19 @@ where
         // Under the origin wallet's prepare lock: a re-quoted pair or a
         // redeposit sent above the nonces of a late signing would wait behind
         // their release.
-        let redeposited = {
+        let before_signing = {
             let _prepare = self
                 .hop
                 .lock_prepare(id, self.prepare_lock(direction))
                 .await?;
             self.requote_or_redeposit(id).await?
         };
-        if redeposited {
-            return Ok(());
+        match before_signing {
+            BeforeSigning::Sign => {}
+            BeforeSigning::Ended => return Ok(()),
+            // Past the lock: a refund at the hub is quoted again and its
+            // next pair signed under the same lock.
+            BeforeSigning::Adopted => return Box::pin(self.continue_after_recovery(id)).await,
         }
 
         let Some(state) = self.cqrs.load(id).await? else {
@@ -1705,9 +1723,10 @@ where
     /// Scans the origin chain for our deposits of `reverted` orders, which a
     /// reorg may have landed: `false` when none is on chain. A lone found
     /// deposit is adopted once its payment proves, after the approves that
-    /// went out alone are sent again; until then, and for good when several
-    /// are found, the attempt ends with `RevertedSwapDepositLive`, signing
-    /// and redepositing nothing.
+    /// went out alone are sent again, and `true` is returned for the caller to
+    /// move it on; until then, and for good when several are found, the
+    /// attempt ends with `RevertedSwapDepositLive`, signing and redepositing
+    /// nothing.
     async fn adopt_reverted_deposit(
         &self,
         id: &UsdcRebalanceId,
@@ -1803,8 +1822,6 @@ where
             )
             .await?;
         warn!(target: "rebalance", %id, %order_id, deposit_tx = %deposit.tx, ?payment, "Adopted the late payment of a reverted Relay order");
-
-        Box::pin(self.continue_after_recovery(id)).await?;
         Ok(true)
     }
 
