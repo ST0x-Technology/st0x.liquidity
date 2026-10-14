@@ -5451,9 +5451,11 @@ signing a second deposit while an earlier one may still land:
   scan of its re-quote finds and adopts an older reverted order, that refund
   stays in the Ethereum wallet, untracked, for the operator. `transfer recheck`
   of an unresolved escrow records a proven payment of its deposited order with
-  `ConfirmSwapFill` or `RecordSwapRefund`. Approves that went out alone are sent
-  again before a `SwapQuoted` adopts one. Superseding an order adds its id to
-  `signed_order_ids` and never drops one.
+  `ConfirmSwapFill` or `RecordSwapRefund`. Once a deposit of a reverted order is
+  found, approves that went out alone are sent again, confirmed and their gas
+  queued, before a `SwapQuoted` adopts it or holds: a reconcile ending the hold
+  drops them. Superseding an order adds its id to `signed_order_ids` and never
+  drops one.
 
 ##### Crash-safe resume
 
