@@ -1256,6 +1256,151 @@ mod decimal {
     }
 }
 
+/// Why [`quote_body_for_test`] could not build a quote body.
+#[cfg(any(test, feature = "mock"))]
+#[derive(Debug, thiserror::Error)]
+pub enum TestQuoteError {
+    #[error("{chain} has no Relay chain name")]
+    NoRelayName { chain: Chain },
+    #[error("{origin} has no pinned Relay depository")]
+    NoDepository { origin: Chain },
+    #[error("the clock is before the Unix epoch: {0}")]
+    Clock(#[from] std::time::SystemTimeError),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Order(#[from] QuoteMismatch),
+}
+
+/// A quote body Relay could send for `request`, as [`RelayClient::quote`]
+/// checks it.
+///
+/// The solver expects to pay `expected_out` and guarantees `minimum_out`,
+/// with a refund on the origin chain and an order id derived from the order.
+///
+/// [`RelayClient::quote`]: super::RelayClient::quote
+#[cfg(any(test, feature = "mock"))]
+pub fn quote_body_for_test(
+    request: &QuoteRequest,
+    expected_out: U256,
+    minimum_out: U256,
+) -> Result<serde_json::Value, TestQuoteError> {
+    use serde_json::json;
+
+    let origin = request.origin;
+    let destination = request.destination;
+    let origin_name = origin
+        .relay_name()
+        .ok_or(TestQuoteError::NoRelayName { chain: origin })?;
+    let destination_name = destination
+        .relay_name()
+        .ok_or(TestQuoteError::NoRelayName { chain: destination })?;
+    let depository = origin
+        .relay_depository()
+        .ok_or(TestQuoteError::NoDepository { origin })?;
+    let stable_in = origin.settlement_stable().address;
+    let stable_out = destination.settlement_stable().address;
+    let deadline = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + 3600;
+    let amount = request.amount.to_string();
+    let currency = |chain: Chain| {
+        let stable = chain.settlement_stable();
+        json!({"chainId": chain.chain_id(), "address": stable.address, "decimals": stable.decimals})
+    };
+
+    let order_data = json!({
+        "version": ORDER_VERSION,
+        "solverChainId": origin_name,
+        "solver": Address::repeat_byte(0x50),
+        "salt": "0x1",
+        "inputs": [{
+            "payment": {"chainId": origin_name, "currency": stable_in, "amount": amount, "weight": "1"},
+            "refunds": [{
+                "chainId": origin_name,
+                "recipient": request.refund_to,
+                "currency": stable_in,
+                "minimumAmount": "0",
+                "deadline": deadline,
+                "extraData": "0x",
+            }],
+        }],
+        "fees": [],
+        "output": {
+            "chainId": destination_name,
+            "payments": [{
+                "recipient": request.recipient,
+                "currency": stable_out,
+                "minimumAmount": minimum_out.to_string(),
+                "expectedAmount": expected_out.to_string(),
+            }],
+            "calls": [],
+            "deadline": deadline,
+            "extraData": "0x",
+        },
+    });
+    let order: RawOrderData = serde_json::from_value(order_data.clone())?;
+    let order_id = eip712_order(&order)?.eip712_hash_struct();
+
+    let step = |id: &str, to: Address, data: Vec<u8>| {
+        json!({
+            "id": id,
+            "items": [{"data": {
+                "to": to,
+                "data": Bytes::from(data),
+                "value": "0",
+                "chainId": origin.chain_id(),
+            }}],
+        })
+    };
+    let approve = approveCall {
+        spender: depository,
+        amount: request.amount,
+    }
+    .abi_encode();
+    let deposit = depositErc20Call {
+        depositor: request.user,
+        token: stable_in,
+        amount: request.amount,
+        id: order_id,
+    }
+    .abi_encode();
+
+    Ok(json!({
+        "requestId": B256::repeat_byte(0x7e),
+        "steps": [step("approve", stable_in, approve), step("deposit", depository, deposit)],
+        "fees": {
+            "gas": {
+                "currency": {"chainId": origin.chain_id(), "address": Address::ZERO, "decimals": 18},
+                "amount": "1",
+                "minimumAmount": "1",
+            },
+            "relayer": {
+                "currency": currency(origin),
+                "amount": request.amount.saturating_sub(expected_out).to_string(),
+                "minimumAmount": "0",
+            },
+        },
+        "details": {
+            "recipient": request.recipient,
+            "currencyIn": {"currency": currency(origin), "amount": amount, "minimumAmount": amount},
+            "currencyOut": {
+                "currency": currency(destination),
+                "amount": expected_out.to_string(),
+                "minimumAmount": minimum_out.to_string(),
+            },
+        },
+        "protocol": {"v2": {
+            "orderId": order_id,
+            "orderData": order_data,
+            "paymentDetails": {
+                "chainId": origin_name,
+                "depository": depository,
+                "currency": stable_in,
+                "amount": amount,
+            },
+        }},
+    }))
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use alloy::primitives::{address, b256};
@@ -1457,6 +1602,21 @@ pub(super) mod tests {
     }
 
     /// Both directions at 1000 units and 50 bps, quoted for the `0xdead` user.
+    #[test]
+    fn test_quote_body_validates_as_built() {
+        let request = dead_request(Chain::Ethereum, Chain::Robinhood, 30);
+
+        let quote = validate(
+            &quote_body_for_test(&request, U256::from(999_000_000), U256::from(996_000_000))
+                .unwrap(),
+            &request,
+        )
+        .unwrap();
+
+        assert_eq!(quote.amounts.expected_out, U256::from(999_000_000));
+        assert_eq!(quote.amounts.minimum_out, U256::from(996_000_000));
+    }
+
     #[test]
     fn both_directions_validate() {
         for (fixture, origin, destination, order_id, expected_out, minimum_out) in [

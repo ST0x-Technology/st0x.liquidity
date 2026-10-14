@@ -105,7 +105,7 @@ use crate::unwrapped_equity_recovery::{
 };
 use crate::usdc_rebalance::{
     CooldownFailure, InterruptedUsdcRebalances, PreBurnFailEligibility, RebalanceDirection,
-    UsdcRebalance, UsdcRebalanceEvent, UsdcRebalanceId, any_rebalance_holds_guard,
+    RefundSide, UsdcRebalance, UsdcRebalanceEvent, UsdcRebalanceId, any_rebalance_holds_guard,
     interrupted_usdc_rebalance_ids,
 };
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
@@ -1135,6 +1135,11 @@ type EquityInventoryUpdate = Box<
 >;
 
 const TIMEOUT_TOMBSTONE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Delay of the sweep's re-arm of an Alpaca-to-chain Relay transfer held at
+/// `WithdrawalComplete`: its job ends after a refused binding quote, and each
+/// re-armed run quotes Relay and reads the withdrawal again.
+const RELAY_HUB_HOLD_REARM_DELAY: Duration = Duration::from_secs(30 * 60);
 const TERMINAL_RESERVATION_RELEASE_RETRY_DELAY: Duration = Duration::from_millis(25);
 const TERMINAL_RESERVATION_RELEASE_ATTEMPTS: u32 = 5;
 
@@ -1159,6 +1164,9 @@ enum UsdcTimeoutCleanup {
         elapsed: Duration,
         corridor: UsdcCorridor,
         amount: Usdc,
+        /// When the job runs: at once, or after the hold cadence for a
+        /// Relay transfer held at the hub, whose run quotes Relay again.
+        delay: Option<Duration>,
     },
     /// An AlpacaToBase transfer stopped after its Alpaca withdrawal with no
     /// confirmed burn (see [`alpaca_to_base_hold_without_confirmed_burn`]).
@@ -1178,16 +1186,82 @@ enum UsdcTimeoutCleanup {
         corridor: UsdcCorridor,
         direction: RebalanceDirection,
     },
-    /// A chain-to-Alpaca Relay transfer stopped after its withdrawal, at
-    /// `Withdrawing`, `WithdrawalComplete` or a swap state that holds the
-    /// guard: the withdrawn stable is outside the vault, in the chain wallet,
-    /// with Relay or on its way back, and only the swap, a redeposit or
+    /// A Relay transfer stopped after its withdrawal, at a chain-to-Alpaca
+    /// `Withdrawing` or `WithdrawalComplete` or a swap state that holds the
+    /// guard: the withdrawn stable is outside the vault or Alpaca, in a
+    /// wallet, with Relay or on its way back, and only the swap, a redeposit or
     /// `transfer reconcile` settles it, so the guard stays held.
     HeldOutsideVault {
         tracking: usdc::UsdcRebalanceTracking,
         elapsed: Duration,
-        state: &'static str,
+        state: Box<UsdcRebalance>,
     },
+}
+
+/// The operator step that moves a Relay transfer held outside the vault on
+/// from `state`: a resume where the job can still move it, settling the
+/// stable by hand and `transfer reconcile` where it cannot.
+fn relay_hold_step(state: &UsdcRebalance) -> &'static str {
+    const SETTLE: &str = "A resume does not move it on: settle the stable by hand, then run \
+                          `transfer reconcile --kind usdc` (see the Relay runbook).";
+    const RESUME_TO_ALPACA: &str = "Resume it with \
+                                    `transfer resume --kind usdc --direction to-alpaca`.";
+    const RESUME_TO_RAINDEX: &str = "Resume it with \
+                                     `transfer resume --kind usdc --direction to-raindex`.";
+    const RESUME_OR_SETTLE_TO_RAINDEX: &str = "Resume it with \
+         `transfer resume --kind usdc --direction to-raindex`, or, once the job has paged its \
+         hold, settle the stable by hand, then run `transfer reconcile --kind usdc`.";
+    const RESUME_OR_SETTLE_TO_ALPACA: &str = "Resume it with \
+         `transfer resume --kind usdc --direction to-alpaca`, or, once the job has paged that \
+         the redeposit failed, settle the stable by hand, then run \
+         `transfer reconcile --kind usdc`.";
+
+    match state {
+        UsdcRebalance::SwapFailed { .. }
+        | UsdcRebalance::SwapRefunded {
+            short_of_floor: Some(_),
+            ..
+        }
+        | UsdcRebalance::SwapRefunded {
+            side: RefundSide::Destination,
+            ..
+        } => SETTLE,
+        UsdcRebalance::SwapQuoted {
+            direction: RebalanceDirection::AlpacaToBase,
+            ..
+        }
+        | UsdcRebalance::SwapRefunded {
+            direction: RebalanceDirection::AlpacaToBase,
+            ..
+        } => RESUME_OR_SETTLE_TO_RAINDEX,
+        UsdcRebalance::Redepositing { .. } => RESUME_OR_SETTLE_TO_ALPACA,
+        resumable @ (UsdcRebalance::Converting { .. }
+        | UsdcRebalance::ConversionComplete { .. }
+        | UsdcRebalance::ConversionFailed { .. }
+        | UsdcRebalance::WithdrawalSubmitting { .. }
+        | UsdcRebalance::Withdrawing { .. }
+        | UsdcRebalance::WithdrawalComplete { .. }
+        | UsdcRebalance::WithdrawalFailed { .. }
+        | UsdcRebalance::BridgingSubmitting { .. }
+        | UsdcRebalance::Bridging { .. }
+        | UsdcRebalance::AwaitingAttestation { .. }
+        | UsdcRebalance::Attested { .. }
+        | UsdcRebalance::SwapQuoted { .. }
+        | UsdcRebalance::SwapDepositPrepared { .. }
+        | UsdcRebalance::SwapDeposited { .. }
+        | UsdcRebalance::SwapRefunded { .. }
+        | UsdcRebalance::SwapEscrowUnresolved { .. }
+        | UsdcRebalance::ReturnedToSource { .. }
+        | UsdcRebalance::Bridged { .. }
+        | UsdcRebalance::BridgingFailed { .. }
+        | UsdcRebalance::DepositInitiated { .. }
+        | UsdcRebalance::DepositConfirmed { .. }
+        | UsdcRebalance::DepositFailed { .. }
+        | UsdcRebalance::Reconciled { .. }) => match resumable.direction() {
+            RebalanceDirection::BaseToAlpaca => RESUME_TO_ALPACA,
+            RebalanceDirection::AlpacaToBase => RESUME_TO_RAINDEX,
+        },
+    }
 }
 
 /// Whether a tracked transfer's durable state lets the sweep release its
@@ -2618,6 +2692,7 @@ impl RebalancingService {
                     elapsed,
                     corridor,
                     amount,
+                    delay,
                 } => {
                     // An Alpaca-to-Base pre-burn state timed out with no live job:
                     // re-arm a fresh `TransferUsdcToMarketMaking` redrive instead
@@ -2628,19 +2703,22 @@ impl RebalancingService {
                         aggregate_id = %id,
                         direction = ?tracking.direction,
                         ?elapsed,
+                        ?delay,
                         "AlpacaToBase withdrawal state timed out with no live job; \
                          re-arming TransferUsdcToMarketMaking redrive (guard preserved)"
                     );
-                    self.transfer_usdc_to_market_making_queue
-                        .clone()
-                        .push(TransferUsdcToMarketMaking {
-                            id: id.clone(),
-                            amount,
-                            corridor,
-                            revert_redrive_attempts: 0,
-                            backpressure_streak: BackpressureStreak::default(),
-                        })
-                        .await?;
+                    let job = TransferUsdcToMarketMaking {
+                        id: id.clone(),
+                        amount,
+                        corridor,
+                        revert_redrive_attempts: 0,
+                        backpressure_streak: BackpressureStreak::default(),
+                    };
+                    let mut queue = self.transfer_usdc_to_market_making_queue.clone();
+                    match delay {
+                        Some(delay) => queue.push_with_delay(job, delay).await?,
+                        None => queue.push(job).await?,
+                    }
                     self.usdc_guards
                         .hold(corridor.chain(), &id, tracking.direction);
                 }
@@ -2659,7 +2737,7 @@ impl RebalancingService {
                 } => {
                     self.usdc_guards
                         .hold(tracking.corridor.chain(), &id, tracking.direction);
-                    self.page_relay_withdrawal_hold_once(&id, &tracking, elapsed, state)
+                    self.page_relay_withdrawal_hold_once(&id, &tracking, elapsed, &state)
                         .await;
                 }
             }
@@ -2742,7 +2820,7 @@ impl RebalancingService {
         id: &UsdcRebalanceId,
         tracking: &usdc::UsdcRebalanceTracking,
         elapsed: Duration,
-        state: &'static str,
+        held: &UsdcRebalance,
     ) {
         if !self
             .relay_withdrawal_hold_alerted
@@ -2752,6 +2830,8 @@ impl RebalancingService {
         {
             return;
         }
+        let state = held.state_name();
+        let step = relay_hold_step(held);
 
         error!(
             target: "rebalance",
@@ -2759,15 +2839,15 @@ impl RebalancingService {
             corridor = %tracking.corridor,
             ?elapsed,
             state,
-            "Relay USDC transfer timed out after its vault withdrawal with the stable outside \
-             the vault; holding the trigger guard"
+            "Relay USDC transfer timed out after its withdrawal with the stable outside the \
+             vault or Alpaca; holding the trigger guard"
         );
 
         let message = format!(
-            "USDC transfer {id} on the {} corridor timed out at {state}: the vault withdrawal \
-             moved the stable out of the vault, to the chain wallet or to Relay. Guard held. \
-             Elapsed: {elapsed:?}. Resume it with resume-usdc; it is not failed or released \
-             until the swap, a redeposit or reconcile-usdc settles the stable.",
+            "USDC transfer {id} on the {} corridor timed out at {state}: its withdrawal moved \
+             the stable out of the vault or Alpaca, to a wallet or to Relay. Guard held. \
+             Elapsed: {elapsed:?}. {step} It is not failed or released until the swap, a \
+             redeposit or `transfer reconcile` settles the stable.",
             tracking.corridor,
         );
 
@@ -3538,7 +3618,7 @@ impl RebalancingService {
                             return Ok(Some(UsdcTimeoutCleanup::HeldOutsideVault {
                                 tracking,
                                 elapsed,
-                                state: state.state_name(),
+                                state: Box::new(state),
                             }));
                         }
 
@@ -3612,31 +3692,47 @@ impl RebalancingService {
         let usdc_store = self.usdc_store.read().await.as_ref().map(Arc::clone);
         if let Some(store) = usdc_store {
             match store.load(id).await {
-                Ok(Some(
-                    UsdcRebalance::Withdrawing {
-                        direction: RebalanceDirection::AlpacaToBase,
-                        corridor,
-                        amount,
-                        ..
-                    }
-                    | UsdcRebalance::WithdrawalComplete {
-                        direction: RebalanceDirection::AlpacaToBase,
-                        corridor,
-                        amount,
-                        ..
-                    },
-                )) => {
+                Ok(Some(UsdcRebalance::Withdrawing {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    corridor,
+                    amount,
+                    ..
+                })) => {
                     drop(tracking_guard);
                     return Ok(Some(UsdcTimeoutCleanup::ReArmAlpacaToBaseWithdrawal {
                         tracking,
                         elapsed,
                         corridor,
                         amount,
+                        delay: None,
                     }));
                 }
-                // Tracking can lag the store, so every chain-to-Alpaca Relay
-                // state after the withdrawal that `fail-usdc-transfer` refuses
-                // with the Relay hold holds here too: a deposit may be on chain.
+                // A Relay transfer here is held at the hub after a refused
+                // binding quote, or its job was lost: re-armed slowly, as
+                // each run quotes Relay again.
+                Ok(Some(UsdcRebalance::WithdrawalComplete {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    corridor,
+                    amount,
+                    ..
+                })) => {
+                    drop(tracking_guard);
+                    let UsdcCorridor::HubRouted { hop, .. } = corridor;
+                    let delay = match hop {
+                        HopKind::Relay => Some(RELAY_HUB_HOLD_REARM_DELAY),
+                        HopKind::Cctp => None,
+                    };
+                    return Ok(Some(UsdcTimeoutCleanup::ReArmAlpacaToBaseWithdrawal {
+                        tracking,
+                        elapsed,
+                        corridor,
+                        amount,
+                        delay,
+                    }));
+                }
+                // Tracking can lag the store, so every Relay state after the
+                // withdrawal that `fail-usdc-transfer` refuses with the Relay
+                // hold holds here too, either way: a deposit may be on chain.
                 Ok(Some(state))
                     if state.pre_burn_fail_eligibility()
                         == PreBurnFailEligibility::RelayHeldOutsideVault =>
@@ -3645,7 +3741,7 @@ impl RebalancingService {
                     return Ok(Some(UsdcTimeoutCleanup::HeldOutsideVault {
                         tracking,
                         elapsed,
-                        state: state.state_name(),
+                        state: Box::new(state),
                     }));
                 }
                 // Past the withdrawal with no confirmed burn: arming a job again
@@ -44645,9 +44741,9 @@ mod tests {
         }
     }
 
-    /// A Relay corridor's trigger sends chain-to-Alpaca within its bounds:
-    /// capped at `max_transfer`, nothing below `min_transfer`, nothing with no
-    /// bounds at all, and never Alpaca-to-chain.
+    /// A Relay corridor's trigger sends within its bounds, either way:
+    /// capped at `max_transfer`, nothing below `min_transfer`, and nothing
+    /// with no bounds at all.
     #[tokio::test]
     async fn relay_corridor_trigger_sends_within_its_bounds() {
         let run = |relay: Option<RelayHopCtx>, onchain: i64| async move {
@@ -44688,9 +44784,15 @@ mod tests {
             0
         );
 
-        let alpaca_to_chain = run(Some(relay_bounds(1, 50_000)), 100).await;
+        let alpaca_to_chain = run(Some(relay_bounds(1, 200)), 100).await;
+        let job = pending_transfer_usdc_to_market_making_job(&alpaca_to_chain).await;
+        assert_eq!(job.corridor, ROBINHOOD_RELAY);
+        assert_eq!(job.amount, usdc(200));
+        assert!(alpaca_to_chain.usdc_guards.is_held(Chain::Robinhood));
+
+        let alpaca_to_chain_below_minimum = run(Some(relay_bounds(15_000, 50_000)), 100).await;
         assert_eq!(
-            count_pending_transfer_usdc_to_market_making_jobs(&alpaca_to_chain).await,
+            count_pending_transfer_usdc_to_market_making_jobs(&alpaca_to_chain_below_minimum).await,
             0
         );
     }
@@ -44749,6 +44851,90 @@ mod tests {
         assert!(trigger.usdc_guards.is_held(Chain::Robinhood));
         let job = pending_transfer_usdc_to_market_making_job(&trigger).await;
         assert_eq!(job.corridor, ROBINHOOD_RELAY);
+    }
+
+    /// An Alpaca-to-chain Relay transfer held at `WithdrawalComplete` after a
+    /// refused binding quote: its job ends with nothing to retry, so the
+    /// timeout sweep re-arms it, but at the hold cadence, not on every tick
+    /// (each run quotes Relay again).
+    #[tokio::test]
+    async fn sweep_rearms_a_relay_transfer_held_at_the_hub_at_the_hold_cadence() {
+        let config = RebalancingServiceConfig {
+            usdc: UsdcCorridors::for_test(
+                OperationMode::Enabled,
+                [active_corridor(Chain::Robinhood, HopKind::Relay)],
+            )
+            .with_relay_hop(Chain::Robinhood, relay_bounds(1, 50_000)),
+            ..with_cash_on(
+                test_config_with_timeout(Duration::from_secs(1)),
+                &[Chain::Robinhood],
+            )
+        };
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc(400);
+        seed_withdrawing_alpaca_to_base_on(&store, &id, amount, ROBINHOOD_RELAY).await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: Some(TxHash::repeat_byte(0x78)),
+                },
+            )
+            .await
+            .unwrap();
+        let trigger = make_trigger_with_inventory_config(InventoryView::default(), config).await;
+        trigger
+            .set_stores(
+                Arc::new(test_store::<TokenizedEquityMint>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                store.clone(),
+            )
+            .await;
+        trigger
+            .usdc_guards
+            .hold(Chain::Robinhood, &id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                corridor: ROBINHOOD_RELAY,
+                direction: RebalanceDirection::AlpacaToBase,
+                initiated_amount: amount,
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::WithdrawalConfirmed,
+                last_progress_at: Utc::now() - ChronoDuration::minutes(31),
+            },
+        );
+
+        let before = Utc::now().timestamp();
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        assert!(trigger.usdc_guards.is_held(Chain::Robinhood));
+        let job = pending_transfer_usdc_to_market_making_job(&trigger).await;
+        assert_eq!(job.id, id);
+        assert_eq!(job.corridor, ROBINHOOD_RELAY);
+        let run_at: i64 = sqlx_apalis::query_scalar(
+            "SELECT run_at FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+        .fetch_one(trigger.transfer_usdc_to_market_making_queue.pool())
+        .await
+        .unwrap();
+        // The hold cadence is 30 minutes.
+        assert!(
+            run_at >= before + 30 * 60 - 1,
+            "the re-armed job runs at {run_at}, not 30 minutes after {before}"
+        );
     }
 
     const ROBINHOOD_RELAY: UsdcCorridor = UsdcCorridor::HubRouted {
@@ -46442,6 +46628,26 @@ mod tests {
         amount: Usdc,
         stage: usdc::UsdcRebalanceStage,
     ) -> Arc<RebalancingService> {
+        sweep_timed_out_relay_transfer_toward(
+            pool,
+            store,
+            id,
+            amount,
+            stage,
+            RebalanceDirection::BaseToAlpaca,
+        )
+        .await
+    }
+
+    /// Like `sweep_timed_out_relay_transfer`, for a transfer in `direction`.
+    async fn sweep_timed_out_relay_transfer_toward(
+        pool: &SqlitePool,
+        store: Arc<Store<UsdcRebalance>>,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        stage: usdc::UsdcRebalanceStage,
+        direction: RebalanceDirection,
+    ) -> Arc<RebalancingService> {
         let now = Utc::now();
         let config = RebalancingServiceConfig {
             usdc: UsdcCorridors::for_test(
@@ -46462,7 +46668,7 @@ mod tests {
             id.clone(),
             ActiveUsdcRebalance::Known {
                 chain: Chain::Robinhood,
-                direction: RebalanceDirection::BaseToAlpaca,
+                direction,
             },
         );
         let trigger = make_trigger_with_inventory_config(inventory, config).await;
@@ -46479,14 +46685,12 @@ mod tests {
                 store,
             )
             .await;
-        trigger
-            .usdc_guards
-            .hold(Chain::Robinhood, id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(Chain::Robinhood, id, direction);
         trigger.usdc_tracking.write().await.insert(
             id.clone(),
             usdc::UsdcRebalanceTracking {
                 corridor: ROBINHOOD_RELAY,
-                direction: RebalanceDirection::BaseToAlpaca,
+                direction,
                 initiated_amount: amount,
                 bridged_amount_received: None,
                 stage,
@@ -46626,6 +46830,198 @@ mod tests {
             Some(id),
             "the transfer must stay the active rebalance",
         );
+    }
+
+    /// The hold page names the step that moves the transfer on from its
+    /// state: a Relay failure is settled by hand and reconciled, as a resume
+    /// refuses it, while a deposit with Relay is resumed.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn relay_hold_page_names_the_step_for_its_state() {
+        for failed in [false, true] {
+            let pool = crate::test_utils::setup_test_db().await;
+            let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+            let id = UsdcRebalanceId(Uuid::new_v4());
+            let deposit = PreparedTransaction::for_test(TxHash::repeat_byte(0xa2), 6);
+            crate::usdc_rebalance::record_swap_pair_for_test(
+                &store,
+                &id,
+                RebalanceDirection::BaseToAlpaca,
+                ROBINHOOD_RELAY,
+                None,
+                deposit.clone(),
+            )
+            .await;
+            store
+                .send(
+                    &id,
+                    UsdcRebalanceCommand::ConfirmSwapDeposit {
+                        deposit_tx: deposit.tx_hash(),
+                        deposit_block: 9,
+                    },
+                )
+                .await
+                .unwrap();
+            if failed {
+                store
+                    .send(
+                        &id,
+                        UsdcRebalanceCommand::FailSwap {
+                            reason: "Relay reported Failure".to_string(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            sweep_timed_out_relay_transfer(
+                &pool,
+                store,
+                &id,
+                usdc(100),
+                usdc::UsdcRebalanceStage::WithdrawalConfirmed,
+            )
+            .await;
+
+            let id = id.to_string();
+            logs_assert(|lines| {
+                let page = lines
+                    .iter()
+                    .find(|line| line.contains(&id) && line.contains("Guard held"))
+                    .ok_or("no hold page")?;
+                let step = if failed {
+                    "settle the stable by hand, then run `transfer reconcile --kind usdc`"
+                } else {
+                    "`transfer resume --kind usdc --direction to-alpaca`"
+                };
+                page.contains(step)
+                    .then_some(())
+                    .ok_or_else(|| format!("{page} does not name {step}"))
+            });
+        }
+    }
+
+    /// Each Relay hold's page names the step that moves it on: a resume in
+    /// its direction, settling by hand and reconciling where a resume cannot,
+    /// and both where a resume may still move it or the job has paged a hold.
+    #[tokio::test]
+    async fn relay_hold_step_names_resume_or_settle_per_state() {
+        let quote = || UsdcRebalanceCommand::QuoteSwap {
+            quote: Box::new(swap_quote_for_test(
+                U256::from(100_000_000u64),
+                B256::repeat_byte(0x0d),
+            )),
+        };
+        let deposited = || {
+            vec![
+                quote(),
+                UsdcRebalanceCommand::PrepareSwapDeposit {
+                    approve: None,
+                    deposit: PreparedTransaction::for_test(TxHash::repeat_byte(0xa2), 6),
+                },
+                UsdcRebalanceCommand::ConfirmSwapDeposit {
+                    deposit_tx: TxHash::repeat_byte(0xa2),
+                    deposit_block: 9,
+                },
+            ]
+        };
+        // 99.5 is the refund floor of the 100 quoted.
+        let short_refund = UsdcRebalanceCommand::RecordSwapRefund {
+            refund_tx: TxHash::repeat_byte(0xe1),
+            side: RefundSide::Origin,
+            amount_refunded: U256::from(99_000_000u64),
+        };
+        let to_alpaca = "`transfer resume --kind usdc --direction to-alpaca`";
+        let to_raindex = "`transfer resume --kind usdc --direction to-raindex`";
+        let settle = "settle the stable by hand, then run `transfer reconcile --kind usdc`";
+
+        let cases = [
+            (
+                RebalanceDirection::BaseToAlpaca,
+                deposited(),
+                vec![to_alpaca],
+                vec![settle],
+            ),
+            (
+                RebalanceDirection::BaseToAlpaca,
+                [
+                    deposited(),
+                    vec![UsdcRebalanceCommand::FailSwap {
+                        reason: "Relay reported Failure".to_string(),
+                    }],
+                ]
+                .concat(),
+                vec![settle],
+                vec![to_alpaca],
+            ),
+            (
+                RebalanceDirection::BaseToAlpaca,
+                vec![
+                    quote(),
+                    UsdcRebalanceCommand::BeginRedeposit {
+                        reason: RedepositReason::QuoteRefused,
+                    },
+                ],
+                vec![to_alpaca, settle],
+                vec![],
+            ),
+            (
+                RebalanceDirection::AlpacaToBase,
+                deposited(),
+                vec![to_raindex],
+                vec![settle],
+            ),
+            (
+                RebalanceDirection::AlpacaToBase,
+                vec![quote()],
+                vec![to_raindex, settle],
+                vec![],
+            ),
+            (
+                RebalanceDirection::AlpacaToBase,
+                [deposited(), vec![short_refund]].concat(),
+                vec![settle],
+                vec![to_raindex],
+            ),
+        ];
+
+        for (direction, tail, named, unnamed) in cases {
+            let pool = crate::test_utils::setup_test_db().await;
+            let store = test_store::<UsdcRebalance>(pool, ());
+            let id = UsdcRebalanceId(Uuid::new_v4());
+            let withdrawal = match direction {
+                RebalanceDirection::BaseToAlpaca => {
+                    TransferRef::OnchainTx(TxHash::repeat_byte(0x77))
+                }
+                RebalanceDirection::AlpacaToBase => {
+                    TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4()))
+                }
+            };
+            let head = [
+                UsdcRebalanceCommand::Initiate {
+                    corridor: ROBINHOOD_RELAY,
+                    direction,
+                    amount: usdc(100),
+                    withdrawal,
+                },
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: Some(TxHash::repeat_byte(0x78)),
+                },
+            ];
+            for command in head.into_iter().chain(tail) {
+                store.send(&id, command).await.unwrap();
+            }
+            let state = store.load(&id).await.unwrap().unwrap();
+
+            let step = relay_hold_step(&state);
+
+            for expected in named {
+                assert!(step.contains(expected), "{}: {step}", state.state_name());
+            }
+            for unexpected in unnamed {
+                assert!(!step.contains(unexpected), "{}: {step}", state.state_name());
+            }
+        }
     }
 
     /// Tracking that is current at `SwapDeposited` reads as past the hop, so
@@ -46854,5 +47250,77 @@ mod tests {
                 .contains_key(&id),
             "the sweep must not tombstone a redepositing transfer",
         );
+    }
+
+    /// Stale tracking that still reads `WithdrawalConfirmed` while an
+    /// Alpaca-to-chain Relay transfer's store is at a swap state: the USDC is
+    /// at the hub or with Relay, so the sweep holds the guard instead of
+    /// clearing it.
+    #[tokio::test]
+    async fn sweep_holds_a_stale_relay_transfer_toward_the_chain() {
+        let refund = UsdcRebalanceCommand::RecordSwapRefund {
+            refund_tx: TxHash::repeat_byte(0xe1),
+            side: RefundSide::Origin,
+            amount_refunded: U256::from(99_500_000u64),
+        };
+        let deposit = PreparedTransaction::for_test(TxHash::repeat_byte(0xa2), 6);
+        let confirm = UsdcRebalanceCommand::ConfirmSwapDeposit {
+            deposit_tx: deposit.tx_hash(),
+            deposit_block: 9,
+        };
+
+        let reverted = UsdcRebalanceCommand::RecordSwapDepositReverted {
+            deposit_tx: deposit.tx_hash(),
+        };
+
+        for (after_pair, expected) in [
+            (vec![reverted], "SwapQuoted"),
+            (vec![], "SwapDepositPrepared"),
+            (vec![confirm.clone()], "SwapDeposited"),
+            (vec![confirm, refund], "SwapRefunded"),
+        ] {
+            let pool = crate::test_utils::setup_test_db().await;
+            let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+            let id = UsdcRebalanceId(Uuid::new_v4());
+            crate::usdc_rebalance::record_swap_pair_for_test(
+                &store,
+                &id,
+                RebalanceDirection::AlpacaToBase,
+                ROBINHOOD_RELAY,
+                None,
+                deposit.clone(),
+            )
+            .await;
+            for command in after_pair {
+                store.send(&id, command).await.unwrap();
+            }
+            assert_eq!(
+                store.load(&id).await.unwrap().unwrap().state_name(),
+                expected
+            );
+
+            let trigger = sweep_timed_out_relay_transfer_toward(
+                &pool,
+                store,
+                &id,
+                usdc(100),
+                usdc::UsdcRebalanceStage::WithdrawalConfirmed,
+                RebalanceDirection::AlpacaToBase,
+            )
+            .await;
+
+            assert!(
+                trigger.usdc_guards.is_held(Chain::Robinhood),
+                "the guard must stay held at {expected}",
+            );
+            assert!(
+                !trigger
+                    .timed_out_usdc_rebalances
+                    .read()
+                    .await
+                    .contains_key(&id),
+                "the sweep must not tombstone a transfer held at {expected}",
+            );
+        }
     }
 }

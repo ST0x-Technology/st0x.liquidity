@@ -185,6 +185,14 @@ alert_kinds! {
         RelayEscrowUnresolved => "Relay deposit has no fill and no refund past its fill window",
         RelayRedepositFailed => "The redeposit into the vault was dropped, reverted or refused",
         RelaySwapPaymentUnverified => "check the order with Relay's status API",
+        RelayHubQuoteRefused => "Relay refused the binding quote from the hub",
+        RelayHubDepositsKeptReverting => "Relay deposits from the hub kept reverting",
+        RelayHubRequoteRefused => "Relay refused the re-quote from the hub",
+        RelayRefundedToChainWallet => "Relay refunded the deposit in the chain's stable to the chain wallet",
+        RelayHubRefundPastBudget => "Relay refunded an Alpaca-to-chain deposit at the hub past the corridor's re-quote budget or below its minimum",
+        RelayHubRefundQuoteRefused => "Relay refused the quote for a refund at the hub",
+        ReconciledTransferHoldsRelayEnvelopes => "Reconciled a USDC transfer that holds signed Relay envelopes",
+        RelayQuoteKeepsFailing => "Relay quotes keep failing transiently for a transfer past its withdrawal",
     }
 }
 

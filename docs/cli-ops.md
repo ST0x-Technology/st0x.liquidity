@@ -910,9 +910,11 @@ The job takes a fresh binding quote (or re-quotes an expired one) and signs the
 deposit; when Relay refuses the quote it puts the USDG back into the vault
 (`Redepositing` -> `ReturnedToSource`), which releases the guard; USDC dispatch
 then waits for a fresh Robinhood vault read, and Robinhood chain-to-Alpaca
-planning for the 30-minute withdraw cooldown, also across a restart. A transient
-quote failure (transport, rate limit) leaves the transfer where it was for the
-next resume. The other Relay holds:
+planning for the 30-minute withdraw cooldown, also across a restart. After a
+transient quote failure (transport, a Relay 5xx, a transient error code) the job
+quotes again 30 seconds later, and pages once if that lasts 30 minutes ("Relay
+quotes keep failing transiently"); after a rate limit it quotes again once
+Relay's `Retry-After` has passed. The other Relay holds:
 
 - `SwapEscrowUnresolved` (the fill window passed with no fill or refund) keeps
   the guard and pages, and the bot stops reading Relay. `transfer resume` reads
@@ -966,6 +968,21 @@ next resume. The other Relay holds:
   `transfer reconcile --kind usdc --id <uuid> --reason funds-moved-manually`:
   reconciling first leaves the refund outside both venues while the inventory
   counts it as spent.
+- A pending Relay approve or deposit (`SwapDepositPrepared`, on the Robinhood
+  wallet or on the shared Ethereum wallet): never cancel or replace it at its
+  nonce, as the playbooks for a stuck deposit send or burn do. This build has no
+  exit for a cancelled pair: `transfer reconcile` and `fail-usdc-transfer`
+  refuse the state and a resume sends the same bytes again, so the guard stays
+  held. Let it mine, or escalate.
+- An Alpaca->Robinhood `SwapQuoted` or `SwapRefunded`: `transfer reconcile`
+  accepts it even while its job still quotes or signs (the CLI preflight and the
+  API take it as reconcilable; the dashboard shows it as bridging, with no
+  reconcile action). Reconcile only after its hold page ("Relay refused the
+  re-quote from the hub", "Relay deposits from the hub kept reverting", "past
+  the corridor's re-quote budget", "Relay refused the quote for a refund at the
+  hub"). A `SwapQuoted` whose approves went out alone then pages "Reconciled a
+  USDC transfer that holds signed Relay envelopes": restart the bot to release
+  their nonces.
 - `Redepositing` whose vault deposit does not confirm (paged "The redeposit into
   the vault was dropped, reverted or refused"): `transfer reconcile` accepts
   every `Redepositing` in this build, also one whose vault deposit is still
@@ -1623,18 +1640,28 @@ before the startup token approvals.
   confirm, follow the not-confirmed page above.
 - **"Startup token approvals deferred on this chain"** (warning, not a page,
   target `orderbook`, with `chain`): a signed send restored at startup on that
-  chain (an Alpaca deposit send, or a vault withdrawal) is not mined yet: its
-  rebroadcast failed, or it is pending, possibly at a fee too low to confirm. An
-  approval would wait behind its nonce, so startup grants none there and skips
-  that chain's stale-allowance revokes. Wraps and deposits still approve on
-  demand. The `rebalance` log names the send: "Restored Alpaca deposit send is
-  not mined yet at startup" (with `id` and `tx`), "Restored vault withdrawal is
-  not mined yet at startup" (with `redemption_id` and `tx_hash`), or a
-  rebroadcast page: the deposit send page above, or **"Equity redemption `<id>`
-  has a signed vault withdrawal ... that could not be rebroadcast at startup"**,
-  whose resume job broadcasts the withdrawal again. If the send stays pending,
-  it will not confirm at its fee: for a deposit send follow the not-confirmed
-  page above (wait for fees to drop, or cancel it at its nonce).
+  chain (an Alpaca deposit send, a vault withdrawal, or a Relay approve or
+  deposit, which counts as mined only with its confirmations in a canonical
+  block) is not mined yet: its rebroadcast failed, or it is pending, possibly at
+  a fee too low to confirm. An approval would wait behind its nonce, so startup
+  grants none there and skips that chain's stale-allowance revokes. Wraps and
+  deposits still approve on demand. The `rebalance` log names the send:
+  "Restored Alpaca deposit send is not mined yet at startup" (with `id` and
+  `tx`), "Restored vault withdrawal is not mined yet at startup" (with
+  `redemption_id` and `tx_hash`), "Restored Relay envelope is not mined yet at
+  startup" (with `id` and `tx`), or a rebroadcast page: the deposit send page
+  above, or **"Equity redemption `<id>` has a signed vault withdrawal ... that
+  could not be rebroadcast at startup"**, whose resume job broadcasts the
+  withdrawal again. If the send stays pending, it will not confirm at its fee:
+  for a deposit send follow the not-confirmed page above (wait for fees to drop,
+  or cancel it at its nonce).
+- **"Cannot tell whether a signed Relay pair was persisted"** or **"Cannot tell
+  whether a lone Relay approve was persisted"** (`operational_alert`): a Relay
+  pair or approve write failed and the reload that checks it failed too or
+  showed an unexpected state. The bot keeps their nonces reserved, so later
+  sends from that wallet (the Ethereum wallet for an Alpaca->Robinhood transfer)
+  wait behind them. Fix the database, then restart the bot: startup reserves
+  them again only if they were persisted.
 - **"Cannot tell whether a signed Alpaca deposit send was persisted"**
   (`operational_alert`): a `PrepareDepositSend` write failed and the reload that
   checks it failed too. The bot keeps the send's nonce reserved, so later sends

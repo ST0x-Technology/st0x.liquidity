@@ -61,7 +61,8 @@ use crate::bot_gas::redrive::BotGasFailureClassifier;
 use crate::inventory::InventoryViewError;
 use crate::native_gas::GasReadinessFailure;
 use crate::usdc_rebalance::{
-    BurnTxOwnershipLookupError, RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceId,
+    BurnTxOwnershipLookupError, RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceError,
+    UsdcRebalanceId,
 };
 
 #[derive(Debug, Error)]
@@ -320,13 +321,6 @@ pub enum UsdcTransferError {
     },
     #[error(transparent)]
     BasisPoints(#[from] BasisPointsOutOfRange),
-    /// The Relay hop runs chain-to-Alpaca only in this build; refused before
-    /// any call.
-    #[error("USDC rebalance {id}: the Relay hop does not run {direction} yet; nothing was sent")]
-    SwapDirectionNotBuilt {
-        id: UsdcRebalanceId,
-        direction: RebalanceDirection,
-    },
     #[error("Relay API error: {0}")]
     RelayApi(#[from] Box<RelayError>),
     #[error("Relay bridge error: {0}")]
@@ -337,6 +331,14 @@ pub enum UsdcTransferError {
         id: UsdcRebalanceId,
         #[source]
         source: QuoteAcceptanceError,
+    },
+    /// The first deposit's refund floor, which a re-quote must reach, does
+    /// not compute; the quote is refused.
+    #[error("USDC rebalance {id}: the first deposit's refund floor does not compute: {source}")]
+    RefundFloorUndefined {
+        id: UsdcRebalanceId,
+        #[source]
+        source: Box<UsdcRebalanceError>,
     },
     /// Another send took a nonce between the swap's approve and deposit: the
     /// approve went out alone and the next attempt signs the deposit again.
@@ -390,6 +392,14 @@ pub enum UsdcTransferError {
         id: UsdcRebalanceId,
         #[source]
         source: Box<RelayBridgeError>,
+    },
+    /// Relay's quote of a transfer past its withdrawal failed in transport or
+    /// at Relay's server: the job quotes again later at no retry cost.
+    #[error("USDC rebalance {id}: Relay quote failed transiently: {source}")]
+    SwapQuoteTransient {
+        id: UsdcRebalanceId,
+        #[source]
+        source: Box<RelayError>,
     },
     #[error(
         "USDC transfer corridor mismatch: transfer {id} runs on the {recorded} corridor, \
@@ -857,10 +867,10 @@ impl UsdcTransferError {
             | Self::DepositSendLookup { .. }
             | Self::StateOffHop { .. }
             | Self::BasisPoints(_)
-            | Self::SwapDirectionNotBuilt { .. }
             | Self::RelayApi(_)
             | Self::RelayBridge(_)
             | Self::SwapQuoteOutOfBounds { .. }
+            | Self::RefundFloorUndefined { .. }
             | Self::SwapPairSplit { .. }
             | Self::SwapPrepareTaskPanicked { .. }
             | Self::SwapPrepareTimedOut { .. }
@@ -868,6 +878,7 @@ impl UsdcTransferError {
             | Self::RelayFillPending { .. }
             | Self::SwapDepositReverted { .. }
             | Self::SwapPaymentUnverified { .. }
+            | Self::SwapQuoteTransient { .. }
             | Self::EthereumChainMissing(_) => None,
         }
     }
@@ -940,10 +951,10 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::DepositSendLookup { .. }
             | Self::StateOffHop { .. }
             | Self::BasisPoints(_)
-            | Self::SwapDirectionNotBuilt { .. }
             | Self::RelayApi(_)
             | Self::RelayBridge(_)
             | Self::SwapQuoteOutOfBounds { .. }
+            | Self::RefundFloorUndefined { .. }
             | Self::SwapPairSplit { .. }
             | Self::SwapPrepareTaskPanicked { .. }
             | Self::SwapPrepareTimedOut { .. }
@@ -951,6 +962,7 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::RelayFillPending { .. }
             | Self::SwapDepositReverted { .. }
             | Self::SwapPaymentUnverified { .. }
+            | Self::SwapQuoteTransient { .. }
             | Self::EthereumChainMissing(_) => false,
         }
     }

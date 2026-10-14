@@ -1,22 +1,32 @@
-//! The Relay hop of a cash transfer: the corridor chain's stable deposited
-//! into Relay's depository, paid out by Relay's solver at the Ethereum hub.
+//! The Relay hop of a cash transfer: one end's stable deposited into Relay's
+//! depository, paid out by Relay's solver at the other end.
 //!
-//! This build runs the chain-to-Alpaca side: a pre-flight quote, the vault
-//! withdraw, the binding quote (`SwapQuoted`), the approve and deposit signed
-//! and persisted together (`SwapDepositPrepared`), their broadcast, the
-//! deposit confirmed (`SwapDeposited`), then one Relay status read per
-//! attempt until a proven fill (`Bridged`, then the Alpaca deposit) or a
-//! proven refund. A refused quote, a spent budget of reverted deposits, or a
-//! refund on the origin chain returns the stable to the vault
-//! (`Redepositing` -> `ReturnedToSource`); a refund below its refund floor
-//! holds at `SwapRefunded` for the operator.
+//! Chain-to-Alpaca: a pre-flight quote, the vault withdraw, the binding quote
+//! (`SwapQuoted`), the approve and deposit signed and persisted together
+//! (`SwapDepositPrepared`), their broadcast, the deposit confirmed
+//! (`SwapDeposited`), then one Relay status read per attempt until a proven
+//! fill (`Bridged`, then the Alpaca deposit) or a proven refund. A refused
+//! quote, a spent budget of reverted deposits, or a refund on the origin
+//! chain returns the stable to the vault (`Redepositing` ->
+//! `ReturnedToSource`).
+//!
+//! Alpaca-to-chain: a pre-flight quote, the USD conversion and the Alpaca
+//! withdrawal to the hub, then the same swap states with the pair signed on
+//! the shared Ethereum wallet under its deposit-send lock, and a proven fill
+//! deposited into the chain's vault. A refund at the hub is quoted again
+//! within the corridor's bounds and the first deposit's refund floor;
+//! everything else that cannot go on holds the
+//! USDC at the hub, guard held, for `transfer reconcile`.
+//!
+//! In either direction a refund below its refund floor holds at
+//! `SwapRefunded` for the operator.
 
 use alloy::primitives::{Address, B256, TxHash, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, PoisonError};
 use std::time::{Duration, SystemTime};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::task::{JoinError, JoinHandle};
@@ -51,23 +61,49 @@ use crate::bot_gas::BotGasOperationCategory;
 use crate::native_gas::TransferGasRoute;
 use crate::rebalancing::equity::RecheckOutcome;
 use crate::usdc_rebalance::{
-    RebalanceDirection, RedepositReason, RefundSide, SwapQuote, SwapStep, UsdcRebalance,
-    UsdcRebalanceCommand, UsdcRebalanceId, prepared_swap_ids,
+    FirstDeposit, RebalanceDirection, RedepositReason, RefundSide, SwapQuote, SwapStep,
+    TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId, prepared_swap_ids,
 };
 
 /// One Relay corridor's hop: the bridge that signs the deposit and proves
 /// the payment, the API client that quotes, the corridor's bounds, and the
 /// lock that serializes the signing of a pair on the corridor chain's wallet.
+/// A pair signed on the Ethereum wallet takes the service's deposit-send lock
+/// instead, which every corridor's service shares.
 pub(crate) struct RelayHop<Signer> {
     bridge: RelayBridge<Signer, Signer>,
     client: RelayClient,
     bounds: RelayHopCtx,
-    /// Where the solver pays: our wallet at the Ethereum hub.
+    /// Our wallet at the Ethereum hub: the solver's payee toward the hub,
+    /// the depositor from it.
     hub_wallet: Address,
     /// Held by a signing, and by a re-quote or redeposit, so none of them
     /// sends from the chain wallet above nonces a late signing still holds.
     chain_send_prepare: Arc<Mutex<()>>,
+    /// Transfers whose refused binding quote from the hub this process has
+    /// paged: the sweep re-arms them, and each run quotes again.
+    paged_hub_quote_refusals: std::sync::Mutex<HashSet<UsdcRebalanceId>>,
+    /// When each transfer's quotes started failing transiently in this
+    /// process, and whether that has been paged; cleared by a quote.
+    failing_quotes: std::sync::Mutex<HashMap<UsdcRebalanceId, FailingQuotes>>,
 }
+
+/// A run of transient quote failures of one transfer, from `since` to
+/// `last`.
+#[derive(Debug, Clone, Copy)]
+struct FailingQuotes {
+    since: Instant,
+    last: Instant,
+    paged: bool,
+}
+
+/// How long a transfer's quotes may fail transiently, re-queued every 30
+/// seconds, before it pages.
+const QUOTE_FAILING_PAGE_AFTER: Duration = Duration::from_secs(30 * 60);
+
+/// A failure this long after the last one starts a new run: the job, which
+/// re-queues every 30 seconds, stopped in between.
+const QUOTE_FAILING_RUN_GAP: Duration = Duration::from_secs(5 * 60);
 
 impl<Signer> RelayHop<Signer> {
     pub(crate) fn new(
@@ -82,26 +118,105 @@ impl<Signer> RelayHop<Signer> {
             bounds,
             hub_wallet,
             chain_send_prepare: Arc::new(Mutex::new(())),
+            paged_hub_quote_refusals: std::sync::Mutex::new(HashSet::new()),
+            failing_quotes: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// A quote failure of `id` past its withdrawal, for the job: a transient
+    /// Relay failure (transport, a 5xx, a transient code) becomes
+    /// `SwapQuoteTransient`, re-queued at no retry cost, and pages once it
+    /// has lasted `QUOTE_FAILING_PAGE_AFTER`. Anything else, a rate limit
+    /// included, is left as it is.
+    fn transient_swap_quote(
+        &self,
+        id: &UsdcRebalanceId,
+        error: UsdcTransferError,
+    ) -> UsdcTransferError {
+        let UsdcTransferError::RelayApi(relay) = error else {
+            return error;
+        };
+        if !relay.is_transient() {
+            return UsdcTransferError::RelayApi(relay);
+        }
+
+        let mut failing = self
+            .failing_quotes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        let entry = failing.entry(id.clone()).or_insert(FailingQuotes {
+            since: now,
+            last: now,
+            paged: false,
+        });
+        if now.duration_since(entry.last) >= QUOTE_FAILING_RUN_GAP {
+            *entry = FailingQuotes {
+                since: now,
+                last: now,
+                paged: false,
+            };
+        }
+        entry.last = now;
+        let failing_for = now.duration_since(entry.since);
+        let page = !entry.paged && failing_for >= QUOTE_FAILING_PAGE_AFTER;
+        entry.paged |= page;
+        drop(failing);
+        if page {
+            error!(target: "operational_alert", alert = true, kind = AlertKind::RelayQuoteKeepsFailing.as_str(), %id, error = %relay, ?failing_for, "Relay quotes keep failing transiently for a transfer past its withdrawal; the transfer holds its guard and the job quotes again later");
+        }
+
+        UsdcTransferError::SwapQuoteTransient {
+            id: id.clone(),
+            source: relay,
+        }
+    }
+
+    /// Forgets `id`'s transient quote failures once a quote ends any other
+    /// way, so a later run of them is timed and paged afresh.
+    fn forget_failing_quotes(&self, id: &UsdcRebalanceId) {
+        self.failing_quotes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id);
+    }
+
+    /// Whether this is the first refusal of `id`'s binding quote from the
+    /// hub in this process.
+    fn first_hub_quote_refusal(&self, id: &UsdcRebalanceId) -> bool {
+        self.paged_hub_quote_refusals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id.clone())
     }
 }
 
 /// The chain-to-Alpaca side of a Relay hop: the corridor chain is the origin.
 const TO_HUB: HopDirection = HopDirection::ToHub;
 
+/// The side of the hop a transfer in `direction` swaps on: chain-to-Alpaca
+/// toward the hub, Alpaca-to-chain from it.
+const fn hop_direction(direction: RebalanceDirection) -> HopDirection {
+    match direction {
+        RebalanceDirection::BaseToAlpaca => HopDirection::ToHub,
+        RebalanceDirection::AlpacaToBase => HopDirection::FromHub,
+    }
+}
+
 impl<Signer: Wallet> RelayHop<Signer> {
-    /// The chain wallet's prepare lock, waited for up to `quote_max_age`: a
-    /// signing that outlasted its attempt holds it until its nonces are
+    /// The origin wallet's prepare `lock`, waited for up to `quote_max_age`:
+    /// a signing that outlasted its attempt holds it until its nonces are
     /// released.
     async fn lock_prepare(
         &self,
         id: &UsdcRebalanceId,
+        lock: Arc<Mutex<()>>,
     ) -> Result<OwnedMutexGuard<()>, UsdcTransferError> {
         let timeout = self.bounds.quote_max_age;
-        tokio::time::timeout(timeout, Arc::clone(&self.chain_send_prepare).lock_owned())
+        tokio::time::timeout(timeout, lock.lock_owned())
             .await
             .map_err(|_elapsed| {
-                warn!(target: "rebalance", %id, ?timeout, "A late Relay pair signing still holds the chain wallet's prepare lock; the retry waits for its nonces");
+                warn!(target: "rebalance", %id, ?timeout, "A late Relay pair signing still holds the origin wallet's prepare lock; the retry waits for its nonces");
                 UsdcTransferError::SwapPrepareTimedOut {
                     id: id.clone(),
                     timeout,
@@ -110,8 +225,8 @@ impl<Signer: Wallet> RelayHop<Signer> {
     }
 
     /// Signs and persists the pair, or picks up the one already persisted;
-    /// `None` once the deposit is confirmed. Read and signed under the chain
-    /// wallet's prepare lock: a timed-out attempt's prepare may have
+    /// `None` once the deposit is confirmed. Read and signed under the
+    /// origin wallet's prepare `lock`: a timed-out attempt's prepare may have
     /// persisted a pair this one must send instead of signing anew. A
     /// signing that outlasts `quote_max_age` is not cancelled: it keeps the
     /// lock until its nonces are released, so no retry signs above them.
@@ -119,8 +234,10 @@ impl<Signer: Wallet> RelayHop<Signer> {
         self: &Arc<Self>,
         cqrs: &Store<UsdcRebalance>,
         id: &UsdcRebalanceId,
-    ) -> Result<Option<(PreparedSwapDeposit, B256)>, UsdcTransferError> {
-        let mut prepare = Some(self.lock_prepare(id).await?);
+        direction: HopDirection,
+        lock: Arc<Mutex<()>>,
+    ) -> Result<Option<PersistedPair>, UsdcTransferError> {
+        let mut prepare = Some(self.lock_prepare(id, lock).await?);
         let deadline = Instant::now() + self.bounds.quote_max_age;
 
         let prepared = match cqrs.load(id).await? {
@@ -130,6 +247,10 @@ impl<Signer: Wallet> RelayHop<Signer> {
                 quoted_at,
                 ..
             }) => {
+                let signing = PairSigning {
+                    direction,
+                    deadline,
+                };
                 let pair = self
                     .sign_swap_pair(
                         cqrs,
@@ -137,11 +258,15 @@ impl<Signer: Wallet> RelayHop<Signer> {
                         &quote,
                         quoted_at,
                         &split_approves,
-                        deadline,
+                        signing,
                         &mut prepare,
                     )
                     .await?;
-                Ok(Some((pair, quote.order_id)))
+                Ok(Some(PersistedPair {
+                    pair,
+                    order_id: quote.order_id,
+                    split_approves,
+                }))
             }
             Some(UsdcRebalance::SwapDepositPrepared {
                 quote,
@@ -150,12 +275,13 @@ impl<Signer: Wallet> RelayHop<Signer> {
                 deposit,
                 ..
             }) => {
-                self.broadcast_split_approves(id, &split_approves, deadline)
+                self.broadcast_split_approves(id, &split_approves, direction, deadline)
                     .await?;
-                Ok(Some((
-                    PreparedSwapDeposit { approve, deposit },
-                    quote.order_id,
-                )))
+                Ok(Some(PersistedPair {
+                    pair: PreparedSwapDeposit { approve, deposit },
+                    order_id: quote.order_id,
+                    split_approves,
+                }))
             }
             Some(UsdcRebalance::SwapDeposited { .. }) => Ok(None),
             None => Err(UsdcTransferError::StateOffHop {
@@ -210,10 +336,13 @@ impl<Signer: Wallet> RelayHop<Signer> {
         quote: &SwapQuote,
         quoted_at: DateTime<Utc>,
         split_approves: &[PreparedTransaction],
-        deadline: Instant,
+        PairSigning {
+            direction,
+            deadline,
+        }: PairSigning,
         prepare: &mut Option<OwnedMutexGuard<()>>,
     ) -> Result<PreparedSwapDeposit, UsdcTransferError> {
-        self.broadcast_split_approves(id, split_approves, deadline)
+        self.broadcast_split_approves(id, split_approves, direction, deadline)
             .await?;
 
         // The attempt re-quotes an expired quote before it gets here; one
@@ -230,7 +359,9 @@ impl<Signer: Wallet> RelayHop<Signer> {
         // After a split the allowance may already cover the deposit: the
         // bridge reads it and signs an approve only when it falls short.
         let relay_quote = relay_quote(id, quote, split_approves.is_empty(), &self.bounds)?;
-        let prepared = self.sign_before(id, relay_quote, deadline, prepare).await?;
+        let prepared = self
+            .sign_before(id, relay_quote, direction, deadline, prepare)
+            .await?;
 
         match prepared {
             PreparedSwap::Deposit(pair)
@@ -238,7 +369,7 @@ impl<Signer: Wallet> RelayHop<Signer> {
             {
                 warn!(target: "rebalance", %id, %quoted_at, deadline = %quote.deadline, max_age = ?self.bounds.quote_max_age, "Relay quote expired while its pair was signed; releasing its nonces, the transfer holds its guard at SwapQuoted");
                 self.bridge
-                    .discard_prepared(TO_HUB, &PreparedSwap::Deposit(pair))
+                    .discard_prepared(direction, &PreparedSwap::Deposit(pair))
                     .await;
                 Err(UsdcTransferError::SwapQuoteExpired {
                     id: id.clone(),
@@ -247,16 +378,17 @@ impl<Signer: Wallet> RelayHop<Signer> {
                 })
             }
             PreparedSwap::Deposit(pair) => {
-                self.persist_swap_pair(cqrs, id, &pair).await?;
+                self.persist_swap_pair(cqrs, id, &pair, direction).await?;
                 Ok(pair)
             }
             PreparedSwap::ApproveOnly { approve } => {
-                self.persist_lone_approve(cqrs, id, &approve).await?;
+                self.persist_lone_approve(cqrs, id, &approve, direction)
+                    .await?;
                 // Persisted: a retry sends it again if this times out.
                 self.before(
                     id,
                     deadline,
-                    self.bridge.broadcast_approve(TO_HUB, &approve),
+                    self.bridge.broadcast_approve(direction, &approve),
                 )
                 .await?
                 .map_err(Box::new)?;
@@ -274,12 +406,13 @@ impl<Signer: Wallet> RelayHop<Signer> {
         self: &Arc<Self>,
         id: &UsdcRebalanceId,
         quote: AcceptedRelayQuote,
+        direction: HopDirection,
         deadline: Instant,
         prepare: &mut Option<OwnedMutexGuard<()>>,
     ) -> Result<PreparedSwap, UsdcTransferError> {
         let hop = Arc::clone(self);
         let mut signing =
-            tokio::spawn(async move { hop.bridge.prepare_deposit(TO_HUB, &quote).await });
+            tokio::spawn(async move { hop.bridge.prepare_deposit(direction, &quote).await });
 
         match tokio::time::timeout_at(deadline, &mut signing).await {
             Ok(Ok(prepared)) => Ok(prepared.map_err(Box::new)?),
@@ -290,7 +423,7 @@ impl<Signer: Wallet> RelayHop<Signer> {
                 let held = prepare.take();
                 tokio::spawn(async move {
                     let _held = held;
-                    hop.discard_late_signing(&late_id, signing).await;
+                    hop.discard_late_signing(&late_id, signing, direction).await;
                 });
                 Err(self.prepare_timed_out(id))
             }
@@ -302,11 +435,12 @@ impl<Signer: Wallet> RelayHop<Signer> {
         &self,
         id: &UsdcRebalanceId,
         signing: JoinHandle<Result<PreparedSwap, RelayBridgeError>>,
+        direction: HopDirection,
     ) {
         match signing.await {
             Ok(Ok(prepared)) => {
                 warn!(target: "rebalance", %id, "Releasing the nonces of a Relay pair signed after its prepare timed out");
-                self.bridge.discard_prepared(TO_HUB, &prepared).await;
+                self.bridge.discard_prepared(direction, &prepared).await;
             }
             Ok(Err(error)) => {
                 warn!(target: "rebalance", %id, ?error, "A timed-out Relay pair signing failed; it holds no nonce");
@@ -346,12 +480,13 @@ impl<Signer: Wallet> RelayHop<Signer> {
         &self,
         id: &UsdcRebalanceId,
         split_approves: &[PreparedTransaction],
+        direction: HopDirection,
         deadline: Instant,
     ) -> Result<(), UsdcTransferError> {
         self.before(id, deadline, async {
             for approve in split_approves {
                 self.bridge
-                    .broadcast_approve(TO_HUB, approve)
+                    .broadcast_approve(direction, approve)
                     .await
                     .map_err(Box::new)?;
             }
@@ -368,6 +503,7 @@ impl<Signer: Wallet> RelayHop<Signer> {
         cqrs: &Store<UsdcRebalance>,
         id: &UsdcRebalanceId,
         pair: &PreparedSwapDeposit,
+        direction: HopDirection,
     ) -> Result<(), UsdcTransferError> {
         let Err(error) = cqrs
             .send(
@@ -389,16 +525,17 @@ impl<Signer: Wallet> RelayHop<Signer> {
                 warn!(target: "rebalance", %id, ?error, "The failed Relay pair write committed; sending it");
                 Ok(())
             }
-            Ok(Some(UsdcRebalance::SwapQuoted { .. })) => {
+            // A reconciled transfer is never resumed, so nothing sends it.
+            Ok(Some(UsdcRebalance::SwapQuoted { .. } | UsdcRebalance::Reconciled { .. })) => {
                 warn!(target: "rebalance", %id, ?error, "Releasing the nonces of a Relay pair that was not persisted");
                 self.bridge
-                    .discard_prepared(TO_HUB, &PreparedSwap::Deposit(pair.clone()))
+                    .discard_prepared(direction, &PreparedSwap::Deposit(pair.clone()))
                     .await;
                 Err(error.into())
             }
             reload => {
                 let reload = reload.map(|state| state.map(|state| state.state_name()));
-                error!(target: "operational_alert", alert = true, kind = AlertKind::RelayPairPersistenceUnknown.as_str(), %id, deposit = %pair.deposit.tx_hash(), ?reload, "Cannot tell whether a signed Relay pair was persisted; its nonces stay reserved and later sends from the chain wallet wait behind them until a restart");
+                error!(target: "operational_alert", alert = true, kind = AlertKind::RelayPairPersistenceUnknown.as_str(), %id, deposit = %pair.deposit.tx_hash(), ?reload, ?direction, "Cannot tell whether a signed Relay pair was persisted; its nonces stay reserved and later sends from the origin wallet wait behind them until a restart");
                 Err(error.into())
             }
         }
@@ -411,6 +548,7 @@ impl<Signer: Wallet> RelayHop<Signer> {
         cqrs: &Store<UsdcRebalance>,
         id: &UsdcRebalanceId,
         approve: &PreparedTransaction,
+        direction: HopDirection,
     ) -> Result<(), UsdcTransferError> {
         let Err(error) = cqrs
             .send(
@@ -430,10 +568,11 @@ impl<Signer: Wallet> RelayHop<Signer> {
             {
                 Ok(())
             }
-            Ok(Some(UsdcRebalance::SwapQuoted { .. })) => {
+            // Even persisted, a reconciled transfer's approve is never sent.
+            Ok(Some(UsdcRebalance::SwapQuoted { .. } | UsdcRebalance::Reconciled { .. })) => {
                 self.bridge
                     .discard_prepared(
-                        TO_HUB,
+                        direction,
                         &PreparedSwap::ApproveOnly {
                             approve: approve.clone(),
                         },
@@ -607,9 +746,151 @@ where
         }
     }
 
-    /// A fresh chain-to-Alpaca transfer. The pre-flight quote runs before
-    /// anything is recorded, so a refusal moves nothing.
-    async fn execute_chain_to_alpaca_via_relay(
+    /// Drives an Alpaca-to-chain transfer on a Relay corridor from its
+    /// recorded state. A state the Relay hop never reaches from the hub is
+    /// refused.
+    pub(crate) async fn resume_alpaca_to_chain_via_relay(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        corridor: UsdcCorridor,
+    ) -> Result<(), UsdcTransferError> {
+        let state = self.cqrs.load(id).await?;
+        self.require_served_corridor(id, corridor, state.as_ref())?;
+
+        info!(target: "rebalance", ?state, "Resuming Alpaca->chain transfer over Relay");
+
+        if let Some(state) = &state
+            && state.direction() == RebalanceDirection::BaseToAlpaca
+        {
+            return Err(UsdcTransferError::ResumeDirectionMismatch {
+                id: id.clone(),
+                direction: RebalanceDirection::BaseToAlpaca,
+            });
+        }
+
+        match state {
+            None => self.execute_alpaca_to_chain_via_relay(id, amount).await,
+
+            // Conversion placement fails fast, so a resume here means a crash
+            // between `InitiateConversion` and its outcome: the broker order
+            // id is not persisted, so it fails for reconciliation, as on CCTP.
+            Some(UsdcRebalance::Converting { .. }) => {
+                self.fail_conversion(
+                    id,
+                    "resume from Converting state requires manual reconciliation: broker \
+                     order ID not persisted"
+                        .into(),
+                )
+                .await?;
+                Err(UsdcTransferError::ResumeIndeterminateConversion { id: id.clone() })
+            }
+
+            Some(UsdcRebalance::ConversionComplete { conversion, .. }) => {
+                let converted = conversion.received_amount;
+                let transfer = self.initiate_alpaca_withdrawal(id, converted).await?;
+                let withdrawal_tx = self
+                    .poll_and_confirm_withdrawal(id, &transfer.id, Utc::now())
+                    .await?;
+                self.quote_swap_from_hub(id, converted, Some(withdrawal_tx), Utc::now())
+                    .await
+            }
+
+            Some(UsdcRebalance::Withdrawing {
+                amount,
+                withdrawal_ref,
+                initiated_at,
+                ..
+            }) => {
+                let TransferRef::AlpacaId(transfer_id) = withdrawal_ref else {
+                    return Err(UsdcTransferError::WithdrawalRefMustBeAlpacaId { id: id.clone() });
+                };
+                let withdrawal_tx = self
+                    .poll_and_confirm_withdrawal(id, &transfer_id, initiated_at)
+                    .await?;
+                self.quote_swap_from_hub(id, amount, Some(withdrawal_tx), Utc::now())
+                    .await
+            }
+
+            Some(UsdcRebalance::WithdrawalComplete {
+                amount,
+                withdrawal_tx,
+                confirmed_at,
+                ..
+            }) => {
+                self.quote_swap_from_hub(id, amount, withdrawal_tx, confirmed_at)
+                    .await
+            }
+
+            Some(UsdcRebalance::SwapQuoted { .. } | UsdcRebalance::SwapDepositPrepared { .. }) => {
+                self.send_swap_deposit(id).await
+            }
+
+            Some(
+                UsdcRebalance::SwapDeposited { .. } | UsdcRebalance::SwapEscrowUnresolved { .. },
+            ) => self.read_relay_payment(id).await,
+
+            Some(UsdcRebalance::SwapRefunded {
+                side: RefundSide::Origin,
+                ..
+            }) => self.requote_refund_toward_chain(id).await,
+
+            Some(UsdcRebalance::SwapRefunded {
+                side: RefundSide::Destination,
+                refund_tx,
+                amount_refunded,
+                ..
+            }) => {
+                if self.hold_short_refund(id).await? {
+                    return Ok(());
+                }
+                warn!(target: "rebalance", %id, %refund_tx, %amount_refunded, "Relay refunded the deposit in the chain's stable to the chain wallet; the transfer holds its guard for the operator to move it and reconcile");
+                Ok(())
+            }
+
+            Some(UsdcRebalance::Bridged {
+                amount_received, ..
+            }) => {
+                self.continue_alpaca_to_base_from_bridged(id, amount_received)
+                    .await
+            }
+
+            Some(UsdcRebalance::DepositInitiated { deposit_ref, .. }) => {
+                self.resume_alpaca_to_base_deposit_initiated(id, deposit_ref)
+                    .await
+            }
+
+            Some(UsdcRebalance::DepositConfirmed { .. } | UsdcRebalance::Reconciled { .. }) => {
+                Ok(())
+            }
+
+            Some(
+                UsdcRebalance::WithdrawalFailed { .. }
+                | UsdcRebalance::BridgingFailed { .. }
+                | UsdcRebalance::DepositFailed { .. }
+                | UsdcRebalance::ConversionFailed { .. }
+                | UsdcRebalance::SwapFailed { .. },
+            ) => Err(UsdcTransferError::PreviouslyFailedAggregate { id: id.clone() }),
+
+            Some(
+                state @ (UsdcRebalance::WithdrawalSubmitting { .. }
+                | UsdcRebalance::BridgingSubmitting { .. }
+                | UsdcRebalance::Bridging { .. }
+                | UsdcRebalance::AwaitingAttestation { .. }
+                | UsdcRebalance::Attested { .. }
+                | UsdcRebalance::Redepositing { .. }
+                | UsdcRebalance::ReturnedToSource { .. }),
+            ) => Err(UsdcTransferError::StateOffHop {
+                id: id.clone(),
+                state: state.state_name(),
+                hop: HopKind::Relay,
+            }),
+        }
+    }
+
+    /// A fresh Alpaca-to-chain transfer. The pre-flight quote runs before the
+    /// USD conversion, so a refusal moves nothing.
+    async fn execute_alpaca_to_chain_via_relay(
         &self,
         id: &UsdcRebalanceId,
         amount: Usdc,
@@ -618,32 +899,52 @@ where
             .ensure_ready(TransferGasRoute::Usdc)
             .await?;
 
-        let amount_u256 = usdc_to_u256(amount)?;
-        let preflight = self.accepted_quote(id, amount_u256).await?;
-        info!(target: "rebalance", %id, %amount, request_id = %preflight.request_id(), "Relay pre-flight quote accepted");
+        let preflight = self
+            .accepted_quote(id, usdc_to_u256(amount)?, HopDirection::FromHub, None)
+            .await?;
+        info!(target: "rebalance", %id, %amount, request_id = %preflight.request_id(), "Relay pre-flight quote from the hub accepted");
 
-        self.withdraw_from_vault(id, amount, amount_u256).await?;
-        self.quote_swap_after_withdrawal(id, amount).await
+        let converted = self.execute_usd_to_usdc_conversion(id, amount).await?;
+        let transfer = self.initiate_alpaca_withdrawal(id, converted).await?;
+        let withdrawal_tx = self
+            .poll_and_confirm_withdrawal(id, &transfer.id, Utc::now())
+            .await?;
+        self.quote_swap_from_hub(id, converted, Some(withdrawal_tx), Utc::now())
+            .await
     }
 
-    /// Records the binding quote on `WithdrawalComplete` and sends the
-    /// deposit. A refused quote returns the withdrawn stable to the vault; a
-    /// transient failure leaves the transfer at `WithdrawalComplete`, guard
-    /// held, for the retry.
-    async fn quote_swap_after_withdrawal(
+    /// Records the binding quote for what the Alpaca withdrawal tx credited
+    /// at the hub, and sends the deposit. A refused quote pages and holds the
+    /// USDC at the hub, guard held at `WithdrawalComplete`: the retry quotes
+    /// again, or the operator fails and reconciles it. A transient failure is
+    /// left for the retry.
+    async fn quote_swap_from_hub(
         &self,
         id: &UsdcRebalanceId,
         amount: Usdc,
+        withdrawal_tx: Option<TxHash>,
+        confirmed_at: DateTime<Utc>,
     ) -> Result<(), UsdcTransferError> {
-        let quote = match self.binding_quote(id, usdc_to_u256(amount)?).await {
+        let (credited, withdrawal_tx) = self
+            .credited_alpaca_withdrawal(id, amount, withdrawal_tx, confirmed_at)
+            .await?;
+
+        let quote = match self
+            .binding_quote(id, credited, HopDirection::FromHub, None)
+            .await
+        {
             Ok(quote) => quote,
             Err(error) if quote_refused(&error) => {
-                warn!(target: "rebalance", %id, %error, "Binding Relay quote refused after the vault withdrawal; returning the stable to the vault");
-                return self.redeposit(id, RedepositReason::QuoteRefused).await;
+                if self.hop.first_hub_quote_refusal(id) {
+                    error!(target: "operational_alert", alert = true, kind = AlertKind::RelayHubQuoteRefused.as_str(), %id, %withdrawal_tx, %error, "Relay refused the binding quote from the hub after the Alpaca withdrawal; the transfer holds its guard at WithdrawalComplete with the USDC at the hub until it is resumed, or failed and reconciled");
+                } else {
+                    warn!(target: "rebalance", %id, %withdrawal_tx, %error, "The binding Relay quote from the hub was refused again; the transfer still holds at WithdrawalComplete");
+                }
+                return Ok(());
             }
             Err(error) => {
-                warn!(target: "rebalance", %id, %error, "Binding Relay quote failed transiently; the transfer holds its guard at WithdrawalComplete for the retry");
-                return Err(error);
+                warn!(target: "rebalance", %id, %error, "Binding Relay quote from the hub failed transiently; the transfer holds its guard at WithdrawalComplete for the retry");
+                return Err(self.hop.transient_swap_quote(id, error));
             }
         };
 
@@ -659,31 +960,102 @@ where
         self.send_swap_deposit(id).await
     }
 
-    /// An accepted quote for `amount_in`, in its persisted form, with the
-    /// origin chain's head read before it.
+    /// A fresh chain-to-Alpaca transfer. The pre-flight quote runs before
+    /// anything is recorded, so a refusal moves nothing.
+    async fn execute_chain_to_alpaca_via_relay(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+    ) -> Result<(), UsdcTransferError> {
+        self.gas_readiness
+            .ensure_ready(TransferGasRoute::Usdc)
+            .await?;
+
+        let amount_u256 = usdc_to_u256(amount)?;
+        let preflight = self.accepted_quote(id, amount_u256, TO_HUB, None).await?;
+        info!(target: "rebalance", %id, %amount, request_id = %preflight.request_id(), "Relay pre-flight quote accepted");
+
+        self.withdraw_from_vault(id, amount, amount_u256).await?;
+        self.quote_swap_after_withdrawal(id, amount).await
+    }
+
+    /// Records the binding quote on `WithdrawalComplete` and sends the
+    /// deposit. A refused quote returns the withdrawn stable to the vault; a
+    /// transient failure leaves the transfer at `WithdrawalComplete`, guard
+    /// held, for the retry.
+    async fn quote_swap_after_withdrawal(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+    ) -> Result<(), UsdcTransferError> {
+        let quote = match self
+            .binding_quote(id, usdc_to_u256(amount)?, TO_HUB, None)
+            .await
+        {
+            Ok(quote) => quote,
+            Err(error) if quote_refused(&error) => {
+                warn!(target: "rebalance", %id, %error, "Binding Relay quote refused after the vault withdrawal; returning the stable to the vault");
+                return self.redeposit(id, RedepositReason::QuoteRefused).await;
+            }
+            Err(error) => {
+                warn!(target: "rebalance", %id, %error, "Binding Relay quote failed transiently; the transfer holds its guard at WithdrawalComplete for the retry");
+                return Err(self.hop.transient_swap_quote(id, error));
+            }
+        };
+
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::QuoteSwap {
+                    quote: Box::new(quote),
+                },
+            )
+            .await?;
+
+        self.send_swap_deposit(id).await
+    }
+
+    /// An accepted quote for `amount_in` on the `direction` side, in its
+    /// persisted form, with the origin chain's head read before it.
     async fn binding_quote(
         &self,
         id: &UsdcRebalanceId,
         amount_in: U256,
+        direction: HopDirection,
+        first_deposit: Option<&FirstDeposit>,
     ) -> Result<SwapQuote, UsdcTransferError> {
         let origin_from_block = self
             .hop
             .bridge
-            .origin_block(TO_HUB)
+            .origin_block(direction)
             .await
             .map_err(Box::new)?;
-        let quote = self.accepted_quote(id, amount_in).await?;
+        let quote = self
+            .accepted_quote(id, amount_in, direction, first_deposit)
+            .await;
+        // A rate limit, backpressure of its own, leaves a run open.
+        let failing_transiently = if let Err(UsdcTransferError::RelayApi(relay)) = &quote {
+            relay.is_transient() || matches!(**relay, RelayError::RateLimited { .. })
+        } else {
+            false
+        };
+        if !failing_transiently {
+            self.hop.forget_failing_quotes(id);
+        }
+        let quote = quote?;
 
         Ok(swap_quote(&quote, &self.hop.bounds, origin_from_block))
     }
 
     /// Readies a `SwapQuoted` for signing: past the corridor's budget of
-    /// reverted deposits the stable goes back to the vault; an expired quote,
-    /// or one whose order id a deposit was already signed for, is replaced,
-    /// and a refused replacement returns the stable to the vault. `true` when
-    /// the transfer redeposited.
+    /// reverted deposits the stable goes back to the vault (or, from the hub,
+    /// the transfer holds); an expired quote, or one whose order id a deposit
+    /// was already signed for, is replaced, and a refused replacement returns
+    /// the stable to the vault (or holds). `true` when the attempt ends here.
     async fn requote_or_redeposit(&self, id: &UsdcRebalanceId) -> Result<bool, UsdcTransferError> {
         let Some(UsdcRebalance::SwapQuoted {
+            direction,
+            first_deposit,
             quote,
             quoted_at,
             signed_order_ids,
@@ -697,13 +1069,22 @@ where
 
         let max_reverts = self.hop.bounds.max_deposit_revert_redrives;
         if deposit_reverts >= max_reverts {
-            warn!(target: "rebalance", %id, deposit_reverts, max_reverts, "Relay deposits kept reverting; returning the stable to the vault");
-            self.redeposit_after_split_approves(
-                id,
-                &split_approves,
-                RedepositReason::DepositRevertsExhausted,
-            )
-            .await?;
+            match direction {
+                RebalanceDirection::BaseToAlpaca => {
+                    warn!(target: "rebalance", %id, deposit_reverts, max_reverts, "Relay deposits kept reverting; returning the stable to the vault");
+                    self.redeposit_after_split_approves(
+                        id,
+                        &split_approves,
+                        RedepositReason::DepositRevertsExhausted,
+                    )
+                    .await?;
+                }
+                RebalanceDirection::AlpacaToBase => {
+                    self.send_split_approves_from_hub(id, &split_approves)
+                        .await?;
+                    error!(target: "operational_alert", alert = true, kind = AlertKind::RelayHubDepositsKeptReverting.as_str(), %id, deposit_reverts, max_reverts, "Relay deposits from the hub kept reverting; the transfer holds its guard at SwapQuoted with the USDC at the hub until it is moved by hand and reconciled");
+                }
+            }
             return Ok(true);
         }
 
@@ -714,7 +1095,15 @@ where
         }
 
         info!(target: "rebalance", %id, signed, expired, order_id = %quote.order_id, "Re-quoting the Relay swap before signing");
-        match self.binding_quote(id, quote.amount_in).await {
+        match self
+            .binding_quote(
+                id,
+                quote.amount_in,
+                hop_direction(direction),
+                Some(&first_deposit),
+            )
+            .await
+        {
             Ok(requoted) => {
                 self.cqrs
                     .send(
@@ -727,79 +1116,147 @@ where
                 Ok(false)
             }
             Err(error) if quote_refused(&error) => {
-                warn!(target: "rebalance", %id, %error, "Relay refused the re-quote; returning the stable to the vault");
-                self.redeposit_after_split_approves(
-                    id,
-                    &split_approves,
-                    RedepositReason::QuoteRefused,
-                )
-                .await?;
+                match direction {
+                    RebalanceDirection::BaseToAlpaca => {
+                        warn!(target: "rebalance", %id, %error, "Relay refused the re-quote; returning the stable to the vault");
+                        self.redeposit_after_split_approves(
+                            id,
+                            &split_approves,
+                            RedepositReason::QuoteRefused,
+                        )
+                        .await?;
+                    }
+                    RebalanceDirection::AlpacaToBase => {
+                        self.send_split_approves_from_hub(id, &split_approves)
+                            .await?;
+                        error!(target: "operational_alert", alert = true, kind = AlertKind::RelayHubRequoteRefused.as_str(), %id, %error, "Relay refused the re-quote from the hub; the transfer holds its guard at SwapQuoted with the USDC at the hub until it is resumed, or moved by hand and reconciled");
+                    }
+                }
                 Ok(true)
             }
             Err(error) => {
                 warn!(target: "rebalance", %id, %error, "Relay re-quote failed transiently; the transfer holds its guard at SwapQuoted for the retry");
-                Err(error)
+                Err(self.hop.transient_swap_quote(id, error))
             }
         }
     }
 
-    /// A quote for `amount_in` of the chain's stable, accepted only within
-    /// the corridor's bounds.
+    /// A quote for `amount_in` of the origin stable on the `direction` side,
+    /// accepted only within the corridor's bounds and, once the transfer has
+    /// a `first_deposit`, at or above its refund floor. The depositor takes
+    /// any refund, on either chain.
     async fn accepted_quote(
         &self,
         id: &UsdcRebalanceId,
         amount_in: U256,
+        direction: HopDirection,
+        first_deposit: Option<&FirstDeposit>,
     ) -> Result<AcceptedRelayQuote, UsdcTransferError> {
         let RelayHopCtx {
             slippage_bps,
             fill_timeout,
             ..
         } = self.hop.bounds;
+        let chain = self.corridor.chain();
+        let (origin, destination, user, recipient) = match direction {
+            HopDirection::ToHub => (
+                chain,
+                Chain::Ethereum,
+                self.market_maker_wallet,
+                self.hop.hub_wallet,
+            ),
+            HopDirection::FromHub => (
+                Chain::Ethereum,
+                chain,
+                self.hop.hub_wallet,
+                self.market_maker_wallet,
+            ),
+        };
 
         let request = QuoteRequest {
-            origin: self.corridor.chain(),
-            destination: Chain::Ethereum,
+            origin,
+            destination,
             amount: amount_in,
-            user: self.market_maker_wallet,
-            recipient: self.hop.hub_wallet,
-            refund_to: self.market_maker_wallet,
+            user,
+            recipient,
+            refund_to: user,
             slippage: basis_points(slippage_bps)?,
             ttl: fill_timeout,
         };
         let quote = self.hop.client.quote(&request).await.map_err(Box::new)?;
 
-        accept_quote(id, &self.hop.bounds, |bounds| quote.accept(bounds))
+        accept_quote(id, &self.hop.bounds, first_deposit, |bounds| {
+            quote.accept(bounds)
+        })
     }
 
     /// Signs and persists the pair, or picks up the one already persisted,
     /// then broadcasts it, records the confirmed deposit and reads Relay's
     /// status once.
     async fn send_swap_deposit(&self, id: &UsdcRebalanceId) -> Result<(), UsdcTransferError> {
-        // Under the prepare lock: a re-quoted pair or a redeposit sent above
-        // the nonces of a late signing would wait behind their release.
+        let Some(direction) = self
+            .cqrs
+            .load(id)
+            .await?
+            .map(|state| hop_direction(state.direction()))
+        else {
+            return Err(UsdcTransferError::StateOffHop {
+                id: id.clone(),
+                state: "Uninitialized",
+                hop: HopKind::Relay,
+            });
+        };
+        // Under the origin wallet's prepare lock: a re-quoted pair or a
+        // redeposit sent above the nonces of a late signing would wait behind
+        // their release.
         let redeposited = {
-            let _prepare = self.hop.lock_prepare(id).await?;
+            let _prepare = self
+                .hop
+                .lock_prepare(id, self.prepare_lock(direction))
+                .await?;
             self.requote_or_redeposit(id).await?
         };
         if redeposited {
             return Ok(());
         }
 
-        let Some((pair, order_id)) = self.prepare_and_persist_swap_pair(id).await? else {
+        let Some(state) = self.cqrs.load(id).await? else {
+            return Err(UsdcTransferError::StateOffHop {
+                id: id.clone(),
+                state: "Uninitialized",
+                hop: HopKind::Relay,
+            });
+        };
+        // The shared Ethereum wallet's credits are checked before a pair is
+        // signed on it, as before a CCTP burn: a shortfall pages.
+        if let UsdcRebalance::SwapQuoted {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount,
+            ..
+        } = state
+        {
+            self.check_ethereum_credit_ledger(id, amount).await;
+        }
+
+        let Some(PersistedPair {
+            pair,
+            order_id,
+            split_approves,
+        }) = self.prepare_and_persist_swap_pair(id, direction).await?
+        else {
             return self.read_relay_payment(id).await;
         };
 
         let deposit_tx = self
             .hop
             .bridge
-            .broadcast_deposit(TO_HUB, &pair)
+            .broadcast_deposit(direction, &pair)
             .await
             .map_err(Box::new)?;
-        let split_approves = self.split_approves(id).await?;
         let confirmed = self
             .hop
             .bridge
-            .confirm_deposit(TO_HUB, RelayOrderId(order_id), &pair, &split_approves)
+            .confirm_deposit(direction, RelayOrderId(order_id), &pair, &split_approves)
             .await;
 
         // A reverted or unverified deposit was mined too, so the bot paid for
@@ -816,7 +1273,10 @@ where
             Err(_) => false,
         };
         if mined {
-            let chain = self.corridor.chain();
+            let chain = match direction {
+                HopDirection::ToHub => self.corridor.chain(),
+                HopDirection::FromHub => Chain::Ethereum,
+            };
             for approve in split_approves.iter().chain(&pair.approve) {
                 self.enqueue_bot_gas_cost(
                     chain,
@@ -872,18 +1332,28 @@ where
     /// `RelayFillPending` within the fill window, held at
     /// `SwapEscrowUnresolved` past it.
     async fn read_relay_payment(&self, id: &UsdcRebalanceId) -> Result<(), UsdcTransferError> {
-        let (quote, deposit_tx, wait) = match self.cqrs.load(id).await? {
+        let (direction, quote, deposit_tx, wait) = match self.cqrs.load(id).await? {
             Some(UsdcRebalance::SwapDeposited {
+                direction,
                 quote,
                 deposit_tx,
                 deposited_at,
                 ..
-            }) => (quote, deposit_tx, PaymentWait::FillWindow { deposited_at }),
+            }) => (
+                direction,
+                quote,
+                deposit_tx,
+                PaymentWait::FillWindow { deposited_at },
+            ),
             Some(UsdcRebalance::SwapEscrowUnresolved {
-                quote, deposit_tx, ..
-            }) => (quote, deposit_tx, PaymentWait::Unresolved),
+                direction,
+                quote,
+                deposit_tx,
+                ..
+            }) => (direction, quote, deposit_tx, PaymentWait::Unresolved),
             _ => return Ok(()),
         };
+        let side = hop_direction(direction);
         let order_id = RelayOrderId(quote.order_id);
         let past_window = wait.is_past(self.hop.bounds.fill_timeout, Utc::now());
 
@@ -905,7 +1375,7 @@ where
                 let proof = self
                     .hop
                     .bridge
-                    .verify_fill(TO_HUB, order_id, quote.minimum_out, &report.txs)
+                    .verify_fill(side, order_id, quote.minimum_out, &report.txs)
                     .await;
                 match Self::proven_payment(id, proof, past_window)? {
                     Some(payment) => self.adopt_fill(id, payment).await,
@@ -916,10 +1386,10 @@ where
                 let proof = self
                     .hop
                     .bridge
-                    .verify_refund(TO_HUB, order_id, quote.amount_in, &report.txs)
+                    .verify_refund(side, order_id, quote.amount_in, &report.txs)
                     .await;
                 match Self::proven_payment(id, proof, past_window)? {
-                    Some(payment) => self.adopt_refund(id, payment, reason).await,
+                    Some(payment) => self.adopt_refund(id, payment, reason, direction).await,
                     None => self.payment_pending(id, deposit_tx, wait).await,
                 }
             }
@@ -980,7 +1450,7 @@ where
     }
 
     /// Records the proven fill and continues as after any hop: the Alpaca
-    /// deposit send and the USD conversion.
+    /// deposit send and the USD conversion, or the vault deposit.
     async fn adopt_fill(
         &self,
         id: &UsdcRebalanceId,
@@ -995,26 +1465,37 @@ where
                 },
             )
             .await?;
-        info!(target: "rebalance", %id, fill_tx = %payment.tx, amount = %payment.amount, "Relay fill proven; sending it to Alpaca");
+        info!(target: "rebalance", %id, fill_tx = %payment.tx, amount = %payment.amount, "Relay fill proven; moving it on");
 
-        let Some(state) = self.cqrs.load(id).await? else {
-            return Err(UsdcTransferError::StateOffHop {
+        match self.cqrs.load(id).await? {
+            Some(UsdcRebalance::Bridged {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount_received,
+                ..
+            }) => {
+                self.continue_alpaca_to_base_from_bridged(id, amount_received)
+                    .await
+            }
+            Some(state) => self.resume_base_to_alpaca_past_hop(id, state).await,
+            None => Err(UsdcTransferError::StateOffHop {
                 id: id.clone(),
                 state: "Uninitialized",
                 hop: HopKind::Relay,
-            });
-        };
-        self.resume_base_to_alpaca_past_hop(id, state).await
+            }),
+        }
     }
 
     /// Records the proven refund. One below the refund floor holds for the
-    /// operator; otherwise an origin-side one goes back into the vault and a
-    /// destination-side one waits at the hub for the operator.
+    /// operator. Otherwise toward the hub an origin-side one goes back into
+    /// the vault and a destination-side one waits at the hub for the
+    /// operator; from the hub an origin-side one is quoted again within the
+    /// corridor's bounds and a destination-side one waits in the chain wallet.
     async fn adopt_refund(
         &self,
         id: &UsdcRebalanceId,
         payment: SwapPayment,
         reason: Option<FailReason>,
+        direction: RebalanceDirection,
     ) -> Result<(), UsdcTransferError> {
         let side = match payment.side {
             SwapSide::Origin => RefundSide::Origin,
@@ -1035,13 +1516,21 @@ where
             return Ok(());
         }
 
-        match side {
-            RefundSide::Origin => {
+        match (direction, side) {
+            (RebalanceDirection::BaseToAlpaca, RefundSide::Origin) => {
                 warn!(target: "rebalance", %id, refund_tx = %payment.tx, amount = %payment.amount, ?reason, "Relay refunded the deposit on the origin chain; returning it to the vault");
                 self.redeposit(id, RedepositReason::Refunded).await
             }
-            RefundSide::Destination => {
+            (RebalanceDirection::BaseToAlpaca, RefundSide::Destination) => {
                 error!(target: "operational_alert", alert = true, kind = AlertKind::RelayRefundedAtHub.as_str(), %id, refund_tx = %payment.tx, amount = %payment.amount, ?reason, "Relay refunded the deposit in USDC at the hub; the transfer holds its guard until the operator moves it and reconciles");
+                Ok(())
+            }
+            (RebalanceDirection::AlpacaToBase, RefundSide::Origin) => {
+                warn!(target: "rebalance", %id, refund_tx = %payment.tx, amount = %payment.amount, ?reason, "Relay refunded the deposit in USDC at the hub; quoting it again");
+                self.requote_refund_toward_chain(id).await
+            }
+            (RebalanceDirection::AlpacaToBase, RefundSide::Destination) => {
+                error!(target: "operational_alert", alert = true, kind = AlertKind::RelayRefundedToChainWallet.as_str(), %id, refund_tx = %payment.tx, amount = %payment.amount, ?reason, "Relay refunded the deposit in the chain's stable to the chain wallet, not the vault; the transfer holds its guard until the operator moves it and reconciles");
                 Ok(())
             }
         }
@@ -1051,6 +1540,7 @@ where
     /// holds at `SwapRefunded`, guard kept, for the operator.
     async fn hold_short_refund(&self, id: &UsdcRebalanceId) -> Result<bool, UsdcTransferError> {
         let Some(UsdcRebalance::SwapRefunded {
+            first_deposit,
             quote,
             refund_tx,
             side,
@@ -1069,8 +1559,83 @@ where
         let deposited = quote.amount_in;
         let refunded = usdc_to_u256(amount_refunded)?;
         let shortfall = deposited.saturating_sub(refunded);
-        error!(target: "operational_alert", alert = true, kind = AlertKind::RelayRefundBelowFloor.as_str(), %id, %refund_tx, ?side, %deposited, %refunded, %floor, %shortfall, "Relay refunded less than the refund floor; the transfer holds its guard at SwapRefunded until the operator settles it and reconciles");
+        let first_deposit = first_deposit.amount_in;
+        error!(target: "operational_alert", alert = true, kind = AlertKind::RelayRefundBelowFloor.as_str(), %id, %refund_tx, ?side, %deposited, %refunded, %first_deposit, %floor, %shortfall, "Relay refunded less than the refund floor; the transfer holds its guard at SwapRefunded until the operator settles it and reconciles");
         Ok(true)
+    }
+
+    /// Quotes again, from the hub, an Alpaca-to-chain refund paid in USDC at
+    /// the hub, then signs and sends the new deposit: while fewer than
+    /// `max_refund_retries` re-quotes followed a refund and the refund is at
+    /// least `min_transfer` and not below its refund floor. Otherwise, or
+    /// when Relay refuses the quote or quotes a minimum below the first
+    /// deposit's refund floor, the transfer holds at `SwapRefunded`,
+    /// paged, for `transfer reconcile`; a transient failure is left for the
+    /// retry.
+    async fn requote_refund_toward_chain(
+        &self,
+        id: &UsdcRebalanceId,
+    ) -> Result<(), UsdcTransferError> {
+        let Some(UsdcRebalance::SwapRefunded {
+            direction: RebalanceDirection::AlpacaToBase,
+            side: RefundSide::Origin,
+            first_deposit,
+            amount_refunded,
+            refund_requotes,
+            ..
+        }) = self.cqrs.load(id).await?
+        else {
+            warn!(target: "rebalance", %id, "No Alpaca-to-chain refund at the hub to quote again");
+            return Ok(());
+        };
+        if self.hold_short_refund(id).await? {
+            return Ok(());
+        }
+
+        let RelayHopCtx {
+            max_refund_retries,
+            min_transfer,
+            ..
+        } = self.hop.bounds;
+        let below_minimum = amount_refunded.lt(&min_transfer)?;
+        if refund_requotes >= max_refund_retries || below_minimum {
+            error!(target: "operational_alert", alert = true, kind = AlertKind::RelayHubRefundPastBudget.as_str(), %id, %amount_refunded, refund_requotes, max_refund_retries, %min_transfer, "Relay refunded an Alpaca-to-chain deposit at the hub past the corridor's re-quote budget or below its minimum; the transfer holds its guard at SwapRefunded with the USDC at the hub until it is moved by hand and reconciled");
+            return Ok(());
+        }
+
+        let quote = match self
+            .binding_quote(
+                id,
+                usdc_to_u256(amount_refunded)?,
+                HopDirection::FromHub,
+                Some(&first_deposit),
+            )
+            .await
+        {
+            Ok(quote) => quote,
+            Err(error) if quote_refused(&error) => {
+                error!(target: "operational_alert", alert = true, kind = AlertKind::RelayHubRefundQuoteRefused.as_str(), %id, %error, %amount_refunded, "Relay refused the quote for a refund at the hub; the transfer holds its guard at SwapRefunded until it is resumed, or moved by hand and reconciled");
+                return Ok(());
+            }
+            Err(error) => {
+                warn!(target: "rebalance", %id, %error, "Relay quote for a refund at the hub failed transiently; the transfer holds its guard at SwapRefunded for the retry");
+                return Err(self.hop.transient_swap_quote(id, error));
+            }
+        };
+
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::RequoteSwap {
+                    quote: Box::new(quote),
+                },
+            )
+            .await?;
+        info!(target: "rebalance", %id, %amount_refunded, refund_requote = refund_requotes + 1, "Quoted a refund at the hub again");
+
+        // The status read in `send_swap_deposit` reaches this function, so
+        // the call back is boxed.
+        Box::pin(self.send_swap_deposit(id)).await
     }
 
     /// Ends an attempt with no payment: `RelayFillPending` within the fill
@@ -1114,7 +1679,7 @@ where
     ) -> Result<(), UsdcTransferError> {
         let deadline = Instant::now() + self.hop.bounds.quote_max_age;
         self.hop
-            .broadcast_split_approves(id, split_approves, deadline)
+            .broadcast_split_approves(id, split_approves, TO_HUB, deadline)
             .await?;
         for approve in split_approves {
             match self.hop.bridge.confirm_approve(TO_HUB, approve).await {
@@ -1129,8 +1694,56 @@ where
                     return Err(Box::new(error).into());
                 }
             }
+            // Mined and paid for, and no deposit will queue it once
+            // `BeginRedeposit` drops it.
+            self.enqueue_bot_gas_cost(
+                self.corridor.chain(),
+                approve.tx_hash(),
+                BotGasOperationCategory::RelayApprove,
+            )
+            .await?;
         }
         self.redeposit(id, reason).await
+    }
+
+    /// Sends again and confirms, before a hold at the hub, the approves of a
+    /// `SwapQuoted` that went out alone, and queues their gas: a node may
+    /// have dropped them, every later send from the shared Ethereum wallet
+    /// waits behind their nonces, and a hold the operator reconciles never
+    /// deposits to queue it.
+    async fn send_split_approves_from_hub(
+        &self,
+        id: &UsdcRebalanceId,
+        split_approves: &[PreparedTransaction],
+    ) -> Result<(), UsdcTransferError> {
+        let deadline = Instant::now() + self.hop.bounds.quote_max_age;
+        self.hop
+            .broadcast_split_approves(id, split_approves, HopDirection::FromHub, deadline)
+            .await?;
+        for approve in split_approves {
+            match self
+                .hop
+                .bridge
+                .confirm_approve(HopDirection::FromHub, approve)
+                .await
+            {
+                Ok(()) => {}
+                Err(RelayBridgeError::ApproveReverted { tx }) => {
+                    warn!(target: "rebalance", %id, approve = %tx, "A lone Relay approve from the hub reverted; holding at the hub anyway");
+                }
+                Err(error) => {
+                    warn!(target: "rebalance", %id, approve = %approve.tx_hash(), %error, "A lone Relay approve from the hub is not confirmed; the hold waits for the retry to send it again");
+                    return Err(Box::new(error).into());
+                }
+            }
+            self.enqueue_bot_gas_cost(
+                Chain::Ethereum,
+                approve.tx_hash(),
+                BotGasOperationCategory::RelayApprove,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// Starts returning the stable to the vault, then finishes it.
@@ -1202,33 +1815,31 @@ where
         Ok(())
     }
 
-    /// The approves that went out alone before the persisted pair: below
-    /// its deposit, their nonces are released when it confirms.
-    async fn split_approves(
-        &self,
-        id: &UsdcRebalanceId,
-    ) -> Result<Vec<PreparedTransaction>, UsdcTransferError> {
-        match self.cqrs.load(id).await? {
-            Some(UsdcRebalance::SwapDepositPrepared { split_approves, .. }) => Ok(split_approves),
-            state => {
-                warn!(target: "rebalance", %id, state = ?state.as_ref().map(UsdcRebalance::state_name), "Relay pair sent off SwapDepositPrepared; its split approves, if any, stay reserved until restart");
-                Ok(Vec::new())
-            }
+    /// The prepare lock of the wallet that signs on the `direction` side:
+    /// toward the hub the corridor chain's wallet; from it the Ethereum
+    /// wallet, under the lock its deposit sends hold.
+    fn prepare_lock(&self, direction: HopDirection) -> Arc<Mutex<()>> {
+        match direction {
+            HopDirection::ToHub => Arc::clone(&self.hop.chain_send_prepare),
+            HopDirection::FromHub => Arc::clone(&self.deposit_send_prepare),
         }
     }
 
-    /// The pair to broadcast and its order id, `None` once the deposit is
-    /// confirmed. Runs on a detached task, as the Alpaca deposit send's
-    /// prepare does, so a job timeout cannot drop the future between the
+    /// The pair to broadcast, with its order id and the approves that went
+    /// out alone before it, `None` once the deposit is confirmed. Runs on a
+    /// detached task, as the Alpaca deposit send's prepare does, so a job
+    /// timeout cannot drop the future between the
     /// signing and the persist: a pair signed and never persisted keeps its
-    /// nonces reserved and stalls every later send from the chain wallet.
+    /// nonces reserved and stalls every later send from the origin wallet.
     async fn prepare_and_persist_swap_pair(
         &self,
         id: &UsdcRebalanceId,
-    ) -> Result<Option<(PreparedSwapDeposit, B256)>, UsdcTransferError> {
+        direction: HopDirection,
+    ) -> Result<Option<PersistedPair>, UsdcTransferError> {
         let hop = Arc::clone(&self.hop);
         let cqrs = Arc::clone(&self.cqrs);
         let task_id = id.clone();
+        let lock = self.prepare_lock(direction);
         // `PrepareSwapDeposit` can outlive a cancelled job, so the task
         // continues the job's projection slot.
         let projection_slot =
@@ -1236,7 +1847,8 @@ where
 
         tokio::spawn(async move {
             let _projection_slot = projection_slot;
-            hop.prepare_swap_pair(&cqrs, &task_id).await
+            hop.prepare_swap_pair(&cqrs, &task_id, direction, lock)
+                .await
         })
         .await
         .map_err(|join_error| prepare_panicked(id, &join_error))?
@@ -1389,8 +2001,8 @@ where
         (restored, unmined)
     }
 
-    /// Whether a restored envelope has a receipt on the chain; a receipt
-    /// that cannot be read counts as missing.
+    /// Whether a restored envelope has its confirmations in a canonical
+    /// block; a receipt that cannot be read counts as missing.
     async fn restored_envelope_mined(
         &self,
         id: &UsdcRebalanceId,
@@ -1410,6 +2022,22 @@ where
             }
         }
     }
+}
+
+/// A persisted pair to broadcast: its order id, and the approves that went
+/// out alone before it, read with it under the prepare lock.
+struct PersistedPair {
+    pair: PreparedSwapDeposit,
+    order_id: B256,
+    split_approves: Vec<PreparedTransaction>,
+}
+
+/// Where and by when a pair is signed: the hop side whose origin wallet
+/// signs it, and the bound on the RPC work under that wallet's prepare lock.
+#[derive(Clone, Copy)]
+struct PairSigning {
+    direction: HopDirection,
+    deadline: Instant,
 }
 
 /// What a deposit with no payment adopted is waiting within.
@@ -1436,10 +2064,10 @@ impl PaymentWait {
 }
 
 /// Pages that a Relay pair prepare panicked: nonces it reserved and did not
-/// persist are never released, so later sends from the chain wallet wait
+/// persist are never released, so later sends from the origin wallet wait
 /// behind them until a restart.
 fn prepare_panicked(id: &UsdcRebalanceId, join_error: &JoinError) -> UsdcTransferError {
-    error!(target: "operational_alert", alert = true, kind = AlertKind::RelayPairPreparePanicked.as_str(), %id, %join_error, "The Relay pair prepare task panicked; nonces it reserved and did not persist stall later sends from the chain wallet until a restart");
+    error!(target: "operational_alert", alert = true, kind = AlertKind::RelayPairPreparePanicked.as_str(), %id, %join_error, "The Relay pair prepare task panicked; nonces it reserved and did not persist stall later sends from the origin wallet until a restart");
     UsdcTransferError::SwapPrepareTaskPanicked { id: id.clone() }
 }
 
@@ -1466,17 +2094,32 @@ fn quote_expired(
         || stale_at.is_none_or(|stale_at| now >= stale_at)
 }
 
-/// Accepts a quote within the corridor's bounds. The chain-to-Alpaca leg
-/// after the hop is the Alpaca deposit, which sets no minimum; the trigger's
-/// `min_transfer` sizes against it.
+/// The least output the leg after the hop, the Alpaca deposit or the vault
+/// deposit, takes: none, the trigger's `min_transfer` sizes against it.
+const NEXT_LEG_MINIMUM: U256 = U256::ZERO;
+
+/// Accepts a quote within the corridor's bounds. Once the transfer has a
+/// `first_deposit`, the quote's minimum must also reach that deposit's refund
+/// floor: a re-quote after a refund is bound to the first deposit's loss, not
+/// to a loss on the refunded amount on top of it.
 fn accept_quote(
     id: &UsdcRebalanceId,
     ctx: &RelayHopCtx,
+    first_deposit: Option<&FirstDeposit>,
     accept: impl FnOnce(&QuoteBounds) -> Result<AcceptedRelayQuote, QuoteAcceptanceError>,
 ) -> Result<AcceptedRelayQuote, UsdcTransferError> {
+    let transfer_floor = match first_deposit {
+        Some(first_deposit) => first_deposit.refund_floor().map_err(|source| {
+            UsdcTransferError::RefundFloorUndefined {
+                id: id.clone(),
+                source: Box::new(source),
+            }
+        })?,
+        None => NEXT_LEG_MINIMUM,
+    };
     let bounds = QuoteBounds {
         max_loss: basis_points(ctx.max_quote_loss_bps)?,
-        downstream_minimum: U256::ZERO,
+        downstream_minimum: NEXT_LEG_MINIMUM.max(transfer_floor),
     };
 
     accept(&bounds).map_err(|source| UsdcTransferError::SwapQuoteOutOfBounds {
@@ -1569,7 +2212,7 @@ fn relay_quote(
         deposit: step_transaction(&quote.deposit),
     };
 
-    accept_quote(id, ctx, |bounds| recorded.accept(bounds))
+    accept_quote(id, ctx, None, |bounds| recorded.accept(bounds))
 }
 
 /// Whether Relay definitively refused a quote: a non-transient error code, a
@@ -1578,7 +2221,8 @@ fn relay_quote(
 /// retry, so the stable stays out of the vault for it.
 fn quote_refused(error: &UsdcTransferError) -> bool {
     match error {
-        UsdcTransferError::SwapQuoteOutOfBounds { .. } => true,
+        UsdcTransferError::SwapQuoteOutOfBounds { .. }
+        | UsdcTransferError::RefundFloorUndefined { .. } => true,
         UsdcTransferError::RelayApi(relay) => match relay.as_ref() {
             RelayError::QuoteRefused { code } => !code.is_transient(),
             RelayError::QuoteMismatch(_) => true,
@@ -1707,8 +2351,6 @@ where
     }
 }
 
-/// The Alpaca-to-chain side of a Relay hop is not built yet: refused after
-/// the corridor check and before any call.
 #[async_trait]
 impl<Signer> ResumeAlpacaToBase for CrossVenueCashTransfer<Signer, RelayHop<Signer>>
 where
@@ -1717,16 +2359,11 @@ where
     async fn resume_alpaca_to_base(
         &self,
         id: &UsdcRebalanceId,
-        _amount: Usdc,
+        amount: Usdc,
         corridor: UsdcCorridor,
     ) -> Result<(), UsdcTransferError> {
-        let state = self.cqrs.load(id).await?;
-        self.require_served_corridor(id, corridor, state.as_ref())?;
-
-        Err(UsdcTransferError::SwapDirectionNotBuilt {
-            id: id.clone(),
-            direction: RebalanceDirection::AlpacaToBase,
-        })
+        self.resume_alpaca_to_chain_via_relay(id, amount, corridor)
+            .await
     }
 }
 
@@ -1832,7 +2469,9 @@ mod tests {
     use std::time::Duration;
     use uuid::Uuid;
 
-    use st0x_bridge::relay::{QuoteErrorCode, RelayCtx, RelayEndContracts, RelayError};
+    use st0x_bridge::relay::{
+        QuoteErrorCode, RelayCtx, RelayEndContracts, RelayEndpoint, RelayError, quote_body_for_test,
+    };
     use st0x_event_sorcery::{Store, test_store};
     use st0x_evm::{Evm, EvmError, IERC20};
     use st0x_execution::{
@@ -1846,18 +2485,21 @@ mod tests {
     };
 
     use super::*;
+    use crate::alerts::LogNotifier;
     use crate::bot_gas::{
         BotGasReceiptCostEnqueuer, RecordBotGasReceiptCostJobQueue, pending_bot_gas_jobs,
     };
-    use crate::conductor::job::find_backpressure;
-    use crate::rebalancing::usdc::{MarketMakingUsdcEndpoints, UsdcSettlementParams};
+    use crate::conductor::job::{BackpressureStreak, Job, find_backpressure};
+    use crate::rebalancing::usdc::{
+        MarketMakingUsdcEndpoints, TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
+        TransferUsdcToMarketMakingJobQueue, UsdcDriverGate, UsdcSettlementParams,
+    };
     use crate::telemetry::TelemetrySender;
     use crate::telemetry::broker::InstrumentedAlpacaBroker;
     use crate::test_utils::{
         AnvilRaindexChain, TestAnvilInstance, anvil_wallet, erc20_balance, relay_test_client,
-        setup_test_db, setup_test_pools, spawn_anvil,
+        setup_test_apalis_pool, setup_test_db, setup_test_pools, spawn_anvil,
     };
-    use crate::usdc_rebalance::TransferRef;
 
     type TestWallet = Arc<dyn Wallet<Provider = RootProvider>>;
 
@@ -1974,6 +2616,8 @@ mod tests {
         /// Where the service's vault lives.
         raindex: RaindexContracts,
         bot_gas: BotGasReceiptCostEnqueuer,
+        /// The depth an Ethereum tx needs to count as confirmed.
+        ethereum_confirmations: u64,
     }
 
     impl Default for RelayTestSetup {
@@ -1985,6 +2629,7 @@ mod tests {
                     orderbook: Address::repeat_byte(0x0b),
                 },
                 bot_gas: BotGasReceiptCostEnqueuer::Disabled,
+                ethereum_confirmations: 1,
             }
         }
     }
@@ -2002,13 +2647,14 @@ mod tests {
             bounds,
             raindex,
             bot_gas,
+            ethereum_confirmations,
         } = setup;
         let hub_wallet = ethereum_wallet.address();
         let bridge = RelayBridge::try_from_ctx(RelayCtx {
             chain: Chain::Robinhood,
             ethereum_wallet,
             chain_wallet: chain_wallet.clone(),
-            ethereum_confirmations: 1,
+            ethereum_confirmations,
             chain_confirmations: 1,
         })
         .unwrap()
@@ -2035,7 +2681,7 @@ mod tests {
             &UsdcSettlementParams {
                 attestation_retry_deadline: Duration::from_secs(3600),
                 settlement_retry_deadline: Duration::from_secs(3600),
-                ethereum_required_confirmations: Some(1),
+                ethereum_required_confirmations: Some(ethereum_confirmations),
                 reserved_cash: None,
                 circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
                 token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
@@ -2404,8 +3050,7 @@ mod tests {
         quote.assert_calls(1);
     }
 
-    /// The Alpaca-to-chain side is refused before any call, and a CCTP mint
-    /// recovery is never this service's.
+    /// A CCTP mint recovery is never this service's.
     #[tokio::test]
     async fn relay_service_refuses_what_it_does_not_run() {
         let anvil = spawn_anvil(Anvil::new());
@@ -2427,23 +3072,6 @@ mod tests {
             store.clone(),
         )
         .await;
-        let id = UsdcRebalanceId(Uuid::new_v4());
-
-        let error = transfer
-            .resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                UsdcTransferError::SwapDirectionNotBuilt {
-                    direction: RebalanceDirection::AlpacaToBase,
-                    ..
-                }
-            ),
-            "got {error:?}"
-        );
-        assert_eq!(store.load(&id).await.unwrap(), None);
 
         let error = transfer
             .fetch_recovery_attestation(BridgeDirection::BaseToEthereum, TxHash::ZERO)
@@ -2769,6 +3397,18 @@ mod tests {
             value: U256::ZERO,
         };
 
+        quote
+    }
+
+    /// [`exact_quote`] for a hop from the hub toward the chain.
+    async fn exact_quote_from_hub(
+        wallet: &TestWallet,
+        contracts: RelayEndContracts,
+        order_id: B256,
+    ) -> SwapQuote {
+        let mut quote = exact_quote(wallet, contracts, order_id).await;
+        quote.origin = Chain::Ethereum;
+        quote.destination = Chain::Robinhood;
         quote
     }
 
@@ -3405,7 +4045,7 @@ mod tests {
             assert!(
                 matches!(
                     &error,
-                    UsdcTransferError::RelayApi(relay)
+                    UsdcTransferError::SwapQuoteTransient { source: relay, .. }
                         if matches!(**relay, RelayError::HttpStatus { status: 503, .. })
                 ),
                 "got {error:?}"
@@ -3420,7 +4060,7 @@ mod tests {
     }
 
     /// A panic while the pair is signed pages an operational alert: the
-    /// nonces it reserved stall the chain wallet until a restart.
+    /// nonces it reserved stall the origin wallet until a restart.
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn panicked_swap_prepare_pages_an_operational_alert() {
@@ -3465,7 +4105,7 @@ mod tests {
                 .iter()
                 .any(|line| {
                     line.contains("operational_alert")
-                        && line.contains("stall later sends from the chain wallet until a restart")
+                        && line.contains("stall later sends from the origin wallet until a restart")
                 })
                 .then_some(())
                 .ok_or_else(|| "no operational alert says the nonces stall the wallet".to_string())
@@ -3852,7 +4492,7 @@ mod tests {
             .unwrap();
         transfer
             .hop
-            .persist_swap_pair(&store, &committed, &persisted)
+            .persist_swap_pair(&store, &committed, &persisted, TO_HUB)
             .await
             .unwrap();
 
@@ -3887,7 +4527,7 @@ mod tests {
 
         transfer
             .hop
-            .persist_swap_pair(&store, &unpersisted, &pair)
+            .persist_swap_pair(&store, &unpersisted, &pair, TO_HUB)
             .await
             .unwrap_err();
 
@@ -3998,8 +4638,8 @@ mod tests {
             exact_quote(&wallet, contracts, B256::repeat_byte(0x0d)).await,
         )
         .await;
-        let (pair, _order_id) = transfer
-            .prepare_and_persist_swap_pair(&id)
+        let PersistedPair { pair, .. } = transfer
+            .prepare_and_persist_swap_pair(&id, TO_HUB)
             .await
             .unwrap()
             .unwrap();
@@ -4207,8 +4847,8 @@ mod tests {
             exact_quote(&wallet, contracts, B256::repeat_byte(0x0d)).await,
         )
         .await;
-        let (pair, _order_id) = transfer
-            .prepare_and_persist_swap_pair(&id)
+        let PersistedPair { pair, .. } = transfer
+            .prepare_and_persist_swap_pair(&id, TO_HUB)
             .await
             .unwrap()
             .unwrap();
@@ -4239,6 +4879,136 @@ mod tests {
                 .is_some(),
             "the rebroadcast reached the node; only the receipt is missing"
         );
+    }
+
+    /// A restored pair from the hub whose receipts are shallower than
+    /// Ethereum's confirmations counts as unmined, as a corridor-origin pair
+    /// does: startup skips the Ethereum approvals and revokes that could
+    /// take a nonce behind it if a reorg drops it.
+    #[tokio::test]
+    async fn restored_pair_from_the_hub_short_of_its_confirmations_is_counted_unmined() {
+        let anvil = spawn_anvil(Anvil::new());
+        let (wallet, contracts) = funded_relay_end(&anvil).await;
+        let pool = setup_test_db().await;
+        let store = Arc::new(test_store(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let transfer = relay_transfer_with(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet.clone(),
+            contracts,
+            store.clone(),
+            RelayTestSetup {
+                ethereum_confirmations: 3,
+                ..RelayTestSetup::default()
+            },
+        )
+        .await;
+        record_quoted_toward_chain(
+            &store,
+            &id,
+            exact_quote_from_hub(&wallet, contracts, TOWARD_CHAIN_ORDER_ID).await,
+        )
+        .await;
+        let PersistedPair { pair, .. } = transfer
+            .prepare_and_persist_swap_pair(&id, HopDirection::FromHub)
+            .await
+            .unwrap()
+            .unwrap();
+        transfer
+            .hop
+            .bridge
+            .broadcast_deposit(HopDirection::FromHub, &pair)
+            .await
+            .unwrap();
+        wallet.await_receipt(pair.deposit.tx_hash()).await.unwrap();
+        assert_eq!(
+            store.load(&id).await.unwrap().unwrap().state_name(),
+            "SwapDepositPrepared"
+        );
+
+        let restored = transfer.restore_prepared_deposit_sends(&pool).await;
+
+        assert_eq!(
+            restored,
+            RestoredDepositSends {
+                restored: 2,
+                unmined: 2,
+            }
+        );
+    }
+
+    /// A startup that cannot list the signed Alpaca deposit sends still
+    /// reserves the Relay envelopes signed on the Ethereum wallet: the two
+    /// listings are independent.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn ethereum_relay_envelopes_are_restored_when_deposit_sends_cannot_be_listed() {
+        let anvil = spawn_anvil(Anvil::new());
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let pool = setup_test_db().await;
+        let store = Arc::new(test_store(pool.clone(), ()));
+        let contracts = RelayEndContracts {
+            stable: Address::repeat_byte(0x51),
+            depository: Address::repeat_byte(0x52),
+        };
+        let transfer = relay_transfer(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet,
+            contracts,
+            store.clone(),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_quoted_toward_chain(
+            &store,
+            &id,
+            crate::usdc_rebalance::swap_quote_for_test(
+                U256::from(AMOUNT_IN),
+                TOWARD_CHAIN_ORDER_ID,
+            ),
+        )
+        .await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::PrepareSwapDeposit {
+                    approve: None,
+                    deposit: PreparedTransaction::for_test(TxHash::repeat_byte(0xd7), 7),
+                },
+            )
+            .await
+            .unwrap();
+        // A signed deposit send whose transfer id is stored as a blob: the
+        // deposit-send listing cannot decode it and fails.
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, \
+             metadata) \
+             VALUES ('UsdcRebalance', x'01', 1, 'UsdcRebalanceEvent::DepositSendPrepared', \
+             '1', '{}', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let restored = transfer.restore_prepared_deposit_sends(&pool).await;
+
+        assert_eq!(restored.restored, 1, "{restored:?}");
+        assert!(logs_contain(
+            "Could not list signed Alpaca deposit sends at startup"
+        ));
+        assert!(logs_contain(
+            "Reserved the nonce of a signed Relay envelope on the Ethereum wallet"
+        ));
     }
 
     /// A Robinhood stand-in with a Raindex orderbook and a hub stand-in, on two
@@ -4320,11 +5090,13 @@ mod tests {
                 store,
                 bounds,
                 self.chain.bot_wallet.clone(),
+                BotGasReceiptCostEnqueuer::Disabled,
             )
             .await
         }
 
-        /// [`Self::transfer`], sending on the chain through `chain_wallet`.
+        /// [`Self::transfer`], sending on the chain through `chain_wallet`
+        /// and queueing bot gas through `bot_gas`.
         async fn transfer_through(
             &self,
             server: &MockServer,
@@ -4332,6 +5104,7 @@ mod tests {
             store: Arc<Store<UsdcRebalance>>,
             bounds: RelayHopCtx,
             chain_wallet: TestWallet,
+            bot_gas: BotGasReceiptCostEnqueuer,
         ) -> CrossVenueCashTransfer<TestWallet, RelayHop<TestWallet>> {
             let bridge = RelayBridge::try_from_ctx(RelayCtx {
                 chain: Chain::Robinhood,
@@ -4378,7 +5151,7 @@ mod tests {
                     token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
                     message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
                 },
-                BotGasReceiptCostEnqueuer::Disabled,
+                bot_gas,
             )
         }
 
@@ -4455,6 +5228,46 @@ mod tests {
                 self.chain.bot,
                 amount,
                 order_id,
+            )
+            .await
+        }
+
+        /// The solver's fill of `amount` USDG to the bot on the chain.
+        async fn fill_on_chain(&self, amount: U256, order_id: B256) -> TxHash {
+            self.refund_on_chain(amount, order_id).await
+        }
+
+        /// The solver's refund of `amount` USDC to the bot at the hub.
+        async fn refund_on_hub(&self, amount: U256, order_id: B256) -> TxHash {
+            self.fill_on_hub(amount, order_id).await
+        }
+
+        /// Credits the hub wallet `amount` USDC, as an Alpaca withdrawal
+        /// does, mines past it, and returns the tx.
+        async fn withdraw_to_hub(&self, amount: U256) -> TxHash {
+            let tx =
+                MintableStable::new(self.hub_contracts.stable, Self::signer_on(&self.hub_anvil))
+                    .mint(self.hub_wallet.address(), amount)
+                    .send()
+                    .await
+                    .unwrap()
+                    .get_receipt()
+                    .await
+                    .unwrap()
+                    .transaction_hash;
+            self.hub_wallet
+                .provider()
+                .anvil_mine(Some(2), None)
+                .await
+                .unwrap();
+            tx
+        }
+
+        async fn hub_usdc(&self) -> U256 {
+            erc20_balance(
+                &self.hub_wallet,
+                self.hub_contracts.stable,
+                self.hub_wallet.address(),
             )
             .await
         }
@@ -4914,6 +5727,85 @@ mod tests {
         assert_eq!(rig.vault_usdg().await, U256::from(AMOUNT_IN));
     }
 
+    /// An approve that went out alone and mined has its gas queued when the
+    /// transfer redeposits instead of depositing into Relay: the bot paid
+    /// for it, and the redeposit drops it from the transfer.
+    #[tokio::test]
+    async fn redeposit_queues_the_gas_of_a_split_approve() {
+        let rig = RelayRig::deploy().await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        relay_api.mock(|when, then| {
+            when.method(POST).path("/quote/v2");
+            then.status(400).json_body(json!({
+                "message": "No routes",
+                "errorCode": "NO_SWAP_ROUTES_FOUND",
+                "requestId": "0x00"
+            }));
+        });
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let transfer = rig
+            .transfer_through(
+                &server,
+                &relay_api,
+                store.clone(),
+                relay_bounds(),
+                rig.chain.bot_wallet.clone(),
+                BotGasReceiptCostEnqueuer::Enabled(RecordBotGasReceiptCostJobQueue::new(
+                    &apalis_pool,
+                )),
+            )
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let mut quote = exact_quote(
+            &rig.chain.bot_wallet,
+            rig.chain_contracts,
+            B256::repeat_byte(0x0d),
+        )
+        .await;
+        let approve_step = quote.approve.clone().unwrap();
+        quote.deadline = Utc::now() - chrono::Duration::minutes(1);
+        record_quoted(&store, &id, quote).await;
+        let approve = rig
+            .chain
+            .bot_wallet
+            .prepare_pending(approve_step.to, approve_step.data, "split approve")
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::PrepareSwapApprove {
+                    approve: approve.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends")
+        .unwrap();
+
+        assert_eq!(
+            store.load(&id).await.unwrap().unwrap().state_name(),
+            "ReturnedToSource"
+        );
+        let queued = queued_gas_costs(&apalis_pool).await;
+        assert!(
+            queued.contains(&(
+                Chain::Robinhood,
+                approve.tx_hash(),
+                "relay_approve".to_string()
+            )),
+            "{queued:?}"
+        );
+    }
+
     /// A split approve the node accepted and then dropped is confirmed
     /// before the redeposit starts, so the attempt ends at `SwapQuoted` and
     /// the retry sends it again; the vault deposit never waits behind its
@@ -4968,6 +5860,7 @@ mod tests {
                 store.clone(),
                 relay_bounds(),
                 chain_wallet,
+                BotGasReceiptCostEnqueuer::Disabled,
             )
             .await;
         let attempt = || {
@@ -5312,4 +6205,1669 @@ mod tests {
     }
 
     const ALPACA_DEPOSIT_ADDRESS: Address = Address::repeat_byte(0xa1);
+
+    const TOWARD_CHAIN_ORDER_ID: B256 = B256::repeat_byte(0x0e);
+
+    /// Records an Alpaca-to-Robinhood Relay transfer of 100 USDC up to its
+    /// Alpaca withdrawal, credited by `withdrawal_tx`.
+    async fn record_withdrawn_toward_chain(
+        store: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        withdrawal_tx: TxHash,
+    ) {
+        for command in [
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::AlpacaToBase,
+                corridor: ROBINHOOD_RELAY,
+                amount: Usdc::new(float!(100)),
+                withdrawal: TransferRef::AlpacaId(st0x_execution::AlpacaTransferId::from(
+                    Uuid::new_v4(),
+                )),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: Some(withdrawal_tx),
+            },
+        ] {
+            store.send(id, command).await.unwrap();
+        }
+    }
+
+    /// Records an Alpaca-to-Robinhood Relay transfer up to `SwapQuoted` on
+    /// `quote`, signed at the hub.
+    async fn record_quoted_toward_chain(
+        store: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        quote: SwapQuote,
+    ) {
+        record_withdrawn_toward_chain(store, id, TxHash::repeat_byte(0x78)).await;
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::QuoteSwap {
+                    quote: Box::new(quote),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Records an Alpaca-to-Robinhood Relay transfer of `AMOUNT_IN` up to
+    /// `SwapDeposited` without a chain, for `order_id`.
+    async fn record_deposited_toward_chain(
+        store: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        order_id: B256,
+    ) {
+        record_quoted_toward_chain(
+            store,
+            id,
+            crate::usdc_rebalance::swap_quote_for_test(U256::from(AMOUNT_IN), order_id),
+        )
+        .await;
+        record_pair_deposited(store, id, 7).await;
+    }
+
+    /// Persists and confirms a stand-in pair at `nonce` on a `SwapQuoted`.
+    async fn record_pair_deposited(store: &Store<UsdcRebalance>, id: &UsdcRebalanceId, nonce: u64) {
+        let deposit = PreparedTransaction::for_test(
+            TxHash::repeat_byte(0xd0 + u8::try_from(nonce).unwrap()),
+            nonce,
+        );
+        for command in [
+            UsdcRebalanceCommand::PrepareSwapDeposit {
+                approve: None,
+                deposit: deposit.clone(),
+            },
+            UsdcRebalanceCommand::ConfirmSwapDeposit {
+                deposit_tx: deposit.tx_hash(),
+                deposit_block: 1,
+            },
+        ] {
+            store.send(id, command).await.unwrap();
+        }
+    }
+
+    /// Answers every quote with a 503, recording what was asked.
+    fn mock_quote_unavailable(relay_api: &MockServer) -> httpmock::Mock<'_> {
+        relay_api.mock(|when, then| {
+            when.method(POST).path("/quote/v2");
+            then.status(503);
+        })
+    }
+
+    /// The happy path from the hub: the pair is signed on the Ethereum
+    /// wallet, the fill is proven on Robinhood, and the filled USDG goes into
+    /// the corridor's vault, which clears the guard.
+    #[tokio::test]
+    async fn alpaca_to_robinhood_fill_deposits_into_the_vault() {
+        let rig = RelayRig::deploy().await;
+        rig.withdraw_to_hub(U256::from(AMOUNT_IN)).await;
+        let fill_tx = rig
+            .fill_on_chain(U256::from(AMOUNT_IN), TOWARD_CHAIN_ORDER_ID)
+            .await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_status(
+            &relay_api,
+            json!({"status": "success", "inTxHashes": [], "txHashes": [fill_tx]}),
+        );
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_quoted_toward_chain(
+            &store,
+            &id,
+            exact_quote_from_hub(&rig.hub_wallet, rig.hub_contracts, TOWARD_CHAIN_ORDER_ID).await,
+        )
+        .await;
+
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends")
+        .unwrap();
+
+        let state = store.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::DepositConfirmed { hop, .. } = &state else {
+            panic!("expected DepositConfirmed, got {state:?}");
+        };
+        assert_eq!(hop.destination_tx(), fill_tx);
+        assert!(!state.holds_rebalance_guard());
+        assert_eq!(rig.vault_usdg().await, U256::from(AMOUNT_IN));
+        assert_eq!(
+            rig.hub_usdc().await,
+            U256::ZERO,
+            "the hub's USDC went to Relay"
+        );
+    }
+
+    /// The Ethereum-origin pair is signed under the deposit-send lock every
+    /// corridor's service shares: while another send holds it, nothing is
+    /// signed or persisted.
+    #[tokio::test]
+    async fn ethereum_relay_pair_shares_nonce_lock_with_deposit_sends() {
+        let rig = RelayRig::deploy().await;
+        rig.withdraw_to_hub(U256::from(AMOUNT_IN)).await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_status(&relay_api, json!({"status": "pending"}));
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let transfer = Arc::new(
+            rig.transfer(&server, &relay_api, store.clone(), relay_bounds())
+                .await
+                .with_deposit_send_lock(Arc::clone(&lock)),
+        );
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_quoted_toward_chain(
+            &store,
+            &id,
+            exact_quote_from_hub(&rig.hub_wallet, rig.hub_contracts, TOWARD_CHAIN_ORDER_ID).await,
+        )
+        .await;
+
+        let deposit_send = lock.lock().await;
+        let attempt = tokio::spawn({
+            let transfer = Arc::clone(&transfer);
+            let id = id.clone();
+            async move {
+                transfer
+                    .resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert!(
+            !attempt.is_finished(),
+            "the attempt waits for the deposit-send lock"
+        );
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(
+            state.state_name(),
+            "SwapQuoted",
+            "nothing is signed while a deposit send holds the lock"
+        );
+        assert_eq!(rig.hub_usdc().await, U256::from(AMOUNT_IN));
+
+        drop(deposit_send);
+        let outcome = tokio::time::timeout(Duration::from_secs(30), attempt)
+            .await
+            .expect("the attempt ends once the lock is free")
+            .unwrap();
+        assert_fill_pending(&outcome);
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "SwapDeposited", "{state:?}");
+        assert_eq!(rig.hub_usdc().await, U256::ZERO);
+    }
+
+    /// Before an Ethereum-origin pair is signed the shared wallet's credit
+    /// ledger is checked, as before a CCTP burn: a shortfall pages and the
+    /// pair is still signed.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn ethereum_relay_pair_runs_the_credit_ledger_check() {
+        let rig = RelayRig::deploy().await;
+        rig.withdraw_to_hub(U256::from(AMOUNT_IN)).await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_status(&relay_api, json!({"status": "pending"}));
+        let pool = setup_test_db().await;
+        let store = Arc::new(test_store(pool.clone(), ()));
+        let transfer = rig
+            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .await
+            .with_credit_ledger(pool);
+        let other = UsdcRebalanceId(Uuid::new_v4());
+        record_quoted_toward_chain(
+            &store,
+            &other,
+            crate::usdc_rebalance::swap_quote_for_test(
+                U256::from(AMOUNT_IN),
+                B256::repeat_byte(0x0f),
+            ),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_quoted_toward_chain(
+            &store,
+            &id,
+            exact_quote_from_hub(&rig.hub_wallet, rig.hub_contracts, TOWARD_CHAIN_ORDER_ID).await,
+        )
+        .await;
+
+        let attempt = tokio::time::timeout(
+            Duration::from_secs(30),
+            transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends");
+
+        assert_fill_pending(&attempt);
+        assert!(logs_contain(
+            "Ethereum wallet USDC is short of the credits of the open USDC transfers"
+        ));
+    }
+
+    /// The binding quote from the hub is for what the Alpaca withdrawal tx
+    /// credited, from the hub to the chain; a transient failure leaves the
+    /// transfer at `WithdrawalComplete` with its guard held.
+    #[tokio::test]
+    async fn binding_quote_toward_chain_swaps_the_withdrawal_credit() {
+        let rig = RelayRig::deploy().await;
+        let withdrawal_tx = rig.withdraw_to_hub(U256::from(99_900_000_u64)).await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let quote = relay_api.mock(|when, then| {
+            when.method(POST).path("/quote/v2").json_body_includes(
+                json!({
+                    "originChainId": 1,
+                    "destinationChainId": 4663,
+                    "originCurrency": Chain::Ethereum.settlement_stable().address,
+                    "destinationCurrency": Chain::Robinhood.settlement_stable().address,
+                    "amount": "99900000",
+                })
+                .to_string(),
+            );
+            then.status(503);
+        });
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_withdrawn_toward_chain(&store, &id, withdrawal_tx).await;
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(30),
+            transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends")
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                UsdcTransferError::SwapQuoteTransient { source: relay, .. }
+                    if matches!(**relay, RelayError::HttpStatus { status: 503, .. })
+            ),
+            "got {error:?}"
+        );
+        assert!(
+            quote.calls() > 0,
+            "the credited amount is quoted from the hub"
+        );
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "WithdrawalComplete");
+        assert!(state.holds_rebalance_guard());
+    }
+
+    /// A binding quote Relay refuses after the Alpaca withdrawal pages and
+    /// holds the USDC at the hub with the guard held: there is no vault to
+    /// return it to.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn binding_quote_refused_toward_chain_holds_at_the_hub() {
+        let rig = RelayRig::deploy().await;
+        let withdrawal_tx = rig.withdraw_to_hub(U256::from(AMOUNT_IN)).await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let quote = mock_quote_refused(&relay_api);
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_withdrawn_toward_chain(&store, &id, withdrawal_tx).await;
+
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends")
+        .unwrap();
+
+        quote.assert_calls(1);
+        assert!(logs_contain("Relay refused the binding quote from the hub"));
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "WithdrawalComplete");
+        assert!(state.holds_rebalance_guard());
+        assert_eq!(rig.hub_usdc().await, U256::from(AMOUNT_IN));
+    }
+
+    /// A binding quote from the hub that Relay keeps refusing pages once per
+    /// transfer: every re-armed run quotes again, but only the first refusal
+    /// pages.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn binding_quote_refused_toward_chain_pages_once() {
+        let rig = RelayRig::deploy().await;
+        let withdrawal_tx = rig.withdraw_to_hub(U256::from(AMOUNT_IN)).await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let quote = mock_quote_refused(&relay_api);
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_withdrawn_toward_chain(&store, &id, withdrawal_tx).await;
+
+        for _ in 0..2 {
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+            )
+            .await
+            .expect("the attempt ends")
+            .unwrap();
+        }
+
+        quote.assert_calls(2);
+        logs_assert(|lines| {
+            let pages = lines
+                .iter()
+                .filter(|line| line.contains("Relay refused the binding quote from the hub"))
+                .count();
+            (pages == 1)
+                .then_some(())
+                .ok_or_else(|| format!("{pages} pages of the refused quote"))
+        });
+        assert_eq!(
+            store.load(&id).await.unwrap().unwrap().state_name(),
+            "WithdrawalComplete"
+        );
+    }
+
+    /// A refund paid in USDC at the hub is quoted again, for the refunded
+    /// amount, from the hub to the chain.
+    #[tokio::test]
+    async fn refund_toward_chain_requotes_from_refunded_amount() {
+        let rig = RelayRig::deploy().await;
+        let refunded = U256::from(99_500_000_u64);
+        let refund_tx = rig.refund_on_hub(refunded, TOWARD_CHAIN_ORDER_ID).await;
+        rig.hub_wallet
+            .provider()
+            .anvil_mine(Some(2), None)
+            .await
+            .unwrap();
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_status(
+            &relay_api,
+            json!({
+                "status": "refund",
+                "txHashes": [refund_tx],
+                "failReason": "SOLVER_CAPACITY_EXCEEDED"
+            }),
+        );
+        let requote = relay_api.mock(|when, then| {
+            when.method(POST).path("/quote/v2").json_body_includes(
+                json!({
+                    "originChainId": 1,
+                    "destinationChainId": 4663,
+                    "amount": "99500000",
+                })
+                .to_string(),
+            );
+            then.status(503);
+        });
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(
+                &server,
+                &relay_api,
+                store.clone(),
+                RelayHopCtx {
+                    min_transfer: Usdc::new(float!(10)),
+                    ..relay_bounds()
+                },
+            )
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited_toward_chain(&store, &id, TOWARD_CHAIN_ORDER_ID).await;
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(30),
+            transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends")
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                UsdcTransferError::SwapQuoteTransient { source: relay, .. }
+                    if matches!(**relay, RelayError::HttpStatus { status: 503, .. })
+            ),
+            "got {error:?}"
+        );
+        assert!(requote.calls() > 0, "the refunded amount is quoted again");
+        let state = store.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::SwapRefunded {
+            side,
+            amount_refunded,
+            ..
+        } = &state
+        else {
+            panic!("expected SwapRefunded, got {state:?}");
+        };
+        assert_eq!(*side, RefundSide::Origin);
+        assert_eq!(*amount_refunded, Usdc::new(float!(99.5)));
+        assert!(state.holds_rebalance_guard());
+    }
+
+    /// A refund at the hub that Relay quotes again within the first
+    /// deposit's floor is re-quoted and its next pair signed and sent:
+    /// `RequoteSwap` counts the re-quote and keeps the refunded order id
+    /// among the signed ones, and the new order's deposit moves the
+    /// refunded USDC from the hub.
+    #[tokio::test]
+    async fn refund_toward_chain_requote_signs_the_next_pair() {
+        // The quote names Ethereum's chain id, stable and depository, which
+        // the signer checks: the mocks' code is set at the pinned addresses.
+        let anvil = spawn_anvil(Anvil::new().chain_id(1));
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let contracts = RelayEndContracts {
+            stable: Chain::Ethereum.settlement_stable().address,
+            depository: Chain::Ethereum.relay_depository().unwrap(),
+        };
+        let deployer = RelayRig::signer_on(&anvil);
+        let mocks = st0x_bridge::relay::deploy_relay_end(&deployer)
+            .await
+            .unwrap();
+        for (mock, pinned) in [
+            (mocks.stable, contracts.stable),
+            (mocks.depository, contracts.depository),
+        ] {
+            let code = deployer.get_code_at(mock).await.unwrap();
+            deployer.anvil_set_code(pinned, code).await.unwrap();
+        }
+        let refunded = U256::from(99_500_000_u64);
+        MintableStable::new(contracts.stable, &deployer)
+            .mint(wallet.address(), refunded)
+            .send()
+            .await
+            .unwrap()
+            .watch()
+            .await
+            .unwrap();
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let request = QuoteRequest {
+            origin: Chain::Ethereum,
+            destination: Chain::Robinhood,
+            amount: refunded,
+            user: wallet.address(),
+            recipient: wallet.address(),
+            refund_to: wallet.address(),
+            slippage: BasisPoints::new(relay_bounds().slippage_bps).unwrap(),
+            ttl: relay_bounds().fill_timeout,
+        };
+        let requote = relay_api.mock(|when, then| {
+            when.method(POST).path("/quote/v2");
+            then.status(200)
+                .json_body(quote_body_for_test(&request, refunded, refunded).unwrap());
+        });
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = relay_transfer_with_bounds(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet.clone(),
+            contracts,
+            store.clone(),
+            RelayHopCtx {
+                min_transfer: Usdc::new(float!(10)),
+                ..relay_bounds()
+            },
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited_toward_chain(&store, &id, TOWARD_CHAIN_ORDER_ID).await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::RecordSwapRefund {
+                    refund_tx: TxHash::repeat_byte(0xe1),
+                    side: RefundSide::Origin,
+                    amount_refunded: refunded,
+                },
+            )
+            .await
+            .unwrap();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends");
+
+        requote.assert_calls(1);
+        let state = store.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::SwapDeposited {
+            quote,
+            refund_requotes,
+            signed_order_ids,
+            deposit_tx,
+            ..
+        } = &state
+        else {
+            panic!("expected SwapDeposited, got {state:?} after {outcome:?}");
+        };
+        assert_eq!(*refund_requotes, 1);
+        assert_eq!(quote.amount_in, refunded);
+        assert_ne!(quote.order_id, TOWARD_CHAIN_ORDER_ID);
+        assert_eq!(
+            signed_order_ids,
+            &vec![TOWARD_CHAIN_ORDER_ID, quote.order_id],
+            "the refunded order id stays signed"
+        );
+        let receipt = wallet
+            .provider()
+            .get_transaction_receipt(*deposit_tx)
+            .await
+            .unwrap()
+            .expect("the new deposit is mined");
+        assert!(receipt.status());
+        assert_eq!(receipt.to, Some(contracts.depository));
+        assert_eq!(
+            erc20_balance(&wallet, contracts.stable, wallet.address()).await,
+            U256::ZERO,
+            "the refunded USDC went to Relay"
+        );
+        assert!(state.holds_rebalance_guard());
+        assert_fill_pending(&outcome);
+    }
+
+    /// A Relay 5xx on the quote for a refund at the hub ends the job's
+    /// attempt with a re-queue at no retry cost: apalis's few quick retries
+    /// would otherwise dead-letter the job within seconds and leave nothing
+    /// to drive the transfer held at `SwapRefunded`.
+    #[tokio::test]
+    async fn transient_refund_requote_toward_chain_requeues_the_job() {
+        let rig = RelayRig::deploy().await;
+        let refunded = U256::from(99_500_000_u64);
+        let refund_tx = rig.refund_on_hub(refunded, TOWARD_CHAIN_ORDER_ID).await;
+        rig.hub_wallet
+            .provider()
+            .anvil_mine(Some(2), None)
+            .await
+            .unwrap();
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_status(
+            &relay_api,
+            json!({
+                "status": "refund",
+                "txHashes": [refund_tx],
+                "failReason": "SOLVER_CAPACITY_EXCEEDED"
+            }),
+        );
+        let requote = mock_quote_unavailable(&relay_api);
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(
+                &server,
+                &relay_api,
+                store.clone(),
+                RelayHopCtx {
+                    min_transfer: Usdc::new(float!(10)),
+                    ..relay_bounds()
+                },
+            )
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited_toward_chain(&store, &id, TOWARD_CHAIN_ORDER_ID).await;
+        let queue_pool = setup_test_apalis_pool().await;
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(transfer),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&queue_pool),
+            max_burn_revert_redrives: 5,
+            notifier: Arc::new(LogNotifier),
+            driver_gate: UsdcDriverGate::unpaused(),
+            unrecorded_guards: None,
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: id.clone(),
+            amount: Usdc::new(float!(100)),
+            corridor: ROBINHOOD_RELAY,
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        let before = Utc::now().timestamp();
+        tokio::time::timeout(Duration::from_secs(30), Job::perform(&job, &ctx))
+            .await
+            .expect("the attempt ends")
+            .expect("a transient Relay quote failure re-queues instead of failing the attempt");
+
+        assert!(requote.calls() > 0, "the refunded amount is quoted again");
+        let requeued: Vec<(Vec<u8>, i64)> = sqlx_apalis::query_as(
+            "SELECT job, run_at FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+        .fetch_all(&queue_pool)
+        .await
+        .unwrap();
+        assert_eq!(requeued.len(), 1);
+        let (payload, run_at) = &requeued[0];
+        // The job quotes again 30 seconds later.
+        assert!(
+            *run_at >= before + 29,
+            "the re-queued job runs at {run_at}, not 30 seconds after {before}"
+        );
+        let requeued: TransferUsdcToMarketMaking = serde_json::from_slice(payload).unwrap();
+        assert_eq!(requeued.id, id);
+        assert_eq!(
+            store.load(&id).await.unwrap().unwrap().state_name(),
+            "SwapRefunded"
+        );
+    }
+
+    /// Only a transient Relay failure of a quote past the withdrawal is
+    /// re-queued at no retry cost; a 4xx, a response that does not decode
+    /// and a rate limit are left to the job's retries and backpressure.
+    /// One that keeps failing for 30 minutes pages once per run of failures;
+    /// a gap or another quote outcome starts a new run.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn only_a_transient_quote_failure_is_requeued_and_a_lasting_one_pages_once() {
+        let anvil = spawn_anvil(Anvil::new());
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let contracts = RelayEndContracts {
+            stable: Address::repeat_byte(0x51),
+            depository: Address::repeat_byte(0x52),
+        };
+        let transfer = relay_transfer(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet,
+            contracts,
+            store,
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let http = |status| {
+            UsdcTransferError::RelayApi(Box::new(RelayError::HttpStatus {
+                endpoint: RelayEndpoint::Quote,
+                status,
+            }))
+        };
+        let decode = UsdcTransferError::RelayApi(Box::new(RelayError::Decode {
+            endpoint: RelayEndpoint::Quote,
+            source: serde_json::from_str::<u8>("x").unwrap_err(),
+        }));
+        let rate_limited =
+            UsdcTransferError::RelayApi(Box::new(RelayError::RateLimited { retry_after: None }));
+
+        for left in [http(400), decode, rate_limited] {
+            let classified = transfer.hop.transient_swap_quote(&id, left);
+            assert!(
+                matches!(classified, UsdcTransferError::RelayApi(_)),
+                "got {classified:?}"
+            );
+        }
+        let requeued = transfer.hop.transient_swap_quote(&id, http(503));
+        assert!(
+            matches!(
+                &requeued,
+                UsdcTransferError::SwapQuoteTransient { source, .. }
+                    if matches!(**source, RelayError::HttpStatus { status: 503, .. })
+            ),
+            "got {requeued:?}"
+        );
+        assert!(!logs_contain("Relay quotes keep failing transiently"));
+
+        // A run of failures 30 minutes long pages once.
+        let backdate = |since: Instant, last: Instant| {
+            let mut failing = transfer.hop.failing_quotes.lock().unwrap();
+            let entry = failing.get_mut(&id).unwrap();
+            entry.since = since;
+            entry.last = last;
+            drop(failing);
+        };
+        let since = Instant::now()
+            .checked_sub(QUOTE_FAILING_PAGE_AFTER)
+            .unwrap();
+        backdate(since, Instant::now());
+        for _ in 0..2 {
+            transfer.hop.transient_swap_quote(&id, http(502));
+        }
+        // A failure after a gap starts a new run, which does not page yet.
+        let now = Instant::now();
+        backdate(
+            now.checked_sub(QUOTE_FAILING_PAGE_AFTER * 2).unwrap(),
+            now.checked_sub(QUOTE_FAILING_RUN_GAP).unwrap(),
+        );
+        transfer.hop.transient_swap_quote(&id, http(502));
+        // A run ended by another quote outcome is forgotten, and the next one
+        // pages again once it lasts.
+        transfer.hop.forget_failing_quotes(&id);
+        assert!(
+            !transfer
+                .hop
+                .failing_quotes
+                .lock()
+                .unwrap()
+                .contains_key(&id)
+        );
+        transfer.hop.transient_swap_quote(&id, http(502));
+        backdate(since, Instant::now());
+        transfer.hop.transient_swap_quote(&id, http(502));
+
+        logs_assert(|lines| {
+            let pages = lines
+                .iter()
+                .filter(|line| line.contains("Relay quotes keep failing transiently"))
+                .count();
+            (pages == 2)
+                .then_some(())
+                .ok_or_else(|| format!("{pages} pages of the failing quotes"))
+        });
+    }
+
+    /// A refund at the hub below the corridor's `min_transfer` is not quoted
+    /// again: the transfer holds at `SwapRefunded`, guard held, for
+    /// `transfer reconcile`.
+    #[tokio::test]
+    async fn refund_retries_stop_at_min_transfer() {
+        let anvil = spawn_anvil(Anvil::new());
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let quote = mock_quote_unavailable(&relay_api);
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let contracts = RelayEndContracts {
+            stable: Address::repeat_byte(0x51),
+            depository: Address::repeat_byte(0x52),
+        };
+        let transfer = relay_transfer_with_bounds(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet,
+            contracts,
+            store.clone(),
+            RelayHopCtx {
+                min_transfer: Usdc::new(float!(99.6)),
+                ..relay_bounds()
+            },
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited_toward_chain(&store, &id, TOWARD_CHAIN_ORDER_ID).await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::RecordSwapRefund {
+                    refund_tx: TxHash::repeat_byte(0xe1),
+                    side: RefundSide::Origin,
+                    amount_refunded: U256::from(99_500_000_u64),
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer
+            .resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
+            .await
+            .unwrap();
+
+        quote.assert_calls(0);
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "SwapRefunded");
+        assert!(state.holds_rebalance_guard());
+        assert!(state.is_reconcilable_failure());
+    }
+
+    /// A refund at the hub below its refund floor is never quoted again, on
+    /// resume as on adoption: it pages and holds at `SwapRefunded`, guard
+    /// held, for `transfer reconcile`.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn short_refund_toward_chain_holds_without_requoting() {
+        let anvil = spawn_anvil(Anvil::new());
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let quote = mock_quote_unavailable(&relay_api);
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let contracts = RelayEndContracts {
+            stable: Address::repeat_byte(0x51),
+            depository: Address::repeat_byte(0x52),
+        };
+        let transfer = relay_transfer_with_bounds(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet,
+            contracts,
+            store.clone(),
+            RelayHopCtx {
+                min_transfer: Usdc::new(float!(10)),
+                ..relay_bounds()
+            },
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited_toward_chain(&store, &id, TOWARD_CHAIN_ORDER_ID).await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::RecordSwapRefund {
+                    refund_tx: TxHash::repeat_byte(0xe1),
+                    side: RefundSide::Origin,
+                    amount_refunded: U256::from(99_000_000_u64),
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer
+            .resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
+            .await
+            .unwrap();
+
+        quote.assert_calls(0);
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "SwapRefunded");
+        assert!(state.holds_rebalance_guard());
+        assert!(state.is_reconcilable_failure());
+        assert!(logs_contain("refund floor"));
+    }
+
+    /// A short refund of a re-quoted attempt pages that attempt's deposit and
+    /// shortfall, next to the first deposit its floor is measured against.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn short_refund_of_a_requote_pages_its_own_shortfall() {
+        let anvil = spawn_anvil(Anvil::new());
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let quote = mock_quote_unavailable(&relay_api);
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let contracts = RelayEndContracts {
+            stable: Address::repeat_byte(0x51),
+            depository: Address::repeat_byte(0x52),
+        };
+        let transfer = relay_transfer_with_bounds(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet,
+            contracts,
+            store.clone(),
+            RelayHopCtx {
+                min_transfer: Usdc::new(float!(10)),
+                ..relay_bounds()
+            },
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let refund = |refund_tx: u8, amount_refunded: u64| UsdcRebalanceCommand::RecordSwapRefund {
+            refund_tx: TxHash::repeat_byte(refund_tx),
+            side: RefundSide::Origin,
+            amount_refunded: U256::from(amount_refunded),
+        };
+        record_deposited_toward_chain(&store, &id, TOWARD_CHAIN_ORDER_ID).await;
+        store.send(&id, refund(0xe1, 99_500_000)).await.unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::RequoteSwap {
+                    quote: Box::new(crate::usdc_rebalance::swap_quote_for_test(
+                        U256::from(99_500_000u64),
+                        B256::repeat_byte(0x1e),
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+        record_pair_deposited(&store, &id, 8).await;
+        store.send(&id, refund(0xe2, 99_000_000)).await.unwrap();
+
+        transfer
+            .resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
+            .await
+            .unwrap();
+
+        quote.assert_calls(0);
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "SwapRefunded");
+        assert!(logs_contain(
+            "deposited=99500000 refunded=99000000 first_deposit=100000000 floor=99500000 shortfall=500000"
+        ));
+    }
+
+    /// After `max_refund_retries` re-quotes that followed a refund, the next
+    /// refund at the hub holds at `SwapRefunded` instead of quoting again.
+    #[tokio::test]
+    async fn refund_retries_stop_at_the_retry_budget() {
+        let anvil = spawn_anvil(Anvil::new());
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let quote = mock_quote_unavailable(&relay_api);
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let contracts = RelayEndContracts {
+            stable: Address::repeat_byte(0x51),
+            depository: Address::repeat_byte(0x52),
+        };
+        let transfer = relay_transfer_with_bounds(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet,
+            contracts,
+            store.clone(),
+            RelayHopCtx {
+                min_transfer: Usdc::new(float!(10)),
+                max_refund_retries: 1,
+                ..relay_bounds()
+            },
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited_toward_chain(&store, &id, TOWARD_CHAIN_ORDER_ID).await;
+        let refund = |amount: u64| UsdcRebalanceCommand::RecordSwapRefund {
+            refund_tx: TxHash::repeat_byte(0xe1),
+            side: RefundSide::Origin,
+            amount_refunded: U256::from(amount),
+        };
+        store.send(&id, refund(99_500_000)).await.unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::RequoteSwap {
+                    quote: Box::new(crate::usdc_rebalance::swap_quote_for_test(
+                        U256::from(99_500_000_u64),
+                        B256::repeat_byte(0x1e),
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+        record_pair_deposited(&store, &id, 8).await;
+        store.send(&id, refund(99_100_000)).await.unwrap();
+
+        transfer
+            .resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
+            .await
+            .unwrap();
+
+        quote.assert_calls(0);
+        let state = store.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::SwapRefunded {
+            signed_order_ids, ..
+        } = &state
+        else {
+            panic!("expected SwapRefunded, got {state:?}");
+        };
+        assert_eq!(
+            *signed_order_ids,
+            vec![TOWARD_CHAIN_ORDER_ID, B256::repeat_byte(0x1e)],
+            "every order id signed stays on the record"
+        );
+        assert!(state.holds_rebalance_guard());
+        assert!(state.is_reconcilable_failure());
+    }
+
+    /// Past `max_deposit_revert_redrives` reverted deposits from the hub the
+    /// transfer holds at `SwapQuoted` with the USDC at the hub, guard held,
+    /// for `transfer reconcile`: nothing is redeposited or re-quoted.
+    #[tokio::test]
+    async fn deposit_revert_budget_exhausted_toward_chain_holds_at_the_hub() {
+        let rig = RelayRig::deploy().await;
+        rig.withdraw_to_hub(U256::from(AMOUNT_IN)).await;
+        rig.hub_wallet
+            .provider()
+            .anvil_set_code(
+                rig.hub_contracts.depository,
+                alloy::primitives::bytes!("5f5ffd"),
+            )
+            .await
+            .unwrap();
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let quote = mock_quote_unavailable(&relay_api);
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(
+                &server,
+                &relay_api,
+                store.clone(),
+                RelayHopCtx {
+                    max_deposit_revert_redrives: 1,
+                    ..relay_bounds()
+                },
+            )
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_quoted_toward_chain(
+            &store,
+            &id,
+            exact_quote_from_hub(&rig.hub_wallet, rig.hub_contracts, TOWARD_CHAIN_ORDER_ID).await,
+        )
+        .await;
+
+        let attempt = || async {
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+            )
+            .await
+            .expect("the attempt ends")
+        };
+        let reverted = attempt().await;
+        assert!(
+            matches!(reverted, Err(UsdcTransferError::SwapDepositReverted { .. })),
+            "the first deposit reverts, got {reverted:?}"
+        );
+        attempt()
+            .await
+            .expect("the spent revert budget ends the attempt with a hold");
+        quote.assert_calls(0);
+        let state = store.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::SwapQuoted {
+            deposit_reverts, ..
+        } = &state
+        else {
+            panic!("expected SwapQuoted, got {state:?}");
+        };
+        assert_eq!(*deposit_reverts, 1, "one deposit reverted");
+        assert!(state.holds_rebalance_guard());
+        assert!(state.is_reconcilable_failure());
+        assert_eq!(rig.hub_usdc().await, U256::from(AMOUNT_IN));
+    }
+
+    /// Answers every quote with Relay's refusal of the amount.
+    fn mock_quote_refused(relay_api: &MockServer) -> httpmock::Mock<'_> {
+        relay_api.mock(|when, then| {
+            when.method(POST).path("/quote/v2");
+            then.status(400).json_body(json!({
+                "message": "Amount is too low",
+                "errorCode": "AMOUNT_TOO_LOW",
+                "requestId": "0x00"
+            }));
+        })
+    }
+
+    /// A refused pre-flight quote from the hub ends a fresh attempt before
+    /// the USD conversion: nothing is recorded and no order is placed.
+    #[tokio::test]
+    async fn preflight_quote_refused_toward_chain_moves_nothing() {
+        let anvil = spawn_anvil(Anvil::new());
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let server = MockServer::start();
+        let orders = server.mock(|when, then| {
+            when.method(POST).path_includes("/orders");
+            then.status(500);
+        });
+        let relay_api = MockServer::start();
+        let quote = mock_quote_refused(&relay_api);
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let contracts = RelayEndContracts {
+            stable: Address::repeat_byte(0x51),
+            depository: Address::repeat_byte(0x52),
+        };
+        let transfer = relay_transfer(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet,
+            contracts,
+            store.clone(),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        let error = transfer
+            .resume_alpaca_to_base(&id, Usdc::new(float!(1000)), ROBINHOOD_RELAY)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                UsdcTransferError::RelayApi(relay)
+                    if matches!(**relay, RelayError::QuoteRefused { code: QuoteErrorCode::AmountTooLow })
+            ),
+            "got {error:?}"
+        );
+        quote.assert_calls(1);
+        orders.assert_calls(0);
+        assert_eq!(store.load(&id).await.unwrap(), None);
+    }
+
+    /// An expired quote from the hub that Relay refuses to replace holds the
+    /// transfer at `SwapQuoted` with the USDC at the hub, guard held: there
+    /// is no vault to return it to.
+    #[tokio::test]
+    async fn refused_requote_toward_chain_holds_at_the_hub() {
+        let rig = RelayRig::deploy().await;
+        rig.withdraw_to_hub(U256::from(AMOUNT_IN)).await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let quote = mock_quote_refused(&relay_api);
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let mut expired =
+            exact_quote_from_hub(&rig.hub_wallet, rig.hub_contracts, TOWARD_CHAIN_ORDER_ID).await;
+        expired.deadline = Utc::now() - chrono::Duration::minutes(1);
+        record_quoted_toward_chain(&store, &id, expired).await;
+
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends")
+        .unwrap();
+
+        assert!(quote.calls() > 0, "the expired quote is quoted again");
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "SwapQuoted", "{state:?}");
+        assert!(state.holds_rebalance_guard());
+        assert!(state.is_reconcilable_failure());
+        assert_eq!(rig.hub_usdc().await, U256::from(AMOUNT_IN));
+    }
+
+    /// A refund at the hub whose new quote Relay refuses holds at
+    /// `SwapRefunded`, guard held, for `transfer reconcile`.
+    #[tokio::test]
+    async fn refused_refund_requote_toward_chain_holds_at_the_hub() {
+        let anvil = spawn_anvil(Anvil::new());
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let quote = mock_quote_refused(&relay_api);
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let contracts = RelayEndContracts {
+            stable: Address::repeat_byte(0x51),
+            depository: Address::repeat_byte(0x52),
+        };
+        let transfer = relay_transfer_with_bounds(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet,
+            contracts,
+            store.clone(),
+            RelayHopCtx {
+                min_transfer: Usdc::new(float!(10)),
+                ..relay_bounds()
+            },
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited_toward_chain(&store, &id, TOWARD_CHAIN_ORDER_ID).await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::RecordSwapRefund {
+                    refund_tx: TxHash::repeat_byte(0xe1),
+                    side: RefundSide::Origin,
+                    amount_refunded: U256::from(99_500_000_u64),
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer
+            .resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
+            .await
+            .unwrap();
+
+        assert!(quote.calls() > 0, "the refund is quoted again");
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "SwapRefunded", "{state:?}");
+        assert!(state.holds_rebalance_guard());
+        assert!(state.is_reconcilable_failure());
+    }
+
+    /// Relay quotes the 99.5 refunded at the hub to `wallet` at 99.3
+    /// expected, 99.1 guaranteed: within the corridor's 50 bps of 99.5, below
+    /// the 99.5 floor of the 100 first deposited.
+    fn mock_quote_below_the_first_deposits_floor(
+        relay_api: &MockServer,
+        wallet: Address,
+    ) -> httpmock::Mock<'_> {
+        let request = QuoteRequest {
+            origin: Chain::Ethereum,
+            destination: Chain::Robinhood,
+            amount: U256::from(99_500_000_u64),
+            user: wallet,
+            recipient: wallet,
+            refund_to: wallet,
+            slippage: BasisPoints::new(relay_bounds().slippage_bps).unwrap(),
+            ttl: relay_bounds().fill_timeout,
+        };
+
+        relay_api.mock(|when, then| {
+            when.method(POST).path("/quote/v2");
+            then.status(200).json_body(
+                quote_body_for_test(
+                    &request,
+                    U256::from(99_300_000_u64),
+                    U256::from(99_100_000_u64),
+                )
+                .unwrap(),
+            );
+        })
+    }
+
+    /// A refund at the hub that clears the first deposit's floor is quoted
+    /// again only for a fill that clears it too: 99.5 refunded of 100 at
+    /// 50 bps, a re-quote guaranteeing 99.1 is within its own loss bound but
+    /// would lose past the first deposit's, so it is refused and the transfer
+    /// holds at `SwapRefunded`, guard held, for `transfer reconcile`.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn refund_requote_below_the_first_deposits_floor_holds_at_the_hub() {
+        let anvil = spawn_anvil(Anvil::new());
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let refunded = U256::from(99_500_000_u64);
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let quote = mock_quote_below_the_first_deposits_floor(&relay_api, wallet.address());
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let contracts = RelayEndContracts {
+            stable: Address::repeat_byte(0x51),
+            depository: Address::repeat_byte(0x52),
+        };
+        let transfer = relay_transfer_with_bounds(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet,
+            contracts,
+            store.clone(),
+            RelayHopCtx {
+                min_transfer: Usdc::new(float!(10)),
+                ..relay_bounds()
+            },
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited_toward_chain(&store, &id, TOWARD_CHAIN_ORDER_ID).await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::RecordSwapRefund {
+                    refund_tx: TxHash::repeat_byte(0xe1),
+                    side: RefundSide::Origin,
+                    amount_refunded: refunded,
+                },
+            )
+            .await
+            .unwrap();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends");
+
+        assert!(quote.calls() > 0, "the refund is quoted again");
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "SwapRefunded", "{state:?}");
+        assert!(state.holds_rebalance_guard());
+        assert!(state.is_reconcilable_failure());
+        outcome.unwrap();
+        assert!(logs_contain(
+            "Relay refused the quote for a refund at the hub"
+        ));
+        assert!(logs_contain("below the required minimum 99500000"));
+    }
+
+    /// An expired re-quote of a refund is quoted again within the first
+    /// deposit's floor too: one guaranteeing 99.1 of the 99.5 refunded is
+    /// refused and the transfer holds at `SwapQuoted`, guard held.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn expired_refund_requote_below_the_first_deposits_floor_holds_at_the_hub() {
+        let anvil = spawn_anvil(Anvil::new());
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let quote = mock_quote_below_the_first_deposits_floor(&relay_api, wallet.address());
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let contracts = RelayEndContracts {
+            stable: Address::repeat_byte(0x51),
+            depository: Address::repeat_byte(0x52),
+        };
+        let transfer = relay_transfer_with_bounds(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet,
+            contracts,
+            store.clone(),
+            RelayHopCtx {
+                min_transfer: Usdc::new(float!(10)),
+                ..relay_bounds()
+            },
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited_toward_chain(&store, &id, TOWARD_CHAIN_ORDER_ID).await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::RecordSwapRefund {
+                    refund_tx: TxHash::repeat_byte(0xe1),
+                    side: RefundSide::Origin,
+                    amount_refunded: U256::from(99_500_000_u64),
+                },
+            )
+            .await
+            .unwrap();
+        let mut expired = crate::usdc_rebalance::swap_quote_for_test(
+            U256::from(99_500_000_u64),
+            B256::repeat_byte(0x1e),
+        );
+        expired.deadline = Utc::now() - chrono::Duration::minutes(1);
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::RequoteSwap {
+                    quote: Box::new(expired),
+                },
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends")
+        .unwrap();
+
+        assert!(quote.calls() > 0, "the expired quote is quoted again");
+        let state = store.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::SwapQuoted { quote: kept, .. } = &state else {
+            panic!("expected SwapQuoted, got {state:?}");
+        };
+        assert_eq!(kept.order_id, B256::repeat_byte(0x1e));
+        assert!(state.holds_rebalance_guard());
+        assert!(state.is_reconcilable_failure());
+        assert!(logs_contain("Relay refused the re-quote from the hub"));
+        assert!(logs_contain("below the required minimum 99500000"));
+    }
+
+    /// A refund Relay pays in USDG to the chain wallet, proven on the chain,
+    /// holds at `SwapRefunded` with the guard held: the stable is in the
+    /// wallet, not the vault, and nothing is quoted again.
+    #[tokio::test]
+    async fn destination_refund_toward_chain_holds_in_the_chain_wallet() {
+        let rig = RelayRig::deploy().await;
+        let refunded = U256::from(99_500_000_u64);
+        let refund_tx = rig.refund_on_chain(refunded, TOWARD_CHAIN_ORDER_ID).await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let quote = mock_quote_unavailable(&relay_api);
+        mock_status(
+            &relay_api,
+            json!({
+                "status": "refund",
+                "txHashes": [refund_tx],
+                "failReason": "SOLVER_CAPACITY_EXCEEDED"
+            }),
+        );
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited_toward_chain(&store, &id, TOWARD_CHAIN_ORDER_ID).await;
+
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends")
+        .unwrap();
+
+        quote.assert_calls(0);
+        let state = store.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::SwapRefunded { side, .. } = &state else {
+            panic!("expected SwapRefunded, got {state:?}");
+        };
+        assert_eq!(*side, RefundSide::Destination);
+        assert!(state.holds_rebalance_guard());
+        assert!(state.is_reconcilable_failure());
+        assert_eq!(rig.vault_usdg().await, U256::ZERO);
+    }
+
+    /// A pair, or a lone approve, signed on the hub for a transfer the
+    /// operator reconciled meanwhile can never be persisted or sent: its
+    /// nonces are released, so later sends from the shared Ethereum wallet do
+    /// not wait behind them.
+    #[tokio::test]
+    async fn envelopes_signed_for_a_reconciled_transfer_release_their_nonces() {
+        let anvil = spawn_anvil(Anvil::new());
+        let (wallet, contracts) = funded_relay_end(&anvil).await;
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let transfer = relay_transfer(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet.clone(),
+            contracts,
+            store.clone(),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let quote = exact_quote_from_hub(&wallet, contracts, TOWARD_CHAIN_ORDER_ID).await;
+        record_quoted_toward_chain(&store, &id, quote.clone()).await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+                },
+            )
+            .await
+            .unwrap();
+        let first_nonce = wallet
+            .provider()
+            .get_transaction_count(wallet.address())
+            .await
+            .unwrap();
+
+        let PreparedSwap::Deposit(pair) = transfer
+            .hop
+            .bridge
+            .prepare_deposit(
+                HopDirection::FromHub,
+                &relay_quote(&id, &quote, true, &transfer.hop.bounds).unwrap(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected a signed pair");
+        };
+        transfer
+            .hop
+            .persist_swap_pair(&store, &id, &pair, HopDirection::FromHub)
+            .await
+            .unwrap_err();
+        let next = wallet
+            .prepare_pending(
+                contracts.stable,
+                quote.approve.clone().unwrap().data,
+                "next",
+            )
+            .await
+            .unwrap();
+        assert_eq!(next.nonce(), first_nonce, "the pair's nonces are released");
+
+        transfer
+            .hop
+            .persist_lone_approve(&store, &id, &next, HopDirection::FromHub)
+            .await
+            .unwrap_err();
+        let after = wallet
+            .prepare_pending(contracts.stable, quote.approve.unwrap().data, "after")
+            .await
+            .unwrap();
+        assert_eq!(
+            after.nonce(),
+            first_nonce,
+            "the lone approve's nonce is released"
+        );
+    }
+
+    /// A transfer from the hub held at `SwapQuoted` sends again the approves
+    /// that went out alone before it stops: a node may have dropped them, and
+    /// every later send from the shared Ethereum wallet waits behind their
+    /// nonces.
+    #[tokio::test]
+    async fn hold_at_the_hub_sends_its_split_approves_again() {
+        let anvil = spawn_anvil(Anvil::new());
+        let (wallet, contracts) = funded_relay_end(&anvil).await;
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_quote_refused(&relay_api);
+        let transfer = relay_transfer(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet.clone(),
+            contracts,
+            store.clone(),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let mut expired = exact_quote_from_hub(&wallet, contracts, TOWARD_CHAIN_ORDER_ID).await;
+        expired.deadline = Utc::now() - chrono::Duration::minutes(1);
+        record_quoted_toward_chain(&store, &id, expired.clone()).await;
+        let approve = wallet
+            .prepare_pending(
+                contracts.stable,
+                expired.approve.unwrap().data,
+                "split approve",
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::PrepareSwapApprove {
+                    approve: approve.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer
+            .resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
+            .await
+            .unwrap();
+
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "SwapQuoted", "{state:?}");
+        assert!(
+            wallet
+                .provider()
+                .get_transaction_receipt(approve.tx_hash())
+                .await
+                .unwrap()
+                .is_some(),
+            "the split approve is sent before the hold"
+        );
+    }
+
+    /// A hold at the hub queues the gas of the approves that went out alone:
+    /// the bot paid for them on Ethereum, and a transfer the operator
+    /// reconciles from the hold never deposits to queue them.
+    #[tokio::test]
+    async fn hold_at_the_hub_queues_the_gas_of_its_split_approves() {
+        let anvil = spawn_anvil(Anvil::new());
+        let (wallet, contracts) = funded_relay_end(&anvil).await;
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_quote_refused(&relay_api);
+        let (transfer, apalis_pool) = relay_transfer_recording_gas(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet.clone(),
+            contracts,
+            store.clone(),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let mut expired = exact_quote_from_hub(&wallet, contracts, TOWARD_CHAIN_ORDER_ID).await;
+        expired.deadline = Utc::now() - chrono::Duration::minutes(1);
+        record_quoted_toward_chain(&store, &id, expired.clone()).await;
+        let approve = wallet
+            .prepare_pending(
+                contracts.stable,
+                expired.approve.unwrap().data,
+                "split approve",
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::PrepareSwapApprove {
+                    approve: approve.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer
+            .resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
+            .await
+            .unwrap();
+
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "SwapQuoted", "{state:?}");
+        assert_eq!(
+            queued_gas_costs(&apalis_pool).await,
+            vec![(
+                Chain::Ethereum,
+                approve.tx_hash(),
+                "relay_approve".to_string()
+            )]
+        );
+    }
 }

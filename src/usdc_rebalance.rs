@@ -1157,8 +1157,9 @@ pub struct SwapQuote {
 }
 
 /// The input and loss bound of a transfer's first binding quote, kept
-/// through every re-quote: a refund on any attempt is measured against it,
-/// so refund losses never stack across re-quotes.
+/// through every re-quote: it bounds the whole transfer's loss, refunds and
+/// fills. A refund on any attempt is measured against its floor, and every
+/// later quote must guarantee at least that floor.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FirstDeposit {
     pub amount_in: U256,
@@ -1370,6 +1371,10 @@ pub enum UsdcRebalance {
         /// Signed deposits that mined and reverted.
         #[serde(default)]
         deposit_reverts: u32,
+        /// Alpaca-to-chain re-quotes made after a refund; zero for snapshots
+        /// from before this field.
+        #[serde(default)]
+        refund_requotes: u32,
         initiated_at: DateTime<Utc>,
         quoted_at: DateTime<Utc>,
     },
@@ -1387,6 +1392,8 @@ pub enum UsdcRebalance {
         deposit: PreparedTransaction,
         #[serde(default)]
         deposit_reverts: u32,
+        #[serde(default)]
+        refund_requotes: u32,
         initiated_at: DateTime<Utc>,
         prepared_at: DateTime<Utc>,
     },
@@ -1401,6 +1408,8 @@ pub enum UsdcRebalance {
         signed_order_ids: Vec<B256>,
         deposit_tx: TxHash,
         deposit_block: u64,
+        #[serde(default)]
+        refund_requotes: u32,
         initiated_at: DateTime<Utc>,
         deposited_at: DateTime<Utc>,
     },
@@ -1420,6 +1429,8 @@ pub enum UsdcRebalance {
         side: RefundSide,
         amount_refunded: Usdc,
         short_of_floor: Option<U256>,
+        #[serde(default)]
+        refund_requotes: u32,
         initiated_at: DateTime<Utc>,
         refunded_at: DateTime<Utc>,
     },
@@ -1433,6 +1444,8 @@ pub enum UsdcRebalance {
         quote: Box<SwapQuote>,
         signed_order_ids: Vec<B256>,
         deposit_tx: TxHash,
+        #[serde(default)]
+        refund_requotes: u32,
         initiated_at: DateTime<Utc>,
         unresolved_at: DateTime<Utc>,
     },
@@ -1570,9 +1583,9 @@ pub enum PreBurnFailEligibility {
     AlreadyFailedPreBurn,
     /// A CCTP burn may already be on-chain; failing would strand the funds.
     PostBurn,
-    /// A chain-to-Alpaca Relay transfer past its vault withdrawal: the stable
-    /// is outside the vault, in the chain wallet, with Relay or on its way
-    /// back. `FailBridging` and the post-burn steps refuse it; resuming it, a
+    /// A Relay transfer past its withdrawal: the stable left the vault or
+    /// Alpaca and is in a wallet, with Relay or on its way back.
+    /// `FailBridging` and the post-burn steps refuse it; resuming it, a
     /// redeposit or `transfer reconcile` settles it.
     RelayHeldOutsideVault,
     /// Before the bridge boundary; `FailBridging` does not apply here.
@@ -1649,6 +1662,12 @@ impl UsdcRebalance {
     /// still mine until its nonce is taken.
     pub fn has_prepared_deposit_send(&self) -> bool {
         self.prepared_deposit_send().is_some()
+    }
+
+    /// Whether the transfer holds a signed Relay envelope, whose nonce the
+    /// running bot keeps reserved until a restart.
+    pub fn has_signed_swap_envelopes(&self) -> bool {
+        !self.prepared_swap_envelopes().is_empty()
     }
 
     /// The signed deposit send of a BaseToAlpaca `Bridged`, if there is one.
@@ -1747,10 +1766,10 @@ impl UsdcRebalance {
     pub fn is_reconcilable_failure(&self) -> bool {
         match self {
             // A Relay failure with nothing paid back, a refund below its floor,
-            // a chain-to-Alpaca refund paid in USDC at the hub, and a
-            // redeposit that does not confirm:
-            // no automated step settles them, and the operator moves the
-            // funds.
+            // a chain-to-Alpaca refund paid in USDC at the hub, a redeposit
+            // that does not confirm, and an Alpaca-to-chain swap held at the
+            // hub or refunded: once paged, no automated step settles them,
+            // and the operator moves the funds.
             Self::DepositFailed { .. }
             | Self::ConversionFailed {
                 direction: RebalanceDirection::BaseToAlpaca,
@@ -1765,6 +1784,14 @@ impl UsdcRebalance {
             | Self::SwapRefunded {
                 direction: RebalanceDirection::BaseToAlpaca,
                 side: RefundSide::Destination,
+                ..
+            }
+            | Self::SwapQuoted {
+                direction: RebalanceDirection::AlpacaToBase,
+                ..
+            }
+            | Self::SwapRefunded {
+                direction: RebalanceDirection::AlpacaToBase,
                 ..
             } => true,
             Self::BridgingFailed {
@@ -1876,6 +1903,32 @@ impl UsdcRebalance {
             | Self::Redepositing {
                 direction: RebalanceDirection::BaseToAlpaca,
                 ..
+            }
+            // An Alpaca-to-chain swap: the USDC left Alpaca and is at the
+            // hub or with Relay.
+            | Self::SwapQuoted {
+                direction: RebalanceDirection::AlpacaToBase,
+                ..
+            }
+            | Self::SwapDepositPrepared {
+                direction: RebalanceDirection::AlpacaToBase,
+                ..
+            }
+            | Self::SwapDeposited {
+                direction: RebalanceDirection::AlpacaToBase,
+                ..
+            }
+            | Self::SwapRefunded {
+                direction: RebalanceDirection::AlpacaToBase,
+                ..
+            }
+            | Self::SwapEscrowUnresolved {
+                direction: RebalanceDirection::AlpacaToBase,
+                ..
+            }
+            | Self::SwapFailed {
+                direction: RebalanceDirection::AlpacaToBase,
+                ..
             } => PreBurnFailEligibility::RelayHeldOutsideVault,
             // The two states `FailBridging` accepts from before any burn.
             // `BridgingSubmitting` with no recorded burn is the only genuinely
@@ -1899,19 +1952,13 @@ impl UsdcRebalance {
             // (use `transfer resume`, which adopts / waits / pages, or
             // `clear-pending-burn` after verifying the burn never landed).
             // A BaseToAlpaca `ConversionFailed` is post-deposit, hence
-            // post-burn; an AlpacaToBase one is pre-withdrawal. Every other
-            // swap state counts as post-burn: a lone approve or a signed
-            // deposit may be on chain, and `FailBridging` has no swap arm.
+            // post-burn; an AlpacaToBase one is pre-withdrawal. The redeposit
+            // states the Alpaca-to-chain side never reaches count as
+            // post-burn, and `FailBridging` has no swap arm.
             Self::BridgingSubmitting {
                 pending_burn_tx: Some(_),
                 ..
             }
-            | Self::SwapQuoted { .. }
-            | Self::SwapDepositPrepared { .. }
-            | Self::SwapDeposited { .. }
-            | Self::SwapRefunded { .. }
-            | Self::SwapEscrowUnresolved { .. }
-            | Self::SwapFailed { .. }
             | Self::Redepositing { .. }
             | Self::ReturnedToSource { .. }
             | Self::BridgingFailed { .. }
@@ -3432,7 +3479,10 @@ impl EventSourced for UsdcRebalance {
     // events, `HopEvidence::Relay`, `deposit_reverts` on the swap states,
     // `max_quote_loss_bps` on `SwapQuote`, `first_deposit` on the swap
     // states and `short_of_floor` on `SwapRefunded`.
-    const SCHEMA_VERSION: u64 = 15;
+    // v16: `refund_requotes` on `SwapQuoted`, `SwapDepositPrepared`,
+    // `SwapDeposited`, `SwapRefunded` and `SwapEscrowUnresolved`; older
+    // snapshots read it as 0.
+    const SCHEMA_VERSION: u64 = 16;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use UsdcRebalanceEvent::*;
@@ -3979,6 +4029,7 @@ impl EventSourced for UsdcRebalance {
                 signed_order_ids: Vec::new(),
                 split_approves: Vec::new(),
                 deposit_reverts: 0,
+                refund_requotes: 0,
                 initiated_at: *initiated_at,
                 quoted_at: *quoted_at,
             },
@@ -3994,6 +4045,7 @@ impl EventSourced for UsdcRebalance {
                     signed_order_ids,
                     split_approves,
                     deposit_reverts,
+                    refund_requotes,
                     initiated_at,
                     quoted_at,
                 },
@@ -4010,6 +4062,7 @@ impl EventSourced for UsdcRebalance {
                     .cloned()
                     .collect(),
                 deposit_reverts: *deposit_reverts,
+                refund_requotes: *refund_requotes,
                 initiated_at: *initiated_at,
                 quoted_at: *quoted_at,
             },
@@ -4029,6 +4082,7 @@ impl EventSourced for UsdcRebalance {
                     signed_order_ids,
                     split_approves,
                     deposit_reverts,
+                    refund_requotes,
                     initiated_at,
                     ..
                 },
@@ -4043,6 +4097,7 @@ impl EventSourced for UsdcRebalance {
                 approve: approve.clone(),
                 deposit: deposit.clone(),
                 deposit_reverts: *deposit_reverts,
+                refund_requotes: *refund_requotes,
                 initiated_at: *initiated_at,
                 prepared_at: *prepared_at,
             },
@@ -4060,6 +4115,7 @@ impl EventSourced for UsdcRebalance {
                     first_deposit,
                     quote,
                     signed_order_ids,
+                    refund_requotes,
                     initiated_at,
                     ..
                 },
@@ -4072,6 +4128,7 @@ impl EventSourced for UsdcRebalance {
                 signed_order_ids: signed_order_ids.clone(),
                 deposit_tx: *deposit_tx,
                 deposit_block: *deposit_block,
+                refund_requotes: *refund_requotes,
                 initiated_at: *initiated_at,
                 deposited_at: *deposited_at,
             },
@@ -4086,6 +4143,7 @@ impl EventSourced for UsdcRebalance {
                     signed_order_ids,
                     split_approves,
                     deposit_reverts,
+                    refund_requotes,
                     initiated_at,
                     ..
                 },
@@ -4098,6 +4156,35 @@ impl EventSourced for UsdcRebalance {
                 signed_order_ids: signed_order_ids.clone(),
                 split_approves: split_approves.clone(),
                 deposit_reverts: *deposit_reverts,
+                refund_requotes: *refund_requotes,
+                initiated_at: *initiated_at,
+                quoted_at: *quoted_at,
+            },
+
+            // An Alpaca-to-chain refund at the hub quoted again: a fresh
+            // attempt on the refunded amount, its revert budget anew, its
+            // refunds still measured against the first deposit.
+            (
+                SwapRequoted { quote, quoted_at },
+                Self::SwapRefunded {
+                    direction,
+                    corridor,
+                    first_deposit,
+                    signed_order_ids,
+                    refund_requotes,
+                    initiated_at,
+                    ..
+                },
+            ) => Self::SwapQuoted {
+                direction: *direction,
+                corridor: *corridor,
+                amount: swap_input(quote)?,
+                first_deposit: *first_deposit,
+                quote: quote.clone(),
+                signed_order_ids: signed_order_ids.clone(),
+                split_approves: Vec::new(),
+                deposit_reverts: 0,
+                refund_requotes: refund_requotes.saturating_add(1),
                 initiated_at: *initiated_at,
                 quoted_at: *quoted_at,
             },
@@ -4115,6 +4202,7 @@ impl EventSourced for UsdcRebalance {
                     quote,
                     signed_order_ids,
                     deposit_reverts,
+                    refund_requotes,
                     initiated_at,
                     prepared_at,
                     ..
@@ -4128,6 +4216,7 @@ impl EventSourced for UsdcRebalance {
                 signed_order_ids: signed_order_ids.clone(),
                 split_approves: Vec::new(),
                 deposit_reverts: deposit_reverts.saturating_add(1),
+                refund_requotes: *refund_requotes,
                 initiated_at: *initiated_at,
                 quoted_at: *prepared_at,
             },
@@ -4191,6 +4280,7 @@ impl EventSourced for UsdcRebalance {
                     quote,
                     signed_order_ids,
                     deposit_tx,
+                    refund_requotes,
                     initiated_at,
                     ..
                 }
@@ -4202,6 +4292,7 @@ impl EventSourced for UsdcRebalance {
                     quote,
                     signed_order_ids,
                     deposit_tx,
+                    refund_requotes,
                     initiated_at,
                     ..
                 },
@@ -4217,6 +4308,7 @@ impl EventSourced for UsdcRebalance {
                 side: *side,
                 amount_refunded: *amount_refunded,
                 short_of_floor: *short_of_floor,
+                refund_requotes: *refund_requotes,
                 initiated_at: *initiated_at,
                 refunded_at: *refunded_at,
             },
@@ -4231,6 +4323,7 @@ impl EventSourced for UsdcRebalance {
                     quote,
                     signed_order_ids,
                     deposit_tx,
+                    refund_requotes,
                     initiated_at,
                     ..
                 },
@@ -4242,6 +4335,7 @@ impl EventSourced for UsdcRebalance {
                 quote: quote.clone(),
                 signed_order_ids: signed_order_ids.clone(),
                 deposit_tx: *deposit_tx,
+                refund_requotes: *refund_requotes,
                 initiated_at: *initiated_at,
                 unresolved_at: *unresolved_at,
             },
@@ -4606,9 +4700,12 @@ impl EventSourced for UsdcRebalance {
                         reconciled_at: *reconciled_at,
                     },
 
-                    // A Relay refund at the hub the operator moved on, or a
-                    // redeposit the operator settled by hand.
-                    Self::SwapRefunded { .. } | Self::Redepositing { .. }
+                    // A Relay refund the operator moved on, a redeposit the
+                    // operator settled by hand, or Alpaca-to-chain USDC held
+                    // at the hub.
+                    Self::SwapRefunded { .. }
+                    | Self::Redepositing { .. }
+                    | Self::SwapQuoted { .. }
                         if state.is_reconcilable_failure() =>
                     {
                         Self::Reconciled {
@@ -6057,26 +6154,51 @@ impl UsdcRebalance {
     }
 
     /// Replaces the quote of a `SwapQuoted` with a fresh one for the same
-    /// input whose order id no deposit was signed for.
+    /// input, or quotes again an Alpaca-to-chain refund paid at the hub for
+    /// the refunded amount; either way under an order id no deposit was
+    /// signed for.
     fn transition_requote_swap(
         &self,
         quote: Box<SwapQuote>,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
-        let Self::SwapQuoted {
-            quote: current,
-            signed_order_ids,
-            ..
-        } = self
-        else {
-            return Err(UsdcRebalanceError::InvalidCommand {
-                command: "RequoteSwap".to_string(),
-                state: self.state_name().to_string(),
-            });
+        let (input, signed_order_ids) = match self {
+            Self::SwapQuoted {
+                quote: current,
+                signed_order_ids,
+                ..
+            } => (current.amount_in, signed_order_ids),
+            Self::SwapRefunded {
+                short_of_floor: Some(floor),
+                ..
+            } => return Err(UsdcRebalanceError::ShortRefundHeld { floor: *floor }),
+            Self::SwapRefunded {
+                direction: RebalanceDirection::AlpacaToBase,
+                side: RefundSide::Origin,
+                amount_refunded,
+                signed_order_ids,
+                ..
+            } => (
+                amount_refunded.to_u256_6_decimals().map_err(|_| {
+                    UsdcRebalanceError::SwapAmountUnconvertible {
+                        amount: *amount_refunded,
+                    }
+                })?,
+                signed_order_ids,
+            ),
+            _ => {
+                return Err(UsdcRebalanceError::InvalidCommand {
+                    command: "RequoteSwap".to_string(),
+                    state: self.state_name().to_string(),
+                });
+            }
         };
 
-        if quote.amount_in != current.amount_in {
+        if quote.amount_in != input {
+            let withdrawn = Float::from_fixed_decimal(input, 6)
+                .map(Usdc::new)
+                .map_err(|_| UsdcRebalanceError::SwapInputUnconvertible { amount_in: input })?;
             return Err(UsdcRebalanceError::SwapAmountMismatch {
-                withdrawn: swap_input(current)?,
+                withdrawn,
                 quoted: quote.amount_in,
             });
         }
@@ -6740,6 +6862,12 @@ impl UsdcRebalance {
                 initiated_at,
                 ..
             }
+            | Self::SwapQuoted {
+                direction,
+                amount,
+                initiated_at,
+                ..
+            }
             | Self::Redepositing {
                 direction,
                 amount,
@@ -6771,8 +6899,8 @@ impl UsdcRebalance {
 }
 
 /// A Relay quote for `amount_in` in base units, as `QuoteSwap` records it.
-#[cfg(test)]
-pub(crate) fn swap_quote_for_test(amount_in: U256, order_id: B256) -> SwapQuote {
+#[cfg(any(test, feature = "test-support"))]
+pub fn swap_quote_for_test(amount_in: U256, order_id: B256) -> SwapQuote {
     SwapQuote {
         request_id: B256::repeat_byte(0x5e),
         order_id,
@@ -7358,6 +7486,277 @@ mod tests {
         }
     }
 
+    fn refunded_toward_chain(side: RefundSide) -> Vec<UsdcRebalanceEvent> {
+        [
+            deposited(RebalanceDirection::AlpacaToBase),
+            vec![UsdcRebalanceEvent::SwapRefunded {
+                refund_tx: TxHash::repeat_byte(0xe1),
+                side,
+                amount_refunded: Usdc::new(float!(99)),
+                short_of_floor: None,
+                shortfall: Usdc::new(float!(1)),
+                refunded_at: Utc::now(),
+            }],
+        ]
+        .concat()
+    }
+
+    /// An Alpaca-to-chain refund paid in USDC at the hub is quoted again for
+    /// the refunded amount under a fresh order id, every signed one kept.
+    #[tokio::test]
+    async fn origin_refund_toward_chain_requotes_the_refunded_amount() {
+        let requote = swap_quote_for_test(U256::from(99_000_000u64), B256::repeat_byte(0x1e));
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(refunded_toward_chain(RefundSide::Origin))
+            .when(UsdcRebalanceCommand::RequoteSwap {
+                quote: Box::new(requote.clone()),
+            })
+            .await
+            .events();
+        let state =
+            replay::<UsdcRebalance>([refunded_toward_chain(RefundSide::Origin), events].concat())
+                .unwrap()
+                .unwrap();
+
+        let UsdcRebalance::SwapQuoted {
+            direction,
+            amount,
+            quote,
+            signed_order_ids,
+            split_approves,
+            deposit_reverts,
+            ..
+        } = &state
+        else {
+            panic!("expected SwapQuoted, got {state:?}");
+        };
+        assert_eq!(*direction, RebalanceDirection::AlpacaToBase);
+        assert_eq!(*amount, Usdc::new(float!(99)));
+        assert_eq!(**quote, requote);
+        assert_eq!(*signed_order_ids, vec![B256::repeat_byte(0x0a)]);
+        assert!(split_approves.is_empty());
+        assert_eq!(*deposit_reverts, 0);
+        assert!(state.holds_rebalance_guard());
+        assert_eq!(
+            state.ethereum_wallet_credit(),
+            Some(EthereumWalletCredit::Held(Usdc::new(float!(99))))
+        );
+    }
+
+    /// A refund at the hub below its refund floor is never quoted again.
+    #[tokio::test]
+    async fn short_refund_toward_chain_is_not_requoted() {
+        let deposited = deposited(RebalanceDirection::AlpacaToBase);
+        let refunded = TestHarness::<UsdcRebalance>::with(())
+            .given(deposited.clone())
+            .when(UsdcRebalanceCommand::RecordSwapRefund {
+                refund_tx: TxHash::repeat_byte(0xe1),
+                side: RefundSide::Origin,
+                amount_refunded: U256::from(99_000_000u64),
+            })
+            .await
+            .events();
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given([deposited, refunded].concat())
+            .when(UsdcRebalanceCommand::RequoteSwap {
+                quote: Box::new(swap_quote_for_test(
+                    U256::from(99_000_000u64),
+                    B256::repeat_byte(0x1e),
+                )),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(UsdcRebalanceError::ShortRefundHeld { floor })
+                    if floor == U256::from(99_500_000u64)
+            ),
+            "got {error:?}"
+        );
+    }
+
+    /// A refund after a re-quote is measured against the transfer's first
+    /// deposit: 99.2 clears the 99.6 re-quote's floor of 99.102 but not the
+    /// 100 deposit's floor of 99.5, so it is held.
+    #[tokio::test]
+    async fn requoted_refund_below_the_first_deposits_floor_is_held() {
+        let deposited = deposited(RebalanceDirection::AlpacaToBase);
+        let refund = |refund_tx: u8, amount_refunded: u64| UsdcRebalanceCommand::RecordSwapRefund {
+            refund_tx: TxHash::repeat_byte(refund_tx),
+            side: RefundSide::Origin,
+            amount_refunded: U256::from(amount_refunded),
+        };
+        let first_refund = TestHarness::<UsdcRebalance>::with(())
+            .given(deposited.clone())
+            .when(refund(0xe1, 99_600_000))
+            .await
+            .events();
+        let deposited_again = [
+            deposited,
+            first_refund,
+            vec![
+                UsdcRebalanceEvent::SwapRequoted {
+                    quote: Box::new(swap_quote_for_test(
+                        U256::from(99_600_000u64),
+                        B256::repeat_byte(0x1e),
+                    )),
+                    quoted_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::SwapDepositPrepared {
+                    approve: None,
+                    deposit: PreparedTransaction::for_test(TxHash::repeat_byte(0xa3), 7),
+                    prepared_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::SwapDeposited {
+                    deposit_tx: TxHash::repeat_byte(0xa3),
+                    deposit_block: 10,
+                    deposited_at: Utc::now(),
+                },
+            ],
+        ]
+        .concat();
+
+        let second_refund = TestHarness::<UsdcRebalance>::with(())
+            .given(deposited_again.clone())
+            .when(refund(0xe2, 99_200_000))
+            .await
+            .events();
+        let state = replay::<UsdcRebalance>([deposited_again, second_refund].concat())
+            .unwrap()
+            .unwrap();
+
+        let UsdcRebalance::SwapRefunded { short_of_floor, .. } = &state else {
+            panic!("expected SwapRefunded, got {state:?}");
+        };
+        assert_eq!(*short_of_floor, Some(U256::from(99_500_000u64)));
+        assert!(state.is_reconcilable_failure());
+    }
+
+    /// A re-quote after a refund must be for the refunded amount, under an
+    /// order id never signed, and only for an Alpaca-to-chain refund at the
+    /// hub.
+    #[tokio::test]
+    async fn refund_requote_toward_chain_is_refused_off_its_bounds() {
+        let requote = |amount: u64, order_id: u8| UsdcRebalanceCommand::RequoteSwap {
+            quote: Box::new(swap_quote_for_test(
+                U256::from(amount),
+                B256::repeat_byte(order_id),
+            )),
+        };
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(refunded_toward_chain(RefundSide::Origin))
+            .when(requote(99_500_000, 0x1e))
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(UsdcRebalanceError::SwapAmountMismatch { .. })
+            ),
+            "got {error:?}"
+        );
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(refunded_toward_chain(RefundSide::Origin))
+            .when(requote(99_000_000, 0x0a))
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(UsdcRebalanceError::SwapOrderAlreadySigned { .. })
+            ),
+            "got {error:?}"
+        );
+
+        let base_to_alpaca_refund = [
+            deposited(RebalanceDirection::BaseToAlpaca),
+            vec![UsdcRebalanceEvent::SwapRefunded {
+                refund_tx: TxHash::repeat_byte(0xe1),
+                side: RefundSide::Origin,
+                amount_refunded: Usdc::new(float!(99)),
+                short_of_floor: None,
+                shortfall: Usdc::new(float!(1)),
+                refunded_at: Utc::now(),
+            }],
+        ]
+        .concat();
+        for given in [
+            refunded_toward_chain(RefundSide::Destination),
+            base_to_alpaca_refund,
+        ] {
+            let error = TestHarness::<UsdcRebalance>::with(())
+                .given(given)
+                .when(requote(99_000_000, 0x1e))
+                .await
+                .then_expect_error();
+            assert!(
+                matches!(
+                    error,
+                    LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { .. })
+                ),
+                "got {error:?}"
+            );
+        }
+    }
+
+    /// The Alpaca-to-chain holds keep the guard and are reconcilable: any
+    /// `SwapQuoted`, live or held, and a refund either side. Every
+    /// Alpaca-to-chain swap state refuses `fail-usdc-transfer` with the Relay
+    /// hold.
+    #[tokio::test]
+    async fn relay_holds_toward_chain_classify_for_reconcile_and_fail() {
+        for events in [
+            quoted(RebalanceDirection::AlpacaToBase),
+            refunded_toward_chain(RefundSide::Origin),
+            refunded_toward_chain(RefundSide::Destination),
+        ] {
+            let state = replay::<UsdcRebalance>(events.clone()).unwrap().unwrap();
+            assert!(state.holds_rebalance_guard(), "{state:?}");
+            assert!(state.is_reconcilable_failure(), "{state:?}");
+
+            let reconciled = TestHarness::<UsdcRebalance>::with(())
+                .given(events.clone())
+                .when(UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: ReconcileReason::FundsMovedManually,
+                })
+                .await
+                .events();
+            let reconciled = replay::<UsdcRebalance>([events, reconciled].concat())
+                .unwrap()
+                .unwrap();
+            assert_eq!(reconciled.state_name(), "Reconciled");
+            assert!(!reconciled.holds_rebalance_guard());
+        }
+
+        for events in [
+            quoted(RebalanceDirection::AlpacaToBase),
+            prepared_pair(RebalanceDirection::AlpacaToBase),
+            deposited(RebalanceDirection::AlpacaToBase),
+            refunded_toward_chain(RefundSide::Origin),
+            refunded_toward_chain(RefundSide::Destination),
+            [
+                deposited(RebalanceDirection::AlpacaToBase),
+                vec![UsdcRebalanceEvent::SwapEscrowUnresolved {
+                    unresolved_at: Utc::now(),
+                }],
+            ]
+            .concat(),
+        ] {
+            let state = replay::<UsdcRebalance>(events).unwrap().unwrap();
+            assert_eq!(
+                state.pre_burn_fail_eligibility(),
+                PreBurnFailEligibility::RelayHeldOutsideVault,
+                "{state:?}"
+            );
+        }
+    }
+
     /// The chain-to-Alpaca Relay states after the deposit that hold the
     /// guard refuse `fail-usdc-transfer` with the Relay hold, not the CCTP
     /// post-burn steps: the stable is with Relay or on its way back.
@@ -7725,6 +8124,90 @@ mod tests {
 
             let legacy: UsdcRebalance = from_value(snapshot).unwrap();
             assert_eq!(legacy, state);
+        }
+    }
+
+    /// A refund re-quote counts once and the count rides every swap state to
+    /// the next refund; a snapshot from before the count reads zero.
+    #[test]
+    fn refund_requotes_count_through_the_swap_states() {
+        let requoted = [
+            refunded_toward_chain(RefundSide::Origin),
+            vec![UsdcRebalanceEvent::SwapRequoted {
+                quote: Box::new(swap_quote_for_test(
+                    U256::from(99_000_000u64),
+                    B256::repeat_byte(0x1e),
+                )),
+                quoted_at: Utc::now(),
+            }],
+        ]
+        .concat();
+        let prepared = [
+            requoted.clone(),
+            vec![UsdcRebalanceEvent::SwapDepositPrepared {
+                approve: None,
+                deposit: PreparedTransaction::for_test(TxHash::repeat_byte(0xa3), 7),
+                prepared_at: Utc::now(),
+            }],
+        ]
+        .concat();
+        let deposited_again = [
+            prepared.clone(),
+            vec![UsdcRebalanceEvent::SwapDeposited {
+                deposit_tx: TxHash::repeat_byte(0xa3),
+                deposit_block: 10,
+                deposited_at: Utc::now(),
+            }],
+        ]
+        .concat();
+        let unresolved = [
+            deposited_again.clone(),
+            vec![UsdcRebalanceEvent::SwapEscrowUnresolved {
+                unresolved_at: Utc::now(),
+            }],
+        ]
+        .concat();
+        let refunded_again = [
+            unresolved.clone(),
+            vec![UsdcRebalanceEvent::SwapRefunded {
+                refund_tx: TxHash::repeat_byte(0xe2),
+                side: RefundSide::Origin,
+                amount_refunded: Usdc::new(float!(98)),
+                short_of_floor: None,
+                shortfall: Usdc::new(float!(2)),
+                refunded_at: Utc::now(),
+            }],
+        ]
+        .concat();
+
+        for events in [
+            requoted,
+            prepared,
+            deposited_again,
+            unresolved,
+            refunded_again,
+        ] {
+            let state = replay::<UsdcRebalance>(events).unwrap().unwrap();
+            let mut snapshot = to_value(&state).unwrap();
+            let fields = snapshot
+                .as_object_mut()
+                .and_then(|variant| variant.values_mut().next())
+                .and_then(serde_json::Value::as_object_mut)
+                .unwrap();
+            assert_eq!(
+                fields.remove("refund_requotes"),
+                Some(json!(1)),
+                "{state:?}"
+            );
+
+            let legacy: UsdcRebalance = from_value(snapshot).unwrap();
+            let mut legacy_fields = to_value(&legacy).unwrap();
+            let legacy_count = legacy_fields
+                .as_object_mut()
+                .and_then(|variant| variant.values_mut().next())
+                .and_then(serde_json::Value::as_object_mut)
+                .and_then(|fields| fields.remove("refund_requotes"));
+            assert_eq!(legacy_count, Some(json!(0)), "{legacy:?}");
         }
     }
 

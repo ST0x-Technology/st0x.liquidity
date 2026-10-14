@@ -123,9 +123,9 @@ and the system proves market fit.
     tables. Today the only corridor that loads is Base via CCTP: a `relay` hop
     is parsed and validated but still refused at load (rule 6 of the cash
     corridor rules).
-  - On a `relay` corridor the trigger caps a transfer at the smaller of the
-    chain's operational limit and the sub-table's `max_transfer`, and declines a
-    transfer below its `min_transfer`.
+  - On a `relay` corridor the trigger caps a transfer, either way, at the
+    smaller of the chain's operational limit and the sub-table's `max_transfer`,
+    and declines a transfer below its `min_transfer`.
   - Each corridor's transfers run on its own chain's orderbook, vault, wallet
     and gas check, and the USDC check runs every active corridor in chain order,
     each against its own band.
@@ -825,16 +825,18 @@ orchestrator-mode mint without its chain's entry or `MintAuth` policy.
 Right after it restores each of those signed sends, startup rebroadcasts its
 exact bytes ("already known" is success; it does not wait for a confirmation),
 so no startup approval or revoke waits behind a send no node holds. It then
-reads each restored send's receipt, without waiting. A chain with a restored
-send that is not mined at that point (its rebroadcast failed, or it is pending,
-possibly at too low a fee to confirm) gets neither its approvals nor its revokes
-on that start: startup logs a warning and continues, since an approval there
-would wait behind that nonce until its confirmation timeout and fail every
-restart. Wraps and deposits there still approve on demand. Only a chain whose
-restored sends are all mined gets its startup approvals. A failure to list or
-load the signed Alpaca deposit sends, or one with an unparseable transfer id,
-defers Ethereum the same way: a send it hides has no reserved nonce, so an
-approval could take that nonce and leave the send unable to mine.
+reads each restored send's receipt, without waiting. A restored Relay envelope
+counts as mined only once it has its chain's confirmations in a canonical block.
+A chain with a restored send that is not mined at that point (its rebroadcast
+failed, or it is pending, possibly at too low a fee to confirm) gets neither its
+approvals nor its revokes on that start: startup logs a warning and continues,
+since an approval there would wait behind that nonce until its confirmation
+timeout and fail every restart. Wraps and deposits there still approve on
+demand. Only a chain whose restored sends are all mined gets its startup
+approvals. A failure to list or load the signed Alpaca deposit sends, or one
+with an unparseable transfer id, defers Ethereum the same way: a send it hides
+has no reserved nonce, so an approval could take that nonce and leave the send
+unable to mine.
 
 The per-symbol equity lock is re-armed at startup from every open mint and
 redemption aggregate, and the transfer job row plus the transfer's first event
@@ -2438,9 +2440,9 @@ rule fails startup with a named error:
 5. `hop = "cctp"` on a chain whose settlement stable is not Circle's USDC
    (Robinhood), or on a chain this build has no CCTP domain for (HyperEVM).
 6. `hop = "relay"` on any chain, once its sub-table is valid: the Relay hop is
-   switched on by RAI-2986, which adds the Alpaca-to-chain side, Robinhood's
-   cash capability, two-corridor sizing and the deploy gate's Relay targets.
-   Until then a config naming it does not load.
+   switched on by RAI-2986, which adds Robinhood's cash capability, two-corridor
+   sizing and the deploy gate's Relay targets. Until then a config naming it
+   does not load.
 7. USDC mode enabled and a chain that is not disabled, whose cash table enables
    rebalancing, has no corridor table: there is no implicit corridor.
 8. No served corridor while a hedged chain has a cash table. The build serves
@@ -2475,7 +2477,7 @@ min_transfer = 500              # USDC; the trigger declines below it
 max_transfer = 50000            # USDC; the trigger caps at it
 quote_max_age_secs = 60         # a persisted quote older than this is re-quoted
 fill_timeout_secs = 1800        # the fill window, also sent as the quote's ttl
-max_refund_retries = 3          # Alpaca-to-chain re-quotes after a refund
+max_refund_retries = 3          # Alpaca-to-chain re-quotes after refunds
 max_deposit_revert_redrives = 5 # reverted deposits before the transfer holds
 ```
 
@@ -4787,7 +4789,7 @@ struct SwapQuote {
 
 // The `amount_in` and `max_quote_loss_bps` of the transfer's first binding
 // quote, kept through every re-quote: each refund, on any attempt, is
-// measured against its floor.
+// measured against its floor, and every later quote's minimum must reach it.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 struct FirstDeposit {
     amount_in: U256,
@@ -4932,8 +4934,13 @@ enum UsdcRebalance {
         // broadcast again before a pair is signed.
         split_approves: Vec<PreparedTransaction>,
         // Signed deposits that mined and reverted; at
-        // `max_deposit_revert_redrives` the stable goes back to the vault.
+        // `max_deposit_revert_redrives` the stable goes back to the vault
+        // (chain-to-Alpaca) or the transfer holds at the hub (Alpaca-to-chain).
         deposit_reverts: u32,
+        // Alpaca-to-chain re-quotes made after a refund, carried through the
+        // swap states; at `max_refund_retries` a refund holds. Zero for
+        // snapshots taken before this field existed.
+        refund_requotes: u32,
         initiated_at: DateTime<Utc>,
         quoted_at: DateTime<Utc>,
     },
@@ -4951,6 +4958,7 @@ enum UsdcRebalance {
         approve: Option<PreparedTransaction>,
         deposit: PreparedTransaction,
         deposit_reverts: u32,
+        refund_requotes: u32,
         initiated_at: DateTime<Utc>,
         prepared_at: DateTime<Utc>,
     },
@@ -4963,13 +4971,16 @@ enum UsdcRebalance {
         signed_order_ids: Vec<B256>,
         deposit_tx: TxHash,
         deposit_block: u64,
+        refund_requotes: u32,
         initiated_at: DateTime<Utc>,
         deposited_at: DateTime<Utc>,
     },
     // Relay proved a refund of the deposit. One below the refund floor holds,
-    // guard held, for the operator. Otherwise on the origin side the stable is
-    // redeposited next; on the destination side it waits at the other end for
-    // the operator (or the Alpaca-to-chain side's re-quote), guard held.
+    // guard held, for the operator. Otherwise chain-to-Alpaca: on the origin
+    // side the stable is redeposited next; on the destination side it waits at
+    // the other end for the operator, guard held. Alpaca-to-chain: an origin
+    // refund is re-quoted within the corridor's bounds, or held like a
+    // destination one.
     SwapRefunded {
         direction: RebalanceDirection,
         corridor: UsdcCorridor,
@@ -4983,6 +4994,7 @@ enum UsdcRebalance {
         amount_refunded: Usdc,
         // The first deposit's refund floor, when the refund is below it.
         short_of_floor: Option<U256>,
+        refund_requotes: u32,
         initiated_at: DateTime<Utc>,
         refunded_at: DateTime<Utc>,
     },
@@ -4996,6 +5008,7 @@ enum UsdcRebalance {
         quote: SwapQuote,
         signed_order_ids: Vec<B256>,
         deposit_tx: TxHash,
+        refund_requotes: u32,
         initiated_at: DateTime<Utc>,
         unresolved_at: DateTime<Utc>,
     },
@@ -5111,8 +5124,9 @@ A Relay corridor (Robinhood) swaps the chain's USDG for the hub's USDC: we
 approve and deposit into Relay's depository on the origin chain, and Relay's
 solver pays us on the destination chain from its own funds, or refunds us. The
 swap states sit between `WithdrawalComplete` and the post-hop states. This build
-runs the chain-to-Alpaca side; every path after the vault withdraw ends in a
-proven fill or the stable back in the vault, never in a guard-freeing failure:
+runs both sides. On the chain-to-Alpaca side every path after the vault withdraw
+ends in a proven fill or the stable back in the vault, never in a guard-freeing
+failure:
 
 1. A pre-flight quote at dispatch, never persisted. A refusal, or a quote
    outside the sub-table's bounds, ends the attempt before anything is recorded,
@@ -5133,11 +5147,17 @@ proven fill or the stable back in the vault, never in a guard-freeing failure:
    transfer against it at the trigger. A refusal (a non-transient quote error
    code, a quote out of bounds or not matching the request) redeposits (step 9).
    A transient failure (transport, rate limit, 5xx, a transient code) leaves the
-   transfer at `WithdrawalComplete` with its guard held for the retry; the
-   timeout sweep holds that guard and pages, there, at `Withdrawing` before it
-   (recorded once the vault withdraw is mined) and at every swap state after it,
-   whatever stage its tracking reads, and `fail-usdc-transfer` refuses the
-   transfer there with a Relay-specific reason.
+   transfer at `WithdrawalComplete` with its guard held, and the job quotes
+   again 30 seconds later at no retry cost (a rate limit is backpressure, see
+   below), as after a transient failure of any later quote; quotes that keep
+   failing that way for 30 minutes page once per run of failures (a quote
+   outcome other than a rate limit, or 5 minutes without a failure, ends the
+   run), per process. Any other quote error (a 4xx, a response that does not
+   decode) takes the job's retries. The timeout sweep holds that guard and
+   pages, there, at `Withdrawing` before it (recorded once the vault withdraw is
+   mined) and at every swap state after it, whatever stage its tracking reads,
+   and `fail-usdc-transfer` refuses the transfer there with a Relay-specific
+   reason.
 4. The approve and the deposit are signed together under the origin wallet's
    lock (the Ethereum wallet's deposit-send lock when Ethereum is the origin)
    and persisted in one event (`SwapDepositPrepared`) before either is
@@ -5154,10 +5174,16 @@ proven fill or the stable back in the vault, never in a guard-freeing failure:
    is released instead of persisted: the attempt first re-quotes (`RequoteSwap`
    -> `SwapRequoted`, same input, a fresh order id), and a refused re-quote
    redeposits (step 9). A persist that fails releases both nonces, deposit
-   first, unless a reload shows the pair committed. When another send took the
-   nonce between the two signs, the approve alone is persisted
-   (`SwapApprovePrepared`) and broadcast, even if its quote expired during the
-   signing, since that send holds the nonce above it, and the attempt retries.
+   first, only when a reload shows the pair not committed (the transfer still at
+   `SwapQuoted`, or reconciled); a reload showing it committed sends it. When
+   the reload fails or shows any other state, the nonces stay reserved and it
+   pages ("Cannot tell whether a signed Relay pair was persisted", or "... a
+   lone Relay approve ..." for a lone approve): every later send from that
+   wallet waits behind them until a restart, which reserves them again only if
+   the pair was persisted. When another send took the nonce between the two
+   signs, the approve alone is persisted (`SwapApprovePrepared`) and broadcast,
+   even if its quote expired during the signing, since that send holds the nonce
+   above it, and the attempt retries.
 5. Broadcast in nonce order; a retry sends the same bytes. The deposit is
    recorded (`ConfirmSwapDeposit` -> `SwapDeposited`) once it has the origin
    chain's confirmations and its receipt names our wallet, the origin stable and
@@ -5193,14 +5219,15 @@ proven fill or the stable back in the vault, never in a guard-freeing failure:
    first binding quote's `amount_in` less its `max_quote_loss_bps`, rounded up,
    kept as `first_deposit` through every re-quote), is short (both stables have
    6 decimals and compare unit for unit), and `SwapRefunded` records the floor
-   in `short_of_floor`: on either side it pages with the deposit, the refund,
-   the floor and the shortfall, and holds at `SwapRefunded`, guard kept, on
-   adoption and on every resume, never redeposited, quoted again or released,
-   until the operator settles it with `transfer reconcile`. A short refund so
-   costs at most one deposit, capped by `max_transfer`, and stops the corridor.
-   Otherwise an origin-side refund redeposits (step 9). A destination-side
-   refund leaves the other stable at the other end: the transfer holds its guard
-   at `SwapRefunded`, pages, and is accepted by `transfer reconcile` once the
+   in `short_of_floor`: on either side it pages with the refunded attempt's
+   deposit, the refund and that attempt's shortfall, the first deposit and the
+   floor, and holds at `SwapRefunded`, guard kept, on adoption and on every
+   resume, never redeposited, quoted again or released, until the operator
+   settles it with `transfer reconcile`. A short refund so costs at most one
+   deposit, capped by `max_transfer`, and stops the corridor. Otherwise an
+   origin-side refund redeposits (step 9). A destination-side refund leaves the
+   other stable at the other end: the transfer holds its guard at
+   `SwapRefunded`, pages, and is accepted by `transfer reconcile` once the
    operator has moved it. A `failure`, or a `refund` with a refund fail reason,
    is terminal at Relay with nothing paid back: `FailSwap` -> `SwapFailed`,
    guard held, paged, accepted by `transfer reconcile`. When `fill_timeout_secs`
@@ -5223,17 +5250,75 @@ proven fill or the stable back in the vault, never in a guard-freeing failure:
    imbalance that planned the transfer is unchanged, and a refund, deposits that
    keep reverting or a refused binding quote can persist. No redeposit starts
    while a signed deposit may still be on chain (`SwapDepositPrepared`), and
-   approves that went out alone are sent again and confirmed first: their nonces
-   precede the vault deposit's, and `BeginRedeposit` drops them from the
-   transfer, so an approve a node dropped would leave the vault deposit waiting
-   behind its nonce with nothing to send it again. A redeposit that does not
-   confirm pages and keeps the guard; the operator settles the stable by hand
-   and reconciles it.
+   approves that went out alone are sent again and confirmed first, and their
+   gas queued: their nonces precede the vault deposit's, and `BeginRedeposit`
+   drops them from the transfer, so an approve a node dropped would leave the
+   vault deposit waiting behind its nonce with nothing to send it again. A
+   redeposit that does not confirm pages and keeps the guard; the operator
+   settles the stable by hand and reconciles it.
 
 A Relay rate limit (429) on either quote is backpressure, as a broker 429 is
 (see "Broker rate-limit (429) backpressure"): the job reschedules after Relay's
 `Retry-After` instead of spending its retries, and the resume quotes again from
 the recorded state.
+
+The Alpaca-to-chain side runs the same commands in the `AlpacaToBase` direction,
+with the hub as the origin. Every path after the Alpaca withdrawal ends in a
+proven fill deposited into the chain's vault, or holds the guard with the stable
+at the hub for `transfer reconcile`; there is no redeposit, as the stable never
+left a vault:
+
+1. A pre-flight quote for the requested amount at dispatch, before the USD
+   conversion, never persisted: a refusal moves nothing.
+2. The USD conversion and the Alpaca withdrawal to the hub, exactly as on a CCTP
+   corridor, then the withdrawal tx's confirmations and its USDC credit to our
+   wallet (a credit of nothing or above the nominal fails the transfer for
+   reconciliation, as on CCTP).
+3. The binding quote for the credited amount (`QuoteSwap` -> `SwapQuoted`). A
+   refusal pages and leaves the transfer at `WithdrawalComplete`, guard held:
+   once it times out the sweep re-arms its job 30 minutes out, so it quotes
+   again at that cadence (the refusal pages once per transfer and process),
+   until a quote is accepted or the operator fails it (`fail-usdc-transfer`) and
+   reconciles the USDC at the hub. While that re-arm is queued,
+   `transfer resume` answers `AlreadyInFlight`: the job quotes again within 30
+   minutes. A transient failure is quoted again 30 seconds later, as in step 3
+   of the chain-to-Alpaca side.
+4. Before the pair is signed the shared Ethereum wallet's credit ledger is
+   checked against the swap's input, as before a CCTP burn: a shortfall pages
+   and does not stop the transfer. The pair is signed on the shared Ethereum
+   wallet under the one deposit-send lock every corridor's service holds for the
+   Alpaca deposit sends, so a Relay pair and a deposit send never take one
+   nonce. Expiry, re-quotes, the split pair, the timeout and the persist follow
+   step 4 above.
+5. Broadcast, the deposit's confirmations on Ethereum and the status reads
+   follow steps 5 and 6 above. A refused re-quote, or
+   `max_deposit_revert_redrives` reverted deposits, holds the transfer at
+   `SwapQuoted` with the USDC at the hub, guard held, paged, for
+   `transfer reconcile`, once the approves that went out alone are sent again.
+6. A fill proven on the corridor chain (`ConfirmSwapFill` -> `RelayFillVerified`
+   -> `Bridged`) is deposited into the chain's vault (`deposit4`) exactly as
+   after a CCTP mint: `DepositInitiated`, then `DepositConfirmed`, which clears
+   the guard.
+7. A refund paid in USDC at the hub (origin side) is re-quoted from
+   `amount_refunded` (`RequoteSwap` from `SwapRefunded` -> `SwapRequoted` ->
+   `SwapQuoted`, a fresh order id, every earlier one kept in
+   `signed_order_ids`), while fewer than `max_refund_retries` re-quotes followed
+   a refund (`refund_requotes`), the refunded amount is at least `min_transfer`
+   and the refund is not short of its refund floor (step 8 above; `RequoteSwap`
+   refuses a short one); each such re-quote starts a fresh revert budget but
+   keeps `first_deposit`. The first deposit bounds the whole transfer's loss,
+   refunds and fills: the refund of every attempt is measured against its refund
+   floor, and every quote after the first one (a refund's re-quote, and any
+   re-quote of it once expired or signed) is accepted only if its `minimum_out`
+   is at least that floor, besides the corridor's bounds on its own input. A
+   re-quote guaranteeing less is refused like any refused quote: the transfer
+   holds, guard held, paged, at `SwapRefunded` (or at `SwapQuoted` when an
+   expired re-quote would be replaced), never deposited, redeposited or quoted
+   again until the operator resumes or reconciles it. Otherwise the transfer
+   holds at `SwapRefunded`, guard held, paged, for `transfer reconcile`. A
+   refund paid in the chain's stable (destination side) holds the same way: the
+   stable is in the chain wallet, not the vault. A failure and an unresolved
+   escrow follow step 8 above.
 
 At startup the persisted pairs are restored before any other send from their
 wallet: pairs signed on the Ethereum wallet once, by the hub service, together
@@ -5242,19 +5327,34 @@ corridor's own service. A pair on a corridor no service carries pages, and
 startup skips that chain's approvals and revokes.
 
 Every swap state except `ReturnedToSource` holds the corridor guard and refuses
-`fail-usdc-transfer` (a deposit may be on chain). Only `SwapFailed`,
-`Redepositing`, a short `SwapRefunded` and a destination-side `SwapRefunded` are
-reconcilable. The operator exit of a chain-to-Alpaca transfer held at
-`WithdrawalComplete` or `SwapQuoted` is
-`transfer resume --kind usdc --direction to-alpaca`: the job re-quotes and
-signs, or redeposits on a refusal, as the bot's own retry does. On the shared
-Ethereum wallet's credit ledger an Ethereum-origin `SwapQuoted` is held credit,
-a persisted Ethereum pair is in flight, and a refund paid in Ethereum USDC
-(`SwapRefunded` on the Ethereum side) is held credit, so a Base deposit send
-that would spend the USDC a Relay swap is about to deposit or was refunded pages
-a shortfall. The ledger only pages: it reserves nothing and does not block the
-send. `transfer recheck --kind usdc` refuses Relay transfers in this build: a
-Relay `DepositFailed` is settled with `transfer reconcile`.
+`fail-usdc-transfer` (a deposit may be on chain), and the timeout sweep holds
+the guard of every one, in either direction. A short `SwapRefunded` is
+reconcilable in either direction. On the chain-to-Alpaca side only `SwapFailed`,
+`Redepositing` and a destination-side `SwapRefunded` are also reconcilable; on
+the Alpaca-to-chain side `SwapFailed`, `SwapQuoted` and `SwapRefunded` are, as
+each holds the stable at the hub or in the chain wallet with no automated step
+left once paged. The predicate reads no hold marker, so it also accepts an
+Alpaca-to-chain `SwapQuoted` or `SwapRefunded` whose job still drives it (a
+fresh quote, a revert's redrive, a refund being quoted again): the operator
+reconciles one only after its hold's page. A reconcile that lands while the job
+runs ends it there, since `Reconciled` refuses every later swap command. The
+operator exit of a chain-to-Alpaca transfer held at `WithdrawalComplete` or
+`SwapQuoted` is `transfer resume --kind usdc --direction to-alpaca`: the job
+re-quotes and signs, or redeposits on a refusal, as the bot's own retry does. An
+Alpaca-to-chain transfer held at `WithdrawalComplete` after a refused binding
+quote resumes the same way, `--direction to-raindex`, or is failed with
+`fail-usdc-transfer` and reconciled. On the shared Ethereum wallet's credit
+ledger an Ethereum-origin `SwapQuoted` is held credit, a persisted Ethereum pair
+is in flight, and a refund paid in Ethereum USDC (`SwapRefunded` on the Ethereum
+side) is held credit, so a Base deposit send that would spend the USDC a Relay
+swap is about to deposit or was refunded pages a shortfall. The ledger only
+pages: it reserves nothing and does not block the send. A persisted pair has no
+operator exit in this build (`transfer reconcile` and `fail-usdc-transfer`
+refuse `SwapDepositPrepared`, and a resume only sends the same bytes again), so
+a pending Relay approve or deposit is never cancelled or replaced at its nonce
+by hand: the transfer would keep its guard with nothing to move it on.
+`transfer recheck --kind usdc` refuses Relay transfers in this build: a Relay
+`DepositFailed` is settled with `transfer reconcile`.
 
 ##### Crash-safe resume
 
@@ -5417,8 +5517,9 @@ enum UsdcRebalanceCommand {
     // Records the persisted deposit once it has the origin chain's
     // confirmations; refused for any other tx.
     ConfirmSwapDeposit { deposit_tx: TxHash, deposit_block: u64 },
-    // Replaces an expired or already-signed quote on `SwapQuoted`; same input,
-    // an order id never signed before.
+    // Replaces an expired or already-signed quote on `SwapQuoted` (same
+    // input), or quotes again an Alpaca-to-chain refund paid at the hub (its
+    // input is `amount_refunded`); always an order id never signed before.
     RequoteSwap { quote: SwapQuote },
     // The persisted deposit mined and reverted; back to `SwapQuoted`.
     RecordSwapDepositReverted { deposit_tx: TxHash },
@@ -7608,12 +7709,14 @@ a post-burn BaseToAlpaca `BridgingFailed`. Startup never re-arms
 `WithdrawalComplete` or `BridgingSubmitting`: a re-drive there can submit a
 second burn. Reconcilable failures (`DepositFailed`, a `BridgingFailed` with
 burn evidence or in the AlpacaToBase direction, a BaseToAlpaca
-`ConversionFailed`, and the Relay holds `SwapFailed`, `Redepositing`, and a
-`SwapRefunded` below its refund floor or paid on Ethereum) keep the guard held
-until the operator settles them with `transfer reconcile --kind usdc`. All other
-guarded states keep the guard held and page the operator for manual recovery. A
-candidate that cannot be loaded or parsed at boot, or a post-burn failure whose
-corridor the running bot cannot read, latches every corridor until a restart.
+`ConversionFailed`, and the Relay holds (see "Relay hop"): `SwapFailed`, a
+`SwapRefunded` below its refund floor, a chain-to-Alpaca `Redepositing` or
+`SwapRefunded` paid on Ethereum, and an Alpaca-to-chain `SwapQuoted` or
+`SwapRefunded`) keep the guard held until the operator settles them with
+`transfer reconcile --kind usdc`. All other guarded states keep the guard held
+and page the operator for manual recovery. A candidate that cannot be loaded or
+parsed at boot, or a post-burn failure whose corridor the running bot cannot
+read, latches every corridor until a restart.
 
 **Operator recovery of a pre-burn stranded guard latch**: A USDC rebalance can
 become stranded in `WithdrawalComplete` (pre-bridging, no burn intent recorded)
@@ -7718,16 +7821,20 @@ tick, finds `Reconciled`, applies the source-venue inflight reconciliation with
 **post-burn semantics** (zeroing source-venue inflight WITHOUT crediting
 `available`, because the funds already left the source venue -- it is NOT a
 cancel, which would wrongly credit available), and clears the guard. No restart
-is required. The command is valid ONLY from a terminal failure that strands the
-guard: `DepositFailed` (the CCTP mint landed but the destination deposit
-failed), a `BridgingFailed` with burn evidence (a `burn_tx_hash` is recorded),
-any `AlpacaToBase` `BridgingFailed` (post-withdrawal, so the funds are off
-Alpaca even without burn evidence -- the settlement-retry-deadline terminal), or
-a `BaseToAlpaca` `ConversionFailed` (the post-deposit USDC->USD leg), or one of
-the Relay holds `SwapFailed`, `Redepositing`, and a `SwapRefunded` below its
-refund floor or paid on Ethereum (see "Relay hop"). Every other state is
-rejected -- an in-progress transfer must be resumed, and a failure whose funds
-never left the source venue reconciles to source on its own. Because
+is required, except for a transfer that still holds signed Relay envelopes (an
+Alpaca-to-chain `SwapQuoted` whose approves went out alone): the running bot
+keeps their nonces reserved until a restart, and the reconcile pages and says
+so. The command is valid ONLY from a terminal failure that strands the guard:
+`DepositFailed` (the CCTP mint landed but the destination deposit failed), a
+`BridgingFailed` with burn evidence (a `burn_tx_hash` is recorded), any
+`AlpacaToBase` `BridgingFailed` (post-withdrawal, so the funds are off Alpaca
+even without burn evidence -- the settlement-retry-deadline terminal), or a
+`BaseToAlpaca` `ConversionFailed` (the post-deposit USDC->USD leg), or one of
+the Relay holds (see "Relay hop"): `SwapFailed`, a `SwapRefunded` below its
+refund floor, a chain-to-Alpaca `Redepositing` or `SwapRefunded` paid on
+Ethereum, and an Alpaca-to-chain `SwapQuoted` or `SwapRefunded`. Every other
+state is rejected -- an in-progress transfer must be resumed, and a failure
+whose funds never left the source venue reconciles to source on its own. Because
 `Reconciled` is a clearable terminal, a restart does not re-latch the guard, and
 automatic USDC rebalancing resumes.
 

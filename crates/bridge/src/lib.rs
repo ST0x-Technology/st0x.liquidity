@@ -463,8 +463,8 @@ pub trait SwapBridge: Send + Sync + 'static {
     /// [`SwapBridge::find_recent_deposits`].
     async fn origin_block(&self, direction: HopDirection) -> Result<u64, Self::Error>;
 
-    /// Whether `tx` has a receipt on the origin chain, read once without
-    /// waiting for one.
+    /// Whether `tx` has its confirmations in a canonical block on the origin
+    /// chain, read once without waiting for them.
     async fn origin_tx_mined(
         &self,
         direction: HopDirection,

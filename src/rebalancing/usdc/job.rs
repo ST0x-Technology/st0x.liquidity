@@ -181,6 +181,10 @@ const RELAY_FILL_EARLY_WINDOW: Duration = Duration::from_secs(60);
 const RELAY_FILL_EARLY_POLL_DELAY: Duration = Duration::from_secs(5);
 const RELAY_FILL_POLL_DELAY: Duration = Duration::from_secs(30);
 
+/// Delay before quoting a Relay transfer again after a quote that failed in
+/// transport or at Relay's server.
+const RELAY_QUOTE_TRANSIENT_REDRIVE_DELAY: Duration = Duration::from_secs(30);
+
 /// Delay before reading Relay's status again after a payment that does not
 /// prove on chain: it pages on every read, so slowly.
 const SWAP_PAYMENT_UNVERIFIED_REDRIVE_DELAY: Duration = Duration::from_secs(30 * 60);
@@ -440,8 +444,9 @@ where
 
 /// Re-queues, with no retry cost, a Relay transfer that is waiting on Relay
 /// or on the chain: the fill not paid yet (`RelayFillPending`), a reverted
-/// deposit the next attempt re-quotes (`SwapDepositReverted`), or a payment
-/// that does not prove (`SwapPaymentUnverified`, paged on every read). Each
+/// deposit the next attempt re-quotes (`SwapDepositReverted`), a quote that
+/// failed transiently (`SwapQuoteTransient`), or a payment that does not
+/// prove (`SwapPaymentUnverified`, paged on every read). Each
 /// attempt reads Relay's status once, so the single-concurrency worker never
 /// blocks on a fill.
 async fn intercept_relay_wait<Ctx, TaskJob>(
@@ -464,6 +469,10 @@ where
         Err(UsdcTransferError::SwapDepositReverted { id, deposit_tx }) => {
             warn!(target: "rebalance", %id, %deposit_tx, delay = ?BURN_REVERT_REDRIVE_DELAY, "Relay deposit reverted; re-quoting on the next attempt");
             BURN_REVERT_REDRIVE_DELAY
+        }
+        Err(UsdcTransferError::SwapQuoteTransient { id, source }) => {
+            warn!(target: "rebalance", %id, %source, delay = ?RELAY_QUOTE_TRANSIENT_REDRIVE_DELAY, "Relay quote failed transiently; quoting again later");
+            RELAY_QUOTE_TRANSIENT_REDRIVE_DELAY
         }
         Err(error @ UsdcTransferError::SwapPaymentUnverified { .. }) => {
             let message = format!(
@@ -1900,6 +1909,10 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
             ControlFlow::Continue(result) => result,
         };
         let result = match intercept_unserved_corridor(self, &ctx.job_queue, result).await {
+            ControlFlow::Break(outcome) => return outcome,
+            ControlFlow::Continue(result) => result,
+        };
+        let result = match intercept_relay_wait(self, &ctx.job_queue, &ctx.notifier, result).await {
             ControlFlow::Break(outcome) => return outcome,
             ControlFlow::Continue(result) => result,
         };
@@ -3409,6 +3422,70 @@ mod tests {
         let requeued: TransferUsdcToHedging = serde_json::from_slice(&payload).unwrap();
         assert_eq!(requeued.id, job.id);
         assert_eq!(requeued.backpressure_streak, BackpressureStreak::default());
+    }
+
+    /// Ends every Alpaca-to-chain attempt with a Relay deposit not paid yet,
+    /// confirmed at `self.0`.
+    struct RelayFillPendingAlpacaToBase(DateTime<Utc>);
+
+    #[async_trait]
+    impl ResumeAlpacaToBase for RelayFillPendingAlpacaToBase {
+        async fn resume_alpaca_to_base(
+            &self,
+            id: &UsdcRebalanceId,
+            _amount: Usdc,
+            _corridor: UsdcCorridor,
+        ) -> Result<(), UsdcTransferError> {
+            Err(UsdcTransferError::RelayFillPending {
+                id: id.clone(),
+                deposited_at: self.0,
+            })
+        }
+    }
+
+    /// An Alpaca-to-chain Relay fill not paid yet re-queues the market-making
+    /// job after the poll delay, at no retry or redrive cost, as the
+    /// chain-to-Alpaca job does.
+    #[tokio::test]
+    async fn relay_fill_pending_requeues_the_market_making_job() {
+        let pool = setup_queue_pool().await;
+        let ctx = market_making_ctx(
+            Arc::new(RelayFillPendingAlpacaToBase(
+                Utc::now() - chrono::Duration::seconds(10),
+            )),
+            &pool,
+        );
+        let job = TransferUsdcToMarketMaking {
+            corridor: UsdcCorridor::HubRouted {
+                chain: Chain::Robinhood,
+                hop: HopKind::Relay,
+            },
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 1,
+            backpressure_streak: BackpressureStreak(2),
+        };
+
+        let before = Utc::now().timestamp();
+        tokio::time::timeout(Duration::from_secs(5), Job::perform(&job, &ctx))
+            .await
+            .expect("an unpaid fill must not block the worker")
+            .expect("an unpaid fill re-queues without failing the attempt");
+        let after = Utc::now().timestamp();
+
+        let (payload, run_at) = pending_job_row::<TransferUsdcToMarketMaking>(&pool).await;
+        let requeued: TransferUsdcToMarketMaking = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(requeued.id, job.id);
+        assert_eq!(
+            requeued.revert_redrive_attempts,
+            job.revert_redrive_attempts
+        );
+        assert_eq!(requeued.backpressure_streak, BackpressureStreak::default());
+        let delay = i64::try_from(RELAY_FILL_EARLY_POLL_DELAY.as_secs()).unwrap();
+        assert!(
+            run_at >= before + delay - 1 && run_at <= after + delay + 1,
+            "run_at {run_at} is not {delay}s after {before}..{after}"
+        );
     }
 
     struct UnwiredGasReadinessBaseToAlpaca;

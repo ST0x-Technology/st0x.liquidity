@@ -435,23 +435,17 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> SwapBridge for RelayBridge<EthWalle
         tx: TxHash,
     ) -> Result<bool, RelayBridgeError> {
         let receipt = match direction {
-            HopDirection::ToHub => {
-                self.chain
-                    .wallet
-                    .provider()
-                    .get_transaction_receipt(tx)
-                    .await?
-            }
-            HopDirection::FromHub => {
-                self.hub
-                    .wallet
-                    .provider()
-                    .get_transaction_receipt(tx)
-                    .await?
-            }
+            HopDirection::ToHub => self.chain.read_confirmed_receipt(tx).await,
+            HopDirection::FromHub => self.hub.read_confirmed_receipt(tx).await,
         };
 
-        Ok(receipt.is_some())
+        match receipt {
+            Ok(_) => Ok(true),
+            Err(RelayBridgeError::Unconfirmed { .. } | RelayBridgeError::NotCanonical { .. }) => {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn find_recent_deposits(
@@ -2282,6 +2276,34 @@ mod tests {
             matches!(verify, RelayBridgeError::NotCanonical { tx, .. } if tx == refund),
             "{verify:?}"
         );
+    }
+
+    /// A tx counts as mined on the origin chain only with its confirmations
+    /// in a canonical block, as `confirm_deposit` reads it: a receipt from a
+    /// block a reorg removed, or one short of its depth, does not.
+    #[tokio::test]
+    async fn origin_tx_mined_requires_a_canonical_confirmed_receipt() {
+        let harness = Harness::new().await;
+        let pair = harness.send_deposit_to_hub(B256::random()).await;
+        let deposit = pair.deposit.tx_hash();
+
+        let shallow = harness
+            .bridge
+            .origin_tx_mined(HopDirection::ToHub, deposit)
+            .await
+            .unwrap();
+        harness.chain.mine(CONFIRMATIONS - 1).await;
+        let confirmed = harness
+            .bridge
+            .origin_tx_mined(HopDirection::ToHub, deposit)
+            .await
+            .unwrap();
+        let reorged_out = hooked_bridge(&harness, None, true)
+            .origin_tx_mined(HopDirection::ToHub, deposit)
+            .await
+            .unwrap();
+
+        assert_eq!((shallow, confirmed, reorged_out), (false, true, false));
     }
 
     #[tokio::test]

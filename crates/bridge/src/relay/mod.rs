@@ -28,6 +28,8 @@ pub use quote::{
     AcceptedRelayQuote, QuoteFees, QuoteField, QuoteMismatch, QuoteRequest, QuoteStep,
     QuotedCurrency, RecordedRelayQuote, RelayOrderId, RelayQuote, RelayRequestId, StepTransaction,
 };
+#[cfg(feature = "mock")]
+pub use quote::{TestQuoteError, quote_body_for_test};
 pub use status::{FailReason, InFlightStage, IntentStatus, IntentStatusReport};
 #[cfg(feature = "mock")]
 pub use test_contracts::deploy_relay_end;
@@ -256,9 +258,9 @@ pub enum RelayError {
 }
 
 impl RelayError {
-    /// Worth retrying within the same call: nothing moved, and the same
-    /// request may succeed a moment later.
-    fn is_transient(&self) -> bool {
+    /// Worth retrying: nothing moved, and the same request may succeed a
+    /// moment later.
+    pub fn is_transient(&self) -> bool {
         match self {
             Self::Transport(_) => true,
             Self::HttpStatus { status, .. } => *status >= 500,

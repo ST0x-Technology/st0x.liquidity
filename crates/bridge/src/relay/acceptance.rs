@@ -64,8 +64,9 @@ pub struct QuoteBounds {
     /// Most of the input the quote's guaranteed output (its minimum) may lose,
     /// fees and slippage included.
     pub max_loss: BasisPoints,
-    /// The smallest amount the next leg accepts (an Alpaca deposit minimum),
-    /// in the destination stable's smallest unit.
+    /// The least the quote's minimum may be on top of the loss bound: the
+    /// next leg's minimum, or a floor the caller carries across re-quotes, in
+    /// the destination stable's smallest unit.
     pub downstream_minimum: U256,
 }
 
@@ -136,7 +137,7 @@ pub enum QuoteAcceptanceError {
     QuoteLossExceedsBound { minimum: U256, bound: U256 },
     #[error("Relay's minimum {minimum} is below our slippage floor {floor}")]
     QuoteFloorBelowBound { minimum: U256, floor: U256 },
-    #[error("quote minimum {minimum} is below the next leg's minimum {downstream_minimum}")]
+    #[error("quote minimum {minimum} is below the required minimum {downstream_minimum}")]
     QuoteBelowDownstreamMinimum {
         minimum: U256,
         downstream_minimum: U256,
