@@ -13555,6 +13555,8 @@ mod tests {
         );
     }
 
+    /// The refusal comes from the alerts assembly: a corridor chain is a
+    /// hedged chain, and a hedged Robinhood must set its own threshold.
     #[test]
     fn robinhood_relay_corridor_without_a_robinhood_gas_threshold_is_refused() {
         let mut config = robinhood_relay_corridor_config();

@@ -120,8 +120,9 @@ and the system proves market fit.
     `[rebalancing.usdc.corridors.<chain>]` with its `hop`, `target` and
     `deviation`, and a `relay` sub-table when the hop is `relay`; the chain's
     cash vault, per-transfer limit and confirmations come from the chain's own
-    tables. A `relay` corridor loads once its sub-table is valid and its chain
-    has a gas threshold (rules 6 and 11 of the cash corridor rules).
+    tables. A `relay` corridor loads once its sub-table is valid, its chain has
+    a gas threshold (rules 6 and 11 of the cash corridor rules) and the secrets
+    file carries `[relay] api_key`.
   - On a `relay` corridor the trigger caps a transfer, either way, at the
     smaller of the chain's operational limit and the sub-table's `max_transfer`,
     and declines a transfer below its `min_transfer`.
@@ -293,23 +294,23 @@ unavailable. Its vault balances are polled like any hedged chain's; automated
 rebalancing remains on Base.
 
 Robinhood Chain (chain id 4663, an Arbitrum Orbit L2) is declared the same way.
-The build provides fill ingestion, hedging, signing, gas valuation and equity
-rebalancing on it (the wrappers are deployed and Alpaca's issuer serves its
-`robinhood` network). Fills on its orderbook are ingested, validated against
-USDG and hedged, and Bebop's Robinhood hook is mapped as the inventory adapter,
-so its fills are attributed to Bebop. The production configuration runs it as an
-`active` secondary with the issuer's `redemption_wallet`, and rebalances against
-Alpaca the listings the pinned token file enables there (DNUT, PLBY, GRND, and
-WMT); every other listing keeps `rebalancing = "disabled"`. Staging watches the
-same inventory and runs it as a prefunded hedge-only secondary: every listing
-trades, and none rebalances. Its settlement stable is USDG at
-`0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168` (6 decimals), so it is the first
-chain whose stable CCTP cannot carry. It pays gas in ETH, so the Base Chainlink
-ETH/USD read values its gas and `active` is reachable. Rebalancing an equity
-there needs `active`. It has no CCTP domain, so it cannot be the primary chain,
-and its cash rebalances over the Relay hop only. Base's `safe` cutoff is
-OP-Stack-only: a Robinhood trading table must use the `confirmations` cutoff
-with a depth covering parent-chain finality.
+The build provides fill ingestion, hedging, signing, gas valuation, equity
+rebalancing and cash rebalancing over the Relay hop on it (the wrappers are
+deployed and Alpaca's issuer serves its `robinhood` network). Fills on its
+orderbook are ingested, validated against USDG and hedged, and Bebop's Robinhood
+hook is mapped as the inventory adapter, so its fills are attributed to Bebop.
+The production configuration runs it as an `active` secondary with the issuer's
+`redemption_wallet`, and rebalances against Alpaca the listings the pinned token
+file enables there (DNUT, PLBY, GRND, and WMT); every other listing keeps
+`rebalancing = "disabled"`. Staging watches the same inventory and runs it as a
+prefunded hedge-only secondary: every listing trades, and none rebalances. Its
+settlement stable is USDG at `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168` (6
+decimals), so it is the first chain whose stable CCTP cannot carry. It pays gas
+in ETH, so the Base Chainlink ETH/USD read values its gas and `active` is
+reachable. Rebalancing an equity there needs `active`. It has no CCTP domain, so
+it cannot be the primary chain, and its cash rebalances over the Relay hop only.
+Base's `safe` cutoff is OP-Stack-only: a Robinhood trading table must use the
+`confirmations` cutoff with a depth covering parent-chain finality.
 
 The tokenization services are built per hedged chain, never once for Base, on
 the chain's own signing wallet. The primary, and every secondary with at least
@@ -4721,7 +4722,7 @@ enum RebalanceDirection {
 #[serde(rename_all = "snake_case")]
 enum HopKind {
     Cctp,
-    // Reserved for Robinhood: no build wires it yet.
+    // Relay's USDG -> USDC swap (Robinhood).
     Relay,
 }
 

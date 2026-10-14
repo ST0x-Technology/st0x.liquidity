@@ -117,8 +117,9 @@ impl fmt::Display for ChainCapability {
 /// - Robinhood (an Arbitrum Orbit L2) signs, watches fills, hedges, and
 ///   rebalances equity: Alpaca's issuer serves its `robinhood` network and
 ///   the wrappers are deployed there. It pays gas in ETH, so the same ETH/USD
-///   feed values it. It rebalances cash over the Relay hop: its USDG has no
-///   CCTP domain, and the config loader refuses a `cctp` corridor there.
+///   feed values it. It has no CCTP domain and its stable is USDG, so it
+///   rebalances cash over the Relay hop only; the loader refuses a `cctp`
+///   corridor there.
 pub fn provided_capabilities(chain: Chain) -> BTreeSet<ChainCapability> {
     use ChainCapability::*;
 
