@@ -975,13 +975,14 @@ Relay's `Retry-After` has passed. The other Relay holds:
   refuse the state and a resume sends the same bytes again, so the guard stays
   held. Let it mine, or escalate.
 - An Alpaca->Robinhood `SwapQuoted` or `SwapRefunded`: `transfer reconcile`
-  accepts it even while its job still quotes or signs (the CLI preflight, the
-  API and the dashboard show it as reconcilable). Reconcile only after its hold
-  page ("Relay refused the re-quote from the hub", "Relay deposits from the hub
-  kept reverting", "past the corridor's re-quote budget", "Relay refused the
-  quote for a refund at the hub"). A `SwapQuoted` whose approves went out alone
-  then pages "Reconciled a USDC transfer that holds signed Relay envelopes":
-  restart the bot to release their nonces.
+  accepts it even while its job still quotes or signs (the CLI preflight and the
+  API take it as reconcilable; the dashboard shows it as bridging, with no
+  reconcile action). Reconcile only after its hold page ("Relay refused the
+  re-quote from the hub", "Relay deposits from the hub kept reverting", "past
+  the corridor's re-quote budget", "Relay refused the quote for a refund at the
+  hub"). A `SwapQuoted` whose approves went out alone then pages "Reconciled a
+  USDC transfer that holds signed Relay envelopes": restart the bot to release
+  their nonces.
 - `Redepositing` whose vault deposit does not confirm (paged "The redeposit into
   the vault was dropped, reverted or refused"): `transfer reconcile` accepts
   every `Redepositing` in this build, also one whose vault deposit is still
