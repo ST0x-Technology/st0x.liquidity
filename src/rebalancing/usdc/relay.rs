@@ -2360,16 +2360,20 @@ mod tests {
     };
 
     use super::*;
+    use crate::alerts::LogNotifier;
     use crate::bot_gas::{
         BotGasReceiptCostEnqueuer, RecordBotGasReceiptCostJobQueue, pending_bot_gas_jobs,
     };
-    use crate::conductor::job::find_backpressure;
-    use crate::rebalancing::usdc::{MarketMakingUsdcEndpoints, UsdcSettlementParams};
+    use crate::conductor::job::{BackpressureStreak, Job, find_backpressure};
+    use crate::rebalancing::usdc::{
+        MarketMakingUsdcEndpoints, TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
+        TransferUsdcToMarketMakingJobQueue, UsdcDriverGate, UsdcSettlementParams,
+    };
     use crate::telemetry::TelemetrySender;
     use crate::telemetry::broker::InstrumentedAlpacaBroker;
     use crate::test_utils::{
         AnvilRaindexChain, TestAnvilInstance, anvil_wallet, erc20_balance, relay_test_client,
-        setup_test_db, setup_test_pools, spawn_anvil,
+        setup_test_apalis_pool, setup_test_db, setup_test_pools, spawn_anvil,
     };
 
     type TestWallet = Arc<dyn Wallet<Provider = RootProvider>>;
@@ -6316,6 +6320,91 @@ mod tests {
         assert_eq!(*side, RefundSide::Origin);
         assert_eq!(*amount_refunded, Usdc::new(float!(99.5)));
         assert!(state.holds_rebalance_guard());
+    }
+
+    /// A Relay 5xx on the quote for a refund at the hub ends the job's
+    /// attempt with a re-queue at no retry cost: apalis's few quick retries
+    /// would otherwise dead-letter the job within seconds and leave nothing
+    /// to drive the transfer held at `SwapRefunded`.
+    #[tokio::test]
+    async fn transient_refund_requote_toward_chain_requeues_the_job() {
+        let rig = RelayRig::deploy().await;
+        let refunded = U256::from(99_500_000_u64);
+        let refund_tx = rig.refund_on_hub(refunded, TOWARD_CHAIN_ORDER_ID).await;
+        rig.hub_wallet
+            .provider()
+            .anvil_mine(Some(2), None)
+            .await
+            .unwrap();
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_status(
+            &relay_api,
+            json!({
+                "status": "refund",
+                "txHashes": [refund_tx],
+                "failReason": "SOLVER_CAPACITY_EXCEEDED"
+            }),
+        );
+        let requote = mock_quote_unavailable(&relay_api);
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(
+                &server,
+                &relay_api,
+                store.clone(),
+                RelayHopCtx {
+                    min_transfer: Usdc::new(float!(10)),
+                    ..relay_bounds()
+                },
+            )
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited_toward_chain(&store, &id, TOWARD_CHAIN_ORDER_ID).await;
+        let queue_pool = setup_test_apalis_pool().await;
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(transfer),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&queue_pool),
+            max_burn_revert_redrives: 5,
+            notifier: Arc::new(LogNotifier),
+            driver_gate: UsdcDriverGate::unpaused(),
+            unrecorded_guards: None,
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: id.clone(),
+            amount: Usdc::new(float!(100)),
+            corridor: ROBINHOOD_RELAY,
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        let before = Utc::now().timestamp();
+        tokio::time::timeout(Duration::from_secs(30), Job::perform(&job, &ctx))
+            .await
+            .expect("the attempt ends")
+            .expect("a transient Relay quote failure re-queues instead of failing the attempt");
+
+        assert!(requote.calls() > 0, "the refunded amount is quoted again");
+        let requeued: Vec<(Vec<u8>, i64)> = sqlx_apalis::query_as(
+            "SELECT job, run_at FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+        .fetch_all(&queue_pool)
+        .await
+        .unwrap();
+        assert_eq!(requeued.len(), 1);
+        let (payload, run_at) = &requeued[0];
+        // The job quotes again 30 seconds later.
+        assert!(
+            *run_at >= before + 29,
+            "the re-queued job runs at {run_at}, not 30 seconds after {before}"
+        );
+        let requeued: TransferUsdcToMarketMaking = serde_json::from_slice(payload).unwrap();
+        assert_eq!(requeued.id, id);
+        assert_eq!(
+            store.load(&id).await.unwrap().unwrap().state_name(),
+            "SwapRefunded"
+        );
     }
 
     /// A refund at the hub below the corridor's `min_transfer` is not quoted
