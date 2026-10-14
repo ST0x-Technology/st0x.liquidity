@@ -186,8 +186,10 @@ vault <-> hop <-> Ethereum wallet <-> Alpaca.
   parsed and validated, but still refused at load.
 - **Hop evidence** (`HopEvidence`): what moved the cash across the hop, kept on
   every post-hop `UsdcRebalance` state (`Cctp { burn_tx, mint_tx }`,
-  `Relay { deposit_tx, fill_tx, deposit_id }`). Readers that resolve one of its
-  hashes on a chain take the chain from the corridor.
+  `Relay { deposit_tx, fill_tx, deposit_id }`). Readers that resolve a CCTP hash
+  on a chain take the chain from the corridor. A Relay `deposit_tx` is on the
+  origin chain and `fill_tx` on the payout chain: for Robinhood to Alpaca,
+  Robinhood and Ethereum.
 - **Relay hop**: the corridor chain's stable deposited into Relay's
   **depository** (pinned per chain in `Chain::relay_depository`) and paid out by
   Relay's solver on the other end. Its states are `SwapQuoted` (the binding

@@ -1069,8 +1069,9 @@ impl DepositSend {
 }
 
 /// What moved a transfer's cash across its hop, kept on every post-hop
-/// state. A reader that resolves one of its hashes on a chain takes the chain
-/// from the corridor.
+/// state. A reader that resolves a CCTP hash on a chain takes the chain from
+/// the corridor; a Relay deposit is on the origin chain and its fill on the
+/// payout chain.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum HopEvidence {
     /// The CCTP burn and the mint that paid it out.
