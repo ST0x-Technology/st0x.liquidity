@@ -71,7 +71,8 @@ Analyze why the test fails. The root cause will be at one of two levels:
 ### Unit-level fix (when root cause is at the unit level)
 
 Define any new types, traits, and function signatures needed. Use `todo!()` for
-bodies. `cargo check` must pass. No behavioral logic yet.
+bodies. `cargo check --workspace --all-targets --all-features` must pass. No
+behavioral logic yet.
 
 Write unit tests for the component in question, asserting what it should do.
 These fail because the logic doesn't exist yet (new unit) or is buggy (existing
@@ -89,7 +90,7 @@ If individual components already work correctly but aren't connected, there are
 no unit-level hypotheses to validate — skip straight to integration.
 
 Adjust signatures, add parameters, update wiring types. Use `todo!()` for new
-wiring logic. `cargo check` must pass.
+wiring logic. `cargo check --workspace --all-targets --all-features` must pass.
 
 Write integration tests that verify the components are connected properly,
 asserting the correct integrated behavior. These fail because the wiring doesn't

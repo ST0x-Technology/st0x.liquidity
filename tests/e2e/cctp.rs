@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy::node_bindings::{Anvil, AnvilInstance};
+use alloy::node_bindings::AnvilInstance;
 use alloy::primitives::{Address, B256, U256, utils::parse_units};
 use alloy::providers::Provider;
 use alloy::providers::ext::AnvilApi as _;
@@ -74,7 +74,8 @@ pub struct CctpInfra {
 impl CctpInfra {
     /// Deploys CCTP infrastructure on top of an existing [`TestInfra`].
     pub async fn start<BP: Provider + Clone>(infra: &TestInfra<BP>) -> anyhow::Result<Self> {
-        let ethereum_anvil = Anvil::new().chain_id(1u64).spawn();
+        // Lives as long as the Base node, so it drops old states the same way.
+        let ethereum_anvil = st0x_evm::anvil_without_disk_states().chain_id(1u64).spawn();
         let ethereum_endpoint = ethereum_anvil.endpoint();
 
         // Use Anvil account #2 as CCTP deployer to avoid nonce collisions

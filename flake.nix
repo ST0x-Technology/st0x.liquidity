@@ -193,6 +193,18 @@
         rustToolchain = rainix.rust-toolchain.${system};
         rustShell = rainix.devShells.${system}.rust-shell;
         foundryBin = rainix.pkgs.${system}.foundry-bin;
+
+        # mold links the debug test binaries in a fraction of GNU ld's time.
+        # Applied to the cargo shells and the simulate packages only, via the
+        # target specific rustflags env var, so the crane release builds
+        # (`nix build`, OCI images) keep the stock linker. Linux only; macOS is
+        # unchanged.
+        moldInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.mold ];
+        moldEnv = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          "CARGO_TARGET_${pkgs.stdenv.hostPlatform.rust.cargoEnvVarTarget}_RUSTFLAGS" =
+            "-C link-arg=-fuse-ld=mold";
+        };
+
         rainixPkgs = rainix.packages.${system};
 
         bun2nix = inputs.bun2nix.packages.${system}.default;
@@ -271,12 +283,17 @@
               pkgs.mprocs
               pkgs.bun
               pkgs.cargo-nextest
+              foundryBin
               pkgs.openssl
               pkgs.sqlite
               pkgs.pkg-config
               pkgs.datasette
               rustToolchain
-            ];
+            ]
+            ++ moldInputs
+            # moldEnv passes -fuse-ld=mold to the C compiler, which a host gcc
+            # older than 12.1 rejects; use the dev shells' compiler instead.
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.stdenv.cc ];
 
             # Mock infra + bot + dashboard + e2e driver. Picks the lowest port
             # offset whose bot/board/vite/mock-api ports are all free so
@@ -299,7 +316,10 @@
                 # these from `abiEnv` via `mkShell`, but standalone shell apps
                 # don't inherit them -- bake them in here so `nix run .#simulate`
                 # works from a clean checkout.
-                runtimeEnv = abiEnv;
+                # moldEnv: cargo names artifacts after rustflags, so without the
+                # dev shells' linker flags a standalone run would add another
+                # copy of every dependency to target/.
+                runtimeEnv = abiEnv // moldEnv;
                 text = ''
                   port_free() {
                     ! (echo >"/dev/tcp/127.0.0.1/$1") 2>/dev/null
@@ -350,9 +370,11 @@
                   # datasette only ever opens the file the bot creates now.
                   rm -f "$db_path" "$db_path-shm" "$db_path-wal"
 
+                  # CI's workspace feature set, so simulate builds into the same
+                  # artifacts as the documented verification build.
                   backend="${backendEnvPrefix}SIMULATE_BOT_PORT=$bot_port \
                     SIMULATE_BOARD_PORT=$board_port \
-                    cargo nextest run --test e2e \
+                    cargo nextest run --workspace --all-features --test e2e \
                     -E 'test(=full_system::${testFilter})' \
                     --run-ignored ignored-only --no-capture"
 
@@ -771,15 +793,6 @@
               pkgs.pkg-config
             ];
 
-            # mold links the debug test binaries in a fraction of GNU ld's time.
-            # Applied to the cargo shells only, via the target-specific rustflags
-            # env var, so the crane release builds (`nix build`, OCI images) keep
-            # the stock linker. Linux only; a macOS shell is unchanged.
-            moldInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.mold ];
-            moldEnv = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
-              "CARGO_TARGET_${pkgs.stdenv.hostPlatform.rust.cargoEnvVarTarget}_RUSTFLAGS" =
-                "-C link-arg=-fuse-ld=mold";
-            };
             # Cargo ignores an unset or misnamed target rustflags variable and
             # silently links with the stock linker, so shell entry (local and
             # CI) refuses to proceed unless mold is on PATH and the variable

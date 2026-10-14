@@ -40,7 +40,7 @@ command = [
 
 [jobs.nextest]
 command = [
-    "cargo", "nextest", "run", "--workspace", "-P", "dev",
+    "cargo", "nextest", "run", "--workspace", "--all-features", "-P", "dev",
     "--hide-progress-bar", "--failure-output", "final"
 ]
 need_stdout = true

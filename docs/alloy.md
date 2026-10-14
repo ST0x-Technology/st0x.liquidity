@@ -143,6 +143,42 @@ let filter = contract
 let logs = provider.get_logs(&filter).await?;
 ```
 
+## Anvil Test Nodes
+
+Anvil keeps recent block states in memory: 500 by default, or 1,500 when it
+mines on a 1 or 2 second interval. Once that window fills, Anvil shrinks it
+toward 10 states and writes every evicted state to `~/.foundry/anvil/tmp`, up to
+3,600 complete snapshots, and those temporary directories remain after a normal
+exit. A long simulation can therefore leave several gigabytes per run.
+
+Every interval mining test node, and every node a long simulation keeps alive,
+must turn the disk tier off. Build it with
+`st0x_evm::anvil_without_disk_states()`, which passes
+`--max-persisted-states 0`:
+
+```rust
+let anvil = st0x_evm::anvil_without_disk_states().block_time(1).spawn();
+```
+
+Evicted states are then dropped, and nothing is written to the user's Foundry
+directory. The cost is memory: a memory only node never shrinks its window, so a
+run longer than the window keeps up to 1,500 (interval mining) or 500 (mining
+per transaction) complete state copies in RAM for the rest of the run. At the
+roughly 2.3 MB per state measured for the e2e Base chain, that is several
+gigabytes during a long `nix run .#simulate*` session. State reads at blocks
+older than the window fail, where the default configuration kept about 3,600
+blocks readable from disk; a bot that falls about 25 minutes of 1 s blocks
+behind can no longer read state at its oldest unprocessed fills. Blocks, logs,
+transactions and receipts stay available.
+
+These numbers come from the Foundry nightly pinned through rainix. Newer Foundry
+skips the 1,500 state interval mining window for memory only nodes, so after a
+Foundry bump these nodes keep 500 states (about 8 minutes of 1 s blocks) and use
+a third of the memory.
+
+Do not replace it with a bare `--prune-history`; that stops Anvil from keeping
+any historical state.
+
 ## Canonical State on Load-Balanced RPCs
 
 Separate transaction, head, and `latest` account-state reads can hit different

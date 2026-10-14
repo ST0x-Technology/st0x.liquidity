@@ -239,9 +239,12 @@ This project uses a Cargo workspace with:
 **CRITICAL: NEVER use `cargo build` for verification.** It's slower than
 `cargo check` and less useful than `cargo nextest run` or `cargo clippy`. Use:
 
-- `cargo check` for fast compilation verification
-- `cargo nextest run` for verification with test coverage
-- `cargo clippy` for verification with linting
+- `cargo check --workspace --all-targets --all-features` for fast compilation
+  verification
+- `cargo nextest run --workspace --all-features` for verification with test
+  coverage
+- `cargo clippy --workspace --all-targets --all-features` for verification with
+  linting
 
 Only use `cargo build` when you actually need the build artifacts (e.g., final
 verification before a release, or when the user explicitly asks to run the
@@ -254,12 +257,12 @@ binary).
 
 ### Testing
 
-- `cargo nextest run --workspace` - Run all tests (both main and execution
-  crates)
-- `cargo nextest run --lib` - Run library tests only
-- `cargo nextest run -p st0x-execution` - Run execution crate tests only
-- `cargo nextest run -p st0x-hedge` - Run main crate tests only
-- `cargo nextest run <test_name>` - Run specific test
+- `cargo nextest run --workspace --all-features` - All tests
+- `cargo nextest run --workspace --all-features --lib` - Library tests
+- `cargo nextest run --workspace --all-features -E 'package(st0x-hedge)'` - One
+  crate's tests
+- `cargo nextest run --workspace --all-features -E 'package(<crate>) & test(<test_name>)'` -
+  One test in one crate
 
 ### Database Management
 
@@ -616,14 +619,14 @@ reviewing code that uses configuration instead of reading secrets directly.
 
 ### Workflow Best Practices
 
-- **Incremental verification during development** -- scope checks to the package
-  you're actively working on for fast feedback:
-  1. `cargo check -p <crate>` after every edit -- fast, catches type errors
-  2. `cargo nextest run -p <crate>` after completing a logical unit -- runs that
-     crate's tests only, skips slow e2e and unrelated crates
-  3. `cargo clippy -p <crate>` only after all substantive edits to that crate
-     are done
-  4. Reserve `--workspace` variants for the final verification pass
+- **Incremental verification during development** -- always build the whole
+  workspace with CI's feature set. `-p <crate>` or other feature sets compile
+  another copy of every dependency into `target/`, which cargo never cleans:
+  1. `cargo check --workspace --all-targets --all-features` after every edit
+  2. `cargo nextest run --workspace --all-features -E 'package(<crate>)'` after
+     completing a logical unit -- runs that crate's tests only
+  3. `cargo clippy --workspace --all-targets --all-features` only after all
+     substantive edits are done
 - **Final verification before handing over** (skip for doc-only changes):
   `nix run .#ci` enters the right dev shells (`ci-backend`, `ci-dashboard`) and
   runs the full matrix end-to-end -- backend `cargo check` (with and without
@@ -631,16 +634,16 @@ reviewing code that uses configuration instead of reading secrets directly.
   plus RustSec audit and regressions, dashboard `bun.nix` freshness, DTO
   generation, lint, `svelte-check`. Mirrors CI.
 
-  For iteration (e.g. backend-only), run individual steps in the corresponding
-  shell:
+  For a backend only final pass, run:
   1. `cargo check --workspace`
-  2. `cargo nextest run --workspace --all-features` -- spawns anvil for CCTP
-     integration tests; only the `ci-backend` shell exposes the foundry binary.
-     Run via `nix develop .#ci-backend -c cargo nextest run ...`.
-  3. `cargo clippy --workspace --all-targets --all-features` - full linting
-  4. `cargo fmt` - always run last to ensure clean formatting
-  5. `nix develop .#ci-audit -c bash -c './scripts/test-rust-audit.sh && ./scripts/audit-rust.sh'`
-  6. **Diff review** - after all checks pass, review staged changes and revert
+  2. `cargo check --workspace --all-features`
+  3. `cargo nextest run --workspace --all-features` -- spawns anvil for CCTP
+     integration tests; the `default` and `ci-backend` dev shells both provide
+     the pinned foundry binary.
+  4. `cargo clippy --workspace --all-targets --all-features` - full linting
+  5. `cargo fmt` - always run last to ensure clean formatting
+  6. `nix develop .#ci-audit -c bash -c './scripts/test-rust-audit.sh && ./scripts/audit-rust.sh'`
+  7. **Diff review** - after all checks pass, review staged changes and revert
      any chunks without clear justification (see "Before handing over" section)
 - **CRITICAL: ALL workspace checks must pass before work is done** (except
   doc-only changes). Fix every warning/error/failure regardless of origin. CI
@@ -648,8 +651,8 @@ reviewing code that uses configuration instead of reading secrets directly.
 - **CRITICAL: Do NOT run clippy until ALL substantive work is done.** It's a
   polish step -- subsequent changes introduce new lints. Run clippy only as the
   final pass.
-- **CRITICAL: Do NOT run `cargo nextest run --workspace` repeatedly.** Use
-  `-p <crate>` during iteration; full workspace suite only in final
+- **CRITICAL: Do NOT run the full nextest suite repeatedly.** Filter with
+  `-E 'package(<crate>)'` during iteration; full suite only in final
   verification.
 
 #### CRITICAL: Quality Control Policy

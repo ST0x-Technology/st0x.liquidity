@@ -5,14 +5,14 @@
 //! balances, and helpers for manipulating EVM storage directly.
 
 use alloy::network::EthereumWallet;
-use alloy::node_bindings::{Anvil, AnvilInstance};
+use alloy::node_bindings::AnvilInstance;
 use alloy::primitives::{Address, B256, U256, keccak256, utils::parse_units};
 use alloy::providers::ext::AnvilApi as _;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 
-use crate::{Chain, USDC_BASE};
+use crate::{Chain, USDC_BASE, anvil_without_disk_states};
 
 sol!(
     #![sol(all_derives = true, rpc)]
@@ -56,7 +56,7 @@ impl AnvilTestChain<()> {
     pub async fn start() -> anyhow::Result<AnvilTestChain<impl Provider + Clone>> {
         // Report Base's chain id so the startup chain-id confirmation runs
         // against the harness instead of being skipped in tests.
-        let anvil = Anvil::new()
+        let anvil = anvil_without_disk_states()
             .block_time(1)
             .chain_id(Chain::Base.chain_id())
             .spawn();

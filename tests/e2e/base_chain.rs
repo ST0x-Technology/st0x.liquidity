@@ -7,7 +7,7 @@
 //! used in `take_order()`.
 
 use alloy::network::{EthereumWallet, TransactionBuilder};
-use alloy::node_bindings::{Anvil, AnvilInstance};
+use alloy::node_bindings::AnvilInstance;
 use alloy::primitives::{Address, B256, Bytes, I256, U256, address, utils::parse_units};
 use alloy::providers::ext::AnvilApi as _;
 use alloy::providers::{Provider, ProviderBuilder};
@@ -18,8 +18,8 @@ use alloy::sol_types::SolEvent as _;
 use rain_math_float::Float;
 use std::collections::HashMap;
 
-use st0x_evm::Chain;
 use st0x_evm::test_chain::{evm_mapping_slot, solidity_short_string};
+use st0x_evm::{Chain, anvil_without_disk_states};
 pub use st0x_evm::{IERC20, USDC_BASE};
 pub use st0x_hedge::bindings::DeployableERC20;
 use st0x_hedge::bindings::IRaindexInventory;
@@ -243,7 +243,9 @@ impl BaseChain<()> {
         // is a loud e2e timeout, not a silent pass.)
         // Report Base's real chain id: startup confirms the RPC is the chain
         // its registry entry names, so a default 31337 would fail every e2e.
-        let anvil = Anvil::new()
+        // `anvil_without_disk_states` keeps a long simulation from leaving up
+        // to 3,600 state snapshots under ~/.foundry/anvil/tmp (docs/alloy.md).
+        let anvil = anvil_without_disk_states()
             .block_time(1)
             .chain_id(Chain::Base.chain_id())
             .arg("--slots-in-an-epoch")

@@ -52,6 +52,12 @@ redundant_pub_crate = "allow"
 [profile.dev]
 debug = "line-tables-only"
 
+# Crates outside the workspace, including our git dependencies, skip even line
+# tables: backtraces keep file:line for workspace code (panic messages need no
+# debuginfo), while every dependency rlib and linked test/bin binary shrinks.
+[profile.dev.package."*"]
+debug = false
+
 [workspace.dependencies]
 aes-gcm = "0.10.3"
 alloy = { version = "1.0.38", features = ["full", "rand", "node-bindings"] }
