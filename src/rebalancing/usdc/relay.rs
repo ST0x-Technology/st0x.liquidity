@@ -3451,6 +3451,79 @@ mod tests {
         );
     }
 
+    /// The retry after a timed-out signing waits, up to `quote_max_age`, for
+    /// the late pair's nonces to be released before it re-quotes: a pair it
+    /// signed, or a redeposit it sent, above those nonces would wait behind
+    /// the gap their release leaves.
+    #[tokio::test]
+    async fn retry_waits_for_a_late_signing_to_release_its_nonces() {
+        let anvil = spawn_anvil(Anvil::new());
+        let (wallet, contracts) = funded_relay_end(&anvil).await;
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let witness = Arc::new(
+            BroadcastWitness::new(wallet.clone(), store.clone(), id.clone())
+                .on_deposit_signing(OnDepositSigning::SlowAfterSigning(Duration::from_secs(3))),
+        );
+        let chain_wallet: TestWallet = witness.clone();
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let requote = relay_api.mock(|when, then| {
+            when.method(POST).path("/quote/v2");
+            then.status(400).json_body(json!({
+                "message": "No routes",
+                "errorCode": "NO_SWAP_ROUTES_FOUND",
+                "requestId": "0x00"
+            }));
+        });
+        let transfer = relay_transfer_with_bounds(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            chain_wallet,
+            contracts,
+            store.clone(),
+            RelayHopCtx {
+                quote_max_age: Duration::from_secs(1),
+                ..relay_bounds()
+            },
+        )
+        .await;
+        record_quoted(
+            &store,
+            &id,
+            exact_quote(&wallet, contracts, B256::repeat_byte(0x0d)).await,
+        )
+        .await;
+        let attempt = || {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+            )
+        };
+
+        let timed_out = attempt().await.expect("the attempt ends").unwrap_err();
+        assert!(
+            matches!(timed_out, UsdcTransferError::SwapPrepareTimedOut { .. }),
+            "got {timed_out:?}"
+        );
+
+        let waited = attempt().await.expect("the retry ends").unwrap_err();
+        assert!(
+            matches!(waited, UsdcTransferError::SwapPrepareTimedOut { .. }),
+            "got {waited:?}"
+        );
+        requote.assert_calls(0);
+        assert_eq!(
+            store.load(&id).await.unwrap().unwrap().state_name(),
+            "SwapQuoted"
+        );
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let _released = attempt().await.expect("the retry ends");
+        requote.assert_calls(1);
+    }
+
     /// A pair persisted after an approve went out alone is resumed in
     /// process: the lone approve is broadcast again before the pair, so the
     /// deposit is not left behind a nonce the node may not hold.
