@@ -181,6 +181,10 @@ const RELAY_FILL_EARLY_WINDOW: Duration = Duration::from_secs(60);
 const RELAY_FILL_EARLY_POLL_DELAY: Duration = Duration::from_secs(5);
 const RELAY_FILL_POLL_DELAY: Duration = Duration::from_secs(30);
 
+/// Delay before quoting a Relay transfer again after a quote that failed in
+/// transport or at Relay's server.
+const RELAY_QUOTE_TRANSIENT_REDRIVE_DELAY: Duration = Duration::from_secs(30);
+
 /// Delay before reading Relay's status again after a payment that does not
 /// prove on chain: it pages on every read, so slowly.
 const SWAP_PAYMENT_UNVERIFIED_REDRIVE_DELAY: Duration = Duration::from_secs(30 * 60);
@@ -440,8 +444,9 @@ where
 
 /// Re-queues, with no retry cost, a Relay transfer that is waiting on Relay
 /// or on the chain: the fill not paid yet (`RelayFillPending`), a reverted
-/// deposit the next attempt re-quotes (`SwapDepositReverted`), or a payment
-/// that does not prove (`SwapPaymentUnverified`, paged on every read). Each
+/// deposit the next attempt re-quotes (`SwapDepositReverted`), a quote that
+/// failed transiently (`SwapQuoteTransient`), or a payment that does not
+/// prove (`SwapPaymentUnverified`, paged on every read). Each
 /// attempt reads Relay's status once, so the single-concurrency worker never
 /// blocks on a fill.
 async fn intercept_relay_wait<Ctx, TaskJob>(
@@ -464,6 +469,10 @@ where
         Err(UsdcTransferError::SwapDepositReverted { id, deposit_tx }) => {
             warn!(target: "rebalance", %id, %deposit_tx, delay = ?BURN_REVERT_REDRIVE_DELAY, "Relay deposit reverted; re-quoting on the next attempt");
             BURN_REVERT_REDRIVE_DELAY
+        }
+        Err(UsdcTransferError::SwapQuoteTransient { id, source }) => {
+            warn!(target: "rebalance", %id, %source, delay = ?RELAY_QUOTE_TRANSIENT_REDRIVE_DELAY, "Relay quote failed transiently; quoting again later");
+            RELAY_QUOTE_TRANSIENT_REDRIVE_DELAY
         }
         Err(error @ UsdcTransferError::SwapPaymentUnverified { .. }) => {
             let message = format!(

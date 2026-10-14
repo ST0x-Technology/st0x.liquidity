@@ -393,6 +393,14 @@ pub enum UsdcTransferError {
         #[source]
         source: Box<RelayBridgeError>,
     },
+    /// Relay's quote of a transfer past its withdrawal failed in transport or
+    /// at Relay's server: the job quotes again later at no retry cost.
+    #[error("USDC rebalance {id}: Relay quote failed transiently: {source}")]
+    SwapQuoteTransient {
+        id: UsdcRebalanceId,
+        #[source]
+        source: Box<RelayError>,
+    },
     #[error(
         "USDC transfer corridor mismatch: transfer {id} runs on the {recorded} corridor, \
          this service serves {}; left untouched for the operator",
@@ -870,6 +878,7 @@ impl UsdcTransferError {
             | Self::RelayFillPending { .. }
             | Self::SwapDepositReverted { .. }
             | Self::SwapPaymentUnverified { .. }
+            | Self::SwapQuoteTransient { .. }
             | Self::EthereumChainMissing(_) => None,
         }
     }
@@ -953,6 +962,7 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::RelayFillPending { .. }
             | Self::SwapDepositReverted { .. }
             | Self::SwapPaymentUnverified { .. }
+            | Self::SwapQuoteTransient { .. }
             | Self::EthereumChainMissing(_) => false,
         }
     }

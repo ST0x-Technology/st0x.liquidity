@@ -688,8 +688,8 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
 /// `SettlementCheckTransient`), a non-backpressure
 /// `WithdrawalPollInconclusive` (Alpaca unreachable),
 /// `MintRecoveryInconclusive`, `DepositSendReconciliationPending`, and the
-/// Relay waits `RelayFillPending`, `SwapDepositReverted` and
-/// `SwapPaymentUnverified`. The
+/// Relay waits `RelayFillPending`, `SwapDepositReverted`,
+/// `SwapQuoteTransient` and `SwapPaymentUnverified`. The
 /// CLI must NOT keep redriving these itself: its process would race the
 /// bot's worker on the same aggregate (the CLI-vs-server race), so the first
 /// such outcome hands the transfer off to the running bot instead. Errors outside this set -- including
@@ -705,6 +705,7 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::DepositSendReconciliationPending { .. }
         | UsdcTransferError::RelayFillPending { .. }
         | UsdcTransferError::SwapDepositReverted { .. }
+        | UsdcTransferError::SwapQuoteTransient { .. }
         | UsdcTransferError::SwapPaymentUnverified { .. } => true,
         UsdcTransferError::WithdrawalPollInconclusive { source, .. } => {
             source.backpressure().is_none()
@@ -2720,6 +2721,13 @@ mod tests {
                 deposit_tx: b256!(
                     "0x0000000000000000000000000000000000000000000000000000000000000002"
                 ),
+            },
+            UsdcTransferError::SwapQuoteTransient {
+                id: id.clone(),
+                source: Box::new(st0x_bridge::relay::RelayError::HttpStatus {
+                    endpoint: st0x_bridge::relay::RelayEndpoint::Quote,
+                    status: 503,
+                }),
             },
             UsdcTransferError::SwapPaymentUnverified {
                 id: id.clone(),

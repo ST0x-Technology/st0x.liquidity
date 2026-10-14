@@ -5145,11 +5145,17 @@ failure:
    transfer against it at the trigger. A refusal (a non-transient quote error
    code, a quote out of bounds or not matching the request) redeposits (step 9).
    A transient failure (transport, rate limit, 5xx, a transient code) leaves the
-   transfer at `WithdrawalComplete` with its guard held for the retry; the
-   timeout sweep holds that guard and pages, there, at `Withdrawing` before it
-   (recorded once the vault withdraw is mined) and at every swap state after it,
-   whatever stage its tracking reads, and `fail-usdc-transfer` refuses the
-   transfer there with a Relay-specific reason.
+   transfer at `WithdrawalComplete` with its guard held, and the job quotes
+   again 30 seconds later at no retry cost (a rate limit is backpressure, see
+   below), as after a transient failure of any later quote; quotes that keep
+   failing that way for 30 minutes page once per run of failures (a quote
+   outcome other than a rate limit, or 5 minutes without a failure, ends the
+   run), per process. Any other quote error (a 4xx, a response that does not
+   decode) takes the job's retries. The timeout sweep holds that guard and
+   pages, there, at `Withdrawing` before it (recorded once the vault withdraw is
+   mined) and at every swap state after it, whatever stage its tracking reads,
+   and `fail-usdc-transfer` refuses the transfer there with a Relay-specific
+   reason.
 4. The approve and the deposit are signed together under the origin wallet's
    lock (the Ethereum wallet's deposit-send lock when Ethereum is the origin)
    and persisted in one event (`SwapDepositPrepared`) before either is
@@ -5265,7 +5271,8 @@ left a vault:
    once it times out the sweep re-arms its job 30 minutes out, so it quotes
    again at that cadence (the refusal pages once per transfer and process),
    until a quote is accepted or the operator fails it (`fail-usdc-transfer`) and
-   reconciles the USDC at the hub. A transient failure is retried.
+   reconciles the USDC at the hub. A transient failure is quoted again 30
+   seconds later, as in step 3 of the chain-to-Alpaca side.
 4. Before the pair is signed the shared Ethereum wallet's credit ledger is
    checked against the swap's input, as before a CCTP burn: a shortfall pages
    and does not stop the transfer. The pair is signed on the shared Ethereum

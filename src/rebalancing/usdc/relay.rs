@@ -25,7 +25,7 @@ use alloy::primitives::{Address, B256, TxHash, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, PoisonError};
 use std::time::{Duration, SystemTime};
 use tokio::sync::{Mutex, OwnedMutexGuard};
@@ -83,7 +83,27 @@ pub(crate) struct RelayHop<Signer> {
     /// Transfers whose refused binding quote from the hub this process has
     /// paged: the sweep re-arms them, and each run quotes again.
     paged_hub_quote_refusals: std::sync::Mutex<HashSet<UsdcRebalanceId>>,
+    /// When each transfer's quotes started failing transiently in this
+    /// process, and whether that has been paged; cleared by a quote.
+    failing_quotes: std::sync::Mutex<HashMap<UsdcRebalanceId, FailingQuotes>>,
 }
+
+/// A run of transient quote failures of one transfer, from `since` to
+/// `last`.
+#[derive(Debug, Clone, Copy)]
+struct FailingQuotes {
+    since: Instant,
+    last: Instant,
+    paged: bool,
+}
+
+/// How long a transfer's quotes may fail transiently, re-queued every 30
+/// seconds, before it pages.
+const QUOTE_FAILING_PAGE_AFTER: Duration = Duration::from_secs(30 * 60);
+
+/// A failure this long after the last one starts a new run: the job, which
+/// re-queues every 30 seconds, stopped in between.
+const QUOTE_FAILING_RUN_GAP: Duration = Duration::from_secs(5 * 60);
 
 impl<Signer> RelayHop<Signer> {
     pub(crate) fn new(
@@ -99,7 +119,66 @@ impl<Signer> RelayHop<Signer> {
             hub_wallet,
             chain_send_prepare: Arc::new(Mutex::new(())),
             paged_hub_quote_refusals: std::sync::Mutex::new(HashSet::new()),
+            failing_quotes: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// A quote failure of `id` past its withdrawal, for the job: a transient
+    /// Relay failure (transport, a 5xx, a transient code) becomes
+    /// `SwapQuoteTransient`, re-queued at no retry cost, and pages once it
+    /// has lasted `QUOTE_FAILING_PAGE_AFTER`. Anything else, a rate limit
+    /// included, is left as it is.
+    fn transient_swap_quote(
+        &self,
+        id: &UsdcRebalanceId,
+        error: UsdcTransferError,
+    ) -> UsdcTransferError {
+        let UsdcTransferError::RelayApi(relay) = error else {
+            return error;
+        };
+        if !relay.is_transient() {
+            return UsdcTransferError::RelayApi(relay);
+        }
+
+        let mut failing = self
+            .failing_quotes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        let entry = failing.entry(id.clone()).or_insert(FailingQuotes {
+            since: now,
+            last: now,
+            paged: false,
+        });
+        if now.duration_since(entry.last) >= QUOTE_FAILING_RUN_GAP {
+            *entry = FailingQuotes {
+                since: now,
+                last: now,
+                paged: false,
+            };
+        }
+        entry.last = now;
+        let failing_for = now.duration_since(entry.since);
+        let page = !entry.paged && failing_for >= QUOTE_FAILING_PAGE_AFTER;
+        entry.paged |= page;
+        drop(failing);
+        if page {
+            error!(target: "operational_alert", alert = true, kind = AlertKind::RelayQuoteKeepsFailing.as_str(), %id, error = %relay, ?failing_for, "Relay quotes keep failing transiently for a transfer past its withdrawal; the transfer holds its guard and the job quotes again later");
+        }
+
+        UsdcTransferError::SwapQuoteTransient {
+            id: id.clone(),
+            source: relay,
+        }
+    }
+
+    /// Forgets `id`'s transient quote failures once a quote ends any other
+    /// way, so a later run of them is timed and paged afresh.
+    fn forget_failing_quotes(&self, id: &UsdcRebalanceId) {
+        self.failing_quotes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id);
     }
 
     /// Whether this is the first refusal of `id`'s binding quote from the
@@ -860,7 +939,7 @@ where
             }
             Err(error) => {
                 warn!(target: "rebalance", %id, %error, "Binding Relay quote from the hub failed transiently; the transfer holds its guard at WithdrawalComplete for the retry");
-                return Err(error);
+                return Err(self.hop.transient_swap_quote(id, error));
             }
         };
 
@@ -915,7 +994,7 @@ where
             }
             Err(error) => {
                 warn!(target: "rebalance", %id, %error, "Binding Relay quote failed transiently; the transfer holds its guard at WithdrawalComplete for the retry");
-                return Err(error);
+                return Err(self.hop.transient_swap_quote(id, error));
             }
         };
 
@@ -948,7 +1027,17 @@ where
             .map_err(Box::new)?;
         let quote = self
             .accepted_quote(id, amount_in, direction, first_deposit)
-            .await?;
+            .await;
+        // A rate limit, backpressure of its own, leaves a run open.
+        let failing_transiently = if let Err(UsdcTransferError::RelayApi(relay)) = &quote {
+            relay.is_transient() || matches!(**relay, RelayError::RateLimited { .. })
+        } else {
+            false
+        };
+        if !failing_transiently {
+            self.hop.forget_failing_quotes(id);
+        }
+        let quote = quote?;
 
         Ok(swap_quote(&quote, &self.hop.bounds, origin_from_block))
     }
@@ -1042,7 +1131,7 @@ where
             }
             Err(error) => {
                 warn!(target: "rebalance", %id, %error, "Relay re-quote failed transiently; the transfer holds its guard at SwapQuoted for the retry");
-                Err(error)
+                Err(self.hop.transient_swap_quote(id, error))
             }
         }
     }
@@ -1522,7 +1611,7 @@ where
             }
             Err(error) => {
                 warn!(target: "rebalance", %id, %error, "Relay quote for a refund at the hub failed transiently; the transfer holds its guard at SwapRefunded for the retry");
-                return Err(error);
+                return Err(self.hop.transient_swap_quote(id, error));
             }
         };
 
@@ -2345,7 +2434,7 @@ mod tests {
     use uuid::Uuid;
 
     use st0x_bridge::relay::{
-        QuoteErrorCode, RelayCtx, RelayEndContracts, RelayError, quote_body_for_test,
+        QuoteErrorCode, RelayCtx, RelayEndContracts, RelayEndpoint, RelayError, quote_body_for_test,
     };
     use st0x_event_sorcery::{Store, test_store};
     use st0x_evm::{Evm, EvmError, IERC20};
@@ -3916,7 +4005,7 @@ mod tests {
             assert!(
                 matches!(
                     &error,
-                    UsdcTransferError::RelayApi(relay)
+                    UsdcTransferError::SwapQuoteTransient { source: relay, .. }
                         if matches!(**relay, RelayError::HttpStatus { status: 503, .. })
                 ),
                 "got {error:?}"
@@ -6151,7 +6240,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                UsdcTransferError::RelayApi(relay)
+                UsdcTransferError::SwapQuoteTransient { source: relay, .. }
                     if matches!(**relay, RelayError::HttpStatus { status: 503, .. })
             ),
             "got {error:?}"
@@ -6302,7 +6391,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                UsdcTransferError::RelayApi(relay)
+                UsdcTransferError::SwapQuoteTransient { source: relay, .. }
                     if matches!(**relay, RelayError::HttpStatus { status: 503, .. })
             ),
             "got {error:?}"
@@ -6405,6 +6494,113 @@ mod tests {
             store.load(&id).await.unwrap().unwrap().state_name(),
             "SwapRefunded"
         );
+    }
+
+    /// Only a transient Relay failure of a quote past the withdrawal is
+    /// re-queued at no retry cost; a 4xx, a response that does not decode
+    /// and a rate limit are left to the job's retries and backpressure.
+    /// One that keeps failing for 30 minutes pages once per run of failures;
+    /// a gap or another quote outcome starts a new run.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn only_a_transient_quote_failure_is_requeued_and_a_lasting_one_pages_once() {
+        let anvil = spawn_anvil(Anvil::new());
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let contracts = RelayEndContracts {
+            stable: Address::repeat_byte(0x51),
+            depository: Address::repeat_byte(0x52),
+        };
+        let transfer = relay_transfer(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet,
+            contracts,
+            store,
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let http = |status| {
+            UsdcTransferError::RelayApi(Box::new(RelayError::HttpStatus {
+                endpoint: RelayEndpoint::Quote,
+                status,
+            }))
+        };
+        let decode = UsdcTransferError::RelayApi(Box::new(RelayError::Decode {
+            endpoint: RelayEndpoint::Quote,
+            source: serde_json::from_str::<u8>("x").unwrap_err(),
+        }));
+        let rate_limited =
+            UsdcTransferError::RelayApi(Box::new(RelayError::RateLimited { retry_after: None }));
+
+        for left in [http(400), decode, rate_limited] {
+            let classified = transfer.hop.transient_swap_quote(&id, left);
+            assert!(
+                matches!(classified, UsdcTransferError::RelayApi(_)),
+                "got {classified:?}"
+            );
+        }
+        let requeued = transfer.hop.transient_swap_quote(&id, http(503));
+        assert!(
+            matches!(
+                &requeued,
+                UsdcTransferError::SwapQuoteTransient { source, .. }
+                    if matches!(**source, RelayError::HttpStatus { status: 503, .. })
+            ),
+            "got {requeued:?}"
+        );
+        assert!(!logs_contain("Relay quotes keep failing transiently"));
+
+        // A run of failures 30 minutes long pages once.
+        let backdate = |since: Instant, last: Instant| {
+            let mut failing = transfer.hop.failing_quotes.lock().unwrap();
+            let entry = failing.get_mut(&id).unwrap();
+            entry.since = since;
+            entry.last = last;
+            drop(failing);
+        };
+        let since = Instant::now()
+            .checked_sub(QUOTE_FAILING_PAGE_AFTER)
+            .unwrap();
+        backdate(since, Instant::now());
+        for _ in 0..2 {
+            transfer.hop.transient_swap_quote(&id, http(502));
+        }
+        // A failure after a gap starts a new run, which does not page yet.
+        let now = Instant::now();
+        backdate(
+            now.checked_sub(QUOTE_FAILING_PAGE_AFTER * 2).unwrap(),
+            now.checked_sub(QUOTE_FAILING_RUN_GAP).unwrap(),
+        );
+        transfer.hop.transient_swap_quote(&id, http(502));
+        // A run ended by another quote outcome is forgotten, and the next one
+        // pages again once it lasts.
+        transfer.hop.forget_failing_quotes(&id);
+        assert!(
+            !transfer
+                .hop
+                .failing_quotes
+                .lock()
+                .unwrap()
+                .contains_key(&id)
+        );
+        transfer.hop.transient_swap_quote(&id, http(502));
+        backdate(since, Instant::now());
+        transfer.hop.transient_swap_quote(&id, http(502));
+
+        logs_assert(|lines| {
+            let pages = lines
+                .iter()
+                .filter(|line| line.contains("Relay quotes keep failing transiently"))
+                .count();
+            (pages == 2)
+                .then_some(())
+                .ok_or_else(|| format!("{pages} pages of the failing quotes"))
+        });
     }
 
     /// A refund at the hub below the corridor's `min_transfer` is not quoted

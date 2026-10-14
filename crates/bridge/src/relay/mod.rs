@@ -258,9 +258,9 @@ pub enum RelayError {
 }
 
 impl RelayError {
-    /// Worth retrying within the same call: nothing moved, and the same
-    /// request may succeed a moment later.
-    fn is_transient(&self) -> bool {
+    /// Worth retrying: nothing moved, and the same request may succeed a
+    /// moment later.
+    pub fn is_transient(&self) -> bool {
         match self {
             Self::Transport(_) => true,
             Self::HttpStatus { status, .. } => *status >= 500,

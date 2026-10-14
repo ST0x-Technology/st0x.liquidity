@@ -910,9 +910,11 @@ The job takes a fresh binding quote (or re-quotes an expired one) and signs the
 deposit; when Relay refuses the quote it puts the USDG back into the vault
 (`Redepositing` -> `ReturnedToSource`), which releases the guard; USDC dispatch
 then waits for a fresh Robinhood vault read, and Robinhood chain-to-Alpaca
-planning for the 30-minute withdraw cooldown, also across a restart. A transient
-quote failure (transport, rate limit) leaves the transfer where it was for the
-next resume. The other Relay holds:
+planning for the 30-minute withdraw cooldown, also across a restart. After a
+transient quote failure (transport, a Relay 5xx, a transient error code) the job
+quotes again 30 seconds later, and pages once if that lasts 30 minutes ("Relay
+quotes keep failing transiently"); after a rate limit it quotes again once
+Relay's `Retry-After` has passed. The other Relay holds:
 
 - `SwapEscrowUnresolved` (the fill window passed with no fill or refund) keeps
   the guard and pages, and the bot stops reading Relay. `transfer resume` reads

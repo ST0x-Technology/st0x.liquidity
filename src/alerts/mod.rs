@@ -192,6 +192,7 @@ alert_kinds! {
         RelayHubRefundPastBudget => "Relay refunded an Alpaca-to-chain deposit at the hub past",
         RelayHubRefundQuoteRefused => "Relay refused the quote for a refund at the hub",
         ReconciledTransferHoldsRelayEnvelopes => "Reconciled a USDC transfer that holds signed Relay envelopes",
+        RelayQuoteKeepsFailing => "Relay quotes keep failing transiently for a transfer past its withdrawal",
     }
 }
 
