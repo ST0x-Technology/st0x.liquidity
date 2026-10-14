@@ -7494,6 +7494,7 @@ mod tests {
                 side,
                 amount_refunded: Usdc::new(float!(99)),
                 short_of_floor: None,
+                shortfall: Usdc::new(float!(1)),
                 refunded_at: Utc::now(),
             }],
         ]
@@ -7680,6 +7681,7 @@ mod tests {
                 side: RefundSide::Origin,
                 amount_refunded: Usdc::new(float!(99)),
                 short_of_floor: None,
+                shortfall: Usdc::new(float!(1)),
                 refunded_at: Utc::now(),
             }],
         ]
@@ -8172,6 +8174,7 @@ mod tests {
                 side: RefundSide::Origin,
                 amount_refunded: Usdc::new(float!(98)),
                 short_of_floor: None,
+                shortfall: Usdc::new(float!(2)),
                 refunded_at: Utc::now(),
             }],
         ]

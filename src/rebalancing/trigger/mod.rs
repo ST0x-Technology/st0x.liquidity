@@ -46448,16 +46448,24 @@ mod tests {
         amount: Usdc,
         stage: usdc::UsdcRebalanceStage,
     ) -> Arc<RebalancingService> {
-        sweep_stale_relay_transfer_toward(pool, store, id, amount, RebalanceDirection::BaseToAlpaca)
-            .await
+        sweep_timed_out_relay_transfer_toward(
+            pool,
+            store,
+            id,
+            amount,
+            stage,
+            RebalanceDirection::BaseToAlpaca,
+        )
+        .await
     }
 
-    /// Like `sweep_stale_relay_transfer`, for a transfer in `direction`.
-    async fn sweep_stale_relay_transfer_toward(
+    /// Like `sweep_timed_out_relay_transfer`, for a transfer in `direction`.
+    async fn sweep_timed_out_relay_transfer_toward(
         pool: &SqlitePool,
         store: Arc<Store<UsdcRebalance>>,
         id: &UsdcRebalanceId,
         amount: Usdc,
+        stage: usdc::UsdcRebalanceStage,
         direction: RebalanceDirection,
     ) -> Arc<RebalancingService> {
         let now = Utc::now();
@@ -46919,11 +46927,12 @@ mod tests {
                 expected
             );
 
-            let trigger = sweep_stale_relay_transfer_toward(
+            let trigger = sweep_timed_out_relay_transfer_toward(
                 &pool,
                 store,
                 &id,
                 usdc(100),
+                usdc::UsdcRebalanceStage::WithdrawalConfirmed,
                 RebalanceDirection::AlpacaToBase,
             )
             .await;

@@ -4489,7 +4489,7 @@ mod tests {
         )
         .await;
         let (pair, _order_id) = transfer
-            .prepare_and_persist_swap_pair(&id)
+            .prepare_and_persist_swap_pair(&id, TO_HUB)
             .await
             .unwrap()
             .unwrap();
@@ -4698,7 +4698,7 @@ mod tests {
         )
         .await;
         let (pair, _order_id) = transfer
-            .prepare_and_persist_swap_pair(&id)
+            .prepare_and_persist_swap_pair(&id, TO_HUB)
             .await
             .unwrap()
             .unwrap();

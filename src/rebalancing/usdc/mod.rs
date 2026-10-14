@@ -61,8 +61,8 @@ use crate::bot_gas::redrive::BotGasFailureClassifier;
 use crate::inventory::InventoryViewError;
 use crate::native_gas::GasReadinessFailure;
 use crate::usdc_rebalance::{
-    BurnTxOwnershipLookupError, RebalanceDirection, TransferRef, UsdcRebalance,
-    UsdcRebalanceError, UsdcRebalanceId,
+    BurnTxOwnershipLookupError, RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceError,
+    UsdcRebalanceId,
 };
 
 #[derive(Debug, Error)]
