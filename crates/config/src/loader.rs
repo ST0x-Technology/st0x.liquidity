@@ -13555,6 +13555,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn robinhood_relay_corridor_without_a_robinhood_gas_threshold_is_refused() {
+        let mut config = robinhood_relay_corridor_config();
+        config["alerts"]["low_balance_thresholds"]
+            .as_table_mut()
+            .unwrap()
+            .remove("robinhood")
+            .unwrap();
+
+        let Err(error) = load_with_example_secrets(&config) else {
+            panic!("expected the load to fail");
+        };
+
+        assert!(
+            matches!(
+                error,
+                CtxError::Alerts(crate::AlertsAssemblyError::MissingThreshold {
+                    chain: Chain::Robinhood
+                })
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn robinhood_corridor_naming_cctp_is_still_refused() {
+        let mut config = robinhood_relay_corridor_config();
+        let corridor = config["rebalancing"]["usdc"]["corridors"]["robinhood"]
+            .as_table_mut()
+            .unwrap();
+        corridor.insert("hop".into(), toml::Value::String("cctp".into()));
+        corridor.remove("relay").unwrap();
+
+        let Err(error) = load_with_example_secrets(&config) else {
+            panic!("expected the load to fail");
+        };
+
+        let CtxError::Rebalancing(error) = error else {
+            panic!("expected a rebalancing error, got {error:?}");
+        };
+        assert!(
+            matches!(
+                *error,
+                RebalancingCtxError::CctpHopStableNotUsdc {
+                    chain: Chain::Robinhood,
+                    ..
+                }
+            ),
+            "got {error:?}"
+        );
+    }
+
     /// A corridor runs on its own chain's orderbook, vault and depth, so the
     /// corridor check accepts a corridor off the primary chain.
     #[test]

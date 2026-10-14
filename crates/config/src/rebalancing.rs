@@ -80,12 +80,6 @@ pub enum RebalancingCtxError {
     UsdcEnabledWithoutCorridor,
     #[error("[rebalancing.usdc.corridors.ethereum]: the direct Ethereum corridor is not built")]
     EthereumCorridor,
-    #[error(
-        "[rebalancing.usdc.corridors.{chain}] hop = \"relay\": the Relay hop is switched on by \
-         RAI-2986 (Robinhood cash rebalancing, two-corridor sizing, the deploy gate); until \
-         then it does not load"
-    )]
-    RelayHopNotSwitchedOn { chain: Chain },
     #[error("[rebalancing.usdc.corridors.{chain}] hop = \"relay\" needs a [relay] sub-table")]
     RelayTableMissing { chain: Chain },
     #[error("[rebalancing.usdc.corridors.{chain}.relay] is only for hop = \"relay\"")]
@@ -636,11 +630,6 @@ impl UsdcRebalancing {
             .iter()
             .filter_map(|(chain, corridor)| Some((*chain, corridor.relay?)))
             .collect();
-
-        // Rule 6: every table is valid, and a Relay hop still does not load.
-        if let Some(chain) = relay_hops.keys().next() {
-            return Err(RebalancingCtxError::RelayHopNotSwitchedOn { chain: *chain });
-        }
 
         let by_chain: BTreeMap<Chain, UsdcCorridorCtx> = validated
             .into_iter()
@@ -2250,22 +2239,24 @@ mod tests {
         );
     }
 
-    /// A complete, valid `relay` sub-table still does not load: the hop is
-    /// switched on later.
     #[test]
-    fn relay_hop_still_refused_at_load() {
-        let error = corridor_error(&relay_corridor("robinhood", &[]));
+    fn valid_relay_corridor_loads_with_its_bounds() {
+        let usdc = RebalancingCtx::new(
+            &with_usdc(&relay_corridor("robinhood", &[])),
+            BaseCashVault::Held,
+        )
+        .unwrap()
+        .usdc;
 
-        assert!(
-            matches!(
-                error,
-                RebalancingCtxError::RelayHopNotSwitchedOn {
-                    chain: Chain::Robinhood
-                }
-            ),
-            "got {error:?}"
-        );
-        assert!(error.to_string().contains("RAI-2986"), "got {error}");
+        assert!(usdc.serves(UsdcCorridor::HubRouted {
+            chain: Chain::Robinhood,
+            hop: HopKind::Relay,
+        }));
+        assert!(usdc.serves(UsdcCorridor::BASE_CCTP));
+        let relay = usdc.relay_hop(Chain::Robinhood).unwrap();
+        assert_eq!(relay.slippage_bps, 30);
+        assert_eq!(relay.max_quote_loss_bps, 50);
+        assert_eq!(relay.fill_timeout, Duration::from_secs(1800));
     }
 
     fn robinhood_relay_corridors() -> UsdcCorridors {
@@ -2544,18 +2535,19 @@ mod tests {
             "got {error:?}"
         );
 
-        let error = corridor_error(&relay_corridor(
-            "robinhood",
-            &[("quote_max_age_secs", "3600")],
-        ));
-        assert!(
-            matches!(
-                error,
-                RebalancingCtxError::RelayHopNotSwitchedOn {
-                    chain: Chain::Robinhood
-                }
-            ),
-            "an hour exactly passes the table checks; got {error:?}"
+        let usdc = RebalancingCtx::new(
+            &with_usdc(&relay_corridor(
+                "robinhood",
+                &[("quote_max_age_secs", "3600")],
+            )),
+            BaseCashVault::Held,
+        )
+        .unwrap()
+        .usdc;
+        assert_eq!(
+            usdc.relay_hop(Chain::Robinhood).unwrap().quote_max_age,
+            Duration::from_secs(3600),
+            "an hour exactly loads"
         );
     }
 

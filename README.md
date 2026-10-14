@@ -28,8 +28,9 @@ Bebop's Robinhood hook mapped as the inventory adapter. The build values its gas
 (it pays gas in ETH), so `active` is reachable. Production runs it `active` and
 rebalances against Alpaca the listings the pinned token file enables there
 (DNUT, PLBY, GRND, and WMT); staging runs it as a prefunded hedge-only secondary
-with `rebalancing = "disabled"` on every asset. It cannot rebalance cash,
-because it has no CCTP domain.
+with `rebalancing = "disabled"` on every asset. It has no CCTP domain, so its
+cash rebalances over the Relay hop, under a `relay` corridor table; neither
+shipped config sets one yet.
 
 ## Features
 

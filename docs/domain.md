@@ -182,8 +182,7 @@ vault <-> hop <-> Ethereum wallet <-> Alpaca.
   Pinned, never configured.
 - **Hop**: the leg that moves USDC between the corridor chain and the hub.
 - **Hop kind** (`HopKind`): how the hop moves it. `Cctp` is Circle's burn and
-  mint; `Relay` swaps Robinhood's USDG for USDC through Relay. A `relay` hop is
-  parsed and validated, but still refused at load.
+  mint; `Relay` swaps Robinhood's USDG for USDC through Relay.
 - **Hop evidence** (`HopEvidence`): what moved the cash across the hop, kept on
   every post-hop `UsdcRebalance` state (`Cctp { burn_tx, mint_tx }`,
   `Relay { deposit_tx, fill_tx, deposit_id }`). Readers that resolve a CCTP hash
