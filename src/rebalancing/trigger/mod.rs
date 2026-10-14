@@ -47574,6 +47574,110 @@ mod tests {
         }
     }
 
+    /// An Alpaca-to-chain refund paid in full to the chain wallet holds its
+    /// guard across a restart; once the operator reconciles it from the CLI,
+    /// the sweep releases the guard and the corridor sends again.
+    #[tokio::test]
+    async fn reconciled_chain_wallet_refund_frees_the_corridor_after_a_restart() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let held = relay_withdrawn(RebalanceDirection::AlpacaToBase)
+            .into_iter()
+            .chain([
+                UsdcRebalanceCommand::QuoteSwap {
+                    quote: Box::new(swap_quote_for_test(
+                        U256::from(100_000_000u64),
+                        B256::repeat_byte(0x0d),
+                    )),
+                },
+                UsdcRebalanceCommand::PrepareSwapDeposit {
+                    approve: None,
+                    deposit: PreparedTransaction::for_test(TxHash::repeat_byte(0xa2), 6),
+                },
+                UsdcRebalanceCommand::ConfirmSwapDeposit {
+                    deposit_tx: TxHash::repeat_byte(0xa2),
+                    deposit_block: 9,
+                },
+                // 99.5 is the refund floor of the 100 quoted: not short.
+                UsdcRebalanceCommand::RecordSwapRefund {
+                    refund_tx: TxHash::repeat_byte(0xe1),
+                    side: RefundSide::Destination,
+                    amount_refunded: U256::from(99_500_000u64),
+                },
+            ]);
+        for command in held {
+            store.send(&id, command).await.unwrap();
+        }
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::SwapRefunded {
+                    side: RefundSide::Destination,
+                    short_of_floor: None,
+                    ..
+                }
+            ),
+            "got {state:?}"
+        );
+
+        let config = RebalancingServiceConfig {
+            usdc: UsdcCorridors::for_test(
+                OperationMode::Enabled,
+                [active_corridor(Chain::Robinhood, HopKind::Relay)],
+            )
+            .with_relay_hop(Chain::Robinhood, relay_bounds(1, 200)),
+            ..with_cash_on(test_config(), &[Chain::Robinhood])
+        };
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(900), usdc(900))
+            .with_withdrawable_cash_cents(90_000);
+        let inventory = with_onchain_usdc(inventory, Chain::Robinhood, usdc(100));
+        let trigger = make_trigger_with_inventory_config(inventory, config).await;
+        trigger
+            .set_stores(
+                Arc::new(test_store::<TokenizedEquityMint>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                store.clone(),
+            )
+            .await;
+
+        trigger.recover_usdc_guard(&pool, &store).await.unwrap();
+        assert!(trigger.usdc_guards.is_held(Chain::Robinhood));
+
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+                },
+            )
+            .await
+            .unwrap();
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_guards.is_held(Chain::Robinhood),
+            "the sweep must release the guard of the reconciled refund"
+        );
+
+        trigger.check_and_trigger_usdc().await;
+
+        let job = pending_transfer_usdc_to_market_making_job(&trigger).await;
+        assert_ne!(job.id, id, "a new transfer, not the reconciled one");
+        assert_eq!(job.corridor, ROBINHOOD_RELAY);
+    }
+
     /// A Relay transfer whose job apalis still owns is not re-armed again:
     /// two jobs would drive one transfer.
     #[tokio::test]
