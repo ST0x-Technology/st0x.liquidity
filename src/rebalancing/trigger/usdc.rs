@@ -8,7 +8,7 @@ use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, trace, warn};
 
-use st0x_bridge::corridor::UsdcCorridor;
+use st0x_bridge::corridor::{HopKind, UsdcCorridor};
 use st0x_config::RelayHopCtx;
 use st0x_evm::Chain;
 use st0x_execution::HasZero;
@@ -1913,8 +1913,20 @@ impl RebalancingService {
         let chain = tracking.corridor.chain();
         let source_venue = tracking.source_venue();
         let initiated_amount = tracking.initiated_amount;
+        // A Relay fill can pay more than its input: the quote and the fill
+        // proof bound it only from below, so the transfer settles at what it
+        // received.
+        let settles_above_input = match tracking.corridor {
+            UsdcCorridor::HubRouted {
+                hop: HopKind::Relay,
+                ..
+            } => true,
+            UsdcCorridor::HubRouted {
+                hop: HopKind::Cctp, ..
+            } => false,
+        };
 
-        if settled_amount.gt(&initiated_amount)? {
+        if !settles_above_input && settled_amount.gt(&initiated_amount)? {
             warn!(
                 target: "rebalance",
                 id = %id,

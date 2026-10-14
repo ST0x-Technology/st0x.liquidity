@@ -5180,8 +5180,11 @@ proven fill or the stable back in the vault, never in a guard-freeing failure:
    `RelayFillVerified` -> `Bridged` with `HopEvidence::Relay`, its
    `amount_received` the proven amount and its `fee_collected` the input less
    that amount. The transfer then continues as any `Bridged`: the Alpaca deposit
-   send and the USD conversion. A fill that does not prove (`FillUnverified`)
-   holds the guard, pages, and is read again every 30 minutes.
+   send and the USD conversion. A fill above the input (the quote and the proof
+   bound it only from below) settles at what the conversion received: the
+   inventory releases the whole source reservation and credits Alpaca with it. A
+   fill that does not prove (`FillUnverified`) holds the guard, pages, and is
+   read again every 30 minutes.
 8. A `refund` is adopted only once `verify_refund` proves it, on either chain,
    at most the deposited amount: `RecordSwapRefund` -> `SwapRefunded`. A refund
    below the refund floor, measured against the transfer's first deposit (the
