@@ -5429,14 +5429,28 @@ mod tests {
                 .await
                 .unwrap();
 
-            let hub_anvil = spawn_anvil(Anvil::new());
+            // Ethereum's chain id and pinned stable and depository, which a
+            // quote Relay answers from the hub names.
+            let hub_anvil = spawn_anvil(Anvil::new().chain_id(Chain::Ethereum.chain_id()));
             let hub_wallet = anvil_wallet(
                 hub_anvil.endpoint_url(),
                 &B256::from_slice(&hub_anvil.keys()[0].to_bytes()),
             );
-            let hub_contracts = st0x_bridge::relay::deploy_relay_end(&Self::signer_on(&hub_anvil))
+            let hub_deployer = Self::signer_on(&hub_anvil);
+            let hub_mocks = st0x_bridge::relay::deploy_relay_end(&hub_deployer)
                 .await
                 .unwrap();
+            let hub_contracts = RelayEndContracts {
+                stable: Chain::Ethereum.settlement_stable().address,
+                depository: Chain::Ethereum.relay_depository().unwrap(),
+            };
+            for (mock, pinned) in [
+                (hub_mocks.stable, hub_contracts.stable),
+                (hub_mocks.depository, hub_contracts.depository),
+            ] {
+                let code = hub_deployer.get_code_at(mock).await.unwrap();
+                hub_deployer.anvil_set_code(pinned, code).await.unwrap();
+            }
 
             Self {
                 chain,
@@ -8517,6 +8531,105 @@ mod tests {
             "{queued:?}"
         );
         quotes.assert_calls(0);
+    }
+
+    /// A reverted order's late refund at the hub, adopted by the escrow scan,
+    /// is quoted again and its next pair signed and sent in the same attempt:
+    /// the hub wallet's prepare lock the scan ran under is released first.
+    #[tokio::test]
+    async fn adopted_late_refund_at_the_hub_signs_the_next_pair() {
+        let rig = RelayRig::deploy().await;
+        rig.withdraw_to_hub(U256::from(AMOUNT_IN)).await;
+        let late_deposit = rig.deposit_on_hub(REVERTED_ORDER_ID).await;
+        let refund_tx = rig
+            .refund_on_hub(U256::from(AMOUNT_IN), REVERTED_ORDER_ID)
+            .await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_status_of(
+            &relay_api,
+            B256::repeat_byte(0x5e),
+            json!({
+                "status": "refund",
+                "inTxHashes": [late_deposit],
+                "txHashes": [refund_tx],
+                "failReason": "SOLVER_CAPACITY_EXCEEDED"
+            }),
+        );
+        let next_request = B256::repeat_byte(0x7e);
+        mock_status_of(&relay_api, next_request, json!({"status": "waiting"}));
+        let bounds = RelayHopCtx {
+            min_transfer: Usdc::new(float!(10)),
+            quote_max_age: Duration::from_secs(10),
+            ..relay_bounds()
+        };
+        let request = QuoteRequest {
+            origin: Chain::Ethereum,
+            destination: Chain::Robinhood,
+            amount: U256::from(AMOUNT_IN),
+            user: rig.hub_wallet.address(),
+            recipient: rig.chain.bot_wallet.address(),
+            refund_to: rig.hub_wallet.address(),
+            slippage: BasisPoints::new(bounds.slippage_bps).unwrap(),
+            ttl: bounds.fill_timeout,
+        };
+        let requote = relay_api.mock(|when, then| {
+            when.method(POST).path("/quote/v2");
+            then.status(200).json_body(
+                quote_body_for_test(
+                    &request,
+                    TestQuote {
+                        request_id: next_request,
+                        expected_out: U256::from(AMOUNT_IN),
+                        minimum_out: U256::from(AMOUNT_IN),
+                        salt: B256::repeat_byte(0x5c),
+                        deadline: u32::try_from(
+                            (Utc::now() + chrono::Duration::hours(1)).timestamp(),
+                        )
+                        .unwrap(),
+                    },
+                )
+                .unwrap(),
+            );
+        });
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(&server, &relay_api, store.clone(), bounds)
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_reverted_and_requoted_toward_chain(&rig, &store, &id).await;
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(60),
+            transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends");
+
+        requote.assert_calls(1);
+        let state = store.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::SwapDeposited {
+            quote,
+            refund_requotes,
+            deposit_tx,
+            ..
+        } = &state
+        else {
+            panic!("expected SwapDeposited, got {state:?} after {outcome:?}");
+        };
+        assert_eq!(quote.request_id, next_request);
+        assert_eq!(*refund_requotes, 1);
+        assert!(
+            rig.hub_wallet
+                .provider()
+                .get_transaction_receipt(*deposit_tx)
+                .await
+                .unwrap()
+                .expect("the next deposit is mined")
+                .status()
+        );
+        assert_eq!(rig.hub_usdc().await, U256::ZERO, "the refund went to Relay");
+        assert_fill_pending(&outcome);
     }
 
     /// A reverted order's deposit held for its payment sends again the
