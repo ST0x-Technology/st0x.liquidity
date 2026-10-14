@@ -1639,18 +1639,21 @@ before the startup token approvals.
   confirm, follow the not-confirmed page above.
 - **"Startup token approvals deferred on this chain"** (warning, not a page,
   target `orderbook`, with `chain`): a signed send restored at startup on that
-  chain (an Alpaca deposit send, or a vault withdrawal) is not mined yet: its
-  rebroadcast failed, or it is pending, possibly at a fee too low to confirm. An
-  approval would wait behind its nonce, so startup grants none there and skips
-  that chain's stale-allowance revokes. Wraps and deposits still approve on
-  demand. The `rebalance` log names the send: "Restored Alpaca deposit send is
-  not mined yet at startup" (with `id` and `tx`), "Restored vault withdrawal is
-  not mined yet at startup" (with `redemption_id` and `tx_hash`), or a
-  rebroadcast page: the deposit send page above, or **"Equity redemption `<id>`
-  has a signed vault withdrawal ... that could not be rebroadcast at startup"**,
-  whose resume job broadcasts the withdrawal again. If the send stays pending,
-  it will not confirm at its fee: for a deposit send follow the not-confirmed
-  page above (wait for fees to drop, or cancel it at its nonce).
+  chain (an Alpaca deposit send, a vault withdrawal, or a Relay approve or
+  deposit, which counts as mined only with its confirmations in a canonical
+  block) is not mined yet: its rebroadcast failed, or it is pending, possibly at
+  a fee too low to confirm. An approval would wait behind its nonce, so startup
+  grants none there and skips that chain's stale-allowance revokes. Wraps and
+  deposits still approve on demand. The `rebalance` log names the send:
+  "Restored Alpaca deposit send is not mined yet at startup" (with `id` and
+  `tx`), "Restored vault withdrawal is not mined yet at startup" (with
+  `redemption_id` and `tx_hash`), "Restored Relay envelope is not mined yet at
+  startup" (with `id` and `tx`), or a rebroadcast page: the deposit send page
+  above, or **"Equity redemption `<id>` has a signed vault withdrawal ... that
+  could not be rebroadcast at startup"**, whose resume job broadcasts the
+  withdrawal again. If the send stays pending, it will not confirm at its fee:
+  for a deposit send follow the not-confirmed page above (wait for fees to drop,
+  or cancel it at its nonce).
 - **"Cannot tell whether a signed Relay pair was persisted"** or **"Cannot tell
   whether a lone Relay approve was persisted"** (`operational_alert`): a Relay
   pair or approve write failed and the reload that checks it failed too or
