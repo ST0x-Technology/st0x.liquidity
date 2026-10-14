@@ -1741,11 +1741,20 @@ where
                     .map(|quote| (deposit, quote))
             })
             .collect::<Vec<_>>();
+        if found.is_empty() {
+            info!(target: "rebalance", %id, from_block, scanned_to = scan.scanned_to, reverted = reverted.len(), "No deposit of a reverted Relay order is on chain");
+            return Ok(false);
+        }
+
+        // Every later send from the wallet waits behind their nonces, through
+        // a hold or past the adoption that drops them from the transfer.
+        let deadline = Instant::now() + self.hop.bounds.quote_max_age;
+        self.hop
+            .broadcast_split_approves(id, split_approves, side, deadline)
+            .await?;
+
         let (deposit, quote) = match found.as_slice() {
-            [] => {
-                info!(target: "rebalance", %id, from_block, scanned_to = scan.scanned_to, reverted = reverted.len(), "No deposit of a reverted Relay order is on chain");
-                return Ok(false);
-            }
+            [] => return Ok(false),
             [(deposit, quote)] => (*deposit, *quote),
             [(deposit, quote), ..] => {
                 // Each deposit holds the transfer's amount, so adopting one
@@ -1781,9 +1790,7 @@ where
             }
         };
 
-        let deadline = Instant::now() + self.hop.bounds.quote_max_age;
-        self.hop
-            .broadcast_split_approves(id, split_approves, side, deadline)
+        self.confirm_split_approves(id, split_approves, side)
             .await?;
         self.cqrs
             .send(
@@ -1916,29 +1923,45 @@ where
         self.hop
             .broadcast_split_approves(id, split_approves, TO_HUB, deadline)
             .await?;
+        self.confirm_split_approves(id, split_approves, TO_HUB)
+            .await?;
+        self.redeposit(id, reason).await
+    }
+
+    /// Confirms the broadcast approves of a `SwapQuoted` that went out alone
+    /// and queues their gas, before a command that drops them from the
+    /// transfer: nothing would send them again or book their gas after it.
+    async fn confirm_split_approves(
+        &self,
+        id: &UsdcRebalanceId,
+        split_approves: &[PreparedTransaction],
+        side: HopDirection,
+    ) -> Result<(), UsdcTransferError> {
+        let chain = match side {
+            HopDirection::ToHub => self.corridor.chain(),
+            HopDirection::FromHub => Chain::Ethereum,
+        };
         for approve in split_approves {
-            match self.hop.bridge.confirm_approve(TO_HUB, approve).await {
+            match self.hop.bridge.confirm_approve(side, approve).await {
                 Ok(()) => {}
-                // Mined, so its nonce is used: the vault deposit does not wait
+                // Mined, so its nonce is used: the next send does not wait
                 // behind it.
                 Err(RelayBridgeError::ApproveReverted { tx }) => {
-                    warn!(target: "rebalance", %id, approve = %tx, "A lone Relay approve reverted; returning the stable to the vault anyway");
+                    warn!(target: "rebalance", %id, approve = %tx, "A lone Relay approve reverted; moving the transfer on anyway");
                 }
                 Err(error) => {
-                    warn!(target: "rebalance", %id, approve = %approve.tx_hash(), %error, "A lone Relay approve is not confirmed; the redeposit waits for the retry to send it again");
+                    warn!(target: "rebalance", %id, approve = %approve.tx_hash(), %error, "A lone Relay approve is not confirmed; the attempt waits for the retry to send it again");
                     return Err(Box::new(error).into());
                 }
             }
-            // Mined and paid for, and no deposit will queue it once
-            // `BeginRedeposit` drops it.
             self.enqueue_bot_gas_cost(
-                self.corridor.chain(),
+                chain,
                 approve.tx_hash(),
                 BotGasOperationCategory::RelayApprove,
             )
             .await?;
         }
-        self.redeposit(id, reason).await
+        Ok(())
     }
 
     /// Sends again and confirms, before a hold at the hub, the approves of a
