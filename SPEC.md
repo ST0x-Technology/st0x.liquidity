@@ -5172,10 +5172,16 @@ failure:
    is released instead of persisted: the attempt first re-quotes (`RequoteSwap`
    -> `SwapRequoted`, same input, a fresh order id), and a refused re-quote
    redeposits (step 9). A persist that fails releases both nonces, deposit
-   first, unless a reload shows the pair committed. When another send took the
-   nonce between the two signs, the approve alone is persisted
-   (`SwapApprovePrepared`) and broadcast, even if its quote expired during the
-   signing, since that send holds the nonce above it, and the attempt retries.
+   first, only when a reload shows the pair not committed (the transfer still at
+   `SwapQuoted`, or reconciled); a reload showing it committed sends it. When
+   the reload fails or shows any other state, the nonces stay reserved and it
+   pages ("Cannot tell whether a signed Relay pair was persisted", or "... a
+   lone Relay approve ..." for a lone approve): every later send from that
+   wallet waits behind them until a restart, which reserves them again only if
+   the pair was persisted. When another send took the nonce between the two
+   signs, the approve alone is persisted (`SwapApprovePrepared`) and broadcast,
+   even if its quote expired during the signing, since that send holds the nonce
+   above it, and the attempt retries.
 5. Broadcast in nonce order; a retry sends the same bytes. The deposit is
    recorded (`ConfirmSwapDeposit` -> `SwapDeposited`) once it has the origin
    chain's confirmations and its receipt names our wallet, the origin stable and

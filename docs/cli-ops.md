@@ -1651,6 +1651,13 @@ before the startup token approvals.
   whose resume job broadcasts the withdrawal again. If the send stays pending,
   it will not confirm at its fee: for a deposit send follow the not-confirmed
   page above (wait for fees to drop, or cancel it at its nonce).
+- **"Cannot tell whether a signed Relay pair was persisted"** or **"Cannot tell
+  whether a lone Relay approve was persisted"** (`operational_alert`): a Relay
+  pair or approve write failed and the reload that checks it failed too or
+  showed an unexpected state. The bot keeps their nonces reserved, so later
+  sends from that wallet (the Ethereum wallet for an Alpaca->Robinhood transfer)
+  wait behind them. Fix the database, then restart the bot: startup reserves
+  them again only if they were persisted.
 - **"Cannot tell whether a signed Alpaca deposit send was persisted"**
   (`operational_alert`): a `PrepareDepositSend` write failed and the reload that
   checks it failed too. The bot keeps the send's nonce reserved, so later sends
