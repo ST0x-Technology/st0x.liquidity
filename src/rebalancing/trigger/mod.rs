@@ -75,7 +75,7 @@ use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::view::InFlightEquityLocation;
 use crate::inventory::{
     BroadcastingInventory, CashAdmission, Inventory, InventoryDivergenceGate, InventoryError,
-    InventoryScope, InventoryViewError, Operator, PendingRequestOwnership,
+    InventoryScope, InventoryView, InventoryViewError, Operator, PendingRequestOwnership,
     PendingRequestOwnershipSnapshot, PollFreshness, PortfolioAsset, PortfolioLocation, TransferOp,
     Venue,
 };
@@ -3032,6 +3032,7 @@ impl RebalancingService {
             return Ok(None);
         }
         *inventory = cleared;
+        self.request_equity_snapshots_after_release(&inventory, &tracking.symbol, tracking.chain);
         drop(inventory);
 
         self.timed_out_mints.write().await.insert(
@@ -3233,6 +3234,12 @@ impl RebalancingService {
         {
             let mut inventory = self.inventory.write().await;
             *inventory = inventory.clone().clear_active_redemption(&tracking.symbol);
+            self.request_equity_snapshots_after_release(
+                &inventory,
+                &tracking.symbol,
+                tracking.chain,
+            );
+            drop(inventory);
         }
 
         // Tombstone so a late reactor `OperatorReconciled` (should the
@@ -3349,6 +3356,7 @@ impl RebalancingService {
             .clone()
             .clear_equity_inflight_at(&tracking.symbol, tracking.chain, Venue::MarketMaking, now)?
             .clear_active_redemption(&tracking.symbol);
+        self.request_equity_snapshots_after_release(&inventory, &tracking.symbol, tracking.chain);
         drop(inventory);
 
         self.timed_out_redemptions.write().await.insert(
@@ -5786,6 +5794,25 @@ impl RebalancingService {
         Ok(EquitySettlementOutcome::DeferredToSnapshot)
     }
 
+    /// Re-read the transfer's vault scope after ownership releases, including
+    /// values deduplicated before the view could record a skip. Broker reads
+    /// need a request only when their observations were deferred.
+    /// Arm the existing gate while the caller holds the inventory write lock,
+    /// before another transfer can size itself from that suspect balance.
+    fn request_equity_snapshots_after_release(
+        &self,
+        inventory: &InventoryView,
+        symbol: &Symbol,
+        chain: Chain,
+    ) {
+        self.divergence_gate
+            .request_onchain_equity_reconcile(chain, symbol, None);
+        if inventory.has_deferred_offchain_equity_snapshot(symbol) {
+            self.divergence_gate
+                .request_offchain_equity_reconcile(symbol);
+        }
+    }
+
     /// Sets `active_mints[symbol] = id` while the aggregate is alive,
     /// clears it on terminal events. Mirrors the lifecycle of
     /// `mint_tracking` so `InventoryView` reflects which aggregate
@@ -5799,12 +5826,15 @@ impl RebalancingService {
     ) {
         let mut inventory = self.inventory.write().await;
         *inventory = if Self::is_terminal_mint_event(event) {
-            inventory.clone().clear_active_mint(symbol)
+            let updated = inventory.clone().clear_active_mint(symbol);
+            self.request_equity_snapshots_after_release(&updated, symbol, chain);
+            updated
         } else {
             inventory
                 .clone()
                 .set_active_mint(symbol.clone(), chain, id.clone())
         };
+        drop(inventory);
     }
 
     /// Hedging inflight holds only mint shares, and a symbol has one mint at a
@@ -5868,12 +5898,15 @@ impl RebalancingService {
     ) {
         let mut inventory = self.inventory.write().await;
         *inventory = if Self::is_terminal_redemption_event(event) {
-            inventory.clone().clear_active_redemption(symbol)
+            let updated = inventory.clone().clear_active_redemption(symbol);
+            self.request_equity_snapshots_after_release(&updated, symbol, chain);
+            updated
         } else {
             inventory
                 .clone()
                 .set_active_redemption(symbol.clone(), chain, id.clone())
         };
+        drop(inventory);
     }
 
     async fn load_redemption_tracking(
@@ -8348,9 +8381,13 @@ impl RebalancingService {
         // the write lock so a concurrent mint cannot claim the slot between the
         // read and the clear.
         let mut inventory = self.inventory.write().await;
-        if inventory.active_mint(symbol) == Some(id) {
+        if let Some((active_id, chain)) = inventory.active_mint_with_chain(symbol)
+            && active_id == id
+        {
             *inventory = inventory.clone().clear_active_mint(symbol);
+            self.request_equity_snapshots_after_release(&inventory, symbol, chain);
         }
+        drop(inventory);
     }
 
     /// Reconstructs the corridor guards (`usdc_guards`) from durable
@@ -9625,8 +9662,11 @@ impl RebalancingService {
         // now, but only while this id still owns it -- re-checking under the write
         // lock so a concurrent redemption that claimed the slot is not cleared.
         let mut inventory = self.inventory.write().await;
-        if inventory.active_redemption(symbol) == Some(id) {
+        if let Some((active_id, chain)) = inventory.active_redemption_with_chain(symbol)
+            && active_id == id
+        {
             *inventory = inventory.clone().clear_active_redemption(symbol);
+            self.request_equity_snapshots_after_release(&inventory, symbol, chain);
         }
         drop(inventory);
         Ok(())
@@ -10365,8 +10405,8 @@ mod tests {
     };
     use st0x_dto::Statement;
     use st0x_event_sorcery::{
-        EntityList, Never, Reactor, ReactorHarness, StoreBuilder, TestStore, deps, replay,
-        send_command, test_store,
+        EntityList, Never, Reactor, ReactorHarness, StoreBuilder, TestHarness, TestStore, deps,
+        replay, send_command, test_store,
     };
     use st0x_evm::Chain;
     use st0x_execution::{
@@ -11139,6 +11179,79 @@ mod tests {
         assert_eq!(jobs.len(), 1, "{jobs:?}");
         assert_eq!(jobs[0]["chain"], json!("robinhood"));
         assert_eq!(jobs[0]["symbol"], json!("AAPL"));
+    }
+
+    #[tokio::test]
+    async fn startup_hydrates_balances_before_a_restored_mint_resumes() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let requested = vec![make_mint_requested(&symbol, float!(30))];
+        let mut wrapped = requested.clone();
+        wrapped.extend([
+            make_mint_accepted(),
+            make_tokens_received(),
+            TokenizedEquityMintEvent::TokensWrapped {
+                wrap_tx_hash: TxHash::random(),
+                wrapped_shares: U256::from(30u64),
+                wrap_block: None,
+                wrapped_at: Utc::now(),
+            },
+        ]);
+
+        for (label, events) in [("requested", requested), ("wrapped", wrapped)] {
+            let trigger = make_trigger_with_inventory(InventoryView::default()).await;
+            let mint_id = issuer_request_id(label);
+            let mint = replay::<TokenizedEquityMint>(events).unwrap().unwrap();
+            trigger.recover_mint_state(&mint_id, &mint).await.unwrap();
+            let fetched_at = Utc::now();
+            let persisted = replay::<InventorySnapshot>(vec![
+                InventorySnapshotEvent::OffchainEquity {
+                    positions: BTreeMap::from([(symbol.clone(), shares(80))]),
+                    fetched_at,
+                },
+                InventorySnapshotEvent::OnchainEquity {
+                    chain: Chain::Base,
+                    balances: BTreeMap::from([(symbol.clone(), shares(20))]),
+                    fetched_at,
+                    block_number: Some(100),
+                },
+            ])
+            .unwrap()
+            .unwrap();
+
+            let report = persisted.hydrate_inventory(&trigger.inventory).await;
+            assert_eq!(report.failed, 0);
+            let inventory = trigger.inventory.read().await;
+            assert_eq!(
+                inventory.equity_available(&symbol, Venue::Hedging),
+                Some(shares(80)),
+                "{label}: restored ownership must not prevent broker hydration"
+            );
+            assert_eq!(
+                inventory.onchain_equity_available_at(&symbol, Chain::Base),
+                Some(shares(20)),
+                "{label}: restored ownership must not prevent vault hydration"
+            );
+            assert_eq!(inventory.active_mint(&symbol), Some(&mint_id));
+            drop(inventory);
+
+            if label == "requested" {
+                trigger
+                    .on_mint(mint_id, make_mint_accepted())
+                    .await
+                    .unwrap();
+                let inventory = trigger.inventory.read().await;
+                assert_eq!(
+                    inventory.equity_available(&symbol, Venue::Hedging),
+                    Some(shares(50)),
+                    "a resumed mint must debit the hydrated broker balance"
+                );
+                assert_eq!(
+                    inventory.equity_inflight(&symbol, Venue::Hedging),
+                    Some(shares(30))
+                );
+                drop(inventory);
+            }
+        }
     }
 
     #[tokio::test]
@@ -17705,6 +17818,411 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restored_mint_reconciles_a_deferred_unchanged_deposit_snapshot() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger =
+            make_trigger_with_inventory_and_registry(InventoryView::default(), &symbol).await;
+        let id = issuer_request_id("restored-deposit-snapshot");
+        let mint = replay::<TokenizedEquityMint>(vec![
+            make_mint_requested(&symbol, float!(30)),
+            make_mint_accepted(),
+            make_tokens_received(),
+            TokenizedEquityMintEvent::TokensWrapped {
+                wrap_tx_hash: TxHash::random(),
+                wrapped_shares: U256::from(30u64),
+                wrap_block: None,
+                wrapped_at: Utc::now(),
+            },
+        ])
+        .unwrap()
+        .unwrap();
+        trigger.recover_mint_state(&id, &mint).await.unwrap();
+        let seed = InventorySnapshotEvent::OnchainEquity {
+            chain: Chain::Base,
+            balances: BTreeMap::from([(symbol.clone(), shares(20))]),
+            fetched_at: Utc::now(),
+            block_number: Some(100),
+        };
+        replay::<InventorySnapshot>(vec![seed.clone()])
+            .unwrap()
+            .unwrap()
+            .hydrate_inventory(&trigger.inventory)
+            .await;
+        let deposited = InventorySnapshotEvent::OnchainEquity {
+            chain: Chain::Base,
+            balances: BTreeMap::from([(symbol.clone(), shares(50))]),
+            fetched_at: Utc::now(),
+            block_number: Some(101),
+        };
+        trigger.on_snapshot(deposited.clone()).await.unwrap();
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .onchain_equity_available_at(&symbol, Chain::Base),
+            Some(shares(20)),
+            "the deposited read remains deferred until the restored mint releases ownership"
+        );
+        trigger
+            .on_mint(id, make_deposited_into_raindex())
+            .await
+            .unwrap();
+
+        let history = vec![seed, deposited];
+        let unchanged = TestHarness::<InventorySnapshot>::with(())
+            .given(history.clone())
+            .when(InventorySnapshotCommand::OnchainEquity {
+                chain: Chain::Base,
+                balances: BTreeMap::from([(symbol.clone(), shares(50))]),
+                fetched_at: Utc::now(),
+                block_number: Some(102),
+            })
+            .await
+            .events();
+        assert_eq!(unchanged, Vec::new());
+        let generations = trigger
+            .divergence_gate
+            .claim_pending_onchain_equity_reconciles(Chain::Base);
+        assert_eq!(
+            generations.keys().cloned().collect::<Vec<_>>(),
+            vec![symbol.clone()]
+        );
+        assert_eq!(
+            trigger
+                .divergence_gate
+                .claim_pending_onchain_equity_reconciles(Chain::Robinhood),
+            BTreeMap::new()
+        );
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given(history)
+            .when(InventorySnapshotCommand::ReconcileOnchainEquity {
+                chain: Chain::Base,
+                balances: BTreeMap::from([(symbol.clone(), shares(50))]),
+                fetched_at: Utc::now(),
+                block_number: Some(102),
+                generations,
+            })
+            .await
+            .events();
+        assert_eq!(events.len(), 1);
+        trigger.on_snapshot(events[0].clone()).await.unwrap();
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .onchain_equity_available_at(&symbol, Chain::Base),
+            Some(shares(50))
+        );
+        assert!(!trigger.divergence_gate.is_engaged(&symbol));
+    }
+
+    #[tokio::test]
+    async fn failed_mint_reconciles_both_deferred_equity_scopes() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(20), shares(80)),
+            &symbol,
+        )
+        .await;
+        let id = issuer_request_id("failed-deferred-snapshots");
+        for event in [
+            make_mint_requested(&symbol, float!(30)),
+            make_mint_accepted(),
+            make_tokens_received(),
+        ] {
+            trigger.on_mint(id.clone(), event).await.unwrap();
+        }
+        let cached = InventorySnapshotEvent::OnchainEquity {
+            chain: Chain::Base,
+            balances: BTreeMap::from([(symbol.clone(), shares(20))]),
+            fetched_at: Utc::now() - ChronoDuration::seconds(10),
+            block_number: Some(100),
+        };
+        let unchanged = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![cached])
+            .when(InventorySnapshotCommand::OnchainEquity {
+                chain: Chain::Base,
+                balances: BTreeMap::from([(symbol.clone(), shares(20))]),
+                fetched_at: Utc::now(),
+                block_number: Some(101),
+            })
+            .await
+            .events();
+        assert_eq!(unchanged, Vec::new());
+        trigger
+            .on_snapshot(InventorySnapshotEvent::OffchainEquity {
+                positions: BTreeMap::from([(symbol.clone(), shares(45))]),
+                fetched_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .onchain_equity_available_at(&symbol, Chain::Base),
+            Some(shares(50))
+        );
+        trigger
+            .on_mint(id, make_wrapping_failed(&symbol, float!(30)))
+            .await
+            .unwrap();
+        reconcile_deferred_equity_scopes(&trigger, &symbol, 20, 45).await;
+    }
+
+    #[tokio::test]
+    async fn completed_redemption_reconciles_both_deferred_equity_scopes() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(80), shares(20)),
+            &symbol,
+        )
+        .await;
+        let id = redemption_aggregate_id("completed-deferred-snapshots");
+        trigger
+            .on_redemption(id.clone(), make_withdrawn_from_raindex(&symbol, float!(30)))
+            .await
+            .unwrap();
+        trigger
+            .on_snapshot(InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
+                balances: BTreeMap::from([(symbol.clone(), shares(50))]),
+                fetched_at: Utc::now(),
+                block_number: Some(100),
+            })
+            .await
+            .unwrap();
+        trigger
+            .on_snapshot(InventorySnapshotEvent::OffchainEquity {
+                positions: BTreeMap::from([(symbol.clone(), shares(45))]),
+                fetched_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        trigger
+            .on_redemption(id, make_redemption_completed())
+            .await
+            .unwrap();
+        reconcile_deferred_equity_scopes(&trigger, &symbol, 50, 45).await;
+    }
+
+    async fn reconcile_released_base_vault(
+        trigger: &RebalancingService,
+        symbol: &Symbol,
+        vault_shares: i64,
+    ) {
+        let generations = trigger
+            .divergence_gate
+            .claim_pending_onchain_equity_reconciles(Chain::Base);
+        assert_eq!(
+            generations.keys().cloned().collect::<Vec<_>>(),
+            vec![symbol.clone()]
+        );
+        trigger
+            .on_snapshot(InventorySnapshotEvent::OnchainEquityReconciled {
+                chain: Chain::Base,
+                balances: BTreeMap::from([(symbol.clone(), shares(vault_shares))]),
+                fetched_at: Utc::now(),
+                block_number: Some(101),
+                generations,
+            })
+            .await
+            .unwrap();
+        assert!(
+            !trigger
+                .divergence_gate
+                .has_pending_onchain_equity_reconcile(Chain::Base)
+        );
+    }
+
+    async fn reconcile_deferred_equity_scopes(
+        trigger: &RebalancingService,
+        symbol: &Symbol,
+        vault_shares: i64,
+        broker_shares: i64,
+    ) {
+        reconcile_released_base_vault(trigger, symbol, vault_shares).await;
+        let claimed = trigger
+            .divergence_gate
+            .claim_pending_offchain_equity_reconciles();
+        assert_eq!(
+            claimed
+                .iter()
+                .map(|(symbol, _)| symbol.clone())
+                .collect::<Vec<_>>(),
+            vec![symbol.clone()]
+        );
+        let ledger_position = trigger
+            .inventory
+            .read()
+            .await
+            .equity_available(symbol, Venue::Hedging);
+        trigger
+            .on_snapshot(InventorySnapshotEvent::OffchainEquityReconciled {
+                symbol: symbol.clone(),
+                position: shares(broker_shares),
+                fetched_at: Utc::now(),
+                ledger_position,
+                consecutive_polls: 1,
+                generation: Some(claimed[0].1),
+            })
+            .await
+            .unwrap();
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.onchain_equity_available_at(symbol, Chain::Base),
+            Some(shares(vault_shares))
+        );
+        assert_eq!(
+            inventory.equity_available(symbol, Venue::Hedging),
+            Some(shares(broker_shares))
+        );
+        drop(inventory);
+        assert!(!trigger.divergence_gate.is_engaged(symbol));
+    }
+
+    #[tokio::test]
+    async fn timeout_reconciles_deferred_reads_only_when_recovery_releases_ownership() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        for recovery_owned in [false, true] {
+            let trigger = make_trigger_with_inventory_and_registry(
+                InventoryView::default().with_equity(symbol.clone(), shares(20), shares(80)),
+                &symbol,
+            )
+            .await;
+            let id = issuer_request_id("timeout-deferred-snapshot");
+            for event in [
+                make_mint_requested(&symbol, float!(30)),
+                make_mint_accepted(),
+                make_tokens_received(),
+            ] {
+                trigger.on_mint(id.clone(), event).await.unwrap();
+            }
+            trigger
+                .on_snapshot(InventorySnapshotEvent::OnchainEquity {
+                    chain: Chain::Base,
+                    balances: BTreeMap::from([(symbol.clone(), shares(20))]),
+                    fetched_at: Utc::now(),
+                    block_number: Some(100),
+                })
+                .await
+                .unwrap();
+            if recovery_owned {
+                trigger.mark_equity_held_for_recovery(&symbol, Chain::Base);
+            }
+            let now = Utc::now()
+                + ChronoDuration::from_std(trigger.config.transfer_timeout).unwrap()
+                + ChronoDuration::seconds(1);
+            let cleanup = trigger.cleanup_timed_out_mint(&id, now).await.unwrap();
+            assert_eq!(
+                cleanup.map(|(tracking, _)| tracking.symbol),
+                if recovery_owned {
+                    None
+                } else {
+                    Some(symbol.clone())
+                }
+            );
+            assert_eq!(
+                trigger.inventory.read().await.active_mint(&symbol),
+                if recovery_owned { Some(&id) } else { None }
+            );
+            assert_eq!(
+                trigger
+                    .divergence_gate
+                    .has_pending_onchain_equity_reconcile(Chain::Base),
+                !recovery_owned
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mint_received_credit_survives_predeposit_snapshot_until_terminal_cleanup() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory =
+            InventoryView::default().with_equity(symbol.clone(), shares(20), shares(80));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(trigger.clone());
+        let id = issuer_request_id("mint-snapshot-ownership");
+        for event in [
+            make_mint_requested(&symbol, float!(30)),
+            make_mint_accepted(),
+            make_tokens_received(),
+        ] {
+            harness
+                .receive::<TokenizedEquityMint>(id.clone(), event)
+                .await
+                .unwrap();
+        }
+
+        trigger
+            .on_snapshot(InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
+                balances: BTreeMap::from([(symbol.clone(), shares(20))]),
+                fetched_at: Utc::now(),
+                block_number: Some(100),
+            })
+            .await
+            .unwrap();
+        trigger
+            .on_snapshot(InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Robinhood,
+                balances: BTreeMap::from([(symbol.clone(), shares(7))]),
+                fetched_at: Utc::now(),
+                block_number: Some(100),
+            })
+            .await
+            .unwrap();
+        {
+            let inventory = trigger.inventory.read().await;
+            assert_eq!(
+                inventory.equity_inflight(&symbol, Venue::Hedging),
+                Some(shares(0))
+            );
+            assert_eq!(inventory.active_mint(&symbol), Some(&id));
+            assert_eq!(
+                inventory.onchain_equity_available_at(&symbol, Chain::Base),
+                Some(shares(50)),
+                "a fresh predeposit vault read must preserve the received-token credit"
+            );
+            assert_eq!(
+                inventory.onchain_equity_available_at(&symbol, Chain::Robinhood),
+                Some(shares(7))
+            );
+            drop(inventory);
+        }
+        harness
+            .receive::<TokenizedEquityMint>(id.clone(), make_deposited_into_raindex())
+            .await
+            .unwrap();
+        assert_eq!(trigger.inventory.read().await.active_mint(&symbol), None);
+        let generations = trigger
+            .divergence_gate
+            .claim_pending_onchain_equity_reconciles(Chain::Base);
+        trigger
+            .on_snapshot(InventorySnapshotEvent::OnchainEquityReconciled {
+                chain: Chain::Base,
+                balances: BTreeMap::from([(symbol.clone(), shares(49))]),
+                fetched_at: Utc::now(),
+                block_number: Some(101),
+                generations,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .onchain_equity_available_at(&symbol, Chain::Base),
+            Some(shares(49)),
+            "a fresh vault read must reconcile after terminal deposit releases ownership"
+        );
+    }
+
+    #[tokio::test]
     async fn provider_poll_seen_before_mint_accepted_leaves_no_hedging_inflight() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
@@ -18393,6 +18911,7 @@ mod tests {
             .unwrap();
 
         // After cancellation, inflight is cleared, imbalance should trigger again
+        reconcile_released_base_vault(&trigger, &symbol, 20).await;
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
         assert_eq!(
             take_pending_equity_mint_jobs(&trigger).await.len(),
@@ -35663,6 +36182,7 @@ mod tests {
         // After cancel: back to 80 onchain, 20 offchain -> once the first
         // dispatch's cooldown has passed, the imbalance re-triggers.
         trigger.clear_equity_cooldowns().await;
+        reconcile_released_base_vault(&trigger, &symbol, 80).await;
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
         assert_eq!(
             take_pending_equity_redemption_jobs(&trigger).await.len(),
@@ -35927,6 +36447,7 @@ mod tests {
             Some(shares(20))
         );
         drop(inventory);
+        reconcile_released_base_vault(&trigger, &symbol, 70).await;
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
         assert_eq!(take_pending_equity_redemption_jobs(&trigger).await.len(), 1);
     }
@@ -36158,12 +36679,13 @@ mod tests {
             Some(shares(20))
         );
         drop(inventory);
+        reconcile_released_base_vault(&trigger, &symbol, 70).await;
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
         assert_eq!(take_pending_equity_redemption_jobs(&trigger).await.len(), 1);
     }
 
     #[tokio::test]
-    async fn detection_failed_releases_inflight_without_a_pending_snapshot() {
+    async fn detection_failed_reconciles_before_rebalancing() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(0), shares(0))
@@ -36234,6 +36756,9 @@ mod tests {
             Some(shares(20))
         );
         drop(inventory);
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+        assert_eq!(take_pending_equity_redemption_jobs(&trigger).await.len(), 0);
+        reconcile_released_base_vault(&trigger, &symbol, 70).await;
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
         assert_eq!(take_pending_equity_redemption_jobs(&trigger).await.len(), 1);
     }
@@ -36954,6 +37479,8 @@ mod tests {
             },
         );
 
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+        reconcile_released_base_vault(&trigger, &symbol, 70).await;
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
 
         assert_eq!(
