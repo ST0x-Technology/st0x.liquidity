@@ -132,6 +132,7 @@ pub(crate) const GIT_COMMIT: &str = match option_env!("ST0X_GIT_COMMIT") {
 #[serde(rename_all = "camelCase")]
 struct HealthResponse {
     status: String,
+    stalled_queues: Vec<String>,
     timestamp: DateTime<Utc>,
     git_commit: String,
     uptime_seconds: i64,
@@ -234,6 +235,23 @@ impl Serialize for ProtocolTrades<'_> {
 
 async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthResponse>) {
     let uptime = Utc::now() - DateTime::<Utc>::from(*PROCESS_START);
+    let (status_code, status, stalled_queues) = if state.health.is_ready() {
+        match crate::conductor::queue_health::stalled_queues(
+            &state.apalis_pool,
+            state.ctx.order_polling_interval(),
+        )
+        .await
+        {
+            Ok(stalled) if stalled.is_empty() => (StatusCode::OK, "healthy", stalled),
+            Ok(stalled) => (StatusCode::SERVICE_UNAVAILABLE, "unhealthy", stalled),
+            Err(error) => {
+                error!(?error, "Failed to read essential job queue health");
+                (StatusCode::SERVICE_UNAVAILABLE, "unhealthy", Vec::new())
+            }
+        }
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "starting", Vec::new())
+    };
 
     // Gated on the startup barrier: every essential run loop has
     // acknowledged before this reports healthy, and the conductor
@@ -247,16 +265,11 @@ async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRespon
     // to the setup path later are covered automatically. A deploy probe
     // polling this endpoint therefore cannot see a 200 from a bot that
     // failed ANY startup check, not just the smoke suite.
-    let (status_code, status) = if state.health.is_ready() {
-        (StatusCode::OK, "healthy")
-    } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "starting")
-    };
-
     (
         status_code,
         Json(HealthResponse {
             status: status.to_string(),
+            stalled_queues,
             timestamp: Utc::now(),
             git_commit: GIT_COMMIT.to_string(),
             uptime_seconds: uptime.num_seconds(),
@@ -5366,6 +5379,7 @@ mod tests {
     use crate::usdc_rebalance::{ConversionAmounts, RebalanceDirection, TransferRef};
 
     async fn empty_app_state(ctx: Ctx) -> AppState {
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
         let (sender, _) = broadcast::channel(16);
         // Use the shared-cache test pool so the apalis `Jobs` table (set up by
         // `setup_test_db`) is visible to the reliability job-queue-health query.
@@ -5395,6 +5409,7 @@ mod tests {
             pnl_report_admission: crate::dashboard::pnl::pnl_report_admission(),
             metrics_handle: crate::metrics::setup().expect("metrics setup"),
             health: crate::startup::HealthGate::default(),
+            apalis_pool,
             detached_tasks: TaskTracker::new(),
         }
     }
@@ -8151,6 +8166,84 @@ mod tests {
         assert!(health_response.timestamp <= chrono::Utc::now());
         assert!(!health_response.git_commit.is_empty());
         assert!(health_response.uptime_seconds >= 0);
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn health_reports_overdue_poll_queue_and_recovers_when_work_is_delayed() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let mut queue = crate::offchain::order::PollOrderStatusJobQueue::new(&state.apalis_pool);
+        queue
+            .push(crate::offchain::order::PollOrderStatus {
+                offchain_order_id: OffchainOrderId::new(),
+                backpressure_streak: crate::conductor::job::BackpressureStreak::default(),
+            })
+            .await
+            .unwrap();
+        sqlx_apalis::query("UPDATE Jobs SET run_at = 0")
+            .execute(&state.apalis_pool)
+            .await
+            .unwrap();
+        state.health.set_ready();
+        let app = build_app(state.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value =
+            serde_json::from_str(&body_to_string(response).await).unwrap();
+        assert_eq!(body["status"], "unhealthy");
+        assert_eq!(
+            body["stalledQueues"],
+            serde_json::json!([std::any::type_name::<crate::offchain::order::PollOrderStatus>()])
+        );
+        assert!(logs_contain("ERROR"));
+        assert!(logs_contain("Essential job queue stalled"));
+
+        sqlx_apalis::query("UPDATE Jobs SET run_at = strftime('%s', 'now') + 3600")
+            .execute(&state.apalis_pool)
+            .await
+            .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn health_reports_unavailable_when_queue_health_cannot_be_read() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        state.health.set_ready();
+        state.apalis_pool.close().await;
+        let response = build_app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value =
+            serde_json::from_str(&body_to_string(response).await).unwrap();
+        assert_eq!(body["status"], "unhealthy");
+        assert_eq!(body["stalledQueues"], serde_json::json!([]));
     }
 
     #[tokio::test]

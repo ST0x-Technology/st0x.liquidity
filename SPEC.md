@@ -8307,6 +8307,21 @@ sequenceDiagram
 
 #### Orchestration Job Taxonomy
 
+Queue fetch and heartbeat failures must be logged with the worker name and
+recovered with bounded exponential backoff. Recovery preserves active job
+futures and durable queue ownership, rather than cancelling and replaying an
+in-flight financial operation. Fetch and heartbeat recovery share a budget of
+three stream restarts per worker lifetime, delayed by 1, 2, and 4 seconds.
+Exhaustion or a worker panic immediately fails the conductor; terminal failures
+of supervised jobs retain their existing fail-stop behavior.
+
+After startup, `/health` reports unavailable when an essential queue has an
+overdue runnable row or queue health cannot be read. Future `run_at` values do
+not count as stalls. Order-status polls use five polling intervals as their
+overdue bound; other essential queues use their job execution deadline to avoid
+misclassifying a legitimate long-running predecessor. Queue stalls are also
+checked periodically and logged at ERROR without changing or duplicating jobs.
+
 All work managed by the Conductor falls into one of these categories:
 
 **Finite jobs** (one-shot, durable, processed from SQLite queue):

@@ -38,6 +38,9 @@ use crate::trading::onchain::trade_accountant::{
     AccountForDexTrade, AccountantCtx, DexTradeAccountingJobQueue, TradeAccountingError,
 };
 
+pub(crate) const BACKFILL_PERFORM_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(2 * 60 * 60);
+
 pub(crate) fn get_backfill_retry_strat() -> ExponentialBuilder {
     const BACKFILL_MAX_RETRIES: usize = 15;
     const BACKFILL_INITIAL_DELAY: Duration = Duration::from_millis(100);
@@ -269,8 +272,7 @@ where
     /// attempt that still times out resumes at the first unscanned block
     /// rather than restarting the range -- which on HyperEVM's 50-block
     /// batches is what keeps a day-long backlog converging.
-    const PERFORM_TIMEOUT: Option<std::time::Duration> =
-        Some(std::time::Duration::from_secs(2 * 60 * 60));
+    const PERFORM_TIMEOUT: Option<std::time::Duration> = Some(BACKFILL_PERFORM_TIMEOUT);
 
     #[cfg(any(test, feature = "test-support"))]
     const JOB_KIND: crate::conductor::job::JobKind = crate::conductor::job::JobKind::Backfill;

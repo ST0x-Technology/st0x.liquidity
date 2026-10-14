@@ -14,7 +14,9 @@ pub(crate) mod job;
 mod manifest;
 pub(crate) mod monitor;
 pub(crate) mod projection_pause;
+pub(crate) mod queue_health;
 mod trading_queues;
+pub(crate) mod worker_recovery;
 
 use alloy::primitives::Address;
 use alloy::providers::fillers::{
@@ -1301,6 +1303,7 @@ impl Conductor {
             pool.clone(),
             apalis_pool.clone(),
             Duration::from_secs(ctx.apalis_finished_job_cleanup_interval_secs),
+            ctx.order_polling_interval(),
             startup_tokens.job_cleanup,
         );
 
@@ -1939,6 +1942,7 @@ fn spawn_finished_job_cleanup(
     pool: SqlitePool,
     apalis_pool: apalis_sqlite::SqlitePool,
     cleanup_interval: Duration,
+    poll_interval: Duration,
     startup_token: StartupToken,
 ) -> JoinHandle<()> {
     tokio::spawn(startup_token.wrap(async move {
@@ -1947,6 +1951,10 @@ fn spawn_finished_job_cleanup(
 
         loop {
             interval.tick().await;
+
+            if let Err(error) = queue_health::stalled_queues(&apalis_pool, poll_interval).await {
+                error!(?error, "Failed to read essential job queue health");
+            }
 
             // Transfer-job rows are the durable startup ownership signal.
             // USDC rows additionally preserve the redrive budget. Equity rows
@@ -13183,6 +13191,7 @@ mod tests {
             pool.clone(),
             apalis_pool.clone(),
             Duration::from_secs(60),
+            Duration::from_secs(10),
             crate::startup::StartupBarrier::new().token(),
         );
 
@@ -13274,6 +13283,7 @@ mod tests {
             pool.clone(),
             apalis_pool.clone(),
             Duration::from_secs(60),
+            Duration::from_secs(10),
             crate::startup::StartupBarrier::new().token(),
         );
 

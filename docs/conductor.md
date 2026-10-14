@@ -840,6 +840,34 @@ Monitor::new()
 `should_restart(false)` — terminal job failure is fail-stop. The worker must not
 restart and process the next job with stale state.
 
+Worker queue backends now recover failed fetch and heartbeat streams while
+retaining the worker's active handlers and middleware. Rebuilding a worker on a
+heartbeat error would cancel its in-flight operation, potentially losing a
+financial side effect before persistence. Stream recovery neither re-enqueues
+rows nor releases locks, so the active operation finishes once and concurrency
+remains unchanged. The two streams share three restarts per worker lifetime,
+with 1s/2s/4s backoff. Unknown/non-storage errors, including payload decode
+failures after reservation, fail closed immediately. Exhaustion and worker
+panics log the original worker error and signal the conductor's `UnexpectedExit`
+path without waiting for other workers or external shutdown. Terminal job errors
+still use the original `TerminalFailureSignal` path.
+
+Do not rely on `run_with_signal` plus a terminator to propagate the first worker
+error in apalis-core 1.0.0-rc.9: `run_all_workers` uses `join_all`, and the
+terminator branch discards the selected result. Immediate exit observation must
+therefore signal alongside the monitor future.
+
+The finished-job cleanup loop also checks essential queue health on its
+configured cadence; `/health` checks the same durable rows after startup. A
+`Pending` or retryable `Failed` row is overdue only relative to `run_at`, so a
+delayed successor is healthy. Poll-order status uses five configured polling
+intervals; the other supervised queues use the 30-minute perform bound, or the
+two-hour backfill bound for every namespaced chain queue. Overdue queues log at
+ERROR and appear in `/health`'s `stalledQueues` array with HTTP 503. A failed or
+five-second-timed-out queue read also returns 503. These checks report runnable
+backlogs; they do not prove an active handler is making progress or recover a
+row by creating another job.
+
 ### AccountForDexTrade
 
 Defined in `src/trading/onchain/trade_accountant.rs`. Serializable wrapper

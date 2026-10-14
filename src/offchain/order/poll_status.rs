@@ -1180,7 +1180,7 @@ where
 /// worker) rather than a poll genuinely in flight. A poll is a single broker
 /// round-trip, so a live worker clears it within a small multiple of the
 /// interval.
-const STRANDED_POLL_JOB_INTERVAL_MULTIPLIER: u32 = 5;
+pub(crate) const STRANDED_POLL_JOB_INTERVAL_MULTIPLIER: u32 = 5;
 
 /// Reconciles the live [`PollOrderStatus`] rows for `offchain_order_id`
 /// toward a single-live-row invariant and returns whether one exists

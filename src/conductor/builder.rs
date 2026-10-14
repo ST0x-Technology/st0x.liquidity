@@ -34,6 +34,7 @@ use super::monitor::gas::GasMonitor;
 use super::monitor::hedge_stall::HedgeStallMonitor;
 use super::monitor::inventory::InventoryMonitor;
 use super::monitor::order_fills::OrderFillMonitor;
+use super::worker_recovery::observe_worker_exits;
 use super::{Conductor, SupervisorStartupTokens};
 use crate::alerts::Notifier;
 #[cfg(test)]
@@ -1051,12 +1052,13 @@ where
         let best_effort_notifier_for_portfolio_snapshot = Arc::clone(&best_effort_failure_notifier);
 
         let accountant_ctx_for_backfill = accountant_ctx.clone();
+        let worker_exit = Arc::new(tokio::sync::Notify::new());
 
         tokio::spawn(startup_token.wrap(async move {
             // Supervised: an incomplete backfill can omit onchain trades. One
             // worker per hedged chain, each on its own namespaced queue, so
             // one chain's scan backlog never occupies another chain's worker.
-            let mut monitor = Monitor::new();
+            let mut monitor = observe_worker_exits(Monitor::new(), worker_exit.clone());
             for (worker_chain, chain_queue) in backfill_queues.iter() {
                 let chain_queue = chain_queue.clone();
                 let worker_chain = *worker_chain;
@@ -1078,7 +1080,6 @@ where
             }
 
             let monitor = monitor
-                .should_restart(|_ctx, _error, _attempt| false)
                 .register(move |index| {
                     // Supervised: losing trade accounting compromises hedging state.
                     build_supervised_worker!(
@@ -1339,6 +1340,7 @@ where
                         source,
                     })
                 }
+                () = worker_exit.notified() => Err(MonitorTaskError::UnexpectedExit { source: None }),
                 result = apalis_monitor.run_with_signal(shutdown_signal) => match result {
                     Ok(()) => Ok(()),
                     Err(source) => Err(MonitorTaskError::UnexpectedExit { source: Some(source) }),
