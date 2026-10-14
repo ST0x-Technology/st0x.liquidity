@@ -2712,9 +2712,18 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
             return false;
         }
 
-        match self.hop.ethereum_tx_confirmations(tx).await {
-            Ok(Some(_)) => true,
-            Ok(None) => {
+        let mined = match send {
+            RestoredSend::AlpacaDepositSend => self
+                .hop
+                .ethereum_tx_confirmations(tx)
+                .await
+                .map(|confirmations| confirmations.is_some()),
+            RestoredSend::RelayEnvelope => self.relay_envelope_confirmed(tx).await,
+        };
+
+        match mined {
+            Ok(true) => true,
+            Ok(false) => {
                 warn!(target: "rebalance", %id, %tx, nonce, "Restored {what} is not mined yet at startup");
                 false
             }
@@ -2723,6 +2732,23 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
                 false
             }
         }
+    }
+
+    /// Whether a restored Relay envelope has Ethereum's confirmations in a
+    /// canonical block, as a corridor-origin envelope must: a shallow or
+    /// stale-fork receipt counts as not mined. With no Ethereum depth
+    /// configured, nothing counts as mined.
+    async fn relay_envelope_confirmed(&self, tx: TxHash) -> Result<bool, B::HubError> {
+        let Some(required) = self.ethereum_required_confirmations else {
+            warn!(target: "rebalance", %tx, "No Ethereum confirmation depth configured; treating the restored Relay envelope as not mined");
+            return Ok(false);
+        };
+
+        Ok(self
+            .hop
+            .ethereum_mined_tx(tx)
+            .await?
+            .is_some_and(|mined| mined.confirmations >= required))
     }
 
     pub(super) fn require_base_to_alpaca(
