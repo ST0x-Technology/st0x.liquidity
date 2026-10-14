@@ -46764,6 +46764,75 @@ mod tests {
         );
     }
 
+    /// The hold page names the step that moves the transfer on from its
+    /// state: a Relay failure is settled by hand and reconciled, as a resume
+    /// refuses it, while a deposit with Relay is resumed.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn relay_hold_page_names_the_step_for_its_state() {
+        for failed in [false, true] {
+            let pool = crate::test_utils::setup_test_db().await;
+            let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+            let id = UsdcRebalanceId(Uuid::new_v4());
+            let deposit = PreparedTransaction::for_test(TxHash::repeat_byte(0xa2), 6);
+            crate::usdc_rebalance::record_swap_pair_for_test(
+                &store,
+                &id,
+                RebalanceDirection::BaseToAlpaca,
+                ROBINHOOD_RELAY,
+                None,
+                deposit.clone(),
+            )
+            .await;
+            store
+                .send(
+                    &id,
+                    UsdcRebalanceCommand::ConfirmSwapDeposit {
+                        deposit_tx: deposit.tx_hash(),
+                        deposit_block: 9,
+                    },
+                )
+                .await
+                .unwrap();
+            if failed {
+                store
+                    .send(
+                        &id,
+                        UsdcRebalanceCommand::FailSwap {
+                            reason: "Relay reported Failure".to_string(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            sweep_timed_out_relay_transfer(
+                &pool,
+                store,
+                &id,
+                usdc(100),
+                usdc::UsdcRebalanceStage::WithdrawalConfirmed,
+            )
+            .await;
+
+            let id = id.to_string();
+            logs_assert(|lines| {
+                let page = lines
+                    .iter()
+                    .find(|line| line.contains(&id) && line.contains("Guard held"))
+                    .ok_or("no hold page")?;
+                let step = if failed {
+                    "settle the stable by hand, then run `transfer reconcile --kind usdc`"
+                } else {
+                    "`transfer resume --kind usdc --direction to-alpaca`"
+                };
+                page.contains(step)
+                    .then_some(())
+                    .ok_or_else(|| format!("{page} does not name {step}"))
+            });
+        }
+    }
+
     /// Tracking that is current at `SwapDeposited` reads as past the hop, so
     /// the sweep takes its post-burn branch: it must still send the Relay
     /// hold page, not the CCTP-burn page, since no CCTP burn exists.
