@@ -6387,7 +6387,7 @@ aggregate, because the shortfall check is off until it is fixed. Two open
 AlpacaToBase transfers that recorded the same withdrawal tx page too ("Open USDC
 transfers share one Alpaca withdrawal tx"), naming them: the tx paid only one of
 them. A failed wallet balance read only warns. The check never blocks or fails a
-transfer.
+transfer. The Relay swap states the ledger counts are listed under "Relay hop".
 
 ###### Fast Transfer Benefits
 
@@ -7290,6 +7290,10 @@ transfer dispatch. It does not calculate cross-venue inventory imbalances.
   write lock, so a read pinned below the fill cannot replace the balance it
   changed. An event without the block (a BaseToAlpaca deposit at Alpaca, or one
   recorded before the block was captured) requests no read
+- `UsdcRebalanceEvent::ReturnedToSource` - Relay: returns what the redeposit put
+  back from source inflight to available and releases the rest (what a refund
+  kept) without a credit, requests the same pinned read at or past the
+  redeposit's block, and starts the chain's withdraw cooldown
 - `UsdcRebalanceEvent::ConversionConfirmed` - Terminal success for BaseToAlpaca;
   moves from inflight to destination available
 - `UsdcRebalanceEvent::WithdrawalFailed`, BaseToAlpaca pre-burn
@@ -7301,9 +7305,10 @@ transfer dispatch. It does not calculate cross-venue inventory imbalances.
 - Post-burn `UsdcRebalanceEvent::BridgingFailed`, any AlpacaToBase
   `BridgingFailed` (post-withdrawal, so the funds are off Alpaca even without
   burn evidence), `DepositFailed`, and BaseToAlpaca `ConversionFailed` (the
-  post-deposit USDC->USD leg) - Keeps source inflight and the USDC rebalancing
-  guard active because the funds left the source venue and are not available
-  there. The same applies to any transfer that times out at or after the burn
+  post-deposit USDC->USD leg), and the Relay `SwapFailed` - Keeps source
+  inflight and the USDC rebalancing guard active because the funds left the
+  source venue and are not available there. The same applies to any transfer
+  that times out at or after the burn
 - `InventorySnapshotEvent::OnchainEquity` - Onchain equity balances fetched from
   vaults
 - `InventorySnapshotEvent::OnchainCash` - Onchain USDC balance fetched from
@@ -7602,12 +7607,13 @@ states with a recorded burn: `Bridging`, `AwaitingAttestation`, `Attested`, and
 a post-burn BaseToAlpaca `BridgingFailed`. Startup never re-arms
 `WithdrawalComplete` or `BridgingSubmitting`: a re-drive there can submit a
 second burn. Reconcilable failures (`DepositFailed`, a `BridgingFailed` with
-burn evidence or in the AlpacaToBase direction, and a BaseToAlpaca
-`ConversionFailed`) keep the guard held until the operator settles them with
-`transfer reconcile --kind usdc`. All other guarded states keep the guard held
-and page the operator for manual recovery. A candidate that cannot be loaded or
-parsed at boot, or a post-burn failure whose corridor the running bot cannot
-read, latches every corridor until a restart.
+burn evidence or in the AlpacaToBase direction, a BaseToAlpaca
+`ConversionFailed`, and the Relay holds `SwapFailed`, `Redepositing`, and a
+`SwapRefunded` below its refund floor or paid on Ethereum) keep the guard held
+until the operator settles them with `transfer reconcile --kind usdc`. All other
+guarded states keep the guard held and page the operator for manual recovery. A
+candidate that cannot be loaded or parsed at boot, or a post-burn failure whose
+corridor the running bot cannot read, latches every corridor until a restart.
 
 **Operator recovery of a pre-burn stranded guard latch**: A USDC rebalance can
 become stranded in `WithdrawalComplete` (pre-bridging, no burn intent recorded)
@@ -7717,11 +7723,13 @@ guard: `DepositFailed` (the CCTP mint landed but the destination deposit
 failed), a `BridgingFailed` with burn evidence (a `burn_tx_hash` is recorded),
 any `AlpacaToBase` `BridgingFailed` (post-withdrawal, so the funds are off
 Alpaca even without burn evidence -- the settlement-retry-deadline terminal), or
-a `BaseToAlpaca` `ConversionFailed` (the post-deposit USDC->USD leg). Every
-other state is rejected -- an in-progress transfer must be resumed, and a
-failure whose funds never left the source venue reconciles to source on its own.
-Because `Reconciled` is a clearable terminal, a restart does not re-latch the
-guard, and automatic USDC rebalancing resumes.
+a `BaseToAlpaca` `ConversionFailed` (the post-deposit USDC->USD leg), or one of
+the Relay holds `SwapFailed`, `Redepositing`, and a `SwapRefunded` below its
+refund floor or paid on Ethereum (see "Relay hop"). Every other state is
+rejected -- an in-progress transfer must be resumed, and a failure whose funds
+never left the source venue reconciles to source on its own. Because
+`Reconciled` is a clearable terminal, a restart does not re-latch the guard, and
+automatic USDC rebalancing resumes.
 
 Reconcile also applies to the equity transfer aggregates (`TokenizedEquityMint`,
 `EquityRedemption`): a mint or redemption stuck in its `Failed` terminal whose

@@ -872,8 +872,9 @@ guard records the transfers that hold it. Who touches it, and when:
 - **Release (event-driven)**: the trigger reactor releases the transfer's own
   hold when it reaches a clearable terminal; other holders keep their guards.
   Guard-holding terminals (post-burn failures, any AlpacaToBase
-  `BridgingFailed`, `DepositFailed`) keep it held until `transfer reconcile`
-  settles them.
+  `BridgingFailed`, `DepositFailed`, and the Relay holds under "Robinhood Relay
+  transfer held after its vault withdrawal") keep it held until
+  `transfer reconcile` settles them.
 - **Restart**: the guards reset; `recover_usdc_guard` re-derives each corridor's
   holders from durable state (`holds_rebalance_guard`) and re-arms resumable
   jobs. A candidate that cannot be loaded or parsed latches every corridor until
@@ -918,8 +919,21 @@ next resume. The other Relay holds:
   later; the solver may fill until the order's deadline, about a week.
 - `SwapDeposited` with a fill or refund that does not prove on chain keeps the
   guard and pages every 30 minutes; check the order with Relay's status API.
-- `SwapFailed` (Relay failed the order with nothing paid back): settle the funds
-  with Relay, then `transfer reconcile --kind usdc`.
+- `SwapFailed` (Relay failed the order with nothing paid back): recover the
+  deposit with Relay. USDG it returns to the Robinhood wallet goes into the
+  Robinhood cash vault, and USDC it pays on Ethereum goes to Alpaca and is
+  converted, as for the refunds below. Only then run
+  `transfer reconcile --kind usdc`.
+- `SwapRefunded` on the origin side, at or above its refund floor, that no job
+  drives any more (a restart before the redeposit started): the bot does not
+  re-arm Relay states at startup, and `transfer reconcile` refuses it. Run
+  `transfer resume --kind usdc --id <uuid> --direction to-alpaca`: the job puts
+  the USDG back into the vault.
+- `DepositFailed` after a Relay fill: `transfer recheck --kind usdc` refuses
+  Relay transfers in this build. Where "Base->Alpaca deposit send pages" says to
+  recheck a deposit Alpaca credited, convert the credited USDC by hand with
+  `stox alpaca-convert -d to-usd -a <amount>` and check the Alpaca cash balance
+  instead, then run `transfer reconcile --kind usdc`, which does not convert.
 - `SwapRefunded` paid in USDC on Ethereum: the USDC is in the bot's Ethereum
   wallet. `transfer reconcile` only releases the guard and the Robinhood
   inflight; it credits neither Alpaca nor the vault, and it ends the transfer's
