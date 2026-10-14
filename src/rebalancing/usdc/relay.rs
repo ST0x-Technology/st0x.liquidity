@@ -8866,8 +8866,10 @@ mod tests {
 
     /// Two reverted orders landed a deposit each, so Relay holds the
     /// transfer's amount twice: the scan adopts neither, even the one Relay
-    /// paid, and holds the transfer at `SwapQuoted` for the operator.
+    /// paid, and holds the transfer at `SwapQuoted` for the operator. The page
+    /// names each order's request, the key `stox relay status` takes.
     #[tokio::test]
+    #[tracing_test::traced_test]
     async fn escrow_scan_holds_when_two_reverted_orders_landed_deposits() {
         let rig = RelayRig::deploy().await;
         rig.withdraw_to_hub(U256::from(2 * AMOUNT_IN)).await;
@@ -8929,6 +8931,21 @@ mod tests {
         );
         assert!(state.holds_rebalance_guard());
         quotes.assert_calls(0);
+        let requests = [B256::repeat_byte(0x5e), B256::repeat_byte(0x5f)];
+        logs_assert(|lines: &[&str]| {
+            lines
+                .iter()
+                .any(|line| {
+                    line.contains("operational_alert")
+                        && line.contains("Deposits of several reverted Relay orders are on chain")
+                        && line.contains("stox relay status")
+                        && requests
+                            .iter()
+                            .all(|request| line.contains(&request.to_string()))
+                })
+                .then_some(())
+                .ok_or_else(|| "no page names both requests for `stox relay status`".to_string())
+        });
     }
 
     /// Records [`record_reverted_and_requoted_toward_chain`], then a deposit
