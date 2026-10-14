@@ -431,21 +431,23 @@ mod tests {
         let hyperevm = new_id();
         guards.hold(Chain::HyperEvm, &hyperevm, RebalanceDirection::AlpacaToBase);
         guards.record_amount(&hyperevm, Usdc::new(float!(30)));
+        guards.hold(Chain::Ethereum, &new_id(), RebalanceDirection::BaseToAlpaca);
+        let robinhood = new_id();
         guards.hold(
             Chain::Robinhood,
-            &new_id(),
+            &robinhood,
             RebalanceDirection::BaseToAlpaca,
         );
+        guards.record_amount(&robinhood, Usdc::new(float!(20)));
 
         assert_eq!(
             guards.inbound_elsewhere(Chain::Robinhood).unwrap(),
             Usdc::new(float!(50)),
-            "an outbound hold and a hold with no recorded amount add nothing"
+            "outbound, unrecorded and own holds add nothing"
         );
         assert_eq!(
-            guards.inbound_elsewhere(Chain::Base).unwrap(),
-            Usdc::ZERO,
-            "a corridor's own hold is not cash on its way from elsewhere"
+            guards.inbound_elsewhere(Chain::HyperEvm).unwrap(),
+            Usdc::new(float!(70))
         );
     }
 

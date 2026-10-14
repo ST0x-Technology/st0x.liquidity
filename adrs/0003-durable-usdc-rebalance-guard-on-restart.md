@@ -177,16 +177,17 @@ time, do not roll back below the first per-corridor release.
 ## Amendment: holds carry the transfer amount (RAI-3380)
 
 Each corridor's band is measured against the whole Alpaca balance, and nothing
-on the Alpaca side marks an incoming transfer until its job writes its first
-event, so two corridors over their band in one check both sized a transfer to
-Alpaca against the same balance and overshot.
+on the Alpaca side marks an incoming transfer until it lands (its first event
+marks only the source chain), so two corridors over their band in one check both
+sized a transfer to Alpaca against the same balance and overshot.
 
 Decision: each hold records its transfer's amount, and a chain-to-Alpaca
 decision on one corridor adds the amounts of the other corridors'
 chain-to-Alpaca holds to the Alpaca balance. We project rather than serialize: a
 stuck hold or the fixed chain order would otherwise block every other corridor's
 transfers to Alpaca. Only the chain-to-Alpaca side projects, because the
-projection can only be too high and must only shrink a transfer, never grow a
-withdrawal. The amounts stay in memory: startup records them from the persisted
-transfers it holds, and a job queued before a restart that has not written its
-first event is not counted until RAI-3397.
+projection errs high (a landed transfer counted for a moment, a stuck one until
+resolved) and must only shrink a transfer, never grow a withdrawal. The amounts
+stay in memory: startup records them from the persisted transfers it holds, and
+a job queued before a restart that has not written its first event is not
+counted until RAI-3397.

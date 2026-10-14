@@ -44707,28 +44707,6 @@ mod tests {
         }
     }
 
-    async fn attach_usdc_store(
-        trigger: &RebalancingService,
-    ) -> (sqlx::SqlitePool, Arc<Store<UsdcRebalance>>) {
-        let pool = crate::test_utils::setup_test_db().await;
-        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
-        trigger
-            .set_stores(
-                Arc::new(test_store::<TokenizedEquityMint>(
-                    pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
-                )),
-                Arc::new(test_store::<EquityRedemption>(
-                    pool.clone(),
-                    crate::rebalancing::equity::EquityTransferServices::panicking(),
-                )),
-                store.clone(),
-            )
-            .await;
-
-        (pool, store)
-    }
-
     /// Robinhood at 200 and Alpaca at 50, with Base already holding its
     /// guard for a 50 transfer to Alpaca.
     async fn robinhood_trigger_beside_a_base_transfer() -> Arc<RebalancingService> {
@@ -44900,7 +44878,8 @@ mod tests {
     #[tokio::test]
     async fn manual_transfer_hold_projects_into_the_trigger() {
         let trigger = robinhood_trigger_beside_a_base_transfer().await;
-        let (pool, _store) = attach_usdc_store(&trigger).await;
+        let pool = crate::test_utils::setup_test_db().await;
+        attach_stores(&trigger, pool.clone(), test_store(pool.clone(), ())).await;
 
         trigger
             .start_manual_usdc_transfer(
@@ -44922,7 +44901,8 @@ mod tests {
     #[tokio::test]
     async fn manual_resume_hold_projects_into_the_trigger() {
         let trigger = robinhood_trigger_beside_a_base_transfer().await;
-        let (pool, store) = attach_usdc_store(&trigger).await;
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
         let base = UsdcRebalanceId(Uuid::new_v4());
         store
             .send(
@@ -44936,6 +44916,7 @@ mod tests {
             )
             .await
             .unwrap();
+        attach_stores(&trigger, pool.clone(), store).await;
 
         trigger
             .resume_usdc_transfer(&pool, &base, RebalanceDirection::BaseToAlpaca)
@@ -45067,9 +45048,11 @@ mod tests {
     #[tokio::test]
     async fn unread_transfer_records_its_amount_once_read() {
         let trigger = make_trigger_with_inventory(InventoryView::default()).await;
-        let (_pool, store) = attach_usdc_store(&trigger).await;
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
         let id = UsdcRebalanceId(Uuid::new_v4());
         seed_bridging_submitting_base_to_alpaca(&store, &id, usdc(50), TxHash::random()).await;
+        attach_stores(&trigger, pool, store).await;
         trigger.usdc_guards.block_unread(&id);
 
         trigger.read_unread_corridors().await;

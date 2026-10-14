@@ -1101,9 +1101,9 @@ impl InventoryView {
     ///
     /// `inbound_elsewhere` is cash other corridors are already sending to
     /// Alpaca. Only the chain-to-Alpaca decision adds it to the Alpaca
-    /// balance: the projection can only be too high (a landed transfer
-    /// counted twice for a moment, a stuck one for as long as it is stuck),
-    /// so it may shrink a transfer to Alpaca but never grow one out of it.
+    /// balance: the projection errs high (a landed transfer counted twice for
+    /// a moment, a stuck one for as long as it is stuck), so it may shrink a
+    /// transfer to Alpaca but never grow one out of it.
     pub(crate) fn check_usdc_imbalance_with_gross_offchain(
         &self,
         chain: Chain,
