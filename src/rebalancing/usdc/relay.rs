@@ -236,7 +236,7 @@ impl<Signer: Wallet> RelayHop<Signer> {
         id: &UsdcRebalanceId,
         direction: HopDirection,
         lock: Arc<Mutex<()>>,
-    ) -> Result<Option<(PreparedSwapDeposit, B256)>, UsdcTransferError> {
+    ) -> Result<Option<PersistedPair>, UsdcTransferError> {
         let mut prepare = Some(self.lock_prepare(id, lock).await?);
         let deadline = Instant::now() + self.bounds.quote_max_age;
 
@@ -262,7 +262,11 @@ impl<Signer: Wallet> RelayHop<Signer> {
                         &mut prepare,
                     )
                     .await?;
-                Ok(Some((pair, quote.order_id)))
+                Ok(Some(PersistedPair {
+                    pair,
+                    order_id: quote.order_id,
+                    split_approves,
+                }))
             }
             Some(UsdcRebalance::SwapDepositPrepared {
                 quote,
@@ -273,10 +277,11 @@ impl<Signer: Wallet> RelayHop<Signer> {
             }) => {
                 self.broadcast_split_approves(id, &split_approves, direction, deadline)
                     .await?;
-                Ok(Some((
-                    PreparedSwapDeposit { approve, deposit },
-                    quote.order_id,
-                )))
+                Ok(Some(PersistedPair {
+                    pair: PreparedSwapDeposit { approve, deposit },
+                    order_id: quote.order_id,
+                    split_approves,
+                }))
             }
             Some(UsdcRebalance::SwapDeposited { .. }) => Ok(None),
             None => Err(UsdcTransferError::StateOffHop {
@@ -1233,7 +1238,11 @@ where
             self.check_ethereum_credit_ledger(id, amount).await;
         }
 
-        let Some((pair, order_id)) = self.prepare_and_persist_swap_pair(id, direction).await?
+        let Some(PersistedPair {
+            pair,
+            order_id,
+            split_approves,
+        }) = self.prepare_and_persist_swap_pair(id, direction).await?
         else {
             return self.read_relay_payment(id).await;
         };
@@ -1244,7 +1253,6 @@ where
             .broadcast_deposit(direction, &pair)
             .await
             .map_err(Box::new)?;
-        let split_approves = self.split_approves(id).await?;
         let confirmed = self
             .hop
             .bridge
@@ -1781,21 +1789,6 @@ where
         Ok(())
     }
 
-    /// The approves that went out alone before the persisted pair: below
-    /// its deposit, their nonces are released when it confirms.
-    async fn split_approves(
-        &self,
-        id: &UsdcRebalanceId,
-    ) -> Result<Vec<PreparedTransaction>, UsdcTransferError> {
-        match self.cqrs.load(id).await? {
-            Some(UsdcRebalance::SwapDepositPrepared { split_approves, .. }) => Ok(split_approves),
-            state => {
-                warn!(target: "rebalance", %id, state = ?state.as_ref().map(UsdcRebalance::state_name), "Relay pair sent off SwapDepositPrepared; its split approves, if any, stay reserved until restart");
-                Ok(Vec::new())
-            }
-        }
-    }
-
     /// The prepare lock of the wallet that signs on the `direction` side:
     /// toward the hub the corridor chain's wallet; from it the Ethereum
     /// wallet, under the lock its deposit sends hold.
@@ -1806,16 +1799,17 @@ where
         }
     }
 
-    /// The pair to broadcast and its order id, `None` once the deposit is
-    /// confirmed. Runs on a detached task, as the Alpaca deposit send's
-    /// prepare does, so a job timeout cannot drop the future between the
+    /// The pair to broadcast, with its order id and the approves that went
+    /// out alone before it, `None` once the deposit is confirmed. Runs on a
+    /// detached task, as the Alpaca deposit send's prepare does, so a job
+    /// timeout cannot drop the future between the
     /// signing and the persist: a pair signed and never persisted keeps its
     /// nonces reserved and stalls every later send from the origin wallet.
     async fn prepare_and_persist_swap_pair(
         &self,
         id: &UsdcRebalanceId,
         direction: HopDirection,
-    ) -> Result<Option<(PreparedSwapDeposit, B256)>, UsdcTransferError> {
+    ) -> Result<Option<PersistedPair>, UsdcTransferError> {
         let hop = Arc::clone(&self.hop);
         let cqrs = Arc::clone(&self.cqrs);
         let task_id = id.clone();
@@ -2002,6 +1996,14 @@ where
             }
         }
     }
+}
+
+/// A persisted pair to broadcast: its order id, and the approves that went
+/// out alone before it, read with it under the prepare lock.
+struct PersistedPair {
+    pair: PreparedSwapDeposit,
+    order_id: B256,
+    split_approves: Vec<PreparedTransaction>,
 }
 
 /// Where and by when a pair is signed: the hop side whose origin wallet
@@ -4606,7 +4608,7 @@ mod tests {
             exact_quote(&wallet, contracts, B256::repeat_byte(0x0d)).await,
         )
         .await;
-        let (pair, _order_id) = transfer
+        let PersistedPair { pair, .. } = transfer
             .prepare_and_persist_swap_pair(&id, TO_HUB)
             .await
             .unwrap()
@@ -4815,7 +4817,7 @@ mod tests {
             exact_quote(&wallet, contracts, B256::repeat_byte(0x0d)).await,
         )
         .await;
-        let (pair, _order_id) = transfer
+        let PersistedPair { pair, .. } = transfer
             .prepare_and_persist_swap_pair(&id, TO_HUB)
             .await
             .unwrap()
