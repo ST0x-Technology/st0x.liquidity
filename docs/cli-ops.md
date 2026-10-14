@@ -296,8 +296,9 @@ automated path for this, the operator deposits it. Prerequisites, all per chain:
   `approve`, Raindex `deposit4`/`withdraw4` against the chain's orderbook or
   inventory, ERC-4626 `deposit`/`redeem` on the wrapper vaults, and the plain
   ERC-20 `transfer` to the issuer redemption wallet. The deploy gate
-  (`verify-approvals`) proves the approval policies; the rest are exercised by
-  the commands below.
+  (`verify-approvals`) proves the approval policies and, on a chain with a
+  served cash corridor, the corridor's vault `deposit4`/`withdraw4` and hop
+  calls; the rest are exercised by the commands below.
 
 Then, per asset:
 

@@ -24,7 +24,7 @@ pub enum ApprovalPolicyVerification {
     /// The validated wallet backend is not Turnkey, so no Turnkey query is
     /// applicable.
     SkippedNonTurnkey,
-    /// Every startup approval target and every served corridor's hop call is
+    /// Every startup approval target and every call a served corridor signs is
     /// covered by at least one allow policy.
     Verified {
         target_count: usize,
@@ -100,8 +100,12 @@ impl Display for MissingCorridorCoverage {
                 call.chain, call.function, call.selector, call.to
             )?;
 
-            if let FirstArgument::Address(spender) = call.first_argument {
-                write!(formatter, ", spender {spender}")?;
+            match call.first_argument {
+                FirstArgument::Address(address) => {
+                    write!(formatter, ", first argument {address}")?;
+                }
+                FirstArgument::Signer => write!(formatter, ", first argument our wallet")?,
+                FirstArgument::ChosenAtRunTime | FirstArgument::NotAnAddress => {}
             }
 
             writeln!(formatter)?;
@@ -124,8 +128,8 @@ pub enum ApprovalPolicyVerificationError {
     Coverage(#[from] ChainCoverageError),
 }
 
-/// Why one hedged chain's startup approvals, or one served corridor's hop
-/// calls, are not provably covered.
+/// Why one hedged chain's startup approvals, or one served corridor's calls,
+/// are not provably covered.
 #[derive(Debug, thiserror::Error)]
 pub enum ChainCoverageError {
     #[error(transparent)]
@@ -139,7 +143,7 @@ pub enum ChainCoverageError {
 }
 
 /// Validates deploy inputs, lists Turnkey policies, and fails unless every
-/// startup MAX approval and every served corridor's hop call has a provably
+/// startup MAX approval and every call a served corridor signs has a provably
 /// matching allow policy.
 pub async fn verify_turnkey_approval_policies(
     config_path: &Path,
@@ -1493,8 +1497,10 @@ mod tests {
             format!(
                 "Turnkey policies do not cover 2 call(s) the robinhood via relay corridor \
                  signs:\n\
-                 - robinhood: depositErc20 (0xe8017952) on {depository}\n\
-                 - ethereum: depositErc20 (0xe8017952) on {depository}\n"
+                 - robinhood: depositErc20 (0xe8017952) on {depository}, first argument our \
+                 wallet\n\
+                 - ethereum: depositErc20 (0xe8017952) on {depository}, first argument our \
+                 wallet\n"
             )
         );
     }
@@ -1712,13 +1718,21 @@ mod tests {
 
     /// `depositForBurn`'s first word is the amount, `receiveMessage`'s an
     /// offset and the Alpaca `transfer`'s a recipient only a run knows, so a
-    /// policy constraining that word proves nothing about those calls.
+    /// deny on that word may apply to them and refuses them. The approves and
+    /// vault calls name a known address there, so the deny provably misses.
     #[test]
-    fn first_word_constraint_on_an_unknown_argument_fails_closed() {
-        let messenger = UsdcCorridor::BASE_CCTP.hop_calls().unwrap()[1].to;
-        let policies = snapshot(vec![tag_allow(&format!(
-            "eth.tx.data[34..74] == '{messenger:x}'"
-        ))]);
+    fn deny_on_an_unknown_first_word_fails_closed() {
+        let policies = snapshot(vec![
+            tag_allow("eth.tx.chain_id == 8453"),
+            tag_allow("eth.tx.chain_id == 1"),
+            TurnkeyPolicy {
+                effect: TurnkeyPolicyEffect::Deny,
+                consensus: None,
+                condition: Some(
+                    "eth.tx.data[34..74] == '9999999999999999999999999999999999999999'".to_string(),
+                ),
+            },
+        ]);
 
         let error = verify_corridor_ends(
             &BTreeSet::from([UsdcCorridor::BASE_CCTP]),
@@ -1731,28 +1745,20 @@ mod tests {
             panic!("expected missing corridor coverage, got {error:?}");
         };
 
-        assert!(
+        assert_eq!(
             missing
                 .missing
                 .iter()
-                .all(|call| call.function != "approve"),
-            "the approves name the messenger as their first word"
+                .map(|call| (call.chain, call.function))
+                .collect::<Vec<_>>(),
+            vec![
+                (Chain::Base, "depositForBurn"),
+                (Chain::Base, "receiveMessage"),
+                (Chain::Ethereum, "depositForBurn"),
+                (Chain::Ethereum, "receiveMessage"),
+                (Chain::Ethereum, "transfer"),
+            ]
         );
-        for (chain, function) in [
-            (Chain::Base, "depositForBurn"),
-            (Chain::Base, "receiveMessage"),
-            (Chain::Ethereum, "depositForBurn"),
-            (Chain::Ethereum, "receiveMessage"),
-            (Chain::Ethereum, "transfer"),
-        ] {
-            assert!(
-                missing
-                    .missing
-                    .iter()
-                    .any(|call| call.chain == chain && call.function == function),
-                "{function} on {chain} must stay uncovered"
-            );
-        }
     }
 
     #[tokio::test]
