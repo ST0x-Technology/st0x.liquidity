@@ -8920,7 +8920,7 @@ impl RebalancingService {
             self.usdc_guards
                 .hold(corridor.chain(), id, *direction, *amount);
         }
-        self.hold_queued_usdc_jobs(usdc_store).await?;
+        self.hold_live_usdc_job_rows(usdc_store).await?;
 
         if held.is_empty() && unresolved_ids.is_empty() && unparseable.is_empty() {
             return Ok(());
@@ -8972,11 +8972,13 @@ impl RebalancingService {
     /// Holds the corridor of each live job row whose transfer has recorded
     /// nothing yet, with its amount: startup rebuilds every other hold from
     /// the persisted transfer, and a job queued just before the restart has
-    /// none until its first event. A recorded transfer, a zombie row's
-    /// included, is left to its state. The hold is released like any other:
-    /// by the transfer's terminal event, or by the job's last attempt when
-    /// it records nothing.
-    async fn hold_queued_usdc_jobs(
+    /// none until its first event. A row whose transfer has recorded events,
+    /// a zombie included, is left to that transfer's state, and so is one
+    /// whose transfer cannot be read: a hold nothing would release is worse
+    /// than the queue check alone. The hold is released like any other: by
+    /// the transfer's terminal event, or by the job's last attempt when it
+    /// records nothing.
+    async fn hold_live_usdc_job_rows(
         &self,
         usdc_store: &Store<UsdcRebalance>,
     ) -> Result<(), sqlx_apalis::Error> {
@@ -9012,14 +9014,17 @@ impl RebalancingService {
             match usdc_store.load(&id).await {
                 Ok(Some(_)) => continue,
                 Ok(None) => {}
-                Err(error) => warn!(
-                    target: "rebalance",
-                    %row_id,
-                    %id,
-                    ?error,
-                    "Failed to load the transfer of a live USDC job row on startup; holding its \
-                     corridor"
-                ),
+                Err(error) => {
+                    warn!(
+                        target: "rebalance",
+                        %row_id,
+                        %id,
+                        ?error,
+                        "Failed to load the transfer of a live USDC job row on startup; holding \
+                         no corridor for it, the queue check still counts it on its corridor"
+                    );
+                    continue;
+                }
             }
 
             let direction = if job_type == hedging_job_type {
@@ -45379,7 +45384,8 @@ mod tests {
     }
 
     /// Startup holds a live job row's corridor with its amount, though the
-    /// transfer has recorded nothing yet. A zombie row (its transfer already
+    /// transfer has recorded nothing yet; an Alpaca to chain row holds its
+    /// corridor but adds nothing inbound. A zombie row (its transfer already
     /// ended) and a done row hold nothing.
     #[tokio::test]
     async fn recover_usdc_guard_holds_live_job_rows_with_their_amount() {
@@ -45424,6 +45430,22 @@ mod tests {
             "status = 'Done', done_at = strftime('%s','now')",
         )
         .await;
+        let outbound = UsdcRebalanceId(Uuid::new_v4());
+        service
+            .transfer_usdc_to_market_making_queue
+            .clone()
+            .push(TransferUsdcToMarketMaking {
+                id: outbound.clone(),
+                amount: usdc(400),
+                corridor: UsdcCorridor::HubRouted {
+                    chain: Chain::HyperEvm,
+                    hop: HopKind::Cctp,
+                },
+                revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
+            })
+            .await
+            .unwrap();
 
         service.recover_usdc_guard(&pool, &store).await.unwrap();
 
@@ -45434,6 +45456,10 @@ mod tests {
         );
         assert_eq!(service.usdc_guards.held_chain(&zombie), None);
         assert_eq!(service.usdc_guards.held_chain(&done), None);
+        assert_eq!(
+            service.usdc_guards.held_chain(&outbound),
+            Some(Chain::HyperEvm)
+        );
         assert_eq!(
             service
                 .usdc_guards
