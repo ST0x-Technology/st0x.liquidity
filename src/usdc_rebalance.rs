@@ -2711,7 +2711,7 @@ impl UsdcRebalance {
                 ..
             }
             | Self::SwapRefunded {
-                direction: direction @ RebalanceDirection::BaseToAlpaca,
+                direction,
                 side: RefundSide::Destination,
                 amount,
                 refunded_at: failed_at,
@@ -9433,7 +9433,8 @@ mod tests {
     /// clear their guard after a reconcile from the CLI; the others do not.
     #[test]
     fn reconcilable_relay_holds_seed_guard_recovery_tracking() {
-        let after = |event| [deposited(RebalanceDirection::BaseToAlpaca), vec![event]].concat();
+        let toward = |direction, event| [deposited(direction), vec![event]].concat();
+        let after = |event| toward(RebalanceDirection::BaseToAlpaca, event);
         let refunded = |side| UsdcRebalanceEvent::SwapRefunded {
             refund_tx: TxHash::repeat_byte(0xe1),
             side,
@@ -9461,8 +9462,22 @@ mod tests {
                 true,
             ),
             (after(refunded(RefundSide::Destination)), true),
+            (
+                toward(
+                    RebalanceDirection::AlpacaToBase,
+                    refunded(RefundSide::Destination),
+                ),
+                true,
+            ),
             (redepositing, true),
             (after(refunded(RefundSide::Origin)), false),
+            (
+                toward(
+                    RebalanceDirection::AlpacaToBase,
+                    refunded(RefundSide::Origin),
+                ),
+                false,
+            ),
             (
                 after(UsdcRebalanceEvent::SwapEscrowUnresolved {
                     unresolved_at: Utc::now(),
@@ -9474,7 +9489,7 @@ mod tests {
             let seed = state.guard_recovery_tracking_data();
             assert_eq!(seed.is_some(), seeded, "{state:?}");
             if let Some((direction, amount, _)) = seed {
-                assert_eq!(direction, RebalanceDirection::BaseToAlpaca);
+                assert_eq!(direction, state.direction());
                 assert_eq!(amount, Usdc::new(float!(100)));
             }
         }
