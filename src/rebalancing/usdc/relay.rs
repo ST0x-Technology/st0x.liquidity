@@ -25,8 +25,8 @@ use alloy::primitives::{Address, B256, TxHash, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::{Arc, PoisonError};
 use std::time::{Duration, SystemTime};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::task::{JoinError, JoinHandle};
@@ -80,6 +80,9 @@ pub(crate) struct RelayHop<Signer> {
     /// Held by a signing, and by a re-quote or redeposit, so none of them
     /// sends from the chain wallet above nonces a late signing still holds.
     chain_send_prepare: Arc<Mutex<()>>,
+    /// Transfers whose refused binding quote from the hub this process has
+    /// paged: the sweep re-arms them, and each run quotes again.
+    paged_hub_quote_refusals: std::sync::Mutex<HashSet<UsdcRebalanceId>>,
 }
 
 impl<Signer> RelayHop<Signer> {
@@ -95,7 +98,17 @@ impl<Signer> RelayHop<Signer> {
             bounds,
             hub_wallet,
             chain_send_prepare: Arc::new(Mutex::new(())),
+            paged_hub_quote_refusals: std::sync::Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Whether this is the first refusal of `id`'s binding quote from the
+    /// hub in this process.
+    fn first_hub_quote_refusal(&self, id: &UsdcRebalanceId) -> bool {
+        self.paged_hub_quote_refusals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id.clone())
     }
 }
 
@@ -838,7 +851,11 @@ where
         {
             Ok(quote) => quote,
             Err(error) if quote_refused(&error) => {
-                error!(target: "operational_alert", alert = true, kind = AlertKind::RelayHubQuoteRefused.as_str(), %id, %withdrawal_tx, %error, "Relay refused the binding quote from the hub after the Alpaca withdrawal; the transfer holds its guard at WithdrawalComplete with the USDC at the hub until it is resumed, or failed and reconciled");
+                if self.hop.first_hub_quote_refusal(id) {
+                    error!(target: "operational_alert", alert = true, kind = AlertKind::RelayHubQuoteRefused.as_str(), %id, %withdrawal_tx, %error, "Relay refused the binding quote from the hub after the Alpaca withdrawal; the transfer holds its guard at WithdrawalComplete with the USDC at the hub until it is resumed, or failed and reconciled");
+                } else {
+                    warn!(target: "rebalance", %id, %withdrawal_tx, %error, "The binding Relay quote from the hub was refused again; the transfer still holds at WithdrawalComplete");
+                }
                 return Ok(());
             }
             Err(error) => {
