@@ -4979,6 +4979,78 @@ mod tests {
         assert_eq!(rig.vault_usdg().await, U256::from(AMOUNT_IN));
     }
 
+    /// A redeposit whose vault deposit is recorded is resumed by confirming
+    /// that deposit: the resume sends nothing.
+    #[tokio::test]
+    async fn resumed_redeposit_with_a_recorded_deposit_confirms_without_a_second_send() {
+        let rig = RelayRig::deploy().await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        for command in [
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor: ROBINHOOD_RELAY,
+                amount: Usdc::new(float!(100)),
+                withdrawal: TransferRef::OnchainTx(TxHash::repeat_byte(0x77)),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceCommand::BeginRedeposit {
+                reason: RedepositReason::QuoteRefused,
+            },
+        ] {
+            store.send(&id, command).await.unwrap();
+        }
+        let deposit_tx = transfer
+            .submit_vault_deposit(U256::from(AMOUNT_IN))
+            .await
+            .unwrap();
+        store
+            .send(&id, UsdcRebalanceCommand::RecordRedeposit { deposit_tx })
+            .await
+            .unwrap();
+        let wallet = &rig.chain.bot_wallet;
+        let nonce = wallet
+            .provider()
+            .get_transaction_count(wallet.address())
+            .await
+            .unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends")
+        .unwrap();
+
+        let state = store.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::ReturnedToSource {
+            deposit_tx: confirmed,
+            ..
+        } = state
+        else {
+            panic!("expected ReturnedToSource, got {state:?}");
+        };
+        assert_eq!(confirmed, deposit_tx);
+        assert_eq!(
+            wallet
+                .provider()
+                .get_transaction_count(wallet.address())
+                .await
+                .unwrap(),
+            nonce,
+            "the resume must not send a second vault deposit"
+        );
+        assert_eq!(rig.vault_usdg().await, U256::from(AMOUNT_IN));
+    }
+
     /// Deposits that keep reverting moved nothing: once
     /// `max_deposit_revert_redrives` of them reverted, the USDG goes back to
     /// the vault instead of a guard-freeing failure.
