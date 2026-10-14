@@ -38,7 +38,7 @@ use std::time::Duration;
 #[cfg(feature = "test-support")]
 use st0x_bridge::cctp::{deploy_cctp_on_chain, link_chains, mint_usdc};
 #[cfg(test)]
-use st0x_bridge::relay::{RelayApiKey, RelayClient};
+use st0x_bridge::relay::{RelayApiKey, RelayClient, deploy_relay_end};
 use st0x_config::{BrokerCtx, ChainEquities, ChainEquityAsset, OperationMode, RebalancingMode};
 #[cfg(any(test, feature = "test-support"))]
 use st0x_event_sorcery::{DomainEvent, EventSourced};
@@ -139,6 +139,20 @@ pub(crate) fn relay_test_client(api_base: String) -> RelayClient {
     RelayClient::new(Some(RelayApiKey::from("relay-test-key".to_owned())))
         .unwrap()
         .with_api_base(api_base)
+}
+
+/// Deploys Relay's stand-in stable and depository through `provider` and
+/// moves their code to `chain`'s pinned stable and depository.
+#[cfg(test)]
+pub(crate) async fn etch_relay_end(provider: &impl Provider, chain: Chain) {
+    let local = deploy_relay_end(provider).await.unwrap();
+    for (deployed, pinned) in [
+        (local.stable, chain.settlement_stable().address),
+        (local.depository, chain.relay_depository().unwrap()),
+    ] {
+        let code = provider.get_code_at(deployed).await.unwrap();
+        provider.anvil_set_code(pinned, code).await.unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -421,7 +435,12 @@ pub(crate) struct AnvilRaindexChain {
 #[cfg(test)]
 impl AnvilRaindexChain {
     pub(crate) async fn deploy() -> Self {
-        let anvil = spawn_anvil(Anvil::new());
+        Self::deploy_on(Anvil::new()).await
+    }
+
+    /// Deploys on the chain `anvil` describes, e.g. with a chain's real id.
+    pub(crate) async fn deploy_on(anvil: Anvil) -> Self {
+        let anvil = spawn_anvil(anvil);
         let endpoint = anvil.endpoint_url();
         let bot_key = B256::from_slice(&anvil.keys()[0].to_bytes());
         let deployer_key = B256::from_slice(&anvil.keys()[1].to_bytes());

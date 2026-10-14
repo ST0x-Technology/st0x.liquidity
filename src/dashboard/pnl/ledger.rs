@@ -41,7 +41,7 @@ use st0x_float_serde::format_float;
 use crate::bot_gas::{BotGasReceiptCost, BotGasReceiptCostEvent};
 use crate::position::{Position, PositionEvent, TradeId};
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
-use crate::usdc_rebalance::{UsdcRebalance, UsdcRebalanceEvent, UsdcRebalanceId};
+use crate::usdc_rebalance::{SwapRecovery, UsdcRebalance, UsdcRebalanceEvent, UsdcRebalanceId};
 
 /// Bumped when the ledger schema or the event-to-row mapping changes. A
 /// mismatch against the persisted `pnl_ledger_checkpoint.ledger_version`
@@ -619,6 +619,19 @@ async fn ingest_rebalance(
             let swap_cost = (fee_collected - relayer_fee)?;
             return insert_relay_cost(tx, rowid, &id, relayer_fee, swap_cost, &filled_at).await;
         }
+        UsdcRebalanceEvent::SwapCompletionRecovered {
+            payment:
+                SwapRecovery::Fill {
+                    fee_collected,
+                    relayer_fee,
+                    ..
+                },
+            recovered_at,
+            ..
+        } => {
+            let swap_cost = (fee_collected - relayer_fee)?;
+            return insert_relay_cost(tx, rowid, &id, relayer_fee, swap_cost, &recovered_at).await;
+        }
         // What a refund kept back is the swap's cost too, booked once the
         // refund is proven, whether it is redeposited or reconciled.
         UsdcRebalanceEvent::SwapRefunded {
@@ -627,6 +640,13 @@ async fn ingest_rebalance(
             ..
         } => {
             return insert_relay_cost(tx, rowid, &id, Usdc::ZERO, shortfall, &refunded_at).await;
+        }
+        UsdcRebalanceEvent::SwapCompletionRecovered {
+            payment: SwapRecovery::Refund { shortfall, .. },
+            recovered_at,
+            ..
+        } => {
+            return insert_relay_cost(tx, rowid, &id, Usdc::ZERO, shortfall, &recovered_at).await;
         }
         UsdcRebalanceEvent::Bridged {
             fee_collected,

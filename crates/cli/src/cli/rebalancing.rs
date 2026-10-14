@@ -689,7 +689,8 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
 /// `WithdrawalPollInconclusive` (Alpaca unreachable),
 /// `MintRecoveryInconclusive`, `DepositSendReconciliationPending`, and the
 /// Relay waits `RelayFillPending`, `SwapDepositReverted`,
-/// `SwapQuoteTransient` and `SwapPaymentUnverified`. The
+/// `SwapQuoteTransient`, `SwapPaymentUnverified`, `SwapEscrowUnresolved` and
+/// `RevertedSwapDepositLive`. The
 /// CLI must NOT keep redriving these itself: its process would race the
 /// bot's worker on the same aggregate (the CLI-vs-server race), so the first
 /// such outcome hands the transfer off to the running bot instead. Errors outside this set -- including
@@ -706,7 +707,9 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::RelayFillPending { .. }
         | UsdcTransferError::SwapDepositReverted { .. }
         | UsdcTransferError::SwapQuoteTransient { .. }
-        | UsdcTransferError::SwapPaymentUnverified { .. } => true,
+        | UsdcTransferError::SwapPaymentUnverified { .. }
+        | UsdcTransferError::SwapEscrowUnresolved { .. }
+        | UsdcTransferError::RevertedSwapDepositLive { .. } => true,
         UsdcTransferError::WithdrawalPollInconclusive { source, .. } => {
             source.backpressure().is_none()
         }
@@ -2734,6 +2737,16 @@ mod tests {
                 source: Box::new(st0x_bridge::relay::RelayBridgeError::TxNotFound {
                     tx: b256!("0x0000000000000000000000000000000000000000000000000000000000000003"),
                 }),
+            },
+            UsdcTransferError::SwapEscrowUnresolved {
+                id: id.clone(),
+                deposit_tx: B256::repeat_byte(0x04),
+            },
+            UsdcTransferError::RevertedSwapDepositLive {
+                id: id.clone(),
+                order_id: B256::repeat_byte(0x05),
+                request_id: B256::repeat_byte(0x06),
+                deposit_tx: B256::repeat_byte(0x07),
             },
             UsdcTransferError::WithdrawalPollInconclusive {
                 id,

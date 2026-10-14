@@ -8,6 +8,8 @@ mod spawn;
 pub(crate) mod trigger;
 pub(crate) mod usdc;
 
+#[cfg(test)]
+pub(crate) use spawn::UsdcTransferResumeHandles;
 pub use spawn::to_wrapped_equities;
 pub(crate) use spawn::{
     BaseWallet, ChainWallets, EthereumWallet, RebalancerServices, RelayHopSetup,

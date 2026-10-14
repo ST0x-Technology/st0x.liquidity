@@ -348,3 +348,11 @@ the first deposit bounds the whole transfer's loss, refunds and fills, so a
 refund and a re-quoted fill never lose more than one `max_quote_loss_bps`
 between them. A re-quote below the floor is refused and the transfer holds,
 paged, guard kept.
+
+## Operator lookup
+
+`stox relay status <request_id>` reads `GET /intents/status/v3` once with the
+bot's client, without its API key, and prints the parsed status, its reasons and
+every tx Relay lists. What the bot does with each state, and the operator action
+for every hold, is in `docs/cli-ops.md` ("Robinhood Relay transfer runbook") and
+SPEC.md ("Relay recovery").

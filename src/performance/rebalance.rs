@@ -599,7 +599,13 @@ impl StoredOperation {
             UsdcRebalanceEvent::WithdrawalSubmitting {
                 direction,
                 amount,
-                submitting_at,
+                submitting_at: withdrawal_at,
+                ..
+            }
+            | UsdcRebalanceEvent::Initiated {
+                direction,
+                amount,
+                initiated_at: withdrawal_at,
                 ..
             } => {
                 self.direction.get_or_insert(*direction);
@@ -610,24 +616,9 @@ impl StoredOperation {
                 // record a mid-pipeline timestamp when the reactor first
                 // observes an `AlpacaToBase` op here after a deploy.
                 if *direction == RebalanceDirection::BaseToAlpaca {
-                    self.started_at.get_or_insert(*submitting_at);
+                    self.started_at.get_or_insert(*withdrawal_at);
                 }
-                self.open_once(Withdrawal, *submitting_at);
-            }
-            UsdcRebalanceEvent::Initiated {
-                direction,
-                amount,
-                initiated_at,
-                ..
-            } => {
-                self.direction.get_or_insert(*direction);
-                self.amount.get_or_insert(*amount);
-                // Same direction gating as `WithdrawalSubmitting`: the
-                // withdrawal is the genuine first phase only for `BaseToAlpaca`.
-                if *direction == RebalanceDirection::BaseToAlpaca {
-                    self.started_at.get_or_insert(*initiated_at);
-                }
-                self.open_once(Withdrawal, *initiated_at);
+                self.open_once(Withdrawal, *withdrawal_at);
             }
             UsdcRebalanceEvent::WithdrawalConfirmed { confirmed_at, .. } => {
                 self.close(
@@ -726,6 +717,10 @@ impl StoredOperation {
             UsdcRebalanceEvent::BridgingFailed { failed_at, .. } => {
                 self.close_open_stages(*failed_at, StoredStageOutcome::Failed);
                 self.status = StoredStatus::Failed;
+            }
+            // A late Relay payment un-fails a `SwapFailed`.
+            UsdcRebalanceEvent::SwapCompletionRecovered { .. } => {
+                self.status = StoredStatus::InProgress;
             }
             UsdcRebalanceEvent::BridgingCompletionRecovered { recovered_at, .. } => {
                 self.close_open_stages(*recovered_at, StoredStageOutcome::Succeeded);
@@ -1023,6 +1018,7 @@ fn observed_at(event: &UsdcRebalanceEvent) -> DateTime<Utc> {
         UsdcRebalanceEvent::AttestationTimedOut { timed_out_at, .. } => *timed_out_at,
         UsdcRebalanceEvent::Bridged { minted_at, .. } => *minted_at,
         UsdcRebalanceEvent::BridgingCompletionRecovered { recovered_at, .. }
+        | UsdcRebalanceEvent::SwapCompletionRecovered { recovered_at, .. }
         | UsdcRebalanceEvent::DepositCompletionRecovered { recovered_at } => *recovered_at,
         UsdcRebalanceEvent::DepositInitiated {
             deposit_initiated_at,
@@ -1054,7 +1050,7 @@ mod tests {
         replay_after_competing_writer, setup_file_backed_test_db, setup_test_db,
     };
     use crate::usdc_rebalance::{
-        ConversionAmounts, ReconcileReason, TransferRef, UsdcRebalanceCommand,
+        ConversionAmounts, ReconcileReason, SwapRecovery, TransferRef, UsdcRebalanceCommand,
     };
 
     fn timestamp(seconds: i64) -> DateTime<Utc> {
@@ -2070,6 +2066,33 @@ mod tests {
         let mint = stage(&operation, RebalanceStageName::Mint);
         assert_eq!(mint.duration_ms, None);
         assert_eq!(mint.outcome, StageOutcome::Unmeasured);
+    }
+
+    #[test]
+    fn relay_failure_then_late_payment_returns_to_in_progress() {
+        let events = vec![
+            UsdcRebalanceEvent::SwapFailed {
+                reason: "Relay reported Failure".to_string(),
+                failed_at: timestamp(100),
+            },
+            UsdcRebalanceEvent::SwapCompletionRecovered {
+                order_id: B256::random(),
+                deposit_tx: TxHash::random(),
+                payment: SwapRecovery::Fill {
+                    fill_tx: TxHash::random(),
+                    amount_received: Usdc::new(float!(99.9)),
+                    fee_collected: Usdc::new(float!(0.1)),
+                    relayer_fee: Usdc::new(float!(0.1)),
+                },
+                recovered_at: timestamp(200),
+            },
+        ];
+
+        let failed = fold_operation("op-relay", &events[..1]).unwrap();
+        assert_eq!(failed.status, RebalanceTimingStatus::Failed);
+
+        let recovered = fold_operation("op-relay", &events).unwrap();
+        assert_eq!(recovered.status, RebalanceTimingStatus::InProgress);
     }
 
     #[test]

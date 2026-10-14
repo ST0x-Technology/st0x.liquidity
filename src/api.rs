@@ -18,6 +18,7 @@ use rain_math_float::Float;
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Deserialize, Serialize};
 use st0x_bridge::BridgeDirection;
+use st0x_bridge::relay::{RelayBridgeError, RelayError};
 use tokio::sync::Mutex;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
@@ -1954,6 +1955,45 @@ fn replay_refusal(error: &MintError) -> Option<&TokenizedEquityMintError> {
     }
 }
 
+/// A Relay read worth repeating later: a transient failure, or a rate limit.
+fn relay_read_retryable(error: &RelayError) -> bool {
+    match error {
+        RelayError::RateLimited { .. } => true,
+        RelayError::Transport(_)
+        | RelayError::Decode { .. }
+        | RelayError::QuoteRefused { .. }
+        | RelayError::HttpStatus { .. }
+        | RelayError::QuoteMismatch(_)
+        | RelayError::ApiKeyHeader(_)
+        | RelayError::NoApiKey
+        | RelayError::Unauthorized { .. } => error.is_transient(),
+    }
+}
+
+/// Whether a Relay bridge error is a chain read that failed, not an answer.
+fn relay_chain_unread(error: &RelayBridgeError) -> bool {
+    match error {
+        RelayBridgeError::Rpc(_) | RelayBridgeError::Evm(_) => true,
+        RelayBridgeError::NoDepository { .. }
+        | RelayBridgeError::HubAsCorridorChain
+        | RelayBridgeError::WalletsDiffer { .. }
+        | RelayBridgeError::ZeroConfirmations { .. }
+        | RelayBridgeError::Quote(_)
+        | RelayBridgeError::DirectionMismatch { .. }
+        | RelayBridgeError::PairNonces { .. }
+        | RelayBridgeError::Unconfirmed { .. }
+        | RelayBridgeError::NotCanonical { .. }
+        | RelayBridgeError::DepositReverted { .. }
+        | RelayBridgeError::ApproveReverted { .. }
+        | RelayBridgeError::DepositUnverified { .. }
+        | RelayBridgeError::DepositLogIncomplete { .. }
+        | RelayBridgeError::DepositReceiptMissing { .. }
+        | RelayBridgeError::TxNotFound { .. }
+        | RelayBridgeError::FillUnverified { .. }
+        | RelayBridgeError::RefundUnverified { .. } => false,
+    }
+}
+
 /// Maps a [`UsdcRecheckError`] to an HTTP status and operator-facing message,
 /// with the same recoverability split as [`recheck_error_response`]: the
 /// not-recoverable refusals carry the typed error's message (they only
@@ -1965,9 +2005,9 @@ fn replay_refusal(error: &MintError) -> Option<&TokenizedEquityMintError> {
 fn usdc_recheck_error_response(error: &UsdcRecheckError) -> (StatusCode, String) {
     use UsdcRecheckError::{
         Alpaca, AlpacaToBaseDeposit, DepositTxAmountMismatch, DepositTxBeforeMint,
-        DepositTxConflict, DepositTxLookup, DepositTxNotMined, DepositTxRead,
-        DepositTxRecordedElsewhere, DepositTxUnchecked, NoOnchainDepositRef, NotDepositFailed,
-        NotFound, Transfer,
+        DepositTxConflict, DepositTxLookup, DepositTxNotApplicable, DepositTxNotMined,
+        DepositTxRead, DepositTxRecordedElsewhere, DepositTxUnchecked, NoOnchainDepositRef,
+        NotDepositFailed, NotFound, Transfer,
     };
 
     match error {
@@ -1975,6 +2015,7 @@ fn usdc_recheck_error_response(error: &UsdcRecheckError) -> (StatusCode, String)
         AlpacaToBaseDeposit(_)
         | NoOnchainDepositRef(_)
         | NotDepositFailed { .. }
+        | DepositTxNotApplicable { .. }
         | DepositTxConflict { .. }
         | DepositTxRecordedElsewhere { .. }
         | DepositTxNotMined { .. }
@@ -1984,9 +2025,20 @@ fn usdc_recheck_error_response(error: &UsdcRecheckError) -> (StatusCode, String)
         // refusal: the operator needs its message, not a generic 500.
         Transfer(transfer_error) => match transfer_error.as_ref() {
             UsdcTransferError::CorridorMismatch { .. }
-            | UsdcTransferError::CorridorNotServed { .. } => {
+            | UsdcTransferError::CorridorNotServed { .. }
+            | UsdcTransferError::SwapPaymentUnverified { .. } => {
                 (StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
             }
+            // A Relay status read that failed is inconclusive, not unpaid.
+            UsdcTransferError::RelayApi(relay) if relay_read_retryable(relay) => (
+                StatusCode::BAD_GATEWAY,
+                "Relay unavailable; retry later".to_string(),
+            ),
+            // So is a chain read for the payment Relay names.
+            UsdcTransferError::RelayBridge(bridge) if relay_chain_unread(bridge) => (
+                StatusCode::BAD_GATEWAY,
+                "Chain RPC unavailable; retry later".to_string(),
+            ),
             _ => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to recheck transfer".to_string(),
@@ -5285,6 +5337,7 @@ mod tests {
     use alloy::signers::SignerSync as _;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::SolCall;
+    use alloy::transports::TransportErrorKind;
     use async_trait::async_trait;
     use axum::body::{Body, to_bytes};
     use axum::extract::ConnectInfo;
@@ -5300,6 +5353,7 @@ mod tests {
 
     use st0x_bridge::cctp::CctpError;
     use st0x_bridge::corridor::{HopKind, UsdcCorridor};
+    use st0x_bridge::relay::{RelayBridgeError, RelayEndpoint, UnverifiedReason};
     use st0x_config::{
         BrokerCtx, ChainCashAsset, Ctx, ExecutionThreshold, FileLogging, HedgedChain, LogLevel,
         OperationMode, RebalancingMode, RestApiCtx, UsdcCorridors,
@@ -5307,7 +5361,7 @@ mod tests {
     };
     use st0x_dto::{Trade, TradeOutcome, TradingVenue};
     use st0x_event_sorcery::{ReactorHarness, StoreBuilder};
-    use st0x_evm::{Chain, MinedTx, PreparedTransaction};
+    use st0x_evm::{Chain, EvmError, MinedTx, PreparedTransaction};
     use st0x_execution::alpaca_broker_api::AlpacaBrokerMock;
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaWalletError,
@@ -12121,7 +12175,7 @@ mod tests {
 
         let (status, message) = usdc_recheck_error_response(&UsdcRecheckError::Transfer(Box::new(
             UsdcTransferError::CorridorNotServed {
-                id,
+                id: id.clone(),
                 requested: relay,
                 served: BTreeSet::from([UsdcCorridor::BASE_CCTP]),
             },
@@ -12131,6 +12185,75 @@ mod tests {
             message.starts_with("USDC transfer corridor mismatch"),
             "got {message}"
         );
+
+        let (status, message) = usdc_recheck_error_response(&UsdcRecheckError::Transfer(Box::new(
+            UsdcTransferError::RelayApi(Box::new(RelayError::HttpStatus {
+                endpoint: RelayEndpoint::Status,
+                status: 503,
+            })),
+        )));
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(message, "Relay unavailable; retry later");
+
+        let (status, _) = usdc_recheck_error_response(&UsdcRecheckError::Transfer(Box::new(
+            UsdcTransferError::RelayApi(Box::new(RelayError::RateLimited { retry_after: None })),
+        )));
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+        for unread in [
+            RelayBridgeError::Rpc(TransportErrorKind::backend_gone()),
+            RelayBridgeError::Evm(EvmError::Transport(TransportErrorKind::backend_gone())),
+        ] {
+            let (status, message) = usdc_recheck_error_response(&UsdcRecheckError::Transfer(
+                Box::new(UsdcTransferError::RelayBridge(Box::new(unread))),
+            ));
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert_eq!(message, "Chain RPC unavailable; retry later");
+        }
+
+        let (status, message) = usdc_recheck_error_response(&UsdcRecheckError::Transfer(Box::new(
+            UsdcTransferError::RelayBridge(Box::new(RelayBridgeError::TxNotFound { tx })),
+        )));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(message, "Failed to recheck transfer");
+
+        let (status, message) =
+            usdc_recheck_error_response(&UsdcRecheckError::DepositTxNotApplicable {
+                id: id.clone(),
+                tx: TxHash::repeat_byte(0xd1),
+                state: "SwapFailed",
+            });
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            message,
+            UsdcRecheckError::DepositTxNotApplicable {
+                id: id.clone(),
+                tx: TxHash::repeat_byte(0xd1),
+                state: "SwapFailed",
+            }
+            .to_string()
+        );
+
+        let unverified =
+            UsdcRecheckError::Transfer(Box::new(UsdcTransferError::SwapPaymentUnverified {
+                id,
+                source: Box::new(RelayBridgeError::RefundUnverified {
+                    txs: vec![TxHash::repeat_byte(0xe1)],
+                    reason: UnverifiedReason::Reverted,
+                }),
+            }));
+        let (status, message) = usdc_recheck_error_response(&unverified);
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(message, unverified.to_string());
+
+        let (status, message) = usdc_recheck_error_response(&UsdcRecheckError::Transfer(Box::new(
+            UsdcTransferError::RelayApi(Box::new(RelayError::HttpStatus {
+                endpoint: RelayEndpoint::Status,
+                status: 404,
+            })),
+        )));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(message, "Failed to recheck transfer");
     }
 
     /// Seeds a `UsdcRebalance` (BaseToAlpaca) into a post-burn `BridgingFailed`
