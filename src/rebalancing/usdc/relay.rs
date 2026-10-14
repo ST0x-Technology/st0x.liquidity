@@ -2447,6 +2447,11 @@ mod tests {
         id: UsdcRebalanceId,
         seen: std::sync::Mutex<Vec<(TxHash, Vec<TxHash>)>>,
         on_deposit_signing: std::sync::Mutex<Option<OnDepositSigning>>,
+        /// A tx whose next broadcast the node accepts and then drops.
+        drop_next_broadcast_of: std::sync::Mutex<Option<TxHash>>,
+        /// The tx the node dropped, until it is broadcast again: its receipt
+        /// wait reports it dropped.
+        dropped: std::sync::Mutex<Option<TxHash>>,
     }
 
     /// What the wallet does, once, when the transfer signs a Relay deposit.
@@ -2471,11 +2476,19 @@ mod tests {
                 id,
                 seen: std::sync::Mutex::new(Vec::new()),
                 on_deposit_signing: std::sync::Mutex::new(None),
+                drop_next_broadcast_of: std::sync::Mutex::new(None),
+                dropped: std::sync::Mutex::new(None),
             }
         }
 
         fn on_deposit_signing(self, hook: OnDepositSigning) -> Self {
             *self.on_deposit_signing.lock().unwrap() = Some(hook);
+            self
+        }
+
+        /// The node accepts the next broadcast of `tx` and then drops it.
+        fn dropping_next_broadcast_of(self, tx: TxHash) -> Self {
+            *self.drop_next_broadcast_of.lock().unwrap() = Some(tx);
             self
         }
 
@@ -2593,6 +2606,22 @@ mod tests {
                 .unwrap()
                 .push((prepared.tx_hash(), persisted));
 
+            let tx = prepared.tx_hash();
+            if self
+                .drop_next_broadcast_of
+                .lock()
+                .unwrap()
+                .take_if(|next| *next == tx)
+                .is_some()
+            {
+                *self.dropped.lock().unwrap() = Some(tx);
+                return Ok(tx);
+            }
+            self.dropped
+                .lock()
+                .unwrap()
+                .take_if(|dropped| *dropped == tx);
+
             self.inner.broadcast_prepared(prepared, note).await
         }
 
@@ -2629,6 +2658,13 @@ mod tests {
         }
 
         async fn await_receipt(&self, tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
+            if *self.dropped.lock().unwrap() == Some(tx_hash) {
+                return Err(EvmError::TransactionDropped {
+                    tx_hash,
+                    elapsed_secs: 0,
+                });
+            }
+
             self.inner.await_receipt(tx_hash).await
         }
 
@@ -4257,7 +4293,25 @@ mod tests {
             store: Arc<Store<UsdcRebalance>>,
             bounds: RelayHopCtx,
         ) -> CrossVenueCashTransfer<TestWallet, RelayHop<TestWallet>> {
-            let chain_wallet = self.chain.bot_wallet.clone();
+            self.transfer_through(
+                server,
+                relay_api,
+                store,
+                bounds,
+                self.chain.bot_wallet.clone(),
+            )
+            .await
+        }
+
+        /// [`Self::transfer`], sending on the chain through `chain_wallet`.
+        async fn transfer_through(
+            &self,
+            server: &MockServer,
+            relay_api: &MockServer,
+            store: Arc<Store<UsdcRebalance>>,
+            bounds: RelayHopCtx,
+            chain_wallet: TestWallet,
+        ) -> CrossVenueCashTransfer<TestWallet, RelayHop<TestWallet>> {
             let bridge = RelayBridge::try_from_ctx(RelayCtx {
                 chain: Chain::Robinhood,
                 ethereum_wallet: self.hub_wallet.clone(),
@@ -4836,6 +4890,82 @@ mod tests {
             .await
             .unwrap();
         assert!(approved.is_some(), "the split approve must be mined");
+        assert_eq!(rig.vault_usdg().await, U256::from(AMOUNT_IN));
+    }
+
+    /// A split approve the node accepted and then dropped is confirmed
+    /// before the redeposit starts, so the attempt ends at `SwapQuoted` and
+    /// the retry sends it again; the vault deposit never waits behind its
+    /// nonce with nothing left to send it.
+    #[tokio::test]
+    async fn redeposit_confirms_a_split_approve_the_node_dropped() {
+        let rig = RelayRig::deploy().await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        relay_api.mock(|when, then| {
+            when.method(POST).path("/quote/v2");
+            then.status(400).json_body(json!({
+                "message": "No routes",
+                "errorCode": "NO_SWAP_ROUTES_FOUND",
+                "requestId": "0x00"
+            }));
+        });
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let mut quote = exact_quote(
+            &rig.chain.bot_wallet,
+            rig.chain_contracts,
+            B256::repeat_byte(0x0d),
+        )
+        .await;
+        let approve_step = quote.approve.clone().unwrap();
+        quote.deadline = Utc::now() - chrono::Duration::minutes(1);
+        record_quoted(&store, &id, quote).await;
+        let approve = rig
+            .chain
+            .bot_wallet
+            .prepare_pending(approve_step.to, approve_step.data, "split approve")
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::PrepareSwapApprove {
+                    approve: approve.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let chain_wallet: TestWallet = Arc::new(
+            BroadcastWitness::new(rig.chain.bot_wallet.clone(), store.clone(), id.clone())
+                .dropping_next_broadcast_of(approve.tx_hash()),
+        );
+        let transfer = rig
+            .transfer_through(
+                &server,
+                &relay_api,
+                store.clone(),
+                relay_bounds(),
+                chain_wallet,
+            )
+            .await;
+        let attempt = || {
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+            )
+        };
+
+        attempt().await.expect("the attempt ends").unwrap_err();
+        assert_eq!(
+            store.load(&id).await.unwrap().unwrap().state_name(),
+            "SwapQuoted",
+            "the redeposit must not start behind an approve that is not mined"
+        );
+
+        attempt().await.expect("the retry ends").unwrap();
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "ReturnedToSource", "{state:?}");
         assert_eq!(rig.vault_usdg().await, U256::from(AMOUNT_IN));
     }
 
