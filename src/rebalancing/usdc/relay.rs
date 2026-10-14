@@ -635,13 +635,17 @@ where
             .confirm_deposit(TO_HUB, RelayOrderId(order_id), &pair, &split_approves)
             .await;
 
-        // A reverted deposit was mined too, so the bot paid for it and its
-        // approves. Enqueued before `ConfirmSwapDeposit` (see
+        // A reverted or unverified deposit was mined too, so the bot paid for
+        // it and its approves. Enqueued before `ConfirmSwapDeposit` (see
         // `enqueue_bot_gas_cost`): a failed enqueue leaves
         // `SwapDepositPrepared`, whose retry sends the same pair again and
         // enqueues again.
         let mined = match &confirmed {
-            Ok(_) | Err(RelayBridgeError::DepositReverted { .. }) => true,
+            Ok(_)
+            | Err(
+                RelayBridgeError::DepositReverted { .. }
+                | RelayBridgeError::DepositUnverified { .. },
+            ) => true,
             Err(_) => false,
         };
         if mined {
@@ -2447,6 +2451,68 @@ mod tests {
         assert!(
             matches!(&error, UsdcTransferError::RelayBridge(bridge)
                 if matches!(**bridge, RelayBridgeError::DepositReverted { tx } if tx == deposit)),
+            "got {error:?}"
+        );
+        assert_eq!(
+            queued_gas_costs(&apalis_pool).await,
+            vec![
+                (Chain::Robinhood, approve, "relay_approve".to_string()),
+                (Chain::Robinhood, deposit, "relay_deposit".to_string()),
+            ]
+        );
+    }
+
+    /// A deposit that mined with success status but emitted no deposit event
+    /// for our order was still paid by the bot, as was its approve, so both
+    /// have their gas queued before the unverified deposit surfaces.
+    #[tokio::test]
+    async fn unverified_relay_deposit_queues_the_gas_of_its_approve_and_deposit() {
+        let anvil = spawn_anvil(Anvil::new());
+        let (wallet, deployed) = funded_relay_end(&anvil).await;
+        // A depository with no code: the deposit call succeeds and logs nothing.
+        let contracts = RelayEndContracts {
+            depository: Address::repeat_byte(0xde),
+            ..deployed
+        };
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let witness = Arc::new(BroadcastWitness::new(
+            wallet.clone(),
+            store.clone(),
+            id.clone(),
+        ));
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let (transfer, apalis_pool) = relay_transfer_recording_gas(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            witness.clone(),
+            contracts,
+            store.clone(),
+        )
+        .await;
+        record_quoted(
+            &store,
+            &id,
+            exact_quote(&wallet, contracts, B256::repeat_byte(0x0d)).await,
+        )
+        .await;
+
+        let error = transfer
+            .resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
+            .await
+            .unwrap_err();
+
+        let [approve, deposit] = witness.broadcasts()[..] else {
+            panic!(
+                "expected the approve, then the deposit: {:?}",
+                witness.broadcasts()
+            );
+        };
+        assert!(
+            matches!(&error, UsdcTransferError::RelayBridge(bridge)
+                if matches!(**bridge, RelayBridgeError::DepositUnverified { tx, .. } if tx == deposit)),
             "got {error:?}"
         );
         assert_eq!(
