@@ -7823,6 +7823,28 @@ that the allocation planner sizes from (see Equity Allocation Planner).
 Rebalancing is only triggered when no inflight operations exist for the asset.
 The trigger enqueues the matching transfer job for execution.
 
+With a cash reserve configured, the broker side of the ratio is the gross broker
+cash, before the reserve; with a reserve but no gross reading the check skips.
+The poll drops an unchanged reading, so the bot moves the gross figure itself,
+in the same inventory write as the Hedging ledger and by the same change:
+`ConversionConfirmed` (chain to Alpaca) adds what Alpaca received;
+`DepositConfirmed` (Alpaca to chain) subtracts what left Alpaca, and so does a
+release of Hedging inflight with no credit (an operator reconcile, by the
+reactor or the timeout sweep, or a timeout clear before the burn). Kept in
+lockstep, a wrong ledger value carries a wrong gross figure with it, and the
+cash divergence reconcile restores both. The result rounds down to whole cents.
+A debit larger than the figure clears it, and checks skip until a changed broker
+reading or a cash reconcile restores it.
+
+Accepted risk: a broker reading that already holds the moved cash and is applied
+before the bot's event counts it twice, in the ledger and the gross figure
+alike. Chain to Alpaca, only a forced read can do this, since cash snapshots are
+skipped while USDC is in flight; Alpaca to chain, an ordinary poll during the
+USD->USDC conversion can, since nothing is in flight before `Initiated`. The
+check the landing queues can act on the doubled figure once. The next poll's
+ledger divergence engages the cash gate, and the forced reconcile restores both
+figures (see Inventory Reconciliation).
+
 #### Failure Handling and Reconciliation
 
 **Automatic Reconciliation**: When rebalancing operations fail before assets
