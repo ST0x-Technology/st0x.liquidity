@@ -7841,9 +7841,12 @@ before the bot's event counts it twice, in the ledger and the gross figure
 alike. Chain to Alpaca, only a forced read can do this, since cash snapshots are
 skipped while USDC is in flight; Alpaca to chain, an ordinary poll during the
 USD->USDC conversion can, since nothing is in flight before `Initiated`. The
-check the landing queues can act on the doubled figure once. The next poll's
-ledger divergence engages the cash gate, and the forced reconcile restores both
-figures (see Inventory Reconciliation).
+check the landing queues, and one a vault read queues earlier in the next poll,
+run before that poll's cash comparison, so either can send a transfer the real
+balances do not need. The cash divergence counter is frozen while that transfer
+is active, so the forced reconcile (see Inventory Reconciliation) restores both
+figures only after it settles, and the next check can then send a corrective
+transfer back.
 
 #### Failure Handling and Reconciliation
 
