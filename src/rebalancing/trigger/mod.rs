@@ -45512,6 +45512,89 @@ mod tests {
         );
     }
 
+    /// A live job row whose payload does not parse or whose transfer does not
+    /// load gets no hold and does not fail startup; only the readable row
+    /// counts on the other corridors.
+    #[tokio::test]
+    async fn recover_usdc_guard_holds_no_corridor_for_an_unreadable_live_job_row() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        let unloadable = UsdcRebalanceId(Uuid::new_v4());
+        seed_terminal_usdc_aggregate(&store, &unloadable).await;
+        break_latest_usdc_event(&pool, &unloadable).await;
+        queue_hedging_job_row(
+            &service,
+            &unloadable,
+            UsdcCorridor::BASE_CCTP,
+            usdc(1000),
+            "status = 'Pending'",
+        )
+        .await;
+        let readable = UsdcRebalanceId(Uuid::new_v4());
+        queue_hedging_job_row(
+            &service,
+            &readable,
+            UsdcCorridor::BASE_CCTP,
+            usdc(50),
+            "status = 'Pending'",
+        )
+        .await;
+        // Last: the row lookup in `queue_hedging_job_row` fails on a malformed
+        // payload.
+        let malformed = UsdcRebalanceId(Uuid::new_v4());
+        queue_hedging_job_row(
+            &service,
+            &malformed,
+            ETHEREUM_CCTP,
+            usdc(600),
+            "job = CAST('not json at all' AS BLOB)",
+        )
+        .await;
+
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert_eq!(service.usdc_guards.held_chain(&unloadable), None);
+        assert_eq!(service.usdc_guards.held_chain(&malformed), None);
+        assert_eq!(service.usdc_guards.held_chain(&readable), Some(Chain::Base));
+        assert_eq!(
+            service
+                .usdc_guards
+                .inbound_elsewhere(Chain::Robinhood)
+                .unwrap(),
+            usdc(50)
+        );
+    }
+
+    /// A job row queued just before a restart, with nothing recorded yet,
+    /// still shrinks the other corridor's next transfer once startup holds it.
+    #[tokio::test]
+    async fn startup_hold_of_a_live_job_row_sizes_the_other_corridors_next_transfer() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let trigger = robinhood_trigger_beside_a_base_transfer().await;
+        let base = UsdcRebalanceId(Uuid::new_v4());
+        queue_hedging_job_row(
+            &trigger,
+            &base,
+            UsdcCorridor::BASE_CCTP,
+            usdc(50),
+            "status = 'Pending'",
+        )
+        .await;
+
+        trigger.recover_usdc_guard(&pool, &store).await.unwrap();
+        trigger.check_and_trigger_usdc().await;
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            2,
+            "only Robinhood's transfer joins the queued Base row"
+        );
+        let robinhood = pending_transfer_usdc_to_hedging_job_on(&trigger, ROBINHOOD_RELAY).await;
+        assert_eq!(robinhood.amount, usdc(20));
+    }
+
     /// An Alpaca-outbound transfer marks Alpaca's cash inflight from its
     /// first event, so no other corridor sizes against that balance until
     /// it ends.
