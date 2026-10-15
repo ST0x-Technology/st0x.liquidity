@@ -2946,7 +2946,9 @@ mod tests {
         AnvilRaindexChain, TestAnvilInstance, anvil_wallet, erc20_balance, etch_relay_end,
         relay_test_client, setup_test_apalis_pool, setup_test_db, setup_test_pools, spawn_anvil,
     };
-    use crate::usdc_rebalance::{HopEvidence, PreBurnFailEligibility};
+    use crate::usdc_rebalance::{
+        EthereumWalletCredit, HopEvidence, PreBurnFailEligibility, open_ethereum_credits,
+    };
 
     type TestWallet = Arc<dyn Wallet<Provider = RootProvider>>;
 
@@ -9366,7 +9368,8 @@ mod tests {
             json!({"status": "pending", "inTxHashes": [], "txHashes": []}),
         );
         let quotes = mock_quote_unavailable(&relay_api);
-        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let pool = setup_test_db().await;
+        let store = Arc::new(test_store(pool.clone(), ()));
         let transfer = rig
             .transfer(&server, &relay_api, store.clone(), relay_bounds())
             .await;
@@ -9425,6 +9428,14 @@ mod tests {
             }]
         );
         assert_eq!(*amount, Usdc::new(float!(99.6)), "the refunded amount");
+        assert_eq!(
+            open_ethereum_credits(&pool, &store).await.unwrap(),
+            vec![(
+                id.clone(),
+                EthereumWalletCredit::Held(Usdc::new(float!(99.6)))
+            )],
+            "the refund stays in the Ethereum wallet as the hold's credit"
+        );
         assert!(state.holds_rebalance_guard());
         assert!(state.is_reconcilable_failure());
         reverted_status.assert_calls(0);
