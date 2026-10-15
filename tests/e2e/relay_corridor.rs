@@ -33,7 +33,10 @@ use st0x_hedge::{
 
 use crate::assert::{StoredEvent, assert_event_subsequence, assert_single_clean_aggregate};
 use crate::cctp::{CctpInfra, USDC_ETHEREUM};
-use crate::poll::{connect_db, fetch_events_by_type, poll_for_events_with_timeout, spawn_bot};
+use crate::poll::{
+    connect_db, fetch_events_by_type, poll_for_done_job_referencing, poll_for_events_with_timeout,
+    spawn_bot,
+};
 use crate::rebalancing::assertions::test_wallet;
 use crate::relay::{RelayMock, RobinhoodChain, relay_fill_amount};
 use crate::test_infra::TestInfra;
@@ -321,6 +324,13 @@ fn single_aggregate_id(events: &[StoredEvent]) -> String {
     events[0].aggregate_id.clone()
 }
 
+fn count_of(events: &[StoredEvent], event_type: &str) -> usize {
+    events
+        .iter()
+        .filter(|event| event.event_type == event_type)
+        .count()
+}
+
 /// 30,000 USDG in the Robinhood vault against 10,000 USD at Alpaca is 75%
 /// onchain, above the 60% band edge: the bot withdraws the 10,000 USDG
 /// above the 50% target, swaps it to USDC on Ethereum over Relay, deposits
@@ -391,6 +401,88 @@ async fn relay_corridor_moves_usdc_from_alpaca_to_robinhood() -> anyhow::Result<
             stable_units("2000") + relay_fill_amount(stable_units("8000")),
             float!(10000),
         )
+        .await?;
+
+    bot.abort();
+    Ok(())
+}
+
+/// A bot stopped while Relay holds its USDG deposit resumes the same
+/// transfer on restart: it reads the deposit's status instead of quoting,
+/// withdrawing or depositing again, proves the fill once Relay pays it, and
+/// finishes the transfer through the same job.
+#[test_log::test(tokio::test)]
+async fn interrupted_relay_transfer_resumes_after_restart() -> anyhow::Result<()> {
+    let corridor = RelayCorridor::start("30000", float!(10000)).await?;
+    corridor.relay.hold_fills();
+    let mut bot = spawn_bot(corridor.ctx().await?);
+
+    poll_for_events_with_timeout(
+        &mut bot,
+        &corridor.infra.db_path,
+        "UsdcRebalanceEvent::SwapDeposited",
+        1,
+        TRANSFER_TIMEOUT,
+    )
+    .await;
+    bot.abort();
+    let _ = bot.await;
+
+    let events_before_restart = corridor.usdc_rebalance_events().await?;
+    let transfer_id = single_aggregate_id(&events_before_restart);
+    assert_eq!(
+        count_of(
+            &events_before_restart,
+            "UsdcRebalanceEvent::RelayFillVerified"
+        ),
+        0,
+        "the fill was held, so the first bot cannot have proven it",
+    );
+    let quotes_before_restart = corridor.relay.quotes_served();
+
+    corridor.relay.release_fills();
+    let mut bot = spawn_bot(corridor.ctx().await?);
+
+    poll_for_events_with_timeout(
+        &mut bot,
+        &corridor.infra.db_path,
+        "UsdcRebalanceEvent::ConversionConfirmed",
+        1,
+        TRANSFER_TIMEOUT,
+    )
+    .await;
+    poll_for_done_job_referencing(
+        &mut bot,
+        &corridor.infra.db_path,
+        "TransferUsdcToHedging",
+        &transfer_id,
+        TRANSFER_TIMEOUT,
+    )
+    .await;
+
+    let events = corridor.usdc_rebalance_events().await?;
+    assert_eq!(single_aggregate_id(&events), transfer_id);
+    assert_event_subsequence(&events, ROBINHOOD_TO_ALPACA_EVENTS);
+    for event_type in [
+        "UsdcRebalanceEvent::WithdrawalConfirmed",
+        "UsdcRebalanceEvent::SwapQuoted",
+        "UsdcRebalanceEvent::SwapDepositPrepared",
+        "UsdcRebalanceEvent::SwapDeposited",
+        "UsdcRebalanceEvent::RelayFillVerified",
+    ] {
+        assert_eq!(
+            count_of(&events, event_type),
+            1,
+            "{event_type} should be recorded once across the restart",
+        );
+    }
+    assert_eq!(
+        corridor.relay.quotes_served(),
+        quotes_before_restart,
+        "the resumed transfer must not quote again",
+    );
+    corridor
+        .assert_settled("10000", stable_units("20000"), float!(19995))
         .await?;
 
     bot.abort();

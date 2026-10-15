@@ -197,6 +197,8 @@ struct RelayOrder {
 #[derive(Default)]
 struct RelayState {
     orders: HashMap<B256, RelayOrder>,
+    quotes_served: usize,
+    fills_held: bool,
 }
 
 /// One chain the solver watches and pays on.
@@ -303,6 +305,20 @@ impl RelayMock {
         self.server.base_url()
     }
 
+    /// Makes the solver leave every deposit unfilled until
+    /// [`Self::release_fills`], so a test can stop the bot mid-transfer.
+    pub fn hold_fills(&self) {
+        lock(&self.state).fills_held = true;
+    }
+
+    pub fn release_fills(&self) {
+        lock(&self.state).fills_held = false;
+    }
+
+    pub fn quotes_served(&self) -> usize {
+        lock(&self.state).quotes_served
+    }
+
     /// Every deposit the solver saw, as `(amount_in, amount_out, filled)`.
     pub fn deposits(&self) -> Vec<(U256, U256, bool)> {
         lock(&self.state)
@@ -387,14 +403,18 @@ fn quote_response(state: &Mutex<RelayState>, body: &[u8]) -> anyhow::Result<Valu
     // One request id per order, so each status read names its own order.
     quote["requestId"] = json!(order_id);
 
-    lock(state).orders.entry(order_id).or_insert(RelayOrder {
-        destination: quote_request.destination,
-        recipient: quote_request.recipient,
-        amount_in: quote_request.amount,
-        amount_out,
-        deposit_tx: None,
-        fill_tx: None,
-    });
+    {
+        let mut state = lock(state);
+        state.quotes_served += 1;
+        state.orders.entry(order_id).or_insert(RelayOrder {
+            destination: quote_request.destination,
+            recipient: quote_request.recipient,
+            amount_in: quote_request.amount,
+            amount_out,
+            deposit_tx: None,
+            fill_tx: None,
+        });
+    }
     debug!(%order_id, amount = %quote_request.amount, "Relay mock quoted");
 
     Ok(quote)
@@ -417,7 +437,7 @@ fn status_body(state: &RelayState, request_id: Option<B256>) -> Value {
 }
 
 /// Scans both depositories for deposits of quoted orders and fills each
-/// one on its destination chain.
+/// one on its destination chain, unless fills are held.
 async fn run_solver<const CHAINS: usize>(
     state: Arc<Mutex<RelayState>>,
     keys: SolverKeys,
@@ -499,12 +519,18 @@ async fn fill_deposits(
     keys: SolverKeys,
     chains: &[SolverChain],
 ) -> anyhow::Result<()> {
-    let unfilled: Vec<(B256, RelayOrder)> = lock(state)
-        .orders
-        .iter()
-        .filter(|(_, order)| order.deposit_tx.is_some() && order.fill_tx.is_none())
-        .map(|(id, order)| (*id, order.clone()))
-        .collect();
+    let unfilled: Vec<(B256, RelayOrder)> = {
+        let state = lock(state);
+        if state.fills_held {
+            return Ok(());
+        }
+        state
+            .orders
+            .iter()
+            .filter(|(_, order)| order.deposit_tx.is_some() && order.fill_tx.is_none())
+            .map(|(id, order)| (*id, order.clone()))
+            .collect()
+    };
 
     for (order_id, order) in unfilled {
         let destination = chains

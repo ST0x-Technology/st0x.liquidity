@@ -551,6 +551,54 @@ pub async fn poll_for_running_job(
     }
 }
 
+/// Polls the apalis `Jobs` table until a `Done` job whose type contains
+/// `job_type` names `aggregate_id` in its payload, panicking if the bot dies
+/// or the timeout passes first. A job reaches `Done` after the event that
+/// ended its work, so a single read right after that event can miss it.
+pub async fn poll_for_done_job_referencing(
+    bot: &mut JoinHandle<anyhow::Result<()>>,
+    db_path: &std::path::Path,
+    job_type: &str,
+    aggregate_id: &str,
+    timeout: Duration,
+) {
+    let connect_opts = SqliteConnectOptions::new().filename(db_path);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let context = format!("Done {job_type} job for {aggregate_id}");
+
+    loop {
+        sleep_or_crash(bot, &context).await;
+
+        let Ok(pool) = SqlitePool::connect_with(connect_opts.clone()).await else {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out after {timeout:?} waiting for {context} (database not ready)",
+            );
+            continue;
+        };
+
+        let done: Result<Vec<(Vec<u8>,)>, _> =
+            sqlx::query_as("SELECT job FROM Jobs WHERE job_type LIKE ? AND status = 'Done'")
+                .bind(format!("%{job_type}%"))
+                .fetch_all(&pool)
+                .await;
+
+        pool.close().await;
+
+        if done.is_ok_and(|rows| {
+            rows.iter()
+                .any(|(job,)| String::from_utf8_lossy(job).contains(aggregate_id))
+        }) {
+            return;
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Timed out after {timeout:?} waiting for {context}",
+        );
+    }
+}
+
 /// Polls until the conductor's first `CheckPositions` tick completes
 /// (a `Done` row in the apalis `Jobs` table), panicking if the bot dies
 /// or the timeout passes first.
