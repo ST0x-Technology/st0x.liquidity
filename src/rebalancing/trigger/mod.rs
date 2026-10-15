@@ -25611,6 +25611,69 @@ mod tests {
         assert!(!trigger.usdc_guards.is_held(Chain::Base));
     }
 
+    /// A reserve-configured band at 0.6 +- 0.05, Base 200 against $50 of
+    /// gross broker cash ($10 reserved).
+    async fn make_reserve_trigger_base_200_alpaca_50() -> Arc<RebalancingService> {
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(200), usdc(40))
+            .with_offchain_gross_usd_cents(5_000);
+        let config = RebalancingServiceConfig {
+            cash_reserved: Some(Positive::new(Usd::new(float!(10))).unwrap()),
+            usdc: UsdcCorridors::base_cctp(ImbalanceThreshold {
+                target: float!(0.6),
+                deviation: float!(0.05),
+            }),
+            ..test_config()
+        };
+
+        make_trigger_with_inventory_config(inventory, config).await
+    }
+
+    /// Base sends 50 to Alpaca and it lands: Base 150 against $100 at the
+    /// broker is 0.6, so the check the landing queues must plan nothing.
+    #[tokio::test]
+    async fn landed_base_to_alpaca_with_reserve_plans_no_second_transfer() {
+        let trigger = make_reserve_trigger_base_200_alpaca_50().await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.check_and_trigger_usdc().await;
+        assert_eq!(
+            take_pending_usdc_transfer_jobs(&trigger).await,
+            vec![UsdcRebalanceOperation::BaseToAlpaca { amount: usdc(50) }]
+        );
+
+        trigger.usdc_guards.release_every_holder();
+        trigger
+            .usdc_guards
+            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca, usdc(50));
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(50)),
+            )
+            .await
+            .unwrap();
+        harness
+            .receive::<UsdcRebalance>(
+                id,
+                make_usdc_conversion_confirmed(
+                    RebalanceDirection::BaseToAlpaca,
+                    usdc(50),
+                    usdc(50),
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(usdc::drain_pending_usdc_jobs(&trigger).await, 1);
+        assert_eq!(
+            take_pending_usdc_transfer_jobs(&trigger).await,
+            vec![],
+            "the landed $50 is at the broker; the check must not send it again"
+        );
+    }
+
     #[tokio::test]
     async fn recovered_post_burn_bridge_holds_guard_then_clears_on_terminal() {
         // Recovery lifecycle through the reactor: a post-burn
