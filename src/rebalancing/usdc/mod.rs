@@ -411,7 +411,7 @@ pub enum UsdcTransferError {
     FoundSwapDepositApprovesUnconfirmed {
         id: UsdcRebalanceId,
         #[source]
-        source: Box<UsdcTransferError>,
+        source: Box<Self>,
     },
     /// The fill window passed with no fill or refund proven: the transfer
     /// holds its guard and the job reads Relay's status again slowly.
