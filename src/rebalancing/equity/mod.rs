@@ -3818,15 +3818,13 @@ impl CrossVenueEquityTransfer {
     ) -> Result<RecheckOutcome, RecheckError> {
         let entity = self.load_mint_entity(issuer_request_id).await?;
 
-        let (symbol, quantity) = match &entity {
+        let symbol = match &entity {
             // Both terminals are already settled: nothing to recheck.
             TokenizedEquityMint::DepositedIntoRaindex { .. }
             | TokenizedEquityMint::Reconciled { .. } => {
                 return Ok(RecheckOutcome::AlreadyCompleted);
             }
-            TokenizedEquityMint::Failed {
-                symbol, quantity, ..
-            } => (symbol.clone(), FractionalShares::new(*quantity)),
+            TokenizedEquityMint::Failed { symbol, .. } => symbol.clone(),
             _ => {
                 self.resume_mint(issuer_request_id).await?;
                 return Ok(RecheckOutcome::Resumed);
@@ -3930,7 +3928,6 @@ impl CrossVenueEquityTransfer {
                     issuer_request_id,
                     &symbol,
                     entity.chain(),
-                    quantity,
                     rollback,
                 )
                 .await

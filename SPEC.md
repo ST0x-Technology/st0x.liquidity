@@ -7511,7 +7511,13 @@ transfer dispatch. It does not calculate cross-venue inventory imbalances.
   effect as the successful flow) under the shared resume lock. Mint recovery
   applies only to acceptance-stage failures (tokens never received); a mint that
   failed after receiving tokens is reported as not recoverable so recovery never
-  re-wraps tokens that already moved.
+  re-wraps tokens that already moved. Before dispatch, mint recovery restores
+  the mint's Alpaca inflight without debiting Alpaca available again: the
+  provider already took the shares, so a broker snapshot since the failure may
+  already exclude them. Unless the failure kept available debited (a timeout, or
+  a failure that left the inflight in place), recovery also forces an offchain
+  equity reconcile so available re-bases to the broker position. A failed
+  dispatch clears the inflight it restored without crediting available.
 - Operator-forced equity-transfer failures run in-process through
   `POST /transfers/fail/<kind>/<id>` under the shared transfer-recovery lock.
   The endpoint dispatches the stage-appropriate failure command through the
