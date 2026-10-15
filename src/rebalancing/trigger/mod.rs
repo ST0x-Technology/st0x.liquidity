@@ -75,7 +75,7 @@ use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::view::InFlightEquityLocation;
 use crate::inventory::{
     BroadcastingInventory, CashAdmission, Inventory, InventoryDivergenceGate, InventoryError,
-    InventoryScope, InventoryViewError, Operator, PendingRequestOwnership,
+    InventoryScope, InventoryViewError, OnchainForm, Operator, PendingRequestOwnership,
     PendingRequestOwnershipSnapshot, PollFreshness, PortfolioAsset, PortfolioLocation, TransferOp,
     Venue,
 };
@@ -6192,7 +6192,10 @@ impl RebalancingService {
                 .onchain_equity_slot_seeded(symbol, chain);
             let last_polled = seeded.then(|| {
                 self.config.poll_freshness.last_observed(
-                    PortfolioLocation::MarketMaking(chain),
+                    PortfolioLocation::Onchain {
+                        chain,
+                        form: OnchainForm::MarketMaking,
+                    },
                     &PortfolioAsset::Equity(symbol.clone()),
                 )
             });
@@ -6556,7 +6559,10 @@ impl RebalancingService {
         // USDC poll (PollFreshness, not snapshot stamps: a static USDC
         // balance emits no events, yet stays fresh while polled).
         let last_polled = self.config.poll_freshness.last_observed(
-            PortfolioLocation::MarketMaking(chain),
+            PortfolioLocation::Onchain {
+                chain,
+                form: OnchainForm::MarketMaking,
+            },
             &PortfolioAsset::Usdc,
         );
         if let Some(staleness) =
@@ -14814,12 +14820,18 @@ mod tests {
             .rebalancing = RebalancingMode::Paused;
         let freshness = PollFreshness::new();
         freshness.set_observed(
-            PortfolioLocation::MarketMaking(Chain::Base),
+            PortfolioLocation::Onchain {
+                chain: Chain::Base,
+                form: OnchainForm::MarketMaking,
+            },
             PortfolioAsset::Equity(symbol.clone()),
             Utc::now(),
         );
         freshness.set_observed(
-            PortfolioLocation::MarketMaking(Chain::Robinhood),
+            PortfolioLocation::Onchain {
+                chain: Chain::Robinhood,
+                form: OnchainForm::MarketMaking,
+            },
             PortfolioAsset::Equity(symbol.clone()),
             Utc::now() - chrono::Duration::seconds(301),
         );
@@ -14879,7 +14891,10 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let freshness = PollFreshness::new();
         freshness.set_observed(
-            PortfolioLocation::MarketMaking(Chain::Base),
+            PortfolioLocation::Onchain {
+                chain: Chain::Base,
+                form: OnchainForm::MarketMaking,
+            },
             PortfolioAsset::Equity(symbol.clone()),
             Utc::now() - chrono::Duration::seconds(301),
         );
@@ -14915,7 +14930,10 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let freshness = PollFreshness::new();
         freshness.set_observed(
-            PortfolioLocation::MarketMaking(Chain::Base),
+            PortfolioLocation::Onchain {
+                chain: Chain::Base,
+                form: OnchainForm::MarketMaking,
+            },
             PortfolioAsset::Equity(symbol.clone()),
             Utc::now(),
         );
@@ -14943,7 +14961,10 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let freshness = PollFreshness::new();
         freshness.set_observed(
-            PortfolioLocation::MarketMaking(Chain::Base),
+            PortfolioLocation::Onchain {
+                chain: Chain::Base,
+                form: OnchainForm::MarketMaking,
+            },
             PortfolioAsset::Equity(symbol.clone()),
             Utc::now() + chrono::Duration::seconds(120),
         );
@@ -14996,7 +15017,10 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let aged_out = PollFreshness::new();
         aged_out.set_observed(
-            PortfolioLocation::MarketMaking(Chain::Base),
+            PortfolioLocation::Onchain {
+                chain: Chain::Base,
+                form: OnchainForm::MarketMaking,
+            },
             PortfolioAsset::Equity(symbol.clone()),
             Utc::now() - chrono::Duration::seconds(301),
         );
@@ -39681,7 +39705,10 @@ mod tests {
         let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
         let freshness = PollFreshness::new();
         freshness.set_observed(
-            PortfolioLocation::MarketMaking(Chain::Base),
+            PortfolioLocation::Onchain {
+                chain: Chain::Base,
+                form: OnchainForm::MarketMaking,
+            },
             PortfolioAsset::Usdc,
             Utc::now() - chrono::Duration::seconds(301),
         );
@@ -39702,7 +39729,10 @@ mod tests {
         );
 
         freshness.set_observed(
-            PortfolioLocation::MarketMaking(Chain::Base),
+            PortfolioLocation::Onchain {
+                chain: Chain::Base,
+                form: OnchainForm::MarketMaking,
+            },
             PortfolioAsset::Usdc,
             Utc::now(),
         );

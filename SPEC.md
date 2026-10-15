@@ -330,8 +330,8 @@ over its own asset table, because vault polling reads its market-making vaults
 like any hedged chain's and those hold wrapped vault shares the daily portfolio
 capture values in underlying units. The rebalancing trigger plans across every
 hedged chain's entry and dispatches each operation with its chain (see Equity
-Allocation Planner). The daily portfolio snapshot still values only the Base
-wallet, so equity waiting for recovery in a secondary wallet is not in that
+Allocation Planner). The daily portfolio snapshot values every polled chain's
+bot wallet, so equity waiting for recovery in a secondary wallet is in that
 capture. Wallet polling and wrapped and unwrapped equity recovery cover each
 chain whose equity services are built. Recovery reads that chain's wallet
 balances and resumes only a mint or redemption recorded on that chain, using its
@@ -2131,22 +2131,27 @@ not backfilled.
 **What is captured**: every balance the live in-memory inventory view has polled
 at least once that ET day, across both trading venues (onchain Raindex
 market-making, offchain Alpaca hedging) and the wallet-transit locations equity
-or cash may sit at in between (Ethereum wallet, Base wallet unwrapped, Base
-wallet wrapped). A venue never polled produces no row; a venue polled to a
-genuine zero balance still produces a `0` row. The capture only proceeds once
-every configured balance has been polled at least once that run -- a
-partially-hydrated view (e.g. equity seen onchain but not yet offchain) is
-skipped and retried shortly after, since a captured day can never be amended.
-The required market-making balances are per hedged chain: each chain requires
-the equities and the cash its own assets table declares, so a chain the poller
-reads is a chain the capture waits for. This is a PRESENCE check, not a
-freshness check: a balance that is merely present (e.g. replayed from a
-persisted `InventorySnapshot` at startup, without ever being re-polled this run)
-still satisfies it on its own. An earlier attempt at a time-window freshness
-gate was reverted: the underlying `InventorySnapshot` suppresses events, and
-their watermarks, on unchanged balances, so tying freshness to that watermark
-freezes on a static book and the window would eventually block every future
-capture.
+or cash may sit at in between (USDC in the Ethereum and Base wallets, and the
+unwrapped and wrapped equity in the bot wallet of every chain whose equity
+wallet is polled). Each row's location is `Onchain { chain, form }` (form
+market-making, wallet unwrapped or wallet wrapped) or `Offchain`, persisted as
+`<form>:<chain>` or `offchain`, so every chain's balances stay attributable. A
+venue never polled produces no row; a venue polled to a genuine zero balance
+still produces a `0` row. The capture only proceeds once every configured
+balance has been polled at least once that run -- a partially-hydrated view
+(e.g. equity seen onchain but not yet offchain) is skipped and retried shortly
+after, since a captured day can never be amended. The required market-making
+balances are per hedged chain: each chain requires the equities and the cash its
+own assets table declares, so a chain the poller reads is a chain the capture
+waits for. Likewise each chain whose equity wallet is polled requires its
+unwrapped and wrapped wallet slots for its own equities, like Base's. This is a
+PRESENCE check, not a freshness check: a balance that is merely present (e.g.
+replayed from a persisted `InventorySnapshot` at startup, without ever being
+re-polled this run) still satisfies it on its own. An earlier attempt at a
+time-window freshness gate was reverted: the underlying `InventorySnapshot`
+suppresses events, and their watermarks, on unchanged balances, so tying
+freshness to that watermark freezes on a static book and the window would
+eventually block every future capture.
 
 A vault-registry symbol can outlive its config entry (registry seeds are
 permanent events, config entries are not), and such a symbol has no wrapper

@@ -33,9 +33,9 @@
 //!
 //! Keyed by `(PortfolioLocation, PortfolioAsset)`, the SAME identity
 //! `InventoryView::to_portfolio_snapshot_rows` and the presence gate use --
-//! keying by location alone would collapse the two co-located rows at
-//! `PortfolioLocation::BaseWalletUnwrapped` (USDC and unwrapped equity are
-//! distinct assets tracked independently at that one location).
+//! keying by location alone would collapse the two co-located rows in a
+//! chain's unwrapped wallet slot (USDC and unwrapped equity are distinct
+//! assets tracked independently at that one location).
 
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
@@ -179,6 +179,7 @@ mod tests {
     use st0x_execution::Symbol;
 
     use super::*;
+    use crate::inventory::view::OnchainForm;
 
     fn symbol(value: &str) -> Symbol {
         Symbol::new(value).unwrap()
@@ -192,7 +193,10 @@ mod tests {
         let poll_freshness = PollFreshness::new();
 
         assert!(!poll_freshness.observed_since(
-            PortfolioLocation::MarketMaking(Chain::Base),
+            PortfolioLocation::Onchain {
+                chain: Chain::Base,
+                form: OnchainForm::MarketMaking
+            },
             &PortfolioAsset::Usdc,
             DateTime::<Utc>::MIN_UTC
         ));
@@ -204,12 +208,18 @@ mod tests {
         let poll_freshness = PollFreshness::new();
 
         poll_freshness.observe(
-            PortfolioLocation::MarketMaking(Chain::Base),
+            PortfolioLocation::Onchain {
+                chain: Chain::Base,
+                form: OnchainForm::MarketMaking,
+            },
             PortfolioAsset::Usdc,
         );
 
         assert!(poll_freshness.observed_since(
-            PortfolioLocation::MarketMaking(Chain::Base),
+            PortfolioLocation::Onchain {
+                chain: Chain::Base,
+                form: OnchainForm::MarketMaking
+            },
             &PortfolioAsset::Usdc,
             before
         ));
@@ -223,14 +233,20 @@ mod tests {
         let poll_freshness = PollFreshness::new();
 
         poll_freshness.observe(
-            PortfolioLocation::MarketMaking(Chain::Base),
+            PortfolioLocation::Onchain {
+                chain: Chain::Base,
+                form: OnchainForm::MarketMaking,
+            },
             PortfolioAsset::Usdc,
         );
 
         let floor_in_the_future = Utc::now() + chrono::Duration::hours(1);
         assert!(
             !poll_freshness.observed_since(
-                PortfolioLocation::MarketMaking(Chain::Base),
+                PortfolioLocation::Onchain {
+                    chain: Chain::Base,
+                    form: OnchainForm::MarketMaking
+                },
                 &PortfolioAsset::Usdc,
                 floor_in_the_future
             ),
@@ -243,33 +259,48 @@ mod tests {
         let poll_freshness = PollFreshness::new();
 
         poll_freshness.observe(
-            PortfolioLocation::MarketMaking(Chain::Base),
+            PortfolioLocation::Onchain {
+                chain: Chain::Base,
+                form: OnchainForm::MarketMaking,
+            },
             PortfolioAsset::Usdc,
         );
 
         assert!(!poll_freshness.observed_since(
-            PortfolioLocation::Hedging,
+            PortfolioLocation::Offchain,
             &PortfolioAsset::Usdc,
             DateTime::<Utc>::MIN_UTC
         ));
     }
 
     /// The exact regression this module exists to prevent: keying by
-    /// location alone would collapse USDC and unwrapped equity at
-    /// `BaseWalletUnwrapped` into one slot.
+    /// location alone would collapse USDC and unwrapped equity in Base's
+    /// unwrapped wallet slot into one.
     #[test]
     fn base_wallet_unwrapped_usdc_and_equity_are_tracked_as_distinct_slots() {
         let poll_freshness = PollFreshness::new();
 
-        poll_freshness.observe(PortfolioLocation::BaseWalletUnwrapped, PortfolioAsset::Usdc);
+        poll_freshness.observe(
+            PortfolioLocation::Onchain {
+                chain: Chain::Base,
+                form: OnchainForm::WalletUnwrapped,
+            },
+            PortfolioAsset::Usdc,
+        );
 
         assert!(poll_freshness.observed_since(
-            PortfolioLocation::BaseWalletUnwrapped,
+            PortfolioLocation::Onchain {
+                chain: Chain::Base,
+                form: OnchainForm::WalletUnwrapped
+            },
             &PortfolioAsset::Usdc,
             DateTime::<Utc>::MIN_UTC
         ));
         assert!(!poll_freshness.observed_since(
-            PortfolioLocation::BaseWalletUnwrapped,
+            PortfolioLocation::Onchain {
+                chain: Chain::Base,
+                form: OnchainForm::WalletUnwrapped
+            },
             &PortfolioAsset::Equity(symbol("AAPL")),
             DateTime::<Utc>::MIN_UTC
         ));
@@ -279,13 +310,13 @@ mod tests {
     fn re_observing_an_already_fresh_slot_advances_its_timestamp() {
         let poll_freshness = PollFreshness::new();
 
-        poll_freshness.observe(PortfolioLocation::Hedging, PortfolioAsset::Usdc);
+        poll_freshness.observe(PortfolioLocation::Offchain, PortfolioAsset::Usdc);
         let floor_between_the_two_observations = Utc::now();
-        poll_freshness.observe(PortfolioLocation::Hedging, PortfolioAsset::Usdc);
+        poll_freshness.observe(PortfolioLocation::Offchain, PortfolioAsset::Usdc);
 
         assert!(
             poll_freshness.observed_since(
-                PortfolioLocation::Hedging,
+                PortfolioLocation::Offchain,
                 &PortfolioAsset::Usdc,
                 floor_between_the_two_observations
             ),
@@ -298,10 +329,10 @@ mod tests {
         let poll_freshness = PollFreshness::new();
         let clone = poll_freshness.clone();
 
-        clone.observe(PortfolioLocation::Hedging, PortfolioAsset::Usdc);
+        clone.observe(PortfolioLocation::Offchain, PortfolioAsset::Usdc);
 
         assert!(poll_freshness.observed_since(
-            PortfolioLocation::Hedging,
+            PortfolioLocation::Offchain,
             &PortfolioAsset::Usdc,
             DateTime::<Utc>::MIN_UTC
         ));

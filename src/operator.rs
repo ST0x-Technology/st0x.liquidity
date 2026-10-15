@@ -631,7 +631,9 @@ pub mod equity_transfer {
 }
 
 pub mod inventory {
-    pub use crate::inventory::{PortfolioAsset, PortfolioBalanceRow, PortfolioLocation};
+    pub use crate::inventory::{
+        OnchainForm, PortfolioAsset, PortfolioBalanceRow, PortfolioLocation,
+    };
 
     #[cfg(feature = "test-support")]
     pub use st0x_config::ImbalanceThreshold;
@@ -792,25 +794,34 @@ pub mod portfolio_snapshot {
 
         // `EquityMarkSet` prices EVERY row of the symbol (the projection's UPDATE
         // has no location filter). A symbol with no `[chains.<name>.trading.assets.equities]` entry has
-        // no wrapper entry either, so the capture leaves its MarketMaking and
-        // BaseWalletWrapped rows in vault-share units -- applying an underlying
-        // share price to those misvalues the day, which is exactly what the
-        // capture's forced-absent mark prevents. Refuse rather than let one repair
-        // reintroduce it. Rows at those locations exist only when nonzero: the
-        // capture drops the empty ones.
+        // no wrapper entry either, so the capture leaves its market-making and
+        // wrapped-wallet rows, on any chain, in vault-share units -- applying an
+        // underlying share price to those misvalues the day, which is exactly what
+        // the capture's forced-absent mark prevents. Refuse rather than let one
+        // repair reintroduce it. Rows at those locations exist only when nonzero:
+        // the capture drops the empty ones.
         if !configured_equity_symbols(ctx).contains(symbol) {
-            let market_making = PortfolioLocation::MarketMaking(ctx.chains.primary().chain);
-            let unconverted: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM portfolio_snapshot \
-                 WHERE et_day = ? AND asset = ? AND location IN (?, ?)",
+            let locations: Vec<String> = sqlx::query_scalar(
+                "SELECT location FROM portfolio_snapshot WHERE et_day = ? AND asset = ?",
             )
             .bind(day.to_string())
             .bind(symbol.to_string())
-            .bind(market_making.to_string())
-            .bind(PortfolioLocation::BaseWalletWrapped.to_string())
-            .fetch_one(pool)
+            .fetch_all(pool)
             .await
             .context("failed to check for unconverted wrapped-equity rows")?;
+
+            let locations = locations
+                .iter()
+                .map(|location| location.parse::<PortfolioLocation>())
+                .collect::<Result<Vec<_>, _>>()
+                .context("failed to parse a persisted portfolio snapshot location")?;
+            let unconverted = i64::try_from(
+                locations
+                    .iter()
+                    .filter(|location| location.wrapped_equity_chain().is_some())
+                    .count(),
+            )
+            .context("unconverted wrapped-equity row count exceeds i64")?;
 
             if unconverted > 0 {
                 return Err(RejectionReason::UnconvertedWrappedEquityRows {

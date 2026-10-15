@@ -29,4 +29,7 @@ pub(crate) use view::{
     ActiveUsdcRebalance, EquityVenuesError, Imbalance, Inventory, InventoryScope, InventoryView,
     InventoryViewError, Operator, TransferOp, Venue,
 };
-pub use view::{PortfolioAsset, PortfolioBalanceRow, PortfolioLocation};
+pub use view::{
+    OnchainForm, ParsePortfolioLocationError, PortfolioAsset, PortfolioBalanceRow,
+    PortfolioLocation,
+};
