@@ -409,9 +409,8 @@ async fn relay_corridor_moves_usdc_from_alpaca_to_robinhood() -> anyhow::Result<
 }
 
 /// A bot stopped while Relay holds its USDG deposit resumes the same
-/// transfer on restart: it reads the deposit's status instead of quoting,
-/// withdrawing or depositing again, proves the fill once Relay pays it, and
-/// finishes the transfer.
+/// transfer on restart: it quotes, withdraws and deposits nothing again,
+/// proves the fill once Relay pays it, and finishes the transfer.
 #[test_log::test(tokio::test)]
 async fn interrupted_relay_transfer_resumes_after_restart() -> anyhow::Result<()> {
     let corridor = RelayCorridor::start("30000", float!(10000)).await?;

@@ -380,7 +380,7 @@ fn json_response(status: u16, body: &Value) -> HttpMockResponse {
             "content-type".to_owned(),
             "application/json".to_owned(),
         )]),
-        body: Some(serde_json::to_vec(body).unwrap_or_default().into()),
+        body: Some(serde_json::to_vec(body).unwrap().into()),
     }
 }
 
