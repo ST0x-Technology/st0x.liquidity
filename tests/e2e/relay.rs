@@ -41,7 +41,7 @@ sol! {
 
 /// The fee the mock solver keeps from every fill, in basis points of the
 /// deposit.
-pub const RELAY_FEE_BPS: u64 = 5;
+const RELAY_FEE_BPS: u64 = 5;
 
 /// What a fill of a `deposit` pays after [`RELAY_FEE_BPS`].
 pub fn relay_fill_amount(deposit: U256) -> U256 {
@@ -228,7 +228,6 @@ struct RelayState {
 }
 
 /// One chain the solver watches and pays on.
-#[derive(Clone)]
 struct SolverChain {
     chain: Chain,
     endpoint: String,
@@ -426,6 +425,15 @@ fn quote_response(state: &Mutex<RelayState>, body: &[u8]) -> anyhow::Result<Valu
                 .ok_or_else(|| anyhow::anyhow!("ttl is not a number"))?,
         ),
     };
+    // `quote_body_for_test` quotes the two chains' settlement stables
+    // whatever the request names, so a request for anything else is refused.
+    anyhow::ensure!(
+        address("originCurrency")? == quote_request.origin.settlement_stable().address
+            && address("destinationCurrency")?
+                == quote_request.destination.settlement_stable().address
+            && text("tradeType")? == "EXACT_INPUT",
+        "quote request is not an exact-input swap of the settlement stables"
+    );
     let amount_out = relay_fill_amount(quote_request.amount);
 
     let mut quote = quote_body_for_test(&quote_request, amount_out, amount_out)?;
@@ -552,7 +560,11 @@ fn record_deposits(
             && deposit.token == chain.settlement_stable().address
             && deposit.amount == order.amount_in;
         if !funds_order {
-            warn!(%order_id, amount = %deposit.amount, "Relay mock saw a deposit that does not fund its order");
+            warn!(
+                %order_id,
+                amount = %deposit.amount,
+                "Relay mock saw a deposit that does not fund its order"
+            );
             continue;
         }
         if order.deposit.is_none() {

@@ -33,8 +33,8 @@ use st0x_hedge::{
 use crate::assert::{StoredEvent, assert_event_subsequence, assert_single_clean_aggregate};
 use crate::cctp::{CctpInfra, USDC_ETHEREUM};
 use crate::poll::{
-    connect_db, fetch_events_by_type, poll_for_done_job_referencing, poll_for_events_with_timeout,
-    spawn_bot,
+    connect_db, done_job_ids, fetch_events_by_type, poll_for_done_job_referencing,
+    poll_for_events_with_timeout, spawn_bot,
 };
 use crate::rebalancing::assertions::{test_broker_ctx, test_wallet};
 use crate::relay::{RELAY_API_KEY, RelayMock, RobinhoodChain, SeenDeposit, relay_fill_amount};
@@ -78,6 +78,20 @@ const ROBINHOOD_TO_ALPACA_EVENTS: &[&str] = &[
     "UsdcRebalanceEvent::DepositConfirmed",
     "UsdcRebalanceEvent::ConversionInitiated",
     "UsdcRebalanceEvent::ConversionConfirmed",
+];
+
+/// The Alpaca-to-chain transfer's events, in order.
+const ALPACA_TO_ROBINHOOD_EVENTS: &[&str] = &[
+    "UsdcRebalanceEvent::ConversionInitiated",
+    "UsdcRebalanceEvent::ConversionConfirmed",
+    "UsdcRebalanceEvent::Initiated",
+    "UsdcRebalanceEvent::WithdrawalConfirmed",
+    "UsdcRebalanceEvent::SwapQuoted",
+    "UsdcRebalanceEvent::SwapDepositPrepared",
+    "UsdcRebalanceEvent::SwapDeposited",
+    "UsdcRebalanceEvent::RelayFillVerified",
+    "UsdcRebalanceEvent::DepositInitiated",
+    "UsdcRebalanceEvent::DepositConfirmed",
 ];
 
 /// The bot's world for one test: the shared harness (Base, the Alpaca
@@ -381,21 +395,7 @@ async fn relay_corridor_moves_usdc_from_alpaca_to_robinhood() -> anyhow::Result<
 
     let events = corridor.usdc_rebalance_events().await?;
     single_aggregate_id(&events);
-    assert_event_subsequence(
-        &events,
-        &[
-            "UsdcRebalanceEvent::ConversionInitiated",
-            "UsdcRebalanceEvent::ConversionConfirmed",
-            "UsdcRebalanceEvent::Initiated",
-            "UsdcRebalanceEvent::WithdrawalConfirmed",
-            "UsdcRebalanceEvent::SwapQuoted",
-            "UsdcRebalanceEvent::SwapDepositPrepared",
-            "UsdcRebalanceEvent::SwapDeposited",
-            "UsdcRebalanceEvent::RelayFillVerified",
-            "UsdcRebalanceEvent::DepositInitiated",
-            "UsdcRebalanceEvent::DepositConfirmed",
-        ],
-    );
+    assert_event_subsequence(&events, ALPACA_TO_ROBINHOOD_EVENTS);
     corridor
         .assert_settled(
             "8000",
@@ -440,6 +440,12 @@ async fn interrupted_relay_transfer_resumes_after_restart() -> anyhow::Result<()
         "the fill was held, so the first bot cannot have proven it",
     );
     let quotes_before_restart = corridor.relay.quotes_served();
+    let jobs_done_before_restart = done_job_ids(
+        &corridor.infra.db_path,
+        "TransferUsdcToHedging",
+        &transfer_id,
+    )
+    .await?;
 
     corridor.relay.release_fills();
     let mut bot = spawn_bot(corridor.ctx()?);
@@ -457,6 +463,7 @@ async fn interrupted_relay_transfer_resumes_after_restart() -> anyhow::Result<()
         &corridor.infra.db_path,
         "TransferUsdcToHedging",
         &transfer_id,
+        &jobs_done_before_restart,
         TRANSFER_TIMEOUT,
     )
     .await;
