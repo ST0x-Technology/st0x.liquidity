@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::network::{EthereumWallet, TransactionBuilder};
 use alloy::node_bindings::{Anvil, AnvilInstance};
@@ -26,7 +26,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use st0x_bridge::relay::{
-    BasisPoints, QuoteRequest, RelayEndContracts, deploy_relay_end, quote_body_for_test,
+    BasisPoints, QuoteRequest, RelayEndContracts, TestQuote, deploy_relay_end, quote_body_for_test,
 };
 use st0x_evm::{Chain, IERC20};
 use st0x_hedge::bindings::{IRaindexV6, RaindexV6};
@@ -436,11 +436,24 @@ fn quote_response(state: &Mutex<RelayState>, body: &[u8]) -> anyhow::Result<Valu
     );
     let amount_out = relay_fill_amount(quote_request.amount);
 
-    let mut quote = quote_body_for_test(&quote_request, amount_out, amount_out)?;
-    let order_id: B256 = serde_json::from_value(quote["protocol"]["v2"]["orderId"].clone())?;
     // Relay's request id is its own handle, distinct from the order id.
     let request_id = B256::random();
-    quote["requestId"] = json!(request_id);
+    let deadline = u32::try_from(
+        (SystemTime::now() + quote_request.ttl)
+            .duration_since(UNIX_EPOCH)?
+            .as_secs(),
+    )?;
+    let quote = quote_body_for_test(
+        &quote_request,
+        TestQuote {
+            request_id,
+            expected_out: amount_out,
+            minimum_out: amount_out,
+            salt: B256::random(),
+            deadline,
+        },
+    )?;
+    let order_id: B256 = serde_json::from_value(quote["protocol"]["v2"]["orderId"].clone())?;
 
     {
         let mut state = lock(state);
