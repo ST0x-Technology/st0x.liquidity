@@ -5464,15 +5464,16 @@ signs, or redeposits on a refusal, as the bot's own retry does. An
 Alpaca-to-chain transfer held at `WithdrawalComplete` after a refused binding
 quote resumes the same way, `--direction to-raindex`, or is failed with
 `fail-usdc-transfer` and reconciled. On the shared Ethereum wallet's credit
-ledger an Ethereum-origin `SwapQuoted` is held credit, a persisted Ethereum pair
-is in flight, and a refund paid in Ethereum USDC (`SwapRefunded` on the Ethereum
-side) is held credit, so a Base deposit send that would spend the USDC a Relay
-swap is about to deposit or was refunded pages a shortfall. The ledger only
-pages: it reserves nothing and does not block the send. A persisted pair has no
-operator exit in this build (`transfer reconcile` and `fail-usdc-transfer`
-refuse `SwapDepositPrepared`, and a resume only sends the same bytes again), so
-a pending Relay approve or deposit is never cancelled or replaced at its nonce
-by hand: the transfer would keep its guard with nothing to move it on.
+ledger an Ethereum-origin `SwapQuoted` is held credit, and so is the
+`SwapOverdeposited` hold recorded from it, a persisted Ethereum pair is in
+flight, and a refund paid in Ethereum USDC (`SwapRefunded` on the Ethereum side)
+is held credit, so a Base deposit send that would spend the USDC a Relay swap is
+about to deposit or was refunded pages a shortfall. The ledger only pages: it
+reserves nothing and does not block the send. A persisted pair has no operator
+exit in this build (`transfer reconcile` and `fail-usdc-transfer` refuse
+`SwapDepositPrepared`, and a resume only sends the same bytes again), so a
+pending Relay approve or deposit is never cancelled or replaced at its nonce by
+hand: the transfer would keep its guard with nothing to move it on.
 `transfer recheck --kind usdc` reads a held escrow (`SwapEscrowUnresolved`,
 `SwapFailed`) again and adopts a late fill or refund (see "Relay recovery"); it
 refuses every other Relay state, and a Relay `DepositFailed` is settled with

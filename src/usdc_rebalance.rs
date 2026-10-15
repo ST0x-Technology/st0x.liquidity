@@ -2501,7 +2501,14 @@ impl UsdcRebalance {
             }),
             // An Ethereum-origin swap: quoted, its input is still in the
             // wallet; once a pair is signed it may be on chain.
+            // The overdeposit hold keeps what its `SwapQuoted` held: no pair
+            // was signed for the current quote.
             Self::SwapQuoted {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                ..
+            }
+            | Self::SwapOverdeposited {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 ..
@@ -3608,6 +3615,7 @@ async fn ethereum_credit_candidate_ids(pool: &SqlitePool) -> Result<Vec<String>,
                'UsdcRebalanceEvent::SwapDepositPrepared', \
                'UsdcRebalanceEvent::SwapRequoted', \
                'UsdcRebalanceEvent::SwapDepositReverted', \
+               'UsdcRebalanceEvent::SwapOverdeposited', \
                'UsdcRebalanceEvent::SwapRefunded', \
                'UsdcRebalanceEvent::RelayFillVerified', \
                'UsdcRebalanceEvent::SwapCompletionRecovered', \
@@ -9089,7 +9097,16 @@ mod tests {
                 state.prepared_swap_envelopes(),
                 Vec::<&PreparedTransaction>::new()
             );
-            assert_eq!(state.ethereum_wallet_credit(), None, "{direction:?}");
+            assert_eq!(
+                state.ethereum_wallet_credit(),
+                match direction {
+                    RebalanceDirection::AlpacaToBase => {
+                        Some(EthereumWalletCredit::Held(Usdc::new(float!(100))))
+                    }
+                    RebalanceDirection::BaseToAlpaca => None,
+                },
+                "{direction:?}"
+            );
             assert_eq!(
                 state.pre_burn_fail_eligibility(),
                 PreBurnFailEligibility::RelayHeldOutsideVault
