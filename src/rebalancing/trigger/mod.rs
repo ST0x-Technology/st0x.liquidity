@@ -12350,6 +12350,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recheck_forced_offchain_reconcile_keeps_the_rebuilt_mint_inflight() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mint_id = issuer_request_id("mint-recheck-reconcile-before-dispatch");
+        let tok = tokenization_request_id("TOK-1");
+        let (trigger, failed) = failed_mint_after_broker_snapshot(
+            &symbol,
+            &mint_id,
+            shares(100),
+            float!(10),
+            shares(90),
+        )
+        .await;
+
+        trigger
+            .rebuild_mint_tracking_for_recovery(&mint_id, &failed, tok.clone())
+            .await
+            .unwrap()
+            .expect_claimed();
+        let [(_, generation)] = trigger
+            .divergence_gate
+            .claim_pending_offchain_equity_reconciles()[..]
+        else {
+            panic!("the recheck must request exactly one offchain reconcile");
+        };
+
+        // The broker read the recheck forced lands before the recovery event
+        // completes the rebuilt inflight.
+        trigger
+            .on_snapshot(InventorySnapshotEvent::OffchainEquityReconciled {
+                symbol: symbol.clone(),
+                position: shares(85),
+                fetched_at: Utc::now() + ChronoDuration::seconds(1),
+                ledger_position: Some(shares(90)),
+                consecutive_polls: 0,
+                generation: Some(generation),
+            })
+            .await
+            .unwrap();
+
+        let view = trigger.inventory.read().await.clone();
+        assert_eq!(
+            view.equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(10)),
+            "the forced reconcile must keep the rebuilt mint's Hedging inflight"
+        );
+        assert_eq!(
+            view.equity_available(&symbol, Venue::Hedging),
+            Some(shares(90))
+        );
+        assert_eq!(
+            trigger.divergence_gate.pending_offchain_equity_reconciles(),
+            vec![symbol.clone()],
+            "a reconcile aborted while the mint owns the inflight must stay pending"
+        );
+
+        trigger
+            .on_mint(
+                mint_id.clone(),
+                provider_completion_recovered(&mint_id, tok, 10),
+            )
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await.clone();
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(0))
+        );
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(10)),
+            "the recovery event must complete the inflight the reconcile kept"
+        );
+    }
+
+    #[tokio::test]
     async fn recheck_recovers_a_mint_whose_shares_left_all_of_hedging_available() {
         let symbol = Symbol::new("AAPL").unwrap();
         let mint_id = issuer_request_id("mint-recheck-short-available");

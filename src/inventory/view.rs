@@ -6989,6 +6989,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn force_apply_offchain_equity_keeps_only_an_active_mints_hedging_inflight() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let tsla = Symbol::new("TSLA").unwrap();
+        let now = Utc::now();
+        let view = InventoryView::default()
+            .with_equity(aapl.clone(), shares(0), shares(100))
+            .with_equity(tsla.clone(), shares(0), shares(50))
+            .set_active_mint(aapl.clone(), Chain::Base, IssuerRequestId::generate())
+            .update_equity(
+                &aapl,
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, shares(30)),
+                now,
+            )
+            .unwrap()
+            .update_equity(
+                &tsla,
+                Inventory::set_inflight(Venue::Hedging, shares(5)),
+                now,
+            )
+            .unwrap();
+
+        let forced = view
+            .force_apply_snapshot_event(
+                &InventorySnapshotEvent::OffchainEquity {
+                    positions: BTreeMap::from([
+                        (aapl.clone(), shares(68)),
+                        (tsla.clone(), shares(40)),
+                    ]),
+                    fetched_at: now,
+                },
+                now,
+                Arc::new(InventoryViewError::UsdBalanceConversion(0)),
+            )
+            .unwrap();
+
+        assert_eq!(
+            forced.equity_available(&aapl, Venue::Hedging),
+            Some(shares(68)),
+            "the broker reading must still correct the active mint's available"
+        );
+        assert_eq!(
+            forced.equity_inflight(&aapl, Venue::Hedging),
+            Some(shares(30)),
+            "the active mint must stay the only writer of its Hedging inflight"
+        );
+        assert_eq!(
+            forced.equity_available(&tsla, Venue::Hedging),
+            Some(shares(40))
+        );
+        assert_eq!(
+            forced.equity_inflight(&tsla, Venue::Hedging),
+            Some(FractionalShares::ZERO),
+            "a symbol without an active mint keeps the forced write's inflight clear"
+        );
+    }
+
     /// The cash twin of the force-path gate above: while any hedge order is
     /// open, `force_apply_snapshot_event` must not write the venue-level
     /// `OffchainUsd` reading -- the fill delta owns the cash balance and the
