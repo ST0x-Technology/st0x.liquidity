@@ -9534,10 +9534,19 @@ impl RebalancingService {
         self.divergence_gate
             .request_offchain_equity_reconcile(symbol);
 
+        // Only an in-flight left in place can still be the one a `Start`
+        // debited. An in-flight re-set from zero debited nothing, so a late
+        // failure must not cancel it into available even if the tracking
+        // still reads `Started` (snapshot-error recovery wiped its in-flight).
         let mut mint_tracking = self.mint_tracking.write().await;
-        let hedging_start = mint_tracking
-            .get(id)
-            .map_or(HedgingStart::NotStarted, |tracking| tracking.hedging_start);
+        let hedging_start = match rollback {
+            RecoveryRollback::TrackingOnly => mint_tracking
+                .get(id)
+                .map_or(HedgingStart::NotStarted, |tracking| tracking.hedging_start),
+            RecoveryRollback::ClearInflight
+            | RecoveryRollback::RestoreTombstone { .. }
+            | RecoveryRollback::RestoreRedemptionInventory { .. } => HedgingStart::NotStarted,
+        };
         mint_tracking.insert(
             id.clone(),
             MintTracking {
