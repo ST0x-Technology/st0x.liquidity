@@ -7790,12 +7790,25 @@ When `InventoryView` applies an equity snapshot (`OnchainEquity` for the
 MarketMaking venue, `OffchainEquity` for the Hedging venue), it treats the
 snapshot as the complete picture of that venue: any symbol already tracked at
 the venue but absent from the snapshot is zeroed at that venue, subject to the
-same staleness guards (snapshot watermark, inflight transfers, last
-rebalancing). This keeps the live view consistent with the fully-replaced
-persisted snapshot rather than retaining a stale balance. It relies on both
-pollers emitting complete venue snapshots: offchain polling seeds an explicit
-zero for every configured symbol (above), and onchain polling emits a balance
-for every discovered vault in the monotonic vault registry.
+same staleness guards (snapshot watermark, inflight transfers, active mint or
+redemption ownership, last rebalancing). This keeps the live view consistent
+with the fully-replaced persisted snapshot rather than retaining a stale
+balance. It relies on both pollers emitting complete venue snapshots: offchain
+polling seeds an explicit zero for every configured symbol (above), and onchain
+polling emits a balance for every discovered vault in the monotonic vault
+registry.
+
+Startup hydration seeds persisted equity balances even when a restored active
+mint or redemption owns the symbol; it retains the existing inflight and
+freshness guards. Live reads resume the full ownership guard. This prevents
+unchanged-value deduplication from leaving a restored transfer's venue empty.
+
+When transfer cleanup releases ownership, its MarketMaking scope requests fresh
+reconciliation through the existing gate, even when an unchanged read was
+deduplicated before the view could record a skip. Requests stay on the
+transfer's chain, and Hedging requests require a deferred broker observation.
+Cleanup that preserves recovery ownership does not request these
+reconciliations.
 
 `InventoryView` listens to trading events (onchain/offchain fills),
 `TokenizedEquityMintEvent`, `EquityRedemptionEvent`, `UsdcRebalanceEvent`, and

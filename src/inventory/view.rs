@@ -97,6 +97,15 @@ pub(crate) enum InventoryScope {
     MarketMaking(Chain),
 }
 
+#[derive(Clone, Copy)]
+enum EquitySnapshotAdmission<'snapshot> {
+    Live {
+        forced_symbols: &'snapshot BTreeSet<Symbol>,
+        protected_symbols: &'snapshot BTreeSet<Symbol>,
+    },
+    Hydration,
+}
+
 impl Venue {
     fn other(self) -> Self {
         match self {
@@ -540,7 +549,7 @@ where
     }
 
     /// Apply a snapshot the caller already admitted through its own
-    /// symbol-level guards (the chain-scoped inflight and staleness checks in
+    /// symbol-level guards (the chain-scoped transfer ownership and staleness checks in
     /// `InventoryView::equity_snapshot_would_apply`). Unlike
     /// [`Self::on_snapshot`], inflight at another venue or chain does not
     /// block it; inflight in the target slot still does
@@ -2626,6 +2635,14 @@ impl InventoryView {
         self
     }
 
+    /// Whether a broker observation is still deferred in the live view.
+    /// Cleanup can request a fresh reconciliation without relying on the
+    /// snapshot aggregate emitting an unchanged value again.
+    pub(crate) fn has_deferred_offchain_equity_snapshot(&self, symbol: &Symbol) -> bool {
+        self.offchain_equity_snapshot_skip_streaks
+            .contains_key(symbol)
+    }
+
     fn reset_equity_snapshot_skip(mut self, symbol: &Symbol, venue: Venue, chain: Chain) -> Self {
         match venue {
             Venue::MarketMaking => {
@@ -2844,6 +2861,7 @@ impl InventoryView {
         venue: Venue,
         chain: Chain,
         fetched_at: DateTime<Utc>,
+        guard_active_transfers: bool,
     ) -> Result<bool, InventoryViewError> {
         if self
             .equity_snapshot_watermark(symbol, venue, chain)
@@ -2859,7 +2877,8 @@ impl InventoryView {
         // writers derive from the same chain, so the DELTA yields instead --
         // a fill covered by an applied snapshot's block watermark is skipped
         // at the source (`onchain_fill_absorbed_by_*`, ADR 0018) and
-        // snapshots here are never blocked. Exhaustive so a new venue forces
+        // snapshots here are not blocked by hedge orders. Transfer ownership
+        // still guards both venues below. Exhaustive so a new venue forces
         // a decision on how its second writer is reconciled.
         match venue {
             Venue::MarketMaking => {}
@@ -2890,7 +2909,12 @@ impl InventoryView {
             }
         }
 
-        if self.equity_inflight_busy(symbol, venue, chain)? {
+        let transfer_busy = if guard_active_transfers {
+            self.equity_transfer_busy(symbol, venue, chain)?
+        } else {
+            self.equity_inflight_busy(symbol, venue, chain)?
+        };
+        if transfer_busy {
             return Ok(false);
         }
 
@@ -2923,7 +2947,10 @@ impl InventoryView {
             fetched_at,
             block_number,
             now,
-            (&BTreeSet::new(), &BTreeSet::new()),
+            EquitySnapshotAdmission::Live {
+                forced_symbols: &BTreeSet::new(),
+                protected_symbols: &BTreeSet::new(),
+            },
         )
     }
 
@@ -2944,7 +2971,10 @@ impl InventoryView {
             fetched_at,
             block_number,
             now,
-            (&BTreeSet::new(), protected_symbols),
+            EquitySnapshotAdmission::Live {
+                forced_symbols: &BTreeSet::new(),
+                protected_symbols,
+            },
         )
     }
 
@@ -2965,7 +2995,10 @@ impl InventoryView {
             fetched_at,
             block_number,
             now,
-            (forced_symbols, protected_symbols),
+            EquitySnapshotAdmission::Live {
+                forced_symbols,
+                protected_symbols,
+            },
         )
     }
 
@@ -2977,9 +3010,16 @@ impl InventoryView {
         fetched_at: DateTime<Utc>,
         block_number: Option<u64>,
         now: DateTime<Utc>,
-        overrides: (&BTreeSet<Symbol>, &BTreeSet<Symbol>),
+        admission: EquitySnapshotAdmission<'_>,
     ) -> Result<Self, InventoryViewError> {
-        let (forced_symbols, protected_symbols) = overrides;
+        let empty_symbols = BTreeSet::new();
+        let (forced_symbols, protected_symbols, guard_active_transfers) = match admission {
+            EquitySnapshotAdmission::Live {
+                forced_symbols,
+                protected_symbols,
+            } => (forced_symbols, protected_symbols, true),
+            EquitySnapshotAdmission::Hydration => (&empty_symbols, &empty_symbols, false),
+        };
         let snapshot: Vec<(Symbol, FractionalShares)> = balances
             .into_iter()
             .map(|(symbol, balance)| (symbol.clone(), *balance))
@@ -3080,8 +3120,13 @@ impl InventoryView {
                     return Ok((view, applied_symbols));
                 }
 
-                let should_record_watermark =
-                    view.equity_snapshot_would_apply(symbol, venue, chain, fetched_at)?;
+                let should_record_watermark = view.equity_snapshot_would_apply(
+                    symbol,
+                    venue,
+                    chain,
+                    fetched_at,
+                    guard_active_transfers,
+                )?;
                 if !should_record_watermark {
                     let view = view.note_equity_snapshot_skip(symbol, venue, chain);
                     return Ok::<_, InventoryViewError>((view, applied_symbols));
@@ -3611,6 +3656,10 @@ impl InventoryView {
         self.apply_snapshot_hydration_event_with_format(event, now, false)
     }
 
+    /// Seed persisted equity balances despite restored active slots: the first
+    /// live poll can deduplicate unchanged values and cannot seed them later.
+    /// Inflight and freshness guards remain in effect.
+    ///
     /// Saved provider entries can still name a redemption whose later terminal
     /// event seeded its exposure at startup. Those entries are not current
     /// ownership and must not be added to the restored total a second time.
@@ -3658,11 +3707,44 @@ impl InventoryView {
                 let redemptions = exclude_stranded(redemptions, *chain);
                 self.apply_inflight_redemptions_at(*chain, &redemptions, *fetched_at, now)
             }
-            InventorySnapshotEvent::OnchainEquity { .. }
-            | InventorySnapshotEvent::OnchainEquityReconciled { .. }
-            | InventorySnapshotEvent::OnchainUsdc { .. }
+            InventorySnapshotEvent::OnchainEquity {
+                chain,
+                balances,
+                fetched_at,
+                block_number,
+            }
+            | InventorySnapshotEvent::OnchainEquityReconciled {
+                chain,
+                balances,
+                fetched_at,
+                block_number,
+                ..
+            } => self.apply_equity_snapshot_with_overrides(
+                Venue::MarketMaking,
+                *chain,
+                balances.iter(),
+                *fetched_at,
+                *block_number,
+                now,
+                EquitySnapshotAdmission::Hydration,
+            ),
+            InventorySnapshotEvent::OffchainEquity {
+                positions,
+                fetched_at,
+            } => {
+                let primary_chain = self.primary_chain;
+                self.apply_equity_snapshot_with_overrides(
+                    Venue::Hedging,
+                    primary_chain,
+                    positions.iter(),
+                    *fetched_at,
+                    None,
+                    now,
+                    EquitySnapshotAdmission::Hydration,
+                )
+            }
+            InventorySnapshotEvent::OnchainUsdc { .. }
             | InventorySnapshotEvent::OnchainUsdcReconciled { .. }
-            | InventorySnapshotEvent::OffchainEquity { .. }
             | InventorySnapshotEvent::OffchainEquityReconciled { .. }
             | InventorySnapshotEvent::OffchainUsd { .. }
             | InventorySnapshotEvent::OffchainUsdReconciled { .. }
@@ -4698,6 +4780,7 @@ mod tests {
     use st0x_float_macro::float;
 
     use super::*;
+    use crate::inventory::divergence::ReconciliationGeneration;
     use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotCommand};
     use crate::offchain::order::OffchainOrderId;
 
@@ -10593,6 +10676,239 @@ mod tests {
 
     const ROBINHOOD_WATERMARK_AGE: Duration = Duration::seconds(10);
     const BASE_WATERMARK_AGE: Duration = Duration::seconds(4);
+
+    #[test]
+    fn hydration_keeps_redemption_ownership_and_existing_inflight_guards() {
+        let symbol = Symbol::new("SPYM").unwrap();
+        let now = Utc::now();
+        let redemption_id = RedemptionAggregateId(Uuid::new_v4());
+        let owned = two_chain_spym_view(&symbol, now).set_active_redemption(
+            symbol.clone(),
+            Chain::Base,
+            redemption_id.clone(),
+        );
+        let inflight = owned
+            .clone()
+            .update_equity_at(
+                &symbol,
+                Chain::Base,
+                Inventory::set_inflight(Venue::MarketMaking, shares(2)),
+                now,
+            )
+            .unwrap();
+        let fetched_at = now + Duration::seconds(1);
+        let snapshot = InventorySnapshotEvent::OnchainEquity {
+            chain: Chain::Base,
+            balances: BTreeMap::from([(symbol.clone(), shares(3))]),
+            fetched_at,
+            block_number: Some(100),
+        };
+
+        for (view, expected) in [(owned, shares(3)), (inflight, shares(10))] {
+            let hydrated = view
+                .apply_new_format_hydration_event(&snapshot, fetched_at)
+                .unwrap();
+            assert_eq!(
+                hydrated.onchain_equity_available_at(&symbol, Chain::Base),
+                Some(expected),
+                "hydration ignores restored ownership but retains inflight protection"
+            );
+            assert_eq!(hydrated.active_redemption(&symbol), Some(&redemption_id));
+            let watermark =
+                hydrated.equity_snapshot_watermark(&symbol, Venue::MarketMaking, Chain::Base);
+            let live = hydrated
+                .apply_snapshot_event(
+                    &InventorySnapshotEvent::OnchainEquity {
+                        chain: Chain::Base,
+                        balances: BTreeMap::from([(symbol.clone(), shares(7))]),
+                        fetched_at: fetched_at + Duration::seconds(1),
+                        block_number: Some(101),
+                    },
+                    fetched_at + Duration::seconds(1),
+                )
+                .unwrap();
+            assert_eq!(
+                live.onchain_equity_available_at(&symbol, Chain::Base),
+                Some(expected),
+                "live snapshots must still defer to ownership after hydration"
+            );
+            assert_eq!(
+                live.equity_snapshot_watermark(&symbol, Venue::MarketMaking, Chain::Base),
+                watermark
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_equity_snapshots_defer_to_active_transfer_ownership() {
+        let symbol = Symbol::new("SPYM").unwrap();
+        let now = Utc::now();
+        let quiet = two_chain_spym_view(&symbol, now);
+        let minting =
+            quiet
+                .clone()
+                .set_active_mint(symbol.clone(), Chain::Base, IssuerRequestId::generate());
+        let redeeming = quiet.set_active_redemption(
+            symbol.clone(),
+            Chain::Base,
+            RedemptionAggregateId(Uuid::new_v4()),
+        );
+
+        for (label, owned) in [("mint", minting), ("redemption", redeeming)] {
+            for (balances, expected) in [
+                (BTreeMap::from([(symbol.clone(), shares(3))]), shares(3)),
+                (BTreeMap::new(), FractionalShares::ZERO),
+            ] {
+                let guarded = owned
+                    .clone()
+                    .apply_equity_snapshot(
+                        Venue::MarketMaking,
+                        Chain::Base,
+                        balances.iter(),
+                        now,
+                        Some(100),
+                        now,
+                    )
+                    .unwrap()
+                    .apply_equity_snapshot(
+                        Venue::Hedging,
+                        Chain::Base,
+                        balances.iter(),
+                        now,
+                        None,
+                        now,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    guarded.equity_available(&symbol, Venue::MarketMaking),
+                    Some(shares(10)),
+                    "{label} owns Base even without inflight, including omitted symbols"
+                );
+                assert_eq!(
+                    guarded.equity_available(&symbol, Venue::Hedging),
+                    Some(shares(10)),
+                    "{label} owns the broker balance even without inflight"
+                );
+                assert_eq!(
+                    guarded.equity_snapshot_watermark(&symbol, Venue::MarketMaking, Chain::Base),
+                    Some(now - BASE_WATERMARK_AGE)
+                );
+                assert_eq!(
+                    guarded.equity_snapshot_watermark(&symbol, Venue::Hedging, Chain::Base),
+                    None
+                );
+                assert_eq!(
+                    guarded
+                        .onchain_equity_snapshot_block_watermarks
+                        .get(&Chain::Base)
+                        .and_then(|watermarks| watermarks.get(&symbol)),
+                    None
+                );
+
+                let readable = guarded
+                    .apply_equity_snapshot(
+                        Venue::MarketMaking,
+                        Chain::Robinhood,
+                        balances.iter(),
+                        now,
+                        Some(100),
+                        now,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    readable.onchain_equity_available_at(&symbol, Chain::Robinhood),
+                    Some(expected)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_equity_snapshot_can_reconcile_an_unchanged_value() {
+        let symbol = Symbol::new("SPYM").unwrap();
+        let now = Utc::now();
+        let balances = BTreeMap::from([(symbol.clone(), shares(3))]);
+        let snapshot = snapshot_event(InventorySnapshotCommand::OnchainEquity {
+            chain: Chain::Base,
+            balances: balances.clone(),
+            fetched_at: now,
+            block_number: Some(100),
+        })
+        .await;
+        let owned = two_chain_spym_view(&symbol, now).set_active_mint(
+            symbol.clone(),
+            Chain::Base,
+            IssuerRequestId::generate(),
+        );
+        let deferred = owned.apply_snapshot_event(&snapshot, now).unwrap();
+        assert_eq!(
+            deferred.equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(10))
+        );
+        assert_eq!(
+            deferred.equity_snapshot_watermark(&symbol, Venue::MarketMaking, Chain::Base),
+            Some(now - BASE_WATERMARK_AGE)
+        );
+
+        let unchanged = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![snapshot.clone()])
+            .when(InventorySnapshotCommand::OnchainEquity {
+                chain: Chain::Base,
+                balances: balances.clone(),
+                fetched_at: now + Duration::seconds(1),
+                block_number: Some(101),
+            })
+            .await
+            .events();
+        assert_eq!(unchanged, Vec::new());
+
+        let generation = ReconciliationGeneration::for_test(1);
+        let reconciled = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![snapshot])
+            .when(InventorySnapshotCommand::ReconcileOnchainEquity {
+                chain: Chain::Base,
+                balances,
+                fetched_at: now + Duration::seconds(1),
+                block_number: Some(101),
+                generations: BTreeMap::from([(symbol.clone(), generation)]),
+            })
+            .await
+            .events();
+        assert_eq!(reconciled.len(), 1);
+        let InventorySnapshotEvent::OnchainEquityReconciled {
+            chain,
+            balances,
+            fetched_at,
+            block_number,
+            ..
+        } = &reconciled[0]
+        else {
+            panic!("expected an onchain reconciliation");
+        };
+        let forced = BTreeSet::from([symbol.clone()]);
+        for view in [deferred.clone(), deferred.clear_active_mint(&symbol)] {
+            let healed = view
+                .apply_reconciled_onchain_equity_snapshot(
+                    *chain,
+                    balances.iter(),
+                    *fetched_at,
+                    *block_number,
+                    now,
+                    &forced,
+                    &BTreeSet::new(),
+                )
+                .unwrap();
+            assert_eq!(
+                healed.equity_available(&symbol, Venue::MarketMaking),
+                Some(shares(3)),
+                "explicit reconciliation must retain its force semantics even while owned"
+            );
+            assert_eq!(
+                healed.equity_snapshot_watermark(&symbol, Venue::MarketMaking, Chain::Base),
+                Some(*fetched_at)
+            );
+        }
+    }
 
     /// Each chain's read is ordered against that chain's own watermark
     /// only. A read fetched between the two watermarks is fresh for

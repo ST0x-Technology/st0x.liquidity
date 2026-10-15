@@ -1510,8 +1510,9 @@ async fn over_target_chain_redeems_before_the_under_target_chain_mints() {
         30,
     )
     .await;
-    // The terminal event re-arms only a USDC check; the next equity tick is
-    // the next snapshot poll's, driven here by hand.
+    // The transfer's fresh vault read releases reconciliation before the
+    // next equity tick sizes the next chain's transfer.
+    reconcile_released_vault(&pool, &service, &symbol, Chain::Base, float!(30)).await;
     service.check_and_trigger_equity(&symbol).await.unwrap();
 
     let mint = fetch_pending_equity_mint_job(&apalis_pool).await;
@@ -1684,6 +1685,48 @@ async fn dry_top_ranked_chain_yields_to_the_funded_next_candidate() {
     assert_eq!(pending_equity_redemption_job_count(&apalis_pool).await, 0);
 }
 
+async fn reconcile_released_vault(
+    pool: &SqlitePool,
+    service: &Arc<RebalancingService>,
+    symbol: &Symbol,
+    chain: Chain,
+    balance: Float,
+) {
+    let generations = service
+        .divergence_gate()
+        .claim_pending_onchain_equity_reconciles(chain);
+    assert_eq!(
+        generations.keys().cloned().collect::<Vec<_>>(),
+        vec![symbol.clone()]
+    );
+    let snapshot_store = StoreBuilder::<InventorySnapshot>::new(pool.clone())
+        .with(Arc::clone(service))
+        .build(())
+        .await
+        .unwrap();
+    snapshot_store
+        .send(
+            &InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotCommand::ReconcileOnchainEquity {
+                chain,
+                balances: BTreeMap::from([(symbol.clone(), FractionalShares::new(balance))]),
+                fetched_at: Utc::now(),
+                block_number: Some(101),
+                generations,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        !service
+            .divergence_gate()
+            .has_pending_onchain_equity_reconcile(chain)
+    );
+}
+
 /// Base holds 80 of AAPL's 100 shares against a 50% target but may move
 /// only 10 per operation: the first tick redeems 10, and while that leaves
 /// Base over target, the next tick declines it as cooling down instead of
@@ -1735,6 +1778,7 @@ async fn capped_chain_cools_down_before_it_is_replanned() {
         10,
     )
     .await;
+    reconcile_released_vault(&pool, &service, &symbol, Chain::Base, float!(70)).await;
     service.check_and_trigger_equity(&symbol).await.unwrap();
 
     assert_eq!(
