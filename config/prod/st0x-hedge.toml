@@ -98,6 +98,9 @@ lifecycle = "active"
 # Block confirmations required before a submitted transaction is treated as
 # settled. Does not govern fill ingestion (controlled by ingestion_cutoff).
 required_confirmations = 3
+# Bare Alchemy endpoint: no key in the URL; every call carries a JWT signed
+# with the Cloud KMS key in ALCHEMY_JWT_KMS_KEY_VERSION and ALCHEMY_JWT_KID.
+rpc_url = "https://base-mainnet.g.alchemy.com/v2"
 
 [chains.base.trading]
 # Rain Orderbook contract on Base.
@@ -150,6 +153,7 @@ redemption_wallet = "0x3d0CD66EFA66c05d86c3d4316B03eAE87ab9E8aE"
 # no [trading] table.
 lifecycle = "active"
 required_confirmations = 12
+rpc_url = "https://eth-mainnet.g.alchemy.com/v2"
 
 # HyperEVM, same shape as Ethereum.
 
@@ -158,6 +162,7 @@ required_confirmations = 12
 # startup: no CCTP domain and no HYPE price source are wired.
 lifecycle = "observe-only"
 required_confirmations = 1
+rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
 # Robinhood Chain (an Arbitrum Orbit L2, chain id 4663): an active
 # secondary. Fills on its orderbook are ingested, validated against USDG
@@ -205,6 +210,7 @@ lifecycle = "active"
 # USDG, wrap and deposit approvals and every wrap, deposit, withdrawal,
 # unwrap and redemption transfer on 4663.
 required_confirmations = 10
+rpc_url = "https://robinhood-mainnet.g.alchemy.com/v2"
 
 [chains.robinhood.trading]
 # RaindexV6 on Robinhood Chain (st0x.raindex-deploy docs/CHAINS.md).
