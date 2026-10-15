@@ -1247,8 +1247,8 @@ where
         match before_signing {
             BeforeSigning::Proceed => {}
             BeforeSigning::Ended => return Ok(()),
-            // Past the lock: a refund at the hub is quoted again and its
-            // next pair signed under the same lock.
+            // Past the lock: Relay's status of the adopted deposit is read as
+            // for any deposit; a refund's next pair takes the lock again.
             BeforeSigning::Adopted => return Box::pin(self.read_relay_payment(id)).await,
         }
 
@@ -1792,14 +1792,15 @@ where
 
         // Every later send from the wallet waits behind their nonces.
         let deadline = Instant::now() + self.hop.bounds.quote_max_age;
-        self.hop
-            .broadcast_split_approves(id, split_approves, side, deadline)
-            .await?;
-
         match found.as_slice() {
-            [(deposit, quote)] if deposit.amount == current.amount_in => {
+            [(deposit, quote)]
+                if deposit.amount == current.amount_in && deposit.amount == quote.amount_in =>
+            {
                 // The adoption drops the approves from the transfer: nothing
                 // would send them again or book their gas after it.
+                self.hop
+                    .broadcast_split_approves(id, split_approves, side, deadline)
+                    .await?;
                 self.confirm_split_approves(id, split_approves, side)
                     .await
                     .inspect_err(|error| {
@@ -1835,10 +1836,18 @@ where
             }
         }
 
-        // The hold keeps the approves at `SwapQuoted`, so one that does not
-        // confirm yet is sent again by the next resume.
-        if let Err(error) = self.confirm_split_approves(id, split_approves, side).await {
-            warn!(target: "rebalance", %id, %error, "Holding with lone Relay approves unconfirmed; the next resume confirms them again");
+        // The hold keeps the approves at `SwapQuoted`, so one that is not
+        // sent or confirmed yet is sent again by the next resume.
+        let sent = match self
+            .hop
+            .broadcast_split_approves(id, split_approves, side, deadline)
+            .await
+        {
+            Ok(()) => self.confirm_split_approves(id, split_approves, side).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = sent {
+            warn!(target: "rebalance", %id, %error, "Holding with lone Relay approves unconfirmed; the next resume sends and confirms them again");
         }
         Ok(BeforeSigning::Ended)
     }
@@ -9129,7 +9138,11 @@ mod tests {
 
         let error = attempt().await.expect("the attempt ends").unwrap_err();
         assert!(
-            matches!(error, UsdcTransferError::RelayBridge(_)),
+            matches!(
+                &error,
+                UsdcTransferError::RelayBridge(inner)
+                    if matches!(**inner, RelayBridgeError::Evm(EvmError::TransactionDropped { .. }))
+            ),
             "got {error:?}"
         );
         assert_eq!(

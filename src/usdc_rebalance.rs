@@ -366,15 +366,14 @@ pub enum UsdcRebalanceError {
     /// `SwapQuoted`.
     #[error("order {order_id} is not a signed order this transfer can adopt")]
     SwapOrderNotRecoverable { order_id: B256 },
-    /// A found deposit of a reverted order for another input than the current
-    /// quote's, as one of an order quoted before a refund re-quote is.
-    #[error(
-        "the deposit of order {order_id} is for {deposited}, not the current quote's {current}"
-    )]
+    /// A found deposit of a reverted order for another input than its order's
+    /// quote or the current quote, as one of an order quoted before a refund
+    /// re-quote is.
+    #[error("the deposit of order {order_id} is for {deposited}, not {expected}")]
     AdoptedDepositAmountMismatch {
         order_id: B256,
         deposited: U256,
-        current: U256,
+        expected: U256,
     },
     /// The redeposit's vault deposit is already recorded.
     #[error("the redeposit {deposit_tx} is already recorded")]
@@ -6505,11 +6504,14 @@ impl UsdcRebalance {
         else {
             return Err(UsdcRebalanceError::SwapOrderNotRecoverable { order_id });
         };
-        if amount != quote.amount_in || amount != reverted.amount_in {
+        if let Some(expected) = [reverted.amount_in, quote.amount_in]
+            .into_iter()
+            .find(|expected| *expected != amount)
+        {
             return Err(UsdcRebalanceError::AdoptedDepositAmountMismatch {
                 order_id,
                 deposited: amount,
-                current: quote.amount_in,
+                expected,
             });
         }
 
@@ -8716,7 +8718,8 @@ mod tests {
 
     /// A deposit of an order quoted before an Alpaca-to-chain refund at the
     /// hub is for more than the refund's re-quote: adopting it would book the
-    /// transfer on another amount, so it is refused.
+    /// transfer on another amount, so it is refused, as is a deposit that is
+    /// not of its own order's amount.
     #[tokio::test]
     async fn adoption_refuses_a_deposit_of_another_amount() {
         let refund_requoted = [
@@ -8751,32 +8754,36 @@ mod tests {
         ]
         .concat();
 
-        let error = TestHarness::<UsdcRebalance>::with(())
-            .given(refund_requoted)
-            .when(UsdcRebalanceCommand::AdoptSwapDeposit {
-                deposit: SwapDeposit {
-                    tx: TxHash::repeat_byte(0xc2),
-                    order_id: B256::repeat_byte(0x0a),
-                    amount: U256::from(100_000_000u64),
-                    block: 12,
-                },
-            })
-            .await
-            .then_expect_error();
+        // A deposit of order 0x0a's own 100 is not the current 99.6; one of
+        // 99.6 is the current amount but not what order 0x0a was quoted for.
+        for (deposited, expected) in [(100_000_000u64, 99_600_000u64), (99_600_000, 100_000_000)] {
+            let error = TestHarness::<UsdcRebalance>::with(())
+                .given(refund_requoted.clone())
+                .when(UsdcRebalanceCommand::AdoptSwapDeposit {
+                    deposit: SwapDeposit {
+                        tx: TxHash::repeat_byte(0xc2),
+                        order_id: B256::repeat_byte(0x0a),
+                        amount: U256::from(deposited),
+                        block: 12,
+                    },
+                })
+                .await
+                .then_expect_error();
 
-        assert!(
-            matches!(
-                &error,
-                LifecycleError::Apply(UsdcRebalanceError::AdoptedDepositAmountMismatch {
-                    order_id,
-                    deposited,
-                    current,
-                }) if *order_id == B256::repeat_byte(0x0a)
-                    && *deposited == U256::from(100_000_000u64)
-                    && *current == U256::from(99_600_000u64)
-            ),
-            "got {error:?}"
-        );
+            assert!(
+                matches!(
+                    &error,
+                    LifecycleError::Apply(UsdcRebalanceError::AdoptedDepositAmountMismatch {
+                        order_id,
+                        deposited: reported,
+                        expected: reported_expected,
+                    }) if *order_id == B256::repeat_byte(0x0a)
+                        && *reported == U256::from(deposited)
+                        && *reported_expected == U256::from(expected)
+                ),
+                "{deposited}: got {error:?}"
+            );
+        }
     }
 
     /// `RecoverSwapCompletion` is refused from `SwapQuoted`, where a found

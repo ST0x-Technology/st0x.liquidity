@@ -190,8 +190,8 @@ const RELAY_QUOTE_TRANSIENT_REDRIVE_DELAY: Duration = Duration::from_secs(30);
 const SWAP_PAYMENT_UNVERIFIED_REDRIVE_DELAY: Duration = Duration::from_secs(30 * 60);
 
 /// Delay between the slow reads of a Relay escrow left unresolved past its
-/// fill window, and of a reverted deposit found on chain: the solver may pay
-/// until the order's deadline, about a week after the quote.
+/// fill window: the solver may pay until the order's deadline, about a week
+/// after the quote.
 const SWAP_ESCROW_RECHECK_DELAY: Duration = Duration::from_secs(30 * 60);
 
 /// When to read Relay's status again for a deposit confirmed at
