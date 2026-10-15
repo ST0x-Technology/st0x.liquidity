@@ -173,3 +173,27 @@ It stays in memory and is still not rebuilt at startup.
 Rollback: a single-guard build treats all corridors as one. It is safe on data
 written while only one corridor ran; after two corridors have run at the same
 time, do not roll back below the first per-corridor release.
+
+## Amendment: holds carry the transfer amount (RAI-3380)
+
+Each corridor's band is measured against the whole Alpaca balance, and nothing
+on the Alpaca side marks an incoming transfer until it lands (its first event
+marks only the source chain), so two corridors over their band in one check both
+sized a transfer to Alpaca against the same balance and overshot.
+
+Decision: each hold records its transfer's amount, published with the holder in
+one guard step so no corridor reads a hold without it, and a chain-to-Alpaca
+decision on one corridor adds the amounts of the other corridors'
+chain-to-Alpaca holds to the Alpaca balance. We project rather than serialize: a
+stuck hold or the fixed chain order would otherwise block every other corridor's
+transfers to Alpaca. Only the chain-to-Alpaca side projects, because the
+projection errs high (a landed transfer counted for a moment, a stuck one until
+resolved) and must only shrink a transfer, never grow a withdrawal. The amounts
+stay in memory: startup records them from the persisted transfers it holds, and
+a job queued before a restart that has not written its first event is not
+counted until RAI-3397. With a cash reserve, the stale gross Alpaca figure after
+a landed transfer also reads low until RAI-3398. Corridors are still sized one
+after another in chain order, so with uneven chain balances the first one can
+land below its band once a later one's transfer lands, and cash moves back
+through Alpaca for a few checks; this coupling is accepted as a risk on
+RAI-3385, to revisit with a joint cash allocation if it shows up in production.

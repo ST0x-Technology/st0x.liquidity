@@ -135,12 +135,25 @@ and the system proves market fit.
   - Each corridor chain has its own cash guard: one transfer per corridor,
     either direction, and at most one Alpaca-outbound transfer across all
     corridors, because Alpaca's withdrawable cash and its USDC inflight are
-    shared. Releasing a transfer frees only the guard that transfer held.
-  - Each corridor's band is computed against the full Alpaca balance, and
-    chain-to-Alpaca transfers on different corridors are not yet sized against
-    each other, so two corridors in one tick can both move cash to Alpaca and
-    overshoot. A second corridor needs that sizing before it loads (part 3 of
-    the Robinhood corridor work).
+    shared. Releasing a transfer frees only the guard that transfer held. Each
+    hold records the transfer's amount.
+  - A chain-to-Alpaca transfer is sized against the Alpaca balance plus the cash
+    other corridors are already sending to Alpaca, read from the corridor guards
+    from the moment a transfer is admitted. An Alpaca-to-chain transfer is sized
+    against the plain balance: cash in flight is not cash Alpaca can pay out,
+    and the projection errs high (a landed transfer counted twice for a moment,
+    a stuck one for as long as it is stuck), so it may only shrink a transfer.
+    It errs low in two cases: a transfer queued just before a restart that has
+    not written its first event, which startup does not count yet, and, with a
+    cash reserve, the stale gross Alpaca figure between a landed transfer's
+    release and the next balance poll. The corridors remain coupled through the
+    shared balance: with a target t a corridor's chain rests at t/(1-t) of the
+    Alpaca balance, so Alpaca's share of all cash is 1/(1 + sum of t_i/(1-t_i))
+    over the active corridors (40% with one corridor at 0.6, 25% with two), and
+    a transfer on one corridor moves every other corridor's ratio. The corridors
+    are sized one after another, so a corridor sized first does not count what a
+    later one sends in the same check; with uneven chain balances it can land
+    below its band, and cash moves back out of Alpaca for a few checks.
 - **Complete Audit Trail**: All rebalancing operations tracked as events
   (CrossVenueEquityTransfer, CrossVenueCashTransfer)
 - **Integration**: Uses Alpaca for share/USDC management, Circle CCTP for

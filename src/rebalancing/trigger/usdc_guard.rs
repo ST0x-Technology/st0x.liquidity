@@ -5,11 +5,19 @@
 //! corridors, because Alpaca's withdrawable cash and its USDC inflight are
 //! shared. A release removes only its own transfer, so it never frees a guard
 //! another transfer still holds.
+//!
+//! Every hold carries its transfer's amount, published with the holder in
+//! one step; chain-to-Alpaca sizing on the other corridors reads the sum of
+//! inbound amounts as cash on its way to Alpaca.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use rain_math_float::FloatError;
+use tracing::warn;
+
 use st0x_evm::Chain;
+use st0x_finance::{HasZero, Usdc};
 
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceId};
 
@@ -17,18 +25,20 @@ use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceId};
 pub(crate) struct UsdcCashGuards(Mutex<CashGuardState>);
 
 impl UsdcCashGuards {
-    /// Claims `chain`'s guard for `id`. Refused while another transfer holds
-    /// the chain, while a transfer whose corridor could not be read latches
-    /// every chain, or, for an Alpaca-outbound transfer, while another chain holds
-    /// one. A claim by the transfer already holding the chain succeeds and
-    /// leaves that hold in place on drop.
+    /// Claims `chain`'s guard for `id` with its `amount`. Refused while
+    /// another transfer holds the chain, while a transfer whose corridor could
+    /// not be read latches every chain, or, for an Alpaca-outbound transfer,
+    /// while another chain holds one. A claim by the transfer already holding
+    /// the chain succeeds, replaces its amount and leaves that hold in place on
+    /// drop.
     pub(super) fn try_claim(
         self: &Arc<Self>,
         chain: Chain,
         id: &UsdcRebalanceId,
         direction: RebalanceDirection,
+        amount: Usdc,
     ) -> Result<CashGuardClaim, ClaimRefusal> {
-        let fresh = self.state().claim(chain, id, direction)?;
+        let fresh = self.state().claim(chain, id, Hold { direction, amount })?;
 
         Ok(CashGuardClaim {
             guards: Arc::clone(self),
@@ -37,13 +47,19 @@ impl UsdcCashGuards {
         })
     }
 
-    /// Keeps `chain` held by `id`, whatever else holds it.
-    pub(super) fn hold(&self, chain: Chain, id: &UsdcRebalanceId, direction: RebalanceDirection) {
+    /// Keeps `chain` held by `id` with its `amount`, whatever else holds it.
+    pub(super) fn hold(
+        &self,
+        chain: Chain,
+        id: &UsdcRebalanceId,
+        direction: RebalanceDirection,
+        amount: Usdc,
+    ) {
         self.state()
             .holders
             .entry(chain)
             .or_default()
-            .insert(id.clone(), direction);
+            .insert(id.clone(), Hold { direction, amount });
     }
 
     /// The chain whose guard `id` holds, if any.
@@ -60,6 +76,19 @@ impl UsdcCashGuards {
             holders.remove(id);
             !holders.is_empty()
         });
+    }
+
+    /// The amounts of chain-to-Alpaca transfers holding a corridor other than
+    /// `chain`: cash on its way to Alpaca that `chain`'s sizing has not seen
+    /// land yet.
+    pub(super) fn inbound_elsewhere(&self, chain: Chain) -> Result<Usdc, FloatError> {
+        self.state()
+            .holders
+            .iter()
+            .filter(|(held_chain, _)| **held_chain != chain)
+            .flat_map(|(_, holders)| holders.values())
+            .filter(|hold| hold.direction == RebalanceDirection::BaseToAlpaca)
+            .try_fold(Usdc::ZERO, |sum, hold| sum + hold.amount)
     }
 
     /// Blocks every corridor until a restart: a transfer whose corridor
@@ -79,21 +108,21 @@ impl UsdcCashGuards {
         self.state().unread.iter().cloned().collect()
     }
 
-    /// Lifts `id`'s unread block, holding `holder`'s chain for it when the
-    /// loaded state still holds a guard.
+    /// Lifts `id`'s unread block, holding `holder`'s chain for it with its
+    /// amount when the loaded state still holds a guard.
     pub(super) fn resolve_unread(
         &self,
         id: &UsdcRebalanceId,
-        holder: Option<(Chain, RebalanceDirection)>,
+        holder: Option<(Chain, RebalanceDirection, Usdc)>,
     ) {
         let mut state = self.state();
         state.unread.remove(id);
-        if let Some((chain, direction)) = holder {
+        if let Some((chain, direction, amount)) = holder {
             state
                 .holders
                 .entry(chain)
                 .or_default()
-                .insert(id.clone(), direction);
+                .insert(id.clone(), Hold { direction, amount });
         }
     }
 
@@ -165,6 +194,23 @@ pub(super) struct CashGuardClaim {
 }
 
 impl CashGuardClaim {
+    /// Replaces the claimed transfer's amount: the trigger re-sizes under its
+    /// claim before it queues the job.
+    pub(super) fn resize(&self, amount: Usdc) {
+        let resized = self
+            .guards
+            .state()
+            .holders
+            .values_mut()
+            .find_map(|holders| holders.get_mut(&self.id))
+            .map(|hold| hold.amount = amount)
+            .is_some();
+
+        if !resized {
+            warn!(target: "rebalance", id = %self.id, "Resize found no hold for its claim");
+        }
+    }
+
     pub(super) fn defuse(mut self) {
         self.release_on_drop = false;
     }
@@ -180,9 +226,17 @@ impl Drop for CashGuardClaim {
 
 #[derive(Debug, Default)]
 struct CashGuardState {
-    holders: BTreeMap<Chain, HashMap<UsdcRebalanceId, RebalanceDirection>>,
+    holders: BTreeMap<Chain, HashMap<UsdcRebalanceId, Hold>>,
     unclassified: bool,
     unread: HashSet<UsdcRebalanceId>,
+}
+
+/// A holder's direction and initiated amount, stored as one entry so no
+/// reader sees a holder without its amount.
+#[derive(Debug, Clone, Copy)]
+struct Hold {
+    direction: RebalanceDirection,
+    amount: Usdc,
 }
 
 impl CashGuardState {
@@ -192,15 +246,15 @@ impl CashGuardState {
         &mut self,
         chain: Chain,
         id: &UsdcRebalanceId,
-        direction: RebalanceDirection,
+        hold: Hold,
     ) -> Result<bool, ClaimRefusal> {
-        self.admits(chain, id, direction)?;
+        self.admits(chain, id, hold.direction)?;
 
         let fresh = self
             .holders
             .entry(chain)
             .or_default()
-            .insert(id.clone(), direction)
+            .insert(id.clone(), hold)
             .is_none();
 
         Ok(fresh)
@@ -229,8 +283,8 @@ impl CashGuardState {
                 .iter()
                 .filter(|(held_chain, _)| **held_chain != chain)
                 .flat_map(|(_, holders)| holders.iter())
-                .any(|(holder, held_direction)| {
-                    holder != id && *held_direction == RebalanceDirection::AlpacaToBase
+                .any(|(holder, hold)| {
+                    holder != id && hold.direction == RebalanceDirection::AlpacaToBase
                 }),
         };
         if outbound_elsewhere {
@@ -253,6 +307,8 @@ impl CashGuardState {
 mod tests {
     use uuid::Uuid;
 
+    use st0x_float_macro::float;
+
     use super::*;
 
     fn new_id() -> UsdcRebalanceId {
@@ -265,7 +321,12 @@ mod tests {
 
         {
             let guard = guards
-                .try_claim(Chain::Base, &new_id(), RebalanceDirection::BaseToAlpaca)
+                .try_claim(
+                    Chain::Base,
+                    &new_id(),
+                    RebalanceDirection::BaseToAlpaca,
+                    Usdc::ZERO,
+                )
                 .unwrap();
             assert!(guards.is_held(Chain::Base));
             drop(guard);
@@ -280,7 +341,12 @@ mod tests {
 
         {
             let guard = guards
-                .try_claim(Chain::Base, &new_id(), RebalanceDirection::BaseToAlpaca)
+                .try_claim(
+                    Chain::Base,
+                    &new_id(),
+                    RebalanceDirection::BaseToAlpaca,
+                    Usdc::ZERO,
+                )
                 .unwrap();
             assert!(guards.is_held(Chain::Base));
             guard.defuse();
@@ -295,11 +361,20 @@ mod tests {
         let guards = Arc::new(UsdcCashGuards::default());
 
         let _guard = guards
-            .try_claim(Chain::Base, &new_id(), RebalanceDirection::BaseToAlpaca)
+            .try_claim(
+                Chain::Base,
+                &new_id(),
+                RebalanceDirection::BaseToAlpaca,
+                Usdc::ZERO,
+            )
             .unwrap();
 
-        let second_claim =
-            guards.try_claim(Chain::Base, &new_id(), RebalanceDirection::BaseToAlpaca);
+        let second_claim = guards.try_claim(
+            Chain::Base,
+            &new_id(),
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
         assert!(matches!(second_claim, Err(ClaimRefusal::CorridorHeld)));
     }
 
@@ -308,7 +383,12 @@ mod tests {
         let guards = Arc::new(UsdcCashGuards::default());
         let base = new_id();
         guards
-            .try_claim(Chain::Base, &base, RebalanceDirection::BaseToAlpaca)
+            .try_claim(
+                Chain::Base,
+                &base,
+                RebalanceDirection::BaseToAlpaca,
+                Usdc::ZERO,
+            )
             .expect("a free corridor admits a transfer")
             .defuse();
 
@@ -317,16 +397,25 @@ mod tests {
                 Chain::Robinhood,
                 &new_id(),
                 RebalanceDirection::BaseToAlpaca,
+                Usdc::ZERO,
             )
             .expect("another corridor must admit its own transfer");
-        let Err(ClaimRefusal::CorridorHeld) =
-            guards.try_claim(Chain::Base, &new_id(), RebalanceDirection::BaseToAlpaca)
-        else {
+        let Err(ClaimRefusal::CorridorHeld) = guards.try_claim(
+            Chain::Base,
+            &new_id(),
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        ) else {
             panic!("a second transfer on a held corridor must be refused");
         };
 
         let again = guards
-            .try_claim(Chain::Base, &base, RebalanceDirection::BaseToAlpaca)
+            .try_claim(
+                Chain::Base,
+                &base,
+                RebalanceDirection::BaseToAlpaca,
+                Usdc::ZERO,
+            )
             .expect("the holder's own claim succeeds");
         drop(again);
         assert!(
@@ -338,12 +427,18 @@ mod tests {
     #[test]
     fn alpaca_outbound_waits_for_another_corridors_alpaca_outbound() {
         let guards = Arc::new(UsdcCashGuards::default());
-        guards.hold(Chain::Base, &new_id(), RebalanceDirection::AlpacaToBase);
+        guards.hold(
+            Chain::Base,
+            &new_id(),
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
 
         let Err(ClaimRefusal::AlpacaOutboundElsewhere) = guards.try_claim(
             Chain::Robinhood,
             &new_id(),
             RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
         ) else {
             panic!("Alpaca's cash is shared: one outbound transfer at a time");
         };
@@ -352,6 +447,7 @@ mod tests {
                 Chain::Robinhood,
                 &new_id(),
                 RebalanceDirection::BaseToAlpaca,
+                Usdc::ZERO,
             )
             .expect("an inbound transfer does not draw on Alpaca's cash");
     }
@@ -359,11 +455,19 @@ mod tests {
     #[test]
     fn a_held_corridor_refuses_the_opposite_direction_too() {
         let guards = Arc::new(UsdcCashGuards::default());
-        guards.hold(Chain::Base, &new_id(), RebalanceDirection::AlpacaToBase);
+        guards.hold(
+            Chain::Base,
+            &new_id(),
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
 
-        let Err(ClaimRefusal::CorridorHeld) =
-            guards.try_claim(Chain::Base, &new_id(), RebalanceDirection::BaseToAlpaca)
-        else {
+        let Err(ClaimRefusal::CorridorHeld) = guards.try_claim(
+            Chain::Base,
+            &new_id(),
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        ) else {
             panic!("both directions of a corridor share its guard");
         };
     }
@@ -372,15 +476,159 @@ mod tests {
     fn releasing_one_of_two_holders_keeps_the_corridor_held() {
         let guards = Arc::new(UsdcCashGuards::default());
         let first = new_id();
-        guards.hold(Chain::Base, &first, RebalanceDirection::BaseToAlpaca);
-        guards.hold(Chain::Base, &new_id(), RebalanceDirection::BaseToAlpaca);
+        guards.hold(
+            Chain::Base,
+            &first,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
+        guards.hold(
+            Chain::Base,
+            &new_id(),
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
 
         guards.release(&first);
 
-        let Err(ClaimRefusal::CorridorHeld) =
-            guards.try_claim(Chain::Base, &new_id(), RebalanceDirection::BaseToAlpaca)
-        else {
+        let Err(ClaimRefusal::CorridorHeld) = guards.try_claim(
+            Chain::Base,
+            &new_id(),
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        ) else {
             panic!("the other holder must keep the corridor held");
         };
+    }
+
+    fn usdc(amount: i64) -> Usdc {
+        Usdc::new(float!(&amount.to_string()))
+    }
+
+    #[test]
+    fn inbound_elsewhere_sums_other_corridors_inbound_amounts() {
+        let guards = Arc::new(UsdcCashGuards::default());
+        guards.hold(
+            Chain::Base,
+            &new_id(),
+            RebalanceDirection::BaseToAlpaca,
+            usdc(50),
+        );
+        guards.hold(
+            Chain::HyperEvm,
+            &new_id(),
+            RebalanceDirection::AlpacaToBase,
+            usdc(30),
+        );
+        guards.hold(
+            Chain::Robinhood,
+            &new_id(),
+            RebalanceDirection::BaseToAlpaca,
+            usdc(20),
+        );
+
+        assert_eq!(
+            guards.inbound_elsewhere(Chain::Robinhood).unwrap(),
+            usdc(50),
+            "outbound and own holds add nothing"
+        );
+        assert_eq!(guards.inbound_elsewhere(Chain::HyperEvm).unwrap(), usdc(70));
+    }
+
+    /// Each publishing call counts its amount from the call itself; `Hold`
+    /// stores direction and amount as one entry.
+    #[test]
+    fn every_hold_counts_its_amount_from_the_call_that_publishes_it() {
+        let guards = Arc::new(UsdcCashGuards::default());
+
+        let _claim = guards
+            .try_claim(
+                Chain::Base,
+                &new_id(),
+                RebalanceDirection::BaseToAlpaca,
+                usdc(50),
+            )
+            .unwrap();
+        assert_eq!(
+            guards.inbound_elsewhere(Chain::Robinhood).unwrap(),
+            usdc(50)
+        );
+
+        guards.hold(
+            Chain::Ethereum,
+            &new_id(),
+            RebalanceDirection::BaseToAlpaca,
+            usdc(30),
+        );
+        assert_eq!(
+            guards.inbound_elsewhere(Chain::Robinhood).unwrap(),
+            usdc(80)
+        );
+
+        let unread = new_id();
+        guards.block_unread(&unread);
+        guards.resolve_unread(
+            &unread,
+            Some((Chain::HyperEvm, RebalanceDirection::BaseToAlpaca, usdc(20))),
+        );
+        assert_eq!(
+            guards.inbound_elsewhere(Chain::Robinhood).unwrap(),
+            usdc(100)
+        );
+    }
+
+    /// A resume claiming the hold its own transfer already has replaces the
+    /// amount with the persisted one.
+    #[test]
+    fn a_claim_by_the_holder_replaces_its_amount() {
+        let guards = Arc::new(UsdcCashGuards::default());
+        let id = new_id();
+        guards.hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca, usdc(50));
+
+        let claim = guards
+            .try_claim(Chain::Base, &id, RebalanceDirection::BaseToAlpaca, usdc(40))
+            .unwrap();
+        drop(claim);
+
+        assert_eq!(
+            guards.inbound_elsewhere(Chain::Robinhood).unwrap(),
+            usdc(40)
+        );
+    }
+
+    #[test]
+    fn release_drops_the_amount() {
+        let guards = Arc::new(UsdcCashGuards::default());
+        let id = new_id();
+        guards.hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca, usdc(50));
+
+        guards.release(&id);
+
+        assert_eq!(
+            guards.inbound_elsewhere(Chain::Robinhood).unwrap(),
+            Usdc::ZERO
+        );
+    }
+
+    /// The trigger re-sizes under its claim before the enqueue: the re-sized
+    /// amount is the one that counts.
+    #[test]
+    fn resizing_a_claim_replaces_its_amount() {
+        let guards = Arc::new(UsdcCashGuards::default());
+        let claim = guards
+            .try_claim(
+                Chain::Base,
+                &new_id(),
+                RebalanceDirection::BaseToAlpaca,
+                usdc(50),
+            )
+            .unwrap();
+
+        claim.resize(usdc(40));
+
+        assert_eq!(
+            guards.inbound_elsewhere(Chain::Robinhood).unwrap(),
+            usdc(40)
+        );
     }
 }
