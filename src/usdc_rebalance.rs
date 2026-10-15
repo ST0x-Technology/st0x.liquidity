@@ -361,9 +361,10 @@ pub enum UsdcRebalanceError {
     /// A refund paid at the other end is not in the vault chain's wallet.
     #[error("the swap refund was paid on the destination chain; there is nothing to redeposit")]
     RefundNotOnOrigin,
-    /// A late payment names an order this transfer has no recovery for: not
-    /// a reverted one, nor the failed one of a `SwapFailed`.
-    #[error("order {order_id} is not a signed order this transfer can adopt a payment of")]
+    /// A late payment or a found deposit names an order this transfer cannot
+    /// adopt: not the failed one of a `SwapFailed`, nor a reverted one of a
+    /// `SwapQuoted`.
+    #[error("order {order_id} is not a signed order this transfer can adopt")]
     SwapOrderNotRecoverable { order_id: B256 },
     /// A found deposit of a reverted order for another input than the current
     /// quote's, as one of an order quoted before a refund re-quote is.
@@ -614,7 +615,8 @@ pub enum UsdcRebalanceCommand {
     },
     /// Adopt the confirmed deposit of a reverted order, found on chain by
     /// the escrow scan, as the swap's deposit. Valid only from `SwapQuoted`,
-    /// for a deposit of the current quote's input.
+    /// for an order in its reverted quotes and a deposit of both that
+    /// order's and the current quote's input.
     AdoptSwapDeposit { deposit: SwapDeposit<B256> },
     /// Replace an expired or already-signed quote. Valid only from
     /// `SwapQuoted`; same input, an order id never signed.
@@ -6497,13 +6499,13 @@ impl UsdcRebalance {
             amount,
             block,
         } = deposit;
-        if !reverted_quotes
+        let Some(reverted) = reverted_quotes
             .iter()
-            .any(|reverted| reverted.order_id == order_id)
-        {
+            .find(|reverted| reverted.order_id == order_id)
+        else {
             return Err(UsdcRebalanceError::SwapOrderNotRecoverable { order_id });
-        }
-        if amount != quote.amount_in {
+        };
+        if amount != quote.amount_in || amount != reverted.amount_in {
             return Err(UsdcRebalanceError::AdoptedDepositAmountMismatch {
                 order_id,
                 deposited: amount,
@@ -9057,8 +9059,8 @@ mod tests {
     }
 
     /// A late fill of the order Relay failed is adopted from `SwapFailed`,
-    /// which then moves on as any `Bridged`; a state with no failed or
-    /// reverted order refuses it.
+    /// which then moves on as any `Bridged`; another order, or a fill below
+    /// the order's floor, is refused, and so is any state but `SwapFailed`.
     #[tokio::test]
     async fn failed_order_adopts_a_late_fill() {
         let failed = [
@@ -9083,7 +9085,7 @@ mod tests {
             .when(fill.clone())
             .await
             .events();
-        let state = replay::<UsdcRebalance>([failed, events].concat())
+        let state = replay::<UsdcRebalance>([failed.clone(), events].concat())
             .unwrap()
             .unwrap();
         assert_eq!(state.state_name(), "Bridged");
@@ -9105,6 +9107,47 @@ mod tests {
             ),
             "got {error:?}"
         );
+
+        for (command, refused, expected) in [
+            (
+                UsdcRebalanceCommand::RecoverSwapCompletion {
+                    order_id: B256::repeat_byte(0x0b),
+                    deposit_tx: TxHash::repeat_byte(0xa2),
+                    payment: RecoveredSwapPayment::Fill {
+                        fill_tx: TxHash::repeat_byte(0xf1),
+                        amount_received: U256::from(100_000_000u64),
+                    },
+                },
+                "not the failed order",
+                (|error: &UsdcRebalanceError| {
+                    matches!(error, UsdcRebalanceError::SwapOrderNotRecoverable { .. })
+                }) as fn(&UsdcRebalanceError) -> bool,
+            ),
+            (
+                UsdcRebalanceCommand::RecoverSwapCompletion {
+                    order_id: B256::repeat_byte(0x0a),
+                    deposit_tx: TxHash::repeat_byte(0xa2),
+                    payment: RecoveredSwapPayment::Fill {
+                        fill_tx: TxHash::repeat_byte(0xf1),
+                        amount_received: U256::from(1u64),
+                    },
+                },
+                "below the floor",
+                |error: &UsdcRebalanceError| {
+                    matches!(error, UsdcRebalanceError::SwapFillBelowMinimum { .. })
+                },
+            ),
+        ] {
+            let error = TestHarness::<UsdcRebalance>::with(())
+                .given(failed.clone())
+                .when(command)
+                .await
+                .then_expect_error();
+            assert!(
+                matches!(&error, LifecycleError::Apply(inner) if expected(inner)),
+                "{refused}: got {error:?}"
+            );
+        }
     }
 
     /// Startup re-arms the job of every Relay state a resume moves on, in

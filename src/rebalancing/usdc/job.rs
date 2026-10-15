@@ -452,8 +452,9 @@ where
 /// deposit the next attempt re-quotes (`SwapDepositReverted`), a quote that
 /// failed transiently (`SwapQuoteTransient`), a payment that does not prove
 /// (`SwapPaymentUnverified`, paged on every read), or an escrow unresolved
-/// past its fill window (`SwapEscrowUnresolved`, read slowly). Each attempt reads Relay's status once, so the single-concurrency
-/// worker never blocks on a fill.
+/// past its fill window (`SwapEscrowUnresolved`, read slowly). Each attempt
+/// reads Relay's status once, so the single-concurrency worker never blocks
+/// on a fill.
 async fn intercept_relay_wait<Ctx, TaskJob>(
     job: &TaskJob,
     job_queue: &JobQueue<TaskJob>,

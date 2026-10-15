@@ -192,6 +192,7 @@ alert_kinds! {
         RelayHubRefundQuoteRefused => "Relay refused the quote for a refund at the hub",
         ReconciledTransferHoldsRelayEnvelopes => "Reconciled a USDC transfer that holds signed Relay envelopes",
         RelayQuoteKeepsFailing => "Relay quotes keep failing transiently for a transfer past its withdrawal",
+        RevertedRelayOrderDepositOnChain => "A deposit of a reverted Relay order is on chain",
         RevertedRelayOrderDepositsOnChain => "Deposits of several reverted Relay orders are on chain",
         RecheckAdoptedRelayRefund => "Recheck adopted a Relay refund paid at the other end",
     }

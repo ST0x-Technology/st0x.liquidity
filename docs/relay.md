@@ -77,9 +77,10 @@ that did not complete may need Relay's manual review. Where the outcome hangs on
 `TRANSACTION_NOT_INCLUDED` failure), a body without the field is
 `RelayError::Decode`, never an empty list: a not-included failure that dropped
 the field must not settle as a terminal `Failure`. `Decode` is not retried
-within the call. Within the fill window the hop waits out a `failure` whose
-`deposit_txs` do not list the transfer's deposit: an adopted deposit of a
-reverted order can first read Relay's failure of the reverted attempt.
+within the call. Within the fill window the hop waits out a `Failure` or a
+`RefundFailed` whose `deposit_txs` do not list the transfer's deposit: an
+adopted deposit of a reverted order can first read Relay's failure of the
+reverted attempt.
 
 A `failure` with `TRANSACTION_NOT_INCLUDED` that still lists a tx is
 `IntentStatus::NotIncluded` (not terminal): that tx may confirm later. With no

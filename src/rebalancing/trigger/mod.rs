@@ -48937,9 +48937,8 @@ mod tests {
 
     /// Every Relay swap state a resume moves on is re-armed at startup when
     /// its job is lost, even past a terminal job row, also a deposit the
-    /// escrow scan adopted; a short refund, a
-    /// refund paid at the other end and a Relay failure stay held for the
-    /// operator.
+    /// escrow scan adopted; a short refund, a refund paid at the other end
+    /// and a Relay failure stay held for the operator.
     #[tokio::test]
     async fn recover_usdc_guard_rearms_every_relay_swap_state() {
         let quote = UsdcRebalanceCommand::QuoteSwap {
