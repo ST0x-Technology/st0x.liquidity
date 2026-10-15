@@ -1448,6 +1448,8 @@ fn vault_tx_fate(
         | RaindexError::Contract(_)
         | RaindexError::Float(_)
         | RaindexError::ZeroAmount
+        | RaindexError::ReceiptHashMismatch { .. }
+        | RaindexError::PreparedWithdrawalSignerMismatch { .. }
         | RaindexError::RpcTransport(_)
         | RaindexError::SolType(_)
         | RaindexError::ScanInconclusive { .. }
@@ -1745,6 +1747,25 @@ mod tests {
     #[test]
     fn a_drop_report_without_a_receipt_leaves_the_fate_unknown() {
         assert_eq!(vault_tx_fate(&dropped(), None, 3), VaultTxFate::Unknown);
+    }
+
+    #[test]
+    fn a_signer_mismatch_does_not_prove_the_old_transaction_failed() {
+        let error = RaindexError::PreparedWithdrawalSignerMismatch {
+            tx_hash: TxHash::ZERO,
+            signer: None,
+            wallet: Address::ZERO,
+        };
+        assert_eq!(vault_tx_fate(&error, None, 3), VaultTxFate::Unknown);
+    }
+
+    #[test]
+    fn a_mismatched_receipt_does_not_prove_the_requested_transaction_failed() {
+        let error = RaindexError::ReceiptHashMismatch {
+            expected: TxHash::repeat_byte(1),
+            actual: TxHash::repeat_byte(2),
+        };
+        assert_eq!(vault_tx_fate(&error, None, 3), VaultTxFate::Unknown);
     }
 
     /// The tx's own receipt at the required depth decides over the error,

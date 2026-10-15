@@ -3776,6 +3776,7 @@ mod tests {
                     corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
+                    prepared: None,
                     from_block: 1,
                 },
             )
@@ -3854,6 +3855,7 @@ mod tests {
                 corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount,
+                prepared: None,
                 from_block: 1,
             },
             UsdcRebalanceCommand::Initiate {

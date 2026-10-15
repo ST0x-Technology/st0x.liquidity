@@ -518,7 +518,8 @@ const USDC_FAIL_ALPACA_TO_BASE =
   'reconcile-usdc.'
 
 const USDC_FAIL_BASE_TO_ALPACA =
-  'Base to Alpaca: the bot accepts this only while the vault withdrawal is unrecorded, ' +
+  'Base to Alpaca: for legacy intents without stored signed bytes, the bot accepts this ' +
+  'only while the vault withdrawal is unrecorded, ' +
   'and it does not check the chain. First confirm on Base that the bot wallet made no ' +
   "OperatorWithdraw on the inventory after the transfer's from_block, and no WithdrawV2 " +
   'on the orderbook either (a withdrawal sent before the inventory migration). Only a ' +
@@ -563,7 +564,11 @@ const USDC_FAIL_BASE_TO_ALPACA =
   'the amount received that complete-mint printed, divided by 1,000,000 (it prints USDC ' +
   'base units), to Alpaca with stox alpaca-deposit -a <amount>, and do not move that USDC ' +
   'back to the vault. Once Alpaca credits it, convert ' +
-  'it with stox alpaca-convert -d to-usd -a <amount>, as the bot would have.'
+  'it with stox alpaca-convert -d to-usd -a <amount>, as the bot would have.' +
+  ' Prepared intents retain their exact signed bytes: an empty scan cannot release ' +
+  'their guard. Resume rebroadcasts those same bytes. For a confirmed safe same-nonce ' +
+  'cancellation, use the live client with --superseding-tx <hash>; it checks the chain ' +
+  'proof. The offline fail command refuses prepared intents.'
 
 /// A Base to Alpaca bridge stuck at `bridging` (its vault withdrawal confirmed):
 /// the running bot refuses `fail-usdc-transfer` there, so the resume command
@@ -709,7 +714,7 @@ const usdcBridgeRecoveryCommands = (
   const check = usdcFailCheck(status.toLowerCase(), direction)
   if (check === null) return [resume]
 
-  return [
+  const commands: RecoveryCommand[] = [
     resume,
     {
       ...spell(cli, `debug fail-usdc-transfer ${id} --reason "<reason>"`, {
@@ -720,6 +725,22 @@ const usdcBridgeRecoveryCommands = (
       description: `Check the transfer first. ${check}`
     }
   ]
+
+  if (
+    cli.kind === 'client' &&
+    direction === 'base_to_alpaca' &&
+    status.toLowerCase() === 'withdrawing'
+  ) {
+    commands.push({
+      command: `${cli.prefix} debug fail-usdc-transfer ${id} --reason "<reason>" --superseding-tx "<confirmed-cancel-hash>"`,
+      mode: 'requires-bot',
+      label: 'Fail (confirmed cancellation)',
+      description:
+        'Only for an unrecorded withdrawal with stored signed bytes: supply a confirmed same-nonce cancellation by its signing wallet. The bot checks the proof. A successful withdrawal must be resumed. The offline command cannot perform this recovery.'
+    })
+  }
+
+  return commands
 }
 
 /// Builds the position/trade recovery commands applicable to a given symbol,

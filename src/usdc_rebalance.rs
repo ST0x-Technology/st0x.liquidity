@@ -93,6 +93,9 @@ use st0x_event_sorcery::{
 use st0x_evm::{Chain, PreparedTransaction};
 use st0x_execution::{AlpacaTransferId, ClientOrderId};
 use st0x_finance::{HasZero, Usdc};
+use st0x_raindex::ConfirmedWithdrawalRevert;
+
+use crate::rebalancing::equity::VerifiedWithdrawalSupersession;
 
 /// Unique identifier for a USDC rebalance operation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -237,6 +240,15 @@ pub enum UsdcRebalanceError {
     /// Withdrawal has not been initiated yet
     #[error("Withdrawal has not been initiated")]
     WithdrawalNotInitiated,
+    /// A submission must identify the exact withdrawal signed before broadcast.
+    #[error("withdrawal reference {actual:?} does not match prepared transaction {expected}")]
+    PreparedWithdrawalHashMismatch {
+        expected: TxHash,
+        actual: TransferRef,
+    },
+    /// Signed bytes can still mine; rejecting them cannot safely release the guard.
+    #[error("prepared withdrawal {tx_hash} must be resolved before releasing its guard")]
+    PreparedWithdrawalUnresolved { tx_hash: TxHash },
     /// Withdrawal has already been confirmed or failed
     #[error("Withdrawal has already completed")]
     WithdrawalAlreadyCompleted,
@@ -456,6 +468,7 @@ pub enum UsdcRebalanceCommand {
         corridor: UsdcCorridor,
         amount: Usdc,
         from_block: u64,
+        prepared: Option<PreparedTransaction>,
     },
     /// Test/fixture-only: identical to `BeginWithdrawal` but takes
     /// `submitting_at` explicitly instead of stamping `Utc::now()`, so
@@ -466,6 +479,7 @@ pub enum UsdcRebalanceCommand {
         corridor: UsdcCorridor,
         amount: Usdc,
         from_block: u64,
+        prepared: Option<PreparedTransaction>,
         submitting_at: DateTime<Utc>,
     },
     /// Start a new rebalancing operation by recording the submitted withdrawal
@@ -674,6 +688,13 @@ pub enum UsdcRebalanceCommand {
     /// broadcast, or an operator verified on chain that none landed. Emits
     /// `WithdrawalFailed` with no withdrawal reference.
     RejectWithdrawal { reason: String },
+    /// Record a prepared withdrawal's confirmed revert atomically with its hash.
+    RecordWithdrawalReverted { proof: ConfirmedWithdrawalRevert },
+    /// Retire a signed intent only with canonical same-nonce chain proof.
+    RecordWithdrawalSuperseded {
+        proof: VerifiedWithdrawalSupersession,
+        reason: String,
+    },
     /// Record bridging failure. Valid from `Bridging` or `Attested` states.
     FailBridging { reason: String },
     /// Recover a post-burn `BridgingFailed` whose CCTP mint actually landed
@@ -752,6 +773,9 @@ pub enum UsdcRebalanceEvent {
         corridor: UsdcCorridor,
         amount: Usdc,
         from_block: u64,
+        /// Exact signed bytes; absent only for legacy or broker withdrawals.
+        #[serde(default)]
+        prepared: Option<PreparedTransaction>,
         submitting_at: DateTime<Utc>,
     },
     /// Rebalancing operation started. Records direction, amount, and withdrawal reference.
@@ -1299,6 +1323,9 @@ pub enum UsdcRebalance {
         corridor: UsdcCorridor,
         amount: Usdc,
         from_block: u64,
+        /// Legacy intents have no signed identity and may only adopt mined evidence.
+        #[serde(default)]
+        prepared: Option<PreparedTransaction>,
         initiated_at: DateTime<Utc>,
     },
     /// Withdrawal from source has been initiated
@@ -3149,6 +3176,36 @@ pub(crate) async fn prepared_deposit_send_ids(
     }))
 }
 
+/// Pending vault withdrawals with durable signed bytes, for startup nonce restoration.
+pub(crate) async fn prepared_vault_withdrawal_ids(
+    pool: &SqlitePool,
+) -> Result<(Vec<UsdcRebalanceId>, Vec<String>), sqlx::Error> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "WITH latest AS ( \
+             SELECT aggregate_id, MAX(sequence) AS max_seq \
+             FROM events \
+             WHERE aggregate_type = 'UsdcRebalance' \
+             GROUP BY aggregate_id \
+         ) \
+         SELECT latest.aggregate_id \
+         FROM events last_ev \
+         INNER JOIN latest \
+             ON last_ev.aggregate_id = latest.aggregate_id \
+            AND last_ev.sequence = latest.max_seq \
+         WHERE last_ev.aggregate_type = 'UsdcRebalance' \
+           AND last_ev.event_type = 'UsdcRebalanceEvent::WithdrawalSubmitting' \
+           AND json_extract(last_ev.payload, '$.WithdrawalSubmitting.prepared') IS NOT NULL \
+         ORDER BY latest.aggregate_id",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().partition_map(|raw| {
+        raw.parse::<UsdcRebalanceId>()
+            .map_or_else(|_| Either::Right(raw), Either::Left)
+    }))
+}
+
 /// The `UsdcRebalance` aggregates whose latest event persisted a signed Relay
 /// envelope not yet confirmed (`SwapApprovePrepared`, `SwapDepositPrepared`,
 /// or a `SwapRequoted` that keeps lone approves),
@@ -3667,7 +3724,9 @@ impl EventSourced for UsdcRebalance {
     // v17: `reverted_quotes` on the swap states, `quote`, `first_deposit`
     // and `refund_requotes` on `SwapFailed`, and `SwapCompletionRecovered`,
     // whose refund carries `short_of_floor`.
-    const SCHEMA_VERSION: u64 = 17;
+    // v18: signed vault withdrawal identity in WithdrawalSubmitting; legacy
+    // events and snapshots retain scan-only recovery with prepared = None.
+    const SCHEMA_VERSION: u64 = 18;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use UsdcRebalanceEvent::*;
@@ -3691,12 +3750,14 @@ impl EventSourced for UsdcRebalance {
                 corridor,
                 amount,
                 from_block,
+                prepared,
                 submitting_at,
             } => Some(Self::WithdrawalSubmitting {
                 direction: *direction,
                 corridor: *corridor,
                 amount: *amount,
                 from_block: *from_block,
+                prepared: prepared.clone(),
                 initiated_at: *submitting_at,
             }),
 
@@ -3789,7 +3850,11 @@ impl EventSourced for UsdcRebalance {
             },
 
             (
-                WithdrawalSubmitting { from_block, .. },
+                WithdrawalSubmitting {
+                    from_block,
+                    prepared,
+                    ..
+                },
                 Self::ConversionComplete {
                     direction,
                     corridor,
@@ -3802,6 +3867,7 @@ impl EventSourced for UsdcRebalance {
                 corridor: *corridor,
                 amount: conversion.received_amount,
                 from_block: *from_block,
+                prepared: prepared.clone(),
                 initiated_at: *initiated_at,
             },
 
@@ -5046,11 +5112,13 @@ impl EventSourced for UsdcRebalance {
                 corridor,
                 amount,
                 from_block,
+                prepared,
             } => Self::begin_withdrawal_init_events(
                 direction,
                 corridor,
                 amount,
                 from_block,
+                prepared,
                 Utc::now(),
             ),
 
@@ -5060,12 +5128,14 @@ impl EventSourced for UsdcRebalance {
                 corridor,
                 amount,
                 from_block,
+                prepared,
                 submitting_at,
             } => Self::begin_withdrawal_init_events(
                 direction,
                 corridor,
                 amount,
                 from_block,
+                prepared,
                 submitting_at,
             ),
 
@@ -5107,9 +5177,11 @@ impl EventSourced for UsdcRebalance {
             #[cfg(any(test, feature = "test-support"))]
             InitiatePostDepositConversionAt { .. } => Err(UsdcRebalanceError::DepositNotConfirmed),
 
-            ConfirmWithdrawal { .. } | FailWithdrawal { .. } | RejectWithdrawal { .. } => {
-                Err(UsdcRebalanceError::WithdrawalNotInitiated)
-            }
+            ConfirmWithdrawal { .. }
+            | FailWithdrawal { .. }
+            | RejectWithdrawal { .. }
+            | RecordWithdrawalReverted { .. }
+            | RecordWithdrawalSuperseded { .. } => Err(UsdcRebalanceError::WithdrawalNotInitiated),
             #[cfg(any(test, feature = "test-support"))]
             ConfirmWithdrawalAt { .. } => Err(UsdcRebalanceError::WithdrawalNotInitiated),
 
@@ -5174,7 +5246,7 @@ impl EventSourced for UsdcRebalance {
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         use UsdcRebalanceCommand::*;
-        match command {
+        match self.require_withdrawal_corridor(command)? {
             InitiateConversion { .. } => Err(UsdcRebalanceError::AlreadyInitiated),
             #[cfg(any(test, feature = "test-support"))]
             InitiateConversionAt { .. } => Err(UsdcRebalanceError::AlreadyInitiated),
@@ -5200,60 +5272,17 @@ impl EventSourced for UsdcRebalance {
                 initiated_at,
             } => self.transition_post_deposit_conversion(order_id, amount, initiated_at),
 
-            BeginWithdrawal {
-                direction,
-                corridor,
-                amount,
-                from_block,
-            } => {
-                self.require_corridor(corridor)?;
-                self.transition_begin_withdrawal(direction, amount, from_block, Utc::now())
-            }
+            command @ (BeginWithdrawal { .. }
+            | Initiate { .. }
+            | ConfirmWithdrawal { .. }
+            | FailWithdrawal { .. }
+            | RejectWithdrawal { .. }
+            | RecordWithdrawalReverted { .. }
+            | RecordWithdrawalSuperseded { .. }) => self.transition_withdrawal_command(command),
             #[cfg(any(test, feature = "test-support"))]
-            BeginWithdrawalAt {
-                direction,
-                corridor,
-                amount,
-                from_block,
-                submitting_at,
-            } => {
-                self.require_corridor(corridor)?;
-                self.transition_begin_withdrawal(direction, amount, from_block, submitting_at)
-            }
-
-            Initiate {
-                direction,
-                corridor,
-                amount,
-                withdrawal,
-            } => {
-                self.require_corridor(corridor)?;
-                self.transition_initiate_withdrawal(direction, amount, withdrawal, Utc::now())
-            }
-            #[cfg(any(test, feature = "test-support"))]
-            InitiateAt {
-                direction,
-                corridor,
-                amount,
-                withdrawal,
-                initiated_at,
-            } => {
-                self.require_corridor(corridor)?;
-                self.transition_initiate_withdrawal(direction, amount, withdrawal, initiated_at)
-            }
-
-            ConfirmWithdrawal { withdrawal_tx } => {
-                self.transition_confirm_withdrawal(withdrawal_tx, Utc::now())
-            }
-            #[cfg(any(test, feature = "test-support"))]
-            ConfirmWithdrawalAt {
-                withdrawal_tx,
-                confirmed_at,
-            } => self.transition_confirm_withdrawal(withdrawal_tx, confirmed_at),
-
-            FailWithdrawal { reason } => self.transition_fail_withdrawal(reason),
-
-            RejectWithdrawal { reason } => self.transition_reject_withdrawal(reason),
+            command @ (BeginWithdrawalAt { .. }
+            | InitiateAt { .. }
+            | ConfirmWithdrawalAt { .. }) => self.transition_withdrawal_command(command),
 
             BeginBridging {
                 from_block,
@@ -5397,6 +5426,26 @@ impl EventSourced for UsdcRebalance {
 /// Extracted from the `transition` match to satisfy the
 /// `too_many_lines` lint while keeping each handler self-contained.
 impl UsdcRebalance {
+    /// Keeps the shared withdrawal corridor check ahead of state-specific
+    /// validation for both production commands and their timestamped fixtures.
+    fn require_withdrawal_corridor(
+        &self,
+        command: UsdcRebalanceCommand,
+    ) -> Result<UsdcRebalanceCommand, UsdcRebalanceError> {
+        use UsdcRebalanceCommand::*;
+        match &command {
+            BeginWithdrawal { corridor, .. } | Initiate { corridor, .. } => {
+                self.require_corridor(*corridor)?;
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            BeginWithdrawalAt { corridor, .. } | InitiateAt { corridor, .. } => {
+                self.require_corridor(*corridor)?;
+            }
+            _ => {}
+        }
+        Ok(command)
+    }
+
     fn transition_confirm_conversion(
         &self,
         conversion: ConversionAmounts,
@@ -5473,6 +5522,7 @@ impl UsdcRebalance {
         corridor: UsdcCorridor,
         amount: Usdc,
         from_block: u64,
+        prepared: Option<PreparedTransaction>,
         submitting_at: DateTime<Utc>,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         // Fresh-start withdrawal intent is BaseToAlpaca-only. An
@@ -5494,6 +5544,7 @@ impl UsdcRebalance {
             corridor,
             amount,
             from_block,
+            prepared,
             submitting_at,
         }])
     }
@@ -5520,6 +5571,7 @@ impl UsdcRebalance {
         direction: RebalanceDirection,
         amount: Usdc,
         from_block: u64,
+        prepared: Option<PreparedTransaction>,
         submitting_at: DateTime<Utc>,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
@@ -5555,6 +5607,7 @@ impl UsdcRebalance {
             corridor: self.corridor(),
             amount: conversion.received_amount,
             from_block,
+            prepared,
             submitting_at,
         }])
     }
@@ -5570,6 +5623,17 @@ impl UsdcRebalance {
         initiated_at: DateTime<Utc>,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
+        if let Self::WithdrawalSubmitting {
+            prepared: Some(prepared),
+            ..
+        } = self
+            && withdrawal != TransferRef::OnchainTx(prepared.tx_hash())
+        {
+            return Err(UsdcRebalanceError::PreparedWithdrawalHashMismatch {
+                expected: prepared.tx_hash(),
+                actual: withdrawal,
+            });
+        }
         let (expected_direction, expected_amount) = match self {
             Self::WithdrawalSubmitting {
                 direction, amount, ..
@@ -5689,6 +5753,125 @@ impl UsdcRebalance {
         }
     }
 
+    /// Dispatch the withdrawal phase together, preserving the shared corridor
+    /// validation already performed by the aggregate's transition entry point.
+    fn transition_withdrawal_command(
+        &self,
+        command: UsdcRebalanceCommand,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceCommand::*;
+        match command {
+            BeginWithdrawal {
+                direction,
+                corridor: _,
+                amount,
+                from_block,
+                prepared,
+            } => self.transition_begin_withdrawal(
+                direction,
+                amount,
+                from_block,
+                prepared,
+                Utc::now(),
+            ),
+            #[cfg(any(test, feature = "test-support"))]
+            BeginWithdrawalAt {
+                direction,
+                corridor: _,
+                amount,
+                from_block,
+                prepared,
+                submitting_at,
+            } => self.transition_begin_withdrawal(
+                direction,
+                amount,
+                from_block,
+                prepared,
+                submitting_at,
+            ),
+
+            Initiate {
+                direction,
+                corridor: _,
+                amount,
+                withdrawal,
+            } => self.transition_initiate_withdrawal(direction, amount, withdrawal, Utc::now()),
+            #[cfg(any(test, feature = "test-support"))]
+            InitiateAt {
+                direction,
+                corridor: _,
+                amount,
+                withdrawal,
+                initiated_at,
+            } => self.transition_initiate_withdrawal(direction, amount, withdrawal, initiated_at),
+
+            ConfirmWithdrawal { withdrawal_tx } => {
+                self.transition_confirm_withdrawal(withdrawal_tx, Utc::now())
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            ConfirmWithdrawalAt {
+                withdrawal_tx,
+                confirmed_at,
+            } => self.transition_confirm_withdrawal(withdrawal_tx, confirmed_at),
+
+            FailWithdrawal { reason } => self.transition_fail_withdrawal(reason),
+
+            RejectWithdrawal { reason } => self.transition_reject_withdrawal(reason),
+            RecordWithdrawalReverted { proof } => self.transition_proven_failed_withdrawal(
+                proof.tx_hash(),
+                format!("vault withdrawal {} confirmed reverted", proof.tx_hash()),
+            ),
+            RecordWithdrawalSuperseded { proof, reason } => self
+                .transition_proven_failed_withdrawal(
+                    proof.withdrawal(),
+                    proof.superseding().map_or_else(
+                        || format!("{reason}; withdrawal confirmed reverted"),
+                        |tx| format!("{reason}; withdrawal safely superseded by {tx}"),
+                    ),
+                ),
+
+            other => {
+                warn!(
+                    state = self.state_name(),
+                    "Refused a non-withdrawal command in withdrawal dispatch"
+                );
+                Err(UsdcRebalanceError::InvalidCommand {
+                    command: format!("{other:?}"),
+                    state: self.state_name().to_owned(),
+                })
+            }
+        }
+    }
+
+    fn transition_proven_failed_withdrawal(
+        &self,
+        tx_hash: TxHash,
+        reason: String,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        let Self::WithdrawalSubmitting {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount,
+            prepared: Some(_),
+            initiated_at,
+            ..
+        } = self
+        else {
+            warn!(state = self.state_name(), %tx_hash, "Refused chain proof outside a signed withdrawal intent");
+            return Err(UsdcRebalanceError::WithdrawalNotInitiated);
+        };
+        let mut events = self.transition_initiate_withdrawal(
+            RebalanceDirection::BaseToAlpaca,
+            *amount,
+            TransferRef::OnchainTx(tx_hash),
+            *initiated_at,
+        )?;
+        events.push(UsdcRebalanceEvent::WithdrawalFailed {
+            reason,
+            failed_at: Utc::now(),
+        });
+        Ok(events)
+    }
+
     /// Fails a BaseToAlpaca withdrawal that never reached the chain. Valid only
     /// from `WithdrawalSubmitting`: once a withdrawal is initiated it has a
     /// reference and fails through `FailWithdrawal`. AlpacaToBase is refused:
@@ -5702,6 +5885,14 @@ impl UsdcRebalance {
         match self {
             Self::WithdrawalSubmitting {
                 direction: RebalanceDirection::BaseToAlpaca,
+                prepared: Some(prepared),
+                ..
+            } => Err(UsdcRebalanceError::PreparedWithdrawalUnresolved {
+                tx_hash: prepared.tx_hash(),
+            }),
+            Self::WithdrawalSubmitting {
+                direction: RebalanceDirection::BaseToAlpaca,
+                prepared: None,
                 ..
             } => Ok(vec![WithdrawalFailed {
                 reason,
@@ -10038,6 +10229,7 @@ mod tests {
                 corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(500.00)),
+                prepared: None,
                 from_block: 42,
             })
             .await
@@ -10058,6 +10250,223 @@ mod tests {
         assert_eq!(*from_block, 42);
     }
 
+    #[test]
+    fn withdrawal_intent_replay_preserves_prepared_identity() {
+        let event: UsdcRebalanceEvent = serde_json::from_value(json!({
+            "WithdrawalSubmitting": {
+                "direction": "BaseToAlpaca",
+                "amount": "500",
+                "from_block": 42,
+                "submitting_at": "2026-10-15T00:00:00Z",
+                "prepared": {
+                    "tx_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                    "nonce": 7,
+                    "raw": "0x"
+                }
+            }
+        }))
+        .unwrap();
+
+        let state = UsdcRebalance::originate(&event).unwrap();
+        let persisted = serde_json::to_value(state).unwrap();
+        assert_eq!(
+            persisted["WithdrawalSubmitting"]["prepared"],
+            json!({
+                "tx_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                "nonce": 7,
+                "raw": "0x"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_withdrawal_rejects_another_hash_or_broker_reference() {
+        let prepared = PreparedTransaction::for_test(TxHash::repeat_byte(0x11), 7);
+        let amount = Usdc::new(float!(500));
+        for withdrawal in [
+            TransferRef::OnchainTx(TxHash::repeat_byte(0x22)),
+            TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+        ] {
+            let error = TestHarness::<UsdcRebalance>::with(())
+                .given(vec![UsdcRebalanceEvent::WithdrawalSubmitting {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    amount,
+                    from_block: 42,
+                    prepared: Some(prepared.clone()),
+                    submitting_at: Utc::now(),
+                }])
+                .when(UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    amount,
+                    withdrawal: withdrawal.clone(),
+                })
+                .await
+                .then_expect_error();
+            let LifecycleError::Apply(error) = error else {
+                panic!("expected prepared hash mismatch, got {error:?}");
+            };
+            assert_eq!(
+                error,
+                UsdcRebalanceError::PreparedWithdrawalHashMismatch {
+                    expected: prepared.tx_hash(),
+                    actual: withdrawal,
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_withdrawal_cannot_be_rejected_from_scan_absence() {
+        let tx_hash = TxHash::repeat_byte(0x11);
+        let state = UsdcRebalance::WithdrawalSubmitting {
+            direction: RebalanceDirection::BaseToAlpaca,
+            corridor: UsdcCorridor::BASE_CCTP,
+            amount: Usdc::new(float!(500)),
+            from_block: 42,
+            prepared: Some(PreparedTransaction::for_test(tx_hash, 7)),
+            initiated_at: Utc::now(),
+        };
+        let error = state
+            .transition(
+                UsdcRebalanceCommand::RejectWithdrawal {
+                    reason: "empty log scan".into(),
+                },
+                &(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            UsdcRebalanceError::PreparedWithdrawalUnresolved { tx_hash }
+        );
+        assert!(state.holds_rebalance_guard());
+    }
+
+    #[test]
+    fn legacy_withdrawal_event_and_snapshot_have_no_prepared_identity() {
+        let mut legacy = json!({"WithdrawalSubmitting": {
+            "direction": "BaseToAlpaca", "amount": "500", "from_block": 42,
+            "submitting_at": "2026-10-15T00:00:00Z"
+        }});
+        let event: UsdcRebalanceEvent = serde_json::from_value(legacy.clone()).unwrap();
+        let state = UsdcRebalance::originate(&event).unwrap();
+        assert!(matches!(
+            state,
+            UsdcRebalance::WithdrawalSubmitting { prepared: None, .. }
+        ));
+        let fields = legacy["WithdrawalSubmitting"].as_object_mut().unwrap();
+        let timestamp = fields.remove("submitting_at").unwrap();
+        fields.insert("initiated_at".into(), timestamp);
+        let snapshot: UsdcRebalance = serde_json::from_value(legacy).unwrap();
+        assert!(matches!(
+            snapshot,
+            UsdcRebalance::WithdrawalSubmitting {
+                prepared: None,
+                from_block: 42,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn prepared_withdrawal_migration_preserves_legacy_event_replay() {
+        let pool = crate::test_utils::pool_migrated_up_to(20_261_008_021_843).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        // Exact historical event shape, before the optional field existed.
+        let payload = json!({"WithdrawalSubmitting": {
+            "direction": "BaseToAlpaca", "amount": "500", "from_block": 42,
+            "submitting_at": "2026-10-15T00:00:00Z"
+        }});
+        sqlx::query(
+            "INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type, \
+             event_version, payload, metadata) VALUES ('UsdcRebalance', ?, 1, \
+             'UsdcRebalanceEvent::WithdrawalSubmitting', '1.0', ?, '{}')",
+        )
+        .bind(id.to_string())
+        .bind(payload.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Stale derived state must not mask immutable legacy event replay.
+        sqlx::query("INSERT INTO snapshots (aggregate_type, aggregate_id, last_sequence, payload, timestamp) VALUES ('UsdcRebalance', ?, 1, '{}', '2026-10-15T00:00:00Z')")
+            .bind(id.to_string()).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO usdc_rebalance_view (view_id, version, payload) VALUES (?, 1, '{}')",
+        )
+        .bind(id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let before: Vec<String> = sqlx::query_scalar("SELECT payload FROM events ORDER BY rowid")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        for (table, query) in [
+            ("snapshots", "SELECT COUNT(*) FROM snapshots"),
+            (
+                "usdc_rebalance_view",
+                "SELECT COUNT(*) FROM usdc_rebalance_view",
+            ),
+        ] {
+            let count: i64 = sqlx::query_scalar(query).fetch_one(&pool).await.unwrap();
+            assert_eq!(count, 0, "migration must invalidate {table}");
+        }
+        let after: Vec<String> = sqlx::query_scalar("SELECT payload FROM events ORDER BY rowid")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "migration must preserve immutable event history"
+        );
+        let store = test_store::<UsdcRebalance>(pool, ());
+        let rebuilt = store.load(&id).await.unwrap().unwrap();
+        assert!(matches!(
+            rebuilt,
+            UsdcRebalance::WithdrawalSubmitting {
+                from_block: 42,
+                prepared: None,
+                ..
+            }
+        ));
+        // A migrated legacy intent still owns its corridor. Scan absence cannot
+        // turn a duplicate BeginWithdrawal into a second withdrawal.
+        assert!(
+            store
+                .send(
+                    &id,
+                    UsdcRebalanceCommand::BeginWithdrawal {
+                        direction: RebalanceDirection::BaseToAlpaca,
+                        corridor: UsdcCorridor::BASE_CCTP,
+                        amount: Usdc::new(float!(500)),
+                        from_block: 43,
+                        prepared: None,
+                    }
+                )
+                .await
+                .is_err()
+        );
+        let adopted_hash = TxHash::repeat_byte(0x33);
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    amount: Usdc::new(float!(500)),
+                    withdrawal: TransferRef::OnchainTx(adopted_hash),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(store.load(&id).await.unwrap(),
+            Some(UsdcRebalance::Withdrawing { withdrawal_ref: TransferRef::OnchainTx(hash), .. })
+                if hash == adopted_hash));
+    }
+
     #[tokio::test]
     async fn begin_withdrawal_from_uninitialized_rejects_alpaca_to_base() {
         let error = TestHarness::<UsdcRebalance>::with(())
@@ -10066,6 +10475,7 @@ mod tests {
                 corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(500.00)),
+                prepared: None,
                 from_block: 42,
             })
             .await
@@ -10087,6 +10497,7 @@ mod tests {
                 corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(500.00)),
+                prepared: None,
                 from_block: 42,
                 submitting_at: Utc::now(),
             }])
@@ -10116,6 +10527,7 @@ mod tests {
                 corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(500.00)),
+                prepared: None,
                 from_block: 42,
                 submitting_at: Utc::now(),
             }])
@@ -10604,6 +11016,7 @@ mod tests {
                 corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(500.00)),
+                prepared: None,
                 from_block: 42,
                 submitting_at: Utc::now(),
             },
@@ -10987,6 +11400,7 @@ mod tests {
             corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(1971.318665)),
+            prepared: None,
             from_block: 52_027_377,
             submitting_at,
         }
@@ -11043,6 +11457,7 @@ mod tests {
             corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(100)),
+            prepared: None,
             from_block: 42,
             initiated_at: Utc::now(),
         };
@@ -15175,6 +15590,7 @@ mod tests {
                 corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(500.00)),
+                prepared: None,
                 from_block: 42,
                 submitting_at,
             })
@@ -15202,6 +15618,7 @@ mod tests {
                 corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(500.00)),
+                prepared: None,
                 from_block: 42,
                 submitting_at: Utc::now(),
             }])
@@ -17099,6 +17516,7 @@ mod tests {
                 corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
+                prepared: None,
                 from_block: 1,
                 initiated_at: now,
             }
@@ -18036,6 +18454,7 @@ mod tests {
             corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(100)),
+            prepared: None,
             from_block: 1,
             initiated_at: Utc::now(),
         }
@@ -18046,6 +18465,7 @@ mod tests {
             corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(100)),
+            prepared: None,
             from_block: 1,
             initiated_at: Utc::now(),
         }
@@ -19048,6 +19468,7 @@ mod tests {
                 direction: RebalanceDirection::BaseToAlpaca,
                 corridor: ROBINHOOD_RELAY,
                 amount: Usdc::new(float!(100)),
+                prepared: None,
                 from_block: 1,
                 submitting_at: Utc::now(),
             },
@@ -19156,6 +19577,7 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 corridor: ROBINHOOD_RELAY,
                 amount,
+                prepared: None,
                 from_block: 1,
                 submitting_at: Utc::now(),
             },
@@ -19214,6 +19636,7 @@ mod tests {
                 direction: RebalanceDirection::BaseToAlpaca,
                 corridor,
                 amount,
+                prepared: None,
                 from_block: 1,
                 submitting_at: Utc::now(),
             },
@@ -19290,6 +19713,7 @@ mod tests {
                 direction: RebalanceDirection::BaseToAlpaca,
                 corridor: ROBINHOOD_RELAY,
                 amount: Usdc::new(float!(100)),
+                prepared: None,
                 from_block: 1,
                 submitting_at: Utc::now(),
             }])
@@ -19322,6 +19746,7 @@ mod tests {
                 direction: RebalanceDirection::BaseToAlpaca,
                 corridor: ROBINHOOD_RELAY,
                 amount: Usdc::new(float!(100)),
+                prepared: None,
                 from_block: 1,
             })
             .await

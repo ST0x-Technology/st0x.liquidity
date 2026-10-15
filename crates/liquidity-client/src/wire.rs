@@ -132,8 +132,11 @@ pub(crate) struct FailEquityTransferRequest {
 
 /// Body of `POST /transfers/usdc/{id}/fail`.
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct FailUsdcTransferRequest {
     pub(crate) reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) superseding_tx: Option<String>,
 }
 
 /// Body of `POST /views/{view}/rebuild`: exactly one of `id` or `all`.

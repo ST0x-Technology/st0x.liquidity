@@ -4792,6 +4792,10 @@ impl RelayCorridorRig {
                 attestation_retry_deadline: Duration::from_secs(3600),
                 settlement_retry_deadline: Duration::from_secs(3600),
                 ethereum_required_confirmations: Some(1),
+                withdrawal_required_confirmations: std::collections::BTreeMap::from([
+                    (Chain::Base, 1),
+                    (Chain::Ethereum, 1),
+                ]),
                 reserved_cash: None,
                 circle_api_base: CIRCLE_API_BASE.to_string(),
                 token_messenger: TOKEN_MESSENGER_V2,

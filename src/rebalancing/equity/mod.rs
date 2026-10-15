@@ -50,7 +50,7 @@ use st0x_event_sorcery::{AggregateError, LifecycleError, SendError, Store};
 use st0x_evm::{Chain, EvmError, MinedTx, PreparedTransaction};
 use st0x_execution::{FractionalShares, SharesConversionError, Symbol};
 use st0x_issuance_dto::VaultModeTag;
-use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
+use st0x_raindex::{Raindex, RaindexError, RaindexVaultId, WithdrawalConfirmation};
 use st0x_tokenization::{
     AlpacaTokenizationError, IssuerRequestId, MintVerificationError, TokenizationRequest,
     TokenizationRequestId, TokenizationRequestIdError, TokenizationRequestStatus, Tokenizer,
@@ -545,7 +545,7 @@ pub async fn verify_signed_redemption_txs_superseded(
         )
         .await
         {
-            Ok(()) => {
+            Ok(_) => {
                 if superseding_tx.is_none() {
                     reverted_copy.get_or_insert_with(|| prepared.tx_hash());
                 }
@@ -593,6 +593,24 @@ pub async fn verify_signed_redemption_txs_superseded(
     Ok(())
 }
 
+/// Chain-verified evidence that a signed withdrawal cannot move funds.
+/// Private fields prevent operator commands from fabricating proof from scan absence.
+#[derive(Debug, Clone)]
+pub struct VerifiedWithdrawalSupersession {
+    withdrawal: TxHash,
+    superseding: Option<TxHash>,
+}
+
+impl VerifiedWithdrawalSupersession {
+    pub(crate) fn withdrawal(&self) -> TxHash {
+        self.withdrawal
+    }
+
+    pub(crate) fn superseding(&self) -> Option<TxHash> {
+        self.superseding
+    }
+}
+
 /// Proves that `prepared`, the signed vault withdrawal of a redemption, can
 /// never land, reading its chain through `raindex`.
 ///
@@ -620,7 +638,7 @@ pub async fn verify_withdrawal_superseded(
     superseding_tx: Option<TxHash>,
     bot_wallet: Address,
     required_confirmations: u64,
-) -> Result<(), WithdrawalNotSuperseded> {
+) -> Result<VerifiedWithdrawalSupersession, WithdrawalNotSuperseded> {
     let tx = prepared.tx_hash();
     let nonce = prepared.nonce();
 
@@ -646,7 +664,10 @@ pub async fn verify_withdrawal_superseded(
                 required: required_confirmations,
             });
         }
-        return Ok(());
+        return Ok(VerifiedWithdrawalSupersession {
+            withdrawal: tx,
+            superseding: None,
+        });
     }
 
     let Some(superseding) = superseding_tx else {
@@ -694,7 +715,10 @@ pub async fn verify_withdrawal_superseded(
     }
 
     if !succeeded {
-        return Ok(());
+        return Ok(VerifiedWithdrawalSupersession {
+            withdrawal: tx,
+            superseding: Some(superseding),
+        });
     }
 
     let plain_cancel = to == Some(bot_wallet)
@@ -709,7 +733,10 @@ pub async fn verify_withdrawal_superseded(
         });
     }
 
-    Ok(())
+    Ok(VerifiedWithdrawalSupersession {
+        withdrawal: tx,
+        superseding: Some(superseding),
+    })
 }
 
 /// Refuses to reconcile a redemption holding only its withdrawal's hash once
@@ -1702,6 +1729,14 @@ impl Raindex for PanickingRaindex {
 
     async fn tx_receipt(&self, _: TxHash) -> Result<Option<TransactionReceipt>, RaindexError> {
         unimplemented!("PanickingRaindex: not available in CLI context")
+    }
+
+    async fn confirm_withdrawal(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<WithdrawalConfirmation, RaindexError> {
+        self.confirm_tx_receipt(tx_hash).await?;
+        Ok(WithdrawalConfirmation::Succeeded)
     }
 
     async fn confirm_tx_receipt(&self, _: TxHash) -> Result<TransactionReceipt, RaindexError> {
@@ -9719,6 +9754,7 @@ mod withdrawal_superseded_tests {
             REQUIRED,
         )
         .await
+        .map(|_| ())
     }
 
     /// Every signed copy of a send to the issuer shares one nonce, so a reconcile

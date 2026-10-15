@@ -12,8 +12,8 @@ use chrono::{DateTime, Utc};
 use itertools::Itertools;
 use rain_math_float::Float;
 use sqlx::SqlitePool;
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
@@ -30,7 +30,7 @@ use st0x_bridge::{
 use st0x_config::{
     ALPACA_MINIMUM_WITHDRAWAL, ALPACA_TO_BASE_MINIMUM_TRANSFER, ChainRegistry, RebalancingCtx,
 };
-use st0x_event_sorcery::Store;
+use st0x_event_sorcery::{LifecycleError, SendError, Store};
 use st0x_evm::{Chain, EvmError, IERC20, MinedTx, PreparedTransaction, Wallet, is_transient_rpc};
 use st0x_execution::alpaca_broker_api::CryptoOrderResponse;
 use st0x_execution::{
@@ -40,7 +40,10 @@ use st0x_execution::{
 };
 use st0x_finance::{HasZero, Usd, Usdc};
 use st0x_float_macro::float;
-use st0x_raindex::{Raindex, RaindexError, RaindexService, RaindexVaultId, WithdrawBroadcast};
+use st0x_raindex::{
+    Raindex, RaindexError, RaindexService, RaindexVaultId, WithdrawBroadcast,
+    WithdrawalConfirmation,
+};
 
 use super::driver_pause::UsdcDriverGate;
 use super::{
@@ -54,9 +57,10 @@ use crate::rebalancing::equity::RecheckOutcome;
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::usdc_rebalance::{
     ConversionAmounts, DepositSend, EthereumWalletCredit, RebalanceDirection, TransferRef,
-    UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId, burn_tx_recorded_elsewhere,
-    deposit_send_recorded_elsewhere, open_ethereum_credits, prepared_deposit_send_ids,
-    prepared_swap_ids, withdrawal_tx_recorded_elsewhere,
+    UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceError, UsdcRebalanceId,
+    burn_tx_recorded_elsewhere, deposit_send_recorded_elsewhere, open_ethereum_credits,
+    prepared_deposit_send_ids, prepared_swap_ids, prepared_vault_withdrawal_ids,
+    withdrawal_tx_recorded_elsewhere,
 };
 
 /// Attempts to commit `RecordPendingBurn` in the detached submit-and-record
@@ -115,6 +119,9 @@ pub struct UsdcSettlementParams {
     /// before it proves a signed deposit send can never mine. `None` with no
     /// `[chains.ethereum]` entry, which refuses both checks.
     pub ethereum_required_confirmations: Option<u64>,
+    /// Existing configured depths for canonical withdrawal retirement on each chain.
+    /// An absent chain refuses recovery; no depth is inferred from the hub.
+    pub withdrawal_required_confirmations: BTreeMap<Chain, u64>,
     pub reserved_cash: Option<Usd>,
     /// Circle attestation/fee API base URL (test-only override; production
     /// builds use the [`st0x_bridge::cctp::CIRCLE_API_BASE`] constant).
@@ -129,9 +136,8 @@ pub struct UsdcSettlementParams {
 }
 
 impl UsdcSettlementParams {
-    /// A cash transfer's settlement tuning. Its depth is Ethereum's: the txs
-    /// it checks against a depth land on Ethereum, whichever chain the
-    /// corridor or the primary is.
+    /// Retains Ethereum's settlement depth and each configured chain's
+    /// withdrawal depth without substituting the primary chain's value.
     pub fn for_chains(
         rebalancing: &RebalancingCtx,
         chains: &ChainRegistry,
@@ -141,6 +147,14 @@ impl UsdcSettlementParams {
             attestation_retry_deadline: rebalancing.attestation_retry_deadline,
             settlement_retry_deadline: rebalancing.settlement_retry_deadline,
             ethereum_required_confirmations: chains.required_confirmations(Chain::Ethereum),
+            withdrawal_required_confirmations: Chain::ALL
+                .into_iter()
+                .filter_map(|chain| {
+                    chains
+                        .required_confirmations(chain)
+                        .map(|depth| (chain, depth))
+                })
+                .collect(),
             reserved_cash,
             #[cfg(feature = "test-support")]
             circle_api_base: rebalancing.circle_api_base.clone(),
@@ -452,8 +466,9 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> UsdcBridgeHelper
 /// fail outright. A [`RaindexError::InsufficientVaultLiquidity`] revert means
 /// the vault could not cover the request, but here a withdraw for this
 /// transfer may have been broadcast (a mined revert, or a resend after the
-/// first raw send may have been accepted). It is surfaced as a distinct,
-/// contextful error the job latches for operator reconciliation (no auto-retry)
+/// first raw send may have been accepted). Exact-hash confirmed reverts instead
+/// use `RecordWithdrawalReverted`; this classifier never creates that proof.
+/// An unproven under-funded error is surfaced as a distinct, contextful error the job latches for operator reconciliation (no auto-retry)
 /// rather than the opaque `Vault` wrap, which the job redrives. Any other error
 /// keeps the opaque wrap and the normal redrive path.
 fn classify_vault_withdrawal_error(
@@ -565,6 +580,7 @@ pub struct CrossVenueCashTransfer<Signer: Wallet, B = CctpBridge<Signer, Signer>
     attestation_retry_deadline: Duration,
     settlement_retry_deadline: Duration,
     ethereum_required_confirmations: Option<u64>,
+    withdrawal_required_confirmations: BTreeMap<Chain, u64>,
     reserved_cash: Option<Usd>,
     pub(super) gas_readiness: ConfiguredGasReadiness,
     /// Enqueues bot-gas cost recording after CCTP burn/mint confirmations and
@@ -576,10 +592,31 @@ pub struct CrossVenueCashTransfer<Signer: Wallet, B = CctpBridge<Signer, Signer>
     /// instead of signing at the next nonce. Shared by every corridor's
     /// service, since all sign on the one Ethereum wallet.
     pub(super) deposit_send_prepare: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes vault signing and persistence, including detached cancelled attempts.
+    vault_withdrawal_prepare: Arc<tokio::sync::Mutex<()>>,
+    vault_withdrawal_orphaned: Arc<std::sync::Mutex<HashSet<UsdcRebalanceId>>>,
     /// The USDC driver gate the conductor's workers claim. The detached burn
     /// task claims through it too, so an operator pause waits for a burn
     /// whose execution was cancelled. `None` where no operator pause exists.
     driver_gate: Option<UsdcDriverGate>,
+}
+
+/// Remembers cancellation even when detached preparation settles before cleanup runs.
+struct VaultWithdrawalCaller {
+    id: UsdcRebalanceId,
+    orphaned: Arc<std::sync::Mutex<HashSet<UsdcRebalanceId>>>,
+    awaiting: bool,
+}
+
+impl Drop for VaultWithdrawalCaller {
+    fn drop(&mut self) {
+        if self.awaiting {
+            self.orphaned
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(self.id.clone());
+        }
+    }
 }
 
 /// Where the Ethereum wallet credit ledger reads the open transfers from.
@@ -984,11 +1021,14 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
             attestation_retry_deadline: settlement.attestation_retry_deadline,
             settlement_retry_deadline: settlement.settlement_retry_deadline,
             ethereum_required_confirmations: settlement.ethereum_required_confirmations,
+            withdrawal_required_confirmations: settlement.withdrawal_required_confirmations.clone(),
             reserved_cash: settlement.reserved_cash,
             gas_readiness: ConfiguredGasReadiness::default(),
             bot_gas_enqueuer,
             credit_ledger: CreditLedger::Unwired,
             deposit_send_prepare: Arc::new(tokio::sync::Mutex::new(())),
+            vault_withdrawal_prepare: Arc::new(tokio::sync::Mutex::new(())),
+            vault_withdrawal_orphaned: Arc::new(std::sync::Mutex::new(HashSet::new())),
             driver_gate: None,
         }
     }
@@ -2561,6 +2601,75 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
         outcome
     }
 
+    /// Restores this corridor's signed vault withdrawals before any startup
+    /// sends can allocate their nonces. Unknown state keeps startup approvals
+    /// disabled on this chain; resume continues to use the persisted bytes.
+    pub(super) async fn restore_prepared_vault_withdrawals(
+        &self,
+        pool: &SqlitePool,
+    ) -> RestoredDepositSends {
+        let mut outcome = RestoredDepositSends::default();
+        let (ids, unparseable) = match prepared_vault_withdrawal_ids(pool).await {
+            Ok(found) => found,
+            Err(error) => {
+                error!(target: "operational_alert", alert = true, kind = AlertKind::UsdcVaultWithdrawalsUnlisted.as_str(), ?error, corridor = %self.corridor, "Could not list signed USDC vault withdrawals at startup; skipping chain approvals");
+                outcome.unmined += 1;
+                return outcome;
+            }
+        };
+        if !unparseable.is_empty() {
+            error!(target: "operational_alert", alert = true, kind = AlertKind::UsdcVaultWithdrawalIdsUnparseable.as_str(), ?unparseable, "Signed USDC vault withdrawals have unparseable ids; skipping chain approvals");
+            outcome.unmined += unparseable.len();
+        }
+        for id in ids {
+            let state = match self.cqrs.load(&id).await {
+                Ok(state) => state,
+                Err(error) => {
+                    error!(target: "operational_alert", alert = true, kind = AlertKind::UsdcVaultWithdrawalTransferUnloadable.as_str(), %id, ?error, "Could not load signed USDC vault withdrawal at startup; skipping chain approvals");
+                    outcome.unmined += 1;
+                    continue;
+                }
+            };
+            let Some(UsdcRebalance::WithdrawalSubmitting {
+                corridor,
+                prepared: Some(prepared),
+                ..
+            }) = state
+            else {
+                warn!(target: "rebalance", %id, "Signed USDC vault withdrawal left its submitting state before restore");
+                continue;
+            };
+            if corridor != self.corridor {
+                continue;
+            }
+            let restored = self
+                .raindex
+                .restore_submitted_withdrawal(prepared.tx_hash(), Some(&prepared))
+                .await;
+            if let Err(error) = restored {
+                error!(target: "operational_alert", alert = true, kind = AlertKind::UsdcVaultWithdrawalRestoreFailed.as_str(), %id, ?error, "Could not restore signed USDC vault withdrawal; skipping chain approvals");
+                outcome.unmined += 1;
+                continue;
+            }
+            outcome.restored += 1;
+            match self.raindex.broadcast_prepared_withdraw(&prepared).await {
+                Ok(tx) if tx == prepared.tx_hash() => match self.raindex.tx_mined(tx).await {
+                    Ok(true) => {}
+                    Ok(false) => outcome.unmined += 1,
+                    Err(error) => {
+                        warn!(target: "rebalance", %id, %tx, ?error, "Could not read restored USDC vault withdrawal receipt; skipping chain approvals");
+                        outcome.unmined += 1;
+                    }
+                },
+                result => {
+                    error!(target: "operational_alert", alert = true, kind = AlertKind::RebroadcastFailedAtStartup.as_str(), %id, ?result, "Signed USDC vault withdrawal could not be rebroadcast at startup; nonce stays reserved and startup skips chain approvals");
+                    outcome.unmined += 1;
+                }
+            }
+        }
+        outcome
+    }
+
     /// Reserves and rebroadcasts the signed Alpaca deposit sends, counting
     /// each into `outcome`.
     async fn restore_alpaca_deposit_sends(
@@ -3385,52 +3494,255 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
         amount: Usdc,
         amount_u256: U256,
     ) -> Result<(), UsdcTransferError> {
-        // Record withdrawal intent and the chain head BEFORE the irreversible
-        // on-chain withdraw, so a crash mid-withdrawal resumes via a chain scan
-        // (`resume_withdrawal_submitting`) instead of blindly re-withdrawing.
         let from_block = self.raindex.current_block().await?;
-        self.cqrs
-            .send(
-                id,
-                UsdcRebalanceCommand::BeginWithdrawal {
-                    direction: RebalanceDirection::BaseToAlpaca,
-                    corridor: self.corridor,
-                    amount,
-                    from_block,
-                },
-            )
-            .await?;
-
-        let stable = self.corridor.chain().settlement_stable();
-        let withdraw_tx = match self
-            .raindex
-            .withdraw(stable.address, self.vault_id, amount_u256, stable.decimals)
+        let (prepared, from_block, initiated_at) = match self
+            .prepare_and_persist_vault_withdrawal(id, amount, amount_u256, from_block)
             .await
         {
-            Ok(tx) => tx,
-            Err(RaindexError::InsufficientVaultLiquidity {
+            Ok(intent) => intent,
+            Err(UsdcTransferError::Vault(RaindexError::InsufficientVaultLiquidity {
                 token,
                 requested,
                 received,
                 broadcast: WithdrawBroadcast::NotBroadcast,
-            }) => {
+            })) => {
+                self.cqrs
+                    .send(
+                        id,
+                        UsdcRebalanceCommand::BeginWithdrawal {
+                            direction: RebalanceDirection::BaseToAlpaca,
+                            corridor: self.corridor,
+                            amount,
+                            from_block,
+                            prepared: None,
+                        },
+                    )
+                    .await?;
                 return Err(self
                     .reject_unsent_withdrawal(id, from_block, token, requested, received)
                     .await);
             }
-            Err(error) => return Err(classify_vault_withdrawal_error(id, from_block, error)),
+            Err(error) => return Err(error),
         };
+        self.broadcast_vault_withdrawal(id, amount, from_block, initiated_at, &prepared)
+            .await
+    }
 
+    pub(super) fn vault_withdrawal_preparation_pending(&self) -> bool {
+        self.vault_withdrawal_prepare.try_lock().is_err()
+    }
+
+    pub(super) fn vault_withdrawal_needs_handoff(&self, id: &UsdcRebalanceId) -> bool {
+        self.vault_withdrawal_preparation_pending()
+            || self
+                .vault_withdrawal_orphaned
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(id)
+    }
+
+    pub(super) fn acknowledge_vault_withdrawal_handoff(&self, id: &UsdcRebalanceId) {
+        self.vault_withdrawal_orphaned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id);
+    }
+
+    pub(super) async fn wait_for_vault_withdrawal_preparation(&self) {
+        drop(self.vault_withdrawal_prepare.lock().await);
+    }
+
+    /// Keeps signing and persistence alive across job cancellation. The lock
+    /// and reload prevent another attempt from signing at a second nonce while
+    /// the first attempt is still committing its identity.
+    async fn prepare_and_persist_vault_withdrawal(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        amount_u256: U256,
+        from_block: u64,
+    ) -> Result<(PreparedTransaction, u64, DateTime<Utc>), UsdcTransferError> {
+        let raindex = Arc::clone(&self.raindex);
+        let cqrs = Arc::clone(&self.cqrs);
+        // Claim before spawning: terminal cleanup must observe even a task
+        // that has not yet been scheduled, and cancellation while waiting
+        // here cannot leave an untracked signer behind.
+        let prepare_guard = Arc::clone(&self.vault_withdrawal_prepare)
+            .lock_owned()
+            .await;
+        let in_flight = self.driver_gate.as_ref().map(UsdcDriverGate::hold);
+        let task_id = id.clone();
+        let corridor = self.corridor;
+        let vault_id = self.vault_id;
+        let projection_slot =
+            crate::conductor::projection_pause::projection_slot_for_detached_work().await;
+        let mut caller = VaultWithdrawalCaller {
+            id: id.clone(),
+            orphaned: self.vault_withdrawal_orphaned.clone(),
+            awaiting: true,
+        };
+        let result = tokio::spawn(async move {
+            let _projection_slot = projection_slot;
+            let _guard = prepare_guard;
+            let _in_flight = in_flight;
+            match cqrs.load(&task_id).await? {
+                Some(UsdcRebalance::WithdrawalSubmitting {
+                    prepared: Some(prepared), from_block, initiated_at,
+                    corridor: recorded_corridor, amount: recorded_amount, ..
+                }) if recorded_corridor == corridor && recorded_amount == amount => {
+                    return Ok((prepared, from_block, initiated_at));
+                }
+                Some(_) => {
+                    warn!(target: "rebalance", id = %task_id, "Vault withdrawal already entered another state; refusing another preparation");
+                    return Err(SendError::from(LifecycleError::Apply(UsdcRebalanceError::AlreadyInitiated)).into());
+                }
+                None => {}
+            }
+            let stable = corridor.chain().settlement_stable();
+            let prepared = raindex.prepare_withdraw(stable.address, vault_id, amount_u256, stable.decimals).await?;
+            let initiated_at = Utc::now();
+            if let Err(error) = cqrs.send(&task_id, UsdcRebalanceCommand::BeginWithdrawal {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor, amount, from_block, prepared: Some(prepared.clone()),
+            }).await {
+                release_unpersisted_vault_withdrawal(raindex.as_ref(), &cqrs, &task_id, &prepared).await;
+                return Err(error.into());
+            }
+            Ok((prepared, from_block, initiated_at))
+        }).await;
+        caller.awaiting = false;
+        if matches!(&result, Ok(Ok(_))) {
+            self.acknowledge_vault_withdrawal_handoff(id);
+        }
+        result.map_err(|source| UsdcTransferError::VaultWithdrawalTaskFailed {
+            id: id.clone(),
+            source,
+        })?
+    }
+
+    /// Operator recovery uses the same strict canonical proof as equity withdrawals.
+    pub(super) async fn fail_superseded_vault_withdrawal(
+        &self,
+        id: &UsdcRebalanceId,
+        superseding_tx: Option<TxHash>,
+        reason: String,
+    ) -> Result<(), UsdcRecheckError> {
+        let state = self
+            .cqrs
+            .load(id)
+            .await
+            .map_err(|e| Box::new(UsdcTransferError::from(e)))?
+            .ok_or_else(|| UsdcRecheckError::NotFound(id.clone()))?;
+        self.require_served_corridor(id, state.corridor(), Some(&state))
+            .map_err(Box::new)?;
+        let UsdcRebalance::WithdrawalSubmitting {
+            direction: RebalanceDirection::BaseToAlpaca,
+            prepared: Some(prepared),
+            ..
+        } = state
+        else {
+            warn!(%id, "Refused withdrawal supersession outside a prepared withdrawal intent");
+            return Err(UsdcRecheckError::WithdrawalRecoveryUnavailable(id.clone()));
+        };
+        let depth = self
+            .withdrawal_required_confirmations
+            .get(&self.corridor.chain())
+            .copied()
+            .ok_or(UsdcRecheckError::WithdrawalDepthMissing(
+                self.corridor.chain(),
+            ))?;
+        let proof = crate::rebalancing::equity::verify_withdrawal_superseded(
+            self.raindex.as_ref(),
+            &prepared,
+            superseding_tx,
+            self.raindex.wallet_address(),
+            depth,
+        )
+        .await?;
+        if proof.superseding().is_none() {
+            self.enqueue_bot_gas_cost(
+                self.corridor.chain(),
+                prepared.tx_hash(),
+                BotGasOperationCategory::VaultWithdraw,
+            )
+            .await
+            .map_err(Box::new)?;
+        }
+        // Canonical proof consumes this nonce even if the following event write fails.
+        // Release never rewinds allocation; the durable guard stays held on failure.
+        self.raindex
+            .release_superseded_withdraw(prepared.tx_hash())
+            .await;
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::RecordWithdrawalSuperseded { proof, reason },
+            )
+            .await
+            .map_err(|e| Box::new(UsdcTransferError::from(e)))?;
+        self.acknowledge_vault_withdrawal_handoff(id);
+        Ok(())
+    }
+
+    /// Reuses the durable signed identity through broadcast and confirmation.
+    /// State advances only after configured confirmations, preserving the
+    /// existing `Withdrawing` crash-recovery contract.
+    async fn broadcast_vault_withdrawal(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        from_block: u64,
+        initiated_at: DateTime<Utc>,
+        prepared: &PreparedTransaction,
+    ) -> Result<(), UsdcTransferError> {
+        let withdraw_tx = self
+            .raindex
+            .broadcast_prepared_withdraw(prepared)
+            .await
+            .map_err(|error| classify_vault_withdrawal_scan_error(id, initiated_at, error))?;
+        if withdraw_tx != prepared.tx_hash() {
+            error!(target: "rebalance", %id, %withdraw_tx, expected = %prepared.tx_hash(), "Withdrawal broadcast returned another transaction hash");
+            return Err(UsdcTransferError::RecordedWithdrawalUnverified {
+                id: id.clone(),
+                withdrawal: TransferRef::OnchainTx(withdraw_tx),
+            });
+        }
+        let confirmation = self
+            .raindex
+            .confirm_withdrawal(withdraw_tx)
+            .await
+            .map_err(|error| {
+                if error.is_reconciliation_pending() || error.is_transaction_dropped() {
+                    UsdcTransferError::WithdrawalScanTransient {
+                        id: id.clone(),
+                        initiated_at,
+                        source: Box::new(error),
+                    }
+                } else {
+                    classify_vault_withdrawal_error(id, from_block, error)
+                }
+            })?;
+        if let WithdrawalConfirmation::Reverted(proof) = confirmation {
+            self.enqueue_bot_gas_cost(
+                self.corridor.chain(),
+                withdraw_tx,
+                BotGasOperationCategory::VaultWithdraw,
+            )
+            .await?;
+            self.cqrs
+                .send(id, UsdcRebalanceCommand::RecordWithdrawalReverted { proof })
+                .await?;
+            self.raindex.release_superseded_withdraw(withdraw_tx).await;
+            error!(target: "operational_alert", alert = true, kind = AlertKind::UsdcVaultWithdrawalReverted.as_str(), %id, %withdraw_tx, "Confirmed vault withdrawal reverted; transfer failed");
+            return Err(UsdcTransferError::PreviouslyFailedAggregate { id: id.clone() });
+        }
         self.record_vault_withdrawal(id, amount, withdraw_tx).await
     }
 
-    /// Fails a transfer whose vault withdraw the vault could not cover and the
-    /// evm layer proved was rejected before broadcast. This is the only call
-    /// that issues this transfer's withdraw, and `BeginWithdrawal` precedes
-    /// it, so no withdraw for this transfer exists anywhere and failing it is
-    /// safe. The guard then clears and rebalancing plans again from fresh
-    /// balances instead of resuming into a scan that can never find a
-    /// withdrawal.
+    /// Fails a transfer whose vault withdrawal preparation was rejected before
+    /// any signed identity was returned. No withdrawal can land, so the guard
+    /// can clear and planning can request a fresh balance instead of scanning
+    /// forever for a transaction that was never submitted.
     ///
     /// If `RejectWithdrawal` cannot be confirmed, the transfer latches as for
     /// any other under-funded withdraw: a redrive would only scan.
@@ -3486,8 +3798,8 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
         }
     }
 
-    /// Resumes a transfer stalled at `WithdrawalSubmitting` by adopting the
-    /// already-mined withdrawal and recording it.
+    /// Rebroadcasts a persisted signed withdrawal, or adopts a mined legacy
+    /// withdrawal when the intent has no prepared bytes.
     ///
     /// Absence from mined logs is never permission to issue another withdrawal:
     /// the original transaction may still be pending, or a load-balanced RPC
@@ -3501,6 +3813,20 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
         from_block: u64,
         initiated_at: DateTime<Utc>,
     ) -> Result<(), UsdcTransferError> {
+        if let Some(UsdcRebalance::WithdrawalSubmitting {
+            prepared: Some(prepared),
+            ..
+        }) = self.cqrs.load(id).await?
+        {
+            self.acknowledge_vault_withdrawal_handoff(id);
+            self.raindex
+                .restore_submitted_withdrawal(prepared.tx_hash(), Some(&prepared))
+                .await?;
+            return self
+                .broadcast_vault_withdrawal(id, amount, from_block, initiated_at, &prepared)
+                .await;
+        }
+
         let (existing_tx, withdrawn) = self
             .raindex
             .find_recent_withdrawal(
@@ -7120,6 +7446,32 @@ fn total_credits(
     Ok((usdc_to_u256(held)?, usdc_to_u256((held + in_flight)?)?))
 }
 
+/// Releases only a preparation a reload proves was not persisted. A reactor
+/// error after commit retains the matching identity for recovery to broadcast.
+async fn release_unpersisted_vault_withdrawal(
+    raindex: &dyn Raindex,
+    store: &Store<UsdcRebalance>,
+    id: &UsdcRebalanceId,
+    prepared: &PreparedTransaction,
+) {
+    let persisted = match store.load(id).await {
+        Ok(None) => false,
+        Ok(Some(UsdcRebalance::WithdrawalSubmitting {
+            prepared: recorded, ..
+        })) => recorded
+            .as_ref()
+            .is_some_and(|recorded| recorded.tx_hash() == prepared.tx_hash()),
+        other => {
+            let state = other.map(|state| state.map(|state| state.state_name()));
+            error!(target: "operational_alert", alert = true, kind = AlertKind::UsdcVaultWithdrawalPersistenceUnknown.as_str(), %id, ?state, tx = %prepared.tx_hash(), "Cannot prove signed vault withdrawal was not persisted; retaining its nonce");
+            return;
+        }
+    };
+    if !persisted {
+        raindex.discard_prepared_withdraw(prepared.tx_hash()).await;
+    }
+}
+
 /// After a failed `PrepareDepositSend` write, releases the signed send's
 /// nonce when a reload proves these bytes are not persisted: `Bridged` with
 /// no signed send, or with another's (not expected: prepares of one manager
@@ -7223,6 +7575,12 @@ fn conversion_amounts_from_order(
 /// the equity `RecheckError`.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum UsdcRecheckError {
+    #[error("withdrawal recovery not applicable to {0}")]
+    WithdrawalRecoveryUnavailable(UsdcRebalanceId),
+    #[error("withdrawal confirmation depth unavailable for {0}")]
+    WithdrawalDepthMissing(Chain),
+    #[error(transparent)]
+    WithdrawalNotSuperseded(#[from] crate::rebalancing::equity::WithdrawalNotSuperseded),
     #[error("no USDC rebalance found for {0}")]
     NotFound(UsdcRebalanceId),
     #[error(
@@ -7565,6 +7923,16 @@ pub fn deposit_send_required_confirmations(
 /// traits in `job.rs`).
 #[async_trait::async_trait]
 pub(crate) trait RecheckUsdcDeposit: Send + Sync + 'static {
+    /// Fails closed unless the served wallet can establish same-nonce proof.
+    async fn fail_superseded_withdrawal(
+        &self,
+        id: &UsdcRebalanceId,
+        _superseding_tx: Option<TxHash>,
+        _reason: String,
+    ) -> Result<(), UsdcRecheckError> {
+        Err(UsdcRecheckError::WithdrawalRecoveryUnavailable(id.clone()))
+    }
+
     async fn recheck_deposit(
         &self,
         id: &UsdcRebalanceId,
@@ -7598,7 +7966,7 @@ pub(crate) trait RestorePreparedDepositSends: Send + Sync + 'static {
     /// signed there. Run once, on one service.
     async fn restore_prepared_deposit_sends(&self, pool: &SqlitePool) -> RestoredDepositSends;
 
-    /// The Relay pairs this service signed on its corridor chain's wallet,
+    /// The vault withdrawals and Relay pairs on this corridor chain's wallet,
     /// by that chain. Run on every service.
     async fn restore_chain_signed_swaps(
         &self,
@@ -7615,12 +7983,17 @@ where
         Self::restore_prepared_deposit_sends(self, pool).await
     }
 
-    /// A CCTP hop signs nothing on its chain before the burn it records.
+    /// Restores the signed vault withdrawal on the corridor chain.
     async fn restore_chain_signed_swaps(
         &self,
-        _pool: &SqlitePool,
+        pool: &SqlitePool,
     ) -> BTreeMap<Chain, RestoredDepositSends> {
-        BTreeMap::new()
+        let outcome = self.restore_prepared_vault_withdrawals(pool).await;
+        if outcome == RestoredDepositSends::default() {
+            BTreeMap::new()
+        } else {
+            BTreeMap::from([(self.corridor.chain(), outcome)])
+        }
     }
 }
 
@@ -7629,6 +8002,16 @@ impl<Signer> RecheckUsdcDeposit for CrossVenueCashTransfer<Signer>
 where
     Signer: Wallet + Send + Sync + 'static,
 {
+    async fn fail_superseded_withdrawal(
+        &self,
+        id: &UsdcRebalanceId,
+        superseding_tx: Option<TxHash>,
+        reason: String,
+    ) -> Result<(), UsdcRecheckError> {
+        self.fail_superseded_vault_withdrawal(id, superseding_tx, reason)
+            .await
+    }
+
     async fn recheck_deposit(
         &self,
         id: &UsdcRebalanceId,
@@ -9248,6 +9631,10 @@ mod tests {
             attestation_retry_deadline: TEST_ATTESTATION_RETRY_DEADLINE,
             settlement_retry_deadline: TEST_SETTLEMENT_RETRY_DEADLINE,
             ethereum_required_confirmations: Some(3),
+            withdrawal_required_confirmations: std::collections::BTreeMap::from([
+                (Chain::Base, 1),
+                (Chain::Ethereum, 3),
+            ]),
             reserved_cash: None,
             #[cfg(feature = "test-support")]
             circle_api_base: test_circle_fee_api_base(),
@@ -18127,6 +18514,10 @@ mod tests {
 
         let without_ethereum = UsdcSettlementParams::for_chains(&rebalancing, &chains, None);
         assert_eq!(without_ethereum.ethereum_required_confirmations, None);
+        assert_eq!(
+            without_ethereum.withdrawal_required_confirmations,
+            BTreeMap::from([(Chain::Base, 3)])
+        );
 
         chains.insert_transport(ChainCtx {
             chain: Chain::Ethereum,
@@ -18136,6 +18527,10 @@ mod tests {
         let settlement = UsdcSettlementParams::for_chains(&rebalancing, &chains, None);
 
         assert_eq!(settlement.ethereum_required_confirmations, Some(5));
+        assert_eq!(
+            settlement.withdrawal_required_confirmations,
+            BTreeMap::from([(Chain::Base, 3), (Chain::Ethereum, 5)])
+        );
     }
 
     /// The cancel lands on Ethereum, so it needs Ethereum's depth, not the
@@ -27648,6 +28043,7 @@ mod tests {
                 corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount,
+                prepared: None,
                 from_block: 0,
             },
         )
@@ -27689,6 +28085,831 @@ mod tests {
         }
         code.extend_from_slice(&[0x60, length, 0x60, 0x00, 0xfd]); // REVERT(0, length)
         Bytes::from(code)
+    }
+
+    /// Observes the durable boundary and injects one transport failure before
+    /// the first raw send. All subsequent broadcasts use the real wallet.
+    #[derive(Clone)]
+    struct WithdrawalBroadcastWallet<Inner> {
+        inner: Inner,
+        store: Arc<Store<UsdcRebalance>>,
+        id: UsdcRebalanceId,
+        seen: Arc<Mutex<Vec<PreparedTransaction>>>,
+        preparation_pause: Option<(Arc<Notify>, Arc<Notify>)>,
+    }
+
+    #[async_trait::async_trait]
+    impl<Inner: Wallet> Evm for WithdrawalBroadcastWallet<Inner> {
+        type Provider = Inner::Provider;
+
+        fn provider(&self) -> &Self::Provider {
+            self.inner.provider()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<Inner: Wallet> Wallet for WithdrawalBroadcastWallet<Inner> {
+        fn address(&self) -> Address {
+            self.inner.address()
+        }
+
+        async fn sign_typed_data(&self, json: String, digest: B256) -> Result<Signature, EvmError> {
+            self.inner.sign_typed_data(json, digest).await
+        }
+
+        async fn prepare_pending(
+            &self,
+            contract: Address,
+            data: Bytes,
+            note: &str,
+        ) -> Result<PreparedTransaction, EvmError> {
+            let prepared = self.inner.prepare_pending(contract, data, note).await?;
+            if let Some((signed, release)) = &self.preparation_pause {
+                signed.notify_one();
+                release.notified().await;
+            }
+            Ok(prepared)
+        }
+
+        async fn prepare_pending_with_gas_limit(
+            &self,
+            contract: Address,
+            data: Bytes,
+            gas: u64,
+            note: &str,
+        ) -> Result<PreparedTransaction, EvmError> {
+            self.inner
+                .prepare_pending_with_gas_limit(contract, data, gas, note)
+                .await
+        }
+
+        async fn broadcast_prepared(
+            &self,
+            prepared: &PreparedTransaction,
+            note: &str,
+        ) -> Result<TxHash, EvmError> {
+            let state = serde_json::to_value(self.store.load(&self.id).await.unwrap()).unwrap();
+            assert_eq!(
+                state["WithdrawalSubmitting"]["prepared"]["raw"],
+                json!(alloy::hex::encode_prefixed(prepared.raw())),
+                "exact signed bytes must be durable before every broadcast"
+            );
+            let first = {
+                let mut seen = self.seen.lock().unwrap();
+                seen.push(prepared.clone());
+                seen.len() == 1
+            };
+            if first {
+                return Err(EvmError::Transport(TransportErrorKind::backend_gone()));
+            }
+            self.inner.broadcast_prepared(prepared, note).await
+        }
+
+        async fn discard_prepared(&self, hash: TxHash) {
+            self.inner.discard_prepared(hash).await;
+        }
+
+        async fn prepare_fee_replacement(
+            &self,
+            prepared: &PreparedTransaction,
+        ) -> Result<Option<PreparedTransaction>, EvmError> {
+            self.inner.prepare_fee_replacement(prepared).await
+        }
+
+        async fn release_superseded(&self, hash: TxHash) {
+            self.inner.release_superseded(hash).await;
+        }
+
+        async fn restore_prepared(&self, prepared: &PreparedTransaction) {
+            self.inner.restore_prepared(prepared).await;
+        }
+
+        async fn restore_transaction(&self, hash: TxHash) -> Result<(), EvmError> {
+            self.inner.restore_transaction(hash).await
+        }
+
+        async fn send_pending(
+            &self,
+            contract: Address,
+            data: Bytes,
+            note: &str,
+        ) -> Result<TxHash, EvmError> {
+            self.inner.send_pending(contract, data, note).await
+        }
+
+        async fn await_receipt(&self, hash: TxHash) -> Result<TransactionReceipt, EvmError> {
+            self.inner.await_receipt(hash).await
+        }
+
+        async fn send(
+            &self,
+            contract: Address,
+            data: Bytes,
+            note: &str,
+        ) -> Result<TransactionReceipt, EvmError> {
+            self.inner.send(contract, data, note).await
+        }
+    }
+
+    #[tokio::test]
+    async fn first_vault_broadcast_failure_retains_exact_bytes_for_restart() {
+        let pool = crate::test_utils::pool_migrated_up_to(20_261_008_021_843).await;
+        let store = Arc::new(test_store(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let wallet = WithdrawalBroadcastWallet {
+            inner: create_test_wallet(&endpoint, &private_key),
+            store: store.clone(),
+            id: id.clone(),
+            seen: seen.clone(),
+            preparation_pause: None,
+        };
+        let (manager, _jobs, _server) =
+            manager_with_bot_gas_queue(store.clone(), wallet.clone(), MockBridge::new()).await;
+
+        let error = manager
+            .withdraw_from_vault(&id, amount, amount_u256)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            UsdcTransferError::WithdrawalScanTransient { .. }
+        ));
+        assert!(
+            !manager.vault_withdrawal_needs_handoff(&id),
+            "ordinary broadcast failure must retain its existing retry budget"
+        );
+        let persisted = serde_json::to_value(store.load(&id).await.unwrap()).unwrap();
+        assert_eq!(
+            persisted["WithdrawalSubmitting"]["prepared"]["nonce"],
+            json!(0)
+        );
+        assert_eq!(
+            wallet
+                .provider()
+                .get_transaction_count(wallet.address())
+                .await
+                .unwrap(),
+            0,
+            "the first failure occurs before broadcast"
+        );
+
+        // Upgrade the populated old physical schema with real signed bytes still
+        // unresolved. Recovery must rebuild from the unchanged event history.
+        sqlx::migrate!().run(&pool).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(store.load(&id).await.unwrap()).unwrap(),
+            persisted
+        );
+        drop(manager);
+        drop(wallet);
+        let restarted_store = Arc::new(test_store(pool.clone(), ()));
+        let wallet = WithdrawalBroadcastWallet {
+            inner: create_test_wallet(&endpoint, &private_key),
+            store: restarted_store.clone(),
+            id: id.clone(),
+            seen: seen.clone(),
+            preparation_pause: None,
+        };
+        let (restarted, _jobs, _server) =
+            manager_with_bot_gas_queue(restarted_store.clone(), wallet.clone(), MockBridge::new())
+                .await;
+        let tx_hash: TxHash = serde_json::from_value(
+            persisted["WithdrawalSubmitting"]["prepared"]["tx_hash"].clone(),
+        )
+        .unwrap();
+        for _attempt in 0..2 {
+            let outcome = restarted.restore_prepared_vault_withdrawals(&pool).await;
+            assert_eq!(outcome.restored, 1);
+            assert!(outcome.unmined <= 1);
+            // Startup probes mining without waiting. Synchronize this fixture
+            // with Anvil before asserting the eventual confirmed resume.
+            wallet.await_receipt(tx_hash).await.unwrap();
+        }
+        restarted
+            .resume_withdrawal_submitting(&id, amount, amount_u256, 0, Utc::now())
+            .await
+            .unwrap();
+        assert!(matches!(
+            restarted_store.load(&id).await.unwrap(),
+            Some(UsdcRebalance::WithdrawalComplete { .. })
+        ));
+        {
+            let broadcasts = seen.lock().unwrap();
+            assert_eq!(broadcasts.len(), 4);
+            for broadcast in broadcasts.iter() {
+                assert_eq!(broadcast, &broadcasts[0]);
+            }
+            assert!(!broadcasts[0].raw().is_empty());
+            drop(broadcasts);
+        }
+        assert_eq!(
+            wallet
+                .provider()
+                .get_transaction_count(wallet.address())
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmed_reverted_prepared_withdrawal_fails_without_a_second_withdrawal() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (manager, jobs, _server) =
+            manager_with_bot_gas_queue(store.clone(), wallet.clone(), MockBridge::new()).await;
+        let stable = Chain::Base.settlement_stable();
+        let prepared = manager
+            .raindex
+            .prepare_withdraw(
+                stable.address,
+                TEST_VAULT_ID,
+                usdc_to_u256(amount).unwrap(),
+                stable.decimals,
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::BeginWithdrawal {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    amount,
+                    from_block: 0,
+                    prepared: Some(prepared.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        // A fill can drain the vault after estimation/signing, before inclusion.
+        wallet
+            .provider()
+            .anvil_set_code(ORDERBOOK_ADDRESS, always_reverting_code(&[]))
+            .await
+            .unwrap();
+        let _error = manager
+            .resume_withdrawal_submitting(&id, amount, usdc_to_u256(amount).unwrap(), 0, Utc::now())
+            .await
+            .unwrap_err();
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(state, UsdcRebalance::WithdrawalFailed {
+            withdrawal_ref: Some(TransferRef::OnchainTx(hash)), ..
+        } if hash == prepared.tx_hash()),
+            "confirmed revert must fail with its audit hash: {state:?}"
+        );
+        assert!(!state.holds_rebalance_guard());
+        assert_eq!(pending_bot_gas_jobs(&jobs).await.len(), 1);
+        for _ in 0..2 {
+            assert_eq!(
+                manager.restore_prepared_vault_withdrawals(&pool).await,
+                RestoredDepositSends::default()
+            );
+            assert!(matches!(
+                manager
+                    .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
+                    .await,
+                Err(UsdcTransferError::PreviouslyFailedAggregate { .. })
+            ));
+        }
+        assert_eq!(
+            wallet
+                .provider()
+                .get_transaction_count(wallet.address())
+                .await
+                .unwrap(),
+            1
+        );
+        let next = wallet
+            .prepare_pending(wallet.address(), Bytes::new(), "after confirmed revert")
+            .await
+            .unwrap();
+        assert_eq!(next.nonce(), prepared.nonce() + 1);
+        wallet.discard_prepared(next.tx_hash()).await;
+    }
+
+    #[tokio::test]
+    async fn confirmed_same_nonce_cancel_retires_only_its_prepared_withdrawal() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (mut manager, jobs, _server) =
+            manager_with_bot_gas_queue(store.clone(), wallet.clone(), MockBridge::new()).await;
+        let stable = Chain::Base.settlement_stable();
+        let prepared = manager
+            .raindex
+            .prepare_withdraw(
+                stable.address,
+                TEST_VAULT_ID,
+                usdc_to_u256(amount).unwrap(),
+                stable.decimals,
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::BeginWithdrawal {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    amount,
+                    from_block: 0,
+                    prepared: Some(prepared.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        let reason = "operator verified cancellation".to_owned();
+        assert!(
+            manager
+                .fail_superseded_vault_withdrawal(&id, None, reason.clone())
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .load(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .holds_rebalance_guard()
+        );
+        // Another signer instance represents the operator's same-wallet cancel;
+        // it sees the still-unused chain nonce, not the bot's reservation.
+        let operator = create_test_wallet(&endpoint, &private_key);
+        let cancel = operator
+            .prepare_pending(operator.address(), Bytes::new(), "cancel withdrawal")
+            .await
+            .unwrap();
+        assert_eq!(cancel.nonce(), prepared.nonce());
+        assert_ne!(cancel.tx_hash(), prepared.tx_hash());
+        operator
+            .broadcast_prepared(&cancel, "cancel withdrawal")
+            .await
+            .unwrap();
+        operator.await_receipt(cancel.tx_hash()).await.unwrap();
+        manager.withdrawal_required_confirmations.clear();
+        assert!(matches!(
+            manager
+                .fail_superseded_vault_withdrawal(&id, Some(cancel.tx_hash()), reason.clone())
+                .await,
+            Err(UsdcRecheckError::WithdrawalDepthMissing(Chain::Base))
+        ));
+        manager
+            .withdrawal_required_confirmations
+            .insert(Chain::Base, 3);
+        assert!(
+            manager
+                .fail_superseded_vault_withdrawal(&id, Some(cancel.tx_hash()), reason.clone())
+                .await
+                .is_err(),
+            "configured depth must gate retirement"
+        );
+        assert!(
+            store
+                .load(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .holds_rebalance_guard()
+        );
+        wallet.provider().anvil_mine(Some(2), None).await.unwrap();
+        // Proof is bound to these exact signed bytes; another prepared identity
+        // cannot be failed using this withdrawal's safe cancellation.
+        let proof = crate::rebalancing::equity::verify_withdrawal_superseded(
+            manager.raindex.as_ref(),
+            &prepared,
+            Some(cancel.tx_hash()),
+            wallet.address(),
+            3,
+        )
+        .await
+        .unwrap();
+        let other_id = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &other_id,
+                UsdcRebalanceCommand::BeginWithdrawal {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    amount,
+                    from_block: 0,
+                    prepared: Some(PreparedTransaction::for_test(
+                        TxHash::repeat_byte(0x82),
+                        prepared.nonce(),
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .send(
+                    &other_id,
+                    UsdcRebalanceCommand::RecordWithdrawalSuperseded {
+                        proof,
+                        reason: reason.clone()
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .load(&other_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .holds_rebalance_guard()
+        );
+        manager
+            .fail_superseded_vault_withdrawal(&id, Some(cancel.tx_hash()), reason.clone())
+            .await
+            .unwrap();
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(&state, UsdcRebalance::WithdrawalFailed { withdrawal_ref: Some(TransferRef::OnchainTx(hash)), reason: recorded, .. } if *hash == prepared.tx_hash() && recorded.contains(&reason) && recorded.contains(&cancel.tx_hash().to_string()))
+        );
+        assert!(!state.holds_rebalance_guard());
+        assert!(
+            pending_bot_gas_jobs(&jobs).await.is_empty(),
+            "unmined withdrawal must not create withdrawal gas accounting"
+        );
+        for _ in 0..2 {
+            assert!(matches!(
+                manager
+                    .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
+                    .await,
+                Err(UsdcTransferError::PreviouslyFailedAggregate { .. })
+            ));
+        }
+        assert!(
+            wallet
+                .provider()
+                .get_transaction_receipt(prepared.tx_hash())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let next = wallet
+            .prepare_pending(wallet.address(), Bytes::new(), "after proven cancel")
+            .await
+            .unwrap();
+        assert_eq!(next.nonce(), prepared.nonce() + 1);
+        wallet.discard_prepared(next.tx_hash()).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_vault_preparation_still_persists_before_redrive() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store(pool, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let signed = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let wallet = WithdrawalBroadcastWallet {
+            inner: create_test_wallet(&endpoint, &private_key),
+            store: store.clone(),
+            id: id.clone(),
+            seen: Arc::new(Mutex::new(Vec::new())),
+            preparation_pause: Some((signed.clone(), release.clone())),
+        };
+        let (manager, _jobs, _server) =
+            manager_with_bot_gas_queue(store.clone(), wallet.clone(), MockBridge::new()).await;
+        let (pause, gate) = super::super::driver_pause::usdc_driver_pause();
+        let manager = Arc::new(manager.with_driver_gate(gate.clone()));
+        let attempt = {
+            let manager = manager.clone();
+            let id = id.clone();
+            tokio::spawn(async move { manager.withdraw_from_vault(&id, amount, amount_u256).await })
+        };
+        signed.notified().await;
+        attempt.abort();
+        assert!(attempt.await.unwrap_err().is_cancelled());
+        assert!(manager.vault_withdrawal_preparation_pending());
+        assert!(store.load(&id).await.unwrap().is_none());
+        {
+            let mut pause_task = tokio::spawn(async move { pause.pause().await });
+            while !gate.is_paused() {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                !pause_task.is_finished(),
+                "operator pause must wait for detached signing"
+            );
+            release.notify_one();
+            let pause_guard = (&mut pause_task).await.unwrap().unwrap();
+            drop(pause_task);
+            drop(pause_guard);
+        }
+        let persisted = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(state) = store.load(&id).await.unwrap() {
+                    break state;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled preparation must still persist its signed bytes");
+        assert!(matches!(
+            persisted,
+            UsdcRebalance::WithdrawalSubmitting {
+                prepared: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(
+            wallet
+                .provider()
+                .get_transaction_count(wallet.address())
+                .await
+                .unwrap(),
+            0
+        );
+        manager.wait_for_vault_withdrawal_preparation().await;
+        assert!(!manager.vault_withdrawal_preparation_pending());
+        assert!(
+            manager.vault_withdrawal_needs_handoff(&id),
+            "cancelled caller must remain visible after signing settles"
+        );
+        let wrong_amount = usdc("2");
+        let error = manager
+            .withdraw_from_vault(&id, wrong_amount, usdc_to_u256(wrong_amount).unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, UsdcTransferError::Aggregate(_)));
+        assert_eq!(wallet.seen.lock().unwrap().len(), 0);
+        assert!(
+            manager.vault_withdrawal_needs_handoff(&id),
+            "a mismatched caller cannot take recovery ownership"
+        );
+        let error = manager
+            .withdraw_from_vault(&id, amount, amount_u256)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            UsdcTransferError::WithdrawalScanTransient { .. }
+        ));
+        assert!(
+            !manager.vault_withdrawal_needs_handoff(&id),
+            "a live redrive takes ownership of the persisted transaction"
+        );
+        assert_eq!(
+            wallet.seen.lock().unwrap().len(),
+            1,
+            "redrive reuses the stored identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_startup_vault_rebroadcast_keeps_nonce_and_guard() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let original = create_test_wallet(&endpoint, &private_key);
+        let stable = Chain::Base.settlement_stable();
+        let service = RaindexService::new(
+            original,
+            RaindexContracts {
+                inventory: ORDERBOOK_ADDRESS,
+                orderbook: ORDERBOOK_ADDRESS,
+            },
+            Address::ZERO,
+        );
+        let prepared = service
+            .prepare_withdraw(
+                stable.address,
+                TEST_VAULT_ID,
+                U256::from(1_000_000),
+                stable.decimals,
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::BeginWithdrawal {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    amount,
+                    from_block: 0,
+                    prepared: Some(prepared.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        let wallet = WithdrawalBroadcastWallet {
+            inner: create_test_wallet(&endpoint, &private_key),
+            store: store.clone(),
+            id: id.clone(),
+            seen: Arc::new(Mutex::new(Vec::new())),
+            preparation_pause: None,
+        };
+        let (manager, _jobs, _server) =
+            manager_with_bot_gas_queue(store.clone(), wallet.clone(), MockBridge::new()).await;
+        assert_eq!(
+            manager.restore_prepared_vault_withdrawals(&pool).await,
+            RestoredDepositSends {
+                restored: 1,
+                unmined: 1
+            }
+        );
+        assert!(
+            store
+                .load(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .holds_rebalance_guard()
+        );
+        let next = wallet
+            .inner
+            .prepare_pending(wallet.address(), Bytes::new(), "after startup restore")
+            .await
+            .unwrap();
+        assert_eq!(next.nonce(), prepared.nonce() + 1);
+        wallet.inner.discard_prepared(next.tx_hash()).await;
+        assert_eq!(
+            manager.restore_prepared_vault_withdrawals(&pool).await,
+            RestoredDepositSends {
+                restored: 1,
+                unmined: 0
+            }
+        );
+        assert_eq!(
+            *wallet.seen.lock().unwrap(),
+            vec![prepared.clone(), prepared]
+        );
+    }
+
+    #[tokio::test]
+    async fn rotated_wallet_rejects_prepared_withdrawal_without_reserving_or_broadcasting() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let (anvil, endpoint, private_key) = setup_anvil();
+        let original = create_test_wallet(&endpoint, &private_key);
+        for _ in 0..3 {
+            original
+                .prepare_pending(original.address(), Bytes::new(), "old wallet reservation")
+                .await
+                .unwrap();
+        }
+        let service = RaindexService::new(
+            original,
+            RaindexContracts {
+                inventory: ORDERBOOK_ADDRESS,
+                orderbook: ORDERBOOK_ADDRESS,
+            },
+            Address::ZERO,
+        );
+        let stable = Chain::Base.settlement_stable();
+        let prepared = service
+            .prepare_withdraw(
+                stable.address,
+                TEST_VAULT_ID,
+                U256::from(1_000_000),
+                stable.decimals,
+            )
+            .await
+            .unwrap();
+        assert_eq!(prepared.nonce(), 3);
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::BeginWithdrawal {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    amount,
+                    from_block: 0,
+                    prepared: Some(prepared.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        let new_key = B256::from_slice(&anvil.keys()[1].to_bytes());
+        let wallet = create_test_wallet(&endpoint, &new_key);
+        let (manager, _jobs, _server) =
+            manager_with_bot_gas_queue(store.clone(), wallet.clone(), MockBridge::new()).await;
+        assert_eq!(
+            manager.restore_prepared_vault_withdrawals(&pool).await,
+            RestoredDepositSends {
+                restored: 0,
+                unmined: 1
+            }
+        );
+        assert!(matches!(
+            manager
+                .resume_withdrawal_submitting(
+                    &id,
+                    amount,
+                    usdc_to_u256(amount).unwrap(),
+                    0,
+                    Utc::now(),
+                )
+                .await,
+            Err(UsdcTransferError::Vault(
+                RaindexError::PreparedWithdrawalSignerMismatch { .. }
+            ))
+        ));
+        assert!(matches!(
+            manager.raindex.broadcast_prepared_withdraw(&prepared).await,
+            Err(RaindexError::PreparedWithdrawalSignerMismatch { .. })
+        ));
+        assert!(matches!(
+            store.load(&id).await.unwrap(),
+            Some(UsdcRebalance::WithdrawalSubmitting {
+                prepared: Some(_),
+                ..
+            })
+        ));
+        assert!(
+            wallet
+                .provider()
+                .get_transaction_by_hash(prepared.tx_hash())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let next = wallet
+            .prepare_pending(
+                wallet.address(),
+                Bytes::new(),
+                "new wallet after rejected restore",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            next.nonce(),
+            0,
+            "foreign nonce must not enter the new wallet's ledger"
+        );
+        wallet.discard_prepared(next.tx_hash()).await;
+    }
+
+    #[tokio::test]
+    async fn failed_vault_identity_persistence_releases_only_unpersisted_nonce() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store(pool.clone(), ()));
+        sqlx::raw_sql("CREATE TRIGGER reject_usdc_intent BEFORE INSERT ON events \
+            WHEN NEW.aggregate_type = 'UsdcRebalance' BEGIN SELECT RAISE(ABORT, 'test persistence failure'); END")
+            .execute(&pool).await.unwrap();
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = WithdrawalBroadcastWallet {
+            inner: create_test_wallet(&endpoint, &private_key),
+            store: store.clone(),
+            id: id.clone(),
+            seen: Arc::new(Mutex::new(Vec::new())),
+            preparation_pause: None,
+        };
+        let (manager, _jobs, _server) =
+            manager_with_bot_gas_queue(store.clone(), wallet.clone(), MockBridge::new()).await;
+        let error = manager
+            .withdraw_from_vault(&id, amount, usdc_to_u256(amount).unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, UsdcTransferError::Aggregate(_)));
+        assert_eq!(
+            store
+                .load(&id)
+                .await
+                .unwrap()
+                .map(|state| state.state_name()),
+            None
+        );
+        assert_eq!(wallet.seen.lock().unwrap().len(), 0);
+        let next = wallet
+            .inner
+            .prepare_pending(wallet.address(), Bytes::new(), "after failed persistence")
+            .await
+            .unwrap();
+        assert_eq!(
+            next.nonce(),
+            0,
+            "unpersisted withdrawal must not strand its unused nonce"
+        );
+        wallet.inner.discard_prepared(next.tx_hash()).await;
     }
 
     /// The production incident: the inventory vault cannot cover the
@@ -27788,6 +29009,7 @@ mod tests {
                 corridor,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount,
+                prepared: None,
                 from_block,
             },
         )
@@ -28003,6 +29225,7 @@ mod tests {
                 corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount,
+                prepared: None,
                 from_block: 0,
             },
         )
@@ -28054,6 +29277,7 @@ mod tests {
                 corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: requested,
+                prepared: None,
                 from_block: 0,
             },
         )
@@ -28126,6 +29350,7 @@ mod tests {
                 corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: requested,
+                prepared: None,
                 from_block: 0,
             },
         )
@@ -28184,6 +29409,7 @@ mod tests {
                 corridor: ROBINHOOD_RELAY,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: requested,
+                prepared: None,
                 from_block: 0,
             },
         )
@@ -30695,6 +31921,7 @@ mod tests {
                 direction: RebalanceDirection::BaseToAlpaca,
                 corridor: ROBINHOOD_RELAY,
                 amount,
+                prepared: None,
                 from_block: 0,
             },
         )
@@ -30769,6 +31996,7 @@ mod tests {
                 direction: RebalanceDirection::BaseToAlpaca,
                 corridor: ROBINHOOD_RELAY,
                 amount: usdc("100"),
+                prepared: None,
                 from_block: 0,
             },
         )

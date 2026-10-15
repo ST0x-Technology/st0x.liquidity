@@ -1360,12 +1360,15 @@ enum RearmPolicy {
     /// `Attested`): any job row -- in-flight or terminal -- blocks re-arm so an
     /// exhausted retry budget is never bypassed.
     PostBurnResumable,
-    /// Pre-burn mid-flight (`BridgingSubmitting` /
+    /// Pre-burn mid-flight (`BridgingSubmitting` / legacy unsigned
     /// `WithdrawalSubmitting{BaseToAlpaca}`): re-arm only when NO job row exists.
     /// A live row means apalis is still driving it (skip). A terminal-only row
     /// means the redrive budget is exhausted with no driver -- strand it for an
     /// operator alert rather than silently resetting the counter to zero.
     MidFlightPreBurn,
+    /// Stored withdrawal bytes make startup redrive idempotent. A terminal
+    /// job must not abandon that signed nonce; only a live job blocks re-arm.
+    PreparedVaultWithdrawal,
     /// Alpaca-to-Base states after the source withdrawal may have moved funds:
     /// re-arm whenever no LIVE job row exists. Unlike `MidFlightPreBurn`, a
     /// terminal (exhausted/Killed) job row does NOT block re-arm. Resume is
@@ -1437,6 +1440,12 @@ impl RearmPolicy {
             } => Self::AlpacaToBaseIdempotentRedrive,
             UsdcRebalance::WithdrawalSubmitting {
                 direction: RebalanceDirection::BaseToAlpaca,
+                prepared: Some(_),
+                ..
+            } => Self::PreparedVaultWithdrawal,
+            UsdcRebalance::WithdrawalSubmitting {
+                direction: RebalanceDirection::BaseToAlpaca,
+                prepared: None,
                 ..
             }
             | UsdcRebalance::BridgingSubmitting { .. } => Self::MidFlightPreBurn,
@@ -8793,14 +8802,10 @@ impl RebalancingService {
                         //
                         // This re-arm runs BEFORE the apalis monitor spawns (see
                         // conductor.rs startup order), so there is no live-worker race.
-                        // The transfer_has_job_row_for_id gate below provides idempotency
-                        // on the very first check; we collect here and gate in
-                        // rearm_stranded_transfers.
-                        // Alpaca-to-Base states whose source withdrawal may have
-                        // moved funds use a separate policy: resume is idempotent,
-                        // so a terminal job row does NOT indicate the transfer is
-                        // unrecoverable. All other mid-flight pre-burn states use
-                        // MidFlightPreBurn.
+                        // Collect here and apply the policy's job-row gate in
+                        // rearm_stranded_transfers. Signed withdrawals and other
+                        // idempotent phases may resume past terminal rows; legacy
+                        // pre-burn intents retain the operator gate.
                         let policy = RearmPolicy::mid_flight(&entity);
                         rearm_candidates.push(RearmCandidate {
                             id,
@@ -9015,8 +9020,11 @@ impl RebalancingService {
     ///   `Failed` awaiting operator reconciliation -- skips it via
     ///   [`Self::transfer_has_job_row_for_id`], so re-arm never bypasses the
     ///   retry budget of a job that already ran and gave up.
+    /// - [`RearmPolicy::PreparedVaultWithdrawal`]: stored signed bytes resume
+    ///   whenever no live job remains, including after terminal job exhaustion.
+    ///   Startup preserves the exact transaction rather than signing a second.
     /// - [`RearmPolicy::MidFlightPreBurn`] (pre-burn `BridgingSubmitting` /
-    ///   `WithdrawalSubmitting{BaseToAlpaca}`): re-armed only when NO job row
+    ///   unsigned `WithdrawalSubmitting{BaseToAlpaca}`): re-armed only when NO job row
     ///   exists. A live row means apalis is still driving it (skip silently). A
     ///   terminal-only row means the redrive budget is exhausted with no driver:
     ///   rather than silently re-arming with a fresh budget, the id is stranded
@@ -9049,6 +9057,7 @@ impl RebalancingService {
         {
             let blocked = match policy {
                 RearmPolicy::RecoverableFailure
+                | RearmPolicy::PreparedVaultWithdrawal
                 | RearmPolicy::AlpacaToBaseIdempotentRedrive
                 | RearmPolicy::RelayResume => self.transfer_live_job_for_id(&id).await?,
                 RearmPolicy::PostBurnResumable => self.transfer_has_job_row_for_id(&id).await?,
@@ -10561,7 +10570,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::pin::pin;
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use tokio::sync::broadcast;
     use uuid::Uuid;
@@ -22704,6 +22713,214 @@ mod tests {
         );
     }
 
+    struct PendingVaultPreparation;
+
+    #[async_trait]
+    impl ResumeBaseToAlpaca for PendingVaultPreparation {
+        fn withdrawal_preparation_pending(&self, _corridor: UsdcCorridor) -> bool {
+            true
+        }
+
+        async fn resume_base_to_alpaca(
+            &self,
+            _id: &UsdcRebalanceId,
+            _amount: Usdc,
+            _corridor: UsdcCorridor,
+        ) -> Result<(), UsdcTransferError> {
+            unreachable!("terminal cleanup must not resume the transfer")
+        }
+    }
+
+    struct CompletingVaultPreparation {
+        store: Arc<Store<UsdcRebalance>>,
+        id: UsdcRebalanceId,
+        persist: bool,
+        pending: AtomicBool,
+        handoff: AtomicBool,
+    }
+
+    #[async_trait]
+    impl ResumeBaseToAlpaca for CompletingVaultPreparation {
+        fn withdrawal_preparation_pending(&self, _corridor: UsdcCorridor) -> bool {
+            self.pending.load(Ordering::SeqCst)
+        }
+
+        fn withdrawal_preparation_needs_handoff(
+            &self,
+            _: &UsdcRebalanceId,
+            _: UsdcCorridor,
+        ) -> bool {
+            self.handoff.load(Ordering::SeqCst)
+        }
+
+        fn acknowledge_withdrawal_handoff(&self, _: &UsdcRebalanceId, _: UsdcCorridor) {
+            self.handoff.store(false, Ordering::SeqCst);
+        }
+
+        async fn wait_for_withdrawal_preparation(&self, corridor: UsdcCorridor) {
+            if !self.pending.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            if self.persist {
+                self.store
+                    .send(
+                        &self.id,
+                        UsdcRebalanceCommand::BeginWithdrawal {
+                            direction: RebalanceDirection::BaseToAlpaca,
+                            corridor,
+                            amount: usdc(250),
+                            from_block: 0,
+                            prepared: Some(PreparedTransaction::for_test(
+                                TxHash::repeat_byte(0x73),
+                                0,
+                            )),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            self.pending.store(false, Ordering::SeqCst);
+        }
+
+        async fn resume_base_to_alpaca(
+            &self,
+            _: &UsdcRebalanceId,
+            _: Usdc,
+            _: UsdcCorridor,
+        ) -> Result<(), UsdcTransferError> {
+            unreachable!("terminal cleanup enqueues the resume rather than driving it inline")
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_attempt_settles_late_preparation_and_preserves_recovery_ownership() {
+        for (persist, live_sibling, completed_before_hook) in [
+            (true, false, false),
+            (false, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            let (trigger, pool, store) = make_resume_trigger().await;
+            let id = trigger
+                .start_manual_usdc_transfer(
+                    &pool,
+                    RebalanceDirection::BaseToAlpaca,
+                    positive_usdc(250),
+                    None,
+                )
+                .await
+                .unwrap();
+            let queue = trigger.transfer_usdc_to_hedging_queue.clone();
+            if !live_sibling {
+                sqlx_apalis::query("DELETE FROM Jobs")
+                    .execute(queue.pool())
+                    .await
+                    .unwrap();
+            }
+            let transfer = Arc::new(CompletingVaultPreparation {
+                store: store.clone(),
+                id: id.clone(),
+                persist,
+                pending: AtomicBool::new(true),
+                handoff: AtomicBool::new(true),
+            });
+            if completed_before_hook {
+                transfer
+                    .wait_for_withdrawal_preparation(UsdcCorridor::BASE_CCTP)
+                    .await;
+            }
+            let ctx = TransferUsdcToHedgingCtx {
+                transfer,
+                timeout: Duration::from_secs(1),
+                job_queue: queue,
+                max_burn_revert_redrives: 1,
+                notifier: Arc::new(LogNotifier),
+                driver_gate: crate::rebalancing::usdc::UsdcDriverGate::unpaused(),
+                unrecorded_guards: Some(UnrecordedGuardRelease {
+                    guards: Arc::clone(&trigger.usdc_guards),
+                    store: Arc::clone(&store),
+                }),
+                underfunded_alerts: crate::rebalancing::usdc::UnderfundedAlertLatch::default(),
+            };
+            let job = TransferUsdcToHedging {
+                id: id.clone(),
+                amount: usdc(250),
+                corridor: UsdcCorridor::BASE_CCTP,
+                revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
+            };
+            for _ in 0..2 {
+                Job::on_terminal_attempt(&job, &ctx, &TaskIdentity::for_test("late-preparation"))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(store.load(&id).await.unwrap().is_some(), persist);
+            assert_eq!(trigger.usdc_guards.is_held(Chain::Base), persist);
+            assert_eq!(
+                count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+                i64::from(persist),
+                "persisted bytes must have exactly one durable resume owner"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_attempt_keeps_guard_while_detached_vault_preparation_has_no_event() {
+        let (trigger, pool, store) = make_resume_trigger().await;
+        let id = trigger
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::BaseToAlpaca,
+                positive_usdc(250),
+                None,
+            )
+            .await
+            .unwrap();
+        let queue = trigger.transfer_usdc_to_hedging_queue.clone();
+        // There is no remaining live job to protect this reservation.
+        sqlx_apalis::query("DELETE FROM Jobs")
+            .execute(queue.pool())
+            .await
+            .unwrap();
+        let ctx = TransferUsdcToHedgingCtx {
+            transfer: Arc::new(PendingVaultPreparation),
+            timeout: Duration::from_secs(1),
+            job_queue: queue,
+            max_burn_revert_redrives: 1,
+            notifier: Arc::new(LogNotifier),
+            driver_gate: crate::rebalancing::usdc::UsdcDriverGate::unpaused(),
+            unrecorded_guards: Some(UnrecordedGuardRelease {
+                guards: Arc::clone(&trigger.usdc_guards),
+                store: Arc::clone(&store),
+            }),
+            underfunded_alerts: crate::rebalancing::usdc::UnderfundedAlertLatch::default(),
+        };
+        let job = TransferUsdcToHedging {
+            id: id.clone(),
+            amount: usdc(250),
+            corridor: UsdcCorridor::BASE_CCTP,
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+        Job::on_terminal_attempt(&job, &ctx, &TaskIdentity::for_test("terminal-signing-row"))
+            .await
+            .unwrap();
+        assert!(store.load(&id).await.unwrap().is_none());
+        assert!(trigger.usdc_guards.is_held(Chain::Base));
+        assert!(
+            trigger
+                .start_manual_usdc_transfer(
+                    &pool,
+                    RebalanceDirection::BaseToAlpaca,
+                    positive_usdc(250),
+                    None,
+                )
+                .await
+                .is_err(),
+            "another transfer must not overlap the detached signer"
+        );
+    }
+
     /// The terminal attempt keeps the guard while another live job row still
     /// drives the same id, even though nothing was recorded: that row will
     /// run the transfer, so freeing the guard would let a second one start.
@@ -23403,6 +23620,7 @@ mod tests {
                     corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: usdc(400),
+                    prepared: None,
                     from_block: 52_027_377,
                 },
             )
@@ -32511,6 +32729,7 @@ mod tests {
                     corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
+                    prepared: None,
                     from_block: 10,
                 },
             )
@@ -32554,6 +32773,7 @@ mod tests {
                     corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
+                    prepared: None,
                     from_block: 10,
                 },
             )
@@ -33122,6 +33342,7 @@ mod tests {
                     corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
+                    prepared: None,
                     from_block: 10,
                 },
             )
@@ -33239,6 +33460,70 @@ mod tests {
             service.usdc_guards.is_held(Chain::Base),
             "the Base guard must be latched after re-arming a stranded WithdrawalSubmitting job",
         );
+    }
+
+    #[tokio::test]
+    async fn startup_rearms_prepared_withdrawal_after_terminal_jobs_without_changing_identity() {
+        for signed in [false, true] {
+            for status in ["Failed", "Done", "Killed"] {
+                let pool = crate::test_utils::setup_test_db().await;
+                let store = test_store::<UsdcRebalance>(pool.clone(), ());
+                let id = UsdcRebalanceId(Uuid::new_v4());
+                let amount = usdc(300);
+                let prepared =
+                    signed.then(|| PreparedTransaction::for_test(TxHash::repeat_byte(0x91), 7));
+                store
+                    .send(
+                        &id,
+                        UsdcRebalanceCommand::BeginWithdrawal {
+                            direction: RebalanceDirection::BaseToAlpaca,
+                            corridor: UsdcCorridor::BASE_CCTP,
+                            amount,
+                            from_block: 1,
+                            prepared,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let before = serde_json::to_value(store.load(&id).await.unwrap()).unwrap();
+                let service = make_trigger_with_inventory(InventoryView::default()).await;
+                service
+                    .transfer_usdc_to_hedging_queue
+                    .clone()
+                    .push(TransferUsdcToHedging {
+                        corridor: UsdcCorridor::BASE_CCTP,
+                        id: id.clone(),
+                        amount,
+                        revert_redrive_attempts: 0,
+                        backpressure_streak: BackpressureStreak::default(),
+                    })
+                    .await
+                    .unwrap();
+                sqlx_apalis::query("UPDATE Jobs SET status = ?, attempts = max_attempts, done_at = strftime('%s','now') WHERE job_type = ?")
+                    .bind(status).bind(std::any::type_name::<TransferUsdcToHedging>()).execute(service.transfer_usdc_to_hedging_queue.pool()).await.unwrap();
+                for _ in 0..2 {
+                    service.recover_usdc_guard(&pool, &store).await.unwrap();
+                    assert_eq!(
+                        count_pending_transfer_usdc_to_hedging_jobs(&service).await,
+                        i64::from(signed),
+                        "signed={signed}, previous status={status}: only idempotent stored bytes can restart past terminal jobs"
+                    );
+                    assert_eq!(
+                        serde_json::to_value(store.load(&id).await.unwrap()).unwrap(),
+                        before,
+                        "startup must preserve the exact signed identity and legacy intent"
+                    );
+                    assert!(service.usdc_guards.is_held(Chain::Base));
+                }
+                if signed {
+                    let job =
+                        pending_transfer_usdc_to_hedging_job_on(&service, UsdcCorridor::BASE_CCTP)
+                            .await;
+                    assert_eq!(job.id, id);
+                    assert_eq!(job.amount, amount);
+                }
+            }
+        }
     }
 
     /// A `BridgingSubmitting` aggregate that already has a Pending
@@ -45145,6 +45430,7 @@ mod tests {
                     corridor: UsdcCorridor::BASE_CCTP,
                     amount: usdc(50),
                     from_block: 1,
+                    prepared: None,
                 },
             )
             .await
@@ -46133,6 +46419,7 @@ mod tests {
                 direction: RebalanceDirection::BaseToAlpaca,
                 corridor: ROBINHOOD_RELAY,
                 amount,
+                prepared: None,
                 from_block: 1,
             },
             UsdcRebalanceCommand::Initiate {
@@ -46200,6 +46487,7 @@ mod tests {
                 direction: RebalanceDirection::BaseToAlpaca,
                 corridor: ROBINHOOD_RELAY,
                 amount,
+                prepared: None,
                 from_block: 1,
             },
             UsdcRebalanceCommand::Initiate {
@@ -46425,6 +46713,7 @@ mod tests {
                         direction,
                         corridor,
                         amount: usdc(300),
+                        prepared: None,
                         from_block: 1,
                     },
                 )

@@ -2162,7 +2162,7 @@ where
         pool: &SqlitePool,
     ) -> BTreeMap<Chain, RestoredDepositSends> {
         let chain = self.corridor.chain();
-        let mut outcome = RestoredDepositSends::default();
+        let mut outcome = self.restore_prepared_vault_withdrawals(pool).await;
 
         let (ids, unparseable) = match prepared_swap_ids(pool).await {
             Ok(found) => found,
@@ -2690,6 +2690,22 @@ impl<Signer> ResumeBaseToAlpaca for CrossVenueCashTransfer<Signer, RelayHop<Sign
 where
     Signer: Wallet + Send + Sync + 'static,
 {
+    fn withdrawal_preparation_needs_handoff(&self, id: &UsdcRebalanceId, _: UsdcCorridor) -> bool {
+        self.vault_withdrawal_needs_handoff(id)
+    }
+
+    fn acknowledge_withdrawal_handoff(&self, id: &UsdcRebalanceId, _: UsdcCorridor) {
+        self.acknowledge_vault_withdrawal_handoff(id);
+    }
+
+    fn withdrawal_preparation_pending(&self, _corridor: UsdcCorridor) -> bool {
+        self.vault_withdrawal_preparation_pending()
+    }
+
+    async fn wait_for_withdrawal_preparation(&self, _corridor: UsdcCorridor) {
+        self.wait_for_vault_withdrawal_preparation().await;
+    }
+
     async fn resume_base_to_alpaca(
         &self,
         id: &UsdcRebalanceId,
@@ -2739,6 +2755,16 @@ impl<Signer> RecheckUsdcDeposit for CrossVenueCashTransfer<Signer, RelayHop<Sign
 where
     Signer: Wallet + Send + Sync + 'static,
 {
+    async fn fail_superseded_withdrawal(
+        &self,
+        id: &UsdcRebalanceId,
+        superseding_tx: Option<TxHash>,
+        reason: String,
+    ) -> Result<(), UsdcRecheckError> {
+        self.fail_superseded_vault_withdrawal(id, superseding_tx, reason)
+            .await
+    }
+
     /// Reads Relay's status of a held escrow's order again: the deposited
     /// order of an unresolved escrow, or the failed one. A payment that
     /// proves is adopted (`Recovered`) and left for the escrow's job, or a
@@ -3133,6 +3159,10 @@ mod tests {
                 attestation_retry_deadline: Duration::from_secs(3600),
                 settlement_retry_deadline: Duration::from_secs(3600),
                 ethereum_required_confirmations: Some(ethereum_confirmations),
+                withdrawal_required_confirmations: std::collections::BTreeMap::from([
+                    (Chain::Base, 1),
+                    (Chain::Ethereum, ethereum_confirmations),
+                ]),
                 reserved_cash: None,
                 circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
                 token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
@@ -5601,6 +5631,10 @@ mod tests {
                     attestation_retry_deadline: Duration::from_secs(3600),
                     settlement_retry_deadline: Duration::from_secs(3600),
                     ethereum_required_confirmations: Some(1),
+                    withdrawal_required_confirmations: std::collections::BTreeMap::from([
+                        (Chain::Base, 1),
+                        (Chain::Ethereum, 1),
+                    ]),
                     reserved_cash: None,
                     circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
                     token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
@@ -9142,10 +9176,19 @@ mod tests {
         )
         .await;
 
-        let held = tokio::time::timeout(
-            Duration::from_secs(60),
-            transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
-        )
+        let held = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let outcome = transfer
+                    .resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
+                    .await;
+                // The first status read can precede the 1 ms deadline.
+                // Drive the next poll, as the worker does, until it expires.
+                if !matches!(outcome, Err(UsdcTransferError::RelayFillPending { .. })) {
+                    break outcome;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
         .await
         .expect("the attempt ends");
         let Err(UsdcTransferError::SwapEscrowUnresolved { .. }) = held else {

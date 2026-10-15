@@ -35,7 +35,7 @@ use st0x_event_sorcery::{RetryOnBusy, Store, StoreBuilder};
 use st0x_evm::{Chain, IERC20, MinedTx, PreparedTransaction};
 use st0x_execution::{AlpacaTransferId, ClientOrderId, FractionalShares, Network, Symbol};
 use st0x_finance::Usdc;
-use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
+use st0x_raindex::{Raindex, RaindexError, RaindexVaultId, WithdrawalConfirmation};
 use st0x_tokenization::{
     AlpacaTokenizationError, ClientRequestId, IssuerRequestId, TokenizationRequest,
     TokenizationRequestId, TokenizationRequestStatus, TokenizationRequestType, Tokenizer,
@@ -487,6 +487,7 @@ async fn seed_alpaca_to_base(
                 corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: received,
+                prepared: None,
                 from_block,
                 submitting_at: t2,
             },
@@ -637,6 +638,7 @@ async fn seed_base_to_alpaca(
                 corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: withdraw_amount,
+                prepared: None,
                 from_block,
                 submitting_at: t0,
             },
@@ -974,6 +976,14 @@ impl Raindex for FixtureRaindex {
         _tx_hash: TxHash,
     ) -> Result<Option<TransactionReceipt>, RaindexError> {
         unimplemented!("FixtureRaindex: redemption fixture never adopts a withdrawal")
+    }
+
+    async fn confirm_withdrawal(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<WithdrawalConfirmation, RaindexError> {
+        self.confirm_tx_receipt(tx_hash).await?;
+        Ok(WithdrawalConfirmation::Succeeded)
     }
 
     async fn confirm_tx_receipt(

@@ -40,6 +40,24 @@ pub struct RaindexContracts {
     pub orderbook: Address,
 }
 
+/// Proof that an exact withdrawal hash reverted at the configured confirmation depth.
+/// Only the confirmation service can construct it; an empty scan is not proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmedWithdrawalRevert(TxHash);
+
+impl ConfirmedWithdrawalRevert {
+    pub const fn tx_hash(&self) -> TxHash {
+        self.0
+    }
+}
+
+/// A withdrawal's outcome after waiting for configured confirmations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WithdrawalConfirmation {
+    Succeeded,
+    Reverted(ConfirmedWithdrawalRevert),
+}
+
 /// Outcome of an idempotent stale-allowance revoke.
 ///
 /// Distinguishes "a revoke tx was submitted" from "the allowance was already
@@ -64,6 +82,17 @@ pub enum RaindexError {
     Float(#[from] rain_math_float::FloatError),
     #[error("Amount cannot be zero")]
     ZeroAmount,
+    /// Signed bytes from a rotated or unknown key cannot use this wallet's nonce ledger.
+    #[error(
+        "prepared withdrawal {tx_hash} was signed by {signer:?}, not configured wallet {wallet}"
+    )]
+    PreparedWithdrawalSignerMismatch {
+        tx_hash: TxHash,
+        signer: Option<Address>,
+        wallet: Address,
+    },
+    #[error("receipt hash {actual} does not match requested transaction {expected}")]
+    ReceiptHashMismatch { expected: TxHash, actual: TxHash },
     #[error("RPC transport error: {0}")]
     RpcTransport(#[from] RpcError<TransportErrorKind>),
     #[error("ABI decode error: {0}")]
@@ -171,6 +200,8 @@ impl RaindexError {
             Self::Contract(_)
             | Self::Float(_)
             | Self::ZeroAmount
+            | Self::ReceiptHashMismatch { .. }
+            | Self::PreparedWithdrawalSignerMismatch { .. }
             | Self::RpcTransport(_)
             | Self::SolType(_)
             | Self::ScanInconclusive { .. }
@@ -204,6 +235,8 @@ impl RaindexError {
             Self::Contract(_)
             | Self::Float(_)
             | Self::ZeroAmount
+            | Self::ReceiptHashMismatch { .. }
+            | Self::PreparedWithdrawalSignerMismatch { .. }
             | Self::SolType(_)
             | Self::ScanAnomalousLog { .. }
             | Self::InsufficientVaultLiquidity { .. }
@@ -265,9 +298,9 @@ pub trait Raindex: Send + Sync {
     /// its unused nonce is refilled first. Ownership-checked and idempotent.
     async fn discard_prepared_withdraw(&self, tx_hash: TxHash);
 
-    /// Releases the wallet-local nonce reservation held for a reconciled
-    /// withdrawal whose nonce another transaction has mined. Leaves nonce
-    /// allocation untouched. Ownership-checked and idempotent, so a repeated
+    /// Releases the wallet-local reservation after the nonce is conclusively
+    /// consumed: a confirmed revert of this withdrawal, or a verified mined
+    /// superseding transaction. Leaves nonce allocation untouched. Ownership-checked and idempotent, so a repeated
     /// reconcile observation is safe, and it also frees a legacy hash-only
     /// withdrawal with no persisted prepared bytes.
     async fn release_superseded_withdraw(&self, tx_hash: TxHash);
@@ -331,6 +364,13 @@ pub trait Raindex: Send + Sync {
     /// none. Does not wait, confirm or touch the wallet's nonce bookkeeping.
     async fn tx_receipt(&self, tx_hash: TxHash)
     -> Result<Option<TransactionReceipt>, RaindexError>;
+
+    /// Wait for a withdrawal's exact receipt at configured confirmation depth,
+    /// preserving a confirmed revert as proof rather than an ambiguous RPC error.
+    async fn confirm_withdrawal(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<WithdrawalConfirmation, RaindexError>;
 
     /// Wait for a previously submitted transaction to be confirmed.
     async fn confirm_tx(&self, tx_hash: TxHash) -> Result<(), RaindexError> {

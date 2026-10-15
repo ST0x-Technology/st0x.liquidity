@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(test)]
 use st0x_evm::EvmError;
 use st0x_evm::{IERC20, MinedTx, PreparedTransaction};
-use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
+use st0x_raindex::{Raindex, RaindexError, RaindexVaultId, WithdrawalConfirmation};
 
 /// Whether `submit_deposit` should succeed, fail generically, or fail
 /// with an "execution reverted" RPC error (simulating a revert during
@@ -565,6 +565,14 @@ impl Raindex for MockRaindex {
         tx_hash: TxHash,
     ) -> Result<Option<TransactionReceipt>, RaindexError> {
         Ok(self.tx_receipts.get(&tx_hash).cloned())
+    }
+
+    async fn confirm_withdrawal(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<WithdrawalConfirmation, RaindexError> {
+        self.confirm_tx_receipt(tx_hash).await?;
+        Ok(WithdrawalConfirmation::Succeeded)
     }
 
     async fn confirm_tx_receipt(
