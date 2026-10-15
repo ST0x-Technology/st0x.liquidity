@@ -375,6 +375,18 @@ pub enum UsdcRebalanceError {
         deposited: U256,
         expected: U256,
     },
+    /// An overdeposit hold lists one order's deposit, or one deposit tx,
+    /// more than once.
+    #[error("the overdeposit hold lists order {order_id} (deposit {deposit_tx}) more than once")]
+    FoundDepositListedTwice { order_id: B256, deposit_tx: TxHash },
+    /// An overdeposit hold lists a deposit under another request than its
+    /// reverted order's quote.
+    #[error("the overdeposit hold lists order {order_id} under request {listed}, not {quoted}")]
+    FoundDepositRequestMismatch {
+        order_id: B256,
+        listed: B256,
+        quoted: B256,
+    },
     /// The redeposit's vault deposit is already recorded.
     #[error("the redeposit {deposit_tx} is already recorded")]
     RedepositAlreadySubmitted { deposit_tx: TxHash },
@@ -6716,6 +6728,27 @@ impl UsdcRebalance {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        if let Some((deposit, reverted)) = found
+            .iter()
+            .find(|(deposit, reverted)| deposit.request_id != reverted.request_id)
+        {
+            return Err(UsdcRebalanceError::FoundDepositRequestMismatch {
+                order_id: deposit.order_id,
+                listed: deposit.request_id,
+                quoted: reverted.request_id,
+            });
+        }
+        if let Some(deposit) = deposits
+            .iter()
+            .duplicates_by(|deposit| deposit.order_id)
+            .chain(deposits.iter().duplicates_by(|deposit| deposit.deposit_tx))
+            .next()
+        {
+            return Err(UsdcRebalanceError::FoundDepositListedTwice {
+                order_id: deposit.order_id,
+                deposit_tx: deposit.deposit_tx,
+            });
+        }
         match found.as_slice() {
             [] => return Err(invalid()),
             // One deposit of its order's and the current quote's input is
@@ -9034,7 +9067,7 @@ mod tests {
 
     fn found_deposit(order_id: u8, amount: u64) -> FoundSwapDeposit {
         FoundSwapDeposit {
-            request_id: B256::repeat_byte(order_id.wrapping_add(0x50)),
+            request_id: B256::repeat_byte(0x5e),
             order_id: B256::repeat_byte(order_id),
             deposit_tx: TxHash::repeat_byte(order_id.wrapping_add(0xc0)),
             deposit_block: 12,
@@ -9184,7 +9217,13 @@ mod tests {
                 .await
                 .then_expect_error();
             assert!(
-                matches!(&error, LifecycleError::Apply(_)),
+                matches!(
+                    &error,
+                    LifecycleError::Apply(
+                        UsdcRebalanceError::FoundDepositListedTwice { .. }
+                            | UsdcRebalanceError::FoundDepositRequestMismatch { .. }
+                    )
+                ),
                 "{refused}: got {error:?}"
             );
         }
