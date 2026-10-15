@@ -48448,6 +48448,46 @@ mod tests {
         }
     }
 
+    /// The sweep's page of an overdeposit hold lists its found deposits, with
+    /// the requests `stox relay status` takes: it is the page that reaches
+    /// the operator when the process stopped between recording the hold and
+    /// its own page.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn overdeposit_hold_timeout_page_lists_its_found_deposits() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        for command in relay_withdrawn(RebalanceDirection::BaseToAlpaca)
+            .into_iter()
+            .chain(overdeposited_hold())
+        {
+            store.send(&id, command).await.unwrap();
+        }
+
+        sweep_timed_out_relay_transfer(
+            &pool,
+            store,
+            &id,
+            usdc(100),
+            usdc::UsdcRebalanceStage::WithdrawalConfirmed,
+        )
+        .await;
+
+        let id = id.to_string();
+        let request = B256::repeat_byte(0x5e).to_string();
+        let deposit_tx = TxHash::repeat_byte(0xa2).to_string();
+        logs_assert(|lines| {
+            let page = lines
+                .iter()
+                .find(|line| line.contains(&id) && line.contains("Guard held"))
+                .ok_or("no hold page")?;
+            (page.contains(&request) && page.contains(&deposit_tx))
+                .then_some(())
+                .ok_or_else(|| format!("{page} does not list the found deposit"))
+        });
+    }
+
     /// Each Relay hold's page names the step that moves it on: a resume in
     /// its direction, settling by hand and reconciling where a resume cannot,
     /// and both where a resume may still move it or the job has paged a hold.
