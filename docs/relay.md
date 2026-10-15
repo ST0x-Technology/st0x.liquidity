@@ -77,10 +77,12 @@ that did not complete may need Relay's manual review. Where the outcome hangs on
 `TRANSACTION_NOT_INCLUDED` failure), a body without the field is
 `RelayError::Decode`, never an empty list: a not-included failure that dropped
 the field must not settle as a terminal `Failure`. `Decode` is not retried
-within the call. Within the fill window the hop waits out a `Failure` or a
-`RefundFailed` whose `deposit_txs` do not list the transfer's deposit: an
-adopted deposit of a reverted order can first read Relay's failure of the
-reverted attempt.
+within the call. For a deposit the escrow scan adopted, the hop waits out a
+`Failure` or a `RefundFailed` within the fill window, since Relay can report its
+failure of the reverted attempt with the same signed deposit listed; past the
+window, one whose `deposit_txs` do not list the deposit leaves it at
+`SwapEscrowUnresolved`. A failure of a deposit the bot signed ends the swap at
+once.
 
 A `failure` with `TRANSACTION_NOT_INCLUDED` that still lists a tx is
 `IntentStatus::NotIncluded` (not terminal): that tx may confirm later. With no

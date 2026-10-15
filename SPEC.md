@@ -5284,10 +5284,13 @@ failure:
    or refund Relay names but the chain still does not show is paged and read
    again every 30 minutes, as an unproven one is (step 7). Within the window a
    `failure` with `DEPOSIT_REORGED` waits as well, as the deposit may be
-   included again, and so does a `failure` or a failed refund whose deposits
-   (`inTxHashes`) do not list the transfer's deposit: a stale read of a reverted
-   attempt under the same request. Past the window, either is a failure (step
-   8).
+   included again; past the window it is a failure (step 8). A deposit the
+   escrow scan adopted (`adopted` on the state) shares its request with the
+   reverted attempt, and Relay's failure of that attempt can list the same
+   signed deposit: within the window any `failure` or failed refund of it waits,
+   and past the window one whose deposits (`inTxHashes`) list it is a failure,
+   while one that does not leaves it at `SwapEscrowUnresolved`, read again every
+   30 minutes. A failure of a deposit the bot signed is a failure at once.
 7. A `success` is adopted only once `verify_fill` proves its one fill tx on the
    destination chain (see `docs/relay.md`, Proofs): `ConfirmSwapFill` ->
    `RelayFillVerified` -> `Bridged` with `HopEvidence::Relay`, its
@@ -5482,13 +5485,14 @@ signing a second deposit while an earlier one may still land:
   (`AdoptSwapDeposit` -> `SwapDepositAdopted` -> `SwapDeposited` on that order's
   quote, which leaves `reverted_quotes`) and read through the normal path (steps
   6 to 8): its fill window starts at the adoption, and a failure Relay reports
-  ends at `SwapFailed`, paged once. Deposits of several reverted orders found
-  together are never adopted: each holds the transfer's amount, so adopting one
-  payment would release the guard with the other still at Relay. Nor is one
-  whose order was quoted for another amount (before an Alpaca-to-chain refund at
-  the hub, whose re-quote is for the refunded amount). Either pages once and
-  holds at `SwapQuoted` for the operator, with nothing read again until a resume
-  or a restart. A scan that fails is retried and signs nothing either.
+  for it past the window, listing the deposit, ends at `SwapFailed`, paged once.
+  Deposits of several reverted orders found together are never adopted: each
+  holds the transfer's amount, so adopting one payment would release the guard
+  with the other still at Relay. Nor is one whose order was quoted for another
+  amount (before an Alpaca-to-chain refund at the hub, whose re-quote is for the
+  refunded amount). Either pages once and holds at `SwapQuoted` for the
+  operator, with nothing read again until a resume or a restart. A scan that
+  fails is retried and signs nothing either.
 - **Late adoption.** `SwapCompletionRecovered` adopts a proven late payment of
   the failed order of a `SwapFailed`, through `transfer recheck`, keeping the
   reverted quotes for the escrow scan, which reads them again once the transfer

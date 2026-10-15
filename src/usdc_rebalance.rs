@@ -1496,6 +1496,10 @@ pub enum UsdcRebalance {
         reverted_quotes: Vec<SwapQuote>,
         deposit_tx: TxHash,
         deposit_block: u64,
+        /// The escrow scan adopted the deposit of a reverted order, whose
+        /// request Relay may still report failed for that attempt.
+        #[serde(default)]
+        adopted: bool,
         #[serde(default)]
         refund_requotes: u32,
         initiated_at: DateTime<Utc>,
@@ -1536,6 +1540,9 @@ pub enum UsdcRebalance {
         #[serde(default)]
         reverted_quotes: Vec<SwapQuote>,
         deposit_tx: TxHash,
+        /// As in `SwapDeposited`.
+        #[serde(default)]
+        adopted: bool,
         #[serde(default)]
         refund_requotes: u32,
         initiated_at: DateTime<Utc>,
@@ -3694,7 +3701,7 @@ impl EventSourced for UsdcRebalance {
     // v17: `reverted_quotes` on the swap states, `quote`, `first_deposit`
     // and `refund_requotes` on `SwapFailed`, and `SwapCompletionRecovered`,
     // whose refund carries `short_of_floor`.
-    const SCHEMA_VERSION: u64 = 17;
+    const SCHEMA_VERSION: u64 = 18;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use UsdcRebalanceEvent::*;
@@ -4347,6 +4354,7 @@ impl EventSourced for UsdcRebalance {
                 reverted_quotes: reverted_quotes.clone(),
                 deposit_tx: *deposit_tx,
                 deposit_block: *deposit_block,
+                adopted: false,
                 refund_requotes: *refund_requotes,
                 initiated_at: *initiated_at,
                 deposited_at: *deposited_at,
@@ -4394,6 +4402,7 @@ impl EventSourced for UsdcRebalance {
                         .collect(),
                     deposit_tx: *deposit_tx,
                     deposit_block: *deposit_block,
+                    adopted: true,
                     refund_requotes: *refund_requotes,
                     initiated_at: *initiated_at,
                     deposited_at: *adopted_at,
@@ -4605,6 +4614,7 @@ impl EventSourced for UsdcRebalance {
                     signed_order_ids,
                     reverted_quotes,
                     deposit_tx,
+                    adopted,
                     refund_requotes,
                     initiated_at,
                     ..
@@ -4618,6 +4628,7 @@ impl EventSourced for UsdcRebalance {
                 signed_order_ids: signed_order_ids.clone(),
                 reverted_quotes: reverted_quotes.clone(),
                 deposit_tx: *deposit_tx,
+                adopted: *adopted,
                 refund_requotes: *refund_requotes,
                 initiated_at: *initiated_at,
                 unresolved_at: *unresolved_at,

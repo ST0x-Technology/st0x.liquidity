@@ -1364,25 +1364,34 @@ where
     /// `RelayFillPending` within the fill window, held at
     /// `SwapEscrowUnresolved` past it.
     async fn read_relay_payment(&self, id: &UsdcRebalanceId) -> Result<(), UsdcTransferError> {
-        let (direction, quote, deposit_tx, wait) = match self.cqrs.load(id).await? {
+        let (direction, quote, deposit_tx, adopted, wait) = match self.cqrs.load(id).await? {
             Some(UsdcRebalance::SwapDeposited {
                 direction,
                 quote,
                 deposit_tx,
+                adopted,
                 deposited_at,
                 ..
             }) => (
                 direction,
                 quote,
                 deposit_tx,
+                adopted,
                 PaymentWait::FillWindow { deposited_at },
             ),
             Some(UsdcRebalance::SwapEscrowUnresolved {
                 direction,
                 quote,
                 deposit_tx,
+                adopted,
                 ..
-            }) => (direction, quote, deposit_tx, PaymentWait::Unresolved),
+            }) => (
+                direction,
+                quote,
+                deposit_tx,
+                adopted,
+                PaymentWait::Unresolved,
+            ),
             _ => return Ok(()),
         };
         let side = hop_direction(direction);
@@ -1434,13 +1443,15 @@ where
                 warn!(target: "rebalance", %id, %deposit_tx, "Relay reports the deposit reorged out; it may be included again, so the transfer keeps waiting");
                 self.payment_pending(id, deposit_tx, wait).await
             }
-            // A failure that does not name the deposit may be a stale read of
-            // a reverted attempt under the same request, as an adopted
-            // deposit's first read can be: waited out within the fill window.
+            // An adopted deposit's request also carries its reverted
+            // attempt, whose failure Relay may still report, with the same
+            // signed deposit listed: any failure is waited out within the
+            // fill window, and past it one that does not list the deposit
+            // leaves it unresolved.
             status @ (IntentStatus::RefundFailed { .. } | IntentStatus::Failure { .. })
-                if !past_window && !report.deposit_txs.contains(&deposit_tx) =>
+                if adopted && (!past_window || !report.deposit_txs.contains(&deposit_tx)) =>
             {
-                warn!(target: "rebalance", %id, %deposit_tx, ?status, "Relay's failure does not name the deposit; a stale read of a reverted attempt, waiting within the fill window");
+                warn!(target: "rebalance", %id, %deposit_tx, ?status, past_window, "Relay reports a failure of an adopted deposit's request, possibly of its reverted attempt; the transfer keeps reading it");
                 self.payment_pending(id, deposit_tx, wait).await
             }
             status @ (IntentStatus::RefundFailed { .. } | IntentStatus::Failure { .. }) => {
@@ -8859,8 +8870,9 @@ mod tests {
 
     /// A reorg landed the deposit of a reverted Robinhood-to-Alpaca order,
     /// and Relay failed that order with nothing paid: the escrow scan adopts
-    /// the deposit, and the normal payment path records `SwapFailed`, paged
-    /// once and reconcilable, with the guard held. Nothing is quoted.
+    /// the deposit, and past the fill window the normal payment path records
+    /// a failure that lists it as `SwapFailed`, paged once and reconcilable,
+    /// with the guard held. Nothing is quoted.
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn found_reverted_deposit_that_relay_failed_holds_at_swap_failed_toward_hub() {
@@ -8881,7 +8893,15 @@ mod tests {
         let quotes = mock_quote_unavailable(&relay_api);
         let store = Arc::new(test_store(setup_test_db().await, ()));
         let transfer = rig
-            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .transfer(
+                &server,
+                &relay_api,
+                store.clone(),
+                RelayHopCtx {
+                    fill_timeout: Duration::from_millis(1),
+                    ..relay_bounds()
+                },
+            )
             .await;
         let id = UsdcRebalanceId(Uuid::new_v4());
         record_reverted_and_requoted_toward_hub(&rig, &store, &id).await;
@@ -8928,7 +8948,8 @@ mod tests {
     /// The Alpaca-to-chain twin of
     /// `found_reverted_deposit_that_relay_failed_holds_at_swap_failed_toward_hub`:
     /// the found deposit at the hub is adopted, and Relay's failure of it
-    /// ends at `SwapFailed`, paged once, with the guard held.
+    /// past the fill window ends at `SwapFailed`, paged once, with the guard
+    /// held.
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn found_reverted_deposit_that_relay_failed_holds_at_swap_failed_from_hub() {
@@ -8950,7 +8971,15 @@ mod tests {
         let quotes = mock_quote_unavailable(&relay_api);
         let store = Arc::new(test_store(setup_test_db().await, ()));
         let transfer = rig
-            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .transfer(
+                &server,
+                &relay_api,
+                store.clone(),
+                RelayHopCtx {
+                    fill_timeout: Duration::from_millis(1),
+                    ..relay_bounds()
+                },
+            )
             .await;
         let id = UsdcRebalanceId(Uuid::new_v4());
         record_reverted_and_requoted_toward_chain(&rig, &store, &id).await;
@@ -9171,8 +9200,13 @@ mod tests {
         .expect("the attempt ends");
 
         let state = store.load(&id).await.unwrap().unwrap();
-        let UsdcRebalance::SwapEscrowUnresolved { quote, .. } = &state else {
-            panic!("expected SwapEscrowUnresolved, got {state:?} after {outcome:?}");
+        let UsdcRebalance::SwapEscrowUnresolved {
+            quote,
+            adopted: true,
+            ..
+        } = &state
+        else {
+            panic!("expected an adopted SwapEscrowUnresolved, got {state:?} after {outcome:?}");
         };
         assert!(
             matches!(outcome, Err(UsdcTransferError::SwapEscrowUnresolved { .. })),
