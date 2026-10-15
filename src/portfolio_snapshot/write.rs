@@ -3908,6 +3908,80 @@ mod tests {
         );
     }
 
+    /// Tokens a failed transfer left in a secondary chain's bot wallet are
+    /// capital under management: the capture values them at that chain's own
+    /// wallet slots, wrapped shares at that chain's vault ratio.
+    #[tokio::test]
+    async fn a_secondary_chains_wallet_equity_is_captured_at_its_own_wallet_slots() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let now = Utc::now();
+
+        let view = InventoryView::default()
+            .with_equity(
+                aapl(),
+                FractionalShares::new(float!(10)),
+                FractionalShares::new(float!(5)),
+            )
+            .set_inflight_equity_at_location(
+                InFlightEquityLocation::WalletUnwrapped(Chain::Robinhood),
+                &BTreeMap::from([(aapl(), FractionalShares::new(float!(3)))]),
+                now,
+                now,
+            )
+            .set_inflight_equity_at_location(
+                InFlightEquityLocation::WalletWrapped(Chain::Robinhood),
+                &BTreeMap::from([(aapl(), FractionalShares::new(float!(2)))]),
+                now,
+                now,
+            );
+
+        let robinhood_ratio = U256::from(1_500_000_000_000_000_000u64);
+        let (ctx, _position) = build_ctx(
+            pool.clone(),
+            apalis_pool,
+            view,
+            HashSet::from([aapl()]),
+            false,
+            false,
+            BTreeMap::from([
+                (
+                    Chain::Base,
+                    Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+                ),
+                (
+                    Chain::Robinhood,
+                    Arc::new(MockWrapper::with_ratio(robinhood_ratio)) as Arc<dyn Wrapper>,
+                ),
+            ]),
+        )
+        .await;
+        mark_all_required_fresh(&ctx);
+
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
+
+        let wallet_rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT location, inflight_balance FROM portfolio_snapshot \
+             WHERE et_day = ? AND asset = 'AAPL' AND location LIKE 'wallet_%' \
+             ORDER BY location",
+        )
+        .bind(et_day(Utc::now()).to_string())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            wallet_rows,
+            vec![
+                ("wallet_unwrapped:robinhood".to_string(), "3".to_string()),
+                ("wallet_wrapped:robinhood".to_string(), "3".to_string()),
+            ],
+            "3 unwrapped tokens as-is, 2 wrapped shares * Robinhood's own 1.5 ratio"
+        );
+    }
+
     /// Cash sits in a vault on every chain the bot makes markets on, and each
     /// chain's own market-making row is where the day's capture must find it:
     /// a secondary chain's USDC folded into the primary's row, or dropped,
