@@ -12,7 +12,7 @@ use st0x_evm::Chain;
 pub enum HopKind {
     /// Circle CCTP burn and mint.
     Cctp,
-    /// Reserved for Robinhood: no build wires it yet.
+    /// Relay's USDG -> USDC swap (Robinhood).
     Relay,
 }
 

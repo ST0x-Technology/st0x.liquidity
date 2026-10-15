@@ -117,12 +117,14 @@ impl fmt::Display for ChainCapability {
 /// - Robinhood (an Arbitrum Orbit L2) signs, watches fills, hedges, and
 ///   rebalances equity: Alpaca's issuer serves its `robinhood` network and
 ///   the wrappers are deployed there. It pays gas in ETH, so the same ETH/USD
-///   feed values it. It has no CCTP domain, so it cannot rebalance cash.
+///   feed values it. It has no CCTP domain and its stable is USDG, so it
+///   rebalances cash over the Relay hop only; the loader refuses a `cctp`
+///   corridor there.
 pub fn provided_capabilities(chain: Chain) -> BTreeSet<ChainCapability> {
     use ChainCapability::*;
 
     match chain {
-        Chain::Base => BTreeSet::from([
+        Chain::Base | Chain::Robinhood => BTreeSet::from([
             FillIngestion,
             Hedging,
             WalletSigning,
@@ -138,13 +140,6 @@ pub fn provided_capabilities(chain: Chain) -> BTreeSet<ChainCapability> {
             GasValuation,
         ]),
         Chain::HyperEvm => BTreeSet::from([FillIngestion, Hedging, WalletSigning]),
-        Chain::Robinhood => BTreeSet::from([
-            FillIngestion,
-            Hedging,
-            WalletSigning,
-            EquityRebalancing,
-            GasValuation,
-        ]),
     }
 }
 
@@ -439,9 +434,10 @@ mod tests {
 
     /// Robinhood pays gas in ETH, so the Base ETH/USD read values it and the
     /// chain can reach `active`, unlike HyperEVM. Its wrappers and issuer
-    /// network are wired, so it rebalances equity, but it has no CCTP domain.
+    /// network are wired, so it rebalances equity, and the Relay hop moves its
+    /// cash.
     #[test]
-    fn robinhood_rebalances_equity_but_not_cash() {
+    fn robinhood_rebalances_equity_and_cash() {
         let robinhood = Chain::Robinhood;
 
         for lifecycle in [
@@ -458,36 +454,22 @@ mod tests {
                 ChainCapability::Hedging,
                 ChainCapability::WalletSigning,
                 ChainCapability::EquityRebalancing,
+                ChainCapability::CashRebalancing,
                 ChainCapability::GasValuation,
             ])
         );
 
         let mut assets = robinhood_rebalancing_equity();
-        check_enablement(robinhood, ChainLifecycle::Active, true, Some(&assets)).unwrap();
-
         assets.cash = Some(crate::ChainCashAsset {
             vault_ids: Vec::new(),
             rebalancing: OperationMode::Enabled,
             operational_limit: None,
         });
-        let error =
-            check_enablement(robinhood, ChainLifecycle::Active, true, Some(&assets)).unwrap_err();
-
-        let ChainEnablementError::MissingCapabilities {
-            chain,
-            lifecycle,
-            missing,
-        } = error
-        else {
-            panic!("expected MissingCapabilities, got: {error:?}")
-        };
-        assert_eq!(chain, robinhood);
-        assert_eq!(lifecycle, ChainLifecycle::Active);
-        assert_eq!(
-            missing.into_inner(),
-            vec![ChainCapability::CashRebalancing],
-            "Robinhood has no CCTP domain"
+        assert!(
+            required_capabilities(ChainLifecycle::Active, true, Some(&assets))
+                .contains(&ChainCapability::CashRebalancing)
         );
+        check_enablement(robinhood, ChainLifecycle::Active, true, Some(&assets)).unwrap();
     }
 
     #[test]
