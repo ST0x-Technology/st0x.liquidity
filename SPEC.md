@@ -5429,7 +5429,12 @@ reconciles one only after its hold's page. A reconcile that lands while the job
 runs ends it there, since `Reconciled` refuses every later swap command. The
 operator exit of a chain-to-Alpaca transfer held at `WithdrawalComplete` or
 `SwapQuoted` is `transfer resume --kind usdc --direction to-alpaca`: the job
-re-quotes and signs, or redeposits on a refusal, as the bot's own retry does. An
+re-quotes and signs, or redeposits on a refusal, as the bot's own retry does. A
+`SwapQuoted` held on found deposits of reverted orders (several, or one of
+another amount; see "Escrow scan") is the exception: a resume only scans and
+pages them again, a chain-to-Alpaca one has no CLI exit, and an Alpaca-to-chain
+one is reconciled once every listed order is settled. A recorded hold state for
+it, with `transfer reconcile` as its only exit, is not in this build. An
 Alpaca-to-chain transfer held at `WithdrawalComplete` after a refused binding
 quote resumes the same way, `--direction to-raindex`, or is failed with
 `fail-usdc-transfer` and reconciled. On the shared Ethereum wallet's credit
