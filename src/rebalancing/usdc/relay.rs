@@ -6005,6 +6005,50 @@ mod tests {
         assert!(state.holds_rebalance_guard());
     }
 
+    /// Relay's failure of a deposit the bot signed fails the swap at once,
+    /// within the fill window, also when it lists no deposit (`inTxHashes`
+    /// absent): only an adopted deposit waits a failure out.
+    #[tokio::test]
+    async fn failure_of_a_signed_deposit_fails_within_the_fill_window() {
+        let anvil = spawn_anvil(Anvil::new());
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let status = mock_status(
+            &relay_api,
+            json!({"status": "failure", "failReason": "SOLVER_CAPACITY_EXCEEDED"}),
+        );
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = relay_transfer(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet,
+            RelayEndContracts {
+                stable: Address::repeat_byte(0x51),
+                depository: Address::repeat_byte(0x52),
+            },
+            store.clone(),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited(&store, &id).await;
+
+        let attempt = tokio::time::timeout(
+            Duration::from_secs(5),
+            transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends");
+
+        status.assert_calls(1);
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "SwapFailed", "after {attempt:?}");
+        attempt.unwrap();
+        assert!(state.holds_rebalance_guard());
+    }
+
     /// The operator's resume of a deposit unresolved past its fill window
     /// reads Relay's status once more: still unpaid, it stays held with no
     /// redrive; failed at Relay, it becomes the reconcilable `SwapFailed`.
