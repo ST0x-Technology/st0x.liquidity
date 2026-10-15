@@ -65,7 +65,9 @@ in-repository branch. The workflow treats either case as an explicit trust
 boundary:
 
 - Cachix gets no auth token and cannot push;
-- Nix and Rust caches restore but do not save.
+- Nix caches restore but do not save;
+- the persistent target disks are not mounted, so the build runs cold (see
+  below).
 
 Blacksmith runs each job in an ephemeral microVM. Do not move untrusted fork
 jobs to a persistent self-hosted runner.
@@ -85,6 +87,44 @@ cannot satisfy pull request branch protection.
 Use a pull request event for merge-blocking validation. Reserve
 `workflow_dispatch` for manual runs whose result does not need to become a pull
 request status check.
+
+## Persistent target directories
+
+`backend build` and `backend lint` keep their cargo target directories
+(`target/test`, `target/lint`) on Blacksmith sticky disks and build with
+`CARGO_INCREMENTAL=1`. A large share of the compile is the `st0x-hedge` test
+harness, which no dependency cache or sccache can reuse; rustc's incremental
+state can.
+
+- Each trusted run mounts the last saved snapshot. Only master pushes save one,
+  so normal pull request runs and manual `workflow_dispatch` runs never replace
+  it.
+- The `commit` input alone is not a trust boundary: a pull request can edit the
+  workflow, and the stickydisk action has no branch scoping. So the disk key
+  embeds a masked hash of `CACHIX_AUTH_TOKEN`. Fork and Dependabot runs get no
+  secrets, so they cannot name the disk; they skip it and build cold.
+  Same-repository runs can derive the key, but they can already push to Cachix
+  with that token, so the disk adds no new trust. Rotating the token starts a
+  fresh, empty disk.
+- After the mount, the job touches every tracked source, so each one is newer
+  than anything on the disk, even when a master run saved the snapshot after
+  this job's checkout. Cargo then always reruns rustc for workspace crates and
+  never trusts a stale fingerprint. rustc's incremental cache reuses only the
+  work whose source hashes still match. Registry and git dependencies
+  fingerprint by version and stay built.
+- `rain-math-float` is a path dependency linked into the Nix store, where every
+  file has mtime 1, so touching cannot refresh it.
+  `scripts/clean-stale-rain-math-float.sh` runs `cargo clean -p rain-math-float`
+  whenever the linked store path differs from the one recorded on the disk.
+- `CARGO_HOME` (registry and git sources) lives on the same disk. These jobs do
+  not use `Swatinem/rust-cache`: its save step prunes workspace-crate and
+  incremental artifacts from the target directory before the disk commits.
+- A saving run wipes the disk once it holds more than 40 GiB, because cargo
+  never collects artifacts from older toolchains or dependency versions.
+- To start from empty disks, bump the `-v1` suffix of both disk keys
+  (`-target-test-v1` and `-target-lint-v1`).
+- `scripts/test-fork-pr-ci.sh` checks the key derivation, the untrusted-run
+  skip, and the master-only commit for every sticky disk.
 
 ## Board and parity checks
 
