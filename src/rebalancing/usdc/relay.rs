@@ -8457,13 +8457,30 @@ mod tests {
         store: &Store<UsdcRebalance>,
         id: &UsdcRebalanceId,
     ) {
+        record_reverted_deposit_and_requoted_toward_chain(
+            rig,
+            store,
+            id,
+            TxHash::repeat_byte(0xa7),
+        )
+        .await;
+    }
+
+    /// [`record_reverted_and_requoted_toward_chain`] with the reverted
+    /// deposit recorded as `reverted_tx`.
+    async fn record_reverted_deposit_and_requoted_toward_chain(
+        rig: &RelayRig,
+        store: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        reverted_tx: TxHash,
+    ) {
         record_quoted_toward_chain(
             store,
             id,
             exact_quote_from_hub(&rig.hub_wallet, rig.hub_contracts, REVERTED_ORDER_ID).await,
         )
         .await;
-        let reverted = PreparedTransaction::for_test(TxHash::repeat_byte(0xa7), 40);
+        let reverted = PreparedTransaction::for_test(reverted_tx, 40);
         let mut requoted =
             exact_quote_from_hub(&rig.hub_wallet, rig.hub_contracts, TOWARD_CHAIN_ORDER_ID).await;
         requoted.request_id = B256::repeat_byte(0x6f);
@@ -9068,6 +9085,50 @@ mod tests {
             );
             status.assert_calls(1);
         }
+    }
+
+    /// A reorg lands a reverted deposit again as the same signed
+    /// transaction, so Relay's failure of the reverted attempt can list the
+    /// adopted deposit: within the fill window it is still waited out.
+    #[tokio::test]
+    async fn failure_listing_the_adopted_deposit_waits_within_the_fill_window() {
+        let rig = RelayRig::deploy().await;
+        rig.withdraw_to_hub(U256::from(AMOUNT_IN)).await;
+        let late_deposit = rig.deposit_on_hub(REVERTED_ORDER_ID).await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let status = mock_status_of(
+            &relay_api,
+            B256::repeat_byte(0x5e),
+            json!({
+                "status": "failure",
+                "failReason": "TTL_EXPIRED",
+                "inTxHashes": [late_deposit],
+                "txHashes": []
+            }),
+        );
+        mock_quote_unavailable(&relay_api);
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_reverted_deposit_and_requoted_toward_chain(&rig, &store, &id, late_deposit).await;
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(60),
+            transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends");
+
+        assert_fill_pending(&outcome);
+        let state = store.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::SwapDeposited { deposit_tx, .. } = &state else {
+            panic!("expected SwapDeposited, got {state:?}");
+        };
+        assert_eq!(*deposit_tx, late_deposit);
+        status.assert_calls(1);
     }
 
     /// Past the fill window, a failure that does not list the adopted
