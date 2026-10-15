@@ -9132,9 +9132,11 @@ mod tests {
     }
 
     /// Past the fill window, a failure that does not list the adopted
-    /// deposit is a failure: the transfer holds at `SwapFailed`.
+    /// deposit is still not tied to it: the transfer holds at
+    /// `SwapEscrowUnresolved` and keeps reading Relay, so a later fill or
+    /// refund is adopted.
     #[tokio::test]
-    async fn stale_failure_after_adoption_fails_past_the_fill_window() {
+    async fn stale_failure_after_adoption_stays_unresolved_past_the_fill_window() {
         let rig = RelayRig::deploy().await;
         rig.withdraw_to_hub(U256::from(AMOUNT_IN)).await;
         rig.deposit_on_hub(REVERTED_ORDER_ID).await;
@@ -9161,18 +9163,21 @@ mod tests {
         let id = UsdcRebalanceId(Uuid::new_v4());
         record_reverted_and_requoted_toward_chain(&rig, &store, &id).await;
 
-        tokio::time::timeout(
+        let outcome = tokio::time::timeout(
             Duration::from_secs(60),
             transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
         )
         .await
-        .expect("the attempt ends")
-        .unwrap();
+        .expect("the attempt ends");
 
         let state = store.load(&id).await.unwrap().unwrap();
-        let UsdcRebalance::SwapFailed { quote, .. } = &state else {
-            panic!("expected SwapFailed, got {state:?}");
+        let UsdcRebalance::SwapEscrowUnresolved { quote, .. } = &state else {
+            panic!("expected SwapEscrowUnresolved, got {state:?} after {outcome:?}");
         };
+        assert!(
+            matches!(outcome, Err(UsdcTransferError::SwapEscrowUnresolved { .. })),
+            "got {outcome:?}"
+        );
         assert_eq!(quote.order_id, REVERTED_ORDER_ID);
         assert!(state.holds_rebalance_guard());
     }
