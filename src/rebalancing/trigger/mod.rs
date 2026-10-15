@@ -2894,11 +2894,20 @@ impl RebalancingService {
              vault or Alpaca; holding the trigger guard"
         );
 
+        // The hold's own page may not have gone out, so the deposits it
+        // lists are paged here too.
+        let found = match held {
+            UsdcRebalance::SwapOverdeposited { deposits, .. } => format!(
+                " Deposits of reverted Relay orders found: {}.",
+                deposits.iter().join(", ")
+            ),
+            _ => String::new(),
+        };
         let message = format!(
             "USDC transfer {id} on the {} corridor timed out at {state}: its withdrawal moved \
              the stable out of the vault or Alpaca, to a wallet or to Relay. Guard held. \
-             Elapsed: {elapsed:?}. {step} It is not failed or released until the swap, a \
-             redeposit or `transfer reconcile` settles the stable.",
+             Elapsed: {elapsed:?}.{found} {step} It is not failed or released until the swap, \
+             a redeposit or `transfer reconcile` settles the stable.",
             tracking.corridor,
         );
 
