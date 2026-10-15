@@ -39624,7 +39624,7 @@ mod tests {
             .await
             .unwrap();
 
-        let inventory = trigger.inventory.read().await;
+        let inventory = trigger.inventory.read().await.clone();
         assert_eq!(
             inventory.equity_inflight(&symbol, Venue::Hedging),
             Some(shares(0)),
