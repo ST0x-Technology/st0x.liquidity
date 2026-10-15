@@ -3818,15 +3818,13 @@ impl CrossVenueEquityTransfer {
     ) -> Result<RecheckOutcome, RecheckError> {
         let entity = self.load_mint_entity(issuer_request_id).await?;
 
-        let (symbol, quantity) = match &entity {
+        let symbol = match &entity {
             // Both terminals are already settled: nothing to recheck.
             TokenizedEquityMint::DepositedIntoRaindex { .. }
             | TokenizedEquityMint::Reconciled { .. } => {
                 return Ok(RecheckOutcome::AlreadyCompleted);
             }
-            TokenizedEquityMint::Failed {
-                symbol, quantity, ..
-            } => (symbol.clone(), FractionalShares::new(*quantity)),
+            TokenizedEquityMint::Failed { symbol, .. } => symbol.clone(),
             _ => {
                 self.resume_mint(issuer_request_id).await?;
                 return Ok(RecheckOutcome::Resumed);
@@ -3930,7 +3928,6 @@ impl CrossVenueEquityTransfer {
                     issuer_request_id,
                     &symbol,
                     entity.chain(),
-                    quantity,
                     rollback,
                 )
                 .await
@@ -5117,11 +5114,12 @@ mod tests {
             "expected Recovered, got {outcome:?}"
         );
 
-        let (hedging_inflight, market_making_available) = {
+        let (hedging_inflight, hedging_available, market_making_available) = {
             let view = inventory.read().await;
 
             (
                 view.equity_inflight(&symbol, Venue::Hedging),
+                view.equity_available(&symbol, Venue::Hedging),
                 view.equity_available(&symbol, Venue::MarketMaking),
             )
         };
@@ -5129,6 +5127,11 @@ mod tests {
             hedging_inflight,
             Some(FractionalShares::ZERO),
             "recovered mint left its quantity stuck in Hedging in-flight"
+        );
+        assert_eq!(
+            hedging_available,
+            Some(FractionalShares::new(float!(100))),
+            "recovery must not debit Hedging available; a broker read re-bases it"
         );
         assert_eq!(
             market_making_available,
