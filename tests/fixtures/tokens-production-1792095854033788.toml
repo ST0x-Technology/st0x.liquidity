@@ -95,6 +95,7 @@ assets = [
   "TR",
   "WEN",
   "WMT",
+  "DIS",
 ]
 
 [[trading_state.scopes]]
@@ -613,6 +614,47 @@ trading = "enabled"
 rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
 
+[assets.equities.DIS]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.DIS.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 25.62
+quote_staleness_seconds = 20
+[[assets.equities.DIS.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 98.5
+quote_staleness_seconds = 20
+[[assets.equities.DIS.spread_model.profiles]]
+session = "post"
+half_spread_bps = 72.62
+quote_staleness_seconds = 20
+[[assets.equities.DIS.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 25.62
+quote_staleness_seconds = 70
+[[assets.equities.DIS.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 98.5
+quote_staleness_seconds = 70
+[[assets.equities.DIS.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 72.62
+quote_staleness_seconds = 70
+[chains.robinhood.assets.equities.DIS]
+tokenized_equity = "0xd78025Aa344E549A1D76eCE1591c481cC7Bc3548"
+tokenized_equity_derivative = "0x81f40cbCFAE7A1aD1f4474eD95A210DfA3B90B0f"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+operational_limit = 50
+target_share = 0.5
+
 [assets.equities.DNUT]
 extended_hours_counter_trading = "enabled"
 [[assets.equities.DNUT.spread_model.profiles]]
@@ -743,6 +785,7 @@ venues = ["raindex", "bebop"]
 trading = "enabled"
 rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
+target_share = 0.4
 [chains.robinhood.assets.equities.FGI]
 tokenized_equity = "0xfEa217600e2b00bBB2172a99345016a0cEb7d29f"
 tokenized_equity_derivative = "0x685DFd386968B58D895F934485820C479C79a8bB"
@@ -750,8 +793,10 @@ vault_ids = ["0xfab"]
 pricing = "enabled"
 venues = ["raindex", "bebop"]
 trading = "enabled"
-rebalancing = "disabled"
-wrapped_equity_recovery = "disabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+operational_limit = 300
+target_share = 0.4
 
 [assets.equities.FTF]
 extended_hours_counter_trading = "enabled"
@@ -902,6 +947,18 @@ venues = ["raindex", "bebop"]
 trading = "enabled"
 rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
+target_share = 0.4
+[chains.robinhood.assets.equities.HOOD]
+tokenized_equity = "0x50DE74136b67911799fc39B726bFC2707cCec769"
+tokenized_equity_derivative = "0xca678d0d69F9E815d1A4f4dF05C904b2DDE017f8"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+operational_limit = 45
+target_share = 0.4
 
 [assets.equities.IAU]
 extended_hours_counter_trading = "enabled"
@@ -1742,8 +1799,10 @@ vault_ids = ["0xfab"]
 pricing = "enabled"
 venues = ["raindex", "bebop"]
 trading = "enabled"
-rebalancing = "disabled"
-wrapped_equity_recovery = "disabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+operational_limit = 3000
+target_share = 0.5
 
 [assets.equities.SPCX]
 extended_hours_counter_trading = "enabled"
