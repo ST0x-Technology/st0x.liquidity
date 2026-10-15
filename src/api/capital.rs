@@ -3,18 +3,18 @@
 //! own wallets and share their nonce state instead of building a second
 //! signer.
 //!
-//! No route waits on CCTP attestation, on USDC settlement, or on the
+//! No route waits on CCTP attestation, on USDC or equity settlement, or on the
 //! confirmations of the transaction it answers with, since the ops load
-//! balancer times out first: `transfer-usdc` enqueues the transfer on the
-//! bot's own worker and returns its id, and every route that sends a
-//! transaction answers at its broadcast through `answer_from_detached` and
-//! confirms it on the task. Only a prerequisite approve, when an allowance is
-//! short, is awaited before that broadcast. The routes that
-//! send transactions, and the
-//! `transfer-usdc` enqueue, run through `spawn_detached`, so a dropped request
-//! cannot cancel them midway (between broadcast and receipt, or between the
-//! enqueue and the corridor claim it keeps), and graceful shutdown waits for
-//! them. Every capital route refuses until startup completes, like
+//! balancer times out first: `transfer-usdc` and `transfer-equity` enqueue the
+//! transfer on the bot's own transfer workers and return its id, and every
+//! route that sends a transaction answers at its broadcast through
+//! `answer_from_detached` and confirms it on the task. Only a prerequisite
+//! approve, when an allowance is short, is awaited before that broadcast. The
+//! routes that send transactions, and the `transfer-usdc` and
+//! `transfer-equity` enqueues, run through `spawn_detached`, so a dropped
+//! request cannot cancel them midway (between broadcast and receipt, or
+//! between the enqueue and the guard claim it keeps), and graceful shutdown
+//! waits for them. Every capital route refuses until startup completes, like
 //! `process-tx`.
 
 use std::fmt::Debug;
@@ -36,14 +36,14 @@ use st0x_bridge::corridor::UsdcCorridor;
 use st0x_config::{HedgedChain, OnchainWalletCtx};
 use st0x_event_sorcery::Store;
 use st0x_evm::{Chain, Evm, IERC20, MinedTx, OpenChainErrorRegistry, PreparedTransaction, Wallet};
-use st0x_finance::{HasZero, Positive, Usdc};
+use st0x_finance::{FractionalShares, HasZero, Positive, Symbol, Usdc};
 use st0x_float_serde::format_float_with_fallback;
 use st0x_raindex::{Raindex, RaindexError, RaindexService, RaindexVaultId, RevokeOutcome};
 
 use super::{
     ErrorResponse, OpsError, UsdcDriverPauseRequest, answer_from_detached,
-    cctp_source_chain_wire_name, ops_command_error, ops_precondition_error, quiesce_usdc_driver,
-    spawn_detached, usdc_resume_error_response,
+    cctp_source_chain_wire_name, manual_equity_transfer_error_response, ops_command_error,
+    ops_precondition_error, quiesce_usdc_driver, spawn_detached, usdc_resume_error_response,
 };
 use crate::AppState;
 use crate::alerts::AlertKind;
@@ -55,10 +55,13 @@ use crate::cctp_burn::{
 };
 use crate::operations_audit::{Audited, AuditedRequest};
 use crate::rebalancing::UsdcResumeError;
+use crate::rebalancing::trigger::allocation::{
+    ALPACA_QUANTITY_MAX_DECIMAL_PLACES, PlannedDirection,
+};
 use crate::usdc_rebalance::RebalanceDirection;
 
-/// The direction of a manual USDC transfer, spelled on the wire like the
-/// `st0x-cli` `--direction` values (`to-raindex`, `to-alpaca`).
+/// The direction of a manual USDC or equity transfer, spelled on the wire
+/// like the `st0x-cli` `--direction` values (`to-raindex`, `to-alpaca`).
 #[derive(Deserialize, Serialize, Clone, Copy)]
 #[serde(rename_all = "kebab-case")]
 enum TransferDirectionWire {
@@ -66,11 +69,30 @@ enum TransferDirectionWire {
     ToAlpaca,
 }
 
+impl TransferDirectionWire {
+    /// The wire spelling, which the audit record names the direction by.
+    const fn wire_name(self) -> &'static str {
+        match self {
+            Self::ToRaindex => "to-raindex",
+            Self::ToAlpaca => "to-alpaca",
+        }
+    }
+}
+
 impl From<TransferDirectionWire> for RebalanceDirection {
     fn from(wire: TransferDirectionWire) -> Self {
         match wire {
             TransferDirectionWire::ToRaindex => Self::AlpacaToBase,
             TransferDirectionWire::ToAlpaca => Self::BaseToAlpaca,
+        }
+    }
+}
+
+impl From<TransferDirectionWire> for PlannedDirection {
+    fn from(wire: TransferDirectionWire) -> Self {
+        match wire {
+            TransferDirectionWire::ToRaindex => Self::Mint,
+            TransferDirectionWire::ToAlpaca => Self::Redemption,
         }
     }
 }
@@ -91,11 +113,7 @@ pub(super) struct TransferUsdcRequest {
 
 impl AuditedRequest for TransferUsdcRequest {
     fn audit_targets(&self) -> Vec<String> {
-        let direction = match self.direction {
-            TransferDirectionWire::ToRaindex => "to-raindex",
-            TransferDirectionWire::ToAlpaca => "to-alpaca",
-        };
-        std::iter::once(direction.to_string())
+        std::iter::once(self.direction.wire_name().to_string())
             .chain(self.chain.iter().map(ToString::to_string))
             .collect()
     }
@@ -107,6 +125,43 @@ pub(super) struct TransferUsdcResponse {
     transfer_id: String,
     direction: TransferDirectionWire,
     amount: String,
+    outcome: &'static str,
+}
+
+/// Wire contract for the manual equity transfer route.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct TransferEquityRequest {
+    direction: TransferDirectionWire,
+    /// Ticker of the tokenized equity, as for `st0x-cli transfer-equity
+    /// --symbol`.
+    symbol: String,
+    /// Decimal shares; must be positive, with at most the nine decimals the
+    /// tokenization API takes.
+    quantity: String,
+    /// Chain whose Raindex vault the shares land in (`to-raindex`) or leave
+    /// (`to-alpaca`), as for `st0x-cli transfer-equity --network`.
+    chain: Chain,
+}
+
+impl AuditedRequest for TransferEquityRequest {
+    fn audit_targets(&self) -> Vec<String> {
+        vec![
+            self.direction.wire_name().to_string(),
+            self.symbol.clone(),
+            self.chain.to_string(),
+        ]
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct TransferEquityResponse {
+    transfer_id: String,
+    direction: TransferDirectionWire,
+    symbol: String,
+    quantity: String,
+    chain: Chain,
     outcome: &'static str,
 }
 
@@ -338,6 +393,104 @@ pub(super) async fn transfer_usdc(
         transfer_id: transfer_id.to_string(),
         direction: wire_direction,
         amount: amount.inner().to_string(),
+        outcome: "enqueued",
+    }))
+}
+
+/// Starts a tokenized equity transfer between Alpaca and Raindex on the
+/// bot's own equity transfer workers, the path the equity rebalancer uses,
+/// and returns its id without waiting for it: a mint of `quantity` shares of
+/// `symbol` into the `chain` vault (`to-raindex`), or a redemption out of it
+/// back to Alpaca (`to-alpaca`). The id is the mint's issuer request id or
+/// the redemption aggregate id, which `debug recheck` and
+/// `read transfer-events` take. Mirrors `st0x-cli transfer-equity`, except
+/// that the bot drives the whole transfer.
+///
+/// Ordered like `transfer_usdc`: input validation and the startup gate, then
+/// the resume lock and the recovery handle, then the enqueue gates of
+/// `start_manual_equity_transfer`. Unlike `transfer_usdc` no driver is
+/// paused: the equity workers have no pause control, and the symbol's
+/// transfer guard, its job row dedupe and its Position reservation already
+/// keep a start from racing a transfer in flight. Everything after the
+/// startup gate runs detached, so a request dropped between the enqueue and
+/// the guard it keeps cannot release the guard and the reservation with the
+/// job still queued. The detached task holds a projection write slot for the
+/// whole start, since it writes Position events, so a view rebuild cannot
+/// replay them while the live projection also applies them.
+pub(super) async fn transfer_equity(
+    State(state): State<AppState>,
+    Audited(request): Audited<TransferEquityRequest>,
+) -> Result<Json<TransferEquityResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let TransferEquityRequest {
+        direction: wire_direction,
+        symbol,
+        quantity,
+        chain,
+    } = request;
+    let direction = PlannedDirection::from(wire_direction);
+    let symbol = Symbol::new(symbol.as_str())
+        .map_err(|error| ops_precondition_error(format!("invalid symbol {symbol:?}: {error}")))?;
+    let quantity = positive_shares(&quantity)?;
+    require_startup_complete(&state, "transfer-equity")?;
+
+    let detached_tasks = state.detached_tasks.clone();
+    let task_symbol = symbol.clone();
+    let transfer_id = spawn_detached(
+        &detached_tasks,
+        "transfer-equity",
+        symbol.clone(),
+        async move {
+            // Admitted before the recovery lock, like the other recovery
+            // routes: a start parked behind a rebuild holds no lock.
+            let _projection_write = state.projection_maintenance.enter().await;
+
+            let _guard = state.resume_lock.0.try_lock().map_err(|_| {
+                (
+                    StatusCode::CONFLICT,
+                    Json(ErrorResponse {
+                        error: "A resume or recheck operation is already in progress".to_string(),
+                    }),
+                )
+            })?;
+
+            let handle = state.recovery.get().ok_or_else(recovery_not_ready)?;
+
+            let transfer_id = handle
+                .rebalancing_service
+                .start_manual_equity_transfer(&task_symbol, direction, quantity, chain)
+                .await
+                .map_err(|error| {
+                    error!(
+                        ?error,
+                        symbol = %task_symbol,
+                        ?direction,
+                        %quantity,
+                        %chain,
+                        "Failed to start manual equity transfer"
+                    );
+                    let (status, message) = manual_equity_transfer_error_response(&error);
+                    (status, Json(ErrorResponse { error: message }))
+                })?;
+
+            info!(
+                %transfer_id,
+                symbol = %task_symbol,
+                ?direction,
+                %quantity,
+                %chain,
+                "Manual equity transfer enqueued via API"
+            );
+            Ok::<_, OpsError>(transfer_id)
+        },
+    )?
+    .await??;
+
+    Ok(Json(TransferEquityResponse {
+        transfer_id: transfer_id.to_string(),
+        direction: wire_direction,
+        symbol: symbol.to_string(),
+        quantity: quantity.inner().to_string(),
+        chain,
         outcome: "enqueued",
     }))
 }
@@ -1272,6 +1425,28 @@ fn positive_usdc(amount: &str) -> Result<(Positive<Usdc>, U256), OpsError> {
     Ok((amount, raw))
 }
 
+/// Parses a decimal share quantity and refuses, as a 400, one that is not
+/// positive or is finer than the nine decimals the tokenization API takes
+/// (the precision the rebalancer truncates its own quantities to), so the
+/// worker never receives a quantity Alpaca would reject.
+fn positive_shares(quantity: &str) -> Result<Positive<FractionalShares>, OpsError> {
+    let parsed = Float::parse(quantity.to_string()).map_err(|error| {
+        ops_precondition_error(format!("invalid quantity {quantity:?}: {error}"))
+    })?;
+    let shares = Positive::new(FractionalShares::new(parsed)).map_err(|_| {
+        ops_precondition_error(format!("quantity must be positive, got {quantity}"))
+    })?;
+    let (_, lossless) = parsed
+        .to_fixed_decimal_lossy(ALPACA_QUANTITY_MAX_DECIMAL_PLACES)
+        .map_err(|error| ops_precondition_error(format!("invalid quantity {quantity}: {error}")))?;
+    if !lossless {
+        return Err(ops_precondition_error(format!(
+            "quantity {quantity} has more than {ALPACA_QUANTITY_MAX_DECIMAL_PLACES} decimals"
+        )));
+    }
+    Ok(shares)
+}
+
 /// Resolves the burn amount from exactly one of `amount` and `all`; both or
 /// neither is a 400, like the CLI's clap conflict.
 fn burn_amount(
@@ -1302,10 +1477,11 @@ fn recovery_not_ready() -> (StatusCode, Json<ErrorResponse>) {
 }
 
 /// Refuses a capital route until startup completes, with the same 503 as
-/// `process-tx`: the routes sign with the bot's wallets, and so does the job
-/// `transfer-usdc` enqueues. The recovery handle and the wallets exist before
-/// the startup preflights (each chain's id, the inventory `OPERATOR_ROLE`)
-/// have passed, and `health.is_ready()` gates on all of them.
+/// `process-tx`: the routes sign with the bot's wallets, and so do the jobs
+/// `transfer-usdc` and `transfer-equity` enqueue. The recovery handle and the
+/// wallets exist before the startup preflights (each chain's id, the
+/// inventory `OPERATOR_ROLE`) have passed, and `health.is_ready()` gates on
+/// all of them.
 fn require_startup_complete(state: &AppState, route: &'static str) -> Result<(), OpsError> {
     if state.health.is_ready() {
         return Ok(());
@@ -1696,6 +1872,16 @@ mod tests {
             bridge.audit_targets(),
             ["33333333-3333-3333-3333-333333333333", "ethereum"]
         );
+
+        let equity: TransferEquityRequest = serde_json::from_value(serde_json::json!({
+            "direction": "to-alpaca",
+            "symbol": "AAPL",
+            "quantity": "1.5",
+            "chain": "base",
+            "network": "forged alias",
+        }))
+        .unwrap();
+        assert_eq!(equity.audit_targets(), ["to-alpaca", "AAPL", "base"]);
     }
 
     /// The audit record spells the transfer direction by hand. It must equal
@@ -1836,6 +2022,32 @@ mod tests {
                 "transferId": "id",
                 "direction": "to-raindex",
                 "amount": "250.5",
+                "outcome": "enqueued",
+            })
+        );
+    }
+
+    /// The equity response is the client contract: camelCase keys, the wire
+    /// direction, and the chain by its wire name.
+    #[test]
+    fn transfer_equity_response_follows_the_wire_contract() {
+        let json = serde_json::to_value(TransferEquityResponse {
+            transfer_id: "id".to_string(),
+            direction: TransferDirectionWire::ToAlpaca,
+            symbol: "AAPL".to_string(),
+            quantity: "1.5".to_string(),
+            chain: Chain::Base,
+            outcome: "enqueued",
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "transferId": "id",
+                "direction": "to-alpaca",
+                "symbol": "AAPL",
+                "quantity": "1.5",
+                "chain": "base",
                 "outcome": "enqueued",
             })
         );

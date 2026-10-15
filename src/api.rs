@@ -85,12 +85,13 @@ use crate::rebalancing::equity::{
     ReplacementNotAdoptable, SignedTxNotSuperseded, WithdrawalNotSuperseded,
     withdrawal_required_confirmations,
 };
+use crate::rebalancing::trigger::TokenAddressError;
 use crate::rebalancing::usdc::{
     CctpMintRecoveryError, DepositSendNotSuperseded, DriverNotQuiesced, RecheckUsdcDeposit,
     RecoverCctpMint, RecoveredMintAmounts, UsdcDriverPause, UsdcDriverPauseGuard, UsdcRecheckError,
     UsdcTransferError,
 };
-use crate::rebalancing::{RebalancingService, UsdcResumeError};
+use crate::rebalancing::{ManualEquityTransferError, RebalancingService, UsdcResumeError};
 use crate::startup::PROCESS_START;
 use crate::tokenized_equity_mint::{
     TokenizedEquityMint, TokenizedEquityMintCommand, TokenizedEquityMintError,
@@ -2179,6 +2180,55 @@ fn usdc_resume_error_response(error: &UsdcResumeError) -> (StatusCode, String) {
         Aggregate(_) | Database(_) | ApalisDatabase(_) | Queue(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to enqueue the USDC transfer job".to_string(),
+        ),
+    }
+}
+
+/// Maps a [`ManualEquityTransferError`] to an HTTP status and operator facing
+/// message, with the split of [`usdc_resume_error_response`]: a listing that
+/// cannot start operations, a token missing from the chain's registry, or a
+/// quantity the planner's sizing rules refuse is `422` (fix the config, the
+/// registry, or the quantity), a single flight or Position
+/// conflict is `409` (wait for or resolve the other transfer, the freeze or
+/// the divergence), a bot still starting or a signing wallet short of gas is
+/// `503`, and a store, queue, or database failure stays a generic `500` (the
+/// full error is logged at the call site).
+fn manual_equity_transfer_error_response(
+    error: &ManualEquityTransferError,
+) -> (StatusCode, String) {
+    use ManualEquityTransferError::{
+        AlreadyInFlight, ApalisDatabase, ChainNotConfigured, DivergenceEngaged, FreezeUnconfirmed,
+        Frozen, GasNotReady, GuardHeld, ListingNotEnabled, NotInRegistry, NotReady,
+        PositionRefused, Queue, Registry, ReservationInvalidated, RestartTainted, Sizing, Trigger,
+    };
+
+    match error {
+        ChainNotConfigured { .. }
+        | ListingNotEnabled { .. }
+        | NotInRegistry { .. }
+        | Sizing { .. }
+        | Registry {
+            source: TokenAddressError::UnwiredRegistry { .. } | TokenAddressError::Uninitialized,
+            ..
+        } => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
+        Frozen { .. }
+        | FreezeUnconfirmed { .. }
+        | DivergenceEngaged { .. }
+        | RestartTainted { .. }
+        | GuardHeld { .. }
+        | AlreadyInFlight { .. }
+        | PositionRefused { .. }
+        | ReservationInvalidated { .. } => (StatusCode::CONFLICT, error.to_string()),
+        NotReady | GasNotReady { .. } => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+        Registry {
+            source: TokenAddressError::Persistence(_),
+            ..
+        }
+        | Trigger(_)
+        | ApalisDatabase(_)
+        | Queue(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to enqueue the equity transfer job".to_string(),
         ),
     }
 }
@@ -4888,6 +4938,7 @@ define_ops_api_routes! {
     debug post "/views/{view}/rebuild" => rebuild_materialized_view;
     debug post "/cctp/complete-mint" => complete_cctp_mint;
     capital post "/transfer-usdc" => capital::transfer_usdc;
+    capital post "/transfer-equity" => capital::transfer_equity;
     capital post "/vault-deposit" => capital::vault_deposit;
     capital post "/vault-withdraw" => capital::vault_withdraw;
     capital post "/vault-withdraw-usdc" => capital::vault_withdraw_usdc;
@@ -9330,7 +9381,7 @@ mod tests {
             .iter()
             .filter(|route| route.role == OpsRole::Capital)
             .collect::<Vec<_>>();
-        assert_eq!(capital_routes.len(), 7);
+        assert_eq!(capital_routes.len(), 8);
         for route in capital_routes {
             let verb = route
                 .path
@@ -10572,6 +10623,125 @@ mod tests {
         );
     }
 
+    fn transfer_equity_body(quantity: &str) -> serde_json::Value {
+        serde_json::json!({
+            "direction": "to-raindex",
+            "symbol": "AAPL",
+            "quantity": quantity,
+            "chain": "base",
+        })
+    }
+
+    /// A quantity that is not positive, does not parse, or is finer than the
+    /// tokenization API's nine decimals, and an empty symbol, are refused as
+    /// input before the startup gate: startup has not completed and the
+    /// resume lock is held, so a 503 or a 409 here would mean the body was
+    /// not checked first.
+    #[tokio::test]
+    async fn transfer_equity_refuses_a_bad_body_before_the_startup_gate() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let resume_lock = Arc::clone(&state.resume_lock);
+        let _held = resume_lock.0.try_lock().unwrap();
+
+        let mut bodies: Vec<serde_json::Value> = ["0", "-1", "abc", "1.0000000001"]
+            .into_iter()
+            .map(transfer_equity_body)
+            .collect();
+        let mut empty_symbol = transfer_equity_body("1");
+        empty_symbol["symbol"] = serde_json::json!("");
+        bodies.push(empty_symbol);
+
+        for body in bodies {
+            let Err((status, Json(response))) =
+                capital::transfer_equity(State(state.clone()), capital_request(body.clone())).await
+            else {
+                panic!("{body} must be refused");
+            };
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{body}: {}",
+                response.error
+            );
+        }
+    }
+
+    /// Like `transfer-usdc`, the start takes the resume lock before it needs
+    /// the recovery handle, so a held lock is a 409 even before the recovery
+    /// handle is published.
+    #[tokio::test]
+    async fn transfer_equity_returns_409_while_the_resume_lock_is_held() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        state.health.set_ready();
+        let resume_lock = Arc::clone(&state.resume_lock);
+        let _held = resume_lock.0.try_lock().unwrap();
+
+        let Err((status, Json(body))) = capital::transfer_equity(
+            State(state.clone()),
+            capital_request(transfer_equity_body("1.5")),
+        )
+        .await
+        else {
+            panic!("a held resume lock must refuse the transfer");
+        };
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body.error,
+            "A resume or recheck operation is already in progress"
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_equity_returns_503_before_the_recovery_handle_is_ready() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        state.health.set_ready();
+
+        let Err((status, Json(body))) =
+            capital::transfer_equity(State(state), capital_request(transfer_equity_body("1.5")))
+                .await
+        else {
+            panic!("the transfer must wait for the recovery handle");
+        };
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body.error,
+            "Recovery not ready yet (conductor still starting)"
+        );
+    }
+
+    /// Through the handler and the conductor wired service, whose stores are
+    /// wired but whose Position authority is not yet: the service refuses
+    /// with `NotReady` and the route answers 503 with its message, so the
+    /// operator retries instead of reading a server fault.
+    #[tokio::test]
+    async fn transfer_equity_returns_503_while_the_position_authority_is_not_wired() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        state.health.set_ready();
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let (service, store) =
+            crate::rebalancing::trigger::wire_usdc_reactor_store(&state.pool, &apalis_pool).await;
+        let _gate =
+            publish_recovery_handle(&state, service, store, EquityTransferServices::panicking())
+                .await;
+
+        let Err((status, Json(body))) =
+            capital::transfer_equity(State(state), capital_request(transfer_equity_body("1.5")))
+                .await
+        else {
+            panic!("the transfer must wait for the Position authority");
+        };
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.error, ManualEquityTransferError::NotReady.to_string());
+        let rows: i64 = sqlx_apalis::query_scalar("SELECT COUNT(*) FROM Jobs")
+            .fetch_one(&apalis_pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "a refused start must enqueue nothing");
+    }
+
     /// Every route that acts on one chain's trading table refuses a chain
     /// without one as input. No `[wallet]` is configured, so the 400 also
     /// proves the table is checked before the wallet is required.
@@ -10823,10 +10993,10 @@ mod tests {
 
     /// Every capital route refuses with 503 until startup completes, as
     /// process-tx does: the recovery handle and the wallets exist before the
-    /// chain id and `OPERATOR_ROLE` preflights have passed, and the job
-    /// `transfer-usdc` enqueues signs with those same wallets. The request is
-    /// otherwise valid for each route, so a 503 proves the gate fires before
-    /// any onchain call or enqueue.
+    /// chain id and `OPERATOR_ROLE` preflights have passed, and the jobs
+    /// `transfer-usdc` and `transfer-equity` enqueue sign with those same
+    /// wallets. The request is otherwise valid for each route, so a 503
+    /// proves the gate fires before any onchain call or enqueue.
     #[tokio::test]
     async fn capital_routes_return_503_until_startup_completes() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
@@ -10847,6 +11017,16 @@ mod tests {
         let transfer = capital::transfer_usdc(
             State(state.clone()),
             capital_request(serde_json::json!({"direction": "to-raindex", "amount": "1"})),
+        )
+        .await;
+        let transfer_equity = capital::transfer_equity(
+            State(state.clone()),
+            capital_request(serde_json::json!({
+                "direction": "to-raindex",
+                "symbol": "AAPL",
+                "quantity": "1",
+                "chain": "base",
+            })),
         )
         .await;
         let deposit =
@@ -10878,6 +11058,7 @@ mod tests {
 
         for (route, result) in [
             ("transfer-usdc", transfer.err()),
+            ("transfer-equity", transfer_equity.err()),
             ("vault-deposit", deposit.err()),
             ("vault-withdraw", withdraw.err()),
             ("vault-withdraw-usdc", withdraw_usdc.err()),
@@ -12403,6 +12584,163 @@ mod tests {
             usdc_resume_error_response(&UsdcResumeError::Database(sqlx::Error::RowNotFound));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(message, "Failed to enqueue the USDC transfer job");
+    }
+
+    /// Every refusal of a manual equity transfer maps to its contract status:
+    /// configuration refusals are 422, single flight, freeze, divergence and
+    /// Position conflicts are 409, a bot still starting or a wallet short of
+    /// gas is 503, all carrying the typed message, and store, queue, and
+    /// database failures are a generic 500.
+    #[test]
+    fn manual_equity_transfer_error_response_maps_every_refusal() {
+        use crate::rebalancing::ManualEquityTransferError as Refusal;
+        use crate::rebalancing::trigger::{EquityTriggerError, FreezeCheckError};
+
+        let symbol = st0x_execution::Symbol::new("AAPL").unwrap();
+        let refusals = [
+            (Refusal::NotReady, StatusCode::SERVICE_UNAVAILABLE),
+            (
+                Refusal::ChainNotConfigured {
+                    chain: Chain::Robinhood,
+                },
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                Refusal::ListingNotEnabled {
+                    symbol: symbol.clone(),
+                    chain: Chain::Base,
+                    mode: st0x_config::RebalancingMode::Paused,
+                },
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                Refusal::NotInRegistry {
+                    symbol: symbol.clone(),
+                    chain: Chain::Base,
+                },
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                Refusal::Registry {
+                    symbol: symbol.clone(),
+                    chain: Chain::Base,
+                    source: TokenAddressError::Uninitialized,
+                },
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                Refusal::Registry {
+                    symbol: symbol.clone(),
+                    chain: Chain::Robinhood,
+                    source: TokenAddressError::UnwiredRegistry {
+                        chain: Chain::Robinhood,
+                    },
+                },
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                Refusal::Frozen {
+                    symbol: symbol.clone(),
+                },
+                StatusCode::CONFLICT,
+            ),
+            (
+                Refusal::FreezeUnconfirmed {
+                    symbol: symbol.clone(),
+                    source: FreezeCheckError::AssetUnknown {
+                        symbol: symbol.clone(),
+                    },
+                },
+                StatusCode::CONFLICT,
+            ),
+            (
+                Refusal::DivergenceEngaged {
+                    symbol: symbol.clone(),
+                },
+                StatusCode::CONFLICT,
+            ),
+            (
+                Refusal::RestartTainted {
+                    symbol: symbol.clone(),
+                },
+                StatusCode::CONFLICT,
+            ),
+            (
+                Refusal::GasNotReady {
+                    chain: Chain::Base,
+                    source: crate::native_gas::GasReadinessFailure::below_threshold_for_test(
+                        Chain::Base,
+                        std::time::Duration::from_secs(60),
+                    ),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                Refusal::GuardHeld {
+                    symbol: symbol.clone(),
+                },
+                StatusCode::CONFLICT,
+            ),
+            (
+                Refusal::AlreadyInFlight {
+                    symbol: symbol.clone(),
+                    row_id: "row-1".to_string(),
+                    age_secs: 30,
+                },
+                StatusCode::CONFLICT,
+            ),
+            (
+                Refusal::PositionRefused {
+                    symbol: symbol.clone(),
+                    reason: crate::position::PositionError::EquityTransferReservationExists {
+                        reservation_id: crate::position::EquityTransferReservationId::generate(),
+                    },
+                },
+                StatusCode::CONFLICT,
+            ),
+            (
+                Refusal::ReservationInvalidated {
+                    symbol: symbol.clone(),
+                },
+                StatusCode::CONFLICT,
+            ),
+            (
+                Refusal::Sizing {
+                    symbol: symbol.clone(),
+                    chain: Chain::Base,
+                    refusal:
+                        crate::rebalancing::trigger::allocation::ManualSizingRefusal::AboveOperationalLimit {
+                            limit: st0x_execution::FractionalShares::new(float!(2)),
+                        },
+                },
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+        ];
+        for (refusal, expected) in refusals {
+            let (status, message) = manual_equity_transfer_error_response(&refusal);
+            assert_eq!(status, expected, "{refusal:?}");
+            assert_eq!(message, refusal.to_string(), "{refusal:?}");
+        }
+
+        let failures = [
+            Refusal::Registry {
+                symbol,
+                chain: Chain::Base,
+                source: TokenAddressError::Persistence(
+                    st0x_event_sorcery::AggregateError::AggregateConflict,
+                ),
+            },
+            Refusal::Trigger(EquityTriggerError::UnwiredWrapper { chain: Chain::Base }),
+            Refusal::ApalisDatabase(sqlx_apalis::Error::RowNotFound),
+            Refusal::Queue(crate::conductor::job::QueuePushError(
+                apalis_core::backend::TaskSinkError::PushError(sqlx_apalis::Error::PoolClosed),
+            )),
+        ];
+        for failure in failures {
+            let (status, message) = manual_equity_transfer_error_response(&failure);
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{failure:?}");
+            assert_eq!(message, "Failed to enqueue the equity transfer job");
+        }
     }
 
     /// Mirrors `recheck_error_response_distinguishes_recoverability` for the
@@ -16099,6 +16437,14 @@ mod tests {
                     .await
                     .map(|_| ())
             }
+            "transfer-equity" => {
+                // The startup gate comes first on capital routes, before the
+                // detached task this test parks.
+                state.health.set_ready();
+                capital::transfer_equity(State(state), capital_request(transfer_equity_body("1.5")))
+                    .await
+                    .map(|_| ())
+            }
             other => panic!("unknown recovery route {other}"),
         };
         outcome.map_err(|(status, _)| status)
@@ -16110,7 +16456,14 @@ mod tests {
     /// with 409 for the whole replay. Taking the lock first fails this test.
     #[tokio::test]
     async fn recovery_routes_wait_for_a_rebuild_without_holding_the_resume_lock() {
-        for route in ["resume", "fail", "recheck", "fail-usdc", "reconcile-usdc"] {
+        for route in [
+            "resume",
+            "fail",
+            "recheck",
+            "fail-usdc",
+            "reconcile-usdc",
+            "transfer-equity",
+        ] {
             let (state, _gate) =
                 recovery_state_with_driver_pause(EquityTransferServices::panicking()).await;
             let rebuild = state.projection_maintenance.pause().await.unwrap();

@@ -450,6 +450,24 @@ async fn dispatch_capital<A: TokenSource + Sync>(
                 )
                 .await
         }
+        Capital::TransferEquity {
+            direction,
+            symbol,
+            quantity,
+            network,
+        } => {
+            client
+                .post_capital_json(
+                    "/transfer-equity",
+                    &wire::TransferEquityRequest {
+                        direction,
+                        symbol,
+                        quantity,
+                        chain: network.wire_name(),
+                    },
+                )
+                .await
+        }
         Capital::VaultDeposit(args) => {
             client
                 .post_capital_json("/vault-deposit", &vault_request(args))
@@ -577,7 +595,7 @@ mod tests {
     };
     use crate::output::OutputError;
     use crate::transport::{Client, TransportError};
-    use crate::wire::{ReconcileUsdcReason, TransferUsdcDirection};
+    use crate::wire::{ReconcileUsdcReason, TransferDirection};
 
     /// Accepts one connection, captures the raw request bytes, and replies with
     /// an empty JSON object.
@@ -1127,8 +1145,8 @@ mod tests {
     async fn transfer_usdc_posts_the_direction_and_amount() -> Result<(), Box<dyn std::error::Error>>
     {
         for (direction, spelling) in [
-            (TransferUsdcDirection::ToRaindex, "to-raindex"),
-            (TransferUsdcDirection::ToAlpaca, "to-alpaca"),
+            (TransferDirection::ToRaindex, "to-raindex"),
+            (TransferDirection::ToAlpaca, "to-alpaca"),
         ] {
             let request = request_for(Command::Capital(Capital::TransferUsdc {
                 direction,
@@ -1146,7 +1164,7 @@ mod tests {
             );
         }
         let request = request_for(Command::Capital(Capital::TransferUsdc {
-            direction: TransferUsdcDirection::ToRaindex,
+            direction: TransferDirection::ToRaindex,
             amount: "250.5".parse()?,
             chain: Some(HedgedChain::Robinhood),
         }))
@@ -1155,6 +1173,49 @@ mod tests {
             request_body(&request),
             serde_json::json!({ "direction": "to-raindex", "amount": "250.5", "chain": "robinhood" })
         );
+        Ok(())
+    }
+
+    /// `transfer-equity` always sends `chain`, from `--network`, with the
+    /// symbol and the share quantity as typed.
+    #[tokio::test]
+    async fn transfer_equity_posts_the_direction_symbol_quantity_and_chain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (direction, spelling, network, chain) in [
+            (
+                TransferDirection::ToRaindex,
+                "to-raindex",
+                HedgedChain::Base,
+                "base",
+            ),
+            (
+                TransferDirection::ToAlpaca,
+                "to-alpaca",
+                HedgedChain::Ethereum,
+                "ethereum",
+            ),
+        ] {
+            let request = request_for(Command::Capital(Capital::TransferEquity {
+                direction,
+                symbol: "AAPL".to_owned(),
+                quantity: "1.5".parse()?,
+                network,
+            }))
+            .await?;
+            assert_eq!(
+                request_line(&request),
+                "POST /liquidity-capital/transfer-equity HTTP/1.1"
+            );
+            assert_eq!(
+                request_body(&request),
+                serde_json::json!({
+                    "direction": spelling,
+                    "symbol": "AAPL",
+                    "quantity": "1.5",
+                    "chain": chain,
+                })
+            );
+        }
         Ok(())
     }
 

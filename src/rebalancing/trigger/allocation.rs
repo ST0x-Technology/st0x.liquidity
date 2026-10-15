@@ -15,7 +15,7 @@ use crate::inventory::VenueBalance;
 use crate::position::PriceObservation;
 
 /// Maximum decimal places for Alpaca tokenization API quantities.
-const ALPACA_QUANTITY_MAX_DECIMAL_PLACES: u8 = 9;
+pub(crate) const ALPACA_QUANTITY_MAX_DECIMAL_PLACES: u8 = 9;
 
 /// One symbol's inventory and limits across every venue the caller could
 /// vouch for.
@@ -455,6 +455,104 @@ fn mintable_above_floors(
     };
 
     offchain.available() - floor
+}
+
+/// Why the planner's sizing rules refuse an operator sized transfer.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum ManualSizingRefusal {
+    #[error(
+        "the symbol's inventory cannot be sized yet ({}); retry once the poller has read \
+         every venue",
+        .0.metric_label()
+    )]
+    Unsizable(DeclineReason),
+    #[error("a transfer of the symbol is still in flight at some venue; retry once it has settled")]
+    Inflight,
+    #[error("the quantity is above the listing's operational limit of {limit} shares")]
+    AboveOperationalLimit { limit: FractionalShares },
+    #[error(
+        "the mint would take the broker below its floor: at most {mintable} shares can be \
+         minted now"
+    )]
+    BelowBrokerFloor { mintable: FractionalShares },
+    #[error(
+        "the redemption is above the chain's vault: at most {redeemable} shares can be \
+         redeemed now"
+    )]
+    AboveVaultBalance { redeemable: FractionalShares },
+    #[error("the symbol has no price to value the transfer against the minimum operation size")]
+    PriceMissing,
+    #[error(
+        "the transfer is worth {value} USD, below the chain's minimum operation of {min_usd} USD"
+    )]
+    BelowMinimum { value: Usdc, min_usd: Usdc },
+}
+
+/// Checks an operator sized `quantity` against the planner's own sizing
+/// rules for `chain`: every venue read with nothing in flight, the listing's
+/// operational limit, the broker floors for a mint, the vault's available
+/// shares for a redemption, and the minimum operation value. `None` when the
+/// quantity passes. The operator picks the chain, the direction and the
+/// quantity, so the band, the ranking and the cooldown do not apply.
+pub(crate) fn check_manual_operation(
+    input: &EquityPlanInput,
+    chain: Chain,
+    direction: PlannedDirection,
+    quantity: FractionalShares,
+) -> Result<Option<ManualSizingRefusal>, EquityPlanError> {
+    let offchain = match sizable_offchain(input) {
+        Ok(offchain) => offchain,
+        Err(reason) => return Ok(Some(ManualSizingRefusal::Unsizable(reason))),
+    };
+    if input.has_inflight {
+        return Ok(Some(ManualSizingRefusal::Inflight));
+    }
+    let Some(slot) = input.onchain.get(&chain) else {
+        return Ok(Some(ManualSizingRefusal::Unsizable(
+            DeclineReason::ChainUnpolled { chain },
+        )));
+    };
+
+    if let Some(limit) = slot.operational_limit
+        && quantity.inner().gt(limit.inner().inner())?
+    {
+        return Ok(Some(ManualSizingRefusal::AboveOperationalLimit {
+            limit: limit.inner(),
+        }));
+    }
+
+    match direction {
+        PlannedDirection::Mint => {
+            let (_, total) = underlying_and_total(input, offchain)?;
+            let mintable = mintable_above_floors(input, offchain, total)?;
+            if quantity.inner().gt(mintable.inner())? {
+                return Ok(Some(ManualSizingRefusal::BelowBrokerFloor { mintable }));
+            }
+        }
+        PlannedDirection::Redemption => {
+            // The vault holds wrapped shares and the quantity is underlying.
+            let redeemable = slot
+                .ratio
+                .to_underlying_fractional(slot.balance.available())?;
+            if quantity.inner().gt(redeemable.inner())? {
+                return Ok(Some(ManualSizingRefusal::AboveVaultBalance { redeemable }));
+            }
+        }
+    }
+
+    let Some(price) = input.last_price else {
+        return Ok(Some(ManualSizingRefusal::PriceMissing));
+    };
+    let value = (quantity.inner() * price.price)?;
+    let min_usd = slot.min_operation_usd.inner();
+    if value.lt(min_usd.inner())? {
+        return Ok(Some(ManualSizingRefusal::BelowMinimum {
+            value: Usdc::new(value),
+            min_usd,
+        }));
+    }
+
+    Ok(None)
 }
 
 /// Every slot's signed distance from its target in underlying shares, and
@@ -1951,5 +2049,223 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// A broker and a Base vault of 50 shares each at 100 USD, no floors,
+    /// and a one dollar minimum: room for any small transfer.
+    fn manual_input() -> EquityPlanInput {
+        input(
+            Some(balance("50")),
+            BTreeMap::from([(Chain::Base, slot("50", "0.5"))]),
+        )
+    }
+
+    fn check_manual(
+        input: &EquityPlanInput,
+        direction: PlannedDirection,
+        quantity: &str,
+    ) -> Option<ManualSizingRefusal> {
+        check_manual_operation(input, Chain::Base, direction, shares(quantity)).unwrap()
+    }
+
+    /// A quantity inside every rule passes in both directions, whatever the
+    /// band says: the operator, not the planner, chose to move it.
+    #[test]
+    fn check_manual_operation_passes_a_quantity_inside_every_rule() {
+        let input = manual_input();
+
+        assert_eq!(check_manual(&input, PlannedDirection::Mint, "5"), None);
+        assert_eq!(
+            check_manual(&input, PlannedDirection::Redemption, "5"),
+            None
+        );
+    }
+
+    #[test]
+    fn check_manual_operation_refuses_an_unpolled_broker() {
+        let input = EquityPlanInput {
+            offchain: None,
+            ..manual_input()
+        };
+
+        assert_eq!(
+            check_manual(&input, PlannedDirection::Redemption, "5"),
+            Some(ManualSizingRefusal::Unsizable(
+                DeclineReason::OffchainUnpolled
+            ))
+        );
+    }
+
+    #[test]
+    fn check_manual_operation_refuses_while_a_transfer_is_in_flight() {
+        let input = EquityPlanInput {
+            has_inflight: true,
+            ..manual_input()
+        };
+
+        assert_eq!(
+            check_manual(&input, PlannedDirection::Redemption, "5"),
+            Some(ManualSizingRefusal::Inflight)
+        );
+    }
+
+    /// A chain with no slot has no polled vault to size against.
+    #[test]
+    fn check_manual_operation_refuses_a_chain_without_a_slot() {
+        let refusal = check_manual_operation(
+            &manual_input(),
+            Chain::Robinhood,
+            PlannedDirection::Redemption,
+            shares("5"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            refusal,
+            Some(ManualSizingRefusal::Unsizable(
+                DeclineReason::ChainUnpolled {
+                    chain: Chain::Robinhood
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn check_manual_operation_refuses_a_quantity_above_the_operational_limit() {
+        let input = input(
+            Some(balance("50")),
+            BTreeMap::from([(
+                Chain::Base,
+                ChainSlot {
+                    operational_limit: Some(positive("2")),
+                    ..slot("50", "0.5")
+                },
+            )]),
+        );
+
+        assert_eq!(
+            check_manual(&input, PlannedDirection::Redemption, "2"),
+            None
+        );
+        assert_eq!(
+            check_manual(&input, PlannedDirection::Redemption, "2.5"),
+            Some(ManualSizingRefusal::AboveOperationalLimit { limit: shares("2") })
+        );
+    }
+
+    /// A mint may only take what the broker holds above the larger floor;
+    /// a redemption brings the broker shares, so the floor never refuses it.
+    #[test]
+    fn check_manual_operation_refuses_a_mint_below_the_broker_floor() {
+        let input = EquityPlanInput {
+            hedge_floor: shares("45"),
+            ..manual_input()
+        };
+
+        assert_eq!(check_manual(&input, PlannedDirection::Mint, "5"), None);
+        assert_eq!(
+            check_manual(&input, PlannedDirection::Mint, "6"),
+            Some(ManualSizingRefusal::BelowBrokerFloor {
+                mintable: shares("5")
+            })
+        );
+        assert_eq!(
+            check_manual(&input, PlannedDirection::Redemption, "6"),
+            None
+        );
+    }
+
+    /// A redemption may only take the vault's available shares, counted in
+    /// underlying through the chain's ratio; the vault never refuses a mint.
+    #[test]
+    fn check_manual_operation_refuses_a_redemption_above_the_vault_balance() {
+        let ratio = UnderlyingPerWrapped::new(U256::from(1_500_000_000_000_000_000u64)).unwrap();
+        let input = input(
+            Some(balance("50")),
+            BTreeMap::from([(
+                Chain::Base,
+                ChainSlot {
+                    ratio,
+                    ..slot("4", "0.5")
+                },
+            )]),
+        );
+
+        assert_eq!(
+            check_manual(&input, PlannedDirection::Redemption, "6"),
+            None
+        );
+        assert_eq!(
+            check_manual(&input, PlannedDirection::Redemption, "6.5"),
+            Some(ManualSizingRefusal::AboveVaultBalance {
+                redeemable: shares("6")
+            })
+        );
+        assert_eq!(check_manual(&input, PlannedDirection::Mint, "7"), None);
+    }
+
+    /// An empty vault has nothing to redeem, however small the quantity.
+    #[test]
+    fn check_manual_operation_refuses_any_redemption_from_an_empty_vault() {
+        let input = input(
+            Some(balance("50")),
+            BTreeMap::from([(Chain::Base, slot("0", "0.5"))]),
+        );
+
+        assert_eq!(
+            check_manual(&input, PlannedDirection::Redemption, "1"),
+            Some(ManualSizingRefusal::AboveVaultBalance {
+                redeemable: shares("0")
+            })
+        );
+    }
+
+    /// A share floor above the broker's balance leaves nothing mintable.
+    #[test]
+    fn check_manual_operation_refuses_any_mint_from_a_broker_at_its_share_floor() {
+        let input = EquityPlanInput {
+            alpaca_floor: target("0.6"),
+            ..manual_input()
+        };
+
+        assert_eq!(
+            check_manual(&input, PlannedDirection::Mint, "1"),
+            Some(ManualSizingRefusal::BelowBrokerFloor {
+                mintable: shares("-10")
+            })
+        );
+    }
+
+    #[test]
+    fn check_manual_operation_refuses_a_symbol_without_a_price() {
+        let input = EquityPlanInput {
+            last_price: None,
+            ..manual_input()
+        };
+
+        assert_eq!(
+            check_manual(&input, PlannedDirection::Redemption, "5"),
+            Some(ManualSizingRefusal::PriceMissing)
+        );
+    }
+
+    #[test]
+    fn check_manual_operation_refuses_a_quantity_below_the_minimum_value() {
+        let input = EquityPlanInput {
+            last_price: Some(observed("0.1", now())),
+            ..manual_input()
+        };
+
+        assert_eq!(
+            check_manual(&input, PlannedDirection::Redemption, "10"),
+            None
+        );
+        assert_eq!(
+            check_manual(&input, PlannedDirection::Redemption, "5"),
+            Some(ManualSizingRefusal::BelowMinimum {
+                value: Usdc::new(float!(0.5)),
+                min_usd: Usdc::new(float!(1)),
+            })
+        );
     }
 }

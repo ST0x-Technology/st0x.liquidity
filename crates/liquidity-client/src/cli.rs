@@ -5,7 +5,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use uuid::Uuid;
 
 use crate::target::Env;
-use crate::wire::{DecimalAmount, EvmAddress, ReconcileUsdcReason, TransferUsdcDirection, VaultId};
+use crate::wire::{DecimalAmount, EvmAddress, ReconcileUsdcReason, TransferDirection, VaultId};
 
 /// Rejects an empty or whitespace-only audit `--reason` at parse time, before
 /// the value can reach auth or the network. The server rejects blank reasons
@@ -422,7 +422,7 @@ pub(crate) enum Capital {
     TransferUsdc {
         /// Direction of transfer.
         #[arg(short = 'd', long, value_enum)]
-        direction: TransferUsdcDirection,
+        direction: TransferDirection,
         /// Amount of USDC to transfer, as a decimal.
         #[arg(short = 'a', long, allow_negative_numbers = true)]
         amount: DecimalAmount,
@@ -430,6 +430,28 @@ pub(crate) enum Capital {
         /// while the bot serves one corridor.
         #[arg(long, value_enum)]
         chain: Option<HedgedChain>,
+    },
+    /// Start a transfer of tokenized equity between Alpaca and Raindex on the
+    /// bot's equity transfer workers, the path the rebalancer uses: a mint
+    /// for `to-raindex`, a redemption for `to-alpaca`. Returns the new
+    /// transfer id (the mint's issuer request id or the redemption id) at
+    /// once; follow it with `read transfer-events` and recover it with
+    /// `debug recheck`.
+    TransferEquity {
+        /// Direction of transfer.
+        #[arg(short = 'd', long, value_enum)]
+        direction: TransferDirection,
+        /// Equity symbol (for example AAPL).
+        #[arg(short = 's', long)]
+        symbol: String,
+        /// Number of shares to transfer, as a decimal; fractional shares are
+        /// allowed.
+        #[arg(short = 'q', long, allow_negative_numbers = true)]
+        quantity: DecimalAmount,
+        /// Chain the mint lands on or the redemption leaves from: selects the
+        /// wallet and the chain's equity listing and token registry.
+        #[arg(long, value_enum, default_value_t = HedgedChain::Base)]
+        network: HedgedChain,
     },
     /// Deposit tokens from the bot's wallet into a Raindex vault: approves,
     /// then deposits, resolving token decimals from onchain metadata. Returns
@@ -596,9 +618,7 @@ mod tests {
         Position, UsdcDirection, parse_key_value,
     };
     use crate::target::Env;
-    use crate::wire::{
-        DecimalAmount, EvmAddress, ReconcileUsdcReason, TransferUsdcDirection, VaultId,
-    };
+    use crate::wire::{DecimalAmount, EvmAddress, ReconcileUsdcReason, TransferDirection, VaultId};
 
     const TOKEN: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
     const VAULT: &str = "0x00000000000000000000000000000000000000000000000000000000000000a1";
@@ -1002,7 +1022,7 @@ mod tests {
             ])
             .unwrap(),
             Capital::TransferUsdc {
-                direction: TransferUsdcDirection::ToRaindex,
+                direction: TransferDirection::ToRaindex,
                 amount,
                 chain: None,
             } if amount == self::amount("250.5")
@@ -1011,10 +1031,39 @@ mod tests {
             capital(&["transfer-usdc", "-d", "to-alpaca", "-a", "10", "--chain", "robinhood"])
                 .unwrap(),
             Capital::TransferUsdc {
-                direction: TransferUsdcDirection::ToAlpaca,
+                direction: TransferDirection::ToAlpaca,
                 amount,
                 chain: Some(super::HedgedChain::Robinhood),
             } if amount == self::amount("10")
+        ));
+        assert!(matches!(
+            capital(&[
+                "transfer-equity",
+                "--direction",
+                "to-raindex",
+                "--symbol",
+                "AAPL",
+                "--quantity",
+                "1.5",
+                "--network",
+                "ethereum",
+            ])
+            .unwrap(),
+            Capital::TransferEquity {
+                direction: TransferDirection::ToRaindex,
+                symbol,
+                quantity,
+                network: super::HedgedChain::Ethereum,
+            } if symbol == "AAPL" && quantity == self::amount("1.5")
+        ));
+        assert!(matches!(
+            capital(&["transfer-equity", "-d", "to-alpaca", "-s", "TSLA", "-q", "3"]).unwrap(),
+            Capital::TransferEquity {
+                direction: TransferDirection::ToAlpaca,
+                symbol,
+                quantity,
+                network: super::HedgedChain::Base,
+            } if symbol == "TSLA" && quantity == self::amount("3")
         ));
 
         let Capital::VaultDeposit(deposit) = capital(&[
@@ -1073,6 +1122,9 @@ mod tests {
 
         for argv in [
             &["transfer-usdc", "--direction", "to-raindex"][..],
+            &["transfer-equity", "-d", "to-raindex", "-s", "AAPL"][..],
+            &["transfer-equity", "-d", "to-raindex", "-q", "1"][..],
+            &["transfer-equity", "-s", "AAPL", "-q", "1"][..],
             &["vault-deposit", "-a", "1", "-t", TOKEN][..],
             &["vault-withdraw", "-a", "1", "-v", VAULT][..],
             &["vault-withdraw-usdc", "--network", "base"][..],
@@ -1097,10 +1149,20 @@ mod tests {
             &["vault-withdraw", "-a", "1", "-t", TOKEN, "-v", VAULT][..],
             &["vault-withdraw-usdc", "-a", "1"][..],
             &["reset-allowance"][..],
+            &[
+                "transfer-equity",
+                "-d",
+                "to-alpaca",
+                "-s",
+                "AAPL",
+                "-q",
+                "1",
+            ][..],
         ] {
             let network = match capital(argv).unwrap() {
                 Capital::VaultDeposit(args) | Capital::VaultWithdraw(args) => args.network,
                 Capital::VaultWithdrawUsdc { network, .. }
+                | Capital::TransferEquity { network, .. }
                 | Capital::ResetAllowance { network } => network,
                 Capital::TransferUsdc { .. }
                 | Capital::CctpBridge { .. }
@@ -1157,6 +1219,18 @@ mod tests {
     fn capital_value_enums_reject_unknown_spellings() {
         for argv in [
             &["transfer-usdc", "--direction", "sideways", "--amount", "1"][..],
+            &["transfer-equity", "-d", "sideways", "-s", "AAPL", "-q", "1"][..],
+            &[
+                "transfer-equity",
+                "-d",
+                "to-raindex",
+                "-s",
+                "AAPL",
+                "-q",
+                "1",
+                "--network",
+                "solana",
+            ][..],
             &[
                 "vault-deposit",
                 "-a",
@@ -1195,6 +1269,15 @@ mod tests {
         let mut argvs: Vec<Vec<&str>> = Vec::new();
         for bad_amount in ["0", "-1", "abc", "1e3", "0.00", "1.", ".5"] {
             argvs.push(vec!["transfer-usdc", "-d", "to-alpaca", "-a", bad_amount]);
+            argvs.push(vec![
+                "transfer-equity",
+                "-d",
+                "to-raindex",
+                "-s",
+                "AAPL",
+                "-q",
+                bad_amount,
+            ]);
             argvs.push(vec![
                 "vault-deposit",
                 "-a",
