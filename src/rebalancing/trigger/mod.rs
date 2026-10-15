@@ -7262,7 +7262,8 @@ impl RebalancingService {
         // nothing durably (a racing trigger claim, or one a separate process
         // already made terminal), so this id joins it as a holder once the
         // push succeeds. A claim carries its amount, so the other corridors
-        // count it through the awaits below.
+        // count it through the awaits below; joining another holder, this id
+        // counts from its hold after the push.
         let claim = match self.usdc_guards.try_claim(
             state.corridor().chain(),
             id,

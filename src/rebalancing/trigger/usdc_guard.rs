@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use rain_math_float::FloatError;
+use tracing::warn;
 
 use st0x_evm::Chain;
 use st0x_finance::{HasZero, Usdc};
@@ -196,13 +197,17 @@ impl CashGuardClaim {
     /// Replaces the claimed transfer's amount: the trigger re-sizes under its
     /// claim before it queues the job.
     pub(super) fn resize(&self, amount: Usdc) {
-        let mut state = self.guards.state();
-        if let Some(hold) = state
+        let resized = self
+            .guards
+            .state()
             .holders
             .values_mut()
             .find_map(|holders| holders.get_mut(&self.id))
-        {
-            hold.amount = amount;
+            .map(|hold| hold.amount = amount)
+            .is_some();
+
+        if !resized {
+            warn!(target: "rebalance", id = %self.id, "Resize found no hold for its claim");
         }
     }
 
@@ -530,8 +535,8 @@ mod tests {
         assert_eq!(guards.inbound_elsewhere(Chain::HyperEvm).unwrap(), usdc(70));
     }
 
-    /// A holder is published with its amount in one step: no other corridor
-    /// can read the hold before its amount.
+    /// Each publishing call counts its amount from the call itself; `Hold`
+    /// stores direction and amount as one entry.
     #[test]
     fn every_hold_counts_its_amount_from_the_call_that_publishes_it() {
         let guards = Arc::new(UsdcCashGuards::default());
