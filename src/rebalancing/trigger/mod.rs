@@ -5634,6 +5634,77 @@ impl RebalancingService {
         }))
     }
 
+    /// Cross-chain staleness rule: the first chain rebalancing `symbol` whose
+    /// onchain balance no recent successful poll vouches for, with why. Every
+    /// such chain counts in the planner's total, so one unpolled or stale
+    /// listing makes the symbol unsizable rather than sized against a partial
+    /// total. Freshness comes from PollFreshness, which the poller stamps on
+    /// every successful fetch, so an unchanged (event-suppressed) book still
+    /// reads fresh; the snapshot aggregate's own stamps freeze on quiet books
+    /// (see freshness.rs module doc).
+    async fn unvouched_listing_chain(
+        &self,
+        symbol: &Symbol,
+    ) -> Option<(DeclineReason, StaleSnapshot)> {
+        for (chain, _, _) in self.config.rebalancing_listings(symbol) {
+            let seeded = self
+                .inventory
+                .read()
+                .await
+                .onchain_equity_slot_seeded(symbol, chain);
+            let last_polled = seeded.then(|| {
+                self.config.poll_freshness.last_observed(
+                    PortfolioLocation::MarketMaking(chain),
+                    &PortfolioAsset::Equity(symbol.clone()),
+                )
+            });
+            if let Some(staleness) =
+                stale_snapshot_age(last_polled.flatten(), self.config.inventory_staleness_bound)
+            {
+                let reason = match staleness {
+                    StaleSnapshot::NeverPolled => DeclineReason::ChainUnpolled { chain },
+                    StaleSnapshot::AgedOut { .. } | StaleSnapshot::FutureStamp { .. } => {
+                        DeclineReason::ChainStale { chain }
+                    }
+                };
+                return Some((reason, staleness));
+            }
+        }
+
+        None
+    }
+
+    /// Why the trigger's freshness gate or the planner's sizing rules refuse
+    /// an operator sized transfer of `quantity` on `chain`, if they do. Run
+    /// before the reservation, so a refusal appends no Position events, and
+    /// again after it, since the inventory can move while the guard and the
+    /// reservation are taken.
+    async fn manual_sizing_refusal(
+        &self,
+        symbol: &Symbol,
+        chain: Chain,
+        direction: PlannedDirection,
+        quantity: FractionalShares,
+    ) -> Result<Option<ManualSizingRefusal>, equity::EquityTriggerError> {
+        if let Some((reason, staleness)) = self.unvouched_listing_chain(symbol).await {
+            warn!(
+                target: "rebalance",
+                %symbol,
+                %staleness,
+                bound_secs = self.config.inventory_staleness_bound.as_secs(),
+                reason = reason.metric_label(),
+                "Manual equity transfer refused: a listing chain's poll cannot vouch for its \
+                 balance"
+            );
+            return Ok(Some(ManualSizingRefusal::Unsizable(reason)));
+        }
+
+        match self.equity_plan_input(symbol).await? {
+            Some(input) => Ok(check_manual_operation(&input, chain, direction, quantity)?),
+            None => Ok(Some(ManualSizingRefusal::PriceMissing)),
+        }
+    }
+
     /// Plans with every chain assumed registered and gas-ready, then checks
     /// the chosen chain's vault registry and probes its wallet. A chain that
     /// fails either is marked and the symbol re-planned, so the next
@@ -6346,40 +6417,10 @@ impl RebalancingService {
             return Ok(());
         }
 
-        // Cross-chain staleness rule: never size an operation off a chain
-        // whose onchain balance was not recently confirmed by a successful
-        // poll. Every chain rebalancing the symbol counts in the planner's
-        // total, so one unpolled or stale listing declines the symbol rather
-        // than sizing against a partial total. Freshness comes from
-        // PollFreshness, which the poller stamps on every successful fetch,
-        // so an unchanged (event-suppressed) book still reads fresh; the
-        // snapshot aggregate's own stamps freeze on quiet books (see
-        // freshness.rs module doc).
-        for (chain, _, _) in self.config.rebalancing_listings(symbol) {
-            let seeded = self
-                .inventory
-                .read()
-                .await
-                .onchain_equity_slot_seeded(symbol, chain);
-            let last_polled = seeded.then(|| {
-                self.config.poll_freshness.last_observed(
-                    PortfolioLocation::MarketMaking(chain),
-                    &PortfolioAsset::Equity(symbol.clone()),
-                )
-            });
-            if let Some(staleness) =
-                stale_snapshot_age(last_polled.flatten(), self.config.inventory_staleness_bound)
-            {
-                let reason = match staleness {
-                    StaleSnapshot::NeverPolled => DeclineReason::ChainUnpolled { chain },
-                    StaleSnapshot::AgedOut { .. } | StaleSnapshot::FutureStamp { .. } => {
-                        DeclineReason::ChainStale { chain }
-                    }
-                };
-                self.record_equity_decline(symbol, &reason, Some(staleness));
-                self.record_equity_bands(symbol, None);
-                return Ok(());
-            }
+        if let Some((reason, staleness)) = self.unvouched_listing_chain(symbol).await {
+            self.record_equity_decline(symbol, &reason, Some(staleness));
+            self.record_equity_bands(symbol, None);
+            return Ok(());
         }
 
         // A claimed guard plans below, and planning records the bands from
@@ -7733,21 +7774,24 @@ impl RebalancingService {
     /// redemption aggregate id.
     ///
     /// The operator sizes the transfer, so the band, the ranking and the
-    /// cooldown do not apply, but the quantity must pass the planner's own
-    /// sizing rules (`check_manual_operation`): every venue read with nothing
-    /// in flight, the listing's operational limit, the broker floors for a
-    /// mint, and the minimum operation value. Otherwise the gates are the
-    /// trigger's, in the trigger's order, each refusing where the trigger
-    /// skips: the listing must start operations and the token must be in the
-    /// chain's registry (the planner's own per chain checks), then the
-    /// dividend freeze (failing closed when issuance cannot answer), the
-    /// snapshot divergence, the restart taint, the chain's gas, the sizing
-    /// rules, the in memory guard, the job row dedupe, and the Position
-    /// reservation. As in the trigger's dispatch, the divergence is checked
-    /// again after the reservation and the reservation is confirmed before the
-    /// enqueue. A refusal after the reservation releases it, a refusal after
-    /// the guard claim drops the guard, and a dispatch keeps both and records
-    /// the chain's cooldown, exactly as the trigger does.
+    /// cooldown do not apply, but every listing chain's poll must vouch for
+    /// its balance as for the trigger, and the quantity must pass the
+    /// planner's own sizing rules (`check_manual_operation`): every venue read
+    /// with nothing in flight, the listing's operational limit, the broker
+    /// floors for a mint, the vault's available shares for a redemption, and
+    /// the minimum operation value. Otherwise the gates are the trigger's, in
+    /// the trigger's order, each refusing where the trigger skips: the
+    /// listing must start operations and the token must be in the chain's
+    /// registry (the planner's own per chain checks), then the dividend
+    /// freeze (failing closed when issuance cannot answer), the snapshot
+    /// divergence, the restart taint, the chain's gas, the freshness and
+    /// sizing rules, the in memory guard, the job row dedupe, and the
+    /// Position reservation. As in the trigger's dispatch, the divergence and
+    /// the freshness and sizing rules are checked again after the reservation
+    /// and the reservation is confirmed before the enqueue. A refusal after
+    /// the reservation releases it, a refusal after the guard claim drops the
+    /// guard, and a dispatch keeps both and records the chain's cooldown,
+    /// exactly as the trigger does.
     pub(crate) async fn start_manual_equity_transfer(
         &self,
         symbol: &Symbol,
@@ -7836,12 +7880,10 @@ impl RebalancingService {
 
         // Before the guard claim and the reservation, so a refusal appends no
         // Position events.
-        let refusal = match self.equity_plan_input(symbol).await? {
-            Some(input) => check_manual_operation(&input, chain, direction, quantity.inner())
-                .map_err(equity::EquityTriggerError::from)?,
-            None => Some(ManualSizingRefusal::PriceMissing),
-        };
-        if let Some(refusal) = refusal {
+        if let Some(refusal) = self
+            .manual_sizing_refusal(symbol, chain, direction, quantity.inner())
+            .await?
+        {
             return Err(ManualEquityTransferError::Sizing {
                 symbol: symbol.clone(),
                 chain,
@@ -7887,6 +7929,19 @@ impl RebalancingService {
             if self.divergence_gate.is_engaged(symbol) {
                 return Err(ManualEquityTransferError::DivergenceEngaged {
                     symbol: symbol.clone(),
+                });
+            }
+            // The inventory can move between the first check and the
+            // reservation, e.g. a hedge filling at the broker, so the quantity
+            // is checked again against what the Position admitted.
+            if let Some(refusal) = self
+                .manual_sizing_refusal(symbol, chain, direction, quantity.inner())
+                .await?
+            {
+                return Err(ManualEquityTransferError::Sizing {
+                    symbol: symbol.clone(),
+                    chain,
+                    refusal,
                 });
             }
             if !self.confirm_equity_transfer(symbol, reservation_id).await? {
@@ -23653,6 +23708,170 @@ mod tests {
 
         assert!(
             matches!(error, ManualEquityTransferError::DivergenceEngaged { .. }),
+            "got {error:?}"
+        );
+        assert_manual_equity_start_left_nothing(&trigger, &symbol).await;
+    }
+
+    /// The trigger's freshness gate refuses a manual start too: a listing
+    /// chain never polled since boot, or polled longer ago than the bound,
+    /// cannot vouch for the balance the quantity is sized against.
+    #[tokio::test]
+    async fn manual_equity_transfer_is_refused_while_a_listing_chain_poll_is_not_fresh() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let aged_out = PollFreshness::new();
+        aged_out.set_observed(
+            PortfolioLocation::MarketMaking(Chain::Base),
+            PortfolioAsset::Equity(symbol.clone()),
+            Utc::now() - chrono::Duration::seconds(301),
+        );
+
+        for (poll_freshness, expected) in [
+            (
+                PollFreshness::new(),
+                DeclineReason::ChainUnpolled { chain: Chain::Base },
+            ),
+            (aged_out, DeclineReason::ChainStale { chain: Chain::Base }),
+        ] {
+            let config = RebalancingServiceConfig {
+                poll_freshness,
+                ..test_config()
+            };
+            let (trigger, pool) = manual_equity_trigger_and_pool(&symbol, config).await;
+
+            let error = trigger
+                .start_manual_equity_transfer(
+                    &symbol,
+                    PlannedDirection::Redemption,
+                    manual_shares(1),
+                    Chain::Base,
+                )
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(
+                    &error,
+                    ManualEquityTransferError::Sizing {
+                        refusal: ManualSizingRefusal::Unsizable(reason),
+                        ..
+                    } if *reason == expected
+                ),
+                "expected {expected:?}, got {error:?}"
+            );
+            assert_manual_equity_start_left_nothing(&trigger, &symbol).await;
+            assert_eq!(position_reservation_events(&pool).await, 0);
+        }
+    }
+
+    /// A redemption larger than the vault's available shares is refused
+    /// before the guard and the reservation: the fixture's Base vault holds
+    /// 50 shares at a one to one ratio.
+    #[tokio::test]
+    async fn manual_equity_transfer_refuses_a_redemption_above_the_vault_balance() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let (trigger, pool) = manual_equity_trigger_and_pool(&symbol, test_config()).await;
+
+        let error = trigger
+            .start_manual_equity_transfer(
+                &symbol,
+                PlannedDirection::Redemption,
+                manual_shares(51),
+                Chain::Base,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                ManualEquityTransferError::Sizing {
+                    chain: Chain::Base,
+                    refusal: ManualSizingRefusal::AboveVaultBalance { redeemable },
+                    ..
+                } if *redeemable == shares(50)
+            ),
+            "got {error:?}"
+        );
+        assert_manual_equity_start_left_nothing(&trigger, &symbol).await;
+        assert_eq!(position_reservation_events(&pool).await, 0);
+    }
+
+    /// Replaces the inventory as the Position records a transfer
+    /// reservation, as a hedge filling at the broker can between a manual
+    /// start's first sizing check and its reservation.
+    struct MoveInventoryOnReservation {
+        inventory: Arc<BroadcastingInventory>,
+        moved_to: tokio::sync::Mutex<Option<InventoryView>>,
+    }
+
+    deps!(MoveInventoryOnReservation, [Position]);
+
+    #[async_trait]
+    impl Reactor for MoveInventoryOnReservation {
+        type Error = Never;
+
+        async fn react(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+        ) -> Result<(), Self::Error> {
+            let (_, event) = event.into_inner();
+            if matches!(event, PositionEvent::EquityTransferReserved { .. })
+                && let Some(moved_to) = self.moved_to.lock().await.take()
+            {
+                *self.inventory.write().await = moved_to;
+            }
+            Ok(())
+        }
+    }
+
+    /// The sizing rules run again after the reservation: a mint of 40 passes
+    /// against a broker of 50, but the broker drops to 35 as the reservation
+    /// is recorded, so the start is refused and the reservation released.
+    #[tokio::test]
+    async fn manual_equity_transfer_resizes_after_its_reservation() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let (trigger, pool) = manual_equity_trigger_and_pool(&symbol, test_config()).await;
+        // Swaps in a Position store over the same events whose reactor
+        // shrinks the broker balance as the reservation is recorded.
+        let (position, position_projection) = StoreBuilder::<Position>::new(pool)
+            .with(Arc::new(MoveInventoryOnReservation {
+                inventory: Arc::clone(&trigger.inventory),
+                moved_to: tokio::sync::Mutex::new(Some(InventoryView::default().with_equity(
+                    symbol.clone(),
+                    shares(50),
+                    shares(35),
+                ))),
+            }))
+            .build(())
+            .await
+            .unwrap();
+        trigger
+            .set_position_authority(
+                position,
+                position_projection,
+                ExecutionThreshold::whole_share(),
+            )
+            .await;
+
+        let error = trigger
+            .start_manual_equity_transfer(
+                &symbol,
+                PlannedDirection::Mint,
+                manual_shares(40),
+                Chain::Base,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                ManualEquityTransferError::Sizing {
+                    refusal: ManualSizingRefusal::BelowBrokerFloor { mintable },
+                    ..
+                } if *mintable == shares(35)
+            ),
             "got {error:?}"
         );
         assert_manual_equity_start_left_nothing(&trigger, &symbol).await;

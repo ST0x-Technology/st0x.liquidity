@@ -8412,85 +8412,89 @@ effect rather than a generic intent:
   config), while a snapshot divergence is engaged for it, or while its balance
   is restart tainted; `503` while the chain's signing wallet cannot be shown to
   pay gas; `422` when the quantity breaks the planner's sizing rules: a venue
-  not yet read or a transfer still in flight at any venue, a quantity above the
-  listing's operational limit, a mint that would take the broker below its floor
-  (the larger of the alpaca floor share and the hedge floor), or a value below
-  the chain's minimum operation (or no price to value it); `409` when its
-  transfer guard is already claimed or a non terminal equity transfer job row
-  exists for it in either direction; and `409` when the Position refuses the
-  reservation, naming its reason (a pending or due hedge, another reservation, a
-  failed order anchor). After the reservation it checks the divergence again and
-  confirms the reservation (`409` when it was invalidated), then enqueues the
-  job under the reservation id; a refusal after the reservation releases it, and
-  a store, queue, or database failure is `500`. On success the guard and the
-  reservation stay held for the worker and the chain's cooldown starts, as after
-  the trigger's own dispatch. Everything after the startup gate runs on a
-  tracked detached task, so a dropped request cannot release the guard and the
-  reservation after the job is queued. `cctp-bridge` only burns: it applies the
-  same corridor gas check (`503`) as `transfer-usdc`, since the burn and the
-  mint that completes it spend both wallets' gas, then holds the recovery lock
-  and the driver pause around the burn like `cctp complete-mint` does around the
-  mint, and returns the burn tx as soon as the burn is broadcast, not when it
-  confirms: an approve plus the burn's confirmations can outlast the 60 second
-  load balancer cut, and a request that timed out after the broadcast would
-  leave the operator without the burn tx. Every request carries the client's
-  operation id (a UUID, which `st0x-liquidity-client` generates per run and
-  prints before sending), and an id holds at most one burn: the
-  `CctpBurnOperation` aggregate (ADR 0023). After the lock, the pause and the
-  amount, the route signs the burn without broadcasting it, records the signed
-  bytes under the id (`Prepared`), and only then broadcasts them, so the burn is
-  on record before it can exist onchain. A request whose id already holds a burn
-  never signs or burns again, and its `from` and amount (or `all`) must match
-  the recorded burn's, else `409`. A settled burn, or a pending one a node
-  already holds (mined or in its mempool), is answered before the gas check and
-  the locks, since nothing is sent: the recorded burn tx and the status its own
-  receipt proves. A pending burn no node holds (a restart before its broadcast,
-  or a drop) is sent again from its recorded bytes under the lock and the pause,
-  like a new burn, since sending spends the wallet's USDC. After every broadcast
-  attempt, accepted or not and on either path, the route reloads the operation,
-  which the supersede route may have settled meanwhile: a settled burn releases
-  its nonce again and reports its outcome, and a failed attempt also reports
-  what the burn's own receipt proves. A failed reload never drops the lock or
-  the pause. Under the lock the route looks the id up again, so two concurrent
-  requests with one id burn once, and the aggregate refuses a second `Prepare`
-  for an id. A failed record releases the signature's nonce when a reload shows
-  nothing recorded (`500`, nothing broadcast), adopts the burn another request
-  recorded, and keeps the nonce reserved when the reload fails too (`500`, rerun
-  only after a restart, since until then a rerun could sign behind the reserved
-  nonce). A failed broadcast of a recorded burn answers `502` only while its
-  receipt does not prove the outcome; a rerun with the same id broadcasts the
-  same bytes. A burn signed by another address than the source wallet (a rotated
-  key) is never broadcast or restored through this wallet, whose nonce
-  bookkeeping is per address. The response carries the operation id, the burn
-  tx, both chains, the raw amount and a `status`: `pending`, `confirmed`,
-  `reverted`, `superseded` or `replaced`. The detached task then awaits the
-  receipt, still holding the lock and the pause, until the burn has the source
-  chain's required confirmations or the wait gives up (up to 5 minutes for
-  inclusion plus 30 minutes for the confirmations), and records the outcome its
-  own canonical receipt proves at those confirmations: `Confirmed`, only with
-  the CCTP `MessageSent` event that `cctp complete-mint` needs (a successful
-  receipt without it pages and stays pending), or `Reverted` (which burned
-  nothing). A receipt timeout, a drop report, an RPC error or a shallower
-  receipt proves nothing, so the burn stays pending and a rerun with its id
-  reports it and broadcasts it again. Meanwhile every route that takes the
-  recovery lock answers `409`, and `cctp complete-mint` answers `502` until
-  Circle attests the burn and `409` once it has, since it fetches the
-  attestation before it tries the lock. The operator finishes with
-  `cctp complete-mint`. A reverted burn is final: a rerun with its id reports
-  `reverted` and burns nothing, and burning again takes a new id. A signed burn
-  is never resigned or fee bumped. At startup, next to the signed deposit sends
-  and before any startup approval or revoke, the bot records the outcome of
-  every pending burn whose receipt now decides, and reserves the nonce of every
-  other one signed by the source wallet and rebroadcasts its exact bytes (except
-  one the node shows mined, a shallow receipt or one without `MessageSent`,
-  which keeps the reservation only; one signed by another wallet is skipped and
-  gates its chain); a chain with such a burn not mined yet skips its startup
-  approvals and revokes, as for a deposit send. A pending burn that will not
-  mine at its fee keeps its nonce on the source wallet, and later sends from
-  that wallet queue behind it, until it mines or the operator cancels it with a
-  plain 0 value transfer to the wallet itself, with no calldata and a higher
-  fee, at the burn's nonce, then settles it with
-  `POST /liquidity-capital/cctp-burn-supersede` (`operationId`,
+  not yet read, a listing chain whose poll is missing since boot or older than
+  the inventory staleness bound (the trigger's own freshness gate), or a
+  transfer still in flight at any venue, a quantity above the listing's
+  operational limit, a mint that would take the broker below its floor (the
+  larger of the alpaca floor share and the hedge floor), a redemption above the
+  vault's available shares (counted in underlying through the chain's ratio), or
+  a value below the chain's minimum operation (or no price to value it); `409`
+  when its transfer guard is already claimed or a non terminal equity transfer
+  job row exists for it in either direction; and `409` when the Position refuses
+  the reservation, naming its reason (a pending or due hedge, another
+  reservation, a failed order anchor). After the reservation it checks the
+  divergence and the sizing rules again (the inventory can move while the guard
+  and the reservation are taken) and confirms the reservation (`409` when it was
+  invalidated), then enqueues the job under the reservation id; a refusal after
+  the reservation releases it, and a store, queue, or database failure is `500`.
+  On success the guard and the reservation stay held for the worker and the
+  chain's cooldown starts, as after the trigger's own dispatch. Everything after
+  the startup gate runs on a tracked detached task, so a dropped request cannot
+  release the guard and the reservation after the job is queued. `cctp-bridge`
+  only burns: it applies the same corridor gas check (`503`) as `transfer-usdc`,
+  since the burn and the mint that completes it spend both wallets' gas, then
+  holds the recovery lock and the driver pause around the burn like
+  `cctp complete-mint` does around the mint, and returns the burn tx as soon as
+  the burn is broadcast, not when it confirms: an approve plus the burn's
+  confirmations can outlast the 60 second load balancer cut, and a request that
+  timed out after the broadcast would leave the operator without the burn tx.
+  Every request carries the client's operation id (a UUID, which
+  `st0x-liquidity-client` generates per run and prints before sending), and an
+  id holds at most one burn: the `CctpBurnOperation` aggregate (ADR 0023). After
+  the lock, the pause and the amount, the route signs the burn without
+  broadcasting it, records the signed bytes under the id (`Prepared`), and only
+  then broadcasts them, so the burn is on record before it can exist onchain. A
+  request whose id already holds a burn never signs or burns again, and its
+  `from` and amount (or `all`) must match the recorded burn's, else `409`. A
+  settled burn, or a pending one a node already holds (mined or in its mempool),
+  is answered before the gas check and the locks, since nothing is sent: the
+  recorded burn tx and the status its own receipt proves. A pending burn no node
+  holds (a restart before its broadcast, or a drop) is sent again from its
+  recorded bytes under the lock and the pause, like a new burn, since sending
+  spends the wallet's USDC. After every broadcast attempt, accepted or not and
+  on either path, the route reloads the operation, which the supersede route may
+  have settled meanwhile: a settled burn releases its nonce again and reports
+  its outcome, and a failed attempt also reports what the burn's own receipt
+  proves. A failed reload never drops the lock or the pause. Under the lock the
+  route looks the id up again, so two concurrent requests with one id burn once,
+  and the aggregate refuses a second `Prepare` for an id. A failed record
+  releases the signature's nonce when a reload shows nothing recorded (`500`,
+  nothing broadcast), adopts the burn another request recorded, and keeps the
+  nonce reserved when the reload fails too (`500`, rerun only after a restart,
+  since until then a rerun could sign behind the reserved nonce). A failed
+  broadcast of a recorded burn answers `502` only while its receipt does not
+  prove the outcome; a rerun with the same id broadcasts the same bytes. A burn
+  signed by another address than the source wallet (a rotated key) is never
+  broadcast or restored through this wallet, whose nonce bookkeeping is per
+  address. The response carries the operation id, the burn tx, both chains, the
+  raw amount and a `status`: `pending`, `confirmed`, `reverted`, `superseded` or
+  `replaced`. The detached task then awaits the receipt, still holding the lock
+  and the pause, until the burn has the source chain's required confirmations or
+  the wait gives up (up to 5 minutes for inclusion plus 30 minutes for the
+  confirmations), and records the outcome its own canonical receipt proves at
+  those confirmations: `Confirmed`, only with the CCTP `MessageSent` event that
+  `cctp complete-mint` needs (a successful receipt without it pages and stays
+  pending), or `Reverted` (which burned nothing). A receipt timeout, a drop
+  report, an RPC error or a shallower receipt proves nothing, so the burn stays
+  pending and a rerun with its id reports it and broadcasts it again. Meanwhile
+  every route that takes the recovery lock answers `409`, and
+  `cctp complete-mint` answers `502` until Circle attests the burn and `409`
+  once it has, since it fetches the attestation before it tries the lock. The
+  operator finishes with `cctp complete-mint`. A reverted burn is final: a rerun
+  with its id reports `reverted` and burns nothing, and burning again takes a
+  new id. A signed burn is never resigned or fee bumped. At startup, next to the
+  signed deposit sends and before any startup approval or revoke, the bot
+  records the outcome of every pending burn whose receipt now decides, and
+  reserves the nonce of every other one signed by the source wallet and
+  rebroadcasts its exact bytes (except one the node shows mined, a shallow
+  receipt or one without `MessageSent`, which keeps the reservation only; one
+  signed by another wallet is skipped and gates its chain); a chain with such a
+  burn not mined yet skips its startup approvals and revokes, as for a deposit
+  send. A pending burn that will not mine at its fee keeps its nonce on the
+  source wallet, and later sends from that wallet queue behind it, until it
+  mines or the operator cancels it with a plain 0 value transfer to the wallet
+  itself, with no calldata and a higher fee, at the burn's nonce, then settles
+  it with `POST /liquidity-capital/cctp-burn-supersede` (`operationId`,
   `supersedingTx`). The named tx must be mined from the burn's signer at the
   burn's nonce with the source chain's required confirmations, and the burn
   itself unmined. The signer is read from the burn's signed bytes, so a burn

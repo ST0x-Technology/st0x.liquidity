@@ -398,10 +398,12 @@ chain's signing wallet cannot be shown to pay gas. It answers `422` when the
 chain's listing of the symbol is not `rebalancing = "enabled"` (the workers
 refuse a paused or disabled listing) or the token is not in the chain's token
 registry, and when the quantity breaks the rules the rebalancer sizes its own
-transfers by: a mint that would take the broker below its floor, a quantity
-above the listing's operational limit, a value below the chain's minimum
-operation (or no price to value it), or a venue not yet read or still holding a
-transfer in flight. The message names the limit. It answers `409` while another
+transfers by: a mint that would take the broker below its floor, a redemption
+above the vault's available shares, a quantity above the listing's operational
+limit, a value below the chain's minimum operation (or no price to value it), or
+a venue not yet read, not polled within the inventory staleness bound, or still
+holding a transfer in flight. These rules are checked again after the position
+reserves the shares. The message names the limit. It answers `409` while another
 verb holds the recovery lock, while the symbol is frozen for a dividend or
 issuance cannot confirm it is not, while a snapshot divergence for the symbol is
 engaged or its balance is restart tainted, while another equity transfer of the

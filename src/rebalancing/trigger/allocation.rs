@@ -475,6 +475,11 @@ pub(crate) enum ManualSizingRefusal {
          minted now"
     )]
     BelowBrokerFloor { mintable: FractionalShares },
+    #[error(
+        "the redemption is above the chain's vault: at most {redeemable} shares can be \
+         redeemed now"
+    )]
+    AboveVaultBalance { redeemable: FractionalShares },
     #[error("the symbol has no price to value the transfer against the minimum operation size")]
     PriceMissing,
     #[error(
@@ -485,10 +490,10 @@ pub(crate) enum ManualSizingRefusal {
 
 /// Checks an operator sized `quantity` against the planner's own sizing
 /// rules for `chain`: every venue read with nothing in flight, the listing's
-/// operational limit, the broker floors for a mint, and the minimum
-/// operation value. `None` when the quantity passes. The operator picks the
-/// chain, the direction and the quantity, so the band, the ranking and the
-/// cooldown do not apply.
+/// operational limit, the broker floors for a mint, the vault's available
+/// shares for a redemption, and the minimum operation value. `None` when the
+/// quantity passes. The operator picks the chain, the direction and the
+/// quantity, so the band, the ranking and the cooldown do not apply.
 pub(crate) fn check_manual_operation(
     input: &EquityPlanInput,
     chain: Chain,
@@ -516,11 +521,22 @@ pub(crate) fn check_manual_operation(
         }));
     }
 
-    if direction == PlannedDirection::Mint {
-        let (_, total) = underlying_and_total(input, offchain)?;
-        let mintable = mintable_above_floors(input, offchain, total)?;
-        if quantity.inner().gt(mintable.inner())? {
-            return Ok(Some(ManualSizingRefusal::BelowBrokerFloor { mintable }));
+    match direction {
+        PlannedDirection::Mint => {
+            let (_, total) = underlying_and_total(input, offchain)?;
+            let mintable = mintable_above_floors(input, offchain, total)?;
+            if quantity.inner().gt(mintable.inner())? {
+                return Ok(Some(ManualSizingRefusal::BelowBrokerFloor { mintable }));
+            }
+        }
+        PlannedDirection::Redemption => {
+            // The vault holds wrapped shares and the quantity is underlying.
+            let redeemable = slot
+                .ratio
+                .to_underlying_fractional(slot.balance.available())?;
+            if quantity.inner().gt(redeemable.inner())? {
+                return Ok(Some(ManualSizingRefusal::AboveVaultBalance { redeemable }));
+            }
         }
     }
 
@@ -2156,6 +2172,51 @@ mod tests {
         assert_eq!(
             check_manual(&input, PlannedDirection::Redemption, "6"),
             None
+        );
+    }
+
+    /// A redemption may only take the vault's available shares, counted in
+    /// underlying through the chain's ratio; the vault never refuses a mint.
+    #[test]
+    fn check_manual_operation_refuses_a_redemption_above_the_vault_balance() {
+        let ratio = UnderlyingPerWrapped::new(U256::from(1_500_000_000_000_000_000u64)).unwrap();
+        let input = input(
+            Some(balance("50")),
+            BTreeMap::from([(
+                Chain::Base,
+                ChainSlot {
+                    ratio,
+                    ..slot("4", "0.5")
+                },
+            )]),
+        );
+
+        assert_eq!(
+            check_manual(&input, PlannedDirection::Redemption, "6"),
+            None
+        );
+        assert_eq!(
+            check_manual(&input, PlannedDirection::Redemption, "6.5"),
+            Some(ManualSizingRefusal::AboveVaultBalance {
+                redeemable: shares("6")
+            })
+        );
+        assert_eq!(check_manual(&input, PlannedDirection::Mint, "7"), None);
+    }
+
+    /// An empty vault has nothing to redeem, however small the quantity.
+    #[test]
+    fn check_manual_operation_refuses_any_redemption_from_an_empty_vault() {
+        let input = input(
+            Some(balance("50")),
+            BTreeMap::from([(Chain::Base, slot("0", "0.5"))]),
+        );
+
+        assert_eq!(
+            check_manual(&input, PlannedDirection::Redemption, "1"),
+            Some(ManualSizingRefusal::AboveVaultBalance {
+                redeemable: shares("0")
+            })
         );
     }
 
