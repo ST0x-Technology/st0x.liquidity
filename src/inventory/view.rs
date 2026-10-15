@@ -8972,15 +8972,15 @@ mod tests {
     /// misattributed.
     #[test]
     fn legacy_and_unknown_portfolio_location_labels_are_rejected() {
-        for legacy in [
+        for label in [
             "hedging",
             "ethereum_wallet:ethereum",
             "base_wallet_unwrapped:base",
             "base_wallet_wrapped:base",
             "wallet_unwrapped:solana",
         ] {
-            let error = legacy.parse::<PortfolioLocation>().unwrap_err();
-            assert_eq!(error.value, legacy);
+            let error = label.parse::<PortfolioLocation>().unwrap_err();
+            assert_eq!(error.value, label);
         }
     }
 

@@ -2198,8 +2198,10 @@ guarantees such a balance is never multiplied by a price.
 
 The remedy for a day excluded this way is to reconcile the holding, not to
 supply a mark: a historical-mark repair prices every row of the symbol, so it is
-refused while any wrapped-location row survives, which would otherwise be valued
-as underlying shares. USDC rows always pass through.
+refused while a market-making or wrapped-wallet row survives on a chain whose
+table does not list the symbol, which would otherwise be valued as underlying
+shares. Wrapped wallet shares are judged per chain, like market-making rows.
+USDC rows always pass through.
 
 **Poll-driven freshness gate**: an additional, independent freshness check now
 closes the gap presence alone leaves open. An ephemeral `PollFreshness` tracker

@@ -1022,8 +1022,8 @@ fn capped_retry_backoff(boundary: Option<DateTime<Utc>>, now: DateTime<Utc>) -> 
 /// underlying mark.
 ///
 /// Wrapped wallet shares are judged against the same per-chain set, since
-/// their ratio is that chain's vault's too; the historical-mark repair reads
-/// that set to refuse pricing an unconverted row. Unwrapped wallet tokens
+/// their ratio is that chain's vault's too; the historical-mark repair derives
+/// the same set to refuse pricing an unconverted row. Unwrapped wallet tokens
 /// and the broker book need no ratio, and a symbol any hedged chain trades is
 /// hedged, so those rows are judged against the union.
 struct ConfiguredEquities<'ctx> {
@@ -4090,9 +4090,12 @@ mod tests {
     }
 
     /// Captures a day on which Robinhood's bot wallet holds 3 unwrapped and 2
-    /// wrapped AAPL, with Robinhood's vault at a 1.5 ratio, and returns the
-    /// persisted AAPL wallet rows as `(location, inflight_balance)`.
-    async fn capture_robinhood_wallet_rows(robinhood_lists_aapl: bool) -> Vec<(String, String)> {
+    /// wrapped AAPL, with Robinhood's vault at a 1.5 ratio and AAPL last
+    /// filled at $150, and returns the persisted AAPL wallet rows as
+    /// `(location, inflight_balance, usd_mark)`.
+    async fn capture_robinhood_wallet_rows(
+        robinhood_lists_aapl: bool,
+    ) -> Vec<(String, String, Option<String>)> {
         let (pool, apalis_pool) = setup_test_pools().await;
         let now = Utc::now();
 
@@ -4125,7 +4128,7 @@ mod tests {
             );
 
         let robinhood_ratio = U256::from(1_500_000_000_000_000_000u64);
-        let (mut ctx, _position) = build_ctx(
+        let (mut ctx, position) = build_ctx(
             pool.clone(),
             apalis_pool,
             view,
@@ -4153,6 +4156,27 @@ mod tests {
                 },
             );
         }
+        position
+            .send(
+                &aapl(),
+                PositionCommand::AcknowledgeOnChainFillAt {
+                    symbol: aapl(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::ZERO,
+                        log_index: 0,
+                    },
+                    amount: FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: now,
+                    block_number: None,
+                    seen_at: now,
+                },
+            )
+            .await
+            .unwrap();
         mark_all_required_fresh(&ctx);
 
         job_for_today()
@@ -4161,7 +4185,7 @@ mod tests {
             .unwrap();
 
         sqlx::query_as(
-            "SELECT location, inflight_balance FROM portfolio_snapshot \
+            "SELECT location, inflight_balance, usd_mark FROM portfolio_snapshot \
              WHERE et_day = ? AND asset = 'AAPL' AND location LIKE 'wallet_%' \
              ORDER BY location",
         )
@@ -4179,8 +4203,16 @@ mod tests {
         assert_eq!(
             capture_robinhood_wallet_rows(true).await,
             vec![
-                ("wallet_unwrapped:robinhood".to_string(), "3".to_string()),
-                ("wallet_wrapped:robinhood".to_string(), "3".to_string()),
+                (
+                    "wallet_unwrapped:robinhood".to_string(),
+                    "3".to_string(),
+                    Some("150".to_string())
+                ),
+                (
+                    "wallet_wrapped:robinhood".to_string(),
+                    "3".to_string(),
+                    Some("150".to_string())
+                ),
             ],
             "3 unwrapped tokens as-is, 2 wrapped shares * Robinhood's own 1.5 ratio"
         );
@@ -4194,8 +4226,16 @@ mod tests {
         assert_eq!(
             capture_robinhood_wallet_rows(false).await,
             vec![
-                ("wallet_unwrapped:robinhood".to_string(), "3".to_string()),
-                ("wallet_wrapped:robinhood".to_string(), "2".to_string()),
+                (
+                    "wallet_unwrapped:robinhood".to_string(),
+                    "3".to_string(),
+                    Some("150".to_string())
+                ),
+                (
+                    "wallet_wrapped:robinhood".to_string(),
+                    "2".to_string(),
+                    None
+                ),
             ],
         );
     }

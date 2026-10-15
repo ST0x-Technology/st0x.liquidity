@@ -5,6 +5,9 @@
 //! implementation modules themselves private.
 
 use chrono::{DateTime, NaiveDate, Utc};
+use std::collections::BTreeSet;
+
+use st0x_evm::Chain;
 use st0x_execution::{ExecutorOrderId, FractionalShares, Symbol};
 
 use crate::offchain::order::OffchainOrderId;
@@ -26,15 +29,17 @@ pub enum RejectionReason {
         boundary: DateTime<Utc>,
     },
     #[error(
-        "{symbol} has no [chains.<name>.trading.assets.equities] entry on the chain of its \
-         {unconverted} wrapped-location row(s) on {day}, so they hold vault shares, not \
-         underlying shares. A mark would price them as underlying and misstate the day's \
-         capital. Reconcile the holding instead, or restore the config entry so the capture \
-         can resolve a vault ratio."
+        "{unconverted} wrapped-location row(s) of {symbol} on {day} sit on chains \
+         {chains:?} whose [chains.<name>.trading.assets.equities] table does not list {symbol} \
+         with trading or rebalancing enabled, so they hold vault shares, not underlying \
+         shares. A mark would price them as underlying and misstate the day's capital. \
+         Reconcile the holding instead, or enable the listing so the capture can resolve a \
+         vault ratio."
     )]
     UnconvertedWrappedEquityRows {
         symbol: Symbol,
         unconverted: i64,
+        chains: BTreeSet<Chain>,
         day: NaiveDate,
     },
     #[error(
@@ -711,6 +716,7 @@ pub mod portfolio_snapshot {
     use sqlx::SqlitePool;
     use st0x_config::Ctx;
     use st0x_event_sorcery::{RetryOnBusy, StoreBuilder, load_entity};
+    use st0x_evm::Chain;
     use st0x_execution::Symbol;
     use st0x_finance::Positive;
     use st0x_float_serde::format_float;
@@ -753,9 +759,9 @@ pub mod portfolio_snapshot {
     /// Sets the audited historical closing-price mark for one captured ET day.
     ///
     /// Shared by the operator CLI and the ops API. Rejects an `observed_at` at
-    /// or after the day's 00:05 ET capture boundary, and refuses an
-    /// unconfigured symbol that still holds unconverted wrapped-equity rows (a
-    /// mark would price vault shares as underlying and misstate the day). On
+    /// or after the day's 00:05 ET capture boundary, and refuses a symbol with a
+    /// market-making or wrapped-wallet row on a chain whose table does not list
+    /// it (a mark would price vault shares as underlying and misstate the day). On
     /// success the read model is verified to have updated every captured row.
     pub async fn set_equity_mark(
         pool: &SqlitePool,
@@ -815,23 +821,22 @@ pub mod portfolio_snapshot {
             .map(|location| location.parse::<PortfolioLocation>())
             .collect::<Result<Vec<_>, _>>()
             .context("failed to parse a persisted portfolio snapshot location")?;
-        let unconverted = i64::try_from(
-            locations
-                .iter()
-                .filter_map(|location| location.wrapped_equity_chain())
-                .filter(|chain| {
-                    !ctx.chains
-                        .hedged_chain(*chain)
-                        .is_some_and(|hedged| chain_equity_symbols(&hedged.assets).contains(symbol))
-                })
-                .count(),
-        )
-        .context("unconverted wrapped-equity row count exceeds i64")?;
+        let unconverted_chains: Vec<Chain> = locations
+            .iter()
+            .filter_map(|location| location.wrapped_equity_chain())
+            .filter(|chain| {
+                !ctx.chains
+                    .hedged_chain(*chain)
+                    .is_some_and(|hedged| chain_equity_symbols(&hedged.assets).contains(symbol))
+            })
+            .collect();
 
-        if unconverted > 0 {
+        if !unconverted_chains.is_empty() {
             return Err(RejectionReason::UnconvertedWrappedEquityRows {
                 symbol: symbol.clone(),
-                unconverted,
+                unconverted: i64::try_from(unconverted_chains.len())
+                    .context("unconverted wrapped-equity row count exceeds i64")?,
+                chains: unconverted_chains.into_iter().collect(),
                 day,
             }
             .into());

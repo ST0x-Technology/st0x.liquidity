@@ -709,22 +709,23 @@ mod tests {
     const ZERO: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
 
     /// One location as persisted before the per-chain migration: its
-    /// read-model label and serde shape, the asset it is seeded with, and the
-    /// location it must become.
+    /// read-model label and serde shape, the asset it is seeded with in both
+    /// forms, and the location it must become.
     struct LegacyLocation {
         label: &'static str,
         payload: serde_json::Value,
-        asset: PortfolioAsset,
+        asset_label: &'static str,
+        asset_payload: serde_json::Value,
         migrated: PortfolioLocation,
     }
 
     fn legacy_locations() -> Vec<LegacyLocation> {
-        let aapl = || PortfolioAsset::Equity(Symbol::new("AAPL").unwrap());
         let onchain = |chain, form| PortfolioLocation::Onchain { chain, form };
         let market_making = |chain: &'static str, label, chain_variant| LegacyLocation {
             label,
             payload: json!({"MarketMaking": chain}),
-            asset: aapl(),
+            asset_label: "AAPL",
+            asset_payload: json!({"Equity": "AAPL"}),
             migrated: onchain(chain_variant, OnchainForm::MarketMaking),
         };
 
@@ -736,31 +737,36 @@ mod tests {
             LegacyLocation {
                 label: "hedging",
                 payload: json!("Hedging"),
-                asset: aapl(),
+                asset_label: "AAPL",
+                asset_payload: json!({"Equity": "AAPL"}),
                 migrated: PortfolioLocation::Offchain,
             },
             LegacyLocation {
                 label: "ethereum_wallet:ethereum",
                 payload: json!("EthereumWallet"),
-                asset: PortfolioAsset::Usdc,
+                asset_label: "USDC",
+                asset_payload: json!("Usdc"),
                 migrated: onchain(Chain::Ethereum, OnchainForm::WalletUnwrapped),
             },
             LegacyLocation {
                 label: "base_wallet_unwrapped:base",
                 payload: json!("BaseWalletUnwrapped"),
-                asset: PortfolioAsset::Usdc,
+                asset_label: "USDC",
+                asset_payload: json!("Usdc"),
                 migrated: onchain(Chain::Base, OnchainForm::WalletUnwrapped),
             },
             LegacyLocation {
                 label: "base_wallet_unwrapped:base",
                 payload: json!("BaseWalletUnwrapped"),
-                asset: aapl(),
+                asset_label: "AAPL",
+                asset_payload: json!({"Equity": "AAPL"}),
                 migrated: onchain(Chain::Base, OnchainForm::WalletUnwrapped),
             },
             LegacyLocation {
                 label: "base_wallet_wrapped:base",
                 payload: json!("BaseWalletWrapped"),
-                asset: aapl(),
+                asset_label: "AAPL",
+                asset_payload: json!({"Equity": "AAPL"}),
                 migrated: onchain(Chain::Base, OnchainForm::WalletWrapped),
             },
         ]
@@ -783,7 +789,7 @@ mod tests {
                   '2026-09-01T04:00:00+00:00')",
             )
             .bind(location.label)
-            .bind(location.asset.to_string())
+            .bind(location.asset_label)
             .execute(&pool)
             .await
             .unwrap();
@@ -794,7 +800,7 @@ mod tests {
             .map(|location| {
                 json!({
                     "location": location.payload,
-                    "asset": location.asset,
+                    "asset": location.asset_payload,
                     "available": ZERO,
                     "inflight": ZERO,
                     "usd_mark": null,
@@ -836,7 +842,7 @@ mod tests {
             .map(|location| {
                 (
                     location.migrated.to_string(),
-                    location.asset.to_string(),
+                    location.asset_label.to_string(),
                     "7".to_string(),
                 )
             })
