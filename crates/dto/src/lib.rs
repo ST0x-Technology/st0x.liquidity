@@ -65,10 +65,13 @@ pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
     EquityPriceStatus::export_all_to(out_dir)?;
     SymbolInventory::export_all_to(out_dir)?;
     InFlightEquity::export_all_to(out_dir)?;
+    ChainEquityInventory::export_all_to(out_dir)?;
+    RebalancingBand::export_all_to(out_dir)?;
     Inventory::export_all_to(out_dir)?;
     InventorySnapshot::export_all_to(out_dir)?;
     UsdcInventory::export_all_to(out_dir)?;
     InFlightCash::export_all_to(out_dir)?;
+    ChainUsdcInventory::export_all_to(out_dir)?;
     TransferOperation::export_all_to(out_dir)?;
     EquityMintOperation::export_all_to(out_dir)?;
     EquityMintStatus::export_all_to(out_dir)?;

@@ -27,7 +27,8 @@
         "inflightEquity": {
           "baseWalletUnwrapped": "0",
           "baseWalletWrapped": "0"
-        }
+        },
+        "chains": []
       },
       {
         "symbol": "tAAPL",
@@ -38,7 +39,24 @@
         "inflightEquity": {
           "baseWalletUnwrapped": "3",
           "baseWalletWrapped": "1.25"
-        }
+        },
+        "chains": [
+          {
+            "chain": "base",
+            "available": "12.5",
+            "inflight": "2",
+            "band": {
+              "target": "0.4",
+              "deviation": "0.1"
+            }
+          },
+          {
+            "chain": "robinhood",
+            "available": "6",
+            "inflight": "0",
+            "band": null
+          }
+        ]
       },
       {
         "symbol": "wtTSLA",
@@ -49,7 +67,8 @@
         "inflightEquity": {
           "baseWalletUnwrapped": "0",
           "baseWalletWrapped": "0"
-        }
+        },
+        "chains": []
       }
     ],
     "usdc": {
@@ -64,7 +83,26 @@
       "inflightCash": {
         "ethereumWallet": "3",
         "baseWallet": null
-      }
+      },
+      "chains": [
+        {
+          "chain": "base",
+          "symbol": "USDC",
+          "available": "2500.5",
+          "inflight": "100",
+          "band": {
+            "target": "0.4",
+            "deviation": "0.1"
+          }
+        },
+        {
+          "chain": "robinhood",
+          "symbol": "USDG",
+          "available": "700",
+          "inflight": "0",
+          "band": null
+        }
+      ]
     }
   },
   "positions": [

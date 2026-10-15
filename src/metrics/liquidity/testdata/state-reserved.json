@@ -27,7 +27,8 @@
         "inflightEquity": {
           "baseWalletUnwrapped": "0",
           "baseWalletWrapped": "0"
-        }
+        },
+        "chains": []
       }
     ],
     "usdc": {
@@ -42,7 +43,8 @@
       "inflightCash": {
         "ethereumWallet": null,
         "baseWallet": null
-      }
+      },
+      "chains": []
     }
   },
   "positions": [],

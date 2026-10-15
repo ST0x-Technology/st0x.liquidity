@@ -9255,6 +9255,25 @@ Message types (`ServerMessage`, `InitialState`, etc.) are defined in the
 `st0x-dto` crate (`crates/dto/src/lib.rs`) and auto-generated as TypeScript
 types via `ts-rs`. The DTO crate is the source of truth for all wire formats.
 
+##### Inventory per chain
+
+The inventory payload (the `current_state` seed and every `inventory_snapshot`)
+keeps its flat `onchain*` figures for the primary chain's vault, as the
+t0.devops liquidity exporter reads them. Beside them, each symbol and the cash
+row carry `chains`: one entry per hedged chain whose vault a snapshot has read,
+the same chains as the `liq_equity_chain_*` and `liq_usdc_chain_*` series. An
+equity entry is in that chain's wrapped vault shares, so entries never sum
+across chains; a cash entry names its chain's settlement stable. Each entry's
+`band` holds a target and a deviation as decimal strings. For an equity they are
+the listing's Target Share on that chain and the Deviation Band; an enabled or
+paused listing has one, a disabled listing none. The planner measures an
+equity's share in underlying shares, through each chain's wrapper ratio, and the
+payload carries no ratio, so the band cannot be checked against `available`. For
+cash they are the chain's corridor threshold: the target for the vault's share
+of itself plus the broker's gross cash, and its deviation. A chain whose cash
+asset rebalances has it, whatever the USDC mode; any other chain has none. The
+`settings` band fields keep their meaning.
+
 ##### TanStack Query Integration
 
 WebSocket messages populate the TanStack Query cache. Each `ServerMessage`

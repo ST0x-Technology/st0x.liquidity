@@ -373,6 +373,13 @@ planner acts, as a fraction of the total: a chain is a candidate only when
 `|actual - target| > band`. Configured as `[rebalancing.allocation].deviation`.
 The type is `DeviationBand`.
 
+### Rebalancing Band
+
+A target share together with the deviation band around it: the range one chain's
+vault is held to for an equity, or a cash corridor's target and deviation. The
+dashboard inventory carries at most one per chain entry. The DTO type is
+`RebalancingBand`.
+
 ### Minimum Operation Size
 
 The smallest equity transfer worth its gas, in dollars, valued at the last

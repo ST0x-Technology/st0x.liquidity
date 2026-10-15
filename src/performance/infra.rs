@@ -14,12 +14,12 @@ use tracing::warn;
 
 use st0x_config::{ChainRegistry, HedgedChain};
 use st0x_dto::{
-    BlockLagPoint, ChainBlockLag, ChainName, ChainPollHealth, DependencyBucket, DependencyName,
+    BlockLagPoint, ChainBlockLag, ChainPollHealth, DependencyBucket, DependencyName,
     DependencyStats, MonitorTelemetry,
 };
-use st0x_evm::Chain;
 
 use super::{PerformanceError, ReportRange, latency_stats};
+use crate::dashboard::chain_name;
 use crate::telemetry::{Monitor, PollOutcome, sqlite_timestamp};
 
 /// Load the monitors' ingestion-health telemetry for `range`: one block-lag
@@ -65,17 +65,6 @@ async fn chain_block_lag(
         current_lag_sampled_at,
         points,
     })
-}
-
-/// The dashboard's chain discriminator for a chain the bot operates on.
-/// Exhaustive so a chain added to `Chain` cannot reach the report unnamed.
-fn chain_name(chain: Chain) -> ChainName {
-    match chain {
-        Chain::Base => ChainName::Base,
-        Chain::Ethereum => ChainName::Ethereum,
-        Chain::HyperEvm => ChainName::HyperEvm,
-        Chain::Robinhood => ChainName::Robinhood,
-    }
 }
 
 async fn current_lag(
@@ -384,21 +373,6 @@ mod tests {
 
     fn timestamp(seconds: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(1_750_000_000 + seconds, 0).unwrap()
-    }
-
-    /// The dashboard's chain discriminator serializes to the wire name
-    /// `st0x_evm::Chain` pins, for every chain the bot can watch. It lives
-    /// here because the dto crate cannot see `Chain`: the two spellings are
-    /// separately pinned literals, so nothing else catches them drifting.
-    #[test]
-    fn chain_name_wire_names_match_the_evm_chain_names() {
-        for chain in Chain::ALL {
-            assert_eq!(
-                serde_json::to_value(chain_name(chain)).unwrap(),
-                serde_json::json!(chain.as_str()),
-                "{chain:?} must reach the dashboard under its pinned wire name"
-            );
-        }
     }
 
     /// Orderbook all test samples are recorded against.
