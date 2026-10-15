@@ -603,6 +603,31 @@ where
             Ok(inventory.set_polled_venue(venue, chain, balance))
         })
     }
+
+    /// Like [`Self::force_on_snapshot`], but keeps the target slot's
+    /// inflight. For a recovery write whose inflight an active aggregate
+    /// still owns and will settle itself.
+    fn force_on_snapshot_keeping_inflight<E: std::fmt::Debug + Send + 'static>(
+        venue: Venue,
+        snapshot_balance: T,
+        recovering_from: E,
+    ) -> Box<dyn FnOnce(Self, Chain) -> Result<Self, InventoryError<T>> + Send> {
+        Box::new(move |inventory, chain| {
+            let balance = inventory.get_venue(venue, chain).unwrap_or_default();
+            warn!(
+                target: "inventory",
+                ?recovering_from,
+                inflight = ?balance.inflight(),
+                "Force-applying snapshot to recover from error, keeping inflight"
+            );
+
+            Ok(inventory.set_polled_venue(
+                venue,
+                chain,
+                balance.apply_snapshot_keeping_inflight(snapshot_balance),
+            ))
+        })
+    }
 }
 
 /// Locations where USDC may sit in transit between venues.
@@ -4520,41 +4545,20 @@ impl InventoryView {
                     return Ok(view);
                 }
 
-                let mint_inflight = view
-                    .active_mint(symbol)
-                    .and_then(|_| view.equity_inflight(symbol, Venue::Hedging));
-                if let Some(inflight) = mint_inflight
-                    && !inflight.is_zero()?
-                {
-                    debug!(
-                        target: "inventory",
-                        %symbol,
-                        ?inflight,
-                        "Forced offchain equity snapshot keeps the active mint's \
-                         Hedging inflight"
-                    );
-                }
-
                 let primary_chain = view.primary_chain;
                 let reason = Arc::clone(reason);
-                view.update_equity(
-                    symbol,
-                    move |inventory, chain| {
-                        let forced = Inventory::force_on_snapshot(
-                            Venue::Hedging,
-                            *snapshot_balance,
-                            reason,
-                        )(inventory, chain)?;
-                        match mint_inflight {
-                            Some(inflight) => {
-                                Inventory::set_inflight(Venue::Hedging, inflight)(forced, chain)
-                            }
-                            None => Ok(forced),
-                        }
-                    },
-                    now,
-                )
-                .map(|view| view.reset_equity_snapshot_skip(symbol, Venue::Hedging, primary_chain))
+                let force = if view.active_mint(symbol).is_some() {
+                    Inventory::force_on_snapshot_keeping_inflight(
+                        Venue::Hedging,
+                        *snapshot_balance,
+                        reason,
+                    )
+                } else {
+                    Inventory::force_on_snapshot(Venue::Hedging, *snapshot_balance, reason)
+                };
+                view.update_equity(symbol, force, now).map(|view| {
+                    view.reset_equity_snapshot_skip(symbol, Venue::Hedging, primary_chain)
+                })
             })
             .map(|view| {
                 let applied: Vec<&Symbol> = positions
