@@ -10263,8 +10263,8 @@ mod tests {
     }
 
     /// Robinhood's equities as the shipped configs list them, by symbol:
-    /// the two launch equities everywhere, plus PLBY, GRND, SNES, and WMT in
-    /// prod.
+    /// the two launch equities everywhere, plus PLBY, GRND, SNES, WMT, HOOD,
+    /// and DIS in prod.
     fn robinhood_equities(with_prod_only: bool) -> BTreeMap<Symbol, (Address, Address)> {
         let launch_equities = [
             (
@@ -10309,6 +10309,20 @@ mod tests {
                 (
                     address!("0xfAE9AfE275E57759f8Fbae5f252c65aDBF1b773F"),
                     address!("0x23A0944e82766242dA76cb0f77e0b7812e5487EA"),
+                ),
+            ),
+            (
+                Symbol::new("HOOD").unwrap(),
+                (
+                    address!("0x50DE74136b67911799fc39B726bFC2707cCec769"),
+                    address!("0xca678d0d69F9E815d1A4f4dF05C904b2DDE017f8"),
+                ),
+            ),
+            (
+                Symbol::new("DIS").unwrap(),
+                (
+                    address!("0xd78025Aa344E549A1D76eCE1591c481cC7Bc3548"),
+                    address!("0x81f40cbCFAE7A1aD1f4474eD95A210DfA3B90B0f"),
                 ),
             ),
         ];
@@ -10428,10 +10442,10 @@ mod tests {
         );
     }
 
-    /// Prod runs Robinhood as an active secondary that rebalances DNUT, PLBY,
-    /// GRND, and WMT against Alpaca, each with its own target share and
+    /// Prod runs Robinhood as an active secondary that rebalances every listed
+    /// equity against Alpaca, each with its own target share and
     /// per-operation limit, and sends redemptions to the issuer wallet
-    /// st0x.issuance signs with on every chain. FGI and SNES only hedge.
+    /// st0x.issuance signs with on every chain.
     #[test]
     fn shipped_prod_config_rebalances_the_robinhood_set() {
         let (robinhood, mut chains) = shipped_robinhood(
@@ -10455,13 +10469,17 @@ mod tests {
 
         // (symbol, Robinhood target_share, operational_limit, Base target_share).
         // A symbol listed on Base sets its Base target to 0.4, so both upper
-        // bands (0.45 + 0.45) leave the broker its 0.1 floor. WMT has no Base
-        // listing, so Robinhood and the broker split it alone.
+        // bands (0.45 + 0.45) leave the broker its 0.1 floor. WMT, SNES, and
+        // DIS have no Base listing, so Robinhood and the broker split them alone.
         let rebalanced = [
             ("DNUT", float!(0.4), float!(25), Some(float!(0.4))),
             ("PLBY", float!(0.4), float!(4000), Some(float!(0.4))),
             ("GRND", float!(0.4), float!(300), Some(float!(0.4))),
+            ("FGI", float!(0.4), float!(300), Some(float!(0.4))),
+            ("HOOD", float!(0.4), float!(45), Some(float!(0.4))),
             ("WMT", float!(0.5), float!(50), None),
+            ("SNES", float!(0.5), float!(3000), None),
+            ("DIS", float!(0.5), float!(50), None),
         ];
         let rebalanced_symbols: BTreeSet<Symbol> = rebalanced
             .iter()

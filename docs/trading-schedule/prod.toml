@@ -70,6 +70,7 @@ assets = [
   "TR",
   "WEN",
   "WMT",
+  "DIS",
 ]
 
 [[pricing.trading_schedule.scopes]]

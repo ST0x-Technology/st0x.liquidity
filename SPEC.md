@@ -303,16 +303,17 @@ orderbook are ingested, validated against USDG and hedged, and Bebop's Robinhood
 hook is mapped as the inventory adapter, so its fills are attributed to Bebop.
 The production configuration runs it as an `active` secondary with the issuer's
 `redemption_wallet`, and rebalances against Alpaca the listings the pinned token
-file enables there (DNUT, PLBY, GRND, and WMT); every other listing keeps
-`rebalancing = "disabled"`. Staging watches the same inventory and runs it as a
-prefunded hedge-only secondary: every listing trades, and none rebalances. Its
-settlement stable is USDG at `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168` (6
-decimals), so it is the first chain whose stable CCTP cannot carry. It pays gas
-in ETH, so the Base Chainlink ETH/USD read values its gas and `active` is
-reachable. Rebalancing an equity there needs `active`. It has no CCTP domain, so
-it cannot be the primary chain, and its cash rebalances over the Relay hop only.
-Base's `safe` cutoff is OP-Stack-only: a Robinhood trading table must use the
-`confirmations` cutoff with a depth covering parent-chain finality.
+file enables there (DNUT, PLBY, GRND, FGI, HOOD, WMT, SNES, and DIS); every
+other listing keeps `rebalancing = "disabled"`. Staging watches the same
+inventory and runs it as a prefunded hedge-only secondary: every listing trades,
+and none rebalances. Its settlement stable is USDG at
+`0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168` (6 decimals), so it is the first
+chain whose stable CCTP cannot carry. It pays gas in ETH, so the Base Chainlink
+ETH/USD read values its gas and `active` is reachable. Rebalancing an equity
+there needs `active`. It has no CCTP domain, so it cannot be the primary chain,
+and its cash rebalances over the Relay hop only. Base's `safe` cutoff is
+OP-Stack-only: a Robinhood trading table must use the `confirmations` cutoff
+with a depth covering parent-chain finality.
 
 The tokenization services are built per hedged chain, never once for Base, on
 the chain's own signing wallet. The primary, and every secondary with at least
