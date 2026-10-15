@@ -12587,6 +12587,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn late_failure_after_recheck_of_started_mint_does_not_credit_available() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mint_id = issuer_request_id("mint-late-failure-started-wiped");
+        let trigger = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(0), shares(100)),
+            &symbol,
+        )
+        .await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        for event in [
+            make_mint_requested(&symbol, float!(10)),
+            make_mint_accepted(),
+        ] {
+            harness
+                .receive::<TokenizedEquityMint>(mint_id.clone(), event)
+                .await
+                .unwrap();
+        }
+
+        // Snapshot-error recovery drops the started mint's inflight while its
+        // tracking stays `Started`, and re-bases available to the broker.
+        trigger
+            .on_snapshot_recovery(
+                RebalancingServiceError::Inventory(InventoryViewError::Equity(
+                    InventoryError::InsufficientAvailable {
+                        requested: shares(1),
+                        available: shares(0),
+                    },
+                )),
+                InventorySnapshotEvent::OffchainEquity {
+                    positions: BTreeMap::from([(symbol.clone(), shares(90))]),
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let failed = TokenizedEquityMint::Failed {
+            chain: Chain::Base,
+            symbol: symbol.clone(),
+            quantity: float!(10),
+            reason: "rejected".to_string(),
+            requested_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+
+        // MintAcceptanceFailed is committed, but its reactor runs only after
+        // the recheck rebuild re-set the in-flight without a debit.
+        trigger
+            .rebuild_mint_tracking_for_recovery(&mint_id, &failed, tokenization_request_id("TOK-1"))
+            .await
+            .unwrap()
+            .expect_claimed();
+        trigger
+            .on_mint(mint_id, make_mint_acceptance_failed())
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::Hedging),
+            Some(shares(90)),
+            "the failure must not credit an in-flight the rebuild re-set without a debit"
+        );
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(0))
+        );
+        drop(inventory);
+    }
+
+    #[tokio::test]
     async fn redemption_recovery_waits_for_inflight_failure_reactor() {
         let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
