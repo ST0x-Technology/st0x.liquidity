@@ -218,7 +218,7 @@ mod tests {
     use st0x_float_macro::float;
 
     use super::*;
-    use crate::inventory::{PortfolioAsset, PortfolioBalanceRow, PortfolioLocation};
+    use crate::inventory::{OnchainForm, PortfolioAsset, PortfolioBalanceRow, PortfolioLocation};
     use crate::portfolio_snapshot::{PortfolioBalanceRowWithMark, PortfolioSnapshotId};
     use crate::test_utils::{
         replay_after_competing_writer, setup_file_backed_test_db, setup_test_db,
@@ -279,8 +279,15 @@ mod tests {
                 PortfolioSnapshotEvent::Captured {
                     captured_at: captured_at(),
                     rows: vec![
-                        row(PortfolioLocation::MarketMaking(Chain::Base), 100, Some(1)),
-                        row(PortfolioLocation::Hedging, 200, Some(1)),
+                        row(
+                            PortfolioLocation::Onchain {
+                                chain: Chain::Base,
+                                form: OnchainForm::MarketMaking,
+                            },
+                            100,
+                            Some(1),
+                        ),
+                        row(PortfolioLocation::Offchain, 200, Some(1)),
                     ],
                 },
             )
@@ -301,7 +308,14 @@ mod tests {
                 id,
                 PortfolioSnapshotEvent::Captured {
                     captured_at: captured_at(),
-                    rows: vec![row(PortfolioLocation::MarketMaking(Chain::Base), 100, None)],
+                    rows: vec![row(
+                        PortfolioLocation::Onchain {
+                            chain: Chain::Base,
+                            form: OnchainForm::MarketMaking,
+                        },
+                        100,
+                        None,
+                    )],
                 },
             )
             .await
@@ -326,8 +340,15 @@ mod tests {
         let event = PortfolioSnapshotEvent::Captured {
             captured_at: captured_at(),
             rows: vec![
-                row(PortfolioLocation::MarketMaking(Chain::Base), 100, Some(1)),
-                row(PortfolioLocation::Hedging, 200, Some(1)),
+                row(
+                    PortfolioLocation::Onchain {
+                        chain: Chain::Base,
+                        form: OnchainForm::MarketMaking,
+                    },
+                    100,
+                    Some(1),
+                ),
+                row(PortfolioLocation::Offchain, 200, Some(1)),
             ],
         };
 
@@ -341,7 +362,10 @@ mod tests {
                 PortfolioSnapshotEvent::Captured {
                     captured_at: captured_at(),
                     rows: vec![row(
-                        PortfolioLocation::MarketMaking(Chain::Base),
+                        PortfolioLocation::Onchain {
+                            chain: Chain::Base,
+                            form: OnchainForm::MarketMaking,
+                        },
                         100,
                         Some(1),
                     )],
@@ -372,8 +396,11 @@ mod tests {
                 PortfolioSnapshotEvent::Captured {
                     captured_at: captured_at(),
                     rows: vec![
-                        equity_row(PortfolioLocation::MarketMaking(Chain::Base)),
-                        equity_row(PortfolioLocation::Hedging),
+                        equity_row(PortfolioLocation::Onchain {
+                            chain: Chain::Base,
+                            form: OnchainForm::MarketMaking,
+                        }),
+                        equity_row(PortfolioLocation::Offchain),
                     ],
                 },
             )
@@ -421,7 +448,7 @@ mod tests {
                 &id,
                 super::super::PortfolioSnapshotCommand::Capture {
                     captured_at: captured_at(),
-                    rows: vec![equity_row(PortfolioLocation::Hedging)],
+                    rows: vec![equity_row(PortfolioLocation::Offchain)],
                 },
             )
             .await
@@ -463,8 +490,11 @@ mod tests {
                 super::super::PortfolioSnapshotCommand::Capture {
                     captured_at: captured_at(),
                     rows: vec![
-                        equity_row(PortfolioLocation::MarketMaking(Chain::Base)),
-                        equity_row(PortfolioLocation::Hedging),
+                        equity_row(PortfolioLocation::Onchain {
+                            chain: Chain::Base,
+                            form: OnchainForm::MarketMaking,
+                        }),
+                        equity_row(PortfolioLocation::Offchain),
                     ],
                 },
             )

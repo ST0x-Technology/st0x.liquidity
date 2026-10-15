@@ -208,9 +208,19 @@ vault <-> hop <-> Ethereum wallet <-> Alpaca.
   mined and reverted. A reorg may still land one, so the **escrow scan** looks
   for our deposits of their order ids in the origin chain's depository before a
   new pair is signed or the stable is redeposited.
+- **Adopted deposit** (`AdoptSwapDeposit` -> `SwapDepositAdopted`): a deposit of
+  a reverted order the escrow scan found on chain, of both its order's and the
+  current quote's amount, taken from `SwapQuoted` as the swap's deposit into
+  `SwapDeposited`.
+- **Overdeposited swap** (`HoldOverdepositedSwap` -> `SwapOverdeposited`): the
+  hold on any other find of the escrow scan, deposits of several reverted orders
+  or one of another amount, so more of the transfer's stable is with Relay or
+  refunded at the hub than one attempt's amount. It lists each **found deposit**
+  (`FoundSwapDeposit`: request id, order id, deposit tx, block, amount) and ends
+  only with `transfer reconcile`.
 - **Late adoption** (`RecoverSwapCompletion` -> `SwapCompletionRecovered`): a
-  fill or refund of a signed order proven after the transfer stopped waiting for
-  it, adopted into `Bridged` or `SwapRefunded`.
+  fill or refund of the failed order of a `SwapFailed`, proven after the
+  transfer stopped waiting for it, adopted into `Bridged` or `SwapRefunded`.
 
 A corridor is configured under `[rebalancing.usdc.corridors.<chain>]` and
 recorded on each `UsdcRebalance` when it starts. Not to be confused with the
@@ -340,6 +350,14 @@ separately: `Hedging` (the chainless broker account) or `MarketMaking(chain)`
 locations are `PortfolioLocation` reporting rows, not scopes: they hold no
 balance a transfer is sized from.
 
+### Portfolio Location
+
+Where a daily portfolio snapshot row sits: `Onchain { chain, form }` or
+`Offchain` (the broker). The form (`OnchainForm`) is `MarketMaking` (the chain's
+vaults), `WalletUnwrapped` (unwrapped tokens or USDC in the chain's bot wallet)
+or `WalletWrapped` (vault shares in that wallet). Persisted as `<form>:<chain>`
+(`wallet_wrapped:robinhood`) or `offchain`.
+
 ### Target Share
 
 The fraction of a symbol's total inventory (broker shares plus every chain's
@@ -364,6 +382,13 @@ How far a chain's actual share may drift from its target share before the
 planner acts, as a fraction of the total: a chain is a candidate only when
 `|actual - target| > band`. Configured as `[rebalancing.allocation].deviation`.
 The type is `DeviationBand`.
+
+### Rebalancing Band
+
+A target share together with the deviation band around it: the range one chain's
+vault is held to for an equity, or a cash corridor's target and deviation. The
+dashboard inventory carries at most one per chain entry. The DTO type is
+`RebalancingBand`.
 
 ### Minimum Operation Size
 

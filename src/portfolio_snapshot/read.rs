@@ -21,13 +21,12 @@ use rain_math_float::Float;
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use thiserror::Error;
 
-use st0x_evm::Chain;
 use st0x_execution::{EmptySymbolError, HasZero, Symbol};
 use st0x_float_macro::float;
 use st0x_float_serde::parse_float_string_or_hex;
 
 use super::write::et_day as et_day_of;
-use crate::inventory::{PortfolioAsset, PortfolioLocation};
+use crate::inventory::{ParsePortfolioLocationError, PortfolioAsset, PortfolioLocation};
 
 /// Balances marked more than this many days before their `et_day` exclude
 /// the whole day from the capital sample. Only equity marks are
@@ -72,8 +71,8 @@ pub(crate) enum ReadError {
         #[source]
         source: EmptySymbolError,
     },
-    #[error("failed to parse persisted portfolio snapshot location: '{value}'")]
-    InvalidLocation { value: String },
+    #[error("failed to parse persisted portfolio snapshot location: {0}")]
+    InvalidLocation(#[from] ParsePortfolioLocationError),
     #[error("failed to parse persisted portfolio snapshot mark_captured_at '{value}': {source}")]
     InvalidMarkTimestamp {
         value: String,
@@ -270,7 +269,7 @@ pub(crate) fn evaluate_portfolio_days(
             mark_captured_at,
         } = row;
         let et_day = parse_et_day(&et_day)?;
-        parse_portfolio_location(&location)?;
+        location.parse::<PortfolioLocation>()?;
         let asset = parse_portfolio_asset(&asset)?;
         let available = parse_float_string_or_hex(&available_balance)?;
         let inflight = parse_float_string_or_hex(&inflight_balance)?;
@@ -550,29 +549,6 @@ fn parse_et_day(value: &str) -> Result<NaiveDate, ReadError> {
     })
 }
 
-/// Inverse of `PortfolioLocation`'s `Display` impl (`src/inventory/view.rs`),
-/// which is what `PortfolioSnapshotProjection` persists into the `location`
-/// column (`row.row.location.to_string()`).
-fn parse_portfolio_location(value: &str) -> Result<PortfolioLocation, ReadError> {
-    if value == "hedging" {
-        return Ok(PortfolioLocation::Hedging);
-    }
-
-    let invalid = || ReadError::InvalidLocation {
-        value: value.to_owned(),
-    };
-    let (name, chain) = value.split_once(':').ok_or_else(invalid)?;
-    let chain: Chain = chain.parse().map_err(|_| invalid())?;
-
-    match (name, chain) {
-        ("market_making", chain) => Ok(PortfolioLocation::MarketMaking(chain)),
-        ("ethereum_wallet", Chain::Ethereum) => Ok(PortfolioLocation::EthereumWallet),
-        ("base_wallet_unwrapped", Chain::Base) => Ok(PortfolioLocation::BaseWalletUnwrapped),
-        ("base_wallet_wrapped", Chain::Base) => Ok(PortfolioLocation::BaseWalletWrapped),
-        _ => Err(invalid()),
-    }
-}
-
 fn parse_portfolio_asset(value: &str) -> Result<PortfolioAsset, ReadError> {
     if value == "USDC" {
         return Ok(PortfolioAsset::Usdc);
@@ -752,7 +728,7 @@ mod tests {
             Some("2026-07-18T04:05:00+00:00"),
         )
         .await;
-        insert_row(&pool, "2026-07-18", "hedging", "AAPL", "0", None, None).await;
+        insert_row(&pool, "2026-07-18", "offchain", "AAPL", "0", None, None).await;
 
         let days = load_portfolio_days(&pool, EtDayRange::default())
             .await
@@ -947,7 +923,7 @@ mod tests {
         insert_row(
             &pool,
             "2026-07-18",
-            "hedging",
+            "offchain",
             "USDC",
             "2000",
             Some("1"),
@@ -968,7 +944,7 @@ mod tests {
         insert_row(
             &pool,
             "2026-07-18",
-            "hedging",
+            "offchain",
             "AAPL",
             "10",
             Some("150"),
@@ -999,7 +975,7 @@ mod tests {
         insert_row(
             &pool,
             "2026-07-18",
-            "hedging",
+            "offchain",
             "AAPL",
             "10",
             Some("150"),
@@ -1031,7 +1007,7 @@ mod tests {
             [("2026-07-18", "60", "40"), ("2026-07-19", "50", "50")]
         {
             for (location, available) in
-                [("market_making:base", market_making), ("hedging", hedging)]
+                [("market_making:base", market_making), ("offchain", hedging)]
             {
                 insert_row(
                     &pool,
@@ -1070,7 +1046,7 @@ mod tests {
     #[tokio::test]
     async fn negative_hedging_equity_does_not_contribute_or_gate_the_day() {
         let pool = setup_test_db().await;
-        insert_row(&pool, "2026-07-18", "hedging", "AAPL", "-10", None, None).await;
+        insert_row(&pool, "2026-07-18", "offchain", "AAPL", "-10", None, None).await;
 
         let days = load_portfolio_days(&pool, EtDayRange::default())
             .await
@@ -1091,9 +1067,9 @@ mod tests {
         let pool = setup_test_db().await;
         for (location, available) in [
             ("market_making:base", "1000"),
-            ("hedging", "2000"),
-            ("ethereum_wallet:ethereum", "300"),
-            ("base_wallet_unwrapped:base", "40"),
+            ("offchain", "2000"),
+            ("wallet_unwrapped:ethereum", "300"),
+            ("wallet_unwrapped:base", "40"),
         ] {
             insert_row(
                 &pool,

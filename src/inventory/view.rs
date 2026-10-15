@@ -11,15 +11,20 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, warn};
 
 use st0x_config::ImbalanceThreshold;
-use st0x_dto::{InFlightCash, InFlightEquity, SymbolInventory, UsdcInventory};
+use st0x_dto::{
+    ChainEquityInventory, ChainUsdcInventory, InFlightCash, InFlightEquity, SymbolInventory,
+    UsdcInventory,
+};
 use st0x_evm::Chain;
 use st0x_execution::{Direction, FractionalShares, HasZero, Symbol};
 use st0x_finance::{Usd, Usdc, UsdcToCentsError};
 use st0x_tokenization::IssuerRequestId;
 
+use super::RebalancingBands;
 use super::divergence::{PersistentBrokerCashDivergence, PersistentBrokerDivergence};
 use super::snapshot::InventorySnapshotEvent;
 use super::venue_balance::{InventoryError, VenueBalance};
+use crate::dashboard::chain_name;
 use crate::equity_redemption::{RedemptionAggregateId, StrandedRedemption};
 use crate::offchain::order::OffchainOrderId;
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceId};
@@ -696,39 +701,99 @@ impl From<InFlightEquityLocation> for InFlightEquityLocationRepr {
     }
 }
 
-/// A destination for USD-denominated balances tracked in a daily portfolio
-/// snapshot (RAI-1457): the two live trading venues, plus the wallet-transit
-/// points equity or cash may sit at in between.
+/// Where a balance tracked in a daily portfolio snapshot sits:
+/// onchain on one chain, in one [`OnchainForm`], or offchain at the broker.
 ///
-/// USDC observed in wallet transit is never "wrapped" (no wrapped-USDC
-/// concept exists onchain), so `InFlightCashLocation::BaseWallet` maps to
-/// `BaseWalletUnwrapped` here. The primary key `(et_day, location, asset)`
-/// prevents this from colliding with unwrapped equity at the same location,
-/// since `asset` still distinguishes them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// USDC observed in a wallet is never "wrapped" (no wrapped-USDC concept
+/// exists onchain), so wallet cash is captured at
+/// [`OnchainForm::WalletUnwrapped`]. The primary key `(et_day, location,
+/// asset)` keeps it apart from unwrapped equity in the same wallet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum PortfolioLocation {
-    MarketMaking(Chain),
-    Hedging,
-    EthereumWallet,
-    BaseWalletUnwrapped,
-    BaseWalletWrapped,
+    Onchain { chain: Chain, form: OnchainForm },
+    Offchain,
+}
+
+/// How a balance is held on its chain: in the market-making vaults, or in
+/// the bot wallet as unwrapped tokens or wrapped vault shares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum OnchainForm {
+    MarketMaking,
+    WalletUnwrapped,
+    WalletWrapped,
+}
+
+impl OnchainForm {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::MarketMaking => "market_making",
+            Self::WalletUnwrapped => "wallet_unwrapped",
+            Self::WalletWrapped => "wallet_wrapped",
+        }
+    }
+}
+
+impl PortfolioLocation {
+    /// The chain whose vault issued the equity held here when it is held as
+    /// wrapped vault shares, which must be converted to underlying units at
+    /// that chain's ratio before a share price applies. `None` where equity
+    /// is already in underlying units.
+    pub(crate) const fn wrapped_equity_chain(self) -> Option<Chain> {
+        match self {
+            Self::Onchain {
+                chain,
+                form: OnchainForm::MarketMaking | OnchainForm::WalletWrapped,
+            } => Some(chain),
+            Self::Onchain {
+                form: OnchainForm::WalletUnwrapped,
+                ..
+            }
+            | Self::Offchain => None,
+        }
+    }
 }
 
 impl std::fmt::Display for PortfolioLocation {
-    /// Every on-chain location renders `<name>:<chain>` so a chain's
-    /// balances stay attributable per the multi-chain SPEC; the broker-side
-    /// `hedging` has no chain to name. Persisted in `portfolio_snapshot`
-    /// (legacy bare rows were migrated to this qualified form).
+    /// Every onchain location renders `<form>:<chain>` so a chain's balances
+    /// stay attributable per the multi-chain SPEC; the broker has no chain to
+    /// name. Persisted in `portfolio_snapshot`.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MarketMaking(chain) => write!(formatter, "market_making:{chain}"),
-            Self::Hedging => write!(formatter, "hedging"),
-            Self::EthereumWallet => write!(formatter, "ethereum_wallet:{}", Chain::Ethereum),
-            Self::BaseWalletUnwrapped => {
-                write!(formatter, "base_wallet_unwrapped:{}", Chain::Base)
-            }
-            Self::BaseWalletWrapped => write!(formatter, "base_wallet_wrapped:{}", Chain::Base),
+            Self::Onchain { chain, form } => write!(formatter, "{}:{chain}", form.label()),
+            Self::Offchain => write!(formatter, "offchain"),
         }
+    }
+}
+
+/// A persisted `portfolio_snapshot` location label that is not the
+/// [`Display`](std::fmt::Display) form of any [`PortfolioLocation`].
+#[derive(Debug, thiserror::Error)]
+#[error("invalid portfolio location '{value}'")]
+pub struct ParsePortfolioLocationError {
+    value: String,
+}
+
+impl std::str::FromStr for PortfolioLocation {
+    type Err = ParsePortfolioLocationError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value == "offchain" {
+            return Ok(Self::Offchain);
+        }
+
+        let invalid = || ParsePortfolioLocationError {
+            value: value.to_owned(),
+        };
+        let (label, chain) = value.split_once(':').ok_or_else(invalid)?;
+        let chain: Chain = chain.parse().map_err(|_| invalid())?;
+        let form = match label {
+            "market_making" => OnchainForm::MarketMaking,
+            "wallet_unwrapped" => OnchainForm::WalletUnwrapped,
+            "wallet_wrapped" => OnchainForm::WalletWrapped,
+            _ => return Err(invalid()),
+        };
+
+        Ok(Self::Onchain { chain, form })
     }
 }
 
@@ -783,20 +848,6 @@ const SNAPSHOT_SKIP_WARN_EVERY: u32 = 5;
 const PORTFOLIO_CASH_TRANSIT_LOCATIONS: [InFlightCashLocation; 2] = [
     InFlightCashLocation::EthereumWallet,
     InFlightCashLocation::BaseWallet,
-];
-
-/// Wallet-transit equity locations in the fixed order rows are emitted,
-/// each with the portfolio location it is captured at. Only Base's wallet
-/// is valued in the portfolio snapshot.
-const PORTFOLIO_EQUITY_TRANSIT_LOCATIONS: [(InFlightEquityLocation, PortfolioLocation); 2] = [
-    (
-        InFlightEquityLocation::WalletUnwrapped(Chain::Base),
-        PortfolioLocation::BaseWalletUnwrapped,
-    ),
-    (
-        InFlightEquityLocation::WalletWrapped(Chain::Base),
-        PortfolioLocation::BaseWalletWrapped,
-    ),
 ];
 
 /// One symbol's balances as the dashboard and the `liq_*` series show them:
@@ -1239,12 +1290,36 @@ impl InventoryView {
     }
 
     /// Converts the in-memory inventory view to a DTO for dashboard
-    /// serialization.
-    pub(crate) fn to_dto(&self) -> st0x_dto::Inventory {
+    /// serialization. The flat fields stay the primary chain's; `chains`
+    /// lists each hedged chain's vault with its band from `bands`.
+    pub(crate) fn to_dto(&self, bands: &RebalancingBands) -> st0x_dto::Inventory {
+        let OnchainByChain {
+            equities: chain_equities,
+            usdc: chain_usdc,
+        } = self.onchain_by_chain(&bands.hedged);
+
+        let mut equity_chains = chain_equities
+            .into_iter()
+            .map(|balance| {
+                let row = ChainEquityInventory {
+                    chain: chain_name(balance.chain),
+                    available: balance.available,
+                    inflight: balance.inflight,
+                    band: bands
+                        .equity
+                        .get(&(balance.symbol.clone(), balance.chain))
+                        .copied(),
+                };
+
+                (balance.symbol, row)
+            })
+            .into_group_map();
+
         let per_symbol = self
             .symbol_balances()
             .into_iter()
             .map(|balances| SymbolInventory {
+                chains: equity_chains.remove(&balances.symbol).unwrap_or_default(),
                 symbol: balances.symbol,
                 onchain_available: balances.onchain_available,
                 onchain_inflight: balances.onchain_inflight,
@@ -1254,6 +1329,17 @@ impl InventoryView {
                     base_wallet_unwrapped: balances.base_wallet_unwrapped,
                     base_wallet_wrapped: balances.base_wallet_wrapped,
                 },
+            })
+            .collect();
+
+        let usdc_chains = chain_usdc
+            .into_iter()
+            .map(|balance| ChainUsdcInventory {
+                chain: chain_name(balance.chain),
+                symbol: balance.chain.settlement_stable().symbol.to_string(),
+                available: balance.available,
+                inflight: balance.inflight,
+                band: bands.usdc.get(&balance.chain).copied(),
             })
             .collect();
 
@@ -1274,6 +1360,7 @@ impl InventoryView {
                     ethereum_wallet: usdc.ethereum_wallet,
                     base_wallet: usdc.base_wallet,
                 },
+                chains: usdc_chains,
             },
         }
     }
@@ -1421,7 +1508,10 @@ impl InventoryView {
             // balances stay attributable (SPEC multi-chain), never summed.
             for (chain, balance) in &inventory.onchain {
                 rows.push(PortfolioBalanceRow {
-                    location: PortfolioLocation::MarketMaking(*chain),
+                    location: PortfolioLocation::Onchain {
+                        chain: *chain,
+                        form: OnchainForm::MarketMaking,
+                    },
                     asset: PortfolioAsset::Equity(symbol.clone()),
                     available: balance.available().into(),
                     inflight: balance.inflight().into(),
@@ -1429,7 +1519,7 @@ impl InventoryView {
             }
             if let Some(balance) = inventory.offchain {
                 rows.push(PortfolioBalanceRow {
-                    location: PortfolioLocation::Hedging,
+                    location: PortfolioLocation::Offchain,
                     asset: PortfolioAsset::Equity(symbol.clone()),
                     available: balance.available().into(),
                     inflight: balance.inflight().into(),
@@ -1439,7 +1529,10 @@ impl InventoryView {
 
         for (chain, balance) in &self.usdc.onchain {
             rows.push(PortfolioBalanceRow {
-                location: PortfolioLocation::MarketMaking(*chain),
+                location: PortfolioLocation::Onchain {
+                    chain: *chain,
+                    form: OnchainForm::MarketMaking,
+                },
                 asset: PortfolioAsset::Usdc,
                 available: balance.available().into(),
                 inflight: balance.inflight().into(),
@@ -1456,7 +1549,7 @@ impl InventoryView {
                 None => balance.available().into(),
             };
             rows.push(PortfolioBalanceRow {
-                location: PortfolioLocation::Hedging,
+                location: PortfolioLocation::Offchain,
                 asset: PortfolioAsset::Usdc,
                 available,
                 inflight: balance.inflight().into(),
@@ -1467,8 +1560,14 @@ impl InventoryView {
             if let Some(entry) = self.inflight_cash.get(&cash_location) {
                 rows.push(PortfolioBalanceRow {
                     location: match cash_location {
-                        InFlightCashLocation::EthereumWallet => PortfolioLocation::EthereumWallet,
-                        InFlightCashLocation::BaseWallet => PortfolioLocation::BaseWalletUnwrapped,
+                        InFlightCashLocation::EthereumWallet => PortfolioLocation::Onchain {
+                            chain: Chain::Ethereum,
+                            form: OnchainForm::WalletUnwrapped,
+                        },
+                        InFlightCashLocation::BaseWallet => PortfolioLocation::Onchain {
+                            chain: Chain::Base,
+                            form: OnchainForm::WalletUnwrapped,
+                        },
                     },
                     asset: PortfolioAsset::Usdc,
                     available: Usdc::ZERO.into(),
@@ -1477,24 +1576,32 @@ impl InventoryView {
             }
         }
 
-        let inflight_equity_symbols: std::collections::BTreeSet<&Symbol> = self
+        // Every chain's wallet, so tokens a transfer left in a secondary
+        // chain's wallet are valued like the primary's.
+        let inflight_equity = self
             .inflight_equity
-            .keys()
-            .map(|(symbol, _)| symbol)
-            .collect();
-        for symbol in inflight_equity_symbols {
-            for (equity_location, location) in PORTFOLIO_EQUITY_TRANSIT_LOCATIONS {
-                let Some(entry) = self.inflight_equity.get(&(symbol.clone(), equity_location))
-                else {
-                    continue;
+            .iter()
+            .map(|((symbol, equity_location), entry)| {
+                let location = match *equity_location {
+                    InFlightEquityLocation::WalletUnwrapped(chain) => PortfolioLocation::Onchain {
+                        chain,
+                        form: OnchainForm::WalletUnwrapped,
+                    },
+                    InFlightEquityLocation::WalletWrapped(chain) => PortfolioLocation::Onchain {
+                        chain,
+                        form: OnchainForm::WalletWrapped,
+                    },
                 };
-                rows.push(PortfolioBalanceRow {
-                    location,
-                    asset: PortfolioAsset::Equity(symbol.clone()),
-                    available: FractionalShares::ZERO.into(),
-                    inflight: entry.amount.into(),
-                });
-            }
+                (symbol, location, entry)
+            })
+            .sorted_by_key(|(symbol, location, _)| (*symbol, *location));
+        for (symbol, location, entry) in inflight_equity {
+            rows.push(PortfolioBalanceRow {
+                location,
+                asset: PortfolioAsset::Equity(symbol.clone()),
+                available: FractionalShares::ZERO.into(),
+                inflight: entry.amount.into(),
+            });
         }
 
         Ok(rows)
@@ -5841,7 +5948,7 @@ mod tests {
                 "a Robinhood wallet event must not touch Base's wrapped slot",
             );
             assert_eq!(
-                view.to_dto().per_symbol[0]
+                view.to_dto(&RebalancingBands::default()).per_symbol[0]
                     .inflight_equity
                     .base_wallet_unwrapped,
                 shares(1),
@@ -8093,7 +8200,7 @@ mod tests {
             .apply_snapshot_event(&usdc_on(Chain::Ethereum, 50_000), now)
             .unwrap();
 
-        let dto = view.to_dto();
+        let dto = view.to_dto(&RebalancingBands::default());
 
         assert_eq!(dto.per_symbol.len(), 1);
         assert_eq!(dto.per_symbol[0].onchain_available, shares(50));
@@ -8110,7 +8217,8 @@ mod tests {
     /// cannot pass here.
     #[test]
     fn to_dto_names_the_primary_chains_settlement_stable() {
-        let dto = InventoryView::for_primary_chain(Chain::Robinhood).to_dto();
+        let dto =
+            InventoryView::for_primary_chain(Chain::Robinhood).to_dto(&RebalancingBands::default());
 
         assert_eq!(dto.usdc.symbol, "USDG");
     }
@@ -8196,11 +8304,86 @@ mod tests {
             }
         );
 
-        let dto = view.to_dto();
+        let dto = view.to_dto(&RebalancingBands::default());
         assert_eq!(dto.per_symbol[0].onchain_available, shares(50));
         assert_eq!(dto.per_symbol[0].onchain_inflight, shares(5));
         assert_eq!(dto.usdc.onchain_available, Usdc::new(float!(2000)));
         assert_eq!(dto.usdc.symbol, "USDC");
+    }
+
+    /// Each hedged chain's vault is listed under its symbol and in the cash
+    /// row, with the band the config holds it to; a chain the config does
+    /// not hedge is left out, and the flat fields stay the primary chain's.
+    #[test]
+    fn to_dto_lists_each_hedged_chains_vault_with_its_band() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let view = InventoryView {
+            equities: HashMap::from([(
+                aapl.clone(),
+                Inventory {
+                    onchain: BTreeMap::from([
+                        (Chain::Base, venue(50, 5)),
+                        (Chain::Robinhood, venue(9, 1)),
+                        (Chain::Ethereum, venue(3, 0)),
+                    ]),
+                    offchain: Some(venue(40, 0)),
+                    last_rebalancing: None,
+                    unpolled_onchain: BTreeSet::new(),
+                },
+            )]),
+            usdc: Inventory {
+                onchain: BTreeMap::from([
+                    (Chain::Base, usdc_venue(2000, 250)),
+                    (Chain::Robinhood, usdc_venue(300, 0)),
+                ]),
+                offchain: Some(usdc_venue(1000, 0)),
+                last_rebalancing: None,
+                unpolled_onchain: BTreeSet::new(),
+            },
+            ..InventoryView::for_primary_chain(Chain::Base)
+        };
+        let band = |target, deviation| st0x_dto::RebalancingBand { target, deviation };
+        let bands = RebalancingBands {
+            hedged: BTreeSet::from([Chain::Base, Chain::Robinhood]),
+            equity: BTreeMap::from([((aapl, Chain::Robinhood), band(float!(0.3), float!(0.05)))]),
+            usdc: BTreeMap::from([(Chain::Base, band(float!(0.5), float!(0.2)))]),
+        };
+
+        let dto = serde_json::to_value(view.to_dto(&bands)).unwrap();
+
+        assert_eq!(dto["perSymbol"][0]["onchainAvailable"], json!("50"));
+        assert_eq!(
+            dto["perSymbol"][0]["chains"],
+            json!([
+                { "chain": "base", "available": "50", "inflight": "5", "band": null },
+                {
+                    "chain": "robinhood",
+                    "available": "9",
+                    "inflight": "1",
+                    "band": { "target": "0.3", "deviation": "0.05" }
+                }
+            ])
+        );
+        assert_eq!(dto["usdc"]["onchainAvailable"], json!("2000"));
+        assert_eq!(
+            dto["usdc"]["chains"],
+            json!([
+                {
+                    "chain": "base",
+                    "symbol": "USDC",
+                    "available": "2000",
+                    "inflight": "250",
+                    "band": { "target": "0.5", "deviation": "0.2" }
+                },
+                {
+                    "chain": "robinhood",
+                    "symbol": "USDG",
+                    "available": "300",
+                    "inflight": "0",
+                    "band": null
+                }
+            ])
+        );
     }
 
     /// The production vault reads (`apply_snapshot_event`, which hydration
@@ -8339,7 +8522,7 @@ mod tests {
             .with_equity(aapl.clone(), shares(100), shares(50))
             .with_usdc(Usdc::new(float!(10000)), Usdc::new(float!(5000)));
 
-        let dto = view.to_dto();
+        let dto = view.to_dto(&RebalancingBands::default());
 
         assert_eq!(dto.per_symbol.len(), 1);
 
@@ -8399,7 +8582,7 @@ mod tests {
             primary_chain: Chain::Base,
         };
 
-        let dto = view.to_dto();
+        let dto = view.to_dto(&RebalancingBands::default());
 
         let tsla_dto = &dto.per_symbol[0];
         assert_eq!(
@@ -8468,7 +8651,7 @@ mod tests {
             primary_chain: Chain::Base,
         };
 
-        let dto = view.to_dto();
+        let dto = view.to_dto(&RebalancingBands::default());
 
         let spy_dto = &dto.per_symbol[0];
         assert_eq!(spy_dto.onchain_available, FractionalShares::new(float!(75)));
@@ -8499,7 +8682,7 @@ mod tests {
                 fetched_at,
             );
 
-        let dto = view.to_dto();
+        let dto = view.to_dto(&RebalancingBands::default());
 
         assert_eq!(
             dto.usdc.inflight_cash.ethereum_wallet,
@@ -8515,14 +8698,14 @@ mod tests {
             ..InventoryView::default()
         };
 
-        let dto = view.to_dto();
+        let dto = view.to_dto(&RebalancingBands::default());
 
         assert_eq!(dto.usdc.withdrawable_cash, Some(Usdc::new(float!(32000))));
     }
 
     #[test]
     fn to_dto_withdrawable_cash_is_none_when_broker_omitted_field() {
-        let dto = InventoryView::default().to_dto();
+        let dto = InventoryView::default().to_dto(&RebalancingBands::default());
 
         assert_eq!(dto.usdc.withdrawable_cash, None);
     }
@@ -8532,7 +8715,7 @@ mod tests {
     /// "observed as zero".
     #[test]
     fn to_dto_inflight_cash_is_none_for_unobserved_locations() {
-        let dto = InventoryView::default().to_dto();
+        let dto = InventoryView::default().to_dto(&RebalancingBands::default());
 
         assert_eq!(dto.usdc.inflight_cash.ethereum_wallet, None);
         assert_eq!(dto.usdc.inflight_cash.base_wallet, None);
@@ -8552,7 +8735,7 @@ mod tests {
                 now,
             )
             .unwrap()
-            .to_dto();
+            .to_dto(&RebalancingBands::default());
 
         assert_eq!(
             dto.usdc.alpaca_usdc,
@@ -8577,7 +8760,7 @@ mod tests {
                 reason,
             )
             .unwrap()
-            .to_dto();
+            .to_dto(&RebalancingBands::default());
 
         assert_eq!(
             dto.usdc.alpaca_usdc,
@@ -8610,7 +8793,7 @@ mod tests {
                 fetched_at,
             );
 
-        let dto = view.to_dto();
+        let dto = view.to_dto(&RebalancingBands::default());
         let aapl_dto = &dto.per_symbol[0];
 
         assert_eq!(aapl_dto.symbol, aapl);
@@ -8632,7 +8815,7 @@ mod tests {
             fetched_at,
         );
 
-        let dto = view.to_dto();
+        let dto = view.to_dto(&RebalancingBands::default());
         let aapl_dto = &dto.per_symbol[0];
 
         assert_eq!(aapl_dto.symbol, aapl);
@@ -8667,7 +8850,7 @@ mod tests {
             .unwrap();
 
         // Verify inflight is set in DTO
-        let dto = view.to_dto();
+        let dto = view.to_dto(&RebalancingBands::default());
         let aapl = &dto.per_symbol[0];
         assert_eq!(
             aapl.onchain_inflight, transfer_quantity,
@@ -8682,7 +8865,7 @@ mod tests {
 
         // Inflight MUST still be present — the polling snapshot
         // should not clear inflight set by the transfer trigger.
-        let dto = view.to_dto();
+        let dto = view.to_dto(&RebalancingBands::default());
         let aapl = &dto.per_symbol[0];
         assert_eq!(
             aapl.onchain_inflight, transfer_quantity,
@@ -8717,7 +8900,7 @@ mod tests {
             )
             .unwrap();
 
-        let dto = view.to_dto();
+        let dto = view.to_dto(&RebalancingBands::default());
         let aapl = &dto.per_symbol[0];
         assert_eq!(
             aapl.onchain_inflight, transfer_quantity,
@@ -8750,25 +8933,31 @@ mod tests {
 
         assert_eq!(rows.len(), 4);
         assert!(rows.contains(&PortfolioBalanceRow {
-            location: PortfolioLocation::MarketMaking(Chain::Base),
+            location: PortfolioLocation::Onchain {
+                chain: Chain::Base,
+                form: OnchainForm::MarketMaking
+            },
             asset: PortfolioAsset::Equity(aapl.clone()),
             available: shares(100).into(),
             inflight: FractionalShares::ZERO.into(),
         }));
         assert!(rows.contains(&PortfolioBalanceRow {
-            location: PortfolioLocation::Hedging,
+            location: PortfolioLocation::Offchain,
             asset: PortfolioAsset::Equity(aapl),
             available: shares(50).into(),
             inflight: FractionalShares::ZERO.into(),
         }));
         assert!(rows.contains(&PortfolioBalanceRow {
-            location: PortfolioLocation::MarketMaking(Chain::Base),
+            location: PortfolioLocation::Onchain {
+                chain: Chain::Base,
+                form: OnchainForm::MarketMaking
+            },
             asset: PortfolioAsset::Usdc,
             available: Usdc::new(float!(10000)).into(),
             inflight: Usdc::ZERO.into(),
         }));
         assert!(rows.contains(&PortfolioBalanceRow {
-            location: PortfolioLocation::Hedging,
+            location: PortfolioLocation::Offchain,
             asset: PortfolioAsset::Usdc,
             available: Usdc::new(float!(5000)).into(),
             inflight: Usdc::ZERO.into(),
@@ -8787,7 +8976,10 @@ mod tests {
         let rows = view.to_portfolio_snapshot_rows().unwrap();
 
         assert!(rows.contains(&PortfolioBalanceRow {
-            location: PortfolioLocation::MarketMaking(Chain::Base),
+            location: PortfolioLocation::Onchain {
+                chain: Chain::Base,
+                form: OnchainForm::MarketMaking
+            },
             asset: PortfolioAsset::Equity(aapl),
             available: FractionalShares::ZERO.into(),
             inflight: FractionalShares::ZERO.into(),
@@ -8818,12 +9010,15 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].location,
-            PortfolioLocation::MarketMaking(Chain::Base)
+            PortfolioLocation::Onchain {
+                chain: Chain::Base,
+                form: OnchainForm::MarketMaking
+            }
         );
         assert!(
             !rows
                 .iter()
-                .any(|row| row.location == PortfolioLocation::Hedging)
+                .any(|row| row.location == PortfolioLocation::Offchain)
         );
     }
 
@@ -8857,17 +9052,143 @@ mod tests {
 
         assert_eq!(rows.len(), 2);
         assert!(rows.contains(&PortfolioBalanceRow {
-            location: PortfolioLocation::BaseWalletUnwrapped,
+            location: PortfolioLocation::Onchain {
+                chain: Chain::Base,
+                form: OnchainForm::WalletUnwrapped
+            },
             asset: PortfolioAsset::Equity(aapl.clone()),
             available: FractionalShares::ZERO.into(),
             inflight: shares(5).into(),
         }));
         assert!(rows.contains(&PortfolioBalanceRow {
-            location: PortfolioLocation::BaseWalletWrapped,
+            location: PortfolioLocation::Onchain {
+                chain: Chain::Base,
+                form: OnchainForm::WalletWrapped
+            },
             asset: PortfolioAsset::Equity(aapl),
             available: FractionalShares::ZERO.into(),
             inflight: shares(7).into(),
         }));
+    }
+
+    /// Each chain's wallet equity is its own row at that chain's slot, so
+    /// the same symbol in two chains' wallets is never summed.
+    #[test]
+    fn to_portfolio_snapshot_rows_emits_every_chains_wallet_equity() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let fetched_at = Utc::now();
+
+        let view = InventoryView::default()
+            .set_inflight_equity_at_location(
+                InFlightEquityLocation::WalletUnwrapped(Chain::Base),
+                &BTreeMap::from([(aapl.clone(), shares(5))]),
+                fetched_at,
+                fetched_at,
+            )
+            .set_inflight_equity_at_location(
+                InFlightEquityLocation::WalletUnwrapped(Chain::Robinhood),
+                &BTreeMap::from([(aapl.clone(), shares(3))]),
+                fetched_at,
+                fetched_at,
+            );
+
+        let rows = view.to_portfolio_snapshot_rows().unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                PortfolioBalanceRow {
+                    location: PortfolioLocation::Onchain {
+                        chain: Chain::Base,
+                        form: OnchainForm::WalletUnwrapped
+                    },
+                    asset: PortfolioAsset::Equity(aapl.clone()),
+                    available: FractionalShares::ZERO.into(),
+                    inflight: shares(5).into(),
+                },
+                PortfolioBalanceRow {
+                    location: PortfolioLocation::Onchain {
+                        chain: Chain::Robinhood,
+                        form: OnchainForm::WalletUnwrapped
+                    },
+                    asset: PortfolioAsset::Equity(aapl),
+                    available: FractionalShares::ZERO.into(),
+                    inflight: shares(3).into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn portfolio_location_labels_roundtrip_for_every_chain_and_form() {
+        let onchain = Chain::ALL.into_iter().flat_map(|chain| {
+            [
+                PortfolioLocation::Onchain {
+                    chain,
+                    form: OnchainForm::MarketMaking,
+                },
+                PortfolioLocation::Onchain {
+                    chain,
+                    form: OnchainForm::WalletUnwrapped,
+                },
+                PortfolioLocation::Onchain {
+                    chain,
+                    form: OnchainForm::WalletWrapped,
+                },
+            ]
+        });
+
+        for location in onchain.chain([PortfolioLocation::Offchain]) {
+            let label = location.to_string();
+            assert_eq!(
+                label.parse::<PortfolioLocation>().unwrap(),
+                location,
+                "{label}"
+            );
+        }
+
+        assert_eq!(
+            PortfolioLocation::Onchain {
+                chain: Chain::Robinhood,
+                form: OnchainForm::WalletWrapped
+            }
+            .to_string(),
+            "wallet_wrapped:robinhood"
+        );
+        assert_eq!(PortfolioLocation::Offchain.to_string(), "offchain");
+    }
+
+    /// The labels the per-chain migration rewrote no longer parse, nor does
+    /// an unknown chain, so a row it missed fails the read instead of being
+    /// misattributed.
+    #[test]
+    fn legacy_and_unknown_portfolio_location_labels_are_rejected() {
+        for label in [
+            "hedging",
+            "ethereum_wallet:ethereum",
+            "base_wallet_unwrapped:base",
+            "base_wallet_wrapped:base",
+            "wallet_unwrapped:solana",
+        ] {
+            let error = label.parse::<PortfolioLocation>().unwrap_err();
+            assert_eq!(error.value, label);
+        }
+    }
+
+    #[test]
+    fn portfolio_location_json_shape_is_stable() {
+        assert_eq!(
+            serde_json::to_value(PortfolioLocation::Onchain {
+                chain: Chain::Robinhood,
+                form: OnchainForm::WalletWrapped
+            })
+            .unwrap(),
+            json!({"Onchain": {"chain": "robinhood", "form": "WalletWrapped"}})
+        );
+        assert_eq!(
+            serde_json::to_value(PortfolioLocation::Offchain).unwrap(),
+            json!("Offchain")
+        );
     }
 
     /// Wallet-transit USDC (`inflight_cash`) is emitted as its own row per
@@ -8885,7 +9206,13 @@ mod tests {
         let rows = view.to_portfolio_snapshot_rows().unwrap();
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].location, PortfolioLocation::EthereumWallet);
+        assert_eq!(
+            rows[0].location,
+            PortfolioLocation::Onchain {
+                chain: Chain::Ethereum,
+                form: OnchainForm::WalletUnwrapped
+            }
+        );
         assert_eq!(rows[0].asset, PortfolioAsset::Usdc);
         let expected_available: Float = Usdc::ZERO.into();
         let expected_inflight: Float = Usdc::new(float!(250)).into();
@@ -8910,7 +9237,7 @@ mod tests {
         let hedging_row = rows
             .iter()
             .find(|row| {
-                row.location == PortfolioLocation::Hedging && row.asset == PortfolioAsset::Usdc
+                row.location == PortfolioLocation::Offchain && row.asset == PortfolioAsset::Usdc
             })
             .expect("Hedging USDC row must be present");
         let expected_gross: Float = Usdc::new(float!(1000)).into();
@@ -8986,7 +9313,7 @@ mod tests {
         fn set_inflight_cash_keeps_freshest_per_location(
             calls in prop::collection::vec(arb_call(), 0..16),
         ) {
-            let dto = apply_calls(&calls).to_dto();
+            let dto = apply_calls(&calls).to_dto(&RebalancingBands::default());
 
             for location in LOCATIONS {
                 let expected = calls
@@ -9015,7 +9342,7 @@ mod tests {
                 call.location = target;
             }
 
-            let dto = apply_calls(&calls).to_dto();
+            let dto = apply_calls(&calls).to_dto(&RebalancingBands::default());
             prop_assert_eq!(dto_slot(&dto, untouched), None);
         }
 
@@ -9049,7 +9376,7 @@ mod tests {
             calls in prop::collection::vec(arb_call(), 0..16),
         ) {
             let view = apply_calls(&calls);
-            let dto = view.to_dto();
+            let dto = view.to_dto(&RebalancingBands::default());
 
             for location in LOCATIONS {
                 prop_assert_eq!(dto_slot(&dto, location), view.inflight_cash_at(location));

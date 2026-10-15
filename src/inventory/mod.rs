@@ -1,5 +1,6 @@
 //! Inventory tracking for cross-venue asset management.
 
+mod bands;
 mod broadcasting;
 pub(crate) mod divergence;
 mod freshness;
@@ -11,6 +12,7 @@ pub(crate) mod view;
 
 pub(crate) use st0x_config::ImbalanceThreshold;
 
+pub(crate) use bands::RebalancingBands;
 pub(crate) use broadcasting::BroadcastingInventory;
 pub(crate) use divergence::{
     CashAdmission, InventoryDivergenceGate, InventoryDivergenceRecoveryCtx,
@@ -27,6 +29,6 @@ pub(crate) use snapshot::{InventorySnapshot, InventorySnapshotId};
 pub(crate) use venue_balance::{InventoryError, VenueBalance};
 pub(crate) use view::{
     ActiveUsdcRebalance, EquityVenuesError, Imbalance, Inventory, InventoryScope, InventoryView,
-    InventoryViewError, Operator, TransferOp, Venue,
+    InventoryViewError, Operator, ParsePortfolioLocationError, TransferOp, Venue,
 };
-pub use view::{PortfolioAsset, PortfolioBalanceRow, PortfolioLocation};
+pub use view::{OnchainForm, PortfolioAsset, PortfolioBalanceRow, PortfolioLocation};

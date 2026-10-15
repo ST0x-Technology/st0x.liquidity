@@ -1890,6 +1890,8 @@ mod tests {
                 false,
             ),
             ("SwapFailed", "BaseToAlpaca", "failed_at", true),
+            ("SwapOverdeposited", "BaseToAlpaca", "held_at", true),
+            ("SwapOverdeposited", "AlpacaToBase", "held_at", true),
             ("ReturnedToSource", "BaseToAlpaca", "returned_at", true),
             (
                 "SwapEscrowUnresolved",
@@ -1927,7 +1929,11 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-            assert_eq!(terminal_at.is_some(), expected_terminal);
+            assert_eq!(
+                terminal_at.is_some(),
+                expected_terminal,
+                "{state} {direction}"
+            );
         }
     }
 
@@ -1945,6 +1951,7 @@ mod tests {
             "SwapRefunded",
             "SwapEscrowUnresolved",
             "SwapFailed",
+            "SwapOverdeposited",
             "Redepositing",
             "ReturnedToSource",
         ] {

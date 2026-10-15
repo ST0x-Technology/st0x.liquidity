@@ -332,8 +332,8 @@ over its own asset table, because vault polling reads its market-making vaults
 like any hedged chain's and those hold wrapped vault shares the daily portfolio
 capture values in underlying units. The rebalancing trigger plans across every
 hedged chain's entry and dispatches each operation with its chain (see Equity
-Allocation Planner). The daily portfolio snapshot still values only the Base
-wallet, so equity waiting for recovery in a secondary wallet is not in that
+Allocation Planner). The daily portfolio snapshot values every polled chain's
+bot wallet, so equity waiting for recovery in a secondary wallet is in that
 capture. Wallet polling and wrapped and unwrapped equity recovery cover each
 chain whose equity services are built. Recovery reads that chain's wallet
 balances and resumes only a mint or redemption recorded on that chain, using its
@@ -2133,22 +2133,28 @@ not backfilled.
 **What is captured**: every balance the live in-memory inventory view has polled
 at least once that ET day, across both trading venues (onchain Raindex
 market-making, offchain Alpaca hedging) and the wallet-transit locations equity
-or cash may sit at in between (Ethereum wallet, Base wallet unwrapped, Base
-wallet wrapped). A venue never polled produces no row; a venue polled to a
-genuine zero balance still produces a `0` row. The capture only proceeds once
-every configured balance has been polled at least once that run -- a
-partially-hydrated view (e.g. equity seen onchain but not yet offchain) is
-skipped and retried shortly after, since a captured day can never be amended.
-The required market-making balances are per hedged chain: each chain requires
-the equities and the cash its own assets table declares, so a chain the poller
-reads is a chain the capture waits for. This is a PRESENCE check, not a
-freshness check: a balance that is merely present (e.g. replayed from a
-persisted `InventorySnapshot` at startup, without ever being re-polled this run)
-still satisfies it on its own. An earlier attempt at a time-window freshness
-gate was reverted: the underlying `InventorySnapshot` suppresses events, and
-their watermarks, on unchanged balances, so tying freshness to that watermark
-freezes on a static book and the window would eventually block every future
-capture.
+or cash may sit at in between (USDC in the Ethereum and Base wallets, and the
+unwrapped and wrapped equity in the bot wallet of every chain whose equity
+wallet is polled). Each row's location is `Onchain { chain, form }` (form
+market-making, wallet unwrapped or wallet wrapped) or `Offchain`, persisted as
+`<form>:<chain>` or `offchain`, so every chain's balances stay attributable. A
+venue never polled produces no row; a venue polled to a genuine zero balance
+still produces a `0` row. The capture only proceeds once every configured
+balance has been polled at least once that run -- a partially-hydrated view
+(e.g. equity seen onchain but not yet offchain) is skipped and retried shortly
+after, since a captured day can never be amended. The required market-making
+balances are per hedged chain: each chain requires the equities and the cash its
+own assets table declares, so a chain the poller reads is a chain the capture
+waits for. Likewise each chain whose equity wallet is polled requires its
+unwrapped and wrapped wallet slots for its own equities, like Base's. Presence
+alone does not admit a capture: a balance restored from a persisted
+`InventorySnapshot` satisfies presence only, and every required slot must also
+have a successful poll recorded on or after the target ET day's midnight (see
+**Poll-driven freshness gate** below). That freshness signal comes from
+`PollFreshness`, never from `InventorySnapshot` event watermarks: the snapshot
+suppresses events, and their watermarks, on unchanged balances, so a watermark
+gate freezes on a static book and would eventually block every future capture --
+which is why an earlier watermark-based gate was reverted.
 
 A vault-registry symbol can outlive its config entry (registry seeds are
 permanent events, config entries are not), and such a symbol has no wrapper
@@ -2195,8 +2201,10 @@ guarantees such a balance is never multiplied by a price.
 
 The remedy for a day excluded this way is to reconcile the holding, not to
 supply a mark: a historical-mark repair prices every row of the symbol, so it is
-refused while any wrapped-location row survives, which would otherwise be valued
-as underlying shares. USDC rows always pass through.
+refused while a market-making or wrapped-wallet row survives on a chain whose
+table does not list the symbol, which would otherwise be valued as underlying
+shares. Wrapped wallet shares are judged per chain, like market-making rows.
+USDC rows always pass through.
 
 **Poll-driven freshness gate**: an additional, independent freshness check now
 closes the gap presence alone leaves open. An ephemeral `PollFreshness` tracker
@@ -2419,10 +2427,10 @@ holds no record yet (the latest copy is what a first boot records).
 The two modes differ only in how much of the input they have:
 
 - **With `--secrets`** it applies every rule, the config/secrets cross-checks
-  included: broker credentials and the type they resolve to, each chain's
-  `rpc_url`, wallet keys, and the pricing and issuance API keys. This is the
-  deploy gate described below, run against the staged candidate files while the
-  old process is still serving.
+  included: broker credentials and the type they resolve to, any chain `rpc_url`
+  still read from the secrets file, wallet keys, and the pricing and issuance
+  API keys. This is the deploy gate described below, run against the staged
+  candidate files while the old process is still serving.
 - **Without `--secrets`** it applies every rule the config file can be judged
   against alone: its schema (an unknown key is a failure, never a silently
   ignored line), the port, chain, asset-table and `[rebalancing]` cross-field
@@ -2643,28 +2651,38 @@ systemd unit:
   wraps in its role: trading enabled or rebalancing enabled or paused on the
   primary, rebalancing enabled or paused on a secondary) is covered by an allow
   policy whose consensus the authenticated API user can satisfy alone and whose
-  target condition provably applies on that chain's id. Applicable deny policies
-  take precedence; unknown allow or deny applicability, unsupported consensus, a
-  hedged chain with no pinned settlement stable, and missing coverage fail
-  closed, naming the chain, symbol, token contract, and spender. Only after both
-  gates pass may activation stop the old process and install the candidate
-  files, so a policy or config failure leaves the running bot untouched; a
-  failed stop aborts before candidate files are installed. It then verifies
-  migrations, chowns data files, writes the git-rev marker, touches the
-  activation marker, and restarts the unit. The server writes its PID to a
-  systemd-managed runtime-directory file only after Conductor has completed
-  startup initialization and every essential supervised runtime task has reached
-  a pending run state. Activation waits for that PID to match the unit's live
-  main process with a bounded startup timeout. If the process exits, readiness
-  reporting fails, or the timeout expires first, activation prints the unit
-  status and recent journal, exits non-zero, and deploy-rs rolls the profile
-  back. The unit remains `Type=simple` so automatic rollback stays compatible
-  with service generations from before the readiness handshake was introduced.
-  The first rollout requires deploying the system profile before the service
-  profile; a service-only deploy verifies the installed unit exposes the
-  expected ready file before stopping the running bot and otherwise fails
-  immediately with the required rollout order. Outside systemd, the server uses
-  a no-op readiness notifier so local runs remain available.
+  target condition provably applies on that chain's id. It proves the same for
+  every call each served cash corridor signs, on the corridor chain and on the
+  Ethereum hub, each on its own chain id. Both ends sign the hop: for CCTP the
+  settlement stable's approve to `TokenMessengerV2`, `depositForBurn` on it and
+  `receiveMessage` on `MessageTransmitterV2`; for Relay the settlement stable's
+  approve to the depository and `depositErc20` on it, with our wallet as
+  depositor. Around the hop the corridor chain signs the cash vault's
+  `withdraw4` and `deposit4` on its deposit spender, and the hub signs the USDC
+  `transfer` to Alpaca's deposit address. Applicable deny policies take
+  precedence; unknown allow or deny applicability, unsupported consensus, a
+  hedged chain with no pinned settlement stable, a corridor whose chain is not
+  hedged, a Relay corridor on a chain with no pinned depository, and missing
+  coverage fail closed, naming the chain, symbol, token contract, and spender,
+  or the corridor, chain, function and contract. Only after both gates pass may
+  activation stop the old process and install the candidate files, so a policy
+  or config failure leaves the running bot untouched; a failed stop aborts
+  before candidate files are installed. It then verifies migrations, chowns data
+  files, writes the git-rev marker, touches the activation marker, and restarts
+  the unit. The server writes its PID to a systemd-managed runtime-directory
+  file only after Conductor has completed startup initialization and every
+  essential supervised runtime task has reached a pending run state. Activation
+  waits for that PID to match the unit's live main process with a bounded
+  startup timeout. If the process exits, readiness reporting fails, or the
+  timeout expires first, activation prints the unit status and recent journal,
+  exits non-zero, and deploy-rs rolls the profile back. The unit remains
+  `Type=simple` so automatic rollback stays compatible with service generations
+  from before the readiness handshake was introduced. The first rollout requires
+  deploying the system profile before the service profile; a service-only deploy
+  verifies the installed unit exposes the expected ready file before stopping
+  the running bot and otherwise fails immediately with the required rollout
+  order. Outside systemd, the server uses a no-op readiness notifier so local
+  runs remain available.
 - `dashboard` (kind = `static`) - frontend assets served by nginx; the deploy
   step is `systemctl reload nginx` and there is no managed systemd unit.
 - `datasette` (kind = `plain`) - read-only SQLite explorer over the hedge DB.
@@ -2704,22 +2722,28 @@ _Configuration management_:
   activation to `/run/agenix/`
 - `st0x`-kind binaries use `--config` + `--secrets` flags; `plain`-kind units
   invoke their package binary with declared `args`
-- The secrets file carries only actual secrets: per-chain `rpc_url` entries, the
-  `[rest_api]` key pair, the `[issuance]` `api_key`, the `[relay]` `api_key`,
-  and (legacy Alpaca only) the `[broker]` `api_key`/`api_secret` pair under its
-  `type` tag. Everything else that once lived there is identity, not
-  credentials, and belongs in the plaintext config: the broker `type`, `mode`,
-  `account_id` and (keyless variant) `client_id`/`kms_key_version` in the config
-  `[broker]` section, and the issuance `base_url` in the config `[issuance]`
-  section. (Migration note, one release: the deprecated secrets-file copies of
-  these identity fields are still accepted with a warning, because deployed
-  secret versions carry them; a field set differently in both files is refused
-  at startup rather than silently resolved. The keyless alpaca-broker-api-kms
-  `[broker]` table migrates all-or-nothing: while it remains in the secrets file
-  its fields stay required there, and the migration step is to delete the whole
-  table once the config carries the identity. The shims and this tolerance are
-  removed next release, together with the `[alerts]` shims described under
-  Operational Alerting.)
+- The secrets file carries only actual secrets: the `[rest_api]` key pair, the
+  `[wallet]` credentials of a credential-bearing wallet, the `[pricing]`
+  `api_key` when pricing authenticates with a static key, the `[issuance]`
+  `api_key`, the `[relay]` `api_key`, and (legacy Alpaca only) the `[broker]`
+  `api_key`/`api_secret` pair under its `type` tag. A KMS-stamped Turnkey wallet
+  takes `[wallet] kms_api_key` from the config instead, and
+  `[pricing] gcp_id_token = true` replaces the pricing key with the machine's
+  Google identity. Everything else that once lived there is identity or
+  endpoint, not credentials, and belongs in the plaintext config: the broker
+  `type`, `mode`, `account_id` and (keyless variant)
+  `client_id`/`kms_key_version` in the config `[broker]` section, the issuance
+  `base_url` in the config `[issuance]` section, and each chain's `rpc_url` in
+  its config `[chains.<name>]` table. (Migration note, one release: the
+  deprecated secrets-file copies of these fields are still accepted with a
+  warning, because deployed secret versions carry them; when a field is set
+  differently in both files, the config value wins and the secrets-file copy is
+  ignored with a startup warning, since the config is the copy operators now
+  edit. The keyless alpaca-broker-api-kms `[broker]` table migrates
+  all-or-nothing: while it remains in the secrets file its fields stay required
+  there, and the migration step is to delete the whole table once the config
+  carries the identity. The shims and this tolerance are removed next release,
+  together with the `[alerts]` shims described under Operational Alerting.)
 - Every chain RPC client, the bot's providers and the signing wallets alike, is
   built through `st0x-rpc`. An `rpc_url` that is a bare
   `https://<network>.g.alchemy.com/v2` carries no API key: each request sends an
@@ -2828,14 +2852,19 @@ The deploy-time Turnkey verifier never signs or submits an activity. It uses the
 same deterministic approval-target builder as server startup, identifies the
 authenticated API user, and lists policies. It accepts only allow policies whose
 consensus that user can satisfy alone and whose condition it can prove applies
-to `SIGN_TRANSACTION` V2 ERC20 `approve` calls for the target token. It trusts
-the raw `0x095ea7b3` selector, not ABI-derived function fields whose smart
-contract interface registration it cannot prove, and rejects applicable or
-unprovable deny policies. This check is intentionally conservative because
-Turnkey does not expose a policy-simulation endpoint. Condition and consensus
-matching ignores syntax whitespace only outside single-quoted literals; literal
-contents remain byte-for-byte significant so a policy with extra literal
-whitespace cannot be certified as covering the runtime activity.
+to `SIGN_TRANSACTION` V2 calls to the target contract with the target's
+selector: ERC20 `approve` for every startup and hop approve, the hop's own
+selector for its contract calls. It trusts raw selectors (`0x095ea7b3` for
+`approve`), not ABI-derived function fields whose smart contract interface
+registration it cannot prove. A condition on the first argument word
+(`eth.tx.data[34..74]`) is proven only where that word is an address the gate
+knows (an approve's spender, a Relay deposit's depositor, a vault call's token);
+on any other call, the Alpaca `transfer` included, it is unprovable. It rejects
+applicable or unprovable deny policies. This check is intentionally conservative
+because Turnkey does not expose a policy-simulation endpoint. Condition and
+consensus matching ignores syntax whitespace only outside single-quoted
+literals; literal contents remain byte-for-byte significant so a policy with
+extra literal whitespace cannot be certified as covering the runtime activity.
 
 ## Crate Architecture
 
@@ -4841,6 +4870,18 @@ struct FirstDeposit {
     max_quote_loss_bps: u16,
 }
 
+// A deposit of a reverted order the escrow scan found on chain, as
+// `SwapOverdeposited` lists it. `request_id` is the key `relay status` takes;
+// `amount` is in the origin stable's smallest unit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FoundSwapDeposit {
+    request_id: B256,
+    order_id: B256,
+    deposit_tx: TxHash,
+    deposit_block: u64,
+    amount: U256,
+}
+
 // One transaction a quote asks the origin wallet to send.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct SwapStep {
@@ -4969,8 +5010,9 @@ enum UsdcRebalance {
     // Relay hop, chain side first (see "Relay hop"). `signed_order_ids`
     // holds every order id a deposit was ever signed for and never shrinks.
     // `reverted_quotes` holds the quote of every signed deposit that mined and
-    // reverted, carried through every swap state up to `SwapFailed`: the
-    // escrow scan watches their order ids (see "Relay recovery").
+    // reverted, carried through every swap state up to `SwapFailed` and
+    // `SwapOverdeposited`: the escrow scan watches their order ids (see
+    // "Relay recovery").
     SwapQuoted {
         direction: RebalanceDirection,
         corridor: UsdcCorridor,
@@ -5080,6 +5122,23 @@ enum UsdcRebalance {
         refund_requotes: u32,
         initiated_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
+    },
+    // The escrow scan found deposits of several reverted orders, or one of an
+    // order quoted for another amount: more of the stable is with Relay, or
+    // refunded at the hub, than one attempt's amount. `deposits` lists them;
+    // no quote and no approves are kept. Guard held, never polled or
+    // re-armed, until `transfer reconcile`.
+    SwapOverdeposited {
+        direction: RebalanceDirection,
+        corridor: UsdcCorridor,
+        amount: Usdc,
+        first_deposit: FirstDeposit,
+        signed_order_ids: Vec<B256>,
+        reverted_quotes: Vec<SwapQuote>,
+        deposits: Vec<FoundSwapDeposit>,
+        refund_requotes: u32,
+        initiated_at: DateTime<Utc>,
+        held_at: DateTime<Utc>,
     },
     // The withdrawn (or refunded) stable is on its way back into the
     // corridor chain's vault. `deposit_tx` is recorded before the
@@ -5261,7 +5320,13 @@ failure:
    or refund Relay names but the chain still does not show is paged and read
    again every 30 minutes, as an unproven one is (step 7). Within the window a
    `failure` with `DEPOSIT_REORGED` waits as well, as the deposit may be
-   included again; past it, it is a failure (step 8).
+   included again; past the window it is a failure (step 8). A deposit the
+   escrow scan adopted (`adopted` on the state) shares its request with the
+   reverted attempt, and Relay's failure of that attempt can list the same
+   signed deposit: within the window any `failure` or failed refund of it waits,
+   and past the window one whose deposits (`inTxHashes`) list it is a failure,
+   while one that does not leaves it at `SwapEscrowUnresolved`, read again every
+   30 minutes. A failure of a deposit the bot signed is a failure at once.
 7. A `success` is adopted only once `verify_fill` proves its one fill tx on the
    destination chain (see `docs/relay.md`, Proofs): `ConfirmSwapFill` ->
    `RelayFillVerified` -> `Bridged` with `HopEvidence::Relay`, its
@@ -5389,34 +5454,38 @@ startup skips that chain's approvals and revokes.
 Every swap state except `ReturnedToSource` holds the corridor guard and refuses
 `fail-usdc-transfer` (a deposit may be on chain), and the timeout sweep holds
 the guard of every one, in either direction. A short `SwapRefunded` is
-reconcilable in either direction. On the chain-to-Alpaca side only `SwapFailed`,
-`Redepositing` and a destination-side `SwapRefunded` are also reconcilable; on
-the Alpaca-to-chain side `SwapFailed`, `SwapQuoted` and `SwapRefunded` are, as
-each holds the stable at the hub or in the chain wallet with no automated step
-left once paged. The predicate reads no hold marker, so it also accepts an
-Alpaca-to-chain `SwapQuoted` or `SwapRefunded` whose job still drives it (a
-fresh quote, a revert's redrive, a refund being quoted again): the operator
-reconciles one only after its hold's page. A reconcile that lands while the job
-runs ends it there, since `Reconciled` refuses every later swap command. The
-operator exit of a chain-to-Alpaca transfer held at `WithdrawalComplete` or
-`SwapQuoted` is `transfer resume --kind usdc --direction to-alpaca`: the job
-re-quotes and signs, or redeposits on a refusal, as the bot's own retry does. An
+reconcilable in either direction, and so is `SwapOverdeposited`. On the
+chain-to-Alpaca side only `SwapFailed`, `Redepositing` and a destination-side
+`SwapRefunded` are also reconcilable; on the Alpaca-to-chain side `SwapFailed`,
+`SwapQuoted` and `SwapRefunded` are, as each holds the stable at the hub or in
+the chain wallet with no automated step left once paged. The predicate reads no
+hold marker, so it also accepts an Alpaca-to-chain `SwapQuoted` or
+`SwapRefunded` whose job still drives it (a fresh quote, a revert's redrive, a
+refund being quoted again): the operator reconciles one only after its hold's
+page. A reconcile that lands while the job runs ends it there, since
+`Reconciled` refuses every later swap command. The operator exit of a
+chain-to-Alpaca transfer held at `WithdrawalComplete` or `SwapQuoted` is
+`transfer resume --kind usdc --direction to-alpaca`: the job re-quotes and
+signs, or redeposits on a refusal, as the bot's own retry does. An
 Alpaca-to-chain transfer held at `WithdrawalComplete` after a refused binding
 quote resumes the same way, `--direction to-raindex`, or is failed with
 `fail-usdc-transfer` and reconciled. On the shared Ethereum wallet's credit
-ledger an Ethereum-origin `SwapQuoted` is held credit, a persisted Ethereum pair
-is in flight, and a refund paid in Ethereum USDC (`SwapRefunded` on the Ethereum
-side) is held credit, so a Base deposit send that would spend the USDC a Relay
-swap is about to deposit or was refunded pages a shortfall. The ledger only
-pages: it reserves nothing and does not block the send. A persisted pair has no
-operator exit in this build (`transfer reconcile` and `fail-usdc-transfer`
-refuse `SwapDepositPrepared`, and a resume only sends the same bytes again), so
-a pending Relay approve or deposit is never cancelled or replaced at its nonce
-by hand: the transfer would keep its guard with nothing to move it on.
+ledger an Ethereum-origin `SwapQuoted` is held credit, and so is the
+`SwapOverdeposited` hold recorded from it, a persisted Ethereum pair is in
+flight, and a refund paid in Ethereum USDC (`SwapRefunded` on the Ethereum side)
+is held credit, so a Base deposit send that would spend the USDC a Relay swap is
+about to deposit or was refunded pages a shortfall. The ledger only pages: it
+reserves nothing and does not block the send. A persisted pair has no operator
+exit in this build (`transfer reconcile` and `fail-usdc-transfer` refuse
+`SwapDepositPrepared`, and a resume only sends the same bytes again), so a
+pending Relay approve or deposit is never cancelled or replaced at its nonce by
+hand: the transfer would keep its guard with nothing to move it on.
 `transfer recheck --kind usdc` reads a held escrow (`SwapEscrowUnresolved`,
 `SwapFailed`) again and adopts a late fill or refund (see "Relay recovery"); it
 refuses every other Relay state, and a Relay `DepositFailed` is settled with
-`transfer reconcile`.
+`transfer reconcile`. A `SwapOverdeposited` hold has `transfer reconcile` as its
+only exit: `transfer resume` is refused before anything is enqueued, and
+`transfer recheck` and `fail-usdc-transfer` refuse it too.
 
 ##### Relay recovery
 
@@ -5431,13 +5500,13 @@ signing a second deposit while an earlier one may still land:
   `SwapEscrowUnresolved` and `Redepositing`. The job routes by the recorded
   corridor, so a `WithdrawalComplete` resumes through the Relay hop (the binding
   quote) and never reaches a CCTP burn. A short or destination-side
-  `SwapRefunded` and a `SwapFailed` are holds for the operator and are not
-  re-armed; a short late refund adopted by the escrow scan or by
-  `transfer recheck` (which pages it) holds the same way. The vault deposit of a
-  `Redepositing` is recorded only after its broadcast, so a crash between the
-  two leaves no tx to confirm, and the re-armed job sends a second deposit: it
-  reverts and pages when the first one already took the USDG, or, with more USDG
-  in the wallet, lands too.
+  `SwapRefunded`, a `SwapFailed` and a `SwapOverdeposited` are holds for the
+  operator and are not re-armed; a short refund of a deposit the escrow scan
+  adopted, or one adopted by `transfer recheck` (which pages it), holds the same
+  way. The vault deposit of a `Redepositing` is recorded only after its
+  broadcast, so a crash between the two leaves no tx to confirm, and the
+  re-armed job sends a second deposit: it reverts and pages when the first one
+  already took the USDG, or, with more USDG in the wallet, lands too.
 - **Re-broadcast, never re-sign.** The persisted envelopes are restored before
   any other send from their wallet (see "Relay hop"), and a resume of
   `SwapDepositPrepared` broadcasts exactly those bytes. A new pair is signed
@@ -5451,34 +5520,46 @@ signing a second deposit while an earlier one may still land:
   bot scans the origin chain's depository from the lowest `origin_from_block` of
   those quotes for our deposits of their order ids, so no new pair is signed and
   nothing is redeposited from `SwapQuoted` while one of them is on chain. A
-  deposit found is never left behind: its order's status is read, and a fill or
-  refund that proves is adopted (`RecoverSwapCompletion` ->
-  `SwapCompletionRecovered`). Until then the transfer signs nothing, pages, and
-  reads it again every 30 minutes. Deposits of several reverted orders found
-  together are never adopted: each holds the transfer's amount, so adopting one
-  payment would release the guard with the other still at Relay; the transfer
-  pages and holds at `SwapQuoted` for the operator. A scan that fails is retried
-  and signs nothing either.
-- **Late adoption.** `SwapCompletionRecovered` adopts a proven late payment of a
-  signed order: from `SwapQuoted`, a reverted order whose deposit the scan
-  found, which leaves `reverted_quotes`; from `SwapFailed`, through
-  `transfer recheck`, the failed order itself, keeping the reverted quotes for
-  the escrow scan, which reads them again once the transfer is back at
-  `SwapQuoted`; while it is `SwapFailed` nothing scans them. A fill continues as
-  any `Bridged`, and the other reverted orders are no longer watched; a refund
-  continues as any `SwapRefunded` of that order (redeposited, re-quoted or
-  held). Only an Alpaca-to-chain refund's re-quote goes back to `SwapQuoted`: a
-  chain-to-Alpaca refund is redeposited with no scan first, so, as after a fill,
-  a deposit of another reverted order that lands later is left to the operator.
-  An earlier refund at the hub is not counted among the found deposits: when the
-  scan of its re-quote finds and adopts an older reverted order, that refund
-  stays in the Ethereum wallet, untracked, for the operator. `transfer recheck`
-  of an unresolved escrow records a proven payment of its deposited order with
+  deposit found is never left behind. One found deposit of both its order's and
+  the current quote's `amount_in` is adopted as the swap's deposit
+  (`AdoptSwapDeposit` -> `SwapDepositAdopted` -> `SwapDeposited` on that order's
+  quote, which leaves `reverted_quotes`) and read through the normal path (steps
+  6 to 8): its fill window starts at the adoption, and a failure Relay reports
+  for it past the window, listing the deposit, ends at `SwapFailed`, paged once.
+  Deposits of several reverted orders found together are never adopted: each
+  holds the transfer's amount, so adopting one payment would release the guard
+  with the other still at Relay. Nor is one whose order was quoted for another
+  amount (before an Alpaca-to-chain refund at the hub, whose re-quote is for the
+  refunded amount). Either is recorded, once its lone approves confirm (see
+  below), as the hold `SwapOverdeposited` (`HoldOverdepositedSwap`), which lists
+  every found deposit (request id, order id, deposit tx, block, amount), pages
+  once when recorded, holds the guard and is never polled or re-armed; the
+  operator settles every listed order with Relay, moves the funds by hand and
+  runs `transfer reconcile`, which alone releases the guard. A scan that fails
+  is retried and signs nothing either.
+- **Late adoption.** `SwapCompletionRecovered` adopts a proven late payment of
+  the failed order of a `SwapFailed`, through `transfer recheck`, keeping the
+  reverted quotes for the escrow scan, which reads them again once the transfer
+  is back at `SwapQuoted`; while it is `SwapFailed` nothing scans them. The
+  command is refused from `SwapQuoted`; a `SwapCompletionRecovered` recorded
+  there by an earlier build still replays. A fill continues as any `Bridged`,
+  and the other reverted orders are no longer watched; a refund continues as any
+  `SwapRefunded` of that order (redeposited, re-quoted or held). Only an
+  Alpaca-to-chain refund's re-quote goes back to `SwapQuoted`: a chain-to-Alpaca
+  refund is redeposited with no scan first, so, as after a fill, a deposit of
+  another reverted order that lands later is left to the operator. An earlier
+  refund at the hub is never booked against an older order's deposit: that order
+  was quoted for more than the refund's re-quote, so the scan records the
+  `SwapOverdeposited` hold instead of adopting it. `transfer recheck` of an
+  unresolved escrow records a proven payment of its deposited order with
   `ConfirmSwapFill` or `RecordSwapRefund`. Once a deposit of a reverted order is
   found, approves that went out alone are sent again, confirmed and their gas
-  queued, before a `SwapQuoted` adopts it or holds: a reconcile ending the hold
-  drops them. Superseding an order adds its id to `signed_order_ids` and never
-  drops one.
+  queued, before a `SwapQuoted` adopts it or holds: neither the adoption nor
+  `SwapOverdeposited` keeps them. While one does not confirm, the transfer
+  neither adopts nor holds: each attempt pages the found deposits, records
+  nothing and ends with `FoundSwapDepositApprovesUnconfirmed`, which the job
+  re-queues after 10 minutes at no retry cost. Superseding an order adds its id
+  to `signed_order_ids` and never drops one.
 
 ##### Crash-safe resume
 
@@ -5641,6 +5722,17 @@ enum UsdcRebalanceCommand {
     // Records the persisted deposit once it has the origin chain's
     // confirmations; refused for any other tx.
     ConfirmSwapDeposit { deposit_tx: TxHash, deposit_block: u64 },
+    // Adopts, from `SwapQuoted`, the deposit of a reverted order the escrow
+    // scan found on chain as the swap's deposit (-> `SwapDeposited` on that
+    // order's quote). Refused for an order that is not a reverted one, and
+    // for a deposit of another amount than its order's or the current
+    // quote's `amount_in`.
+    AdoptSwapDeposit { deposit: SwapDeposit<B256> },
+    // Holds a `SwapQuoted` at `SwapOverdeposited` on found deposits of
+    // reverted orders that are not one deposit `AdoptSwapDeposit` takes:
+    // several, or one of another amount. Refused for an order that is not a
+    // reverted one, for an empty list, and for a lone adoptable deposit.
+    HoldOverdepositedSwap { deposits: Vec<FoundSwapDeposit> },
     // Replaces an expired or already-signed quote on `SwapQuoted` (same
     // input), or quotes again an Alpaca-to-chain refund paid at the hub (its
     // input is `amount_refunded`); always an order id never signed before.
@@ -5657,9 +5749,9 @@ enum UsdcRebalanceCommand {
     FailSwap { reason: String },
     // The fill window passed with no terminal status.
     RecordSwapEscrowUnresolved,
-    // A fill or refund proven late for a signed order: from `SwapQuoted` a
-    // reverted order whose deposit the escrow scan found on chain, from
-    // `SwapFailed` the failed order. The same floors as `ConfirmSwapFill` and
+    // A fill or refund proven late for the failed order of a `SwapFailed`;
+    // refused from `SwapQuoted`, though a recorded `SwapCompletionRecovered`
+    // from there still replays. The same floors as `ConfirmSwapFill` and
     // `RecordSwapRefund`: a fill against that order's quote, a refund against
     // the transfer's first deposit.
     RecoverSwapCompletion { order_id: B256, deposit_tx: TxHash, payment: RecoveredSwapPayment },
@@ -5773,6 +5865,15 @@ enum UsdcRebalanceEvent {
         prepared_at: DateTime<Utc>,
     },
     SwapDeposited { deposit_tx: TxHash, deposit_block: u64, deposited_at: DateTime<Utc> },
+    // The escrow scan's found deposit of reverted order `order_id`, adopted
+    // as the swap's deposit: -> `SwapDeposited` on that order's quote, its
+    // fill window counted from `adopted_at`.
+    SwapDepositAdopted {
+        order_id: B256,
+        deposit_tx: TxHash,
+        deposit_block: u64,
+        adopted_at: DateTime<Utc>,
+    },
     SwapRequoted { quote: SwapQuote, quoted_at: DateTime<Utc> },
     SwapDepositReverted { deposit_tx: TxHash, reverted_at: DateTime<Utc> },
     // `fee_collected` is the input less `amount_received`; `relayer_fee` is
@@ -5797,6 +5898,9 @@ enum UsdcRebalanceEvent {
     },
     SwapEscrowUnresolved { unresolved_at: DateTime<Utc> },
     SwapFailed { reason: String, failed_at: DateTime<Utc> },
+    // The escrow scan's found deposits that one attempt's amount cannot
+    // account for: -> `SwapOverdeposited`, held for `transfer reconcile`.
+    SwapOverdeposited { deposits: Vec<FoundSwapDeposit>, held_at: DateTime<Utc> },
     // A late fill (-> `Bridged`, `HopEvidence::Relay` of `order_id` and
     // `deposit_tx`, booked by the P&L as `RelayFillVerified` is) or refund
     // (-> `SwapRefunded` on that order's quote) of a signed order.
@@ -7545,10 +7649,10 @@ transfer dispatch. It does not calculate cross-venue inventory imbalances.
 - Post-burn `UsdcRebalanceEvent::BridgingFailed`, any AlpacaToBase
   `BridgingFailed` (post-withdrawal, so the funds are off Alpaca even without
   burn evidence), `DepositFailed`, and BaseToAlpaca `ConversionFailed` (the
-  post-deposit USDC->USD leg), and the Relay `SwapFailed` - Keeps source
-  inflight and the USDC rebalancing guard active because the funds left the
-  source venue and are not available there. The same applies to any transfer
-  that times out at or after the burn
+  post-deposit USDC->USD leg), and the Relay `SwapFailed` and
+  `SwapOverdeposited` - Keeps source inflight and the USDC rebalancing guard
+  active because the funds left the source venue and are not available there.
+  The same applies to any transfer that times out at or after the burn
 - `InventorySnapshotEvent::OnchainEquity` - Onchain equity balances fetched from
   vaults
 - `InventorySnapshotEvent::OnchainCash` - Onchain USDC balance fetched from
@@ -7877,13 +7981,13 @@ chain-to-Alpaca `WithdrawalComplete`: its resume quotes, re-broadcasts or reads
 Relay and never burns. Reconcilable failures (`DepositFailed`, a
 `BridgingFailed` with burn evidence or in the AlpacaToBase direction, a
 BaseToAlpaca `ConversionFailed`, and the Relay holds (see "Relay hop"):
-`SwapFailed`, a `SwapRefunded` below its refund floor, a chain-to-Alpaca
-`Redepositing` or `SwapRefunded` paid on Ethereum, and an Alpaca-to-chain
-`SwapQuoted` or `SwapRefunded`) keep the guard held until the operator settles
-them with `transfer reconcile --kind usdc`. All other guarded states keep the
-guard held and page the operator for manual recovery. A candidate that cannot be
-loaded or parsed at boot, or a post-burn failure whose corridor the running bot
-cannot read, latches every corridor until a restart.
+`SwapFailed`, `SwapOverdeposited`, a `SwapRefunded` below its refund floor, a
+chain-to-Alpaca `Redepositing` or `SwapRefunded` paid on Ethereum, and an
+Alpaca-to-chain `SwapQuoted` or `SwapRefunded`) keep the guard held until the
+operator settles them with `transfer reconcile --kind usdc`. All other guarded
+states keep the guard held and page the operator for manual recovery. A
+candidate that cannot be loaded or parsed at boot, or a post-burn failure whose
+corridor the running bot cannot read, latches every corridor until a restart.
 
 **Operator recovery of a pre-burn stranded guard latch**: A USDC rebalance can
 become stranded in `WithdrawalComplete` (pre-bridging, no burn intent recorded)
@@ -7997,13 +8101,13 @@ so. The command is valid ONLY from a terminal failure that strands the guard:
 `AlpacaToBase` `BridgingFailed` (post-withdrawal, so the funds are off Alpaca
 even without burn evidence -- the settlement-retry-deadline terminal), or a
 `BaseToAlpaca` `ConversionFailed` (the post-deposit USDC->USD leg), or one of
-the Relay holds (see "Relay hop"): `SwapFailed`, a `SwapRefunded` below its
-refund floor, a chain-to-Alpaca `Redepositing` or `SwapRefunded` paid on
-Ethereum, and an Alpaca-to-chain `SwapQuoted` or `SwapRefunded`. Every other
-state is rejected -- an in-progress transfer must be resumed, and a failure
-whose funds never left the source venue reconciles to source on its own. Because
-`Reconciled` is a clearable terminal, a restart does not re-latch the guard, and
-automatic USDC rebalancing resumes.
+the Relay holds (see "Relay hop"): `SwapFailed`, `SwapOverdeposited`, a
+`SwapRefunded` below its refund floor, a chain-to-Alpaca `Redepositing` or
+`SwapRefunded` paid on Ethereum, and an Alpaca-to-chain `SwapQuoted` or
+`SwapRefunded`. Every other state is rejected -- an in-progress transfer must be
+resumed, and a failure whose funds never left the source venue reconciles to
+source on its own. Because `Reconciled` is a clearable terminal, a restart does
+not re-latch the guard, and automatic USDC rebalancing resumes.
 
 Reconcile also applies to the equity transfer aggregates (`TokenizedEquityMint`,
 `EquityRedemption`): a mint or redemption stuck in its `Failed` terminal whose
@@ -9270,6 +9374,25 @@ All read data flows through a single WebSocket connection:
 Message types (`ServerMessage`, `InitialState`, etc.) are defined in the
 `st0x-dto` crate (`crates/dto/src/lib.rs`) and auto-generated as TypeScript
 types via `ts-rs`. The DTO crate is the source of truth for all wire formats.
+
+##### Inventory per chain
+
+The inventory payload (the `current_state` seed and every `inventory_snapshot`)
+keeps its flat `onchain*` figures for the primary chain's vault, as the
+t0.devops liquidity exporter reads them. Beside them, each symbol and the cash
+row carry `chains`: one entry per hedged chain whose vault a snapshot has read,
+the same chains as the `liq_equity_chain_*` and `liq_usdc_chain_*` series. An
+equity entry is in that chain's wrapped vault shares, so entries never sum
+across chains; a cash entry names its chain's settlement stable. Each entry's
+`band` holds a target and a deviation as decimal strings. For an equity they are
+the listing's Target Share on that chain and the Deviation Band; an enabled or
+paused listing has one, a disabled listing none. The planner measures an
+equity's share in underlying shares, through each chain's wrapper ratio, and the
+payload carries no ratio, so the band cannot be checked against `available`. For
+cash they are the chain's corridor threshold: the target for the vault's share
+of itself plus the broker's gross cash, and its deviation. A chain whose cash
+asset rebalances has it, whatever the USDC mode; any other chain has none. The
+`settings` band fields keep their meaning.
 
 ##### TanStack Query Integration
 

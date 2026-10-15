@@ -326,7 +326,7 @@ impl UsdcRebalanceStage {
                 Some(Self::SwapQuoted)
             }
             SwapDepositPrepared { .. } => Some(Self::SwapDepositPrepared),
-            SwapDeposited { .. } => Some(Self::SwapDeposited),
+            SwapDeposited { .. } | SwapDepositAdopted { .. } => Some(Self::SwapDeposited),
             SwapRefunded { .. }
             | SwapCompletionRecovered {
                 payment: SwapRecovery::Refund { .. },
@@ -361,6 +361,7 @@ impl UsdcRebalanceStage {
             | BridgingFailed { .. }
             | DepositFailed { .. }
             | SwapFailed { .. }
+            | SwapOverdeposited { .. }
             | ReturnedToSource { .. }
             | OperatorReconciled { .. } => None,
         }
@@ -405,7 +406,14 @@ impl UsdcRebalanceStage {
             (Self::SwapDepositPrepared, SwapDepositPrepared { prepared_at, .. }) => {
                 Some(*prepared_at)
             }
-            (Self::SwapDeposited, SwapDeposited { deposited_at, .. }) => Some(*deposited_at),
+            (
+                Self::SwapDeposited,
+                SwapDeposited { deposited_at, .. }
+                | SwapDepositAdopted {
+                    adopted_at: deposited_at,
+                    ..
+                },
+            ) => Some(*deposited_at),
             (Self::Bridged, Bridged { minted_at, .. }) => Some(*minted_at),
             (Self::Bridged, BridgingCompletionRecovered { recovered_at, .. })
             | (Self::DepositConfirmed, DepositCompletionRecovered { recovered_at, .. }) => {
@@ -1070,7 +1078,7 @@ impl RebalancingService {
         //   - `WithdrawalFailed` is always pre-burn (nothing left the source),
         //     so absent tracking correctly clears.
         match event {
-            DepositFailed { .. } | SwapFailed { .. } => true,
+            DepositFailed { .. } | SwapFailed { .. } | SwapOverdeposited { .. } => true,
             ConversionFailed { .. } => match self.usdc_tracking.read().await.get(id) {
                 Some(tracking) => tracking.is_post_burn(),
                 None => self.durable_guard_hold(id).await,
@@ -1171,6 +1179,7 @@ impl RebalancingService {
             | SwapDepositReverted { .. }
             | SwapDepositPrepared { .. }
             | SwapDeposited { .. }
+            | SwapDepositAdopted { .. }
             | SwapRefunded { .. }
             | SwapEscrowUnresolved { .. }
             | SwapCompletionRecovered {
@@ -1309,10 +1318,10 @@ impl RebalancingService {
                     self.cancel_tracked_usdc_rebalance(id).await?
                 }
             }
-            // A Relay failure holds its guard like a post-burn failure: the
-            // classifier always preserves it.
-            SwapFailed { .. } => {
-                self.warn_if_post_burn_tracking_missing(id).await;
+            // A Relay failure or overdeposit hold holds its guard like a
+            // post-burn failure: the classifier always preserves it.
+            SwapFailed { .. } | SwapOverdeposited { .. } => {
+                self.seed_held_tracking_if_missing(id).await;
                 UsdcSettlementOutcome::Reconciled
             }
             // The stable is back in the vault it left: credit what came back,
@@ -1428,6 +1437,53 @@ impl RebalancingService {
             },
             DurableCorridor::Missing | DurableCorridor::Unread => ActiveUsdcRebalance::Unknown,
         }
+    }
+
+    /// Seeds, for a held Relay state recorded with no tracking (its job was
+    /// re-armed at startup from a state startup does not track), the entry
+    /// startup guard recovery writes for that state: the timeout sweep then
+    /// sees it and releases the guard once it is reconciled from the CLI.
+    async fn seed_held_tracking_if_missing(&self, id: &UsdcRebalanceId) {
+        if self.usdc_tracking.read().await.contains_key(id) {
+            return;
+        }
+        let store = self.usdc_store.read().await.as_ref().map(Arc::clone);
+        let Some(store) = store else {
+            warn!(target: "rebalance", %id, "No usdc_store handle to seed the tracking of an untracked Relay hold; its guard is released only after a restart");
+            return;
+        };
+        let entity = match store.load(id).await {
+            Ok(Some(entity)) => entity,
+            Ok(None) => {
+                warn!(target: "rebalance", %id, "Untracked Relay hold for an aggregate the store cannot find; nothing seeded");
+                return;
+            }
+            Err(error) => {
+                warn!(target: "rebalance", %id, ?error, "Failed to load an untracked Relay hold to seed its tracking; its guard is released only after a restart");
+                return;
+            }
+        };
+        let Some((direction, amount, last_progress_at)) = entity.guard_recovery_tracking_data()
+        else {
+            warn!(target: "rebalance", %id, state = entity.state_name(), "Untracked Relay hold has no tracking seed in its current state; nothing seeded");
+            return;
+        };
+
+        self.usdc_tracking
+            .write()
+            .await
+            .entry(id.clone())
+            .or_insert_with(|| UsdcRebalanceTracking {
+                corridor: entity.corridor(),
+                direction,
+                initiated_amount: amount,
+                bridged_amount_received: None,
+                // Post-burn shaped, as startup's seed: the sweep then checks
+                // the durable state on every tick.
+                stage: UsdcRebalanceStage::BridgingInitiated,
+                last_progress_at,
+            });
+        warn!(target: "rebalance", %id, state = entity.state_name(), "Seeded the tracking of a Relay hold recorded with none, so the sweep releases its guard once it is reconciled");
     }
 
     async fn warn_if_post_burn_tracking_missing(&self, id: &UsdcRebalanceId) {
@@ -3821,6 +3877,15 @@ mod tests {
         entry.track_progress(&withdrawal_confirmed_event());
         assert_eq!(entry.stage, UsdcRebalanceStage::WithdrawalConfirmed);
         assert_eq!(entry.last_progress_at, ts(103));
+
+        entry.track_progress(&UsdcRebalanceEvent::SwapDepositAdopted {
+            order_id: B256::repeat_byte(0x0a),
+            deposit_tx: TxHash::repeat_byte(0xc2),
+            deposit_block: 12,
+            adopted_at: ts(150),
+        });
+        assert_eq!(entry.stage, UsdcRebalanceStage::SwapDeposited);
+        assert_eq!(entry.last_progress_at, ts(150));
     }
 
     #[test]

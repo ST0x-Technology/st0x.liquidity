@@ -85,6 +85,7 @@ use std::str::FromStr;
 use tracing::warn;
 use uuid::Uuid;
 
+use st0x_bridge::SwapDeposit;
 use st0x_bridge::corridor::{HopKind, UsdcCorridor, legacy_base_cctp};
 use st0x_dto::{TransferOperation, UsdcBridgeOperation, UsdcBridgeStatus};
 use st0x_event_sorcery::{
@@ -360,10 +361,32 @@ pub enum UsdcRebalanceError {
     /// A refund paid at the other end is not in the vault chain's wallet.
     #[error("the swap refund was paid on the destination chain; there is nothing to redeposit")]
     RefundNotOnOrigin,
-    /// A late payment names an order this transfer has no recovery for: not
-    /// a reverted one, nor the failed one of a `SwapFailed`.
-    #[error("order {order_id} is not a signed order this transfer can adopt a payment of")]
+    /// A late payment or a found deposit names an order this transfer cannot
+    /// adopt: not the failed one of a `SwapFailed`, nor a reverted one of a
+    /// `SwapQuoted`.
+    #[error("order {order_id} is not a signed order this transfer can adopt")]
     SwapOrderNotRecoverable { order_id: B256 },
+    /// A found deposit of a reverted order for another input than its order's
+    /// quote or the current quote, as one of an order quoted before a refund
+    /// re-quote is.
+    #[error("the deposit of order {order_id} is for {deposited}, not {expected}")]
+    AdoptedDepositAmountMismatch {
+        order_id: B256,
+        deposited: U256,
+        expected: U256,
+    },
+    /// An overdeposit hold lists one order's deposit, or one deposit tx,
+    /// more than once.
+    #[error("the overdeposit hold lists order {order_id} (deposit {deposit_tx}) more than once")]
+    FoundDepositListedTwice { order_id: B256, deposit_tx: TxHash },
+    /// An overdeposit hold lists a deposit under another request than its
+    /// reverted order's quote.
+    #[error("the overdeposit hold lists order {order_id} under request {listed}, not {quoted}")]
+    FoundDepositRequestMismatch {
+        order_id: B256,
+        listed: B256,
+        quoted: B256,
+    },
     /// The redeposit's vault deposit is already recorded.
     #[error("the redeposit {deposit_tx} is already recorded")]
     RedepositAlreadySubmitted { deposit_tx: TxHash },
@@ -601,6 +624,16 @@ pub enum UsdcRebalanceCommand {
         deposit_tx: TxHash,
         deposit_block: u64,
     },
+    /// Adopt the confirmed deposit of a reverted order, found on chain by
+    /// the escrow scan, as the swap's deposit. Valid only from `SwapQuoted`,
+    /// for an order in its reverted quotes and a deposit of both that
+    /// order's and the current quote's input.
+    AdoptSwapDeposit { deposit: SwapDeposit<B256> },
+    /// Hold for the operator on found deposits of reverted orders that are
+    /// not one adoptable deposit: several, or one of another input than its
+    /// order's or the current quote's. Valid only from `SwapQuoted`, for
+    /// orders in its reverted quotes.
+    HoldOverdepositedSwap { deposits: Vec<FoundSwapDeposit> },
     /// Replace an expired or already-signed quote. Valid only from
     /// `SwapQuoted`; same input, an order id never signed.
     RequoteSwap { quote: Box<SwapQuote> },
@@ -626,8 +659,7 @@ pub enum UsdcRebalanceCommand {
     /// Relay failed the order with nothing paid back. Valid from
     /// `SwapDeposited` and `SwapEscrowUnresolved`.
     FailSwap { reason: String },
-    /// A fill or refund proven late for a signed order: a reverted one from
-    /// `SwapQuoted`, or the failed one from `SwapFailed`.
+    /// A fill or refund proven late for the failed order of a `SwapFailed`.
     RecoverSwapCompletion {
         order_id: B256,
         deposit_tx: TxHash,
@@ -869,6 +901,15 @@ pub enum UsdcRebalanceEvent {
         deposit_block: u64,
         deposited_at: DateTime<Utc>,
     },
+    /// The escrow scan's confirmed deposit of reverted order `order_id`,
+    /// adopted as the swap's deposit; the fill window counts from
+    /// `adopted_at`.
+    SwapDepositAdopted {
+        order_id: B256,
+        deposit_tx: TxHash,
+        deposit_block: u64,
+        adopted_at: DateTime<Utc>,
+    },
     /// A fresh binding quote replaced an expired or already-signed one.
     SwapRequoted {
         quote: Box<SwapQuote>,
@@ -906,6 +947,13 @@ pub enum UsdcRebalanceEvent {
     SwapFailed {
         reason: String,
         failed_at: DateTime<Utc>,
+    },
+    /// The escrow scan found `deposits` of reverted orders that one
+    /// attempt's amount cannot account for; the transfer holds for the
+    /// operator.
+    SwapOverdeposited {
+        deposits: Vec<FoundSwapDeposit>,
+        held_at: DateTime<Utc>,
     },
     /// A late fill or refund of signed order `order_id`, whose deposit is
     /// `deposit_tx`, proven on chain.
@@ -1027,12 +1075,14 @@ impl DomainEvent for UsdcRebalanceEvent {
             Self::SwapApprovePrepared { .. } => "UsdcRebalanceEvent::SwapApprovePrepared",
             Self::SwapDepositPrepared { .. } => "UsdcRebalanceEvent::SwapDepositPrepared",
             Self::SwapDeposited { .. } => "UsdcRebalanceEvent::SwapDeposited",
+            Self::SwapDepositAdopted { .. } => "UsdcRebalanceEvent::SwapDepositAdopted",
             Self::SwapRequoted { .. } => "UsdcRebalanceEvent::SwapRequoted",
             Self::SwapDepositReverted { .. } => "UsdcRebalanceEvent::SwapDepositReverted",
             Self::RelayFillVerified { .. } => "UsdcRebalanceEvent::RelayFillVerified",
             Self::SwapRefunded { .. } => "UsdcRebalanceEvent::SwapRefunded",
             Self::SwapEscrowUnresolved { .. } => "UsdcRebalanceEvent::SwapEscrowUnresolved",
             Self::SwapFailed { .. } => "UsdcRebalanceEvent::SwapFailed",
+            Self::SwapOverdeposited { .. } => "UsdcRebalanceEvent::SwapOverdeposited",
             Self::SwapCompletionRecovered { .. } => "UsdcRebalanceEvent::SwapCompletionRecovered",
             Self::RedepositStarted { .. } => "UsdcRebalanceEvent::RedepositStarted",
             Self::RedepositSubmitted { .. } => "UsdcRebalanceEvent::RedepositSubmitted",
@@ -1250,6 +1300,35 @@ impl FirstDeposit {
             .checked_mul(U256::from(kept))
             .ok_or_else(undefined)?
             .div_ceil(U256::from(SCALE)))
+    }
+}
+
+/// A confirmed deposit of a reverted order that the escrow scan found on
+/// chain, as `SwapOverdeposited` lists it: `request_id` is the key
+/// `stox relay status` takes, `amount` is in the origin stable's smallest unit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FoundSwapDeposit {
+    pub request_id: B256,
+    pub order_id: B256,
+    pub deposit_tx: TxHash,
+    pub deposit_block: u64,
+    pub amount: U256,
+}
+
+impl Display for FoundSwapDeposit {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            request_id,
+            order_id,
+            deposit_tx,
+            deposit_block,
+            amount,
+        } = self;
+        write!(
+            formatter,
+            "request {request_id} (order {order_id}, deposit {deposit_tx} in block \
+             {deposit_block} of {amount})"
+        )
     }
 }
 
@@ -1471,6 +1550,10 @@ pub enum UsdcRebalance {
         reverted_quotes: Vec<SwapQuote>,
         deposit_tx: TxHash,
         deposit_block: u64,
+        /// The escrow scan adopted the deposit of a reverted order, whose
+        /// request Relay may still report failed for that attempt.
+        #[serde(default)]
+        adopted: bool,
         #[serde(default)]
         refund_requotes: u32,
         initiated_at: DateTime<Utc>,
@@ -1511,6 +1594,9 @@ pub enum UsdcRebalance {
         #[serde(default)]
         reverted_quotes: Vec<SwapQuote>,
         deposit_tx: TxHash,
+        /// As in `SwapDeposited`.
+        #[serde(default)]
+        adopted: bool,
         #[serde(default)]
         refund_requotes: u32,
         initiated_at: DateTime<Utc>,
@@ -1534,6 +1620,22 @@ pub enum UsdcRebalance {
         refund_requotes: u32,
         initiated_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
+    },
+    /// More of the transfer's stable is with Relay, or refunded at the hub,
+    /// than one attempt's amount: the escrow scan found deposits of several
+    /// reverted orders, or one of an order quoted before a hub refund.
+    /// Nothing automated moves it; held for `transfer reconcile`.
+    SwapOverdeposited {
+        direction: RebalanceDirection,
+        corridor: UsdcCorridor,
+        amount: Usdc,
+        first_deposit: FirstDeposit,
+        signed_order_ids: Vec<B256>,
+        reverted_quotes: Vec<SwapQuote>,
+        deposits: Vec<FoundSwapDeposit>,
+        refund_requotes: u32,
+        initiated_at: DateTime<Utc>,
+        held_at: DateTime<Utc>,
     },
     /// The withdrawn or refunded stable is on its way back into the vault;
     /// `deposit_tx` is recorded before the confirmation wait.
@@ -1687,6 +1789,7 @@ impl UsdcRebalance {
             | Self::SwapRefunded { corridor, .. }
             | Self::SwapEscrowUnresolved { corridor, .. }
             | Self::SwapFailed { corridor, .. }
+            | Self::SwapOverdeposited { corridor, .. }
             | Self::Redepositing { corridor, .. }
             | Self::ReturnedToSource { corridor, .. }
             | Self::Bridged { corridor, .. }
@@ -1719,6 +1822,7 @@ impl UsdcRebalance {
             Self::SwapRefunded { .. } => "SwapRefunded",
             Self::SwapEscrowUnresolved { .. } => "SwapEscrowUnresolved",
             Self::SwapFailed { .. } => "SwapFailed",
+            Self::SwapOverdeposited { .. } => "SwapOverdeposited",
             Self::Redepositing { .. } => "Redepositing",
             Self::ReturnedToSource { .. } => "ReturnedToSource",
             Self::Bridged { .. } => "Bridged",
@@ -1769,6 +1873,7 @@ impl UsdcRebalance {
             | Self::SwapRefunded { .. }
             | Self::SwapEscrowUnresolved { .. }
             | Self::SwapFailed { .. }
+            | Self::SwapOverdeposited { .. }
             | Self::Redepositing { .. }
             | Self::ReturnedToSource { .. }
             | Self::BridgingFailed { .. }
@@ -1814,6 +1919,7 @@ impl UsdcRebalance {
             | Self::SwapRefunded { .. }
             | Self::SwapEscrowUnresolved { .. }
             | Self::SwapFailed { .. }
+            | Self::SwapOverdeposited { .. }
             | Self::Redepositing { .. }
             | Self::ReturnedToSource { .. }
             | Self::Bridged { .. }
@@ -1850,6 +1956,7 @@ impl UsdcRebalance {
                 ..
             }
             | Self::SwapFailed { .. }
+            | Self::SwapOverdeposited { .. }
             | Self::Redepositing { .. }
             | Self::SwapRefunded {
                 short_of_floor: Some(_),
@@ -2003,7 +2110,8 @@ impl UsdcRebalance {
             | Self::SwapFailed {
                 direction: RebalanceDirection::AlpacaToBase,
                 ..
-            } => PreBurnFailEligibility::RelayHeldOutsideVault,
+            }
+            | Self::SwapOverdeposited { .. } => PreBurnFailEligibility::RelayHeldOutsideVault,
             // The two states `FailBridging` accepts from before any burn.
             // `BridgingSubmitting` with no recorded burn is the only genuinely
             // pre-burn form; the operator still verifies on-chain that no
@@ -2141,6 +2249,13 @@ impl UsdcRebalance {
                 amount,
                 initiated_at,
                 failed_at,
+                ..
+            }
+            | Self::SwapOverdeposited {
+                direction,
+                amount,
+                initiated_at,
+                held_at: failed_at,
                 ..
             }
             // The cash did not move: the stable went back into its vault.
@@ -2399,7 +2514,14 @@ impl UsdcRebalance {
             }),
             // An Ethereum-origin swap: quoted, its input is still in the
             // wallet; once a pair is signed it may be on chain.
+            // The overdeposit hold keeps what its `SwapQuoted` held: no pair
+            // was signed for the current quote.
             Self::SwapQuoted {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                ..
+            }
+            | Self::SwapOverdeposited {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 ..
@@ -2431,6 +2553,7 @@ impl UsdcRebalance {
             | Self::SwapRefunded { .. }
             | Self::SwapEscrowUnresolved { .. }
             | Self::SwapFailed { .. }
+            | Self::SwapOverdeposited { .. }
             | Self::Redepositing { .. }
             | Self::ReturnedToSource { .. }
             | Self::Converting { .. }
@@ -2481,6 +2604,7 @@ impl UsdcRebalance {
             | Self::SwapRefunded { .. }
             | Self::SwapEscrowUnresolved { .. }
             | Self::SwapFailed { .. }
+            | Self::SwapOverdeposited { .. }
             | Self::Redepositing { .. }
             | Self::Bridged { .. }
             | Self::DepositInitiated { .. }
@@ -2615,6 +2739,7 @@ impl UsdcRebalance {
             | Self::SwapRefunded { direction, .. }
             | Self::SwapEscrowUnresolved { direction, .. }
             | Self::SwapFailed { direction, .. }
+            | Self::SwapOverdeposited { direction, .. }
             | Self::Redepositing { direction, .. }
             | Self::ReturnedToSource { direction, .. }
             | Self::Bridged { direction, .. }
@@ -2701,6 +2826,12 @@ impl UsdcRebalance {
                 direction,
                 amount,
                 failed_at,
+                ..
+            }
+            | Self::SwapOverdeposited {
+                direction,
+                amount,
+                held_at: failed_at,
                 ..
             }
             | Self::SwapRefunded {
@@ -2800,6 +2931,7 @@ impl UsdcRebalance {
             | Self::SwapRefunded { amount, .. }
             | Self::SwapEscrowUnresolved { amount, .. }
             | Self::SwapFailed { amount, .. }
+            | Self::SwapOverdeposited { amount, .. }
             | Self::Redepositing { amount, .. }
             | Self::ReturnedToSource { amount, .. }
             | Self::BridgingFailed { amount, .. }
@@ -2928,6 +3060,7 @@ impl UsdcRebalance {
                 ..
             }
             | Self::SwapFailed { .. }
+            | Self::SwapOverdeposited { .. }
             | Self::ReturnedToSource { .. }
             | Self::Bridged { .. }
             | Self::DepositInitiated { .. }
@@ -2997,6 +3130,8 @@ pub(crate) async fn interrupted_usdc_rebalance_ids(
                'UsdcRebalanceEvent::SwapApprovePrepared', \
                'UsdcRebalanceEvent::SwapDepositPrepared', \
                'UsdcRebalanceEvent::SwapDeposited', \
+               'UsdcRebalanceEvent::SwapDepositAdopted', \
+               'UsdcRebalanceEvent::SwapOverdeposited', \
                'UsdcRebalanceEvent::SwapRequoted', \
                'UsdcRebalanceEvent::SwapDepositReverted', \
                'UsdcRebalanceEvent::RelayFillVerified', \
@@ -3386,6 +3521,7 @@ fn recorded_burn_tx(event: &UsdcRebalanceEvent) -> Option<TxHash> {
         | SwapApprovePrepared { .. }
         | SwapDepositPrepared { .. }
         | SwapDeposited { .. }
+        | SwapDepositAdopted { .. }
         | SwapCompletionRecovered { .. }
         | SwapRequoted { .. }
         | SwapDepositReverted { .. }
@@ -3393,6 +3529,7 @@ fn recorded_burn_tx(event: &UsdcRebalanceEvent) -> Option<TxHash> {
         | SwapRefunded { .. }
         | SwapEscrowUnresolved { .. }
         | SwapFailed { .. }
+        | SwapOverdeposited { .. }
         | RedepositStarted { .. }
         | RedepositSubmitted { .. }
         | ReturnedToSource { .. }
@@ -3491,6 +3628,7 @@ async fn ethereum_credit_candidate_ids(pool: &SqlitePool) -> Result<Vec<String>,
                'UsdcRebalanceEvent::SwapDepositPrepared', \
                'UsdcRebalanceEvent::SwapRequoted', \
                'UsdcRebalanceEvent::SwapDepositReverted', \
+               'UsdcRebalanceEvent::SwapOverdeposited', \
                'UsdcRebalanceEvent::SwapRefunded', \
                'UsdcRebalanceEvent::RelayFillVerified', \
                'UsdcRebalanceEvent::SwapCompletionRecovered', \
@@ -3667,7 +3805,12 @@ impl EventSourced for UsdcRebalance {
     // v17: `reverted_quotes` on the swap states, `quote`, `first_deposit`
     // and `refund_requotes` on `SwapFailed`, and `SwapCompletionRecovered`,
     // whose refund carries `short_of_floor`.
-    const SCHEMA_VERSION: u64 = 17;
+    // v18: `adopted` on `SwapDeposited` and `SwapEscrowUnresolved`, for a
+    // deposit the escrow scan adopted, whose Relay failure is waited out.
+    // v19: the `SwapOverdeposited` state and event, the recorded hold on found
+    // deposits of reverted Relay orders that one attempt cannot account for.
+    // A new state variant, so stale snapshots are rebuilt from events.
+    const SCHEMA_VERSION: u64 = 19;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use UsdcRebalanceEvent::*;
@@ -4320,9 +4463,85 @@ impl EventSourced for UsdcRebalance {
                 reverted_quotes: reverted_quotes.clone(),
                 deposit_tx: *deposit_tx,
                 deposit_block: *deposit_block,
+                adopted: false,
                 refund_requotes: *refund_requotes,
                 initiated_at: *initiated_at,
                 deposited_at: *deposited_at,
+            },
+
+            // The adopted order's quote becomes the swap's and leaves the
+            // reverted quotes the escrow scan watches; the lone approves were
+            // confirmed and their gas queued before the adoption.
+            (
+                SwapDepositAdopted {
+                    order_id,
+                    deposit_tx,
+                    deposit_block,
+                    adopted_at,
+                },
+                Self::SwapQuoted {
+                    direction,
+                    corridor,
+                    amount,
+                    first_deposit,
+                    signed_order_ids,
+                    reverted_quotes,
+                    refund_requotes,
+                    initiated_at,
+                    ..
+                },
+            ) => {
+                let Some(adopted) = reverted_quotes
+                    .iter()
+                    .find(|reverted| reverted.order_id == *order_id)
+                else {
+                    return Ok(None);
+                };
+                Self::SwapDeposited {
+                    direction: *direction,
+                    corridor: *corridor,
+                    amount: *amount,
+                    first_deposit: *first_deposit,
+                    quote: Box::new(adopted.clone()),
+                    signed_order_ids: signed_order_ids.clone(),
+                    reverted_quotes: reverted_quotes
+                        .iter()
+                        .filter(|reverted| reverted.order_id != *order_id)
+                        .cloned()
+                        .collect(),
+                    deposit_tx: *deposit_tx,
+                    deposit_block: *deposit_block,
+                    adopted: true,
+                    refund_requotes: *refund_requotes,
+                    initiated_at: *initiated_at,
+                    deposited_at: *adopted_at,
+                }
+            }
+
+            (
+                SwapOverdeposited { deposits, held_at },
+                Self::SwapQuoted {
+                    direction,
+                    corridor,
+                    amount,
+                    first_deposit,
+                    signed_order_ids,
+                    reverted_quotes,
+                    refund_requotes,
+                    initiated_at,
+                    ..
+                },
+            ) => Self::SwapOverdeposited {
+                direction: *direction,
+                corridor: *corridor,
+                amount: *amount,
+                first_deposit: *first_deposit,
+                signed_order_ids: signed_order_ids.clone(),
+                reverted_quotes: reverted_quotes.clone(),
+                deposits: deposits.clone(),
+                refund_requotes: *refund_requotes,
+                initiated_at: *initiated_at,
+                held_at: *held_at,
             },
 
             (
@@ -4530,6 +4749,7 @@ impl EventSourced for UsdcRebalance {
                     signed_order_ids,
                     reverted_quotes,
                     deposit_tx,
+                    adopted,
                     refund_requotes,
                     initiated_at,
                     ..
@@ -4543,6 +4763,7 @@ impl EventSourced for UsdcRebalance {
                 signed_order_ids: signed_order_ids.clone(),
                 reverted_quotes: reverted_quotes.clone(),
                 deposit_tx: *deposit_tx,
+                adopted: *adopted,
                 refund_requotes: *refund_requotes,
                 initiated_at: *initiated_at,
                 unresolved_at: *unresolved_at,
@@ -4921,6 +5142,20 @@ impl EventSourced for UsdcRebalance {
                         reconciled_at: *reconciled_at,
                     },
 
+                    // The operator settled every found deposit with Relay.
+                    Self::SwapOverdeposited { deposits, .. } => Self::Reconciled {
+                        direction: *direction,
+                        corridor: state.corridor(),
+                        amount: *amount,
+                        reason: *reason,
+                        failure_reason: Some(format!(
+                            "deposits of reverted Relay orders found on chain: {}",
+                            deposits.iter().join(", ")
+                        )),
+                        initiated_at: *initiated_at,
+                        reconciled_at: *reconciled_at,
+                    },
+
                     // BridgingFailed: eligibility decided by
                     // `is_reconcilable_failure` (burn evidence, or an
                     // AlpacaToBase whose withdrawal completed).
@@ -5137,6 +5372,8 @@ impl EventSourced for UsdcRebalance {
             | PrepareSwapApprove { .. }
             | PrepareSwapDeposit { .. }
             | ConfirmSwapDeposit { .. }
+            | AdoptSwapDeposit { .. }
+            | HoldOverdepositedSwap { .. }
             | RequoteSwap { .. }
             | RecordSwapDepositReverted { .. }
             | ConfirmSwapFill { .. }
@@ -5282,6 +5519,8 @@ impl EventSourced for UsdcRebalance {
                 deposit_tx,
                 deposit_block,
             } => self.transition_confirm_swap_deposit(deposit_tx, deposit_block),
+            AdoptSwapDeposit { deposit } => self.transition_adopt_swap_deposit(deposit),
+            HoldOverdepositedSwap { deposits } => self.transition_hold_overdeposited_swap(deposits),
             RequoteSwap { quote } => self.transition_requote_swap(quote),
             RecordSwapDepositReverted { deposit_tx } => {
                 self.transition_record_swap_deposit_reverted(deposit_tx)
@@ -5632,6 +5871,7 @@ impl UsdcRebalance {
             | Self::SwapRefunded { .. }
             | Self::SwapEscrowUnresolved { .. }
             | Self::SwapFailed { .. }
+            | Self::SwapOverdeposited { .. }
             | Self::Redepositing { .. }
             | Self::ReturnedToSource { .. }
             | Self::Bridged { .. }
@@ -5678,6 +5918,7 @@ impl UsdcRebalance {
             | Self::SwapRefunded { .. }
             | Self::SwapEscrowUnresolved { .. }
             | Self::SwapFailed { .. }
+            | Self::SwapOverdeposited { .. }
             | Self::Redepositing { .. }
             | Self::ReturnedToSource { .. }
             | Self::Bridged { .. }
@@ -5732,6 +5973,7 @@ impl UsdcRebalance {
             | Self::SwapRefunded { .. }
             | Self::SwapEscrowUnresolved { .. }
             | Self::SwapFailed { .. }
+            | Self::SwapOverdeposited { .. }
             | Self::Redepositing { .. }
             | Self::ReturnedToSource { .. } => Err(UsdcRebalanceError::InvalidCommand {
                 command: "BeginBridging".to_string(),
@@ -5818,6 +6060,7 @@ impl UsdcRebalance {
             | Self::SwapRefunded { .. }
             | Self::SwapEscrowUnresolved { .. }
             | Self::SwapFailed { .. }
+            | Self::SwapOverdeposited { .. }
             | Self::Redepositing { .. }
             | Self::ReturnedToSource { .. } => Err(UsdcRebalanceError::InvalidCommand {
                 command: "InitiateBridging".to_string(),
@@ -5869,6 +6112,7 @@ impl UsdcRebalance {
             | Self::SwapRefunded { .. }
             | Self::SwapEscrowUnresolved { .. }
             | Self::SwapFailed { .. }
+            | Self::SwapOverdeposited { .. }
             | Self::Redepositing { .. }
             | Self::ReturnedToSource { .. } => Err(UsdcRebalanceError::InvalidCommand {
                 command: "RecordPendingBurn".to_string(),
@@ -5913,6 +6157,7 @@ impl UsdcRebalance {
             | Self::SwapRefunded { .. }
             | Self::SwapEscrowUnresolved { .. }
             | Self::SwapFailed { .. }
+            | Self::SwapOverdeposited { .. }
             | Self::Redepositing { .. }
             | Self::ReturnedToSource { .. } => Err(UsdcRebalanceError::InvalidCommand {
                 command: "ClearPendingBurn".to_string(),
@@ -5965,6 +6210,7 @@ impl UsdcRebalance {
             | Self::SwapRefunded { .. }
             | Self::SwapEscrowUnresolved { .. }
             | Self::SwapFailed { .. }
+            | Self::SwapOverdeposited { .. }
             | Self::Redepositing { .. }
             | Self::ReturnedToSource { .. } => Err(UsdcRebalanceError::InvalidCommand {
                 command: "ReceiveAttestation".to_string(),
@@ -6014,6 +6260,7 @@ impl UsdcRebalance {
             | Self::SwapRefunded { .. }
             | Self::SwapEscrowUnresolved { .. }
             | Self::SwapFailed { .. }
+            | Self::SwapOverdeposited { .. }
             | Self::Redepositing { .. }
             | Self::ReturnedToSource { .. } => Err(UsdcRebalanceError::InvalidCommand {
                 command: "TimeoutAttestation".to_string(),
@@ -6066,6 +6313,7 @@ impl UsdcRebalance {
             | Self::SwapRefunded { .. }
             | Self::SwapEscrowUnresolved { .. }
             | Self::SwapFailed { .. }
+            | Self::SwapOverdeposited { .. }
             | Self::Redepositing { .. }
             | Self::ReturnedToSource { .. } => Err(UsdcRebalanceError::InvalidCommand {
                 command: "ConfirmBridging".to_string(),
@@ -6110,6 +6358,7 @@ impl UsdcRebalance {
             | Self::SwapRefunded { .. }
             | Self::SwapEscrowUnresolved { .. }
             | Self::SwapFailed { .. }
+            | Self::SwapOverdeposited { .. }
             | Self::Redepositing { .. }
             | Self::ReturnedToSource { .. } => Err(UsdcRebalanceError::InvalidCommand {
                 command: "FailBridging".to_string(),
@@ -6293,6 +6542,7 @@ impl UsdcRebalance {
             | Self::SwapRefunded { .. }
             | Self::SwapEscrowUnresolved { .. }
             | Self::SwapFailed { .. }
+            | Self::SwapOverdeposited { .. }
             | Self::Redepositing { .. }
             | Self::ReturnedToSource { .. } => Err(UsdcRebalanceError::SwapDepositAlreadyPrepared),
             Self::Converting { .. }
@@ -6344,6 +6594,7 @@ impl UsdcRebalance {
             | Self::SwapRefunded { .. }
             | Self::SwapEscrowUnresolved { .. }
             | Self::SwapFailed { .. }
+            | Self::SwapOverdeposited { .. }
             | Self::Redepositing { .. }
             | Self::ReturnedToSource { .. } => Err(UsdcRebalanceError::SwapDepositAlreadyPrepared),
             Self::Converting { .. }
@@ -6393,6 +6644,127 @@ impl UsdcRebalance {
             deposit_tx,
             deposit_block,
             deposited_at: Utc::now(),
+        }])
+    }
+
+    /// Adopts the escrow scan's deposit of a reverted order as the swap's
+    /// deposit: only from `SwapQuoted`, and only for a deposit of both its
+    /// order's and the current quote's input, since one of an order quoted
+    /// before a refund re-quote would book the transfer on another amount.
+    fn transition_adopt_swap_deposit(
+        &self,
+        deposit: SwapDeposit<B256>,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        let Self::SwapQuoted {
+            quote,
+            reverted_quotes,
+            ..
+        } = self
+        else {
+            return Err(UsdcRebalanceError::InvalidCommand {
+                command: "AdoptSwapDeposit".to_string(),
+                state: self.state_name().to_string(),
+            });
+        };
+        let SwapDeposit {
+            tx,
+            order_id,
+            amount,
+            block,
+        } = deposit;
+        let Some(reverted) = reverted_quotes
+            .iter()
+            .find(|reverted| reverted.order_id == order_id)
+        else {
+            return Err(UsdcRebalanceError::SwapOrderNotRecoverable { order_id });
+        };
+        if let Some(expected) = [reverted.amount_in, quote.amount_in]
+            .into_iter()
+            .find(|expected| *expected != amount)
+        {
+            return Err(UsdcRebalanceError::AdoptedDepositAmountMismatch {
+                order_id,
+                deposited: amount,
+                expected,
+            });
+        }
+
+        Ok(vec![UsdcRebalanceEvent::SwapDepositAdopted {
+            order_id,
+            deposit_tx: tx,
+            deposit_block: block,
+            adopted_at: Utc::now(),
+        }])
+    }
+
+    /// Holds a `SwapQuoted` for the operator on the escrow scan's deposits
+    /// of reverted orders, when they are not one deposit the transfer could
+    /// adopt: several, or one of another input than its order's or the
+    /// current quote's.
+    fn transition_hold_overdeposited_swap(
+        &self,
+        deposits: Vec<FoundSwapDeposit>,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        let invalid = || UsdcRebalanceError::InvalidCommand {
+            command: "HoldOverdepositedSwap".to_string(),
+            state: self.state_name().to_string(),
+        };
+        let Self::SwapQuoted {
+            quote,
+            reverted_quotes,
+            ..
+        } = self
+        else {
+            return Err(invalid());
+        };
+        let found = deposits
+            .iter()
+            .map(|deposit| {
+                reverted_quotes
+                    .iter()
+                    .find(|reverted| reverted.order_id == deposit.order_id)
+                    .map(|reverted| (deposit, reverted))
+                    .ok_or(UsdcRebalanceError::SwapOrderNotRecoverable {
+                        order_id: deposit.order_id,
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some((deposit, reverted)) = found
+            .iter()
+            .find(|(deposit, reverted)| deposit.request_id != reverted.request_id)
+        {
+            return Err(UsdcRebalanceError::FoundDepositRequestMismatch {
+                order_id: deposit.order_id,
+                listed: deposit.request_id,
+                quoted: reverted.request_id,
+            });
+        }
+        if let Some(deposit) = deposits
+            .iter()
+            .duplicates_by(|deposit| deposit.order_id)
+            .chain(deposits.iter().duplicates_by(|deposit| deposit.deposit_tx))
+            .next()
+        {
+            return Err(UsdcRebalanceError::FoundDepositListedTwice {
+                order_id: deposit.order_id,
+                deposit_tx: deposit.deposit_tx,
+            });
+        }
+        match found.as_slice() {
+            [] => return Err(invalid()),
+            // One deposit of its order's and the current quote's input is
+            // adopted instead.
+            [(deposit, reverted)]
+                if deposit.amount == reverted.amount_in && deposit.amount == quote.amount_in =>
+            {
+                return Err(invalid());
+            }
+            _ => {}
+        }
+
+        Ok(vec![UsdcRebalanceEvent::SwapOverdeposited {
+            deposits,
+            held_at: Utc::now(),
         }])
     }
 
@@ -6599,7 +6971,10 @@ impl UsdcRebalance {
         deposit_tx: TxHash,
         payment: RecoveredSwapPayment,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
-        let Some(base) = self.swap_recovery_base() else {
+        // A found deposit of a reverted order is adopted as the swap's
+        // deposit instead (`AdoptSwapDeposit`); a recovery recorded from
+        // `SwapQuoted` still replays through `recovered_swap`.
+        let (Self::SwapFailed { .. }, Some(base)) = (self, self.swap_recovery_base()) else {
             return Err(UsdcRebalanceError::InvalidCommand {
                 command: "RecoverSwapCompletion".to_string(),
                 state: self.state_name().to_string(),
@@ -6792,6 +7167,7 @@ impl UsdcRebalance {
             | Self::SwapDeposited { .. }
             | Self::SwapRefunded { .. }
             | Self::SwapEscrowUnresolved { .. }
+            | Self::SwapOverdeposited { .. }
             | Self::Redepositing { .. }
             | Self::ReturnedToSource { .. }
             | Self::Bridged { .. }
@@ -6954,6 +7330,7 @@ impl UsdcRebalance {
             | Self::SwapRefunded { .. }
             | Self::SwapEscrowUnresolved { .. }
             | Self::SwapFailed { .. }
+            | Self::SwapOverdeposited { .. }
             | Self::Redepositing { .. }
             | Self::ReturnedToSource { .. }
             | Self::Converting { .. }
@@ -6997,6 +7374,7 @@ impl UsdcRebalance {
             | Self::SwapRefunded { .. }
             | Self::SwapEscrowUnresolved { .. }
             | Self::SwapFailed { .. }
+            | Self::SwapOverdeposited { .. }
             | Self::Redepositing { .. }
             | Self::ReturnedToSource { .. }
             | Self::Converting { .. }
@@ -7058,6 +7436,7 @@ impl UsdcRebalance {
             | Self::SwapRefunded { .. }
             | Self::SwapEscrowUnresolved { .. }
             | Self::SwapFailed { .. }
+            | Self::SwapOverdeposited { .. }
             | Self::Redepositing { .. }
             | Self::ReturnedToSource { .. }
             | Self::Converting { .. }
@@ -7099,6 +7478,7 @@ impl UsdcRebalance {
             | Self::SwapRefunded { .. }
             | Self::SwapEscrowUnresolved { .. }
             | Self::SwapFailed { .. }
+            | Self::SwapOverdeposited { .. }
             | Self::Redepositing { .. }
             | Self::ReturnedToSource { .. }
             | Self::Converting { .. }
@@ -7277,6 +7657,12 @@ impl UsdcRebalance {
                 ..
             }
             | Self::SwapFailed {
+                direction,
+                amount,
+                initiated_at,
+                ..
+            }
+            | Self::SwapOverdeposited {
                 direction,
                 amount,
                 initiated_at,
@@ -8491,17 +8877,462 @@ mod tests {
         );
     }
 
-    /// A late fill of a reverted order, found on chain from `SwapQuoted`,
-    /// enters `Bridged` with that order's deposit as its evidence; a refund
-    /// of it enters `SwapRefunded` on its quote and leaves the watch list.
-    /// An order that is not a reverted one, or a fill below its floor, is
-    /// refused.
+    /// The escrow scan's deposit of reverted order 0x0a, for the current
+    /// quote's input, enters `SwapDeposited` on that order's quote: it leaves
+    /// the watched reverted quotes and its fill window starts at the
+    /// adoption. An order that is not a reverted one, or a state past
+    /// `SwapQuoted`, refuses it.
     #[tokio::test]
-    async fn late_payment_of_a_reverted_order_is_recovered_from_swap_quoted() {
+    async fn adopted_reverted_deposit_enters_swap_deposited_on_its_order() {
+        let requoted = reverted_and_requoted(RebalanceDirection::BaseToAlpaca);
+        let adopt = |order_id: B256| UsdcRebalanceCommand::AdoptSwapDeposit {
+            deposit: SwapDeposit {
+                tx: TxHash::repeat_byte(0xc2),
+                order_id,
+                amount: U256::from(100_000_000u64),
+                block: 12,
+            },
+        };
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(requoted.clone())
+            .when(adopt(B256::repeat_byte(0x0a)))
+            .await
+            .events();
+        let [
+            UsdcRebalanceEvent::SwapDepositAdopted {
+                adopted_at,
+                order_id,
+                ..
+            },
+        ] = events.as_slice()
+        else {
+            panic!("expected one SwapDepositAdopted, got {events:?}");
+        };
+        assert_eq!(*order_id, B256::repeat_byte(0x0a));
+        let adopted_at = *adopted_at;
+        let adopted = [requoted.clone(), events].concat();
+        let state = replay::<UsdcRebalance>(adopted.clone()).unwrap().unwrap();
+        let UsdcRebalance::SwapDeposited {
+            quote,
+            reverted_quotes,
+            signed_order_ids,
+            deposit_tx,
+            deposit_block,
+            deposited_at,
+            amount,
+            ..
+        } = &state
+        else {
+            panic!("expected SwapDeposited, got {state:?}");
+        };
+        assert_eq!(**quote, hundred_usdc_quote(0x0a));
+        assert_eq!(
+            *reverted_quotes,
+            Vec::new(),
+            "the adopted order leaves the watch"
+        );
+        assert_eq!(*signed_order_ids, vec![B256::repeat_byte(0x0a)]);
+        assert_eq!(*deposit_tx, TxHash::repeat_byte(0xc2));
+        assert_eq!(*deposit_block, 12);
+        assert_eq!(*deposited_at, adopted_at);
+        assert_eq!(*amount, Usdc::new(float!(100)));
+        assert!(state.holds_rebalance_guard());
+        assert_eq!(
+            state.is_resumable_mid_flight_data(),
+            Some((RebalanceDirection::BaseToAlpaca, Usdc::new(float!(100))))
+        );
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(requoted)
+            .when(adopt(B256::repeat_byte(0x0b)))
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                &error,
+                LifecycleError::Apply(UsdcRebalanceError::SwapOrderNotRecoverable { order_id })
+                    if *order_id == B256::repeat_byte(0x0b)
+            ),
+            "the current order was never deposited: got {error:?}"
+        );
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(adopted)
+            .when(adopt(B256::repeat_byte(0x0a)))
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                &error,
+                LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { command, .. })
+                    if command == "AdoptSwapDeposit"
+            ),
+            "already deposited: got {error:?}"
+        );
+    }
+
+    /// A deposit of an order quoted before an Alpaca-to-chain refund at the
+    /// hub is for more than the refund's re-quote: adopting it would book the
+    /// transfer on another amount, so it is refused, as is a deposit that is
+    /// not of its own order's amount.
+    #[tokio::test]
+    async fn adoption_refuses_a_deposit_of_another_amount() {
+        let refund_requoted = [
+            reverted_and_requoted(RebalanceDirection::AlpacaToBase),
+            vec![
+                UsdcRebalanceEvent::SwapDepositPrepared {
+                    approve: None,
+                    deposit: PreparedTransaction::for_test(TxHash::repeat_byte(0xb2), 7),
+                    prepared_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::SwapDeposited {
+                    deposit_tx: TxHash::repeat_byte(0xb2),
+                    deposit_block: 10,
+                    deposited_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::SwapRefunded {
+                    refund_tx: TxHash::repeat_byte(0xe1),
+                    side: RefundSide::Origin,
+                    amount_refunded: Usdc::new(float!(99.6)),
+                    short_of_floor: None,
+                    shortfall: Usdc::new(float!(0.4)),
+                    refunded_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::SwapRequoted {
+                    quote: Box::new(swap_quote_for_test(
+                        U256::from(99_600_000u64),
+                        B256::repeat_byte(0x1e),
+                    )),
+                    quoted_at: Utc::now(),
+                },
+            ],
+        ]
+        .concat();
+
+        // A deposit of order 0x0a's own 100 is not the current 99.6; one of
+        // 99.6 is the current amount but not what order 0x0a was quoted for.
+        for (deposited, expected) in [(100_000_000u64, 99_600_000u64), (99_600_000, 100_000_000)] {
+            let error = TestHarness::<UsdcRebalance>::with(())
+                .given(refund_requoted.clone())
+                .when(UsdcRebalanceCommand::AdoptSwapDeposit {
+                    deposit: SwapDeposit {
+                        tx: TxHash::repeat_byte(0xc2),
+                        order_id: B256::repeat_byte(0x0a),
+                        amount: U256::from(deposited),
+                        block: 12,
+                    },
+                })
+                .await
+                .then_expect_error();
+
+            assert!(
+                matches!(
+                    &error,
+                    LifecycleError::Apply(UsdcRebalanceError::AdoptedDepositAmountMismatch {
+                        order_id,
+                        deposited: reported,
+                        expected: reported_expected,
+                    }) if *order_id == B256::repeat_byte(0x0a)
+                        && *reported == U256::from(deposited)
+                        && *reported_expected == U256::from(expected)
+                ),
+                "{deposited}: got {error:?}"
+            );
+        }
+    }
+
+    /// [`reverted_and_requoted`], then the deposit of order 0x0b reverted
+    /// too, re-quoted under 0x0c: two reverted orders, both of 100 USDC.
+    fn twice_reverted_and_requoted(direction: RebalanceDirection) -> Vec<UsdcRebalanceEvent> {
+        [
+            reverted_and_requoted(direction),
+            vec![
+                UsdcRebalanceEvent::SwapDepositPrepared {
+                    approve: None,
+                    deposit: PreparedTransaction::for_test(TxHash::repeat_byte(0xa3), 8),
+                    prepared_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::SwapDepositReverted {
+                    deposit_tx: TxHash::repeat_byte(0xa3),
+                    reverted_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::SwapRequoted {
+                    quote: Box::new(hundred_usdc_quote(0x0c)),
+                    quoted_at: Utc::now(),
+                },
+            ],
+        ]
+        .concat()
+    }
+
+    fn found_deposit(order_id: u8, amount: u64) -> FoundSwapDeposit {
+        FoundSwapDeposit {
+            request_id: B256::repeat_byte(0x5e),
+            order_id: B256::repeat_byte(order_id),
+            deposit_tx: TxHash::repeat_byte(order_id.wrapping_add(0xc0)),
+            deposit_block: 12,
+            amount: U256::from(amount),
+        }
+    }
+
+    /// Found deposits of both reverted orders hold the transfer at
+    /// `SwapOverdeposited` on either side: guard held and seeded at startup,
+    /// never re-armed, refused by `fail-usdc-transfer`, shown as a
+    /// reconcilable failure, and reconciled with the deposits as its reason.
+    #[tokio::test]
+    async fn overdeposited_swap_lists_its_deposits_and_is_reconcilable_in_either_direction() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let deposits = vec![
+            found_deposit(0x0a, 100_000_000),
+            found_deposit(0x0b, 100_000_000),
+        ];
+
+        for direction in [
+            RebalanceDirection::BaseToAlpaca,
+            RebalanceDirection::AlpacaToBase,
+        ] {
+            let requoted = twice_reverted_and_requoted(direction);
+            let events = TestHarness::<UsdcRebalance>::with(())
+                .given(requoted.clone())
+                .when(UsdcRebalanceCommand::HoldOverdepositedSwap {
+                    deposits: deposits.clone(),
+                })
+                .await
+                .events();
+            let held = [requoted, events].concat();
+            let state = replay::<UsdcRebalance>(held.clone()).unwrap().unwrap();
+            let UsdcRebalance::SwapOverdeposited {
+                deposits: listed,
+                reverted_quotes,
+                amount,
+                initiated_at,
+                held_at,
+                ..
+            } = &state
+            else {
+                panic!("expected SwapOverdeposited, got {state:?}");
+            };
+            assert_eq!(*listed, deposits);
+            assert_eq!(
+                *reverted_quotes,
+                vec![hundred_usdc_quote(0x0a), hundred_usdc_quote(0x0b)]
+            );
+            assert_eq!(*amount, Usdc::new(float!(100)));
+            let (initiated_at, held_at) = (*initiated_at, *held_at);
+            assert!(state.holds_rebalance_guard(), "{direction:?}");
+            assert!(state.is_reconcilable_failure(), "{direction:?}");
+            assert_eq!(
+                state.guard_recovery_tracking_data(),
+                Some((direction, Usdc::new(float!(100)), held_at))
+            );
+            assert_eq!(state.is_resumable_mid_flight_data(), None);
+            assert_eq!(
+                state.prepared_swap_envelopes(),
+                Vec::<&PreparedTransaction>::new()
+            );
+            assert_eq!(
+                state.ethereum_wallet_credit(),
+                match direction {
+                    RebalanceDirection::AlpacaToBase => {
+                        Some(EthereumWalletCredit::Held(Usdc::new(float!(100))))
+                    }
+                    RebalanceDirection::BaseToAlpaca => None,
+                },
+                "{direction:?}"
+            );
+            assert_eq!(
+                state.pre_burn_fail_eligibility(),
+                PreBurnFailEligibility::RelayHeldOutsideVault
+            );
+            let TransferOperation::UsdcBridge(bridge) = state.to_dto(&id) else {
+                panic!("expected UsdcBridge variant");
+            };
+            assert!(
+                matches!(
+                    bridge.status,
+                    UsdcBridgeStatus::Failed {
+                        failed_at,
+                        post_burn: true,
+                    } if failed_at == held_at
+                ),
+                "{direction:?}: got {:?}",
+                bridge.status
+            );
+            assert_eq!(bridge.started_at, initiated_at);
+
+            let events = TestHarness::<UsdcRebalance>::with(())
+                .given(held.clone())
+                .when(UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: ReconcileReason::FundsMovedManually,
+                })
+                .await
+                .events();
+            let reconciled = replay::<UsdcRebalance>([held, events].concat())
+                .unwrap()
+                .unwrap();
+            let UsdcRebalance::Reconciled {
+                failure_reason: Some(failure_reason),
+                ..
+            } = &reconciled
+            else {
+                panic!("expected Reconciled with a reason, got {reconciled:?}");
+            };
+            for deposit in &deposits {
+                assert!(
+                    failure_reason.contains(&deposit.request_id.to_string())
+                        && failure_reason.contains(&format!("in block {}", deposit.deposit_block)),
+                    "{failure_reason}"
+                );
+            }
+            assert!(!reconciled.holds_rebalance_guard());
+        }
+    }
+
+    /// The hold's evidence names each found deposit once, under its reverted
+    /// order's request: a deposit listed twice would stand for a second one,
+    /// and another request would become the operator's lookup key.
+    #[tokio::test]
+    async fn overdeposit_hold_refuses_duplicate_or_mismatched_evidence() {
+        let requoted = twice_reverted_and_requoted(RebalanceDirection::BaseToAlpaca);
+        let listed = |order_id| FoundSwapDeposit {
+            request_id: B256::repeat_byte(0x5e),
+            ..found_deposit(order_id, 100_000_000)
+        };
+
+        for (deposits, refused) in [
+            (vec![listed(0x0a), listed(0x0a)], "one deposit listed twice"),
+            (
+                vec![
+                    listed(0x0a),
+                    FoundSwapDeposit {
+                        request_id: B256::repeat_byte(0x77),
+                        ..listed(0x0b)
+                    },
+                ],
+                "another order's request",
+            ),
+        ] {
+            let error = TestHarness::<UsdcRebalance>::with(())
+                .given(requoted.clone())
+                .when(UsdcRebalanceCommand::HoldOverdepositedSwap { deposits })
+                .await
+                .then_expect_error();
+            assert!(
+                matches!(
+                    &error,
+                    LifecycleError::Apply(
+                        UsdcRebalanceError::FoundDepositListedTwice { .. }
+                            | UsdcRebalanceError::FoundDepositRequestMismatch { .. }
+                    )
+                ),
+                "{refused}: got {error:?}"
+            );
+        }
+    }
+
+    /// The hold takes only what is not one adoptable deposit: a lone deposit
+    /// of its order's and the current quote's input, an empty list, an order
+    /// that never reverted, or a state other than `SwapQuoted` is refused; a
+    /// lone deposit of another input is held.
+    #[tokio::test]
+    async fn overdeposit_hold_refuses_an_adoptable_or_unknown_deposit() {
+        let requoted = twice_reverted_and_requoted(RebalanceDirection::BaseToAlpaca);
+        let hold_command = |deposits: Vec<FoundSwapDeposit>| {
+            UsdcRebalanceCommand::HoldOverdepositedSwap { deposits }
+        };
+
+        for (deposits, refused) in [
+            (vec![found_deposit(0x0a, 100_000_000)], "adoptable"),
+            (Vec::new(), "nothing found"),
+        ] {
+            let error = TestHarness::<UsdcRebalance>::with(())
+                .given(requoted.clone())
+                .when(hold_command(deposits))
+                .await
+                .then_expect_error();
+            assert!(
+                matches!(
+                    &error,
+                    LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { command, .. })
+                        if command == "HoldOverdepositedSwap"
+                ),
+                "{refused}: got {error:?}"
+            );
+        }
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(requoted.clone())
+            .when(hold_command(vec![
+                found_deposit(0x0a, 100_000_000),
+                found_deposit(0x0c, 100_000_000),
+            ]))
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                &error,
+                LifecycleError::Apply(UsdcRebalanceError::SwapOrderNotRecoverable { order_id })
+                    if *order_id == B256::repeat_byte(0x0c)
+            ),
+            "the current order was never deposited: got {error:?}"
+        );
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(requoted.clone())
+            .when(hold_command(vec![found_deposit(0x0b, 99_000_000)]))
+            .await
+            .events();
+        let held = [requoted, events].concat();
+        assert_eq!(
+            replay::<UsdcRebalance>(held.clone())
+                .unwrap()
+                .unwrap()
+                .state_name(),
+            "SwapOverdeposited"
+        );
+
+        for command in [
+            hold_command(vec![
+                found_deposit(0x0a, 100_000_000),
+                found_deposit(0x0b, 100_000_000),
+            ]),
+            UsdcRebalanceCommand::AdoptSwapDeposit {
+                deposit: SwapDeposit {
+                    tx: TxHash::repeat_byte(0xca),
+                    order_id: B256::repeat_byte(0x0a),
+                    amount: U256::from(100_000_000u64),
+                    block: 12,
+                },
+            },
+        ] {
+            let error = TestHarness::<UsdcRebalance>::with(())
+                .given(held.clone())
+                .when(command)
+                .await
+                .then_expect_error();
+            assert!(
+                matches!(
+                    &error,
+                    LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { state, .. })
+                        if state == "SwapOverdeposited"
+                ),
+                "already held: got {error:?}"
+            );
+        }
+    }
+
+    /// `RecoverSwapCompletion` is refused from `SwapQuoted`, where a found
+    /// deposit is adopted instead; a `SwapCompletionRecovered` an earlier
+    /// build recorded there still replays: a fill into `Bridged` with that
+    /// order's deposit as its evidence, a refund into `SwapRefunded` on its
+    /// quote, out of the watched reverted quotes.
+    #[tokio::test]
+    async fn late_payment_is_refused_from_swap_quoted_and_replays_from_it() {
         let requoted = reverted_and_requoted(RebalanceDirection::AlpacaToBase);
         let late_deposit = TxHash::repeat_byte(0xc2);
 
-        let events = TestHarness::<UsdcRebalance>::with(())
+        let error = TestHarness::<UsdcRebalance>::with(())
             .given(requoted.clone())
             .when(UsdcRebalanceCommand::RecoverSwapCompletion {
                 order_id: B256::repeat_byte(0x0a),
@@ -8512,10 +9343,35 @@ mod tests {
                 },
             })
             .await
-            .events();
-        let state = replay::<UsdcRebalance>([requoted.clone(), events].concat())
-            .unwrap()
-            .unwrap();
+            .then_expect_error();
+        assert!(
+            matches!(
+                &error,
+                LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { command, state })
+                    if command == "RecoverSwapCompletion" && state == "SwapQuoted"
+            ),
+            "got {error:?}"
+        );
+
+        let state = replay::<UsdcRebalance>(
+            [
+                requoted.clone(),
+                vec![UsdcRebalanceEvent::SwapCompletionRecovered {
+                    order_id: B256::repeat_byte(0x0a),
+                    deposit_tx: late_deposit,
+                    payment: SwapRecovery::Fill {
+                        fill_tx: TxHash::repeat_byte(0xf1),
+                        amount_received: Usdc::new(float!(100)),
+                        fee_collected: Usdc::new(float!(0)),
+                        relayer_fee: Usdc::new(float!(0)),
+                    },
+                    recovered_at: Utc::now(),
+                }],
+            ]
+            .concat(),
+        )
+        .unwrap()
+        .unwrap();
         let UsdcRebalance::Bridged {
             hop,
             amount_received,
@@ -8533,29 +9389,31 @@ mod tests {
             }
         );
         assert_eq!(*amount_received, Usdc::new(float!(100)));
-        assert!(state.holds_rebalance_guard());
 
-        let events = TestHarness::<UsdcRebalance>::with(())
-            .given(requoted.clone())
-            .when(UsdcRebalanceCommand::RecoverSwapCompletion {
-                order_id: B256::repeat_byte(0x0a),
-                deposit_tx: late_deposit,
-                payment: RecoveredSwapPayment::Refund {
-                    refund_tx: TxHash::repeat_byte(0xe1),
-                    side: RefundSide::Origin,
-                    amount_refunded: U256::from(99_000_000u64),
-                },
-            })
-            .await
-            .events();
-        let state = replay::<UsdcRebalance>([requoted.clone(), events].concat())
-            .unwrap()
-            .unwrap();
+        let state = replay::<UsdcRebalance>(
+            [
+                requoted,
+                vec![UsdcRebalanceEvent::SwapCompletionRecovered {
+                    order_id: B256::repeat_byte(0x0a),
+                    deposit_tx: late_deposit,
+                    payment: SwapRecovery::Refund {
+                        refund_tx: TxHash::repeat_byte(0xe1),
+                        side: RefundSide::Origin,
+                        amount_refunded: Usdc::new(float!(99.6)),
+                        short_of_floor: None,
+                        shortfall: Usdc::new(float!(0.4)),
+                    },
+                    recovered_at: Utc::now(),
+                }],
+            ]
+            .concat(),
+        )
+        .unwrap()
+        .unwrap();
         let UsdcRebalance::SwapRefunded {
             quote,
             deposit_tx,
             reverted_quotes,
-            signed_order_ids,
             amount_refunded,
             ..
         } = &state
@@ -8564,62 +9422,16 @@ mod tests {
         };
         assert_eq!(quote.order_id, B256::repeat_byte(0x0a));
         assert_eq!(*deposit_tx, late_deposit);
-        assert_eq!(
-            *reverted_quotes,
-            Vec::new(),
-            "the adopted order leaves the watch"
-        );
-        assert_eq!(*signed_order_ids, vec![B256::repeat_byte(0x0a)]);
-        assert_eq!(*amount_refunded, Usdc::new(float!(99)));
-
-        for (command, refused, expected) in [
-            (
-                UsdcRebalanceCommand::RecoverSwapCompletion {
-                    order_id: B256::repeat_byte(0x0b),
-                    deposit_tx: late_deposit,
-                    payment: RecoveredSwapPayment::Fill {
-                        fill_tx: TxHash::repeat_byte(0xf1),
-                        amount_received: U256::from(100_000_000u64),
-                    },
-                },
-                "the current order was never deposited",
-                (|error: &UsdcRebalanceError| {
-                    matches!(error, UsdcRebalanceError::SwapOrderNotRecoverable { .. })
-                }) as fn(&UsdcRebalanceError) -> bool,
-            ),
-            (
-                UsdcRebalanceCommand::RecoverSwapCompletion {
-                    order_id: B256::repeat_byte(0x0a),
-                    deposit_tx: late_deposit,
-                    payment: RecoveredSwapPayment::Fill {
-                        fill_tx: TxHash::repeat_byte(0xf1),
-                        amount_received: U256::from(1u64),
-                    },
-                },
-                "below the floor",
-                |error: &UsdcRebalanceError| {
-                    matches!(error, UsdcRebalanceError::SwapFillBelowMinimum { .. })
-                },
-            ),
-        ] {
-            let error = TestHarness::<UsdcRebalance>::with(())
-                .given(requoted.clone())
-                .when(command)
-                .await
-                .then_expect_error();
-            assert!(
-                matches!(&error, LifecycleError::Apply(inner) if expected(inner)),
-                "{refused}: got {error:?}"
-            );
-        }
+        assert_eq!(*reverted_quotes, Vec::new());
+        assert_eq!(*amount_refunded, Usdc::new(float!(99.6)));
     }
 
     /// A late refund of a re-quoted order is measured against the first
-    /// deposit: 99.2 clears the reverted 99.6 re-quote's floor of 99.102 but
+    /// deposit: 99.2 clears the failed 99.6 re-quote's floor of 99.102 but
     /// not the 100 deposit's floor of 99.5, so it is recorded short.
     #[tokio::test]
     async fn late_refund_of_a_requoted_order_is_short_against_the_first_deposit() {
-        let reverted = [
+        let failed = [
             deposited(RebalanceDirection::AlpacaToBase),
             vec![
                 UsdcRebalanceEvent::SwapRefunded {
@@ -8642,16 +9454,21 @@ mod tests {
                     deposit: PreparedTransaction::for_test(TxHash::repeat_byte(0xa3), 7),
                     prepared_at: Utc::now(),
                 },
-                UsdcRebalanceEvent::SwapDepositReverted {
+                UsdcRebalanceEvent::SwapDeposited {
                     deposit_tx: TxHash::repeat_byte(0xa3),
-                    reverted_at: Utc::now(),
+                    deposit_block: 11,
+                    deposited_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::SwapFailed {
+                    reason: "Relay reported Failure".to_string(),
+                    failed_at: Utc::now(),
                 },
             ],
         ]
         .concat();
 
         let events = TestHarness::<UsdcRebalance>::with(())
-            .given(reverted.clone())
+            .given(failed.clone())
             .when(UsdcRebalanceCommand::RecoverSwapCompletion {
                 order_id: B256::repeat_byte(0x1e),
                 deposit_tx: TxHash::repeat_byte(0xa3),
@@ -8663,7 +9480,7 @@ mod tests {
             })
             .await
             .events();
-        let state = replay::<UsdcRebalance>([reverted, events].concat())
+        let state = replay::<UsdcRebalance>([failed, events].concat())
             .unwrap()
             .unwrap();
 
@@ -8785,8 +9602,8 @@ mod tests {
     }
 
     /// A late fill of the order Relay failed is adopted from `SwapFailed`,
-    /// which then moves on as any `Bridged`; a state with no failed or
-    /// reverted order refuses it.
+    /// which then moves on as any `Bridged`; another order, or a fill below
+    /// the order's floor, is refused, and so is any state but `SwapFailed`.
     #[tokio::test]
     async fn failed_order_adopts_a_late_fill() {
         let failed = [
@@ -8811,7 +9628,7 @@ mod tests {
             .when(fill.clone())
             .await
             .events();
-        let state = replay::<UsdcRebalance>([failed, events].concat())
+        let state = replay::<UsdcRebalance>([failed.clone(), events].concat())
             .unwrap()
             .unwrap();
         assert_eq!(state.state_name(), "Bridged");
@@ -8833,6 +9650,47 @@ mod tests {
             ),
             "got {error:?}"
         );
+
+        for (command, refused, expected) in [
+            (
+                UsdcRebalanceCommand::RecoverSwapCompletion {
+                    order_id: B256::repeat_byte(0x0b),
+                    deposit_tx: TxHash::repeat_byte(0xa2),
+                    payment: RecoveredSwapPayment::Fill {
+                        fill_tx: TxHash::repeat_byte(0xf1),
+                        amount_received: U256::from(100_000_000u64),
+                    },
+                },
+                "not the failed order",
+                (|error: &UsdcRebalanceError| {
+                    matches!(error, UsdcRebalanceError::SwapOrderNotRecoverable { .. })
+                }) as fn(&UsdcRebalanceError) -> bool,
+            ),
+            (
+                UsdcRebalanceCommand::RecoverSwapCompletion {
+                    order_id: B256::repeat_byte(0x0a),
+                    deposit_tx: TxHash::repeat_byte(0xa2),
+                    payment: RecoveredSwapPayment::Fill {
+                        fill_tx: TxHash::repeat_byte(0xf1),
+                        amount_received: U256::from(1u64),
+                    },
+                },
+                "below the floor",
+                |error: &UsdcRebalanceError| {
+                    matches!(error, UsdcRebalanceError::SwapFillBelowMinimum { .. })
+                },
+            ),
+        ] {
+            let error = TestHarness::<UsdcRebalance>::with(())
+                .given(failed.clone())
+                .when(command)
+                .await
+                .then_expect_error();
+            assert!(
+                matches!(&error, LifecycleError::Apply(inner) if expected(inner)),
+                "{refused}: got {error:?}"
+            );
+        }
     }
 
     /// Startup re-arms the job of every Relay state a resume moves on, in

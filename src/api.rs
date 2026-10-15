@@ -2160,13 +2160,15 @@ fn usdc_resume_error_response(error: &UsdcResumeError) -> (StatusCode, String) {
     use UsdcResumeError::{
         Aggregate, AlreadyInFlight, AlreadyTerminal, ApalisDatabase, CashDivergenceEngaged,
         CashRestartTainted, CorridorChoice, CorridorNotServed, Database, DirectionMismatch,
-        EveryCorridorLatched, GasNotReady, GuardHeldElsewhere, NotFound, NotReady, Queue,
+        EveryCorridorLatched, GasNotReady, GuardHeldElsewhere, HeldForReconcile, NotFound,
+        NotReady, Queue,
     };
 
     match error {
         NotFound(_) => (StatusCode::NOT_FOUND, error.to_string()),
         DirectionMismatch { .. }
         | AlreadyTerminal { .. }
+        | HeldForReconcile { .. }
         | CorridorNotServed { .. }
         | CorridorChoice(_) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
         AlreadyInFlight { .. }
@@ -5538,7 +5540,8 @@ mod tests {
         TestKey, jwks_server, test_key, token, verifier,
     };
     use crate::inventory::{
-        self, BroadcastingInventory, PortfolioAsset, PortfolioBalanceRow, PortfolioLocation,
+        self, BroadcastingInventory, OnchainForm, PortfolioAsset, PortfolioBalanceRow,
+        PortfolioLocation,
     };
     use crate::metrics::liquidity::pnl::PnlWindowKey;
     use crate::metrics::liquidity::pnl_refresh::{LivePnlReports, PnlReports};
@@ -7052,7 +7055,10 @@ mod tests {
     ) -> PortfolioBalanceRowWithMark {
         PortfolioBalanceRowWithMark {
             row: PortfolioBalanceRow {
-                location: PortfolioLocation::MarketMaking(Chain::Base),
+                location: PortfolioLocation::Onchain {
+                    chain: Chain::Base,
+                    form: OnchainForm::MarketMaking,
+                },
                 asset: PortfolioAsset::Usdc,
                 available: float!(&amount.to_string()),
                 inflight: float!(0),
@@ -12517,6 +12523,16 @@ mod tests {
         });
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 
+        let (status, message) = usdc_resume_error_response(&UsdcResumeError::HeldForReconcile {
+            id: id.clone(),
+            state: "SwapOverdeposited",
+        });
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            message.contains("transfer reconcile --kind usdc"),
+            "the refusal must name the exit; got: {message}"
+        );
+
         let (status, message) = usdc_resume_error_response(&UsdcResumeError::CorridorNotServed {
             id,
             recorded: UsdcCorridor::HubRouted {
@@ -16320,7 +16336,7 @@ mod tests {
                     captured_at: chrono::Utc.with_ymd_and_hms(2026, 7, 20, 4, 5, 0).unwrap(),
                     rows: vec![PortfolioBalanceRowWithMark {
                         row: PortfolioBalanceRow {
-                            location: PortfolioLocation::Hedging,
+                            location: PortfolioLocation::Offchain,
                             asset: PortfolioAsset::Equity(symbol.clone()),
                             available: float!(10),
                             inflight: float!(0),

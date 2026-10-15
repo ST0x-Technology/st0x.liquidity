@@ -146,17 +146,20 @@ pub(super) async fn set_position_command<W: Write>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use alloy::primitives::TxHash;
     use chrono::{TimeZone, Utc};
-    use st0x_config::ExecutionThreshold;
+    use st0x_config::{ChainAssets, ExecutionThreshold, HedgedChain};
     use st0x_event_sorcery::StoreBuilder;
     use st0x_evm::Chain;
     use st0x_execution::{ClientOrderId, Direction, ExecutorOrderId, FractionalShares};
     use st0x_finance::{Positive, Usd};
     use st0x_float_macro::float;
-    use st0x_hedge::operator::inventory::{PortfolioAsset, PortfolioBalanceRow, PortfolioLocation};
+    use st0x_hedge::operator::inventory::{
+        OnchainForm, PortfolioAsset, PortfolioBalanceRow, PortfolioLocation,
+    };
     use st0x_hedge::operator::offchain::order::{OffchainOrder, OffchainOrderCommand, OrderPlacer};
     use st0x_hedge::operator::portfolio_snapshot::{
         PortfolioBalanceRowWithMark, PortfolioSnapshot, PortfolioSnapshotCommand,
@@ -169,6 +172,7 @@ mod tests {
     use st0x_hedge::operator::test_utils::{
         try_positive_shares, try_rebalancing_enabled_equities, try_setup_test_db,
     };
+    use st0x_hedge::operator::{OperatorError, RejectionReason};
     use uuid::Uuid;
 
     use super::*;
@@ -207,8 +211,11 @@ mod tests {
             day,
             symbol,
             &[
-                PortfolioLocation::MarketMaking(Chain::Base),
-                PortfolioLocation::Hedging,
+                PortfolioLocation::Onchain {
+                    chain: Chain::Base,
+                    form: OnchainForm::MarketMaking,
+                },
+                PortfolioLocation::Offchain,
             ],
         )
         .await;
@@ -250,11 +257,77 @@ mod tests {
     }
 
     /// The refusal keys on the LOCATION holding vault shares, not on
-    /// `MarketMaking` specifically: `BaseWalletWrapped` is the other
-    /// unconverted location, and a symbol whose only wrapped rows sit there
-    /// must be refused the same way.
+    /// market making specifically: a wrapped wallet slot on any chain is the
+    /// other unconverted location, and a symbol whose only wrapped rows sit
+    /// there must be refused the same way.
     #[tokio::test]
-    async fn portfolio_snapshot_repair_refuses_unconfigured_symbol_with_base_wallet_wrapped_rows() {
+    async fn portfolio_snapshot_repair_refuses_unconfigured_symbol_with_wrapped_wallet_rows() {
+        for chain in [Chain::Base, Chain::Robinhood] {
+            let pool = setup_test_db().await;
+            let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+            let symbol = Symbol::new("QSEP").unwrap();
+            seed_missing_portfolio_marks_at(
+                &pool,
+                day,
+                &symbol,
+                &[
+                    PortfolioLocation::Onchain {
+                        chain,
+                        form: OnchainForm::WalletWrapped,
+                    },
+                    PortfolioLocation::Offchain,
+                ],
+            )
+            .await;
+
+            let ctx = ctx_with_equities(&["AAPL"]);
+            let error = set_portfolio_snapshot_mark_command(
+                &mut Vec::new(),
+                &pool,
+                PortfolioSnapshotRecoveryCommand::Set {
+                    day,
+                    symbol: symbol.clone(),
+                    usd_mark: Positive::new(float!(150)).unwrap(),
+                    observed_at: Utc.with_ymd_and_hms(2026, 7, 17, 20, 0, 0).unwrap(),
+                    source: "Nasdaq historical close".parse().unwrap(),
+                    reason: "repair missing mark".parse().unwrap(),
+                },
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+
+            assert!(
+                matches!(
+                    error.downcast_ref::<OperatorError>(),
+                    Some(OperatorError::Rejected(RejectionReason::UnconvertedWrappedEquityRows {
+                        unconverted: 1,
+                        chains,
+                        ..
+                    })) if *chains == BTreeSet::from([chain])
+                ),
+                "a {chain} wrapped-wallet-only holding must refuse like market making; got: {error}"
+            );
+            let priced: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM portfolio_snapshot \
+                 WHERE et_day = ? AND asset = ? AND usd_mark IS NOT NULL",
+            )
+            .bind(day.to_string())
+            .bind(symbol.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(priced, 0, "a refused repair must not price any row");
+        }
+    }
+
+    /// The guard must not over-block: an unconfigured symbol whose wrapped
+    /// rows are gone holds only underlying-unit balances (`Offchain` and
+    /// unwrapped wallet tokens are never converted), so a mark values them
+    /// correctly and the repair proceeds.
+    /// This is what makes reconciling the on-chain side restore repairability.
+    #[tokio::test]
+    async fn portfolio_snapshot_repair_allows_unconfigured_symbol_without_wrapped_rows() {
         let pool = setup_test_db().await;
         let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
         let symbol = Symbol::new("QSEP").unwrap();
@@ -263,47 +336,14 @@ mod tests {
             day,
             &symbol,
             &[
-                PortfolioLocation::BaseWalletWrapped,
-                PortfolioLocation::Hedging,
+                PortfolioLocation::Onchain {
+                    chain: Chain::Robinhood,
+                    form: OnchainForm::WalletUnwrapped,
+                },
+                PortfolioLocation::Offchain,
             ],
         )
         .await;
-
-        let ctx = ctx_with_equities(&["AAPL"]);
-        let error = set_portfolio_snapshot_mark_command(
-            &mut Vec::new(),
-            &pool,
-            PortfolioSnapshotRecoveryCommand::Set {
-                day,
-                symbol: symbol.clone(),
-                usd_mark: Positive::new(float!(150)).unwrap(),
-                observed_at: Utc.with_ymd_and_hms(2026, 7, 17, 20, 0, 0).unwrap(),
-                source: "Nasdaq historical close".parse().unwrap(),
-                reason: "repair missing mark".parse().unwrap(),
-            },
-            &ctx,
-        )
-        .await
-        .unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("vault shares, not underlying shares"),
-            "a BaseWalletWrapped-only holding must refuse like MarketMaking; got: {error}"
-        );
-    }
-
-    /// The guard must not over-block: an unconfigured symbol whose wrapped
-    /// rows are gone holds only underlying-unit balances (`Hedging` is never
-    /// converted), so a mark values them correctly and the repair proceeds.
-    /// This is what makes reconciling the on-chain side restore repairability.
-    #[tokio::test]
-    async fn portfolio_snapshot_repair_allows_unconfigured_symbol_without_wrapped_rows() {
-        let pool = setup_test_db().await;
-        let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
-        let symbol = Symbol::new("QSEP").unwrap();
-        seed_missing_portfolio_marks_at(&pool, day, &symbol, &[PortfolioLocation::Hedging]).await;
 
         let ctx = ctx_with_equities(&["AAPL"]);
         set_portfolio_snapshot_mark_command(
@@ -322,16 +362,25 @@ mod tests {
         .await
         .unwrap();
 
-        let (location, mark): (String, Option<String>) = sqlx::query_as(
-            "SELECT location, usd_mark FROM portfolio_snapshot WHERE et_day = ? AND asset = ?",
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT location, usd_mark FROM portfolio_snapshot WHERE et_day = ? AND asset = ? \
+             ORDER BY location",
         )
         .bind(day.to_string())
         .bind(symbol.to_string())
-        .fetch_one(&pool)
+        .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(location, "hedging");
-        assert_eq!(mark.as_deref(), Some("150"));
+        assert_eq!(
+            rows,
+            vec![
+                ("offchain".to_string(), Some("150".to_string())),
+                (
+                    "wallet_unwrapped:robinhood".to_string(),
+                    Some("150".to_string())
+                ),
+            ]
+        );
     }
 
     /// `EquityMarkSet` prices every row of the symbol, and a symbol with no
@@ -382,51 +431,146 @@ mod tests {
         assert_eq!(marked, 0, "a refused repair must not price any row");
     }
 
-    /// The guard derives the market-making location from the configured
-    /// primary chain: a snapshot captured on a non-Base chain persists
-    /// `market_making:<chain>` rows, and a guard hardcoded to
-    /// `market_making:base` would miss them and let the repair price vault
-    /// shares as underlying.
+    /// `ctx_with_equities(primary)` plus a Robinhood secondary chain listing
+    /// `robinhood` with rebalancing enabled.
+    fn ctx_with_robinhood_listing(primary: &[&str], robinhood: &[&str]) -> Ctx {
+        let mut ctx = ctx_with_equities(primary);
+        ctx.chains.insert_secondary(
+            HedgedChain::test()
+                .chain(Chain::Robinhood)
+                .assets(ChainAssets {
+                    equities: try_rebalancing_enabled_equities(robinhood).unwrap(),
+                    cash: None,
+                })
+                .call(),
+        );
+        ctx
+    }
+
+    fn mark_command(day: chrono::NaiveDate, symbol: &Symbol) -> PortfolioSnapshotRecoveryCommand {
+        PortfolioSnapshotRecoveryCommand::Set {
+            day,
+            symbol: symbol.clone(),
+            usd_mark: Positive::new(float!(150)).unwrap(),
+            observed_at: Utc.with_ymd_and_hms(2026, 7, 17, 20, 0, 0).unwrap(),
+            source: "Nasdaq historical close".parse().unwrap(),
+            reason: "repair missing mark".parse().unwrap(),
+        }
+    }
+
+    async fn priced_rows(pool: &SqlitePool, day: chrono::NaiveDate, symbol: &Symbol) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM portfolio_snapshot \
+             WHERE et_day = ? AND asset = ? AND usd_mark IS NOT NULL",
+        )
+        .bind(day.to_string())
+        .bind(symbol.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// The capture converts a wrapped row only at the ratio of a chain that
+    /// lists the symbol, so a symbol configured on Base still holds vault
+    /// shares in a row on a chain that does not list it, and the repair must
+    /// refuse to price it. Unwrapped wallet tokens need no ratio and never
+    /// count against it.
     #[tokio::test]
-    async fn portfolio_snapshot_repair_refuses_wrapped_rows_on_a_non_base_primary_chain() {
+    async fn portfolio_snapshot_repair_refuses_wrapped_rows_on_a_chain_not_listing_the_symbol() {
         let pool = setup_test_db().await;
         let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
-        let symbol = Symbol::new("QSEP").unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
         seed_missing_portfolio_marks_at(
             &pool,
             day,
             &symbol,
             &[
-                PortfolioLocation::MarketMaking(Chain::Ethereum),
-                PortfolioLocation::Hedging,
+                PortfolioLocation::Onchain {
+                    chain: Chain::Base,
+                    form: OnchainForm::MarketMaking,
+                },
+                PortfolioLocation::Onchain {
+                    chain: Chain::Robinhood,
+                    form: OnchainForm::MarketMaking,
+                },
+                PortfolioLocation::Onchain {
+                    chain: Chain::Robinhood,
+                    form: OnchainForm::WalletWrapped,
+                },
+                PortfolioLocation::Onchain {
+                    chain: Chain::Robinhood,
+                    form: OnchainForm::WalletUnwrapped,
+                },
+                PortfolioLocation::Offchain,
             ],
         )
         .await;
 
-        let mut ctx = ctx_with_equities(&["AAPL"]);
-        ctx.chains.primary_mut().chain = Chain::Ethereum;
+        let ctx = ctx_with_robinhood_listing(&["AAPL"], &["TSLA"]);
         let error = set_portfolio_snapshot_mark_command(
             &mut Vec::new(),
             &pool,
-            PortfolioSnapshotRecoveryCommand::Set {
-                day,
-                symbol: symbol.clone(),
-                usd_mark: Positive::new(float!(150)).unwrap(),
-                observed_at: Utc.with_ymd_and_hms(2026, 7, 17, 20, 0, 0).unwrap(),
-                source: "Nasdaq historical close".parse().unwrap(),
-                reason: "repair missing mark".parse().unwrap(),
-            },
+            mark_command(day, &symbol),
             &ctx,
         )
         .await
         .unwrap_err();
 
         assert!(
-            error
-                .to_string()
-                .contains("vault shares, not underlying shares"),
-            "wrapped rows on the configured non-Base chain must refuse; got: {error}"
+            matches!(
+                error.downcast_ref::<OperatorError>(),
+                Some(OperatorError::Rejected(RejectionReason::UnconvertedWrappedEquityRows {
+                    unconverted: 2,
+                    chains,
+                    ..
+                })) if *chains == BTreeSet::from([Chain::Robinhood])
+            ),
+            "both Robinhood wrapped rows are unconverted, on one chain; got: {error}"
         );
+        assert_eq!(
+            priced_rows(&pool, day, &symbol).await,
+            0,
+            "a refused repair must not price any row"
+        );
+    }
+
+    /// Wrapped rows on a secondary chain that lists the symbol were converted
+    /// at that chain's ratio, so the repair prices them like the primary's.
+    #[tokio::test]
+    async fn portfolio_snapshot_repair_prices_wrapped_rows_on_a_secondary_chain_listing_the_symbol()
+    {
+        let pool = setup_test_db().await;
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+        seed_missing_portfolio_marks_at(
+            &pool,
+            day,
+            &symbol,
+            &[
+                PortfolioLocation::Onchain {
+                    chain: Chain::Robinhood,
+                    form: OnchainForm::MarketMaking,
+                },
+                PortfolioLocation::Onchain {
+                    chain: Chain::Robinhood,
+                    form: OnchainForm::WalletWrapped,
+                },
+                PortfolioLocation::Offchain,
+            ],
+        )
+        .await;
+
+        let ctx = ctx_with_robinhood_listing(&[], &["AAPL"]);
+        set_portfolio_snapshot_mark_command(
+            &mut Vec::new(),
+            &pool,
+            mark_command(day, &symbol),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(priced_rows(&pool, day, &symbol).await, 3);
     }
 
     #[tokio::test]
@@ -502,7 +646,7 @@ mod tests {
         )
         .bind(day.to_string())
         .bind(symbol.to_string())
-        .bind(PortfolioLocation::Hedging.to_string())
+        .bind(PortfolioLocation::Offchain.to_string())
         .execute(&pool)
         .await
         .unwrap();

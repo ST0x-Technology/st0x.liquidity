@@ -8,6 +8,7 @@ pub(crate) use registry_candidate::{
     CandidateContractError, validate_registry_candidate_contracts,
 };
 
+pub(crate) use builder::chain_equity_symbols;
 pub use builder::configured_equity_symbols;
 mod exit;
 pub(crate) mod job;
@@ -3498,12 +3499,19 @@ fn relay_hop_setups(
                 format!("the {chain} Relay corridor needs [relay] api_key in the secrets file")
             })?;
 
+            let client = RelayClient::new(Some(api_key))?;
+            #[cfg(feature = "test-support")]
+            let client = match &rebalancing_ctx.relay_api_base {
+                Some(api_base) => client.with_api_base(api_base.clone()),
+                None => client,
+            };
+
             Ok((
                 *chain,
                 RelayHopSetup {
                     bounds: *bounds,
                     chain_confirmations,
-                    client: RelayClient::new(Some(api_key))?,
+                    client,
                 },
             ))
         })

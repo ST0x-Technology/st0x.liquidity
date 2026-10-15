@@ -13,10 +13,11 @@ use tracing::{info, trace, warn};
 
 use st0x_config::{ExecutionThreshold, OperationMode, UsdcCorridorCtx};
 use st0x_dto::{
-    CurrentState, LegacyCompatibleTrade, Statement, TerminalOutcomesV1Trade, Trade, TradeOutcome,
-    TransferWarning,
+    ChainName, CurrentState, LegacyCompatibleTrade, Statement, TerminalOutcomesV1Trade, Trade,
+    TradeOutcome, TransferWarning,
 };
 use st0x_event_sorcery::{load_all_ids, load_entity};
+use st0x_evm::Chain;
 use st0x_finance::Positive;
 
 use crate::AppState;
@@ -254,7 +255,7 @@ async fn send_initial_state(
     state: &AppState,
     trade_protocol: TradeProtocol,
 ) -> bool {
-    let inventory_dto = state.inventory.read().await.to_dto();
+    let inventory_dto = state.inventory.to_dto().await;
     let transfers = transfer_loader::load_transfers(&state.pool).await;
     let mut warnings = transfers.warnings;
     let trades = match query_trades(&state.pool, &TradeQuery::newest(trade_protocol)).await {
@@ -325,9 +326,9 @@ pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
     let (equity_target, equity_deviation, usdc_target, usdc_deviation) = {
         let rebalancing = &ctx.rebalancing;
         // The band of the one corridor the USDC trigger can act on, whatever
-        // its chain; with several, the primary chain's, until the dashboard
-        // shows one cash band per chain. The trigger skips a corridor whose
-        // chain does not rebalance its cash asset.
+        // its chain; with several, the primary chain's, until the UI reads
+        // each chain's band from the inventory. The trigger skips a corridor
+        // whose chain does not rebalance its cash asset.
         let primary = ctx.chains.primary().chain;
         let rebalances_cash = |usdc: &&UsdcCorridorCtx| {
             ctx.chains
@@ -462,6 +463,17 @@ pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
         broker: broker.to_string(),
         order_polling_interval: ctx.order_polling_interval_secs,
         inventory_poll_interval: ctx.inventory_poll_interval_secs,
+    }
+}
+
+/// The dashboard's chain discriminator for a chain the bot operates on.
+/// Exhaustive so a chain added to `Chain` cannot reach the report unnamed.
+pub(crate) fn chain_name(chain: Chain) -> ChainName {
+    match chain {
+        Chain::Base => ChainName::Base,
+        Chain::Ethereum => ChainName::Ethereum,
+        Chain::HyperEvm => ChainName::HyperEvm,
+        Chain::Robinhood => ChainName::Robinhood,
     }
 }
 
@@ -649,6 +661,21 @@ mod tests {
         .unwrap();
         let websocket: serde_json::Value = serde_json::from_str(&websocket).unwrap();
         assert_eq!(websocket["data"]["venue"], "bebop");
+    }
+
+    /// The dashboard's chain discriminator serializes to the wire name
+    /// `st0x_evm::Chain` pins, for every chain the bot can watch. It lives
+    /// here because the dto crate cannot see `Chain`: the two spellings are
+    /// separately pinned literals, so nothing else catches them drifting.
+    #[test]
+    fn chain_name_wire_names_match_the_evm_chain_names() {
+        for chain in Chain::ALL {
+            assert_eq!(
+                serde_json::to_value(chain_name(chain)).unwrap(),
+                serde_json::json!(chain.as_str()),
+                "{chain:?} must reach the dashboard under its pinned wire name"
+            );
+        }
     }
 
     fn empty_settings() -> st0x_dto::Settings {

@@ -37,7 +37,7 @@ pub(crate) use relay::RelayHop;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use alloy::primitives::{Address, B256, TxHash, U256};
+use alloy::primitives::{Address, TxHash, U256};
 use chrono::{DateTime, Utc};
 use itertools::Itertools;
 use rain_math_float::FloatError;
@@ -401,23 +401,23 @@ pub enum UsdcTransferError {
         #[source]
         source: Box<RelayError>,
     },
+    /// Deposits of reverted Relay orders are on chain and the approves that
+    /// went out alone do not confirm yet: the transfer records nothing, and
+    /// the job sends them again later at no retry cost.
+    #[error(
+        "USDC rebalance {id}: deposits of reverted Relay orders are on chain, but the lone \
+         approves do not confirm yet: {source}"
+    )]
+    FoundSwapDepositApprovesUnconfirmed {
+        id: UsdcRebalanceId,
+        #[source]
+        source: Box<Self>,
+    },
     /// The fill window passed with no fill or refund proven: the transfer
     /// holds its guard and the job reads Relay's status again slowly.
     #[error("USDC rebalance {id}: Relay deposit {deposit_tx} is unresolved past its fill window")]
     SwapEscrowUnresolved {
         id: UsdcRebalanceId,
-        deposit_tx: TxHash,
-    },
-    /// A deposit of a reverted order is on chain with no payment proven yet:
-    /// nothing is signed or redeposited until it is.
-    #[error(
-        "USDC rebalance {id}: deposit {deposit_tx} of the reverted Relay order {order_id} \
-         (request {request_id}) is on chain; signing nothing until its payment proves"
-    )]
-    RevertedSwapDepositLive {
-        id: UsdcRebalanceId,
-        order_id: B256,
-        request_id: B256,
         deposit_tx: TxHash,
     },
     #[error(
@@ -899,7 +899,7 @@ impl UsdcTransferError {
             | Self::SwapPaymentUnverified { .. }
             | Self::SwapQuoteTransient { .. }
             | Self::SwapEscrowUnresolved { .. }
-            | Self::RevertedSwapDepositLive { .. }
+            | Self::FoundSwapDepositApprovesUnconfirmed { .. }
             | Self::EthereumChainMissing(_) => None,
         }
     }
@@ -985,7 +985,7 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::SwapPaymentUnverified { .. }
             | Self::SwapQuoteTransient { .. }
             | Self::SwapEscrowUnresolved { .. }
-            | Self::RevertedSwapDepositLive { .. }
+            | Self::FoundSwapDepositApprovesUnconfirmed { .. }
             | Self::EthereumChainMissing(_) => false,
         }
     }

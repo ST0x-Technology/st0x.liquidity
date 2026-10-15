@@ -115,6 +115,28 @@ lifecycle = "active"
 # block, not this depth. Set explicitly per chain based on observed
 # confirmation behavior.
 required_confirmations = 3
+# HTTP RPC endpoint. Drives this chain's continuous eth_getLogs fill polling
+# and its vault-balance reads (single transport, no WebSocket), and signs for
+# the chain when [wallet] is configured. Every enabled chain needs one.
+#
+# Must be an archive node, or must otherwise retain state back to the oldest
+# block a read pins to: the block-pinned bot-gas ETH/USD valuation (ADR 0020)
+# reads a historic block and fails against a pruned node once that block ages
+# out.
+#
+# A bare Alchemy endpoint, https://<network>.g.alchemy.com/v2 with no key in
+# the path, is called with a JWT signed by Cloud KMS: the process env must set
+# ALCHEMY_JWT_KMS_KEY_VERSION (the full cryptoKeyVersions/N name) and
+# ALCHEMY_JWT_KID (the key id Alchemy assigned), or startup fails. Any other
+# URL is called as given.
+#
+# The config files under config/ are committed to a public repository. Put
+# only a keyless endpoint or a bare Alchemy /v2 endpoint here, never a URL
+# with an API key in its path, query or userinfo.
+#
+# Deprecated, one release: the secrets file's [chains.<name>] rpc_url is still
+# read when this is unset, with a startup warning, and ignored when it is set.
+rpc_url = "https://base-mainnet.example.com"
 
 [chains.base.trading]
 orderbook = "0x1111111111111111111111111111111111111111"
@@ -198,6 +220,7 @@ lifecycle = "active"
 # Also the depth the Alpaca withdrawal tx needs before its USDC is used in a
 # USDC rebalancing transfer, whichever chain the corridor serves.
 required_confirmations = 12
+rpc_url = "https://eth-mainnet.example.com"
 
 # HyperEVM, same shape as Ethereum.
 [chains.hyperevm]
@@ -205,6 +228,7 @@ required_confirmations = 12
 # startup: no CCTP domain and no HYPE price source are wired.
 lifecycle = "observe-only"
 required_confirmations = 1
+rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
 # Robinhood Chain (an Arbitrum Orbit L2, chain id 4663): a prefunded
 # hedge-only secondary. Fills on its orderbook are ingested, validated against
@@ -218,6 +242,7 @@ lifecycle = "prefunded"
 # ~1 s at Robinhood's ~100 ms block cadence: enough for a load-balanced RPC
 # to have seen the startup USDG approval before it is treated as settled.
 required_confirmations = 10
+rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
 [chains.robinhood.trading]
 # RaindexV6 on Robinhood Chain.

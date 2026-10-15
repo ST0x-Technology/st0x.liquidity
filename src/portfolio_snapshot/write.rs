@@ -73,8 +73,8 @@ use crate::alerts::{AlertKind, Notifier, NotifierError};
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::dashboard::equity_price::EquityPriceStore;
 use crate::inventory::{
-    BroadcastingInventory, InventoryViewError, PollFreshness, PortfolioAsset, PortfolioBalanceRow,
-    PortfolioLocation,
+    BroadcastingInventory, InventoryViewError, OnchainForm, PollFreshness, PortfolioAsset,
+    PortfolioBalanceRow, PortfolioLocation,
 };
 use crate::position::{Position, PriceObservation};
 
@@ -141,7 +141,7 @@ pub(crate) struct PortfolioSnapshotCtx {
     pub(crate) equity_prices: EquityPriceStore,
     pub(crate) portfolio_snapshot: Arc<Store<PortfolioSnapshot>>,
     /// Resolves each configured equity's live vault ratio so wrapped onchain
-    /// balances (MarketMaking, BaseWalletWrapped) can be valued in
+    /// balances (market-making vaults, wrapped wallet shares) can be valued in
     /// underlying-equivalent units before being persisted (see
     /// [`convert_wrapped_equity_rows`]). Keyed by chain because each chain's
     /// vault accrues on its own, so one chain's ratio can never value
@@ -151,12 +151,13 @@ pub(crate) struct PortfolioSnapshotCtx {
     /// onchain wrapped equity in the first place, so no row would ever need
     /// conversion.
     pub(crate) wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
-    /// The PRIMARY chain's equities alone (`src/conductor/builder.rs`), which
-    /// is all the wallet-transit slots may require: those balances are polled
-    /// from the primary's token map, so any other chain's symbol would gate
-    /// the capture on a slot no poll can stamp. Every venue-level requirement
-    /// reads [`Self::hedged_equity_symbols`] instead.
-    pub(crate) wallet_transit_equity_symbols: HashSet<Symbol>,
+    /// The equities each polled chain's bot-wallet slots require, keyed by
+    /// chain: one entry per chain whose equity wallet the poller reads, with
+    /// that chain's own equities (`src/conductor/builder.rs`). A chain whose
+    /// wallet is not polled has no entry, so the capture never waits on a
+    /// slot no poll can stamp. Every venue-level requirement reads
+    /// [`Self::hedged_equity_symbols`] instead.
+    pub(crate) wallet_equity_symbols: BTreeMap<Chain, HashSet<Symbol>>,
     /// Whether the hedging venue tracks cash at all.
     pub(crate) usdc_tracking_enabled: bool,
     /// The market-making slots each hedged chain contributes to the
@@ -165,8 +166,9 @@ pub(crate) struct PortfolioSnapshotCtx {
     /// Mirrors whether `[wallet_polling]` is configured (the same source the
     /// live inventory poller reads, `crate::inventory::WalletPollingCtx`):
     /// when `true`, [`hydration_gap`] also requires the wallet-transit
-    /// locations (Ethereum wallet, Base wallet unwrapped/wrapped) to have
-    /// been polled at least once before capture.
+    /// locations (the Ethereum and Base wallets' USDC, and every polled
+    /// chain's wallet equity) to have been polled at least once before
+    /// capture.
     pub(crate) wallet_polling_enabled: bool,
     /// Ephemeral "observed this run" freshness signal, stamped by the live
     /// inventory poller on every successful sub-poll
@@ -798,14 +800,17 @@ fn next_capture_delay(now: DateTime<Utc>) -> (Duration, NaiveDate) {
 /// membership) so the two gates can never diverge on what "complete" means.
 ///
 /// The equity set differs by venue: the broker book backs every hedged chain's
-/// market making, so Hedging requires [`PortfolioSnapshotCtx::hedged_equity_symbols`],
-/// while the wallet-transit locations require the primary's symbols alone
-/// (`wallet_transit_equity_symbols`) -- the only ones their polls can stamp.
+/// market making, so Offchain requires [`PortfolioSnapshotCtx::hedged_equity_symbols`],
+/// while each polled chain's wallet slots require that chain's own symbols
+/// (`wallet_equity_symbols`) -- the only ones its wallet poll can stamp.
 fn required_slots(
     ctx: &PortfolioSnapshotCtx,
 ) -> impl Iterator<Item = (PortfolioLocation, PortfolioAsset)> + '_ {
     let market_making_pairs = ctx.market_making.iter().flat_map(|(chain, slots)| {
-        let location = PortfolioLocation::MarketMaking(*chain);
+        let location = PortfolioLocation::Onchain {
+            chain: *chain,
+            form: OnchainForm::MarketMaking,
+        };
         let equities = slots
             .equity_symbols
             .iter()
@@ -820,18 +825,24 @@ fn required_slots(
     let equity_pairs = ctx
         .hedged_equity_symbols()
         .into_iter()
-        .map(|symbol| (PortfolioLocation::Hedging, PortfolioAsset::Equity(symbol)));
+        .map(|symbol| (PortfolioLocation::Offchain, PortfolioAsset::Equity(symbol)));
 
     let usdc_pairs = ctx
         .usdc_tracking_enabled
-        .then_some((PortfolioLocation::Hedging, PortfolioAsset::Usdc))
+        .then_some((PortfolioLocation::Offchain, PortfolioAsset::Usdc))
         .into_iter();
 
     let wallet_usdc_pairs = ctx
         .wallet_polling_enabled
         .then_some([
-            PortfolioLocation::EthereumWallet,
-            PortfolioLocation::BaseWalletUnwrapped,
+            PortfolioLocation::Onchain {
+                chain: Chain::Ethereum,
+                form: OnchainForm::WalletUnwrapped,
+            },
+            PortfolioLocation::Onchain {
+                chain: Chain::Base,
+                form: OnchainForm::WalletUnwrapped,
+            },
         ])
         .into_iter()
         .flatten()
@@ -839,16 +850,24 @@ fn required_slots(
 
     let wallet_equity_pairs = ctx
         .wallet_polling_enabled
-        .then(|| ctx.wallet_transit_equity_symbols.iter())
+        .then(|| ctx.wallet_equity_symbols.iter())
         .into_iter()
         .flatten()
-        .flat_map(|symbol| {
-            [
-                PortfolioLocation::BaseWalletUnwrapped,
-                PortfolioLocation::BaseWalletWrapped,
-            ]
-            .into_iter()
-            .map(move |location| (location, PortfolioAsset::Equity(symbol.clone())))
+        .flat_map(|(chain, symbols)| {
+            symbols.iter().flat_map(move |symbol| {
+                [
+                    PortfolioLocation::Onchain {
+                        chain: *chain,
+                        form: OnchainForm::WalletUnwrapped,
+                    },
+                    PortfolioLocation::Onchain {
+                        chain: *chain,
+                        form: OnchainForm::WalletWrapped,
+                    },
+                ]
+                .into_iter()
+                .map(move |location| (location, PortfolioAsset::Equity(symbol.clone())))
+            })
         });
 
     market_making_pairs
@@ -1002,16 +1021,17 @@ fn capped_retry_backoff(boundary: Option<DateTime<Utc>>, now: DateTime<Utc>) -> 
 /// be kept, valued at a ratio config no longer has, and priced at an
 /// underlying mark.
 ///
-/// Every other location exists on the primary chain alone, but a symbol any
-/// hedged chain trades is hedged and held there, so those rows are judged
-/// against the union.
+/// Wrapped wallet shares are judged against the same per-chain set, since
+/// their ratio is that chain's vault's too; the historical-mark repair derives
+/// the same set to refuse pricing an unconverted row. Unwrapped wallet tokens
+/// and the broker book need no ratio, and a symbol any hedged chain trades is
+/// hedged, so those rows are judged against the union.
 struct ConfiguredEquities<'ctx> {
     market_making: &'ctx BTreeMap<Chain, MarketMakingSlots>,
     /// Every hedged chain's equities, not just the primary's: a symbol traded
-    /// on a secondary chain alone is still hedged and still parked in the
-    /// primary's wallets, so judging its Hedging row against the primary's
-    /// table alone would strand it unmarked and exclude the whole day with
-    /// `MissingMark`.
+    /// on a secondary chain alone is still hedged, so judging its Offchain
+    /// row against the primary's table alone would strand it unmarked and
+    /// exclude the whole day with `MissingMark`.
     hedged: HashSet<Symbol>,
 }
 
@@ -1019,24 +1039,24 @@ impl<'ctx> ConfiguredEquities<'ctx> {
     fn of(ctx: &'ctx PortfolioSnapshotCtx) -> Self {
         Self {
             market_making: &ctx.market_making,
-            hedged: ctx
-                .hedged_equity_symbols()
-                .into_iter()
-                .chain(ctx.wallet_transit_equity_symbols.iter().cloned())
-                .collect(),
+            hedged: ctx.hedged_equity_symbols().into_iter().collect(),
         }
     }
 
     fn contains(&self, location: PortfolioLocation, symbol: &Symbol) -> bool {
         match location {
-            PortfolioLocation::MarketMaking(chain) => self
+            PortfolioLocation::Onchain {
+                chain,
+                form: OnchainForm::MarketMaking | OnchainForm::WalletWrapped,
+            } => self
                 .market_making
                 .get(&chain)
                 .is_some_and(|slots| slots.equity_symbols.contains(symbol)),
-            PortfolioLocation::Hedging
-            | PortfolioLocation::EthereumWallet
-            | PortfolioLocation::BaseWalletUnwrapped
-            | PortfolioLocation::BaseWalletWrapped => self.hedged.contains(symbol),
+            PortfolioLocation::Onchain {
+                form: OnchainForm::WalletUnwrapped,
+                ..
+            }
+            | PortfolioLocation::Offchain => self.hedged.contains(symbol),
         }
     }
 }
@@ -1100,12 +1120,13 @@ fn drop_empty_unconfigured_equity_rows(
     Ok(kept)
 }
 
-/// Converts MarketMaking-venue and BaseWalletWrapped-transit equity balances
+/// Converts market-making and wrapped-wallet equity balances on every chain
 /// from wrapped ERC-4626 vault-share units to underlying-equivalent units via
-/// the live vault ratio, mirroring `InventoryView::check_equity_imbalance`'s
-/// conversion (`src/inventory/view.rs`). Every other row (Hedging, USDC
-/// anywhere, BaseWalletUnwrapped, EthereumWallet) is already denominated in
-/// underlying units and is left untouched.
+/// that chain's live vault ratio, mirroring
+/// `InventoryView::check_equity_imbalance`'s conversion
+/// (`src/inventory/view.rs`). Every other row (Offchain, USDC anywhere,
+/// unwrapped wallet tokens) is already denominated in underlying units and is
+/// left untouched.
 ///
 /// `evaluate_day` (`read.rs`) later multiplies each row's balance directly by
 /// the row's mark (see [`resolve_marks`]), an UNDERLYING share price -- so a wrapped
@@ -1115,7 +1136,7 @@ fn drop_empty_unconfigured_equity_rows(
 ///
 /// The ratio is resolved once per distinct `(chain, symbol)` that actually
 /// needs conversion (not once per configured symbol), so a symbol with no
-/// MarketMaking/BaseWalletWrapped row this tick costs no RPC call. The
+/// wrapped-unit row this tick costs no RPC call. The
 /// chain is part of the key because each chain's vault accrues independently:
 /// the same symbol's wrapped share is worth a different amount of underlying
 /// on every chain it is wrapped on.
@@ -1138,16 +1159,9 @@ async fn convert_wrapped_equity_rows(
         if !configured_equities.contains(row.location, symbol) {
             continue;
         }
-        // The chain whose vault issued the wrapped share this row holds: a
-        // market-making slot names its own, and the wrapped transit leg is a
-        // Base wallet balance by construction (`PortfolioLocation`). Every
-        // other location is already denominated in underlying units.
-        let chain = match row.location {
-            PortfolioLocation::MarketMaking(chain) => chain,
-            PortfolioLocation::BaseWalletWrapped => Chain::Base,
-            PortfolioLocation::Hedging
-            | PortfolioLocation::EthereumWallet
-            | PortfolioLocation::BaseWalletUnwrapped => continue,
+        // Every other location is already denominated in underlying units.
+        let Some(chain) = row.location.wrapped_equity_chain() else {
+            continue;
         };
 
         let ratio = if let Some(ratio) = ratios.get(&(chain, symbol.clone())) {
@@ -1489,23 +1503,182 @@ mod tests {
             slots,
             HashSet::from([
                 (
-                    PortfolioLocation::MarketMaking(Chain::Base),
+                    PortfolioLocation::Onchain {
+                        chain: Chain::Base,
+                        form: OnchainForm::MarketMaking
+                    },
                     PortfolioAsset::Equity(aapl())
                 ),
                 (
-                    PortfolioLocation::MarketMaking(Chain::Base),
+                    PortfolioLocation::Onchain {
+                        chain: Chain::Base,
+                        form: OnchainForm::MarketMaking
+                    },
                     PortfolioAsset::Usdc
                 ),
                 (
-                    PortfolioLocation::MarketMaking(Chain::Ethereum),
+                    PortfolioLocation::Onchain {
+                        chain: Chain::Ethereum,
+                        form: OnchainForm::MarketMaking
+                    },
                     PortfolioAsset::Equity(nvda.clone())
                 ),
-                (PortfolioLocation::Hedging, PortfolioAsset::Equity(aapl())),
-                (PortfolioLocation::Hedging, PortfolioAsset::Equity(nvda)),
-                (PortfolioLocation::Hedging, PortfolioAsset::Usdc),
+                (PortfolioLocation::Offchain, PortfolioAsset::Equity(aapl())),
+                (PortfolioLocation::Offchain, PortfolioAsset::Equity(nvda)),
+                (PortfolioLocation::Offchain, PortfolioAsset::Usdc),
             ]),
             "each hedged chain gates on its own market-making slots, and on the broker row \
              backing them all"
+        );
+    }
+
+    /// Every chain whose equity wallet the poller reads gates the capture on
+    /// that wallet's unwrapped and wrapped slots for its own equities, like
+    /// Base's; wallet cash stays on the Ethereum and Base wallets.
+    #[tokio::test]
+    async fn required_slots_cover_each_polled_chains_wallet_slots() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let nvda = Symbol::new("NVDA").unwrap();
+        let (mut ctx, _position) = build_ctx(
+            pool,
+            apalis_pool,
+            InventoryView::default(),
+            HashSet::from([aapl()]),
+            false,
+            true,
+            BTreeMap::new(),
+        )
+        .await;
+        ctx.wallet_equity_symbols
+            .insert(Chain::Robinhood, HashSet::from([nvda.clone()]));
+
+        let wallet_slots: HashSet<_> = required_slots(&ctx)
+            .filter(|(location, _)| {
+                !matches!(
+                    location,
+                    PortfolioLocation::Onchain {
+                        form: OnchainForm::MarketMaking,
+                        ..
+                    } | PortfolioLocation::Offchain
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            wallet_slots,
+            HashSet::from([
+                (
+                    PortfolioLocation::Onchain {
+                        chain: Chain::Ethereum,
+                        form: OnchainForm::WalletUnwrapped
+                    },
+                    PortfolioAsset::Usdc
+                ),
+                (
+                    PortfolioLocation::Onchain {
+                        chain: Chain::Base,
+                        form: OnchainForm::WalletUnwrapped
+                    },
+                    PortfolioAsset::Usdc
+                ),
+                (
+                    PortfolioLocation::Onchain {
+                        chain: Chain::Base,
+                        form: OnchainForm::WalletUnwrapped
+                    },
+                    PortfolioAsset::Equity(aapl())
+                ),
+                (
+                    PortfolioLocation::Onchain {
+                        chain: Chain::Base,
+                        form: OnchainForm::WalletWrapped
+                    },
+                    PortfolioAsset::Equity(aapl())
+                ),
+                (
+                    PortfolioLocation::Onchain {
+                        chain: Chain::Robinhood,
+                        form: OnchainForm::WalletUnwrapped
+                    },
+                    PortfolioAsset::Equity(nvda.clone())
+                ),
+                (
+                    PortfolioLocation::Onchain {
+                        chain: Chain::Robinhood,
+                        form: OnchainForm::WalletWrapped
+                    },
+                    PortfolioAsset::Equity(nvda)
+                ),
+            ])
+        );
+    }
+
+    /// A secondary chain's wallet slot gates the capture on freshness like
+    /// Base's: one not polled since the target day's midnight blocks it.
+    #[tokio::test]
+    async fn a_stale_secondary_chain_wallet_slot_blocks_the_capture() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let now = Utc::now();
+        let polled = BTreeMap::from([(aapl(), FractionalShares::ZERO)]);
+        let view = InventoryView::default()
+            .with_equity(aapl(), FractionalShares::ZERO, FractionalShares::ZERO)
+            .set_inflight_cash(InFlightCashLocation::EthereumWallet, Usdc::ZERO, now, now)
+            .set_inflight_cash(InFlightCashLocation::BaseWallet, Usdc::ZERO, now, now)
+            .set_inflight_equity_at_location(
+                InFlightEquityLocation::WalletUnwrapped(Chain::Base),
+                &polled,
+                now,
+                now,
+            )
+            .set_inflight_equity_at_location(
+                InFlightEquityLocation::WalletWrapped(Chain::Base),
+                &polled,
+                now,
+                now,
+            )
+            .set_inflight_equity_at_location(
+                InFlightEquityLocation::WalletUnwrapped(Chain::Robinhood),
+                &polled,
+                now,
+                now,
+            )
+            .set_inflight_equity_at_location(
+                InFlightEquityLocation::WalletWrapped(Chain::Robinhood),
+                &polled,
+                now,
+                now,
+            );
+        let (mut ctx, _position) = build_ctx(
+            pool.clone(),
+            apalis_pool,
+            view,
+            HashSet::from([aapl()]),
+            false,
+            true,
+            base_wrapper(MockWrapper::new()),
+        )
+        .await;
+        ctx.wallet_equity_symbols
+            .insert(Chain::Robinhood, HashSet::from([aapl()]));
+        mark_all_required_fresh(&ctx);
+        ctx.poll_freshness.set_observed(
+            PortfolioLocation::Onchain {
+                chain: Chain::Robinhood,
+                form: OnchainForm::WalletWrapped,
+            },
+            PortfolioAsset::Equity(aapl()),
+            now - chrono::Duration::days(2),
+        );
+
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            portfolio_snapshot_row_count(&pool, &et_day(Utc::now()).to_string()).await,
+            0,
+            "Robinhood's wrapped wallet slot was last polled before today's midnight"
         );
     }
 
@@ -1550,7 +1723,7 @@ mod tests {
             equity_prices: EquityPriceStore::new([]),
             portfolio_snapshot,
             wrappers,
-            wallet_transit_equity_symbols: primary_equity_symbols,
+            wallet_equity_symbols: BTreeMap::from([(Chain::Base, primary_equity_symbols)]),
             usdc_tracking_enabled,
             wallet_polling_enabled,
             // Always starts empty, mirroring a fresh process boot: callers
@@ -3082,7 +3255,10 @@ mod tests {
             .unwrap();
         let seeded_row = PortfolioBalanceRowWithMark {
             row: PortfolioBalanceRow {
-                location: PortfolioLocation::MarketMaking(Chain::Base),
+                location: PortfolioLocation::Onchain {
+                    chain: Chain::Base,
+                    form: OnchainForm::MarketMaking,
+                },
                 asset: PortfolioAsset::Equity(aapl()),
                 available: float!(10),
                 inflight: float!(0),
@@ -3324,7 +3500,13 @@ mod tests {
         match error {
             PortfolioSnapshotJobError::MissingWrapper { symbol, location } => {
                 assert_eq!(symbol, aapl());
-                assert_eq!(location, PortfolioLocation::MarketMaking(Chain::Base));
+                assert_eq!(
+                    location,
+                    PortfolioLocation::Onchain {
+                        chain: Chain::Base,
+                        form: OnchainForm::MarketMaking
+                    }
+                );
             }
             other => panic!("expected MissingWrapper, got {other:?}"),
         }
@@ -3529,9 +3711,8 @@ mod tests {
         );
     }
 
-    /// Only the primary chain's assets table feeds the wallet-transit symbol
-    /// set, but the capture reads every hedged chain's market-making balances.
-    /// A symbol traded on a secondary chain alone must still be marked: left
+    /// The capture reads every hedged chain's market-making balances, so a
+    /// symbol traded on a secondary chain alone must still be marked: left
     /// unmarked, its nonzero row excludes the whole day with `MissingMark` and
     /// the capital series loses that day entirely.
     #[tokio::test]
@@ -3720,13 +3901,13 @@ mod tests {
         );
     }
 
-    /// Onchain MarketMaking equity and BaseWalletWrapped-transit equity are
+    /// Onchain market-making equity and Base's wrapped wallet equity are
     /// WRAPPED ERC-4626 vault shares, not underlying shares. With a non-1:1
     /// ratio (1.5, simulating vault NAV accrual from dividends/splits), both
     /// must be persisted as underlying-EQUIVALENT balances (raw * ratio), the
     /// same conversion `InventoryView::check_equity_imbalance` already
-    /// applies. Hedging (already underlying) and BaseWalletUnwrapped
-    /// (already underlying) must be persisted unconverted.
+    /// applies. Offchain (already underlying) and Base's unwrapped wallet
+    /// equity (already underlying) must be persisted unconverted.
     #[tokio::test]
     async fn wrapped_equity_rows_are_valued_as_underlying_equivalent_with_non_1_to_1_ratio() {
         let (pool, apalis_pool) = setup_test_pools().await;
@@ -3806,17 +3987,17 @@ mod tests {
             "10 wrapped shares * 1.5 ratio = 15 underlying-equivalent shares"
         );
         assert_eq!(
-            available_balance(&pool, &et_day, "hedging").await,
+            available_balance(&pool, &et_day, "offchain").await,
             "5",
             "offchain balance is already underlying units and must stay unconverted"
         );
         assert_eq!(
-            inflight_balance(&pool, &et_day, "base_wallet_wrapped:base").await,
+            inflight_balance(&pool, &et_day, "wallet_wrapped:base").await,
             "3",
             "2 wrapped shares * 1.5 ratio = 3 underlying-equivalent shares"
         );
         assert_eq!(
-            inflight_balance(&pool, &et_day, "base_wallet_unwrapped:base").await,
+            inflight_balance(&pool, &et_day, "wallet_unwrapped:base").await,
             "3",
             "unwrapped transit balance is already underlying units and must stay unconverted"
         );
@@ -3905,6 +4086,157 @@ mod tests {
             available_balance(&pool, &et_day, "market_making:ethereum").await,
             "8",
             "4 wrapped shares * Ethereum's own 2.0 ratio, not Base's 1.5"
+        );
+    }
+
+    /// Captures a day on which Robinhood's bot wallet holds 3 unwrapped and 2
+    /// wrapped AAPL, with Robinhood's vault at a 1.5 ratio and AAPL last
+    /// filled at $150, and returns the persisted AAPL wallet rows as
+    /// `(location, inflight_balance, usd_mark)`.
+    async fn capture_robinhood_wallet_rows(
+        robinhood_lists_aapl: bool,
+    ) -> Vec<(String, String, Option<String>)> {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let now = Utc::now();
+
+        let view = InventoryView::default()
+            .with_equity(
+                aapl(),
+                FractionalShares::new(float!(10)),
+                FractionalShares::new(float!(5)),
+            )
+            .apply_equity_snapshot(
+                Venue::MarketMaking,
+                Chain::Robinhood,
+                [(&aapl(), &FractionalShares::ZERO)],
+                now,
+                None,
+                now,
+            )
+            .unwrap()
+            .set_inflight_equity_at_location(
+                InFlightEquityLocation::WalletUnwrapped(Chain::Robinhood),
+                &BTreeMap::from([(aapl(), FractionalShares::new(float!(3)))]),
+                now,
+                now,
+            )
+            .set_inflight_equity_at_location(
+                InFlightEquityLocation::WalletWrapped(Chain::Robinhood),
+                &BTreeMap::from([(aapl(), FractionalShares::new(float!(2)))]),
+                now,
+                now,
+            );
+
+        let robinhood_ratio = U256::from(1_500_000_000_000_000_000u64);
+        let (mut ctx, position) = build_ctx(
+            pool.clone(),
+            apalis_pool,
+            view,
+            HashSet::from([aapl()]),
+            false,
+            false,
+            BTreeMap::from([
+                (
+                    Chain::Base,
+                    Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+                ),
+                (
+                    Chain::Robinhood,
+                    Arc::new(MockWrapper::with_ratio(robinhood_ratio)) as Arc<dyn Wrapper>,
+                ),
+            ]),
+        )
+        .await;
+        if robinhood_lists_aapl {
+            ctx.market_making.insert(
+                Chain::Robinhood,
+                MarketMakingSlots {
+                    equity_symbols: HashSet::from([aapl()]),
+                    usdc_tracking_enabled: false,
+                },
+            );
+        }
+        position
+            .send(
+                &aapl(),
+                PositionCommand::AcknowledgeOnChainFillAt {
+                    symbol: aapl(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::ZERO,
+                        log_index: 0,
+                    },
+                    amount: FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: now,
+                    block_number: None,
+                    seen_at: now,
+                },
+            )
+            .await
+            .unwrap();
+        mark_all_required_fresh(&ctx);
+
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
+
+        sqlx::query_as(
+            "SELECT location, inflight_balance, usd_mark FROM portfolio_snapshot \
+             WHERE et_day = ? AND asset = 'AAPL' AND location LIKE 'wallet_%' \
+             ORDER BY location",
+        )
+        .bind(et_day(Utc::now()).to_string())
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+    }
+
+    /// Tokens a failed transfer left in a secondary chain's bot wallet are
+    /// capital under management: the capture values them at that chain's own
+    /// wallet slots, wrapped shares at that chain's vault ratio.
+    #[tokio::test]
+    async fn a_secondary_chains_wallet_equity_is_captured_at_its_own_wallet_slots() {
+        assert_eq!(
+            capture_robinhood_wallet_rows(true).await,
+            vec![
+                (
+                    "wallet_unwrapped:robinhood".to_string(),
+                    "3".to_string(),
+                    Some("150".to_string())
+                ),
+                (
+                    "wallet_wrapped:robinhood".to_string(),
+                    "3".to_string(),
+                    Some("150".to_string())
+                ),
+            ],
+            "3 unwrapped tokens as-is, 2 wrapped shares * Robinhood's own 1.5 ratio"
+        );
+    }
+
+    /// A wrapped wallet row is valued only at a ratio its own chain lists the
+    /// symbol for: Base listing AAPL does not license Robinhood's ratio, so
+    /// the row stays in vault-share units, to be forced unpriceable.
+    #[tokio::test]
+    async fn a_wrapped_wallet_row_on_a_chain_not_listing_the_symbol_is_left_unconverted() {
+        assert_eq!(
+            capture_robinhood_wallet_rows(false).await,
+            vec![
+                (
+                    "wallet_unwrapped:robinhood".to_string(),
+                    "3".to_string(),
+                    Some("150".to_string())
+                ),
+                (
+                    "wallet_wrapped:robinhood".to_string(),
+                    "2".to_string(),
+                    None
+                ),
+            ],
         );
     }
 
@@ -4193,7 +4525,12 @@ mod tests {
         // chain polled normally, and the broker book backing both chains did
         // too, so the secondary chain's own read is the only thing missing.
         for (location, asset) in required_slots(&ctx) {
-            if location == PortfolioLocation::MarketMaking(Chain::Ethereum) {
+            if location
+                == (PortfolioLocation::Onchain {
+                    chain: Chain::Ethereum,
+                    form: OnchainForm::MarketMaking,
+                })
+            {
                 continue;
             }
             ctx.poll_freshness.observe(location, asset);
@@ -4259,7 +4596,7 @@ mod tests {
     }
 
     /// Proves the `(location, asset)` key does not collapse the two
-    /// co-located rows at `BaseWalletUnwrapped`: USDC observed, equity not,
+    /// co-located rows in Base's unwrapped wallet: USDC observed, equity not,
     /// must still block on the equity slot specifically.
     #[tokio::test]
     async fn base_wallet_unwrapped_equity_and_usdc_freshness_are_tracked_independently() {
@@ -4276,7 +4613,11 @@ mod tests {
         .await;
 
         for (location, asset) in required_slots(&ctx) {
-            if location == PortfolioLocation::BaseWalletUnwrapped
+            if location
+                == (PortfolioLocation::Onchain {
+                    chain: Chain::Base,
+                    form: OnchainForm::WalletUnwrapped,
+                })
                 && asset == PortfolioAsset::Equity(aapl())
             {
                 continue;
@@ -4288,12 +4629,15 @@ mod tests {
         assert_eq!(
             freshness_gap(&ctx, target_et_day),
             Some(format!(
-                "AAPL not observed by a poll on/after {target_et_day} at base_wallet_unwrapped:base"
+                "AAPL not observed by a poll on/after {target_et_day} at wallet_unwrapped:base"
             ))
         );
         assert!(
             ctx.poll_freshness.observed_since(
-                PortfolioLocation::BaseWalletUnwrapped,
+                PortfolioLocation::Onchain {
+                    chain: Chain::Base,
+                    form: OnchainForm::WalletUnwrapped
+                },
                 &PortfolioAsset::Usdc,
                 DateTime::<Utc>::MIN_UTC
             ),

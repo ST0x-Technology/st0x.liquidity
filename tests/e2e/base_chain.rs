@@ -94,7 +94,7 @@ const TOFU_DECIMALS_CREATION_CODE: &str = "0x6080604052348015600e575f80fd5b50610
 /// Deploys the canonical TOFUTokenDecimals init bytecode and etches the resulting
 /// runtime at [`TOFU_TOKEN_DECIMALS`]. The orderbook checks both the address and the
 /// codehash, so the runtime must come from executing the canonical creation code.
-async fn deploy_tofu_singleton<P: Provider>(provider: &P) -> anyhow::Result<()> {
+pub(crate) async fn deploy_tofu_singleton<P: Provider>(provider: &P) -> anyhow::Result<()> {
     let creation_code = alloy::hex::decode(TOFU_DECIMALS_CREATION_CODE)?;
     let deployed = provider
         .send_transaction(TransactionRequest::default().with_deploy_code(creation_code))

@@ -190,9 +190,14 @@ const RELAY_QUOTE_TRANSIENT_REDRIVE_DELAY: Duration = Duration::from_secs(30);
 const SWAP_PAYMENT_UNVERIFIED_REDRIVE_DELAY: Duration = Duration::from_secs(30 * 60);
 
 /// Delay between the slow reads of a Relay escrow left unresolved past its
-/// fill window, and of a reverted deposit found on chain: the solver may pay
-/// until the order's deadline, about a week after the quote.
+/// fill window: the solver may pay until the order's deadline, about a week
+/// after the quote.
 const SWAP_ESCROW_RECHECK_DELAY: Duration = Duration::from_secs(30 * 60);
+
+/// Delay before sending again the lone approves of a transfer whose escrow
+/// scan found deposits of reverted orders: each attempt that does not
+/// confirm them pages.
+const FOUND_SWAP_DEPOSIT_APPROVES_REDRIVE_DELAY: Duration = Duration::from_secs(10 * 60);
 
 /// When to read Relay's status again for a deposit confirmed at
 /// `deposited_at`. A deposit stamped after `now` (clock skew) counts as
@@ -452,10 +457,11 @@ where
 /// deposit the next attempt re-quotes (`SwapDepositReverted`), a quote that
 /// failed transiently (`SwapQuoteTransient`), a payment that does not prove
 /// (`SwapPaymentUnverified`, paged on every read), an escrow unresolved past
-/// its fill window (`SwapEscrowUnresolved`, read slowly), or a reverted
-/// order's deposit found on chain (`RevertedSwapDepositLive`, paged on every
-/// read). Each attempt reads Relay's status once, so the single-concurrency
-/// worker never blocks on a fill.
+/// its fill window (`SwapEscrowUnresolved`, read slowly), or lone approves
+/// that do not confirm behind found deposits of reverted orders
+/// (`FoundSwapDepositApprovesUnconfirmed`, paged on every attempt). Each
+/// attempt reads Relay's status once, so the single-concurrency worker never
+/// blocks on a fill.
 async fn intercept_relay_wait<Ctx, TaskJob>(
     job: &TaskJob,
     job_queue: &JobQueue<TaskJob>,
@@ -498,19 +504,9 @@ where
             info!(target: "rebalance", %id, %deposit_tx, delay = ?SWAP_ESCROW_RECHECK_DELAY, "Relay escrow unresolved; reading its status again later");
             SWAP_ESCROW_RECHECK_DELAY
         }
-        Err(error @ UsdcTransferError::RevertedSwapDepositLive { .. }) => {
-            let message = format!(
-                "{error}. The transfer holds its guard; check the order with \
-                 `stox relay status <request>`. It is read again in \
-                 {SWAP_ESCROW_RECHECK_DELAY:?}."
-            );
-            if let Err(notify_error) = notifier
-                .notify(AlertKind::RevertedRelayDepositLive, &message)
-                .await
-            {
-                warn!(target: "rebalance", error = ?notify_error, "Failed to deliver the reverted Relay deposit page");
-            }
-            SWAP_ESCROW_RECHECK_DELAY
+        Err(UsdcTransferError::FoundSwapDepositApprovesUnconfirmed { id, source }) => {
+            warn!(target: "rebalance", %id, %source, delay = ?FOUND_SWAP_DEPOSIT_APPROVES_REDRIVE_DELAY, "Lone Relay approves do not confirm behind found deposits; sending them again later");
+            FOUND_SWAP_DEPOSIT_APPROVES_REDRIVE_DELAY
         }
         Ok(()) | Err(_) => return ControlFlow::Continue(result),
     };
@@ -2627,7 +2623,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use alloy::primitives::{Address, B256, TxHash, U256};
+    use alloy::primitives::{Address, TxHash, U256};
     use chrono::{DateTime, Utc};
     use reqwest::StatusCode;
     use tokio::sync::Notify;
@@ -3528,35 +3524,35 @@ mod tests {
         }
     }
 
-    /// An escrow unresolved past its fill window, and a reverted order's
-    /// deposit found on chain, re-queue the job after the slow re-check
-    /// delay at no retry or redrive cost: the job keeps reading Relay
-    /// instead of ending with the guard held and nothing driving it. The
-    /// found deposit pages on every read; the escrow paged once, when it was
-    /// recorded.
+    /// An escrow unresolved past its fill window, and lone approves that do
+    /// not confirm behind found deposits of reverted orders, re-queue the job
+    /// after their delay at no retry or redrive cost: the job keeps driving
+    /// the transfer instead of ending with the guard held. Both paged in the
+    /// hop, so the re-queue pages nothing.
     #[tokio::test]
-    async fn unresolved_escrow_and_live_reverted_deposit_are_read_again_slowly() {
+    async fn unresolved_escrow_and_unconfirmed_found_deposit_approves_are_requeued() {
         type HeldEnd = fn(&UsdcRebalanceId) -> UsdcTransferError;
-        let held: [(HeldEnd, Vec<AlertKind>); 2] = [
+        let held: [(HeldEnd, Duration); 2] = [
             (
                 |id| UsdcTransferError::SwapEscrowUnresolved {
                     id: id.clone(),
                     deposit_tx: TxHash::repeat_byte(0xd1),
                 },
-                vec![],
+                SWAP_ESCROW_RECHECK_DELAY,
             ),
             (
-                |id| UsdcTransferError::RevertedSwapDepositLive {
+                |id| UsdcTransferError::FoundSwapDepositApprovesUnconfirmed {
                     id: id.clone(),
-                    order_id: B256::repeat_byte(0x0a),
-                    request_id: B256::repeat_byte(0x5e),
-                    deposit_tx: TxHash::repeat_byte(0xd2),
+                    source: Box::new(UsdcTransferError::SwapDepositReverted {
+                        id: id.clone(),
+                        deposit_tx: TxHash::repeat_byte(0xd2),
+                    }),
                 },
-                vec![AlertKind::RevertedRelayDepositLive],
+                FOUND_SWAP_DEPOSIT_APPROVES_REDRIVE_DELAY,
             ),
         ];
 
-        for (end, pages) in held {
+        for (end, delay) in held {
             let pool = setup_queue_pool().await;
             let notifier = Arc::new(CapturingNotifier::default());
             let ctx = TransferUsdcToHedgingCtx {
@@ -3577,7 +3573,7 @@ mod tests {
             let before = Utc::now().timestamp();
             Job::perform(&job, &ctx)
                 .await
-                .expect("a held escrow re-queues without failing the attempt");
+                .expect("a held transfer re-queues without failing the attempt");
             let after = Utc::now().timestamp();
 
             let (payload, run_at) = pending_job_row::<TransferUsdcToHedging>(&pool).await;
@@ -3587,12 +3583,12 @@ mod tests {
                 requeued.revert_redrive_attempts,
                 job.revert_redrive_attempts
             );
-            let delay = i64::try_from(SWAP_ESCROW_RECHECK_DELAY.as_secs()).unwrap();
+            let delay = i64::try_from(delay.as_secs()).unwrap();
             assert!(
                 run_at >= before + delay - 1 && run_at <= after + delay + 1,
                 "run_at {run_at} is not {delay}s after {before}..{after}"
             );
-            assert_eq!(notifier.kinds(), pages);
+            assert_eq!(notifier.kinds(), Vec::<AlertKind>::new());
         }
     }
 

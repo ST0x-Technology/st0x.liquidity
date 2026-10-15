@@ -16,6 +16,7 @@ const usdc = (overrides: Partial<UsdcInventory>): UsdcInventory => ({
     ethereumWallet: null,
     baseWallet: null
   },
+  chains: [],
   ...overrides
 })
 
