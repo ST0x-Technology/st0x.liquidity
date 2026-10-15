@@ -1401,7 +1401,7 @@ impl RebalancingService {
         *inventory =
             inventory
                 .clone()
-                .clear_usdc_inflight_at(chain, source_venue(*direction), now)?;
+                .release_usdc_inflight_at(chain, source_venue(*direction), now)?;
         drop(inventory);
 
         Ok(())
@@ -2002,7 +2002,15 @@ impl RebalancingService {
             None => None,
         };
         let mut inventory = self.inventory.write().await;
-        let outcome = match inventory.clone().update_usdc_at(chain, update, now) {
+        let settled = inventory
+            .clone()
+            .update_usdc_at(chain, update, now)
+            .and_then(|updated| {
+                // The gross broker cash moves in the same write as the ledger,
+                // so the check the landing queues reads both.
+                updated.settle_offchain_gross(source_venue, initiated_amount, settled_amount)
+            });
+        let outcome = match settled {
             Ok(updated) => {
                 // A fill in the deposit's block or earlier may already have
                 // spent the credit onchain while the order fill reader, which
