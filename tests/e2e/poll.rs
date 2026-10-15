@@ -583,14 +583,17 @@ pub async fn poll_for_done_job_referencing(
         let done = done_jobs_referencing(&pool, job_type, aggregate_id).await;
         pool.close().await;
 
-        if done.is_ok_and(|ids| ids.iter().any(|id| !already_done.contains(id))) {
-            return;
+        match done {
+            Ok(ids) if ids.iter().any(|id| !already_done.contains(id)) => return,
+            Ok(_) => assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out after {timeout:?} waiting for {context}",
+            ),
+            Err(query_error) => assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out after {timeout:?} waiting for {context} (query failed: {query_error})",
+            ),
         }
-
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "Timed out after {timeout:?} waiting for {context}",
-        );
     }
 }
 
