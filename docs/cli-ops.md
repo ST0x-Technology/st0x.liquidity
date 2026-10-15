@@ -1150,26 +1150,71 @@ shows.
 
 #### Withdrawal that never reached the chain
 
-A Base->Alpaca transfer at `WithdrawalSubmitting` recorded its vault withdrawal
-intent (with `from_block`), but no withdrawal was initiated. A resume only
-adopts a withdrawal mined after `from_block` and never re-issues one, so if none
-landed it scans forever. First confirm on Base that the bot wallet made no
-`OperatorWithdraw` on the inventory after the transfer's `from_block` (the latch
-alert names the block), and no `WithdrawV2` on the orderbook either (a
-withdrawal sent before the inventory migration). Only a USDC withdrawal from the
-cash vault counts: the event's `vaultId` must equal `vault_id` under
-`[chains.base.trading.assets.cash]` in the bot config. Withdrawals of other
-tokens or vaults (for example equity rebalancing) do not count. The bot wallet
-must be the `operator` of the `OperatorWithdraw` or the `sender` of the
-`WithdrawV2`. Since the migration, inventory withdrawals also emit a
-`WithdrawV2` with the inventory as `sender` (for example from the Bebop and
-univ4 hooks), and that event does not count. A withdraw the network accepted but
-has not mined is not in the logs yet, so also wait until the transfer's attempt
-timeout has passed and confirm the bot wallet has no pending transaction (no
-pending `withdraw4` in the explorer, and pending nonce equal to latest nonce on
-more than one RPC provider). These checks cannot prove that nothing is pending:
-the bot never records the withdrawal's hash or nonce, and on Base the sequencer
-can hold a transaction that no provider shows.
+New Base->Alpaca vault withdrawals persist their exact signed transaction in
+`WithdrawalSubmitting.prepared` before broadcast. `transfer resume --kind usdc`
+rebroadcasts those same bytes and waits for configured confirmations; repeated
+resumes or restarts cannot create another withdrawal. Startup reserves that
+transaction's nonce before other wallet sends. A transient RPC failure leaves
+the signed identity and corridor guard intact. An empty scan cannot prove that
+its transaction will never mine, so the guard stays held while it is unresolved.
+The live
+`st0x-liquidity-client --env <env> debug fail-usdc-transfer <id>
+--reason "confirmed safe cancellation" --superseding-tx <hash>`
+can retire it only after the existing equity verifier proves that hash consumed
+the same configured wallet's nonce at the corridor's configured confirmation
+depth and moved no funds: a revert, or a plain zero-value self-transfer with no
+calldata, EIP-7702 authorization or logs. A successful withdrawal or arbitrary
+successful replacement is refused. The original withdrawal hash, cancellation
+hash and operator reason remain audited; nonce release never rewinds allocation.
+The offline command still refuses prepared bytes; use the live proof-checked
+path. Once its exact hash has a reverted receipt at the configured confirmation
+depth, resume records that hash and `WithdrawalFailed` atomically. The revert
+moved no funds, so its guard and nonce reservation clear. This applies to any
+confirmed revert, including a vault drained between estimation and inclusion; no
+operator failure or second withdrawal is needed for that intent.
+
+Startup re-arms a stored withdrawal whenever no live job remains, including
+after its old job exhausted retries. Repeated recovery keeps one driver and the
+same transaction bytes; legacy intents without bytes retain their operator gate.
+Ordinary retries within one process remain bounded. Persisted fees are not
+changed: a lasting fee-cap rejection needs operator resume when it can be
+accepted, or the confirmed safe cancellation above. The dashboard offers a
+separate live cancellation command; the offline fail command cannot prove it.
+
+Startup and resume refuse prepared bytes signed by a different configured wallet
+before reserving a nonce or broadcasting. Restore the original signer before
+resuming; rotating the key does not make a fresh withdrawal safe. A job that
+exhausts its retries while detached preparation is pending keeps the corridor
+guard and waits up to the configured transfer-attempt timeout for it to settle.
+If signed bytes were persisted, terminal cleanup queues one resume unless
+another live job already owns that transfer. Cancelled callers remain marked for
+this handoff even if preparation finishes before terminal cleanup runs; normal
+exhausted broadcast retries within the running process do not receive a new
+retry budget. If preparation failed without an event, it releases the unrecorded
+guard. If the wait expires, it alerts and keeps the guard; inspect the signer,
+then resume after it settles or restart recovery.
+
+The following procedure applies only to legacy records with no prepared bytes. A
+legacy Base->Alpaca transfer at `WithdrawalSubmitting` recorded its vault
+withdrawal intent (with `from_block`), but its submission outcome was not
+recorded. A resume only adopts a withdrawal mined after `from_block` and never
+re-issues one, so if none landed it scans forever. First confirm on Base that
+the bot wallet made no `OperatorWithdraw` on the inventory after the transfer's
+`from_block` (the latch alert names the block), and no `WithdrawV2` on the
+orderbook either (a withdrawal sent before the inventory migration). Only a USDC
+withdrawal from the cash vault counts: the event's `vaultId` must equal
+`vault_id` under `[chains.base.trading.assets.cash]` in the bot config.
+Withdrawals of other tokens or vaults (for example equity rebalancing) do not
+count. The bot wallet must be the `operator` of the `OperatorWithdraw` or the
+`sender` of the `WithdrawV2`. Since the migration, inventory withdrawals also
+emit a `WithdrawV2` with the inventory as `sender` (for example from the Bebop
+and univ4 hooks), and that event does not count. A withdraw the network accepted
+but has not mined is not in the logs yet, so also wait until the transfer's
+attempt timeout has passed and confirm the bot wallet has no pending transaction
+(no pending `withdraw4` in the explorer, and pending nonce equal to latest nonce
+on more than one RPC provider). These checks cannot prove that nothing is
+pending: the bot never records the withdrawal's hash or nonce, and on Base the
+sequencer can hold a transaction that no provider shows.
 
 - **If one landed** (an `OperatorWithdraw` or a `WithdrawV2`), or you are not
   certain: run `transfer resume --kind usdc`. It adopts a landed withdrawal of

@@ -22,6 +22,7 @@
 //! (see [`UnrecordedGuardRelease`]).
 
 use std::collections::HashMap;
+use std::future::pending;
 use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -768,6 +769,31 @@ pub(crate) type TransferUsdcToMarketMakingJobQueue = JobQueue<TransferUsdcToMark
 /// regardless of which wallet backend is wired in.
 #[async_trait]
 pub(crate) trait ResumeBaseToAlpaca: Send + Sync + 'static {
+    /// A detached signer may still commit the first event after its job ends.
+    /// Keep the corridor reserved until that work settles.
+    fn withdrawal_preparation_pending(&self, _corridor: UsdcCorridor) -> bool {
+        false
+    }
+
+    fn withdrawal_preparation_needs_handoff(
+        &self,
+        _id: &UsdcRebalanceId,
+        corridor: UsdcCorridor,
+    ) -> bool {
+        self.withdrawal_preparation_pending(corridor)
+    }
+
+    fn acknowledge_withdrawal_handoff(&self, _id: &UsdcRebalanceId, _corridor: UsdcCorridor) {}
+
+    /// Wait until detached preparation no longer owns its sign/persist lock.
+    /// A pending-only implementation cannot establish settlement, so it waits
+    /// for the caller's bound rather than claiming the signer has finished.
+    async fn wait_for_withdrawal_preparation(&self, corridor: UsdcCorridor) {
+        if self.withdrawal_preparation_pending(corridor) {
+            pending::<()>().await;
+        }
+    }
+
     async fn resume_base_to_alpaca(
         &self,
         id: &UsdcRebalanceId,
@@ -781,6 +807,22 @@ impl<Signer> ResumeBaseToAlpaca for CrossVenueCashTransfer<Signer>
 where
     Signer: Wallet + Send + Sync + 'static,
 {
+    fn withdrawal_preparation_needs_handoff(&self, id: &UsdcRebalanceId, _: UsdcCorridor) -> bool {
+        self.vault_withdrawal_needs_handoff(id)
+    }
+
+    fn acknowledge_withdrawal_handoff(&self, id: &UsdcRebalanceId, _: UsdcCorridor) {
+        self.acknowledge_vault_withdrawal_handoff(id);
+    }
+
+    fn withdrawal_preparation_pending(&self, _corridor: UsdcCorridor) -> bool {
+        self.vault_withdrawal_preparation_pending()
+    }
+
+    async fn wait_for_withdrawal_preparation(&self, _corridor: UsdcCorridor) {
+        self.wait_for_vault_withdrawal_preparation().await;
+    }
+
     async fn resume_base_to_alpaca(
         &self,
         id: &UsdcRebalanceId,
@@ -1313,6 +1355,38 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
         let Some(release) = &ctx.unrecorded_guards else {
             return Ok(());
         };
+        if ctx
+            .transfer
+            .withdrawal_preparation_needs_handoff(&self.id, self.corridor)
+        {
+            if tokio::time::timeout(
+                ctx.timeout,
+                ctx.transfer.wait_for_withdrawal_preparation(self.corridor),
+            )
+            .await
+            .is_err()
+            {
+                error!(target: "operational_alert", alert = true, kind = AlertKind::UsdcVaultPreparationUnsettled.as_str(), id = %self.id, "Detached vault preparation did not settle before terminal cleanup; corridor retained, inspect and resume after it settles or restart recovery");
+                return Ok(());
+            }
+            if matches!(
+                release.store.load(&self.id).await?,
+                Some(UsdcRebalance::WithdrawalSubmitting {
+                    prepared: Some(_),
+                    ..
+                })
+            ) && !has_live_sibling_job::<Self>(ctx.job_queue.pool(), task_identity, |sibling| {
+                sibling.id == self.id
+            })
+            .await?
+            {
+                ctx.job_queue.clone().push(self.clone()).await?;
+                info!(target: "rebalance", id = %self.id, "Re-enqueued the same USDC withdrawal after detached preparation settled");
+                ctx.transfer
+                    .acknowledge_withdrawal_handoff(&self.id, self.corridor);
+                return Ok(());
+            }
+        }
         release
             .release_if_unrecorded::<Self>(
                 ctx.job_queue.pool(),
@@ -1320,7 +1394,10 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
                 task_identity,
                 |sibling| sibling.id == self.id,
             )
-            .await
+            .await?;
+        ctx.transfer
+            .acknowledge_withdrawal_handoff(&self.id, self.corridor);
+        Ok(())
     }
 }
 

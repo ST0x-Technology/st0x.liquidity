@@ -4030,13 +4030,13 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             unmined_restore_chains.insert(Chain::Ethereum);
         }
 
-        // Each Relay corridor's pairs signed on its own chain's wallet.
+        // Signed vault withdrawals and Relay pairs on each corridor chain's wallet.
         for (chain, RestoredDepositSends { restored, unmined }) in usdc_handles
             .restore_deposit_sends
             .restore_chain_signed_swaps(&deps.pool)
             .await
         {
-            info!(target: "rebalance", %chain, restored, unmined, "Restored and rebroadcast the signed Relay pairs");
+            info!(target: "rebalance", %chain, restored, unmined, "Restored and rebroadcast signed corridor transactions");
             if unmined > 0 {
                 unmined_restore_chains.insert(chain);
             }

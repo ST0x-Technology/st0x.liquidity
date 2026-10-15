@@ -5,6 +5,7 @@ st0x-liquidity-client --env production debug fail-equity-transfer <mint|redempti
 st0x-liquidity-client --env production debug fail-equity-transfer mint X1 --reason "<reason>"
 st0x-liquidity-client --env production debug fail-equity-transfer redemption X1 --reason "<reason>"
 st0x-liquidity-client --env production debug fail-usdc-transfer 00000000-0000-4000-8000-000000000001 --reason "<reason>"
+st0x-liquidity-client --env production debug fail-usdc-transfer 00000000-0000-4000-8000-000000000001 --reason "<reason>" --superseding-tx "<confirmed-cancel-hash>"
 st0x-liquidity-client --env production debug fail-usdc-transfer <id> --reason "<reason>"
 st0x-liquidity-client --env production debug position release-hedge <symbol> --order-id <order-id> --reason "<reason>"
 st0x-liquidity-client --env production debug position release-hedge MSTR --order-id <order-id> --reason "<reason>"

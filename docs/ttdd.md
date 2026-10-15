@@ -120,3 +120,19 @@ _before_ implementation begins — not after. The sequence is:
 4. **Refine and clean up**: refactor, fix clippy warnings, improve code quality.
    Re-validate SPEC.md — refine any details that became clearer during
    implementation. Update Linear and AGENTS.md to reflect what changed
+
+### Async test resource lifetimes
+
+With the Rust 1.94 Clippy toolchain, put a synchronous mutex guard in a lexical
+scope ending before the next `await`, and explicitly drop it after its last use.
+The scope satisfies `await_holding_lock`; the explicit drop satisfies
+`significant_drop_tightening`, which can still complain at the scope boundary.
+For a spawned task returning a pause guard, awaiting the `JoinHandle` by value
+can likewise leave a nursery drop warning. Await it through a mutable reference,
+then explicitly drop the completed handle and the returned guard before
+continuing the test.
+
+A terminal aggregate event can commit before apalis acknowledges its job as
+`Done`. An E2E assertion about durable job completion must poll for the
+completed row belonging to that aggregate; observing the terminal event alone
+does not establish acknowledgement, and any other completed job is insufficient.

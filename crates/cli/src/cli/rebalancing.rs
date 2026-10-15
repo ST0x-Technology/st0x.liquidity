@@ -766,6 +766,7 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::WithdrawalTxLookupFailed { .. }
         | UsdcTransferError::SettlementRetryDeadlineElapsed { .. }
         | UsdcTransferError::BurnRecordTaskFailed { .. }
+        | UsdcTransferError::VaultWithdrawalTaskFailed { .. }
         | UsdcTransferError::BurnRecordFailed { .. }
         | UsdcTransferError::BurnSubmitInconclusive { .. }
         | UsdcTransferError::BurnTxDropped { .. }
@@ -1281,9 +1282,10 @@ async fn reject_unsent_usdc_withdrawal<Writer: Write>(
 /// refuses BaseToAlpaca transfers past their vault withdrawal, which stay with
 /// this command.
 ///
-/// A BaseToAlpaca transfer at `WithdrawalSubmitting` is failed with
-/// `RejectWithdrawal` instead (see `reject_unsent_usdc_withdrawal`), on either
-/// surface. The operator first verifies on chain that the bot wallet made no
+/// A legacy BaseToAlpaca intent at `WithdrawalSubmitting` without prepared
+/// bytes can fail with `RejectWithdrawal` (see `reject_unsent_usdc_withdrawal`).
+/// Signed intents instead resume their exact bytes; a confirmed revert is
+/// recorded with its hash and failed atomically. The operator first verifies on chain that the bot wallet made no
 /// `OperatorWithdraw` after the transfer's `from_block`.
 pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
     stdout: &mut Writer,
@@ -2805,6 +2807,17 @@ mod tests {
             "a backpressure-classified poll error stays in the bounded retry \
              budget rather than handing off"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_withdrawal_preparation_task_is_not_a_bot_resumable_wait() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        task.abort();
+        let error = UsdcTransferError::VaultWithdrawalTaskFailed {
+            id: UsdcRebalanceId(Uuid::from_u128(7)),
+            source: task.await.unwrap_err(),
+        };
+        assert!(!is_bot_resumable_wait(&error));
     }
 
     /// A recorded vault withdrawal with no tx hash never gains one, so the
@@ -5195,6 +5208,7 @@ mod tests {
                     direction: RebalanceDirection::BaseToAlpaca,
                     corridor: UsdcCorridor::BASE_CCTP,
                     amount: Usdc::new(Float::parse("1971.318665".to_string()).unwrap()),
+                    prepared: None,
                     from_block: 52_027_377,
                 },
             )

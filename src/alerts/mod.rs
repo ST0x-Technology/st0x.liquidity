@@ -135,6 +135,13 @@ alert_kinds! {
         TokenizationResumeFailed => "Interrupted tokenization aggregate failed all resume retries",
     }
     not_extracted {
+        UsdcVaultWithdrawalReverted => "Confirmed vault withdrawal reverted; transfer failed",
+        UsdcVaultPreparationUnsettled => "Detached vault preparation did not settle before terminal cleanup",
+        UsdcVaultWithdrawalsUnlisted => "Could not list signed USDC vault withdrawals at startup",
+        UsdcVaultWithdrawalIdsUnparseable => "Signed USDC vault withdrawals have unparseable ids",
+        UsdcVaultWithdrawalTransferUnloadable => "Could not load signed USDC vault withdrawal at startup",
+        UsdcVaultWithdrawalRestoreFailed => "Could not restore signed USDC vault withdrawal",
+        UsdcVaultWithdrawalPersistenceUnknown => "Cannot prove signed vault withdrawal was not persisted",
         PnlLedgerCatchUpFailed => "PnL ledger failed to catch up at startup",
         RedemptionLegacyPendingSend => "has a legacy pending send to the issuer",
         RedemptionSendSignedByAnotherWallet => "not the wallet that sends to the issuer",
@@ -174,7 +181,7 @@ alert_kinds! {
         RelayPairRebroadcastFailed => "Could not rebroadcast a signed Relay pair at startup",
         RelayEnvelopeRebroadcastFailed => "Could not rebroadcast a signed Relay envelope at startup",
         RelayPairPreparePanicked => "The Relay pair prepare task panicked",
-        RelayPairsOnUnservedCorridor => "Signed Relay pairs on a corridor this build does not serve",
+        ChainTransactionsOnUnservedCorridor => "Signed transactions on a corridor this build does not serve",
         RelayWithdrawalHoldTimedOut => "moved the stable out of the vault",
         RelaySwapFailedNothingPaid => "Relay failed the swap with nothing paid back",
         RelayPaymentUnproven => "The Relay payment does not prove on chain",

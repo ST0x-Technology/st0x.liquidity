@@ -758,6 +758,13 @@ pub enum UsdcTransferError {
     /// and the retry signs one; nothing was broadcast.
     #[error("USDC rebalance {id}: the deposit send prepare task panicked; nothing was broadcast")]
     DepositSendTaskPanicked { id: UsdcRebalanceId },
+    /// Signing and persistence run in a task that survives a cancelled driver.
+    #[error("USDC rebalance {id}: vault withdrawal preparation task failed: {source}")]
+    VaultWithdrawalTaskFailed {
+        id: UsdcRebalanceId,
+        #[source]
+        source: tokio::task::JoinError,
+    },
     /// The event store could not be read to check whether another transfer
     /// claims a same-amount send found on resume. Nothing was sent; the retry
     /// scans again.
@@ -883,6 +890,7 @@ impl UsdcTransferError {
             | Self::DepositSendUnresolved { .. }
             | Self::DepositSendReconciliationPending { .. }
             | Self::DepositSendTaskPanicked { .. }
+            | Self::VaultWithdrawalTaskFailed { .. }
             | Self::DepositSendLookup { .. }
             | Self::StateOffHop { .. }
             | Self::BasisPoints(_)
@@ -969,6 +977,7 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::DepositSendUnresolved { .. }
             | Self::DepositSendReconciliationPending { .. }
             | Self::DepositSendTaskPanicked { .. }
+            | Self::VaultWithdrawalTaskFailed { .. }
             | Self::DepositSendLookup { .. }
             | Self::StateOffHop { .. }
             | Self::BasisPoints(_)

@@ -511,10 +511,43 @@ describe('transferRecoveryCommands', () => {
     expect(labels('withdrawing', 'alpaca_to_base')).toEqual(['Resume', 'Fail (pre-burn)'])
     expect(labels('bridging', 'alpaca_to_base')).toEqual(['Resume', 'Fail (pre-burn)'])
     expect(labels('converting', 'alpaca_to_base')).toEqual(['Resume'])
-    expect(labels('withdrawing', 'base_to_alpaca')).toEqual(['Resume', 'Fail (pre-burn)'])
+    expect(labels('withdrawing', 'base_to_alpaca')).toEqual([
+      'Resume',
+      'Fail (pre-burn)',
+      'Fail (confirmed cancellation)'
+    ])
     expect(labels('bridging', 'base_to_alpaca')).toEqual(['Resume'])
     expect(labels('depositing', 'base_to_alpaca')).toEqual(['Resume'])
     expect(labels('bridging', null)).toEqual(['Resume', 'Fail (pre-burn)'])
+  })
+
+  it('offers proof-checked cancellation only on a live Base to Alpaca withdrawal', () => {
+    const commands = bridgeLabels('withdrawing', 'base_to_alpaca')
+    const cancel = commands.find((entry) => entry.label === 'Fail (confirmed cancellation)')
+    expect(cancel?.command).toBe(
+      `${CLIENT} debug fail-usdc-transfer BRIDGE001 --reason "<reason>" --superseding-tx "<confirmed-cancel-hash>"`
+    )
+    expect(cancel?.description).toContain('stored signed bytes')
+    expect(cancel?.description).toContain('same-nonce')
+    expect(cancel?.mode).toBe('requires-bot')
+    expect(commands.find((entry) => entry.label === 'Fail (pre-burn)')?.description).toContain(
+      'legacy intents without stored signed bytes'
+    )
+    for (const direction of ['alpaca_to_base', null] as const) {
+      expect(
+        bridgeLabels('withdrawing', direction).some(
+          (entry) => entry.label === 'Fail (confirmed cancellation)'
+        )
+      ).toBe(false)
+    }
+    const simulated = transferRecoveryCommands({
+      deployment: SIM,
+      kind: 'usdc_bridge',
+      id: 'BRIDGE001',
+      status: 'withdrawing',
+      direction: 'base_to_alpaca'
+    })
+    expect(simulated.some((entry) => entry.label === 'Fail (confirmed cancellation)')).toBe(false)
   })
 
   it('gives the pre-fail check that applies to the bridge direction', () => {

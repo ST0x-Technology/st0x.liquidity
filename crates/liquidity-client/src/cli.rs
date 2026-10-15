@@ -181,9 +181,10 @@ pub(crate) enum Debug {
     /// recorded (WithdrawalSubmitting; the guard clears). A BaseToAlpaca
     /// rebalance at WithdrawalComplete or BridgingSubmitting with no recorded
     /// burn needs the offline stox fail-usdc-transfer, and its withdrawn USDC
-    /// goes back to the vault by hand. Both refuse every other state. It does
-    /// not check the chain: first verify, for BaseToAlpaca, that no withdrawal
-    /// landed or is pending, and for AlpacaToBase, that no burn landed or is
+    /// goes back to the vault by hand. Other states are refused. Prepared
+    /// withdrawals are checked on chain; --superseding-tx must name a
+    /// confirmed safe same-nonce cancellation. For legacy intents, first verify
+    /// that no withdrawal landed or is pending, and for AlpacaToBase, that no burn landed or is
     /// pending (see docs/cli-ops.md).
     FailUsdcTransfer {
         /// USDC rebalance id.
@@ -191,6 +192,9 @@ pub(crate) enum Debug {
         /// Free text audit reason, persisted on the event.
         #[arg(long, value_parser = nonblank_reason)]
         reason: String,
+        /// Confirmed safe transaction consuming the prepared withdrawal's nonce.
+        #[arg(long)]
+        superseding_tx: Option<String>,
     },
     /// Force fail a stuck equity mint or redemption so its transfer guard
     /// can be released.
@@ -785,8 +789,19 @@ mod tests {
         ));
         assert!(matches!(
             debug(&["fail-usdc-transfer", "abc", "--reason", "pre-burn crash"]).unwrap(),
-            Debug::FailUsdcTransfer { id, reason } if id == "abc" && reason == "pre-burn crash"
+            Debug::FailUsdcTransfer { id, reason, superseding_tx: None } if id == "abc" && reason == "pre-burn crash"
         ));
+        assert!(
+            debug(&[
+                "fail-usdc-transfer",
+                "abc",
+                "--reason",
+                "cancel confirmed",
+                "--superseding-tx",
+                "0xcancel"
+            ])
+            .is_ok()
+        );
         assert!(matches!(
             debug(&["fail-equity-transfer", "mint", "abc", "--reason", "stuck"]).unwrap(),
             Debug::FailEquityTransfer {
@@ -1328,6 +1343,9 @@ mod tests {
             "symbol" => "AAPL",
             "order-id" => "ord-1",
             "hash" => "0xabc",
+            "confirmed-cancel-hash" => {
+                "0x1111111111111111111111111111111111111111111111111111111111111111"
+            }
             "N" => "-5",
             "USDC_PER_SHARE" => "1.5",
             other => panic!("no test value for the placeholder <{other}>"),

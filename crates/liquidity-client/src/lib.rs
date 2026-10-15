@@ -323,12 +323,19 @@ async fn send_debug<A: TokenSource + Sync>(
                 )
                 .await?
         }
-        Debug::FailUsdcTransfer { id, reason } => {
+        Debug::FailUsdcTransfer {
+            id,
+            reason,
+            superseding_tx,
+        } => {
             let id = encode_segment(&id);
             client
                 .post_json(
                     &format!("/transfers/usdc/{id}/fail"),
-                    &wire::FailUsdcTransferRequest { reason },
+                    &wire::FailUsdcTransferRequest {
+                        reason,
+                        superseding_tx,
+                    },
                 )
                 .await?
         }
@@ -903,6 +910,7 @@ mod tests {
         let request = request_for(Command::Debug(Debug::FailUsdcTransfer {
             id: "abc".to_owned(),
             reason: "pre-burn crash, burn not attempted".to_owned(),
+            superseding_tx: None,
         }))
         .await?;
         assert_eq!(
@@ -912,6 +920,22 @@ mod tests {
         assert_eq!(
             request_body(&request),
             serde_json::json!({ "reason": "pre-burn crash, burn not attempted" })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fail_usdc_transfer_posts_superseding_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Debug(Debug::FailUsdcTransfer {
+            id: "abc".to_owned(),
+            reason: "cancel confirmed".to_owned(),
+            superseding_tx: Some("0xcancel".to_owned()),
+        }))
+        .await?;
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({ "reason": "cancel confirmed", "supersedingTx": "0xcancel" })
         );
         Ok(())
     }

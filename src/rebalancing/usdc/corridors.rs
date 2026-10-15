@@ -32,6 +32,7 @@ use crate::alerts::AlertKind;
 use crate::rebalancing::equity::RecheckOutcome;
 use crate::usdc_rebalance::{
     RebalanceDirection, UsdcRebalance, UsdcRebalanceId, prepared_swap_ids,
+    prepared_vault_withdrawal_ids,
 };
 
 const CCTP_CORRIDOR_NOT_SERVED: CctpMintRecoveryError = CctpMintRecoveryError::CorridorNotServed {
@@ -101,18 +102,34 @@ impl UsdcCorridorTransfers {
         Err(unserved_corridor(id, requested, &served, state.as_ref()))
     }
 
-    /// Pages the chain-signed Relay pairs persisted on a corridor no service
+    /// Pages signed vault withdrawals and Relay pairs on a corridor no service
     /// carries, whose nonces nothing restores, and returns how many there are
-    /// on each chain. A listing or load failure is paged by the hub's restore.
-    async fn page_unserved_chain_signed_swaps(&self, pool: &SqlitePool) -> BTreeMap<Chain, usize> {
-        let ids = match prepared_swap_ids(pool).await {
-            Ok((ids, _unparseable)) => ids,
-            Err(error) => {
-                warn!(target: "rebalance", ?error, "Could not list signed Relay pairs to check their corridors at startup");
-                return BTreeMap::new();
+    /// on each chain. Unknown signed state adds an unmined marker on every
+    /// chain: a failed listing or load cannot establish which wallet is safe.
+    async fn page_unserved_chain_transactions(&self, pool: &SqlitePool) -> BTreeMap<Chain, usize> {
+        let mut unsafe_chains = BTreeMap::new();
+        let mut ids = Vec::new();
+        for (kind, listing) in [
+            ("Relay pairs", prepared_swap_ids(pool).await),
+            (
+                "vault withdrawals",
+                prepared_vault_withdrawal_ids(pool).await,
+            ),
+        ] {
+            match listing {
+                Ok((found, unparseable)) => {
+                    ids.extend(found);
+                    if unparseable.is_empty() {
+                        continue;
+                    }
+                    warn!(target: "rebalance", kind, ?unparseable, "Signed corridor transactions have unparseable ids; skipping all chains' startup approvals");
+                }
+                Err(error) => {
+                    warn!(target: "rebalance", kind, ?error, "Could not list signed corridor transactions; skipping all chains' startup approvals");
+                }
             }
-        };
-
+            unsafe_chains.extend(Chain::ALL.map(|chain| (chain, 1)));
+        }
         let mut unserved: BTreeMap<UsdcCorridor, Vec<UsdcRebalanceId>> = BTreeMap::new();
         for id in ids {
             match self.store.load(&id).await {
@@ -122,9 +139,10 @@ impl UsdcCorridorTransfers {
                 {
                     unserved.entry(state.corridor()).or_default().push(id);
                 }
-                Ok(_) => {}
-                Err(error) => {
-                    warn!(target: "rebalance", %id, ?error, "Could not load a transfer with a signed Relay pair to check its corridor at startup");
+                Ok(Some(_)) => {}
+                result => {
+                    warn!(target: "rebalance", %id, ?result, "Could not load a transfer with a signed corridor transaction; skipping all chains' startup approvals");
+                    unsafe_chains.extend(Chain::ALL.map(|chain| (chain, 1)));
                 }
             }
         }
@@ -133,10 +151,10 @@ impl UsdcCorridorTransfers {
             .into_iter()
             .map(|(corridor, ids)| {
                 let chain = corridor.chain();
-                error!(target: "operational_alert", alert = true, kind = AlertKind::RelayPairsOnUnservedCorridor.as_str(), %corridor, %chain, ?ids, "Signed Relay pairs on a corridor this build does not serve were not restored at startup; their nonces are not reserved, so startup skips {chain}'s approvals and revokes until a build serving {corridor} restores them");
+                error!(target: "operational_alert", alert = true, kind = AlertKind::ChainTransactionsOnUnservedCorridor.as_str(), %corridor, %chain, ?ids, "Signed transactions on a corridor this build does not serve were not restored at startup; their nonces are not reserved, so startup skips {chain}'s approvals and revokes until a build serving {corridor} restores them");
                 (chain, ids.len())
             })
-            .fold(BTreeMap::new(), |mut by_chain, (chain, count)| {
+            .fold(unsafe_chains, |mut by_chain, (chain, count)| {
                 *by_chain.entry(chain).or_default() += count;
                 by_chain
             })
@@ -153,6 +171,34 @@ impl UsdcCorridorTransfers {
 
 #[async_trait]
 impl ResumeBaseToAlpaca for UsdcCorridorTransfers {
+    fn withdrawal_preparation_needs_handoff(
+        &self,
+        id: &UsdcRebalanceId,
+        corridor: UsdcCorridor,
+    ) -> bool {
+        self.by_corridor
+            .get(&corridor)
+            .is_some_and(|service| service.withdrawal_preparation_needs_handoff(id, corridor))
+    }
+
+    fn acknowledge_withdrawal_handoff(&self, id: &UsdcRebalanceId, corridor: UsdcCorridor) {
+        if let Some(service) = self.by_corridor.get(&corridor) {
+            service.acknowledge_withdrawal_handoff(id, corridor);
+        }
+    }
+
+    fn withdrawal_preparation_pending(&self, corridor: UsdcCorridor) -> bool {
+        self.by_corridor
+            .get(&corridor)
+            .is_some_and(|transfer| transfer.withdrawal_preparation_pending(corridor))
+    }
+
+    async fn wait_for_withdrawal_preparation(&self, corridor: UsdcCorridor) {
+        if let Some(service) = self.by_corridor.get(&corridor) {
+            service.wait_for_withdrawal_preparation(corridor).await;
+        }
+    }
+
     async fn resume_base_to_alpaca(
         &self,
         id: &UsdcRebalanceId,
@@ -183,6 +229,25 @@ impl ResumeAlpacaToBase for UsdcCorridorTransfers {
 
 #[async_trait]
 impl RecheckUsdcDeposit for UsdcCorridorTransfers {
+    async fn fail_superseded_withdrawal(
+        &self,
+        id: &UsdcRebalanceId,
+        superseding_tx: Option<TxHash>,
+        reason: String,
+    ) -> Result<(), UsdcRecheckError> {
+        let state = self
+            .store
+            .load(id)
+            .await
+            .map_err(|e| Box::new(UsdcTransferError::from(e)))?
+            .ok_or_else(|| UsdcRecheckError::NotFound(id.clone()))?;
+        self.route(id, state.corridor())
+            .await
+            .map_err(Box::new)?
+            .fail_superseded_withdrawal(id, superseding_tx, reason)
+            .await
+    }
+
     async fn recheck_deposit(
         &self,
         id: &UsdcRebalanceId,
@@ -235,10 +300,14 @@ impl RestorePreparedDepositSends for UsdcCorridorTransfers {
     ) -> BTreeMap<Chain, RestoredDepositSends> {
         let mut by_chain = BTreeMap::new();
         for service in self.by_corridor.values() {
-            by_chain.extend(service.restore_chain_signed_swaps(pool).await);
+            for (chain, outcome) in service.restore_chain_signed_swaps(pool).await {
+                let total: &mut RestoredDepositSends = by_chain.entry(chain).or_default();
+                total.restored += outcome.restored;
+                total.unmined += outcome.unmined;
+            }
         }
 
-        for (chain, unrestored) in self.page_unserved_chain_signed_swaps(pool).await {
+        for (chain, unrestored) in self.page_unserved_chain_transactions(pool).await {
             let restored: &mut RestoredDepositSends = by_chain.entry(chain).or_default();
             restored.unmined += unrestored;
         }
@@ -303,6 +372,7 @@ mod tests {
         resumed: Mutex<Vec<UsdcRebalanceId>>,
         restores: Mutex<usize>,
         cctp_recoveries: Mutex<usize>,
+        chain_restores: BTreeMap<Chain, (usize, usize)>,
     }
 
     #[async_trait]
@@ -364,7 +434,12 @@ mod tests {
             &self,
             _pool: &SqlitePool,
         ) -> BTreeMap<Chain, RestoredDepositSends> {
-            BTreeMap::new()
+            self.chain_restores
+                .iter()
+                .map(|(&chain, &(restored, unmined))| {
+                    (chain, RestoredDepositSends { restored, unmined })
+                })
+                .collect()
         }
     }
 
@@ -435,6 +510,7 @@ mod tests {
                     direction: RebalanceDirection::BaseToAlpaca,
                     corridor,
                     amount: Usdc::new(float!(1)),
+                    prepared: None,
                     from_block: 0,
                 },
             )
@@ -547,6 +623,107 @@ mod tests {
         );
         assert!(logs_contain("operational_alert"));
         assert!(logs_contain(&id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn signed_vault_withdrawals_on_unserved_corridors_exclude_chain_approvals() {
+        let pool = setup_test_db().await;
+        let store = Arc::new(test_store(pool.clone(), ()));
+        let transfers = UsdcCorridorTransfers::new(
+            BTreeMap::from([(
+                UsdcCorridor::BASE_CCTP,
+                Arc::new(StubTransfer::default()) as Arc<dyn CorridorTransfer>,
+            )]),
+            store.clone(),
+        )
+        .unwrap();
+        for (nonce, corridor) in [(41, ROBINHOOD_CCTP), (42, ROBINHOOD_RELAY)] {
+            store
+                .send(
+                    &UsdcRebalanceId(Uuid::new_v4()),
+                    UsdcRebalanceCommand::BeginWithdrawal {
+                        direction: RebalanceDirection::BaseToAlpaca,
+                        corridor,
+                        amount: Usdc::new(float!(1)),
+                        from_block: 0,
+                        prepared: Some(PreparedTransaction::for_test(TxHash::random(), nonce)),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let by_chain = transfers.restore_chain_signed_swaps(&pool).await;
+        assert_eq!(
+            by_chain.get(&Chain::Robinhood),
+            Some(&RestoredDepositSends {
+                restored: 0,
+                unmined: 2
+            })
+        );
+        assert!(!by_chain.contains_key(&Chain::Base));
+    }
+
+    #[tokio::test]
+    async fn unreadable_signed_withdrawals_exclude_all_startup_chain_approvals() {
+        for (id, payload) in [
+            ("550e8400-e29b-41d4-a716-446655440000", "{broken"),
+            (
+                "550e8400-e29b-41d4-a716-446655440000",
+                r#"{"WithdrawalSubmitting":{"prepared":{}}}"#,
+            ),
+            ("invalid-id", r#"{"WithdrawalSubmitting":{"prepared":{}}}"#),
+        ] {
+            let pool = setup_test_db().await;
+            let store = Arc::new(test_store(pool.clone(), ()));
+            let transfers = UsdcCorridorTransfers::new(
+                BTreeMap::from([(
+                    UsdcCorridor::BASE_CCTP,
+                    Arc::new(StubTransfer::default()) as Arc<dyn CorridorTransfer>,
+                )]),
+                store,
+            )
+            .unwrap();
+            // Fixture-only historical corruption: exercise listing failure,
+            // aggregate hydration failure, and an unparseable durable id.
+            sqlx::query("INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) VALUES ('UsdcRebalance', ?, 1, 'UsdcRebalanceEvent::WithdrawalSubmitting', '1.0', ?, '{}')")
+                .bind(id).bind(payload).execute(&pool).await.unwrap();
+            assert!(prepared_swap_ids(&pool).await.unwrap().0.is_empty());
+            let outcomes = transfers.restore_chain_signed_swaps(&pool).await;
+            for chain in Chain::ALL {
+                assert!(
+                    outcomes
+                        .get(&chain)
+                        .is_some_and(|outcome| outcome.unmined > 0),
+                    "unreadable withdrawal {id} / {payload} must exclude {chain}'s startup approvals: {outcomes:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn same_chain_corridors_accumulate_unresolved_startup_restores() {
+        let pool = setup_test_db().await;
+        let store = Arc::new(test_store(pool.clone(), ()));
+        let mut services = BTreeMap::new();
+        for (corridor, counts) in [(ROBINHOOD_CCTP, (1, 1)), (ROBINHOOD_RELAY, (2, 0))] {
+            services.insert(
+                corridor,
+                Arc::new(StubTransfer {
+                    chain_restores: BTreeMap::from([(Chain::Robinhood, counts)]),
+                    ..StubTransfer::default()
+                }) as Arc<dyn CorridorTransfer>,
+            );
+        }
+        let transfers = UsdcCorridorTransfers::new(services, store).unwrap();
+        let by_chain = transfers.restore_chain_signed_swaps(&pool).await;
+        assert_eq!(
+            by_chain.get(&Chain::Robinhood),
+            Some(&RestoredDepositSends {
+                restored: 3,
+                unmined: 1
+            }),
+            "a later corridor must not erase an earlier corridor's approval exclusion"
+        );
     }
 
     /// The signed deposit sends belong to the one Ethereum wallet, so the

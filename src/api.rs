@@ -2011,6 +2011,15 @@ fn usdc_recheck_error_response(error: &UsdcRecheckError) -> (StatusCode, String)
     };
 
     match error {
+        UsdcRecheckError::WithdrawalNotSuperseded(WithdrawalNotSuperseded::Read { .. }) => (
+            StatusCode::BAD_GATEWAY,
+            "Chain RPC unavailable; retry later".to_owned(),
+        ),
+        UsdcRecheckError::WithdrawalRecoveryUnavailable(_)
+        | UsdcRecheckError::WithdrawalDepthMissing(_)
+        | UsdcRecheckError::WithdrawalNotSuperseded(_) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
+        }
         NotFound(_) => (StatusCode::NOT_FOUND, error.to_string()),
         AlpacaToBaseDeposit(_)
         | NoOnchainDepositRef(_)
@@ -2739,12 +2748,21 @@ const FAILED_WITHDRAWAL_NEVER_SENT: &str = "failed_withdrawal_never_sent";
 
 /// Wire contract for the fail-usdc-transfer route.
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct FailUsdcTransferRequest {
     /// Free-text operator audit reason (required; persisted on the event).
     reason: String,
+    #[serde(default)]
+    superseding_tx: Option<TxHash>,
 }
 
 impl AuditedRequest for FailUsdcTransferRequest {
+    fn audit_targets(&self) -> Vec<String> {
+        self.superseding_tx
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
     fn audit_reason(&self) -> Option<&str> {
         Some(&self.reason)
     }
@@ -2774,11 +2792,12 @@ struct FailUsdcTransferResponse {
 /// USDC to the market maker wallet, and the live reactor would credit it back
 /// to the vault, so those stay with the offline CLI.
 ///
-/// A BaseToAlpaca transfer at `WithdrawalSubmitting` is accepted and failed
-/// with `RejectWithdrawal`: its withdrawal was never initiated, so the reactor
-/// credits nothing and clears the guard. The route cannot prove the withdraw
-/// never landed, so the operator first confirms on chain that the bot wallet
-/// made no `OperatorWithdraw` after the transfer's `from_block`; a withdrawal
+/// A legacy BaseToAlpaca transfer at `WithdrawalSubmitting` without prepared
+/// bytes can fail with `RejectWithdrawal`; its submission outcome is unknown.
+/// Prepared intents require canonical proof of a confirmed revert or safe
+/// same-nonce cancellation; resume also detects the exact hash's confirmed revert. The route cannot prove
+/// that a legacy withdraw never landed, so the operator first confirms on chain
+/// that the bot wallet made no `OperatorWithdraw` after the transfer's `from_block`; a withdrawal
 /// that did land must be adopted with resume-usdc instead. The route kills
 /// the transfer's queued job rows, which would otherwise count as an
 /// in-flight transfer, and the failure starts the corridor's withdraw cooldown.
@@ -2787,7 +2806,8 @@ struct FailUsdcTransferResponse {
 /// quiesced: a worker execution, including the burn broadcast it spawns,
 /// cannot advance the transfer from `BridgingSubmitting` to `Bridging`
 /// between the preflight and the send, and a concurrent resume cannot adopt a
-/// burn under it. It does not look on chain, so before failing a
+/// burn under it. Apart from prepared-withdrawal proof it does not look on chain,
+/// so before failing a
 /// `BridgingSubmitting` transfer the operator still verifies that no
 /// unrecorded burn was broadcast.
 async fn fail_usdc_transfer(
@@ -2840,10 +2860,20 @@ async fn fail_usdc_transfer(
     )
     .await?;
 
-    let response = fail_pre_burn_usdc_transfer(&handle.usdc_store, &id, reason).await?;
+    let response = fail_usdc_with_chain_proof(
+        &handle.usdc_store,
+        handle.usdc_recheck.as_ref(),
+        &id,
+        request.superseding_tx,
+        reason,
+    )
+    .await?;
     // An operator acting on a USDC transfer re-arms the under-funded page.
     handle.rebalancing_service.underfunded_alerts().reset_all();
-    if response.outcome == FAILED_WITHDRAWAL_NEVER_SENT {
+    if matches!(
+        response.outcome,
+        FAILED_WITHDRAWAL_NEVER_SENT | "failed_withdrawal_superseded"
+    ) {
         match handle
             .rebalancing_service
             .kill_queued_usdc_hedging_jobs(&id)
@@ -2859,6 +2889,53 @@ async fn fail_usdc_transfer(
         }
     }
     Ok(Json(response))
+}
+
+/// Called only while the live driver is quiesced and recovery is serialized.
+async fn fail_usdc_with_chain_proof(
+    store: &Store<UsdcRebalance>,
+    verifier: &dyn RecheckUsdcDeposit,
+    id: &UsdcRebalanceId,
+    superseding_tx: Option<TxHash>,
+    reason: String,
+) -> Result<FailUsdcTransferResponse, (StatusCode, Json<ErrorResponse>)> {
+    let state = store.load(id).await.map_err(ops_store_error)?;
+    if matches!(
+        state,
+        Some(UsdcRebalance::WithdrawalSubmitting {
+            prepared: Some(_),
+            ..
+        })
+    ) {
+        verifier
+            .fail_superseded_withdrawal(id, superseding_tx, reason)
+            .await
+            .map_err(|error| {
+                let (status, message) = usdc_recheck_error_response(&error);
+                (status, Json(ErrorResponse { error: message }))
+            })?;
+        let guard_held = store
+            .load(id)
+            .await
+            .map_err(ops_store_error)?
+            .is_none_or(|state| state.holds_rebalance_guard());
+        return Ok(FailUsdcTransferResponse {
+            transfer_id: id.to_string(),
+            outcome: "failed_withdrawal_superseded",
+            guard_held,
+        });
+    }
+    if superseding_tx.is_some() {
+        warn!(%id, "Refused supersession evidence outside a prepared withdrawal");
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ErrorResponse {
+                error: "supersedingTx applies only to a prepared WithdrawalSubmitting intent"
+                    .to_owned(),
+            }),
+        ));
+    }
+    fail_pre_burn_usdc_transfer(store, id, reason).await
 }
 
 /// The store-level half of [`fail_usdc_transfer`]: gates on
@@ -8130,6 +8207,7 @@ mod tests {
                     corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: st0x_finance::Usdc::new(float!(500)),
+                    prepared: None,
                     from_block: 1,
                     submitting_at: chrono::Utc::now(),
                 },
@@ -12582,6 +12660,7 @@ mod tests {
                     corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
+                    prepared: None,
                     from_block: 1,
                 },
             )
@@ -12689,6 +12768,7 @@ mod tests {
                     corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
+                    prepared: None,
                     from_block: 1,
                 },
             )
@@ -12794,6 +12874,7 @@ mod tests {
                 UsdcRebalanceCommand::BeginWithdrawal {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
+                    prepared: None,
                     from_block: 1,
                     corridor: UsdcCorridor::BASE_CCTP,
                 },
@@ -13314,6 +13395,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RecheckUsdcDeposit for RecordingUsdcRecheck {
+        async fn fail_superseded_withdrawal(
+            &self,
+            id: &UsdcRebalanceId,
+            tx: Option<TxHash>,
+            _: String,
+        ) -> Result<(), UsdcRecheckError> {
+            self.superseding_txs.lock().unwrap().push(tx);
+            Err(UsdcRecheckError::WithdrawalRecoveryUnavailable(id.clone()))
+        }
+
         async fn recheck_deposit(
             &self,
             _id: &UsdcRebalanceId,
@@ -13646,6 +13737,7 @@ mod tests {
             State(state.clone()),
             Path(id.to_string()),
             Audited(FailUsdcTransferRequest {
+                superseding_tx: None,
                 reason: "audit: pre-burn crash".to_string(),
             }),
         )
@@ -13674,6 +13766,7 @@ mod tests {
             State(state.clone()),
             Path(id.to_string()),
             Audited(FailUsdcTransferRequest {
+                superseding_tx: None,
                 reason: "   ".to_string(),
             }),
         )
@@ -13687,6 +13780,7 @@ mod tests {
 
     fn fail_usdc_request() -> Audited<FailUsdcTransferRequest> {
         Audited(FailUsdcTransferRequest {
+            superseding_tx: None,
             reason: "audit: pre-burn crash".to_string(),
         })
     }
@@ -13798,6 +13892,105 @@ mod tests {
         assert!(
             state.resume_lock.0.try_lock().is_ok(),
             "the resume lock must be free once the route returns"
+        );
+    }
+
+    #[test]
+    fn withdrawal_supersession_read_failure_is_retryable_without_retirement() {
+        let (status, message) = usdc_recheck_error_response(
+            &UsdcRecheckError::WithdrawalNotSuperseded(WithdrawalNotSuperseded::Read {
+                tx: TxHash::repeat_byte(0x42),
+                source: Box::new(st0x_raindex::RaindexError::ZeroAmount),
+            }),
+        );
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(message, "Chain RPC unavailable; retry later");
+    }
+
+    #[tokio::test]
+    async fn fail_usdc_route_requires_chain_proof_and_rejects_legacy_supersession() {
+        for prepared in [
+            None,
+            Some(PreparedTransaction::for_test(TxHash::repeat_byte(0x39), 7)),
+        ] {
+            let (state, _) =
+                recovery_state_with_driver_pause(EquityTransferServices::panicking()).await;
+            let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+            let store = standalone_usdc_store(&state.pool).await;
+            store
+                .send(
+                    &id,
+                    UsdcRebalanceCommand::BeginWithdrawal {
+                        direction: RebalanceDirection::BaseToAlpaca,
+                        corridor: UsdcCorridor::BASE_CCTP,
+                        amount: Usdc::new(float!(1)),
+                        from_block: 0,
+                        prepared,
+                    },
+                )
+                .await
+                .unwrap();
+            let request: FailUsdcTransferRequest = serde_json::from_value(serde_json::json!({ "reason": "operator candidate", "supersedingTx": TxHash::repeat_byte(0x40) })).unwrap();
+            assert_eq!(
+                request.audit_targets(),
+                vec![TxHash::repeat_byte(0x40).to_string()]
+            );
+            let Err((status, _)) =
+                fail_usdc_transfer(State(state.clone()), Path(id.to_string()), Audited(request))
+                    .await
+            else {
+                panic!("unverified evidence cannot fail the withdrawal");
+            };
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(
+                load_usdc_rebalance(&state.pool, &id)
+                    .await
+                    .holds_rebalance_guard()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fail_usdc_forwards_superseding_hash_and_preserves_a_refused_intent() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = standalone_usdc_store(&pool).await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::BeginWithdrawal {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    amount: Usdc::new(float!(1)),
+                    from_block: 0,
+                    prepared: Some(PreparedTransaction::for_test(TxHash::repeat_byte(0x39), 7)),
+                },
+            )
+            .await
+            .unwrap();
+        let verifier = RecordingUsdcRecheck {
+            superseding_txs: std::sync::Mutex::new(Vec::new()),
+        };
+        let candidate = TxHash::repeat_byte(0x41);
+        assert!(
+            fail_usdc_with_chain_proof(
+                &store,
+                &verifier,
+                &id,
+                Some(candidate),
+                "operator reason".to_owned()
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            *verifier.superseding_txs.lock().unwrap(),
+            vec![Some(candidate)]
+        );
+        assert!(
+            load_usdc_rebalance(&pool, &id)
+                .await
+                .holds_rebalance_guard()
         );
     }
 
@@ -13981,6 +14174,7 @@ mod tests {
                     corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(1971.318665)),
+                    prepared: None,
                     from_block: 52_027_377,
                 },
             )

@@ -3300,6 +3300,32 @@ async fn interrupted_usdc_base_to_alpaca_resumes_after_restart() -> anyhow::Resu
     .await;
 
     let pool = connect_db(&infra.db_path).await?;
+
+    // The terminal event commits before apalis acknowledges its job. Wait for
+    // the Done row referencing this interrupted aggregate; an unrelated job
+    // must not satisfy the durable resume contract.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let raw_rows = loop {
+        let rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
+            "SELECT job_type, job FROM Jobs \
+             WHERE job_type LIKE '%TransferUsdcToHedging%' \
+             AND status = 'Done'",
+        )
+        .fetch_all(&pool)
+        .await?;
+        if rows
+            .iter()
+            .any(|(_, job)| String::from_utf8_lossy(job).contains(resumed_aggregate_id.as_str()))
+        {
+            break rows;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Timed out waiting for the resumed aggregate {resumed_aggregate_id}'s Done TransferUsdcToHedging row"
+        );
+        sleep_or_crash(&mut bot2, "resumed USDC transfer job acknowledgement").await;
+    };
+
     let events_after_restart = fetch_events_by_type(&pool, "UsdcRebalance").await?;
 
     // Load-bearing assertion: the resumed transfer must NOT re-issue the
@@ -3321,19 +3347,6 @@ async fn interrupted_usdc_base_to_alpaca_resumes_after_restart() -> anyhow::Resu
          contract isn't holding.",
     );
 
-    // Apalis-driven resume produces a Done TransferUsdcToHedging row
-    // in the Jobs table whose serialized payload references the same
-    // aggregate id that BridgingInitiated was emitted under. Asserted via
-    // string match on job_type so the test can sit downstack of the PR
-    // that introduces the type and still fail to compile-time-reference
-    // it.
-    let raw_rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
-        "SELECT job_type, job FROM Jobs \
-         WHERE job_type LIKE '%TransferUsdcToHedging%' \
-         AND status = 'Done'",
-    )
-    .fetch_all(&pool)
-    .await?;
     pool.close().await;
 
     let successful_job_rows: Vec<(String, String)> = raw_rows

@@ -5512,12 +5512,26 @@ or once an operator moves it to a state that holds no guard (such as a pre-burn
 `BridgingFailed`). A manual `transfer resume` or `transfer recheck` is refused
 (422). The way out is a build that serves that corridor.
 
-- `WithdrawalSubmitting`: scan the source chain for an already-mined withdrawal
-  (`find_recent_withdrawal`) from the captured head and adopt it. An empty mined
-  log scan is not proof of absence because the submission may still be pending
-  or hidden by a load-balanced RPC backend; it remains unresolved and must never
-  trigger another withdrawal. See "Under-funded vault withdraw" for the one case
-  that fails the transfer instead.
+- `WithdrawalSubmitting` (BaseToAlpaca): prepare and sign the vault withdrawal,
+  persist its exact bytes before broadcasting, then confirm the same transaction
+  before recording its withdrawal reference. A transient broadcast or
+  confirmation failure retains the signed identity; resume rebroadcasts those
+  identical bytes, never signing a second withdrawal. The recorded hash must
+  equal the prepared transaction's hash. Startup restores its wallet nonce
+  ownership before other wallet sends and skips startup approvals on chains with
+  unmined withdrawals. Signed bytes from another wallet are refused before nonce
+  reservation or broadcast; a rotated-key intent stays unresolved and excludes
+  startup approvals. Cancellation cannot interrupt signing and persistence, and
+  terminal job cleanup retains the corridor while this detached work is pending.
+  Operator quiescence also waits for it. Legacy records without prepared bytes
+  scan the source chain for an already-mined withdrawal
+  (`find_recent_withdrawal`) from the captured head and adopt it. An empty scan
+  never permits a new withdrawal: a pending transaction or a load-balanced
+  backend can hide it. Such legacy records remain unresolved for operator
+  reconciliation. See "Under-funded vault withdraw" for confirmed-revert and
+  before-broadcast rejection outcomes. `RejectWithdrawal` refuses a signed
+  intent: absence of mined logs cannot authorize releasing its guard while the
+  persisted transaction can still mine.
 - `BridgingSubmitting`: scan for an already-submitted burn (`find_recent_burn`)
   and adopt it rather than burning twice. The burn match stays by
   `(depositor, amount, destinationDomain, mintRecipient)` when transfers of
@@ -5607,6 +5621,7 @@ enum UsdcRebalanceCommand {
         corridor: UsdcCorridor,
         amount: Usdc,
         from_block: u64,
+        prepared: Option<PreparedTransaction>,
     },
     Initiate {
         direction: RebalanceDirection,
@@ -5722,6 +5737,8 @@ enum UsdcRebalanceEvent {
         corridor: UsdcCorridor,
         amount: Usdc,
         from_block: u64,
+        // Legacy and broker withdrawal intents have no signed transaction.
+        prepared: Option<PreparedTransaction>,
         submitting_at: DateTime<Utc>,
     },
     Initiated {
@@ -6373,18 +6390,48 @@ send before theirs may have been accepted.
   The alert pages at most once per chain per 30 minutes while the cause
   persists; a completed transfer on the chain, an operator fail or resume, or a
   restart re-arms it at once.
-- Any other under-funded revert: the transfer latches at `WithdrawalSubmitting`
-  with one alert naming `from_block`. The operator checks the chain and either
-  resumes (a withdrawal landed) or fails it with `fail-usdc-transfer`.
+- A prepared withdrawal whose exact hash has a reverted receipt at the
+  configured confirmation depth is recorded as initiated and failed in one
+  atomic event batch, retaining its hash for audit. No funds left the vault. Its
+  nonce reservation and corridor guard clear; no scan absence authorizes this
+  failure.
+- The live `fail-usdc-transfer --superseding-tx` recovery can retire prepared
+  bytes only after the existing equity withdrawal verifier proves the same
+  wallet's nonce was consumed at configured depth without moving funds: a
+  reverted transaction or a plain zero-value self-cancel without calldata,
+  EIP-7702 authorization or logs. A successful withdrawal or arbitrary
+  successful replacement is refused. The original hash and operator reason
+  remain audited; only this proof clears its reservation and guard.
+- An unresolved prepared withdrawal remains held and resumes identical bytes.
+  Legacy intents without bytes retain scan adoption and operator reconciliation;
+  an empty scan alone never authorizes a fresh withdrawal.
+
+Terminal cleanup remembers cancelled preparation callers even if signing settles
+before cleanup starts, and waits for pending detached preparation within the
+configured transfer-attempt timeout. On settlement, persisted bytes receive one
+durable resume job unless a live sibling already owns the transfer; an
+unrecorded failed preparation releases its guard. A settlement timeout alerts
+and retains the guard for operator inspection and resume after settlement or
+restart. Ordinary exhausted retries within one running process do not receive
+this handoff or a reset retry budget.
 
 ##### Startup re-arm for `BridgingSubmitting` and `WithdrawalSubmitting{BaseToAlpaca}`
 
+A `WithdrawalSubmitting` with persisted signed bytes is re-armed whenever no
+live job remains, including after a terminal job exhausted its budget. Its new
+startup driver only rebroadcasts the same bytes; repeated recovery does not
+create another withdrawal or duplicate a live job. Legacy intents without bytes
+retain the terminal-row/operator policy below. Ordinary retries stay bounded
+within a running process. Fees are not changed: permanently rejected bytes need
+operator resume or a confirmed safe cancellation through the live fail route.
+
 On startup, `recover_usdc_guard` re-arms transfer jobs for aggregates at
 `BridgingSubmitting` (both directions) or `WithdrawalSubmitting{BaseToAlpaca}`
-state that have no pending job row. These states are non-terminal and resumable:
-the process either crashed before the burn tx was submitted, or before the
-apalis enqueue committed. The re-arm is idempotent (suppressed if a job row
-exists) and runs before the apalis monitor starts so there is no live-job race.
+state that have no job row; prepared withdrawals also re-arm past terminal job
+rows, as above. These states are non-terminal and resumable: the process either
+crashed before submission or before the apalis enqueue committed. A live row
+always suppresses re-arm. Recovery runs before the apalis monitor starts so
+there is no live-job race.
 
 `WithdrawalSubmitting{AlpacaToBase}` is **NOT** auto-re-armed: the withdrawal
 transfer ID has not yet been persisted in that state (it is persisted only when
@@ -7889,24 +7936,37 @@ resume lock (so it cannot race `/transfers/usdc/resume` or `/transfers/recheck`)
 and quiesces the USDC driver through the recovery handle's `usdc_driver_pause`
 for the duration of the send. The detached burn task holds its own driver claim,
 so no worker execution, and no burn broadcast it started, can advance the
-transfer or adopt a burn between the preflight and the send. The route does not
-read the chain, so the onchain check above still applies. Both send the same
-`FailBridging` command; the eligibility gate (`pre_burn_fail_eligibility`) is
-the single source shared by both, so both refuse the same states after the burn.
-The live route additionally refuses every BaseToAlpaca transfer past its vault
-withdrawal.
+transfer or adopt a burn between the preflight and the send. This bridging
+failure does not read the chain, so the onchain check above still applies. Both
+send the same `FailBridging` command; the eligibility gate
+(`pre_burn_fail_eligibility`) is the single source shared by both, so both
+refuse the same states after the burn. The live route additionally refuses every
+BaseToAlpaca transfer past its vault withdrawal.
 
-Both surfaces also accept a BaseToAlpaca transfer at `WithdrawalSubmitting`: the
-vault withdrawal intent is recorded but no withdrawal was ever initiated. For it
-they send `RejectWithdrawal { reason }`, which emits `WithdrawalFailed` with no
-withdrawal reference. No inventory moved, so the guard clears (live through the
-reactor, offline on restart), the live route kills the transfer's queued job
-rows, and the corridor's withdraw cooldown starts. The command does not read the
-chain: before using it the operator confirms on chain that the bot wallet made
-no `OperatorWithdraw` on the inventory after the transfer's `from_block`. A
-withdrawal that did land is adopted with `transfer resume` instead. The bot
-fails such a transfer itself when its withdraw was rejected before broadcast
-(see "Under-funded vault withdraw").
+Both surfaces also accept a legacy BaseToAlpaca transfer at
+`WithdrawalSubmitting` without prepared bytes. Its submission outcome is
+unknown. They send `RejectWithdrawal { reason }`, which emits `WithdrawalFailed`
+with no withdrawal reference. Before using it, the operator confirms on chain
+that the bot wallet made no `OperatorWithdraw` on the inventory after the
+transfer's `from_block` and closes any uncertain nonce as described in
+`docs/cli-ops.md`. A withdrawal that did land must instead be adopted with
+`transfer resume`. This operator reconciliation clears the guard (live through
+the reactor, offline on restart); the live route kills queued jobs and starts
+the corridor's withdraw cooldown. The bot also rejects its own provably
+pre-broadcast under-funded failures (see "Under-funded vault withdraw").
+
+Prepared intents are refused by the offline command. The live route reads the
+chain and accepts optional `supersedingTx` (`--superseding-tx` in the client),
+using the same strict withdrawal verifier as equity. An exact-hash confirmed
+revert or a confirmed safe same-wallet, same-nonce transaction proves no funds
+left: a reverted replacement, or a plain zero-value self-cancel without
+calldata, EIP-7702 authorization or logs. Successful withdrawals and arbitrary
+successful replacements remain held. Proof binds to the original signed hash and
+uses the corridor's configured depth. The atomic event batch records that
+original hash and fails the withdrawal, retaining the operator reason and
+cancellation hash. Consumed nonce release never rewinds allocation; the guard
+clears, and the live route kills queued jobs. No scan absence authorizes either
+prepared retirement or a second withdrawal.
 
 The guard outcome depends on the direction. For a BaseToAlpaca transfer the
 vault withdrawal already moved the USDC to the market maker wallet, which the

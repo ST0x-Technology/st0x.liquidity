@@ -30,8 +30,8 @@ use st0x_execution::FractionalShares;
 use st0x_finance::Usdc;
 
 use crate::{
-    Raindex, RaindexContracts, RaindexError, RaindexVaultId, RevokeOutcome, ScanAnomaly,
-    WithdrawBroadcast,
+    ConfirmedWithdrawalRevert, Raindex, RaindexContracts, RaindexError, RaindexVaultId,
+    RevokeOutcome, ScanAnomaly, WithdrawBroadcast, WithdrawalConfirmation,
 };
 
 sol!(
@@ -121,6 +121,25 @@ impl<E: Evm> RaindexService<E> {
 
 /// Write operations that require a [`Wallet`] for transaction signing.
 impl<W: Wallet> RaindexService<W> {
+    /// Signer whose nonce space prepared withdrawals reserve.
+    pub fn wallet_address(&self) -> Address {
+        self.evm.address()
+    }
+
+    fn validate_withdrawal_signer(
+        &self,
+        prepared: &PreparedTransaction,
+    ) -> Result<(), RaindexError> {
+        if !prepared.signed_by(self.evm.address()) {
+            return Err(RaindexError::PreparedWithdrawalSignerMismatch {
+                tx_hash: prepared.tx_hash(),
+                signer: prepared.signer(),
+                wallet: self.evm.address(),
+            });
+        }
+        Ok(())
+    }
+
     /// Deposits tokens to a Rain OrderBook vault.
     ///
     /// # Parameters
@@ -780,13 +799,20 @@ impl<W: Wallet> Raindex for RaindexService<W> {
             .evm
             .prepare_pending(self.inventory_address, calldata, "withdraw4 from vault")
             .await
-            .map_err(map_withdraw_revert)?)
+            .map_err(|error| {
+                // Preparation cannot broadcast, even if the wallet does not
+                // attach the marker used by atomic submission failures.
+                map_withdraw_revert(EvmError::RejectedBeforeBroadcast {
+                    source: Box::new(error),
+                })
+            })?)
     }
 
     async fn broadcast_prepared_withdraw(
         &self,
         prepared: &PreparedTransaction,
     ) -> Result<TxHash, RaindexError> {
+        self.validate_withdrawal_signer(prepared)?;
         Ok(self
             .evm
             .broadcast_prepared(prepared, "withdraw4 from vault")
@@ -807,6 +833,7 @@ impl<W: Wallet> Raindex for RaindexService<W> {
         prepared: Option<&PreparedTransaction>,
     ) -> Result<(), RaindexError> {
         if let Some(prepared) = prepared {
+            self.validate_withdrawal_signer(prepared)?;
             self.evm.restore_prepared(prepared).await;
         } else {
             self.evm.restore_transaction(tx_hash).await?;
@@ -888,6 +915,25 @@ impl<W: Wallet> Raindex for RaindexService<W> {
         Ok(self.evm.provider().get_transaction_receipt(tx_hash).await?)
     }
 
+    async fn confirm_withdrawal(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<WithdrawalConfirmation, RaindexError> {
+        let receipt = self.evm.await_receipt(tx_hash).await?;
+        if receipt.transaction_hash != tx_hash {
+            warn!(%tx_hash, actual = %receipt.transaction_hash, "Confirmed receipt does not match the requested withdrawal");
+            return Err(RaindexError::ReceiptHashMismatch {
+                expected: tx_hash,
+                actual: receipt.transaction_hash,
+            });
+        }
+        Ok(if receipt.status() {
+            WithdrawalConfirmation::Succeeded
+        } else {
+            WithdrawalConfirmation::Reverted(ConfirmedWithdrawalRevert(tx_hash))
+        })
+    }
+
     async fn confirm_tx_receipt(
         &self,
         tx_hash: TxHash,
@@ -910,12 +956,12 @@ impl<W: Wallet> Raindex for RaindexService<W> {
 
 #[cfg(test)]
 mod tests {
-    use alloy::consensus::Transaction as _;
+    use alloy::consensus::{Receipt, ReceiptEnvelope, ReceiptWithBloom, Transaction as _};
     use alloy::hex;
     use alloy::network::{Ethereum, TransactionBuilder};
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::Log as PrimitiveLog;
-    use alloy::primitives::{B256, Signature, address, b256};
+    use alloy::primitives::{B256, Bloom, Signature, address, b256};
     use alloy::providers::ext::AnvilApi as _;
     use alloy::providers::fillers::{
         BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
@@ -1491,12 +1537,13 @@ mod tests {
         }
     }
 
-    struct PreparationFailingWallet {
+    struct WithdrawalWalletStub {
         provider: RootProvider,
         revert_data: Bytes,
+        confirmed_receipt: Option<TransactionReceipt>,
     }
 
-    impl PreparationFailingWallet {
+    impl WithdrawalWalletStub {
         fn new(revert_data: Bytes) -> Self {
             let url = "http://stub.invalid"
                 .parse()
@@ -1504,12 +1551,13 @@ mod tests {
             Self {
                 provider: RootProvider::new(RpcClient::builder().http(url)),
                 revert_data,
+                confirmed_receipt: None,
             }
         }
     }
 
     #[async_trait]
-    impl Evm for PreparationFailingWallet {
+    impl Evm for WithdrawalWalletStub {
         type Provider = RootProvider;
 
         fn provider(&self) -> &RootProvider {
@@ -1518,7 +1566,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Wallet for PreparationFailingWallet {
+    impl Wallet for WithdrawalWalletStub {
         fn address(&self) -> Address {
             Address::ZERO
         }
@@ -1593,7 +1641,10 @@ mod tests {
         }
 
         async fn await_receipt(&self, _tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
-            unreachable!("prepare_withdraw must not await a receipt")
+            Ok(self
+                .confirmed_receipt
+                .clone()
+                .expect("receipt wait must be explicitly configured"))
         }
 
         async fn send(
@@ -1607,11 +1658,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn withdrawal_confirmation_requires_the_exact_confirmed_receipt() {
+        let expected = TxHash::repeat_byte(0x41);
+        for (actual, succeeded) in [
+            (expected, false),
+            (expected, true),
+            (TxHash::repeat_byte(0x42), false),
+        ] {
+            let mut wallet = WithdrawalWalletStub::new(Bytes::new());
+            wallet.confirmed_receipt = Some(TransactionReceipt {
+                inner: ReceiptEnvelope::Eip1559(ReceiptWithBloom {
+                    receipt: Receipt {
+                        status: succeeded.into(),
+                        cumulative_gas_used: 0,
+                        logs: vec![],
+                    },
+                    logs_bloom: Bloom::default(),
+                }),
+                transaction_hash: actual,
+                transaction_index: Some(0),
+                block_hash: Some(B256::repeat_byte(1)),
+                block_number: Some(1),
+                gas_used: 21_000,
+                effective_gas_price: 1,
+                blob_gas_used: None,
+                blob_gas_price: None,
+                from: Address::ZERO,
+                to: Some(Address::ZERO),
+                contract_address: None,
+            });
+            let service = RaindexService::new(
+                wallet,
+                RaindexContracts {
+                    inventory: Address::ZERO,
+                    orderbook: Address::ZERO,
+                },
+                Address::ZERO,
+            );
+            let result = service.confirm_withdrawal(expected).await;
+            if actual != expected {
+                assert!(
+                    matches!(result, Err(RaindexError::ReceiptHashMismatch { expected: e, actual: a })
+                    if e == expected && a == actual)
+                );
+            } else if succeeded {
+                assert_eq!(result.unwrap(), WithdrawalConfirmation::Succeeded);
+            } else {
+                assert!(
+                    matches!(result.unwrap(), WithdrawalConfirmation::Reverted(proof)
+                    if proof.tx_hash() == expected)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn prepare_withdraw_maps_insufficient_vault_liquidity() {
         let requested = U256::from(1_000u64);
         let received = U256::from(400u64);
         let wallet =
-            PreparationFailingWallet::new(insufficient_liquidity_revert_bytes(requested, received));
+            WithdrawalWalletStub::new(insufficient_liquidity_revert_bytes(requested, received));
         let service = RaindexService::new(
             wallet,
             RaindexContracts {
@@ -1630,7 +1736,7 @@ mod tests {
             error,
             requested,
             received,
-            WithdrawBroadcast::MayHaveBroadcast,
+            WithdrawBroadcast::NotBroadcast,
         );
     }
 

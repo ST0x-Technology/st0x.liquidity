@@ -535,6 +535,10 @@ mod tests {
             attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
             settlement_retry_deadline: rebalancing_ctx.settlement_retry_deadline,
             ethereum_required_confirmations: Some(1),
+            withdrawal_required_confirmations: std::collections::BTreeMap::from([
+                (Chain::Base, 1),
+                (Chain::Ethereum, 1),
+            ]),
             reserved_cash: None,
             #[cfg(feature = "test-support")]
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
@@ -763,6 +767,7 @@ mod tests {
                     direction: RebalanceDirection::BaseToAlpaca,
                     corridor: UsdcCorridor::BASE_CCTP,
                     amount: Usdc::new(float!(1)),
+                    prepared: None,
                     from_block: 0,
                 },
             )
@@ -832,6 +837,7 @@ mod tests {
                     direction: RebalanceDirection::BaseToAlpaca,
                     corridor: robinhood_relay,
                     amount: Usdc::new(float!(1)),
+                    prepared: None,
                     from_block: 0,
                 },
             )

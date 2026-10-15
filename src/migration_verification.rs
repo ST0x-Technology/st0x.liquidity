@@ -649,12 +649,14 @@ impl DurableSymbolReferences for CctpBurnOperation {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     use alloy::primitives::{Address, TxHash};
     use chrono::Utc;
     use serde_json::json;
+    use sqlx::migrate::Migrator;
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -693,6 +695,10 @@ mod tests {
     }
 
     async fn source_database() -> (TempDir, PathBuf, SqlitePool) {
+        source_database_up_to(i64::MAX).await
+    }
+
+    async fn source_database_up_to(version: i64) -> (TempDir, PathBuf, SqlitePool) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("source.db");
         let pool = SqlitePool::connect_with(
@@ -702,7 +708,19 @@ mod tests {
         )
         .await
         .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        let migrator = sqlx::migrate!();
+        let migrations = migrator
+            .iter()
+            .filter(|migration| migration.version <= version)
+            .cloned()
+            .collect();
+        Migrator {
+            migrations: Cow::Owned(migrations),
+            ..migrator
+        }
+        .run(&pool)
+        .await
+        .unwrap();
 
         (directory, path, pool)
     }
@@ -1308,6 +1326,52 @@ mod tests {
         let after = find_report(&after_reports, "UsdcRebalance");
         assert_eq!(after.total, 1);
         assert!(after.failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn verifier_upgrades_populated_old_schema_with_legacy_withdrawals() {
+        let (_directory, path, pool) = source_database_up_to(20_261_008_021_843).await;
+        // Missing both corridor (historically implicit Base) and prepared bytes.
+        insert_event(
+            &pool,
+            "UsdcRebalance",
+            A_USDC_REBALANCE_ID,
+            1,
+            "UsdcRebalanceEvent::WithdrawalSubmitting",
+            "1.0",
+            json!({"WithdrawalSubmitting": {
+                "direction": "BaseToAlpaca", "amount": "500", "from_block": 42,
+                "submitting_at": "2026-10-15T00:00:00Z"
+            }}),
+        )
+        .await;
+        insert_snapshot(&pool, "UsdcRebalance", A_USDC_REBALANCE_ID).await;
+        pool.close().await;
+
+        let report = verify_migrations(&path, &symbol_policy(&[], &[]))
+            .await
+            .unwrap();
+        assert!(!report.has_failures(), "{report}");
+        let replay = find_report(&report.replay_reports, "UsdcRebalance");
+        assert_eq!(replay.total, 1);
+        assert!(replay.failures.is_empty());
+
+        // The actual deployment verifier migrates its copy, never its input.
+        let source =
+            SqlitePool::connect_with(SqliteConnectOptions::new().filename(&path).read_only(true))
+                .await
+                .unwrap();
+        let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+            .fetch_one(&source)
+            .await
+            .unwrap();
+        assert_eq!(version, 20_261_008_021_843);
+        let payload: String = sqlx::query_scalar("SELECT payload FROM events")
+            .fetch_one(&source)
+            .await
+            .unwrap();
+        assert!(!payload.contains("prepared"));
+        source.close().await;
     }
 
     #[tokio::test]
