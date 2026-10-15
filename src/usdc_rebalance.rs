@@ -5850,6 +5850,7 @@ impl UsdcRebalance {
             | Self::SwapRefunded { .. }
             | Self::SwapEscrowUnresolved { .. }
             | Self::SwapFailed { .. }
+            | Self::SwapOverdeposited { .. }
             | Self::Redepositing { .. }
             | Self::ReturnedToSource { .. }
             | Self::Bridged { .. }
@@ -5896,6 +5897,7 @@ impl UsdcRebalance {
             | Self::SwapRefunded { .. }
             | Self::SwapEscrowUnresolved { .. }
             | Self::SwapFailed { .. }
+            | Self::SwapOverdeposited { .. }
             | Self::Redepositing { .. }
             | Self::ReturnedToSource { .. }
             | Self::Bridged { .. }
@@ -6694,18 +6696,18 @@ impl UsdcRebalance {
         else {
             return Err(invalid());
         };
-        let mut found = Vec::with_capacity(deposits.len());
-        for deposit in &deposits {
-            let Some(reverted) = reverted_quotes
-                .iter()
-                .find(|reverted| reverted.order_id == deposit.order_id)
-            else {
-                return Err(UsdcRebalanceError::SwapOrderNotRecoverable {
-                    order_id: deposit.order_id,
-                });
-            };
-            found.push((deposit, reverted));
-        }
+        let found = deposits
+            .iter()
+            .map(|deposit| {
+                reverted_quotes
+                    .iter()
+                    .find(|reverted| reverted.order_id == deposit.order_id)
+                    .map(|reverted| (deposit, reverted))
+                    .ok_or(UsdcRebalanceError::SwapOrderNotRecoverable {
+                        order_id: deposit.order_id,
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         match found.as_slice() {
             [] => return Err(invalid()),
             // One deposit of its order's and the current quote's input is

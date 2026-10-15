@@ -10365,7 +10365,7 @@ mod tests {
 
     /// `transfer recheck` of a failed order Relay still reports unpaid
     /// changes nothing; it refuses an operator deposit tx and a Relay state
-    /// that is not a held escrow.
+    /// that is not a held escrow, also an overdeposit hold.
     #[tokio::test]
     async fn recheck_leaves_an_unpaid_failure_and_refuses_other_relay_states() {
         let anvil = spawn_anvil(Anvil::new());
@@ -10432,6 +10432,52 @@ mod tests {
                 error,
                 UsdcRecheckError::NotDepositFailed {
                     state: "SwapDeposited",
+                    ..
+                }
+            ),
+            "got {error:?}"
+        );
+
+        let held = UsdcRebalanceId(Uuid::new_v4());
+        record_quoted(
+            &store,
+            &held,
+            crate::usdc_rebalance::swap_quote_for_test(U256::from(AMOUNT_IN), REVERTED_ORDER_ID),
+        )
+        .await;
+        let reverted = PreparedTransaction::for_test(TxHash::repeat_byte(0xa7), 7);
+        for command in [
+            UsdcRebalanceCommand::PrepareSwapDeposit {
+                approve: None,
+                deposit: reverted.clone(),
+            },
+            UsdcRebalanceCommand::RecordSwapDepositReverted {
+                deposit_tx: reverted.tx_hash(),
+            },
+            UsdcRebalanceCommand::RequoteSwap {
+                quote: Box::new(crate::usdc_rebalance::swap_quote_for_test(
+                    U256::from(AMOUNT_IN),
+                    B256::repeat_byte(0x0f),
+                )),
+            },
+            UsdcRebalanceCommand::HoldOverdepositedSwap {
+                deposits: vec![FoundSwapDeposit {
+                    request_id: B256::repeat_byte(0x5e),
+                    order_id: REVERTED_ORDER_ID,
+                    deposit_tx: reverted.tx_hash(),
+                    deposit_block: 1,
+                    amount: U256::from(AMOUNT_IN - 1),
+                }],
+            },
+        ] {
+            store.send(&held, command).await.unwrap();
+        }
+        let error = transfer.recheck_deposit(&held, None).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                UsdcRecheckError::NotDepositFailed {
+                    state: "SwapOverdeposited",
                     ..
                 }
             ),

@@ -7238,7 +7238,7 @@ impl RebalancingService {
         // Clean terminals have nothing to resume; refusing here beats
         // enqueueing a job that immediately errors. Exhaustive so a new
         // variant forces a conscious classification.
-        let clean_terminal = match &state {
+        let refusal = match &state {
             UsdcRebalance::ConversionComplete {
                 direction: RebalanceDirection::BaseToAlpaca,
                 ..
@@ -7248,7 +7248,16 @@ impl RebalancingService {
                 ..
             }
             | UsdcRebalance::ReturnedToSource { .. }
-            | UsdcRebalance::Reconciled { .. } => true,
+            | UsdcRebalance::Reconciled { .. } => Some(UsdcResumeError::AlreadyTerminal {
+                id: id.clone(),
+                state: state.state_name(),
+            }),
+            // Only `transfer reconcile` moves it on: unlike a `SwapFailed`,
+            // which `transfer recheck` can un-fail, no resume of it ever runs.
+            UsdcRebalance::SwapOverdeposited { .. } => Some(UsdcResumeError::HeldForReconcile {
+                id: id.clone(),
+                state: state.state_name(),
+            }),
             UsdcRebalance::Converting { .. }
             | UsdcRebalance::ConversionComplete { .. }
             | UsdcRebalance::ConversionFailed { .. }
@@ -7266,27 +7275,15 @@ impl RebalancingService {
             | UsdcRebalance::SwapRefunded { .. }
             | UsdcRebalance::SwapEscrowUnresolved { .. }
             | UsdcRebalance::SwapFailed { .. }
-            | UsdcRebalance::SwapOverdeposited { .. }
             | UsdcRebalance::Redepositing { .. }
             | UsdcRebalance::Bridged { .. }
             | UsdcRebalance::BridgingFailed { .. }
             | UsdcRebalance::DepositInitiated { .. }
             | UsdcRebalance::DepositConfirmed { .. }
-            | UsdcRebalance::DepositFailed { .. } => false,
+            | UsdcRebalance::DepositFailed { .. } => None,
         };
-        if clean_terminal {
-            return Err(UsdcResumeError::AlreadyTerminal {
-                id: id.clone(),
-                state: state.state_name(),
-            });
-        }
-        // The job would refuse it too, but only after the enqueue was
-        // reported to the operator as accepted.
-        if let UsdcRebalance::SwapOverdeposited { .. } = state {
-            return Err(UsdcResumeError::HeldForReconcile {
-                id: id.clone(),
-                state: state.state_name(),
-            });
+        if let Some(refusal) = refusal {
+            return Err(refusal);
         }
 
         // An unreadable transfer latches every corridor; the durable gates

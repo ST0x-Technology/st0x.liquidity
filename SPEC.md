@@ -5542,17 +5542,17 @@ signing a second deposit while an earlier one may still land:
   refund is redeposited with no scan first, so, as after a fill, a deposit of
   another reverted order that lands later is left to the operator. An earlier
   refund at the hub is never booked against an older order's deposit: that order
-  was quoted for more than the refund's re-quote, so the scan holds instead of
-  adopting it. `transfer recheck` of an unresolved escrow records a proven
-  payment of its deposited order with `ConfirmSwapFill` or `RecordSwapRefund`.
-  Once a deposit of a reverted order is found, approves that went out alone are
-  sent again, confirmed and their gas queued, before a `SwapQuoted` adopts it or
-  holds: neither the adoption nor `SwapOverdeposited` keeps them. While one does
-  not confirm, the transfer neither adopts nor holds: each attempt pages the
-  found deposits, records nothing and ends with
-  `FoundSwapDepositApprovesUnconfirmed`, which the job re-queues after 10
-  minutes at no retry cost. Superseding an order adds its id to
-  `signed_order_ids` and never drops one.
+  was quoted for more than the refund's re-quote, so the scan records the
+  `SwapOverdeposited` hold instead of adopting it. `transfer recheck` of an
+  unresolved escrow records a proven payment of its deposited order with
+  `ConfirmSwapFill` or `RecordSwapRefund`. Once a deposit of a reverted order is
+  found, approves that went out alone are sent again, confirmed and their gas
+  queued, before a `SwapQuoted` adopts it or holds: neither the adoption nor
+  `SwapOverdeposited` keeps them. While one does not confirm, the transfer
+  neither adopts nor holds: each attempt pages the found deposits, records
+  nothing and ends with `FoundSwapDepositApprovesUnconfirmed`, which the job
+  re-queues after 10 minutes at no retry cost. Superseding an order adds its id
+  to `signed_order_ids` and never drops one.
 
 ##### Crash-safe resume
 
