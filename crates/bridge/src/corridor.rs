@@ -73,7 +73,7 @@ impl UsdcCorridor {
     /// chain's, then the Ethereum hub's. Both directions run through one
     /// corridor, so each end sends what either direction's origin sends, and
     /// on CCTP what its destination sends too.
-    pub fn hop_calls(self) -> Result<Vec<HopCall>, NoRelayDepository> {
+    pub fn hop_calls(self) -> Result<Vec<CorridorCall>, NoRelayDepository> {
         let Self::HubRouted { chain, hop } = self;
         let mut calls = Vec::new();
 
@@ -94,9 +94,9 @@ pub struct NoRelayDepository {
 }
 
 #[cfg(all(feature = "cctp", feature = "relay"))]
-fn end_calls(end: Chain, hop: HopKind) -> Result<Vec<HopCall>, NoRelayDepository> {
+fn end_calls(end: Chain, hop: HopKind) -> Result<Vec<CorridorCall>, NoRelayDepository> {
     let stable = end.settlement_stable().address;
-    let approve = |spender| HopCall {
+    let approve = |spender| CorridorCall {
         chain: end,
         to: stable,
         selector: IERC20::approveCall::SELECTOR.into(),
@@ -107,14 +107,14 @@ fn end_calls(end: Chain, hop: HopKind) -> Result<Vec<HopCall>, NoRelayDepository
     match hop {
         HopKind::Cctp => Ok(vec![
             approve(TOKEN_MESSENGER_V2),
-            HopCall {
+            CorridorCall {
                 chain: end,
                 to: TOKEN_MESSENGER_V2,
                 selector: TokenMessengerV2::depositForBurnCall::SELECTOR.into(),
                 first_argument: FirstArgument::NotAnAddress,
                 function: "depositForBurn",
             },
-            HopCall {
+            CorridorCall {
                 chain: end,
                 to: MESSAGE_TRANSMITTER_V2,
                 selector: MessageTransmitterV2::receiveMessageCall::SELECTOR.into(),
@@ -131,7 +131,7 @@ fn end_calls(end: Chain, hop: HopKind) -> Result<Vec<HopCall>, NoRelayDepository
             // signs nothing to receive it.
             Ok(vec![
                 approve(depository),
-                HopCall {
+                CorridorCall {
                     chain: end,
                     to: depository,
                     selector: depositErc20Call::SELECTOR.into(),
@@ -143,10 +143,10 @@ fn end_calls(end: Chain, hop: HopKind) -> Result<Vec<HopCall>, NoRelayDepository
     }
 }
 
-/// One transaction a hop end signs: its chain, target contract, selector,
-/// and what its first ABI word holds.
+/// One transaction a corridor signs, a hop call or a cash-leg call: its chain,
+/// target contract, selector, and what its first ABI word holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HopCall {
+pub struct CorridorCall {
     pub chain: Chain,
     pub to: Address,
     pub selector: Selector,
@@ -242,21 +242,21 @@ mod tests {
         let approve = fixed_bytes!("0x095ea7b3");
         let cctp_end = |chain, usdc| {
             [
-                HopCall {
+                CorridorCall {
                     chain,
                     to: usdc,
                     selector: approve,
                     first_argument: FirstArgument::Address(messenger),
                     function: "approve",
                 },
-                HopCall {
+                CorridorCall {
                     chain,
                     to: messenger,
                     selector: fixed_bytes!("0x8e0250ee"),
                     first_argument: FirstArgument::NotAnAddress,
                     function: "depositForBurn",
                 },
-                HopCall {
+                CorridorCall {
                     chain,
                     to: transmitter,
                     selector: fixed_bytes!("0x57ecfd28"),
@@ -267,14 +267,14 @@ mod tests {
         };
         let relay_end = |chain, stable| {
             [
-                HopCall {
+                CorridorCall {
                     chain,
                     to: stable,
                     selector: approve,
                     first_argument: FirstArgument::Address(depository),
                     function: "approve",
                 },
-                HopCall {
+                CorridorCall {
                     chain,
                     to: depository,
                     selector: fixed_bytes!("0xe8017952"),

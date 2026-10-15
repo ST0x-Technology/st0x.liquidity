@@ -7,7 +7,7 @@ use std::path::Path;
 
 use alloy::primitives::{Address, Selector};
 use alloy::sol_types::SolCall;
-use st0x_bridge::corridor::{FirstArgument, HopCall, NoRelayDepository, UsdcCorridor};
+use st0x_bridge::corridor::{CorridorCall, FirstArgument, NoRelayDepository, UsdcCorridor};
 use st0x_config::{ChainApprovalInputs, Ctx, InventoryMode, TokenFile};
 use st0x_evm::turnkey::{
     TurnkeyPolicy, TurnkeyPolicyClient, TurnkeyPolicyEffect, TurnkeyPolicyError,
@@ -81,7 +81,7 @@ impl std::error::Error for MissingPolicyCoverage {}
 #[derive(Debug)]
 pub struct MissingCorridorCoverage {
     corridor: UsdcCorridor,
-    missing: Vec<HopCall>,
+    missing: Vec<CorridorCall>,
 }
 
 impl Display for MissingCorridorCoverage {
@@ -285,7 +285,7 @@ fn verify_corridor_ends(
     for corridor in corridors {
         let mut calls = corridor.hop_calls()?;
         calls.extend(cash_leg_calls(*corridor, hedged)?);
-        let missing: Vec<HopCall> = calls
+        let missing: Vec<CorridorCall> = calls
             .iter()
             .filter(|call| {
                 let context = ApprovalPolicyContext {
@@ -329,7 +329,7 @@ fn verify_corridor_ends(
 fn cash_leg_calls(
     corridor: UsdcCorridor,
     hedged: &[ChainApprovalInputs],
-) -> Result<[HopCall; 3], ChainCoverageError> {
+) -> Result<[CorridorCall; 3], ChainCoverageError> {
     let chain = corridor.chain();
     let inputs = hedged
         .iter()
@@ -339,7 +339,7 @@ fn cash_leg_calls(
         InventoryMode::Legacy => inputs.orderbook,
         InventoryMode::Managed { inventory } => inventory,
     };
-    let vault_call = |selector: [u8; 4], function| HopCall {
+    let vault_call = |selector: [u8; 4], function| CorridorCall {
         chain,
         to: inventory,
         selector: selector.into(),
@@ -350,7 +350,7 @@ fn cash_leg_calls(
     Ok([
         vault_call(IRaindexInventory::withdraw4Call::SELECTOR, "withdraw4"),
         vault_call(IRaindexInventory::deposit4Call::SELECTOR, "deposit4"),
-        HopCall {
+        CorridorCall {
             chain: Chain::Ethereum,
             to: Chain::Ethereum.settlement_stable().address,
             selector: IERC20::transferCall::SELECTOR.into(),
