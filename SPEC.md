@@ -4864,6 +4864,18 @@ struct FirstDeposit {
     max_quote_loss_bps: u16,
 }
 
+// A deposit of a reverted order the escrow scan found on chain, as
+// `SwapOverdeposited` lists it. `request_id` is the key `relay status` takes;
+// `amount` is in the origin stable's smallest unit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FoundSwapDeposit {
+    request_id: B256,
+    order_id: B256,
+    deposit_tx: TxHash,
+    deposit_block: u64,
+    amount: U256,
+}
+
 // One transaction a quote asks the origin wallet to send.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct SwapStep {
@@ -4992,8 +5004,9 @@ enum UsdcRebalance {
     // Relay hop, chain side first (see "Relay hop"). `signed_order_ids`
     // holds every order id a deposit was ever signed for and never shrinks.
     // `reverted_quotes` holds the quote of every signed deposit that mined and
-    // reverted, carried through every swap state up to `SwapFailed`: the
-    // escrow scan watches their order ids (see "Relay recovery").
+    // reverted, carried through every swap state up to `SwapFailed` and
+    // `SwapOverdeposited`: the escrow scan watches their order ids (see
+    // "Relay recovery").
     SwapQuoted {
         direction: RebalanceDirection,
         corridor: UsdcCorridor,
@@ -5103,6 +5116,23 @@ enum UsdcRebalance {
         refund_requotes: u32,
         initiated_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
+    },
+    // The escrow scan found deposits of several reverted orders, or one of an
+    // order quoted for another amount: more of the stable is with Relay, or
+    // refunded at the hub, than one attempt's amount. `deposits` lists them;
+    // no quote and no approves are kept. Guard held, never polled or
+    // re-armed, until `transfer reconcile`.
+    SwapOverdeposited {
+        direction: RebalanceDirection,
+        corridor: UsdcCorridor,
+        amount: Usdc,
+        first_deposit: FirstDeposit,
+        signed_order_ids: Vec<B256>,
+        reverted_quotes: Vec<SwapQuote>,
+        deposits: Vec<FoundSwapDeposit>,
+        refund_requotes: u32,
+        initiated_at: DateTime<Utc>,
+        held_at: DateTime<Utc>,
     },
     // The withdrawn (or refunded) stable is on its way back into the
     // corridor chain's vault. `deposit_tx` is recorded before the
@@ -5418,23 +5448,19 @@ startup skips that chain's approvals and revokes.
 Every swap state except `ReturnedToSource` holds the corridor guard and refuses
 `fail-usdc-transfer` (a deposit may be on chain), and the timeout sweep holds
 the guard of every one, in either direction. A short `SwapRefunded` is
-reconcilable in either direction. On the chain-to-Alpaca side only `SwapFailed`,
-`Redepositing` and a destination-side `SwapRefunded` are also reconcilable; on
-the Alpaca-to-chain side `SwapFailed`, `SwapQuoted` and `SwapRefunded` are, as
-each holds the stable at the hub or in the chain wallet with no automated step
-left once paged. The predicate reads no hold marker, so it also accepts an
-Alpaca-to-chain `SwapQuoted` or `SwapRefunded` whose job still drives it (a
-fresh quote, a revert's redrive, a refund being quoted again): the operator
-reconciles one only after its hold's page. A reconcile that lands while the job
-runs ends it there, since `Reconciled` refuses every later swap command. The
-operator exit of a chain-to-Alpaca transfer held at `WithdrawalComplete` or
-`SwapQuoted` is `transfer resume --kind usdc --direction to-alpaca`: the job
-re-quotes and signs, or redeposits on a refusal, as the bot's own retry does. A
-`SwapQuoted` held on found deposits of reverted orders (several, or one of
-another amount; see "Escrow scan") is the exception: a resume only scans and
-pages them again, a chain-to-Alpaca one has no CLI exit, and an Alpaca-to-chain
-one is reconciled once every listed order is settled. A recorded hold state for
-it, with `transfer reconcile` as its only exit, is not in this build. An
+reconcilable in either direction, and so is `SwapOverdeposited`. On the
+chain-to-Alpaca side only `SwapFailed`, `Redepositing` and a destination-side
+`SwapRefunded` are also reconcilable; on the Alpaca-to-chain side `SwapFailed`,
+`SwapQuoted` and `SwapRefunded` are, as each holds the stable at the hub or in
+the chain wallet with no automated step left once paged. The predicate reads no
+hold marker, so it also accepts an Alpaca-to-chain `SwapQuoted` or
+`SwapRefunded` whose job still drives it (a fresh quote, a revert's redrive, a
+refund being quoted again): the operator reconciles one only after its hold's
+page. A reconcile that lands while the job runs ends it there, since
+`Reconciled` refuses every later swap command. The operator exit of a
+chain-to-Alpaca transfer held at `WithdrawalComplete` or `SwapQuoted` is
+`transfer resume --kind usdc --direction to-alpaca`: the job re-quotes and
+signs, or redeposits on a refusal, as the bot's own retry does. An
 Alpaca-to-chain transfer held at `WithdrawalComplete` after a refused binding
 quote resumes the same way, `--direction to-raindex`, or is failed with
 `fail-usdc-transfer` and reconciled. On the shared Ethereum wallet's credit
@@ -5450,7 +5476,9 @@ by hand: the transfer would keep its guard with nothing to move it on.
 `transfer recheck --kind usdc` reads a held escrow (`SwapEscrowUnresolved`,
 `SwapFailed`) again and adopts a late fill or refund (see "Relay recovery"); it
 refuses every other Relay state, and a Relay `DepositFailed` is settled with
-`transfer reconcile`.
+`transfer reconcile`. A `SwapOverdeposited` hold has `transfer reconcile` as its
+only exit: `transfer resume` is refused before anything is enqueued, and
+`transfer recheck` and `fail-usdc-transfer` refuse it too.
 
 ##### Relay recovery
 
@@ -5465,13 +5493,13 @@ signing a second deposit while an earlier one may still land:
   `SwapEscrowUnresolved` and `Redepositing`. The job routes by the recorded
   corridor, so a `WithdrawalComplete` resumes through the Relay hop (the binding
   quote) and never reaches a CCTP burn. A short or destination-side
-  `SwapRefunded` and a `SwapFailed` are holds for the operator and are not
-  re-armed; a short refund of a deposit the escrow scan adopted, or one adopted
-  by `transfer recheck` (which pages it), holds the same way. The vault deposit
-  of a `Redepositing` is recorded only after its broadcast, so a crash between
-  the two leaves no tx to confirm, and the re-armed job sends a second deposit:
-  it reverts and pages when the first one already took the USDG, or, with more
-  USDG in the wallet, lands too.
+  `SwapRefunded`, a `SwapFailed` and a `SwapOverdeposited` are holds for the
+  operator and are not re-armed; a short refund of a deposit the escrow scan
+  adopted, or one adopted by `transfer recheck` (which pages it), holds the same
+  way. The vault deposit of a `Redepositing` is recorded only after its
+  broadcast, so a crash between the two leaves no tx to confirm, and the
+  re-armed job sends a second deposit: it reverts and pages when the first one
+  already took the USDG, or, with more USDG in the wallet, lands too.
 - **Re-broadcast, never re-sign.** The persisted envelopes are restored before
   any other send from their wallet (see "Relay hop"), and a resume of
   `SwapDepositPrepared` broadcasts exactly those bytes. A new pair is signed
@@ -5495,9 +5523,13 @@ signing a second deposit while an earlier one may still land:
   holds the transfer's amount, so adopting one payment would release the guard
   with the other still at Relay. Nor is one whose order was quoted for another
   amount (before an Alpaca-to-chain refund at the hub, whose re-quote is for the
-  refunded amount). Either pages once its lone approves confirm (see below) and
-  holds at `SwapQuoted` for the operator, with nothing read again until a resume
-  or a restart. A scan that fails is retried and signs nothing either.
+  refunded amount). Either is recorded, once its lone approves confirm (see
+  below), as the hold `SwapOverdeposited` (`HoldOverdepositedSwap`), which lists
+  every found deposit (request id, order id, deposit tx, block, amount), pages
+  once when recorded, holds the guard and is never polled or re-armed; the
+  operator settles every listed order with Relay, moves the funds by hand and
+  runs `transfer reconcile`, which alone releases the guard. A scan that fails
+  is retried and signs nothing either.
 - **Late adoption.** `SwapCompletionRecovered` adopts a proven late payment of
   the failed order of a `SwapFailed`, through `transfer recheck`, keeping the
   reverted quotes for the escrow scan, which reads them again once the transfer
@@ -5515,9 +5547,9 @@ signing a second deposit while an earlier one may still land:
   payment of its deposited order with `ConfirmSwapFill` or `RecordSwapRefund`.
   Once a deposit of a reverted order is found, approves that went out alone are
   sent again, confirmed and their gas queued, before a `SwapQuoted` adopts it or
-  holds: the adoption drops them, and so does a reconcile ending the hold. While
-  one does not confirm, the transfer neither adopts nor holds: each attempt
-  pages the found deposits, records nothing and ends with
+  holds: neither the adoption nor `SwapOverdeposited` keeps them. While one does
+  not confirm, the transfer neither adopts nor holds: each attempt pages the
+  found deposits, records nothing and ends with
   `FoundSwapDepositApprovesUnconfirmed`, which the job re-queues after 10
   minutes at no retry cost. Superseding an order adds its id to
   `signed_order_ids` and never drops one.
@@ -5689,6 +5721,11 @@ enum UsdcRebalanceCommand {
     // for a deposit of another amount than its order's or the current
     // quote's `amount_in`.
     AdoptSwapDeposit { deposit: SwapDeposit<B256> },
+    // Holds a `SwapQuoted` at `SwapOverdeposited` on found deposits of
+    // reverted orders that are not one deposit `AdoptSwapDeposit` takes:
+    // several, or one of another amount. Refused for an order that is not a
+    // reverted one, for an empty list, and for a lone adoptable deposit.
+    HoldOverdepositedSwap { deposits: Vec<FoundSwapDeposit> },
     // Replaces an expired or already-signed quote on `SwapQuoted` (same
     // input), or quotes again an Alpaca-to-chain refund paid at the hub (its
     // input is `amount_refunded`); always an order id never signed before.
@@ -5854,6 +5891,9 @@ enum UsdcRebalanceEvent {
     },
     SwapEscrowUnresolved { unresolved_at: DateTime<Utc> },
     SwapFailed { reason: String, failed_at: DateTime<Utc> },
+    // The escrow scan's found deposits that one attempt's amount cannot
+    // account for: -> `SwapOverdeposited`, held for `transfer reconcile`.
+    SwapOverdeposited { deposits: Vec<FoundSwapDeposit>, held_at: DateTime<Utc> },
     // A late fill (-> `Bridged`, `HopEvidence::Relay` of `order_id` and
     // `deposit_tx`, booked by the P&L as `RelayFillVerified` is) or refund
     // (-> `SwapRefunded` on that order's quote) of a signed order.
@@ -7602,10 +7642,10 @@ transfer dispatch. It does not calculate cross-venue inventory imbalances.
 - Post-burn `UsdcRebalanceEvent::BridgingFailed`, any AlpacaToBase
   `BridgingFailed` (post-withdrawal, so the funds are off Alpaca even without
   burn evidence), `DepositFailed`, and BaseToAlpaca `ConversionFailed` (the
-  post-deposit USDC->USD leg), and the Relay `SwapFailed` - Keeps source
-  inflight and the USDC rebalancing guard active because the funds left the
-  source venue and are not available there. The same applies to any transfer
-  that times out at or after the burn
+  post-deposit USDC->USD leg), and the Relay `SwapFailed` and
+  `SwapOverdeposited` - Keeps source inflight and the USDC rebalancing guard
+  active because the funds left the source venue and are not available there.
+  The same applies to any transfer that times out at or after the burn
 - `InventorySnapshotEvent::OnchainEquity` - Onchain equity balances fetched from
   vaults
 - `InventorySnapshotEvent::OnchainCash` - Onchain USDC balance fetched from
@@ -7934,13 +7974,13 @@ chain-to-Alpaca `WithdrawalComplete`: its resume quotes, re-broadcasts or reads
 Relay and never burns. Reconcilable failures (`DepositFailed`, a
 `BridgingFailed` with burn evidence or in the AlpacaToBase direction, a
 BaseToAlpaca `ConversionFailed`, and the Relay holds (see "Relay hop"):
-`SwapFailed`, a `SwapRefunded` below its refund floor, a chain-to-Alpaca
-`Redepositing` or `SwapRefunded` paid on Ethereum, and an Alpaca-to-chain
-`SwapQuoted` or `SwapRefunded`) keep the guard held until the operator settles
-them with `transfer reconcile --kind usdc`. All other guarded states keep the
-guard held and page the operator for manual recovery. A candidate that cannot be
-loaded or parsed at boot, or a post-burn failure whose corridor the running bot
-cannot read, latches every corridor until a restart.
+`SwapFailed`, `SwapOverdeposited`, a `SwapRefunded` below its refund floor, a
+chain-to-Alpaca `Redepositing` or `SwapRefunded` paid on Ethereum, and an
+Alpaca-to-chain `SwapQuoted` or `SwapRefunded`) keep the guard held until the
+operator settles them with `transfer reconcile --kind usdc`. All other guarded
+states keep the guard held and page the operator for manual recovery. A
+candidate that cannot be loaded or parsed at boot, or a post-burn failure whose
+corridor the running bot cannot read, latches every corridor until a restart.
 
 **Operator recovery of a pre-burn stranded guard latch**: A USDC rebalance can
 become stranded in `WithdrawalComplete` (pre-bridging, no burn intent recorded)
@@ -8054,13 +8094,13 @@ so. The command is valid ONLY from a terminal failure that strands the guard:
 `AlpacaToBase` `BridgingFailed` (post-withdrawal, so the funds are off Alpaca
 even without burn evidence -- the settlement-retry-deadline terminal), or a
 `BaseToAlpaca` `ConversionFailed` (the post-deposit USDC->USD leg), or one of
-the Relay holds (see "Relay hop"): `SwapFailed`, a `SwapRefunded` below its
-refund floor, a chain-to-Alpaca `Redepositing` or `SwapRefunded` paid on
-Ethereum, and an Alpaca-to-chain `SwapQuoted` or `SwapRefunded`. Every other
-state is rejected -- an in-progress transfer must be resumed, and a failure
-whose funds never left the source venue reconciles to source on its own. Because
-`Reconciled` is a clearable terminal, a restart does not re-latch the guard, and
-automatic USDC rebalancing resumes.
+the Relay holds (see "Relay hop"): `SwapFailed`, `SwapOverdeposited`, a
+`SwapRefunded` below its refund floor, a chain-to-Alpaca `Redepositing` or
+`SwapRefunded` paid on Ethereum, and an Alpaca-to-chain `SwapQuoted` or
+`SwapRefunded`. Every other state is rejected -- an in-progress transfer must be
+resumed, and a failure whose funds never left the source venue reconciles to
+source on its own. Because `Reconciled` is a clearable terminal, a restart does
+not re-latch the guard, and automatic USDC rebalancing resumes.
 
 Reconcile also applies to the equity transfer aggregates (`TokenizedEquityMint`,
 `EquityRedemption`): a mint or redemption stuck in its `Failed` terminal whose
