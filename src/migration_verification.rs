@@ -671,7 +671,7 @@ mod tests {
 
     use super::*;
     use crate::inventory::snapshot::{InventorySnapshotCommand, InventorySnapshotId};
-    use crate::inventory::{PortfolioAsset, PortfolioBalanceRow, PortfolioLocation};
+    use crate::inventory::{OnchainForm, PortfolioAsset, PortfolioBalanceRow, PortfolioLocation};
     use crate::onchain_trade::OnChainTradeSource;
     use crate::portfolio_snapshot::{
         PortfolioBalanceRowWithMark, PortfolioSnapshotCommand, PortfolioSnapshotId,
@@ -850,7 +850,10 @@ mod tests {
                     captured_at,
                     rows: vec![PortfolioBalanceRowWithMark {
                         row: PortfolioBalanceRow {
-                            location: PortfolioLocation::MarketMaking(Chain::Base),
+                            location: PortfolioLocation::Onchain {
+                                chain: Chain::Base,
+                                form: OnchainForm::MarketMaking,
+                            },
                             asset: PortfolioAsset::Equity(Symbol::new(symbol).unwrap()),
                             available: float!(0),
                             inflight: float!(0),

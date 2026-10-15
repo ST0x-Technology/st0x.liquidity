@@ -340,6 +340,14 @@ separately: `Hedging` (the chainless broker account) or `MarketMaking(chain)`
 locations are `PortfolioLocation` reporting rows, not scopes: they hold no
 balance a transfer is sized from.
 
+### Portfolio Location
+
+Where a daily portfolio snapshot row sits: `Onchain { chain, form }` or
+`Offchain` (the broker). The form (`OnchainForm`) is `MarketMaking` (the chain's
+vaults), `WalletUnwrapped` (unwrapped tokens or USDC in the chain's bot wallet)
+or `WalletWrapped` (vault shares in that wallet). Persisted as `<form>:<chain>`
+(`wallet_wrapped:robinhood`) or `offchain`.
+
 ### Target Share
 
 The fraction of a symbol's total inventory (broker shares plus every chain's

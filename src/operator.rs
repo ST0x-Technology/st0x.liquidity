@@ -5,6 +5,10 @@
 //! implementation modules themselves private.
 
 use chrono::{DateTime, NaiveDate, Utc};
+use itertools::Itertools;
+use std::collections::BTreeSet;
+
+use st0x_evm::Chain;
 use st0x_execution::{ExecutorOrderId, FractionalShares, Symbol};
 
 use crate::offchain::order::OffchainOrderId;
@@ -26,14 +30,18 @@ pub enum RejectionReason {
         boundary: DateTime<Utc>,
     },
     #[error(
-        "{symbol} has no [chains.<name>.trading.assets.equities] entry, so its {unconverted} \
-         wrapped-location row(s) on {day} hold vault shares, not underlying shares. A mark \
-         would price them as underlying and misstate the day's capital. Reconcile the holding \
-         instead, or restore the config entry so the capture can resolve a vault ratio."
+        "{unconverted} wrapped-location row(s) of {symbol} on {day} sit on chains \
+         {chain_list} whose [chains.<name>.trading.assets.equities] table does not list \
+         {symbol} with trading or rebalancing enabled, so they hold vault shares, not \
+         underlying shares. A mark would price them as underlying and misstate the day's \
+         capital. Reconcile the holding instead, or enable the listing so the capture can \
+         resolve a vault ratio.",
+        chain_list = .chains.iter().join(", ")
     )]
     UnconvertedWrappedEquityRows {
         symbol: Symbol,
-        unconverted: i64,
+        unconverted: usize,
+        chains: BTreeSet<Chain>,
         day: NaiveDate,
     },
     #[error(
@@ -631,7 +639,9 @@ pub mod equity_transfer {
 }
 
 pub mod inventory {
-    pub use crate::inventory::{PortfolioAsset, PortfolioBalanceRow, PortfolioLocation};
+    pub use crate::inventory::{
+        OnchainForm, PortfolioAsset, PortfolioBalanceRow, PortfolioLocation,
+    };
 
     #[cfg(feature = "test-support")]
     pub use st0x_config::ImbalanceThreshold;
@@ -708,11 +718,12 @@ pub mod portfolio_snapshot {
     use sqlx::SqlitePool;
     use st0x_config::Ctx;
     use st0x_event_sorcery::{RetryOnBusy, StoreBuilder, load_entity};
+    use st0x_evm::Chain;
     use st0x_execution::Symbol;
     use st0x_finance::Positive;
     use st0x_float_serde::format_float;
 
-    use crate::conductor::configured_equity_symbols;
+    use crate::conductor::chain_equity_symbols;
     use crate::inventory::PortfolioLocation;
     use crate::operator::{OperatorError, RejectionReason};
 
@@ -750,9 +761,9 @@ pub mod portfolio_snapshot {
     /// Sets the audited historical closing-price mark for one captured ET day.
     ///
     /// Shared by the operator CLI and the ops API. Rejects an `observed_at` at
-    /// or after the day's 00:05 ET capture boundary, and refuses an
-    /// unconfigured symbol that still holds unconverted wrapped-equity rows (a
-    /// mark would price vault shares as underlying and misstate the day). On
+    /// or after the day's 00:05 ET capture boundary, and refuses a symbol with a
+    /// market-making or wrapped-wallet row on a chain whose table does not list
+    /// it (a mark would price vault shares as underlying and misstate the day). On
     /// success the read model is verified to have updated every captured row.
     pub async fn set_equity_mark(
         pool: &SqlitePool,
@@ -791,35 +802,45 @@ pub mod portfolio_snapshot {
         }
 
         // `EquityMarkSet` prices EVERY row of the symbol (the projection's UPDATE
-        // has no location filter). A symbol with no `[chains.<name>.trading.assets.equities]` entry has
-        // no wrapper entry either, so the capture leaves its MarketMaking and
-        // BaseWalletWrapped rows in vault-share units -- applying an underlying
-        // share price to those misvalues the day, which is exactly what the
-        // capture's forced-absent mark prevents. Refuse rather than let one repair
-        // reintroduce it. Rows at those locations exist only when nonzero: the
-        // capture drops the empty ones.
-        if !configured_equity_symbols(ctx).contains(symbol) {
-            let market_making = PortfolioLocation::MarketMaking(ctx.chains.primary().chain);
-            let unconverted: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM portfolio_snapshot \
-                 WHERE et_day = ? AND asset = ? AND location IN (?, ?)",
-            )
-            .bind(day.to_string())
-            .bind(symbol.to_string())
-            .bind(market_making.to_string())
-            .bind(PortfolioLocation::BaseWalletWrapped.to_string())
-            .fetch_one(pool)
-            .await
-            .context("failed to check for unconverted wrapped-equity rows")?;
+        // has no location filter). The capture converts a market-making or
+        // wrapped-wallet row to underlying units only where that row's own chain
+        // lists the symbol (`ConfiguredEquities` in the capture), so a row on any
+        // other chain is still in vault-share units -- applying an underlying
+        // share price to it misvalues the day, which is exactly what the
+        // capture's forced-absent mark prevents. Refuse rather than let one
+        // repair reintroduce it. Such rows exist only when nonzero: the capture
+        // drops the empty ones.
+        let locations: Vec<String> = sqlx::query_scalar(
+            "SELECT location FROM portfolio_snapshot WHERE et_day = ? AND asset = ?",
+        )
+        .bind(day.to_string())
+        .bind(symbol.to_string())
+        .fetch_all(pool)
+        .await
+        .context("failed to check for unconverted wrapped-equity rows")?;
+        let locations = locations
+            .iter()
+            .map(|location| location.parse::<PortfolioLocation>())
+            .collect::<Result<Vec<_>, _>>()
+            .context("failed to parse a persisted portfolio snapshot location")?;
+        let unconverted_chains: Vec<Chain> = locations
+            .iter()
+            .filter_map(|location| location.wrapped_equity_chain())
+            .filter(|chain| {
+                !ctx.chains
+                    .hedged_chain(*chain)
+                    .is_some_and(|hedged| chain_equity_symbols(&hedged.assets).contains(symbol))
+            })
+            .collect();
 
-            if unconverted > 0 {
-                return Err(RejectionReason::UnconvertedWrappedEquityRows {
-                    symbol: symbol.clone(),
-                    unconverted,
-                    day,
-                }
-                .into());
+        if !unconverted_chains.is_empty() {
+            return Err(RejectionReason::UnconvertedWrappedEquityRows {
+                symbol: symbol.clone(),
+                unconverted: unconverted_chains.len(),
+                chains: unconverted_chains.into_iter().collect(),
+                day,
             }
+            .into());
         }
 
         let store = StoreBuilder::<PortfolioSnapshot>::new(pool.clone())

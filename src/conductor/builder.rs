@@ -196,9 +196,8 @@ struct ConfiguredChainVaults {
 ///
 /// Hedging is venue-level -- one broker book backs every chain's market making
 /// -- so filtering an offchain snapshot against the primary's table alone
-/// drops a secondary-only symbol's broker position and zeroes its Hedging
-/// slot. Shared with the CLI's snapshot-mark repair so the two cannot drift on
-/// what "configured" means.
+/// drops a secondary-only symbol's broker position and zeroes its Offchain
+/// row.
 pub fn configured_equity_symbols(ctx: &Ctx) -> HashSet<Symbol> {
     ctx.chains
         .hedged()
@@ -209,7 +208,11 @@ pub fn configured_equity_symbols(ctx: &Ctx) -> HashSet<Symbol> {
 /// The equities one chain operates: either switch on counts, both off does
 /// not. A chain lists its own, so a symbol traded on one chain alone is
 /// required there and nowhere else.
-fn chain_equity_symbols(assets: &st0x_config::ChainAssets) -> HashSet<Symbol> {
+///
+/// The capture's market-making and wrapped-wallet membership and the
+/// historical-mark repair's wrapped-row guard both read it, so they agree on
+/// which rows were converted.
+pub(crate) fn chain_equity_symbols(assets: &st0x_config::ChainAssets) -> HashSet<Symbol> {
     assets
         .equities
         .symbols
@@ -236,6 +239,23 @@ fn market_making_slots(ctx: &Ctx) -> BTreeMap<Chain, MarketMakingSlots> {
                     usdc_tracking_enabled: hedged.assets.cash.is_some(),
                 },
             )
+        })
+        .collect()
+}
+
+/// The equities the daily capture requires at each polled bot wallet, keyed
+/// by chain: only chains whose equity wallet the poller reads, each with its
+/// own assets table's equities, so the gate never waits on a wallet slot no
+/// poll stamps.
+fn wallet_equity_symbols(
+    ctx: &Ctx,
+    polled_chains: impl Iterator<Item = Chain>,
+) -> BTreeMap<Chain, HashSet<Symbol>> {
+    polled_chains
+        .filter_map(|chain| {
+            ctx.chains
+                .hedged_chain(chain)
+                .map(|hedged| (chain, chain_equity_symbols(&hedged.assets)))
         })
         .collect()
 }
@@ -391,6 +411,10 @@ where
     // The snapshot capture gate below must require exactly the wallet slots
     // this poller populates, so both derive from this single Option: the
     // poller consumes it, the gate reads its presence.
+    let wallet_equity_symbols = wallet_equity_symbols(
+        &context.ctx,
+        context.wallet_polling.equity_wallets.keys().copied(),
+    );
     let wallet_polling = Some(context.wallet_polling);
     let wallet_polling_enabled = wallet_polling.is_some();
     let tokenizer = context.tokenizer;
@@ -605,7 +629,7 @@ where
         equity_prices: context.equity_prices.clone(),
         portfolio_snapshot: context.frameworks.portfolio_snapshot.clone(),
         wrappers: context.wrappers.clone(),
-        wallet_transit_equity_symbols: chain_equity_symbols(&context.ctx.chains.primary().assets),
+        wallet_equity_symbols,
         usdc_tracking_enabled: context.ctx.chains.primary().assets.cash.is_some(),
         // Derived from the same Option the poller consumed, so the gate can
         // never require wallet slots the poller does not populate.
@@ -2020,6 +2044,35 @@ mod tests {
                 (Chain::Ethereum, HashSet::from([secondary_symbol]), false),
             ],
             "each hedged chain contributes the slots its own assets table declares"
+        );
+    }
+
+    /// Only a chain whose equity wallet is polled gates the capture on its
+    /// wallet slots, each with its own table's equities: requiring an
+    /// unpolled wallet would block every capture.
+    #[test]
+    fn wallet_equity_symbols_cover_only_the_polled_wallets() {
+        let robinhood_symbol = Symbol::new("NVDA").unwrap();
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.chains.insert_secondary(
+            st0x_config::HedgedChain::test()
+                .chain(Chain::Robinhood)
+                .assets(ChainAssets {
+                    equities: ChainEquities {
+                        operational_limit: None,
+                        symbols: HashMap::from([(
+                            robinhood_symbol.clone(),
+                            equity_asset(OperationMode::Enabled, RebalancingMode::Enabled),
+                        )]),
+                    },
+                    cash: None,
+                })
+                .call(),
+        );
+
+        assert_eq!(
+            wallet_equity_symbols(&ctx, [Chain::Robinhood].into_iter()),
+            BTreeMap::from([(Chain::Robinhood, HashSet::from([robinhood_symbol]))])
         );
     }
 

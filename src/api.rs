@@ -5487,7 +5487,8 @@ mod tests {
         TestKey, jwks_server, test_key, token, verifier,
     };
     use crate::inventory::{
-        self, BroadcastingInventory, PortfolioAsset, PortfolioBalanceRow, PortfolioLocation,
+        self, BroadcastingInventory, OnchainForm, PortfolioAsset, PortfolioBalanceRow,
+        PortfolioLocation,
     };
     use crate::metrics::liquidity::pnl::PnlWindowKey;
     use crate::metrics::liquidity::pnl_refresh::{LivePnlReports, PnlReports};
@@ -7001,7 +7002,10 @@ mod tests {
     ) -> PortfolioBalanceRowWithMark {
         PortfolioBalanceRowWithMark {
             row: PortfolioBalanceRow {
-                location: PortfolioLocation::MarketMaking(Chain::Base),
+                location: PortfolioLocation::Onchain {
+                    chain: Chain::Base,
+                    form: OnchainForm::MarketMaking,
+                },
                 asset: PortfolioAsset::Usdc,
                 available: float!(&amount.to_string()),
                 inflight: float!(0),
@@ -15982,7 +15986,7 @@ mod tests {
                     captured_at: chrono::Utc.with_ymd_and_hms(2026, 7, 20, 4, 5, 0).unwrap(),
                     rows: vec![PortfolioBalanceRowWithMark {
                         row: PortfolioBalanceRow {
-                            location: PortfolioLocation::Hedging,
+                            location: PortfolioLocation::Offchain,
                             asset: PortfolioAsset::Equity(symbol.clone()),
                             available: float!(10),
                             inflight: float!(0),

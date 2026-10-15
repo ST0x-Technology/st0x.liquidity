@@ -37,7 +37,7 @@ use crate::inventory::freshness::PollFreshness;
 use crate::inventory::snapshot::{
     InventorySnapshot, InventorySnapshotCommand, InventorySnapshotId,
 };
-use crate::inventory::view::{PortfolioAsset, PortfolioLocation};
+use crate::inventory::view::{OnchainForm, PortfolioAsset, PortfolioLocation};
 use crate::offchain::order::OffchainOrderId;
 use crate::position::Position;
 use crate::rebalancing::usdc::{UsdcTransferError, u256_to_usdc};
@@ -165,13 +165,17 @@ impl WalletEquityForm {
         }
     }
 
-    /// The portfolio slot a read on `chain` refreshes. Only Base's wallet is
-    /// valued in the portfolio snapshot.
-    fn portfolio_location(self, chain: Chain) -> Option<PortfolioLocation> {
-        match (self, chain) {
-            (Self::Unwrapped, Chain::Base) => Some(PortfolioLocation::BaseWalletUnwrapped),
-            (Self::Wrapped, Chain::Base) => Some(PortfolioLocation::BaseWalletWrapped),
-            (_, Chain::Ethereum | Chain::HyperEvm | Chain::Robinhood) => None,
+    /// The portfolio slot a read on `chain` refreshes.
+    fn portfolio_location(self, chain: Chain) -> PortfolioLocation {
+        match self {
+            Self::Unwrapped => PortfolioLocation::Onchain {
+                chain,
+                form: OnchainForm::WalletUnwrapped,
+            },
+            Self::Wrapped => PortfolioLocation::Onchain {
+                chain,
+                form: OnchainForm::WalletWrapped,
+            },
         }
     }
 }
@@ -833,7 +837,10 @@ where
         // propagates via `?` above) never leaves this slot falsely fresh.
         for symbol in symbols {
             self.poll_freshness.observe(
-                PortfolioLocation::MarketMaking(vault_polling.chain),
+                PortfolioLocation::Onchain {
+                    chain: vault_polling.chain,
+                    form: OnchainForm::MarketMaking,
+                },
                 PortfolioAsset::Equity(symbol),
             );
         }
@@ -901,7 +908,10 @@ where
         // Stamped only after `send` returns Ok, so a failed persist (which
         // propagates via `?` above) never leaves this slot falsely fresh.
         self.poll_freshness.observe(
-            PortfolioLocation::MarketMaking(vault_polling.chain),
+            PortfolioLocation::Onchain {
+                chain: vault_polling.chain,
+                form: OnchainForm::MarketMaking,
+            },
             PortfolioAsset::Usdc,
         );
 
@@ -988,11 +998,10 @@ where
                 // polled to a zero balance is still a real observation), but
                 // never reached when `send` errors, so a failed persist never
                 // leaves these slots falsely fresh.
-                if let Some(location) = form.portfolio_location(chain) {
-                    for symbol in symbols {
-                        self.poll_freshness
-                            .observe(location, PortfolioAsset::Equity(symbol));
-                    }
+                let location = form.portfolio_location(chain);
+                for symbol in symbols {
+                    self.poll_freshness
+                        .observe(location, PortfolioAsset::Equity(symbol));
                 }
                 Ok(())
             }
@@ -1030,8 +1039,13 @@ where
 
         // Stamped only after `send` returns Ok, so a failed persist (which
         // propagates via `?` above) never leaves this slot falsely fresh.
-        self.poll_freshness
-            .observe(PortfolioLocation::EthereumWallet, PortfolioAsset::Usdc);
+        self.poll_freshness.observe(
+            PortfolioLocation::Onchain {
+                chain: Chain::Ethereum,
+                form: OnchainForm::WalletUnwrapped,
+            },
+            PortfolioAsset::Usdc,
+        );
 
         Ok(())
     }
@@ -1061,8 +1075,13 @@ where
 
         // Stamped only after `send` returns Ok, so a failed persist (which
         // propagates via `?` above) never leaves this slot falsely fresh.
-        self.poll_freshness
-            .observe(PortfolioLocation::BaseWalletUnwrapped, PortfolioAsset::Usdc);
+        self.poll_freshness.observe(
+            PortfolioLocation::Onchain {
+                chain: Chain::Base,
+                form: OnchainForm::WalletUnwrapped,
+            },
+            PortfolioAsset::Usdc,
+        );
 
         Ok(())
     }
@@ -1161,7 +1180,7 @@ where
         // propagates via `?` above) never leaves these slots falsely fresh.
         for symbol in symbols {
             self.poll_freshness
-                .observe(PortfolioLocation::Hedging, PortfolioAsset::Equity(symbol));
+                .observe(PortfolioLocation::Offchain, PortfolioAsset::Equity(symbol));
         }
 
         let (gross_usd_cents, available_usd_cents) =
@@ -1181,7 +1200,7 @@ where
         // Stamped only after `send` returns Ok, so a failed persist (which
         // propagates via `?` above) never leaves this slot falsely fresh.
         self.poll_freshness
-            .observe(PortfolioLocation::Hedging, PortfolioAsset::Usdc);
+            .observe(PortfolioLocation::Offchain, PortfolioAsset::Usdc);
 
         self.snapshot
             .send(
@@ -3728,7 +3747,10 @@ mod tests {
             assert!(
                 observed(
                     &poll_freshness,
-                    PortfolioLocation::MarketMaking(chain),
+                    PortfolioLocation::Onchain {
+                        chain,
+                        form: OnchainForm::MarketMaking
+                    },
                     &PortfolioAsset::Equity(symbol.clone())
                 ),
                 "{chain} must be stamped fresh by its own vault poll"
@@ -4541,13 +4563,13 @@ mod tests {
 
         let equity_asset = PortfolioAsset::Equity(symbol);
         assert!(
-            !observed(&poll_freshness, PortfolioLocation::Hedging, &equity_asset),
+            !observed(&poll_freshness, PortfolioLocation::Offchain, &equity_asset),
             "Hedging equity must stay unobserved when the inflight poll aborts the whole tick"
         );
         assert!(
             !observed(
                 &poll_freshness,
-                PortfolioLocation::Hedging,
+                PortfolioLocation::Offchain,
                 &PortfolioAsset::Usdc
             ),
             "Hedging USDC must stay unobserved when the inflight poll aborts the whole tick"
@@ -8319,7 +8341,10 @@ mod tests {
         service.poll_onchain(&snapshot_id).await.unwrap();
         assert!(
             poll_freshness.observed_since(
-                PortfolioLocation::MarketMaking(Chain::Base),
+                PortfolioLocation::Onchain {
+                    chain: Chain::Base,
+                    form: OnchainForm::MarketMaking
+                },
                 &asset,
                 floor
             ),
@@ -8329,7 +8354,10 @@ mod tests {
         service.poll_onchain(&snapshot_id).await.unwrap();
         assert!(
             poll_freshness.observed_since(
-                PortfolioLocation::MarketMaking(Chain::Base),
+                PortfolioLocation::Onchain {
+                    chain: Chain::Base,
+                    form: OnchainForm::MarketMaking
+                },
                 &asset,
                 floor
             ),
@@ -8404,7 +8432,10 @@ mod tests {
         assert!(
             observed(
                 &poll_freshness,
-                PortfolioLocation::BaseWalletUnwrapped,
+                PortfolioLocation::Onchain {
+                    chain: Chain::Base,
+                    form: OnchainForm::WalletUnwrapped
+                },
                 &PortfolioAsset::Equity(test_symbol("AAPL"))
             ),
             "a zero on-chain balance is still a real observation and must be stamped"
@@ -8666,10 +8697,10 @@ mod tests {
         )));
     }
 
-    /// The portfolio snapshot values Base's wallet only: another chain's
-    /// wallet read records its event but refreshes no Base slot.
+    /// The portfolio snapshot values every polled chain's wallet: a chain's
+    /// wallet read refreshes that chain's own slot and no other chain's.
     #[tokio::test]
-    async fn another_chains_wallet_read_stamps_no_base_wallet_freshness() {
+    async fn a_chains_wallet_read_stamps_only_its_own_wallet_slot_fresh() {
         let pool = setup_test_db().await;
         let server = MockServer::start();
         let tokens = HashMap::from([(
@@ -8709,9 +8740,23 @@ mod tests {
             }
         )));
         assert!(
+            observed(
+                &poll_freshness,
+                PortfolioLocation::Onchain {
+                    chain: Chain::Robinhood,
+                    form: OnchainForm::WalletUnwrapped
+                },
+                &PortfolioAsset::Equity(test_symbol("AAPL"))
+            ),
+            "a Robinhood wallet read must mark Robinhood's wallet slot fresh"
+        );
+        assert!(
             !observed(
                 &poll_freshness,
-                PortfolioLocation::BaseWalletUnwrapped,
+                PortfolioLocation::Onchain {
+                    chain: Chain::Base,
+                    form: OnchainForm::WalletUnwrapped
+                },
                 &PortfolioAsset::Equity(test_symbol("AAPL"))
             ),
             "a Robinhood wallet read must not mark Base's wallet slot fresh"
@@ -8767,7 +8812,10 @@ mod tests {
         assert!(
             !observed(
                 &poll_freshness,
-                PortfolioLocation::EthereumWallet,
+                PortfolioLocation::Onchain {
+                    chain: Chain::Ethereum,
+                    form: OnchainForm::WalletUnwrapped
+                },
                 &PortfolioAsset::Usdc
             ),
             "a failed fetch must leave the slot un-observed so the gate keeps it closed"
@@ -8833,7 +8881,10 @@ mod tests {
         assert!(
             !observed(
                 &poll_freshness,
-                PortfolioLocation::MarketMaking(Chain::Base),
+                PortfolioLocation::Onchain {
+                    chain: Chain::Base,
+                    form: OnchainForm::MarketMaking
+                },
                 &PortfolioAsset::Equity(test_symbol("AAPL"))
             ),
             "a failed vault-balance fetch must leave the slot un-observed so the gate keeps it \
@@ -8894,7 +8945,10 @@ mod tests {
         assert!(
             !observed(
                 &poll_freshness,
-                PortfolioLocation::BaseWalletUnwrapped,
+                PortfolioLocation::Onchain {
+                    chain: Chain::Base,
+                    form: OnchainForm::WalletUnwrapped
+                },
                 &PortfolioAsset::Usdc
             ),
             "a failed fetch must leave the slot un-observed so the gate keeps it closed"
@@ -8902,7 +8956,10 @@ mod tests {
         assert!(
             observed(
                 &poll_freshness,
-                PortfolioLocation::EthereumWallet,
+                PortfolioLocation::Onchain {
+                    chain: Chain::Ethereum,
+                    form: OnchainForm::WalletUnwrapped
+                },
                 &PortfolioAsset::Usdc
             ),
             "the ethereum-wallet slot, which succeeded before the base-wallet failure, must \
@@ -8978,29 +9035,35 @@ mod tests {
         let equity_asset = PortfolioAsset::Equity(symbol);
         assert!(observed(
             &poll_freshness,
-            PortfolioLocation::MarketMaking(Chain::Base),
+            PortfolioLocation::Onchain {
+                chain: Chain::Base,
+                form: OnchainForm::MarketMaking
+            },
             &equity_asset
         ));
         assert!(observed(
             &poll_freshness,
-            PortfolioLocation::Hedging,
+            PortfolioLocation::Offchain,
             &equity_asset
         ));
         assert!(observed(
             &poll_freshness,
-            PortfolioLocation::MarketMaking(Chain::Base),
+            PortfolioLocation::Onchain {
+                chain: Chain::Base,
+                form: OnchainForm::MarketMaking
+            },
             &PortfolioAsset::Usdc
         ));
         assert!(observed(
             &poll_freshness,
-            PortfolioLocation::Hedging,
+            PortfolioLocation::Offchain,
             &PortfolioAsset::Usdc
         ));
     }
 
-    /// The wallet-transit leg of the row->sub-poll mapping table:
-    /// (EthereumWallet, Usdc), (BaseWalletUnwrapped, Usdc),
-    /// (BaseWalletUnwrapped, Equity), (BaseWalletWrapped, Equity).
+    /// The wallet-transit leg of the row->sub-poll mapping table: Ethereum's
+    /// and Base's unwrapped wallet USDC, and Base's unwrapped and wrapped
+    /// wallet equity.
     #[tokio::test]
     async fn poll_wallets_stamps_freshness_for_all_wallet_transit_slots_on_success() {
         let pool = setup_test_db().await;
@@ -9065,22 +9128,34 @@ mod tests {
         let equity_asset = PortfolioAsset::Equity(symbol);
         assert!(observed(
             &poll_freshness,
-            PortfolioLocation::EthereumWallet,
+            PortfolioLocation::Onchain {
+                chain: Chain::Ethereum,
+                form: OnchainForm::WalletUnwrapped
+            },
             &PortfolioAsset::Usdc
         ));
         assert!(observed(
             &poll_freshness,
-            PortfolioLocation::BaseWalletUnwrapped,
+            PortfolioLocation::Onchain {
+                chain: Chain::Base,
+                form: OnchainForm::WalletUnwrapped
+            },
             &PortfolioAsset::Usdc
         ));
         assert!(observed(
             &poll_freshness,
-            PortfolioLocation::BaseWalletUnwrapped,
+            PortfolioLocation::Onchain {
+                chain: Chain::Base,
+                form: OnchainForm::WalletUnwrapped
+            },
             &equity_asset
         ));
         assert!(observed(
             &poll_freshness,
-            PortfolioLocation::BaseWalletWrapped,
+            PortfolioLocation::Onchain {
+                chain: Chain::Base,
+                form: OnchainForm::WalletWrapped
+            },
             &equity_asset
         ));
     }

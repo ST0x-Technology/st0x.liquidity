@@ -323,7 +323,7 @@ impl EventSourced for PortfolioSnapshot {
 
     const AGGREGATE_TYPE: &'static str = "PortfolioSnapshot";
     const PROJECTION: Nil = Nil;
-    const SCHEMA_VERSION: u64 = 2;
+    const SCHEMA_VERSION: u64 = 3;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         match event {
@@ -464,12 +464,16 @@ mod tests {
     use st0x_float_macro::float;
 
     use super::*;
-    use crate::inventory::{PortfolioAsset, PortfolioLocation};
+    use crate::inventory::{OnchainForm, PortfolioAsset, PortfolioLocation};
+    use crate::test_utils::pool_migrated_up_to;
 
     fn test_row(symbol_available: i64) -> PortfolioBalanceRowWithMark {
         PortfolioBalanceRowWithMark {
             row: PortfolioBalanceRow {
-                location: PortfolioLocation::MarketMaking(Chain::Base),
+                location: PortfolioLocation::Onchain {
+                    chain: Chain::Base,
+                    form: OnchainForm::MarketMaking,
+                },
                 asset: PortfolioAsset::Usdc,
                 available: float!(&symbol_available.to_string()),
                 inflight: float!(0),
@@ -482,7 +486,10 @@ mod tests {
     fn equity_row(symbol: &str) -> PortfolioBalanceRowWithMark {
         PortfolioBalanceRowWithMark {
             row: PortfolioBalanceRow {
-                location: PortfolioLocation::MarketMaking(Chain::Base),
+                location: PortfolioLocation::Onchain {
+                    chain: Chain::Base,
+                    form: OnchainForm::MarketMaking,
+                },
                 asset: PortfolioAsset::Equity(Symbol::new(symbol).unwrap()),
                 available: float!(10),
                 inflight: float!(0),
@@ -662,7 +669,10 @@ mod tests {
         let mark_captured_at = Utc.with_ymd_and_hms(2026, 7, 20, 4, 5, 0).unwrap();
         let row = PortfolioBalanceRowWithMark {
             row: PortfolioBalanceRow {
-                location: PortfolioLocation::MarketMaking(Chain::Base),
+                location: PortfolioLocation::Onchain {
+                    chain: Chain::Base,
+                    form: OnchainForm::MarketMaking,
+                },
                 asset: PortfolioAsset::Equity(Symbol::new("AAPL").unwrap()),
                 available: float!(0),
                 inflight: float!(0),
@@ -676,7 +686,7 @@ mod tests {
         assert_eq!(
             encoded,
             json!({
-                "location": {"MarketMaking": "base"},
+                "location": {"Onchain": {"chain": "base", "form": "MarketMaking"}},
                 "asset": {"Equity": "AAPL"},
                 "available":
                     "0x0000000000000000000000000000000000000000000000000000000000000000",
@@ -690,5 +700,211 @@ mod tests {
 
         let decoded: PortfolioBalanceRowWithMark = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded, row);
+    }
+
+    /// Version of the last migration shipped before portfolio locations were
+    /// `Onchain { chain, form } | Offchain`.
+    const LAST_MIGRATION_BEFORE_PER_CHAIN_PORTFOLIO_LOCATIONS: i64 = 20_261_008_021_843;
+
+    const ZERO: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+    /// One location as persisted before the per-chain migration: its
+    /// read-model label and serde shape, the asset it is seeded with in both
+    /// forms, and the location it must become.
+    struct LegacyLocation {
+        label: &'static str,
+        payload: serde_json::Value,
+        asset_label: &'static str,
+        asset_payload: serde_json::Value,
+        migrated: PortfolioLocation,
+    }
+
+    fn legacy_locations() -> Vec<LegacyLocation> {
+        let onchain = |chain, form| PortfolioLocation::Onchain { chain, form };
+        let market_making = |chain: &'static str, label, chain_variant| LegacyLocation {
+            label,
+            payload: json!({"MarketMaking": chain}),
+            asset_label: "AAPL",
+            asset_payload: json!({"Equity": "AAPL"}),
+            migrated: onchain(chain_variant, OnchainForm::MarketMaking),
+        };
+
+        vec![
+            market_making("base", "market_making:base", Chain::Base),
+            market_making("ethereum", "market_making:ethereum", Chain::Ethereum),
+            market_making("hyperevm", "market_making:hyperevm", Chain::HyperEvm),
+            market_making("robinhood", "market_making:robinhood", Chain::Robinhood),
+            LegacyLocation {
+                label: "hedging",
+                payload: json!("Hedging"),
+                asset_label: "AAPL",
+                asset_payload: json!({"Equity": "AAPL"}),
+                migrated: PortfolioLocation::Offchain,
+            },
+            LegacyLocation {
+                label: "ethereum_wallet:ethereum",
+                payload: json!("EthereumWallet"),
+                asset_label: "USDC",
+                asset_payload: json!("Usdc"),
+                migrated: onchain(Chain::Ethereum, OnchainForm::WalletUnwrapped),
+            },
+            LegacyLocation {
+                label: "base_wallet_unwrapped:base",
+                payload: json!("BaseWalletUnwrapped"),
+                asset_label: "USDC",
+                asset_payload: json!("Usdc"),
+                migrated: onchain(Chain::Base, OnchainForm::WalletUnwrapped),
+            },
+            LegacyLocation {
+                label: "base_wallet_unwrapped:base",
+                payload: json!("BaseWalletUnwrapped"),
+                asset_label: "AAPL",
+                asset_payload: json!({"Equity": "AAPL"}),
+                migrated: onchain(Chain::Base, OnchainForm::WalletUnwrapped),
+            },
+            LegacyLocation {
+                label: "base_wallet_wrapped:base",
+                payload: json!("BaseWalletWrapped"),
+                asset_label: "AAPL",
+                asset_payload: json!({"Equity": "AAPL"}),
+                migrated: onchain(Chain::Base, OnchainForm::WalletWrapped),
+            },
+        ]
+    }
+
+    /// Rows, events and snapshots written before the per-chain migration
+    /// read back at the location each legacy label stood for, so no captured
+    /// balance is lost or moved.
+    #[tokio::test]
+    async fn per_chain_location_migration_maps_every_legacy_location_losslessly() {
+        let pool = pool_migrated_up_to(LAST_MIGRATION_BEFORE_PER_CHAIN_PORTFOLIO_LOCATIONS).await;
+        let legacy = legacy_locations();
+
+        for location in &legacy {
+            sqlx::query(
+                "INSERT INTO portfolio_snapshot \
+                 (et_day, captured_at, location, asset, available_balance, inflight_balance, \
+                  usd_mark, mark_captured_at) \
+                 VALUES ('2026-09-01', '2026-09-01T04:05:00+00:00', ?, ?, '7', '0', '1', \
+                  '2026-09-01T04:00:00+00:00')",
+            )
+            .bind(location.label)
+            .bind(location.asset_label)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let rows: Vec<serde_json::Value> = legacy
+            .iter()
+            .map(|location| {
+                json!({
+                    "location": location.payload,
+                    "asset": location.asset_payload,
+                    "available": ZERO,
+                    "inflight": ZERO,
+                    "usd_mark": null,
+                    "mark_captured_at": null,
+                })
+            })
+            .collect();
+        let event = json!({"Captured": {"captured_at": "2026-09-01T04:05:00Z", "rows": rows}});
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+             VALUES ('PortfolioSnapshot', '2026-09-01', 1, 'PortfolioSnapshotEvent::Captured', \
+              '1.0', ?, '{}')",
+        )
+        .bind(event.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO snapshots \
+             (aggregate_type, aggregate_id, last_sequence, payload, timestamp) \
+             VALUES ('PortfolioSnapshot', '2026-09-01', 1, ?, '2026-09-01T04:05:00Z')",
+        )
+        .bind(json!({"captured_rows": rows}).to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::migrate!().run(&pool).await.unwrap();
+
+        let mut migrated_rows: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT location, asset, available_balance FROM portfolio_snapshot")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        migrated_rows.sort();
+        let mut expected_rows: Vec<(String, String, String)> = legacy
+            .iter()
+            .map(|location| {
+                (
+                    location.migrated.to_string(),
+                    location.asset_label.to_string(),
+                    "7".to_string(),
+                )
+            })
+            .collect();
+        expected_rows.sort();
+        assert_eq!(migrated_rows, expected_rows);
+
+        let expected_locations: Vec<PortfolioLocation> =
+            legacy.iter().map(|location| location.migrated).collect();
+
+        let payload: String = sqlx::query_scalar(
+            "SELECT payload FROM events WHERE aggregate_type = 'PortfolioSnapshot'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let PortfolioSnapshotEvent::Captured { rows, .. } =
+            serde_json::from_str::<PortfolioSnapshotEvent>(&payload).unwrap()
+        else {
+            panic!("expected Captured, got {payload}");
+        };
+        assert_eq!(
+            rows.iter().map(|row| row.row.location).collect::<Vec<_>>(),
+            expected_locations
+        );
+
+        let snapshot: String = sqlx::query_scalar(
+            "SELECT payload FROM snapshots WHERE aggregate_type = 'PortfolioSnapshot'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let snapshot: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+        let snapshot_locations: Vec<PortfolioLocation> = snapshot["captured_rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| serde_json::from_value(row["location"].clone()).unwrap())
+            .collect();
+        assert_eq!(snapshot_locations, expected_locations);
+    }
+
+    /// A read-model label the migration does not know fails it, rather than
+    /// surviving as a row no reader can parse.
+    #[tokio::test]
+    async fn per_chain_location_migration_fails_on_an_unknown_legacy_label() {
+        let pool = pool_migrated_up_to(LAST_MIGRATION_BEFORE_PER_CHAIN_PORTFOLIO_LOCATIONS).await;
+        sqlx::query(
+            "INSERT INTO portfolio_snapshot \
+             (et_day, captured_at, location, asset, available_balance, inflight_balance) \
+             VALUES ('2026-09-01', '2026-09-01T04:05:00+00:00', 'robinhood_wallet:robinhood', \
+              'AAPL', '7', '0')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let error = sqlx::migrate!().run(&pool).await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("CHECK constraint failed"),
+            "{error}"
+        );
     }
 }
