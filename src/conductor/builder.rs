@@ -196,8 +196,8 @@ struct ConfiguredChainVaults {
 ///
 /// Hedging is venue-level -- one broker book backs every chain's market making
 /// -- so filtering an offchain snapshot against the primary's table alone
-/// drops a secondary-only symbol's broker position and zeroes its Hedging
-/// slot.
+/// drops a secondary-only symbol's broker position and zeroes its Offchain
+/// row.
 pub fn configured_equity_symbols(ctx: &Ctx) -> HashSet<Symbol> {
     ctx.chains
         .hedged()
@@ -208,8 +208,10 @@ pub fn configured_equity_symbols(ctx: &Ctx) -> HashSet<Symbol> {
 /// The equities one chain operates: either switch on counts, both off does
 /// not. A chain lists its own, so a symbol traded on one chain alone is
 /// required there and nowhere else.
-/// The capture's market-making slots and the historical-mark repair's
-/// wrapped-row guard both read it, so they agree on which rows were converted.
+///
+/// The capture's market-making and wrapped-wallet membership and the
+/// historical-mark repair's wrapped-row guard both read it, so they agree on
+/// which rows were converted.
 pub(crate) fn chain_equity_symbols(assets: &st0x_config::ChainAssets) -> HashSet<Symbol> {
     assets
         .equities

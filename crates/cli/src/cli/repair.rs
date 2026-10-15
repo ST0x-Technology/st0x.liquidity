@@ -298,11 +298,26 @@ mod tests {
             .unwrap_err();
 
             assert!(
-                error
-                    .to_string()
-                    .contains("vault shares, not underlying shares"),
+                matches!(
+                    error.downcast_ref::<OperatorError>(),
+                    Some(OperatorError::Rejected(RejectionReason::UnconvertedWrappedEquityRows {
+                        unconverted: 1,
+                        chains,
+                        ..
+                    })) if *chains == BTreeSet::from([chain])
+                ),
                 "a {chain} wrapped-wallet-only holding must refuse like market making; got: {error}"
             );
+            let priced: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM portfolio_snapshot \
+                 WHERE et_day = ? AND asset = ? AND usd_mark IS NOT NULL",
+            )
+            .bind(day.to_string())
+            .bind(symbol.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(priced, 0, "a refused repair must not price any row");
         }
     }
 
@@ -432,10 +447,10 @@ mod tests {
         ctx
     }
 
-    fn aapl_mark() -> PortfolioSnapshotRecoveryCommand {
+    fn mark_command(day: chrono::NaiveDate, symbol: &Symbol) -> PortfolioSnapshotRecoveryCommand {
         PortfolioSnapshotRecoveryCommand::Set {
-            day: chrono::NaiveDate::from_ymd_opt(2026, 7, 20).unwrap(),
-            symbol: Symbol::new("AAPL").unwrap(),
+            day,
+            symbol: symbol.clone(),
             usd_mark: Positive::new(float!(150)).unwrap(),
             observed_at: Utc.with_ymd_and_hms(2026, 7, 17, 20, 0, 0).unwrap(),
             source: "Nasdaq historical close".parse().unwrap(),
@@ -443,11 +458,13 @@ mod tests {
         }
     }
 
-    async fn priced_aapl_rows(pool: &SqlitePool) -> i64 {
+    async fn priced_rows(pool: &SqlitePool, day: chrono::NaiveDate, symbol: &Symbol) -> i64 {
         sqlx::query_scalar(
             "SELECT COUNT(*) FROM portfolio_snapshot \
-             WHERE et_day = '2026-07-20' AND asset = 'AAPL' AND usd_mark IS NOT NULL",
+             WHERE et_day = ? AND asset = ? AND usd_mark IS NOT NULL",
         )
+        .bind(day.to_string())
+        .bind(symbol.to_string())
         .fetch_one(pool)
         .await
         .unwrap()
@@ -478,6 +495,10 @@ mod tests {
                 },
                 PortfolioLocation::Onchain {
                     chain: Chain::Robinhood,
+                    form: OnchainForm::WalletWrapped,
+                },
+                PortfolioLocation::Onchain {
+                    chain: Chain::Robinhood,
                     form: OnchainForm::WalletUnwrapped,
                 },
                 PortfolioLocation::Offchain,
@@ -486,23 +507,28 @@ mod tests {
         .await;
 
         let ctx = ctx_with_robinhood_listing(&["AAPL"], &["TSLA"]);
-        let error = set_portfolio_snapshot_mark_command(&mut Vec::new(), &pool, aapl_mark(), &ctx)
-            .await
-            .unwrap_err();
+        let error = set_portfolio_snapshot_mark_command(
+            &mut Vec::new(),
+            &pool,
+            mark_command(day, &symbol),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
                 error.downcast_ref::<OperatorError>(),
                 Some(OperatorError::Rejected(RejectionReason::UnconvertedWrappedEquityRows {
-                    unconverted: 1,
+                    unconverted: 2,
                     chains,
                     ..
                 })) if *chains == BTreeSet::from([Chain::Robinhood])
             ),
-            "only the Robinhood market-making row is unconverted; got: {error}"
+            "both Robinhood wrapped rows are unconverted, on one chain; got: {error}"
         );
         assert_eq!(
-            priced_aapl_rows(&pool).await,
+            priced_rows(&pool, day, &symbol).await,
             0,
             "a refused repair must not price any row"
         );
@@ -535,11 +561,16 @@ mod tests {
         .await;
 
         let ctx = ctx_with_robinhood_listing(&[], &["AAPL"]);
-        set_portfolio_snapshot_mark_command(&mut Vec::new(), &pool, aapl_mark(), &ctx)
-            .await
-            .unwrap();
+        set_portfolio_snapshot_mark_command(
+            &mut Vec::new(),
+            &pool,
+            mark_command(day, &symbol),
+            &ctx,
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(priced_aapl_rows(&pool).await, 3);
+        assert_eq!(priced_rows(&pool, day, &symbol).await, 3);
     }
 
     #[tokio::test]

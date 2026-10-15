@@ -5,6 +5,7 @@
 //! implementation modules themselves private.
 
 use chrono::{DateTime, NaiveDate, Utc};
+use itertools::Itertools;
 use std::collections::BTreeSet;
 
 use st0x_evm::Chain;
@@ -30,15 +31,16 @@ pub enum RejectionReason {
     },
     #[error(
         "{unconverted} wrapped-location row(s) of {symbol} on {day} sit on chains \
-         {chains:?} whose [chains.<name>.trading.assets.equities] table does not list {symbol} \
-         with trading or rebalancing enabled, so they hold vault shares, not underlying \
-         shares. A mark would price them as underlying and misstate the day's capital. \
-         Reconcile the holding instead, or enable the listing so the capture can resolve a \
-         vault ratio."
+         {chain_list} whose [chains.<name>.trading.assets.equities] table does not list \
+         {symbol} with trading or rebalancing enabled, so they hold vault shares, not \
+         underlying shares. A mark would price them as underlying and misstate the day's \
+         capital. Reconcile the holding instead, or enable the listing so the capture can \
+         resolve a vault ratio.",
+        chain_list = .chains.iter().join(", ")
     )]
     UnconvertedWrappedEquityRows {
         symbol: Symbol,
-        unconverted: i64,
+        unconverted: usize,
         chains: BTreeSet<Chain>,
         day: NaiveDate,
     },
@@ -834,8 +836,7 @@ pub mod portfolio_snapshot {
         if !unconverted_chains.is_empty() {
             return Err(RejectionReason::UnconvertedWrappedEquityRows {
                 symbol: symbol.clone(),
-                unconverted: i64::try_from(unconverted_chains.len())
-                    .context("unconverted wrapped-equity row count exceeds i64")?,
+                unconverted: unconverted_chains.len(),
                 chains: unconverted_chains.into_iter().collect(),
                 day,
             }
