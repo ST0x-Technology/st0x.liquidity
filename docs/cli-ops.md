@@ -301,8 +301,10 @@ automated path for this, the operator deposits it. Prerequisites, all per chain:
   the hop calls (CCTP: the USDC approve, `depositForBurn` and `receiveMessage`;
   Relay: the stable's approve to the depository and `depositErc20`), the
   corridor chain's vault `withdraw4`/`deposit4`, and the Ethereum USDC
-  `transfer` to Alpaca, whose policy must leave the recipient unconstrained
-  because the Alpaca deposit address is only known at run time. The rest are
+  `transfer` to Alpaca. The Alpaca deposit address is only known at run time, so
+  the gate cannot prove a condition on the `transfer` recipient and refuses a
+  policy that constrains it; the policy requirements for the Alpaca transfer are
+  in [RAI-3384](https://linear.app/makeitrain/issue/RAI-3384). The rest are
   exercised by the commands below.
 
 Then, per asset:
