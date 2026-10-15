@@ -198,7 +198,15 @@ struct RelayOrder {
     amount_in: U256,
     amount_out: U256,
     deposit: Option<OrderDeposit>,
-    fill_tx: Option<TxHash>,
+    fill: Option<OrderFill>,
+}
+
+/// The solver's payment for an order, recorded once sent so a failed receipt
+/// lookup never makes the solver pay twice.
+#[derive(Clone, Copy)]
+enum OrderFill {
+    Sent(TxHash),
+    Mined(TxHash),
 }
 
 /// The deposit that funded an order, as its depository log names it.
@@ -356,7 +364,7 @@ impl RelayMock {
                 Some(SeenDeposit {
                     amount: order.deposit?.amount,
                     amount_out: order.amount_out,
-                    filled: order.fill_tx.is_some(),
+                    filled: matches!(order.fill, Some(OrderFill::Mined(_))),
                 })
             })
             .collect()
@@ -467,7 +475,7 @@ fn quote_response(state: &Mutex<RelayState>, body: &[u8]) -> anyhow::Result<Valu
             amount_in: quote_request.amount,
             amount_out,
             deposit: None,
-            fill_tx: None,
+            fill: None,
         });
     }
     debug!(%order_id, amount = %quote_request.amount, "Relay mock quoted");
@@ -483,11 +491,11 @@ fn status_body(state: &RelayState, request_id: Option<B256>) -> Value {
         return json!({"status": "waiting"});
     };
 
-    match (order.deposit.map(|deposit| deposit.tx), order.fill_tx) {
-        (Some(deposit), Some(fill)) => {
+    match (order.deposit.map(|deposit| deposit.tx), order.fill) {
+        (Some(deposit), Some(OrderFill::Mined(fill))) => {
             json!({"status": "success", "inTxHashes": [deposit], "txHashes": [fill]})
         }
-        (Some(deposit), None) => {
+        (Some(deposit), None | Some(OrderFill::Sent(_))) => {
             json!({"status": "pending", "inTxHashes": [deposit], "txHashes": []})
         }
         (None, _) => json!({"status": "waiting"}),
@@ -590,6 +598,7 @@ fn record_deposits(
     }
 }
 
+/// Pays each deposited order once, then marks it filled when the payment is mined.
 async fn fill_deposits(
     state: &Mutex<RelayState>,
     keys: SolverKeys,
@@ -603,7 +612,9 @@ async fn fill_deposits(
         state
             .orders
             .iter()
-            .filter(|(_, order)| order.deposit.is_some() && order.fill_tx.is_none())
+            .filter(|(_, order)| {
+                order.deposit.is_some() && !matches!(order.fill, Some(OrderFill::Mined(_)))
+            })
             .map(|(id, order)| (*id, order.clone()))
             .collect()
     };
@@ -613,27 +624,48 @@ async fn fill_deposits(
             .iter()
             .find(|solver_chain| solver_chain.chain == order.destination)
             .ok_or_else(|| anyhow::anyhow!("the solver does not pay on {}", order.destination))?;
-        let fill = pay(
-            destination,
-            keys,
-            order.recipient,
-            order.amount_out,
-            order_id,
-        )
-        .await?;
 
-        if let Some(order) = lock(state).orders.get_mut(&order_id) {
-            order.fill_tx = Some(fill);
-        }
+        let fill = match order.fill {
+            Some(OrderFill::Sent(fill)) => fill,
+            Some(OrderFill::Mined(_)) => continue,
+            None => {
+                let fill = pay(
+                    destination,
+                    keys,
+                    order.recipient,
+                    order.amount_out,
+                    order_id,
+                )
+                .await?;
+                record_fill(state, order_id, OrderFill::Sent(fill));
+                fill
+            }
+        };
+
+        let provider = ProviderBuilder::new().connect_http(destination.endpoint.parse()?);
+        let Some(receipt) = provider.get_transaction_receipt(fill).await? else {
+            debug!(%order_id, %fill, "Relay mock fill not mined yet");
+            continue;
+        };
+        anyhow::ensure!(receipt.status(), "Relay mock fill {fill} reverted");
+
+        record_fill(state, order_id, OrderFill::Mined(fill));
         debug!(%order_id, %fill, "Relay mock filled a deposit");
     }
 
     Ok(())
 }
 
+fn record_fill(state: &Mutex<RelayState>, order_id: B256, fill: OrderFill) {
+    if let Some(order) = lock(state).orders.get_mut(&order_id) {
+        order.fill = Some(fill);
+    }
+}
+
 /// Pays `recipient` the way Relay's solver does: the relayer EOA calls the
 /// stable's `transferFrom(solver, recipient, amount)` with the order id
-/// appended, after the solver was funded and approved the relayer.
+/// appended, after the solver was funded and approved the relayer. Returns
+/// the payment's hash as soon as it is sent, without waiting for its receipt.
 async fn pay(
     solver_chain: &SolverChain,
     keys: SolverKeys,
@@ -671,7 +703,14 @@ async fn pay(
     .abi_encode();
     calldata.extend_from_slice(order_id.as_slice());
 
-    send(&key_provider(&keys.relayer, endpoint)?, stable, calldata).await
+    let payment = TransactionRequest::default()
+        .with_to(stable)
+        .with_input(Bytes::from(calldata));
+    let pending = key_provider(&keys.relayer, endpoint)?
+        .send_transaction(payment)
+        .await?;
+
+    Ok(*pending.tx_hash())
 }
 
 /// Sends `calldata` to `to` and waits for a successful receipt.
