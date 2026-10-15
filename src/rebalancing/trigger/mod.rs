@@ -5121,7 +5121,8 @@ impl PendingRequestOwnership for RebalancingService {
 /// never persisted.
 pub(crate) enum RecoveryRollback {
     /// The rebuild touched no inventory balances (called on a non-failed
-    /// aggregate). Rollback only drops the tracking + in-progress guard.
+    /// aggregate), or kept a failed mint's Hedging in-flight that was already in
+    /// place. Rollback only drops the tracking + in-progress guard.
     TrackingOnly,
     /// Redemption recovery restores released exposure or claims one seeded
     /// failure. Rollback removes only the added exposure and restores the seeded identity.
@@ -5132,8 +5133,8 @@ pub(crate) enum RecoveryRollback {
         timed_out_at: Option<DateTime<Utc>>,
         suppressed_at: Option<DateTime<Utc>>,
     },
-    /// The rebuild set the mint's Hedging in-flight without debiting
-    /// available. Rollback clears that in-flight; available is left as is.
+    /// The rebuild set the mint's Hedging in-flight from zero, without
+    /// debiting available. Rollback clears it; available is left as is.
     ClearInflight,
     /// The rebuild re-set the in-flight on the record's `chain` and dropped the
     /// timeout tombstone (a timed-out transfer). Rollback clears that chain's
@@ -9430,11 +9431,12 @@ impl RebalancingService {
             .map(|tombstone| tombstone.timed_out_at);
 
         // A third shape the timeout/zero-inflight branches below do not cover: the
-        // failure left the in-flight already established (a `Start` ran but the
-        // failure never cancelled it back to available -- e.g. an out-of-process
-        // `transfer fail`, or a reactor that recorded the failure without
-        // running `cancel` -- or a provider poll re-set it). That is already the canonical pre-complete shape,
-        // so recovery keeps it and its rollback leaves the in-flight in place.
+        // failure left the in-flight already established (a `Start` ran and the
+        // failure never cancelled it -- an out-of-process `transfer fail`, or a
+        // reactor that recorded the failure without running `cancel` -- or a
+        // provider poll re-set it after the cancel). That is already the
+        // canonical pre-complete shape, so recovery keeps it and its rollback
+        // leaves the in-flight in place.
         let inflight_already_established = self
             .inventory
             .read()
@@ -12375,6 +12377,7 @@ mod tests {
             inventory.equity_inflight(&symbol, Venue::Hedging),
             Some(shares(0))
         );
+        drop(inventory);
     }
 
     #[tokio::test]
@@ -12468,8 +12471,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Same end state as the explicit case: the 10 that left Hedging now
-        // sits in MarketMaking. Hedging available is NOT double-debited.
+        // The 10 that left Hedging now sits in MarketMaking; Hedging available
+        // stays at the timeout's debited 90 until the forced reconcile re-bases it.
         let (hedging, market_making) = {
             let inventory = trigger.inventory.read().await;
             (
@@ -12580,6 +12583,7 @@ mod tests {
             inventory.equity_inflight(&symbol, Venue::Hedging),
             Some(shares(0))
         );
+        drop(inventory);
     }
 
     #[tokio::test]
@@ -13655,17 +13659,15 @@ mod tests {
             .expect_claimed();
 
         // Rebuild set the in-flight without debiting available.
-        {
+        let (inflight, available) = {
             let inventory = trigger.inventory.read().await;
-            assert_eq!(
+            (
                 inventory.equity_inflight(&symbol, Venue::Hedging),
-                Some(shares(10))
-            );
-            assert_eq!(
                 inventory.equity_available(&symbol, Venue::Hedging),
-                Some(shares(100))
-            );
-        }
+            )
+        };
+        assert_eq!(inflight, Some(shares(10)));
+        assert_eq!(available, Some(shares(100)));
         assert!(trigger.mint_tracking.read().await.contains_key(&mint_id));
 
         // The dispatch failed before the reactor ran; rolling back must restore
