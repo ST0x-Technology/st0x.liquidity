@@ -1,16 +1,21 @@
-//! Deploy-time verification that Turnkey policies cover every startup approve.
+//! Deploy-time verification that Turnkey policies cover every startup approve
+//! and every call a served cash corridor signs on either end.
 
+use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter};
 use std::path::Path;
 
-use alloy::primitives::Address;
-use st0x_config::{ChainApprovalInputs, Ctx, TokenFile};
-use st0x_evm::Chain;
+use alloy::primitives::{Address, Selector};
+use alloy::sol_types::SolCall;
+use st0x_bridge::corridor::{CorridorCall, FirstArgument, NoRelayDepository, UsdcCorridor};
+use st0x_config::{ChainApprovalInputs, Ctx, InventoryMode, TokenFile};
 use st0x_evm::turnkey::{
     TurnkeyPolicy, TurnkeyPolicyClient, TurnkeyPolicyEffect, TurnkeyPolicyError,
     TurnkeyPolicySnapshot,
 };
+use st0x_evm::{Chain, IERC20};
 
+use crate::bindings::IRaindexInventory;
 use crate::onchain::approvals::{ApprovalTarget, build_approval_targets};
 
 /// Successful result of a deploy-time policy verification.
@@ -19,9 +24,11 @@ pub enum ApprovalPolicyVerification {
     /// The validated wallet backend is not Turnkey, so no Turnkey query is
     /// applicable.
     SkippedNonTurnkey,
-    /// Every startup approval target is covered by at least one allow policy.
+    /// Every startup approval target and every call a served corridor signs is
+    /// covered by at least one allow policy.
     Verified {
         target_count: usize,
+        corridor_call_count: usize,
         policy_count: usize,
     },
 }
@@ -69,6 +76,47 @@ impl Display for MissingPolicyCoverage {
 
 impl std::error::Error for MissingPolicyCoverage {}
 
+/// Every call one served corridor signs, on either end, for which no
+/// provably matching allow policy was returned by Turnkey.
+#[derive(Debug)]
+pub struct MissingCorridorCoverage {
+    corridor: UsdcCorridor,
+    missing: Vec<CorridorCall>,
+}
+
+impl Display for MissingCorridorCoverage {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            formatter,
+            "Turnkey policies do not cover {} call(s) the {} corridor signs:",
+            self.missing.len(),
+            self.corridor,
+        )?;
+
+        for call in &self.missing {
+            write!(
+                formatter,
+                "- {}: {} ({}) on {}",
+                call.chain, call.function, call.selector, call.to
+            )?;
+
+            match call.first_argument {
+                FirstArgument::Address(address) => {
+                    write!(formatter, ", first argument {address}")?;
+                }
+                FirstArgument::Signer => write!(formatter, ", first argument our wallet")?,
+                FirstArgument::ChosenAtRunTime | FirstArgument::NotAnAddress => {}
+            }
+
+            writeln!(formatter)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl std::error::Error for MissingCorridorCoverage {}
+
 /// Failure from config validation, Turnkey policy listing, or policy coverage.
 #[derive(Debug, thiserror::Error)]
 pub enum ApprovalPolicyVerificationError {
@@ -80,15 +128,23 @@ pub enum ApprovalPolicyVerificationError {
     Coverage(#[from] ChainCoverageError),
 }
 
-/// Why one hedged chain's startup approvals are not provably covered.
+/// Why one hedged chain's startup approvals, or one served corridor's calls,
+/// are not provably covered.
 #[derive(Debug, thiserror::Error)]
 pub enum ChainCoverageError {
     #[error(transparent)]
     MissingCoverage(#[from] MissingPolicyCoverage),
+    #[error(transparent)]
+    MissingCorridorCoverage(#[from] MissingCorridorCoverage),
+    #[error(transparent)]
+    NoRelayDepository(#[from] NoRelayDepository),
+    #[error("the {corridor} corridor's chain is not a hedged chain")]
+    CorridorChainNotHedged { corridor: UsdcCorridor },
 }
 
 /// Validates deploy inputs, lists Turnkey policies, and fails unless every
-/// startup MAX approval has a provably matching allow policy.
+/// startup MAX approval and every call a served corridor signs has a provably
+/// matching allow policy.
 pub async fn verify_turnkey_approval_policies(
     config_path: &Path,
     secrets_path: &Path,
@@ -106,6 +162,7 @@ pub(crate) async fn verify_registry_approval_inputs(
     if let (Some(running), Some(candidate)) = (&running, &candidate)
         && running.wallet_address == candidate.wallet_address
         && running.organization_id.as_str() == candidate.organization_id.as_str()
+        && candidate.corridors.is_subset(&running.corridors)
         && !additional_approval_targets(&running.hedged, &candidate.hedged)
     {
         return Ok(());
@@ -162,9 +219,16 @@ pub(crate) async fn verify_approval_inputs(
     .await?;
     let snapshot = client.list_policies().await?;
     let target_count = verify_hedged_chains(&inputs.hedged, &snapshot, inputs.wallet_address)?;
+    let corridor_call_count = verify_corridor_ends(
+        &inputs.corridors,
+        &inputs.hedged,
+        &snapshot,
+        inputs.wallet_address,
+    )?;
 
     Ok(ApprovalPolicyVerification::Verified {
         target_count,
+        corridor_call_count,
         policy_count: snapshot.policies.len(),
     })
 }
@@ -206,6 +270,96 @@ fn verify_hedged_chains(
     Ok(target_count)
 }
 
+/// Every served corridor's calls, hop and cash legs, each checked against the
+/// policies on its own end's chain id; the covered call count on success. The
+/// first corridor with an uncovered call fails the gate, naming every such
+/// call on both of its ends.
+fn verify_corridor_ends(
+    corridors: &BTreeSet<UsdcCorridor>,
+    hedged: &[ChainApprovalInputs],
+    snapshot: &TurnkeyPolicySnapshot,
+    wallet_address: Address,
+) -> Result<usize, ChainCoverageError> {
+    let mut call_count = 0;
+
+    for corridor in corridors {
+        let mut calls = corridor.hop_calls()?;
+        calls.extend(cash_leg_calls(*corridor, hedged)?);
+        let missing: Vec<CorridorCall> = calls
+            .iter()
+            .filter(|call| {
+                let context = ApprovalPolicyContext {
+                    user_id: &snapshot.user_id,
+                    user_tags: &snapshot.user_tags,
+                    wallet_address,
+                    chain_id: call.chain.chain_id(),
+                };
+                let required = RequiredCall {
+                    to: call.to,
+                    selector: call.selector,
+                    first_address: match call.first_argument {
+                        FirstArgument::Address(address) => Some(address),
+                        FirstArgument::Signer => Some(wallet_address),
+                        FirstArgument::ChosenAtRunTime | FirstArgument::NotAnAddress => None,
+                    },
+                };
+
+                !policies_cover_call(&snapshot.policies, &required, &context)
+            })
+            .copied()
+            .collect();
+
+        if !missing.is_empty() {
+            return Err(MissingCorridorCoverage {
+                corridor: *corridor,
+                missing,
+            }
+            .into());
+        }
+
+        call_count += calls.len();
+    }
+
+    Ok(call_count)
+}
+
+/// The calls a corridor signs around its hop: the vault `withdraw4` and
+/// `deposit4` of the stable on the corridor chain's inventory, and the hub's
+/// USDC `transfer` to Alpaca's deposit address, which only a run knows.
+fn cash_leg_calls(
+    corridor: UsdcCorridor,
+    hedged: &[ChainApprovalInputs],
+) -> Result<[CorridorCall; 3], ChainCoverageError> {
+    let chain = corridor.chain();
+    let inputs = hedged
+        .iter()
+        .find(|inputs| inputs.chain == chain)
+        .ok_or(ChainCoverageError::CorridorChainNotHedged { corridor })?;
+    let inventory = match inputs.inventory {
+        InventoryMode::Legacy => inputs.orderbook,
+        InventoryMode::Managed { inventory } => inventory,
+    };
+    let vault_call = |selector: [u8; 4], function| CorridorCall {
+        chain,
+        to: inventory,
+        selector: selector.into(),
+        first_argument: FirstArgument::Address(chain.settlement_stable().address),
+        function,
+    };
+
+    Ok([
+        vault_call(IRaindexInventory::withdraw4Call::SELECTOR, "withdraw4"),
+        vault_call(IRaindexInventory::deposit4Call::SELECTOR, "deposit4"),
+        CorridorCall {
+            chain: Chain::Ethereum,
+            to: Chain::Ethereum.settlement_stable().address,
+            selector: IERC20::transferCall::SELECTOR.into(),
+            first_argument: FirstArgument::ChosenAtRunTime,
+            function: "transfer",
+        },
+    ])
+}
+
 fn missing_policy_coverage(
     targets: &[ApprovalTarget],
     policies: &[TurnkeyPolicy],
@@ -213,9 +367,27 @@ fn missing_policy_coverage(
 ) -> Vec<ApprovalTarget> {
     targets
         .iter()
-        .filter(|target| !policies_cover_target(policies, target, context))
+        .filter(|target| {
+            let required = RequiredCall {
+                to: target.token,
+                selector: IERC20::approveCall::SELECTOR.into(),
+                first_address: Some(target.spender),
+            };
+
+            !policies_cover_call(policies, &required, context)
+        })
         .cloned()
         .collect()
+}
+
+/// One transaction a policy must allow: its target, its selector, and its
+/// first ABI word when that word is an address (`None` leaves any policy
+/// term on it unprovable).
+#[derive(Debug, Clone, Copy)]
+struct RequiredCall {
+    to: Address,
+    selector: Selector,
+    first_address: Option<Address>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -233,15 +405,15 @@ enum Applicability {
     Unknown,
 }
 
-fn policies_cover_target(
+fn policies_cover_call(
     policies: &[TurnkeyPolicy],
-    target: &ApprovalTarget,
+    call: &RequiredCall,
     context: &ApprovalPolicyContext<'_>,
 ) -> bool {
     let mut has_allow = false;
 
     for policy in policies {
-        let applicability = policy_applicability(policy, target, context);
+        let applicability = policy_applicability(policy, call, context);
 
         match (policy.effect, applicability) {
             (TurnkeyPolicyEffect::Deny, Applicability::Applies | Applicability::Unknown) => {
@@ -257,10 +429,10 @@ fn policies_cover_target(
 
 fn policy_applicability(
     policy: &TurnkeyPolicy,
-    target: &ApprovalTarget,
+    call: &RequiredCall,
     context: &ApprovalPolicyContext<'_>,
 ) -> Applicability {
-    let condition = condition_applicability(policy.condition.as_deref(), target, context);
+    let condition = condition_applicability(policy.condition.as_deref(), call, context);
 
     // Consensus identifies who can approve an allowed activity. A matching
     // deny condition wins independently of which users could approve it.
@@ -300,7 +472,7 @@ fn consensus_applicability(
 
 fn condition_applicability(
     condition: Option<&str>,
-    target: &ApprovalTarget,
+    call: &RequiredCall,
     context: &ApprovalPolicyContext<'_>,
 ) -> Applicability {
     let Some(condition) = compact_expression(condition) else {
@@ -314,7 +486,7 @@ fn condition_applicability(
     conjunction(
         condition
             .split("&&")
-            .map(|term| policy_term_applicability(term, target, context)),
+            .map(|term| policy_term_applicability(term, call, context)),
     )
 }
 
@@ -375,25 +547,27 @@ fn any_approver_user_id(consensus: &str) -> Option<&str> {
 
 fn policy_term_applicability(
     term: &str,
-    target: &ApprovalTarget,
+    call: &RequiredCall,
     context: &ApprovalPolicyContext<'_>,
 ) -> Applicability {
     let term = trim_grouping_parentheses(term);
 
     if let Some(value) = equality_value(term, "eth.tx.to") {
-        return lowercase_address_applicability(value, target.token, true);
+        return lowercase_address_applicability(value, call.to, true);
     }
 
     if let Some(values) = membership_values(term, "eth.tx.to") {
-        return address_membership_applicability(&values, target.token, true);
+        return address_membership_applicability(&values, call.to, true);
     }
 
+    let selector = format!("{:#x}", call.selector);
+
     if let Some(value) = equality_value(term, "eth.tx.data[0..10]") {
-        return equality_applicability(value, "0x095ea7b3");
+        return equality_applicability(value, &selector);
     }
 
     if let Some(value) = equality_value(term, "eth.tx.data[2..10]") {
-        return equality_applicability(value, "095ea7b3");
+        return equality_applicability(value, &selector[2..]);
     }
 
     if let Some(value) = equality_value(term, "activity.kind") {
@@ -424,11 +598,19 @@ fn policy_term_applicability(
     }
 
     if let Some(value) = equality_value(term, "eth.tx.data[34..74]") {
-        return lowercase_address_applicability(value, target.spender, false);
+        return call
+            .first_address
+            .map_or(Applicability::Unknown, |address| {
+                lowercase_address_applicability(value, address, false)
+            });
     }
 
     if let Some(values) = membership_values(term, "eth.tx.data[34..74]") {
-        return address_membership_applicability(&values, target.spender, false);
+        return call
+            .first_address
+            .map_or(Applicability::Unknown, |address| {
+                address_membership_applicability(&values, address, false)
+            });
     }
 
     // ABI-derived fields only have meaning when Turnkey has a matching smart
@@ -544,8 +726,9 @@ fn trim_grouping_parentheses(mut term: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
 
+    use st0x_bridge::corridor::{HopKind, UsdcCorridor};
     use st0x_config::{
         ChainAssets, ChainEquities, ChainEquityAsset, ChainRole, InventoryMode, OperationMode,
         RebalancingMode,
@@ -1009,6 +1192,7 @@ mod tests {
                 ChainRole::Primary,
                 InventoryMode::Legacy,
             )],
+            corridors: BTreeSet::from([UsdcCorridor::BASE_CCTP]),
         };
         let mut candidate = running.clone();
         let asset = candidate.hedged[0]
@@ -1100,7 +1284,9 @@ mod tests {
         )
         .unwrap_err();
 
-        let ChainCoverageError::MissingCoverage(missing) = error;
+        let ChainCoverageError::MissingCoverage(missing) = error else {
+            panic!("expected missing startup coverage, got {error:?}");
+        };
         assert_eq!(missing.chain, Chain::Ethereum);
         assert_eq!(
             missing
@@ -1136,7 +1322,9 @@ mod tests {
         ] {
             let error =
                 verify_hedged_chains(&hedged, &snapshot(policies), wallet_address).unwrap_err();
-            let ChainCoverageError::MissingCoverage(missing) = error;
+            let ChainCoverageError::MissingCoverage(missing) = error else {
+                panic!("expected missing startup coverage, got {error:?}");
+            };
 
             assert_eq!(missing.chain, Chain::HyperEvm);
             assert_eq!(
@@ -1192,7 +1380,9 @@ mod tests {
             wallet_address,
         )
         .unwrap_err();
-        let ChainCoverageError::MissingCoverage(missing) = error;
+        let ChainCoverageError::MissingCoverage(missing) = error else {
+            panic!("expected missing startup coverage, got {error:?}");
+        };
 
         assert_eq!(
             missing
@@ -1221,5 +1411,435 @@ mod tests {
             .unwrap(),
             3
         );
+    }
+
+    const ROBINHOOD_RELAY: UsdcCorridor = UsdcCorridor::HubRouted {
+        chain: Chain::Robinhood,
+        hop: HopKind::Relay,
+    };
+
+    const WALLET: Address = address!("0x52908400098527886E0F7030069857D2E4169EE7");
+
+    /// The corridor chains as hedged secondaries; their vault calls go to
+    /// orderbook 0x33.. in legacy inventory mode.
+    fn corridor_chains() -> [ChainApprovalInputs; 2] {
+        [Chain::Base, Chain::Robinhood]
+            .map(|chain| chain_inputs(chain, ChainRole::Secondary, InventoryMode::Legacy))
+    }
+
+    /// The vault calls on the corridor chain and the hub's send to Alpaca.
+    fn cash_leg_policies() -> Vec<TurnkeyPolicy> {
+        let withdraw = Selector::from(IRaindexInventory::withdraw4Call::SELECTOR);
+        let deposit = Selector::from(IRaindexInventory::deposit4Call::SELECTOR);
+
+        [
+            (
+                "0x3333333333333333333333333333333333333333",
+                format!("{withdraw:x}"),
+            ),
+            (
+                "0x3333333333333333333333333333333333333333",
+                format!("{deposit:x}"),
+            ),
+            (
+                "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                "a9059cbb".to_string(),
+            ),
+        ]
+        .into_iter()
+        .map(|(to, selector)| {
+            tag_allow(&format!(
+                "eth.tx.to == '{to}' && eth.tx.data[2..10] == '{selector}'"
+            ))
+        })
+        .collect()
+    }
+
+    /// A policy that covers both Relay approves (USDG on Robinhood, USDC on
+    /// Ethereum, each to the depository) but no call to the depository itself.
+    #[test]
+    fn relay_corridor_end_without_policy_for_its_deposit_is_refused() {
+        let depository = Chain::Robinhood.relay_depository().unwrap();
+        let usdg = Chain::Robinhood.settlement_stable().address;
+        let approvals_only = tag_allow(&format!(
+            "activity.type == 'ACTIVITY_TYPE_SIGN_TRANSACTION_V2' && \
+             eth.tx.to in ['{usdg:#x}', '{USDC_ETHEREUM:#x}'] && \
+             eth.tx.data[2..10] == '095ea7b3' && \
+             eth.tx.data[34..74] == '{depository:x}'"
+        ));
+
+        let error = verify_corridor_ends(
+            &BTreeSet::from([ROBINHOOD_RELAY]),
+            &corridor_chains(),
+            &snapshot([vec![approvals_only], cash_leg_policies()].concat()),
+            WALLET,
+        )
+        .unwrap_err();
+        let ChainCoverageError::MissingCorridorCoverage(missing) = error else {
+            panic!("expected missing corridor coverage, got {error:?}");
+        };
+
+        assert_eq!(missing.corridor, ROBINHOOD_RELAY);
+        assert_eq!(
+            missing
+                .missing
+                .iter()
+                .map(|call| (call.chain, call.to, call.function))
+                .collect::<Vec<_>>(),
+            vec![
+                (Chain::Robinhood, depository, "depositErc20"),
+                (Chain::Ethereum, depository, "depositErc20"),
+            ],
+            "both Relay ends must be refused for their uncovered deposit"
+        );
+        assert_eq!(
+            missing.to_string(),
+            format!(
+                "Turnkey policies do not cover 2 call(s) the robinhood via relay corridor \
+                 signs:\n\
+                 - robinhood: depositErc20 (0xe8017952) on {depository}, first argument our \
+                 wallet\n\
+                 - ethereum: depositErc20 (0xe8017952) on {depository}, first argument our \
+                 wallet\n"
+            )
+        );
+    }
+
+    /// Both Relay ends' approves and deposits, the deposit only with
+    /// `depositor` as its depositor, plus the cash legs.
+    fn relay_policies(depositor: Address) -> Vec<TurnkeyPolicy> {
+        let depository = Chain::Robinhood.relay_depository().unwrap();
+        let usdg = Chain::Robinhood.settlement_stable().address;
+
+        let mut policies = cash_leg_policies();
+        policies.push(tag_allow(&format!(
+            "eth.tx.to in ['{usdg:#x}', '{USDC_ETHEREUM:#x}'] && \
+             eth.tx.data[2..10] == '095ea7b3' && \
+             eth.tx.data[34..74] == '{depository:x}'"
+        )));
+        policies.push(tag_allow(&format!(
+            "eth.tx.to == '{depository:#x}' && \
+             eth.tx.data[0..10] == '0xe8017952' && \
+             eth.tx.data[34..74] == '{depositor:x}'"
+        )));
+        policies
+    }
+
+    #[test]
+    fn fully_covered_relay_corridor_passes_and_counts_every_call() {
+        assert_eq!(
+            verify_corridor_ends(
+                &BTreeSet::from([ROBINHOOD_RELAY]),
+                &corridor_chains(),
+                &snapshot(relay_policies(WALLET)),
+                WALLET,
+            )
+            .unwrap(),
+            7
+        );
+    }
+
+    #[test]
+    fn relay_deposit_policy_for_another_depositor_does_not_cover_ours() {
+        let other = address!("0x9999999999999999999999999999999999999999");
+
+        let error = verify_corridor_ends(
+            &BTreeSet::from([ROBINHOOD_RELAY]),
+            &corridor_chains(),
+            &snapshot(relay_policies(other)),
+            WALLET,
+        )
+        .unwrap_err();
+        let ChainCoverageError::MissingCorridorCoverage(missing) = error else {
+            panic!("expected missing corridor coverage, got {error:?}");
+        };
+
+        assert_eq!(
+            missing
+                .missing
+                .iter()
+                .map(|call| (call.chain, call.function))
+                .collect::<Vec<_>>(),
+            vec![
+                (Chain::Robinhood, "depositErc20"),
+                (Chain::Ethereum, "depositErc20"),
+            ]
+        );
+    }
+
+    /// A deny on the raw deposit selector overrides the allow for both
+    /// Relay deposits and nothing else.
+    #[test]
+    fn deny_on_a_hop_selector_refuses_that_call_on_both_ends() {
+        let mut policies = relay_policies(WALLET);
+        policies.push(TurnkeyPolicy {
+            effect: TurnkeyPolicyEffect::Deny,
+            consensus: None,
+            condition: Some("eth.tx.data[2..10] == 'e8017952'".to_string()),
+        });
+
+        let error = verify_corridor_ends(
+            &BTreeSet::from([ROBINHOOD_RELAY]),
+            &corridor_chains(),
+            &snapshot(policies),
+            WALLET,
+        )
+        .unwrap_err();
+        let ChainCoverageError::MissingCorridorCoverage(missing) = error else {
+            panic!("expected missing corridor coverage, got {error:?}");
+        };
+
+        assert_eq!(
+            missing
+                .missing
+                .iter()
+                .map(|call| (call.chain, call.function))
+                .collect::<Vec<_>>(),
+            vec![
+                (Chain::Robinhood, "depositErc20"),
+                (Chain::Ethereum, "depositErc20"),
+            ]
+        );
+    }
+
+    /// Base via CCTP signs on Base and on Ethereum: a policy pinned to
+    /// Base's chain id leaves the Ethereum end's calls uncovered, and one
+    /// more pinned to Ethereum's covers all nine.
+    #[test]
+    fn cctp_corridor_ends_are_checked_on_their_own_chain_ids() {
+        let corridors = BTreeSet::from([UsdcCorridor::BASE_CCTP]);
+        let on_chain = |chain_id: u64| {
+            tag_allow(&format!(
+                "activity.type == 'ACTIVITY_TYPE_SIGN_TRANSACTION_V2' && \
+                 eth.tx.chain_id == {chain_id}"
+            ))
+        };
+
+        let error = verify_corridor_ends(
+            &corridors,
+            &corridor_chains(),
+            &snapshot(vec![on_chain(8453)]),
+            WALLET,
+        )
+        .unwrap_err();
+        let ChainCoverageError::MissingCorridorCoverage(missing) = error else {
+            panic!("expected missing corridor coverage, got {error:?}");
+        };
+
+        assert_eq!(missing.corridor, UsdcCorridor::BASE_CCTP);
+        assert_eq!(
+            missing
+                .missing
+                .iter()
+                .map(|call| (call.chain, call.function))
+                .collect::<Vec<_>>(),
+            vec![
+                (Chain::Ethereum, "approve"),
+                (Chain::Ethereum, "depositForBurn"),
+                (Chain::Ethereum, "receiveMessage"),
+                (Chain::Ethereum, "transfer"),
+            ]
+        );
+        assert_eq!(
+            verify_corridor_ends(
+                &corridors,
+                &corridor_chains(),
+                &snapshot(vec![on_chain(8453), on_chain(1)]),
+                WALLET,
+            )
+            .unwrap(),
+            9
+        );
+    }
+
+    /// The vault calls go to the chain's deposit spender, so in managed mode
+    /// a policy for the orderbook does not cover them.
+    #[test]
+    fn corridor_vault_calls_follow_the_inventory_spender() {
+        let inventory = address!("0x4444444444444444444444444444444444444444");
+        let hedged = [chain_inputs(
+            Chain::Base,
+            ChainRole::Primary,
+            InventoryMode::Managed { inventory },
+        )];
+        let hop = UsdcCorridor::BASE_CCTP.hop_calls().unwrap();
+        let (messenger, transmitter) = (hop[1].to, hop[2].to);
+        let policies = snapshot(vec![
+            tag_allow("eth.tx.chain_id == 1"),
+            tag_allow(&format!(
+                "eth.tx.chain_id == 8453 && \
+                 eth.tx.to in ['{USDC_BASE:#x}', '{messenger:#x}', '{transmitter:#x}', \
+                               '0x3333333333333333333333333333333333333333']"
+            )),
+        ]);
+
+        let error = verify_corridor_ends(
+            &BTreeSet::from([UsdcCorridor::BASE_CCTP]),
+            &hedged,
+            &policies,
+            WALLET,
+        )
+        .unwrap_err();
+        let ChainCoverageError::MissingCorridorCoverage(missing) = error else {
+            panic!("expected missing corridor coverage, got {error:?}");
+        };
+
+        assert_eq!(
+            missing
+                .missing
+                .iter()
+                .map(|call| (call.to, call.function))
+                .collect::<Vec<_>>(),
+            vec![(inventory, "withdraw4"), (inventory, "deposit4")]
+        );
+    }
+
+    #[test]
+    fn corridor_on_a_chain_that_is_not_hedged_is_refused() {
+        let error = verify_corridor_ends(
+            &BTreeSet::from([ROBINHOOD_RELAY]),
+            &[chain_inputs(
+                Chain::Base,
+                ChainRole::Primary,
+                InventoryMode::Legacy,
+            )],
+            &snapshot(vec![tag_allow("eth.tx.chain_id == 1")]),
+            WALLET,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ChainCoverageError::CorridorChainNotHedged {
+                corridor: ROBINHOOD_RELAY
+            }
+        ));
+    }
+
+    /// `depositForBurn`'s first word is the amount, `receiveMessage`'s an
+    /// offset and the Alpaca `transfer`'s a recipient only a run knows, so a
+    /// deny on that word may apply to them and refuses them. The approves and
+    /// vault calls name a known address there, so the deny provably misses.
+    #[test]
+    fn deny_on_an_unknown_first_word_fails_closed() {
+        let policies = snapshot(vec![
+            tag_allow("eth.tx.chain_id == 8453"),
+            tag_allow("eth.tx.chain_id == 1"),
+            TurnkeyPolicy {
+                effect: TurnkeyPolicyEffect::Deny,
+                consensus: None,
+                condition: Some(
+                    "eth.tx.data[34..74] == '9999999999999999999999999999999999999999'".to_string(),
+                ),
+            },
+        ]);
+
+        let error = verify_corridor_ends(
+            &BTreeSet::from([UsdcCorridor::BASE_CCTP]),
+            &corridor_chains(),
+            &policies,
+            WALLET,
+        )
+        .unwrap_err();
+        let ChainCoverageError::MissingCorridorCoverage(missing) = error else {
+            panic!("expected missing corridor coverage, got {error:?}");
+        };
+
+        assert_eq!(
+            missing
+                .missing
+                .iter()
+                .map(|call| (call.chain, call.function))
+                .collect::<Vec<_>>(),
+            vec![
+                (Chain::Base, "depositForBurn"),
+                (Chain::Base, "receiveMessage"),
+                (Chain::Ethereum, "depositForBurn"),
+                (Chain::Ethereum, "receiveMessage"),
+                (Chain::Ethereum, "transfer"),
+            ]
+        );
+    }
+
+    /// An allow that pins the first word of `depositForBurn` or the Alpaca
+    /// `transfer` cannot be proven to cover them, so they stay missing while
+    /// every other call is covered by its own exact allow.
+    #[test]
+    fn allow_pinning_an_unknown_first_word_fails_closed() {
+        let corridor = UsdcCorridor::BASE_CCTP;
+        let mut calls = corridor.hop_calls().unwrap();
+        calls.extend(cash_leg_calls(corridor, &corridor_chains()).unwrap());
+        let policies = calls
+            .iter()
+            .map(|call| {
+                let pin = match call.function {
+                    "depositForBurn" => format!(" && eth.tx.data[34..74] == '{WALLET:x}'"),
+                    "transfer" => format!(" && eth.tx.data[34..74] in ['{WALLET:x}']"),
+                    _ => String::new(),
+                };
+
+                tag_allow(&format!(
+                    "eth.tx.chain_id == {} && eth.tx.to == '{:#x}' && \
+                     eth.tx.data[0..10] == '{:#x}'{pin}",
+                    call.chain.chain_id(),
+                    call.to,
+                    call.selector,
+                ))
+            })
+            .collect();
+
+        let error = verify_corridor_ends(
+            &BTreeSet::from([corridor]),
+            &corridor_chains(),
+            &snapshot(policies),
+            WALLET,
+        )
+        .unwrap_err();
+        let ChainCoverageError::MissingCorridorCoverage(missing) = error else {
+            panic!("expected missing corridor coverage, got {error:?}");
+        };
+
+        assert_eq!(
+            missing
+                .missing
+                .iter()
+                .map(|call| (call.chain, call.function))
+                .collect::<Vec<_>>(),
+            vec![
+                (Chain::Base, "depositForBurn"),
+                (Chain::Ethereum, "depositForBurn"),
+                (Chain::Ethereum, "transfer"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_reload_with_an_added_corridor_queries_turnkey() {
+        let running = st0x_config::TurnkeyApprovalPolicyInputs {
+            organization_id: st0x_evm::turnkey::TurnkeyOrganizationId::try_new(
+                "00000000-0000-4000-8000-000000000001".into(),
+            )
+            .unwrap(),
+            kms_api_key: None,
+            api_private_key: None,
+            wallet_address: Address::ZERO,
+            hedged: vec![chain_inputs(
+                Chain::Base,
+                ChainRole::Primary,
+                InventoryMode::Legacy,
+            )],
+            corridors: BTreeSet::from([UsdcCorridor::BASE_CCTP]),
+        };
+        let mut candidate = running.clone();
+        candidate.corridors.insert(ROBINHOOD_RELAY);
+
+        let error = verify_registry_approval_inputs(Some(running), Some(candidate))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ApprovalPolicyVerificationError::Turnkey(TurnkeyPolicyError::MissingCredentials)
+        ));
     }
 }

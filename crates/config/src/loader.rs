@@ -17,6 +17,8 @@ use std::sync::LazyLock;
 use tracing::{Level, info, warn};
 use url::Url;
 
+#[cfg(feature = "wallet-turnkey")]
+use st0x_bridge::corridor::UsdcCorridor;
 use st0x_evm::Chain;
 #[cfg(any(test, feature = "test-support"))]
 use st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS;
@@ -221,9 +223,11 @@ pub struct ChainApprovalInputs {
     pub assets: crate::ChainAssets,
 }
 
-/// Validated, network-free inputs required by the deploy-time Turnkey approval
-/// policy coverage check: one approval surface per hedged chain, since
-/// startup grants approvals on every one of them.
+/// Validated, network-free inputs for the deploy-time Turnkey policy check.
+///
+/// One approval surface per hedged chain, since startup grants approvals on
+/// every one of them, and every served cash corridor, since it signs on both
+/// of its ends.
 #[cfg(feature = "wallet-turnkey")]
 #[derive(Clone, Debug)]
 pub struct TurnkeyApprovalPolicyInputs {
@@ -232,6 +236,7 @@ pub struct TurnkeyApprovalPolicyInputs {
     pub api_private_key: Option<st0x_evm::turnkey::TurnkeyApiPrivateKey>,
     pub wallet_address: Address,
     pub hedged: Vec<ChainApprovalInputs>,
+    pub corridors: BTreeSet<UsdcCorridor>,
 }
 
 /// Non-secret settings deserialized from the plaintext config TOML.
@@ -2945,6 +2950,7 @@ impl Ctx {
                     assets: hedged.assets.clone(),
                 })
                 .collect(),
+            corridors: parts.rebalancing.usdc.served().clone(),
         }))
     }
 
@@ -12420,6 +12426,10 @@ mod tests {
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
 
+            [chains.base.trading.assets.cash]
+            vault_id = "0xfab"
+            rebalancing = "disabled"
+
             [pricing]
             ws_url = "wss://pricing.test/ws"
 
@@ -12562,6 +12572,11 @@ mod tests {
             inputs.hedged[0]
                 .assets
                 .is_trading_enabled(&Symbol::new("AAPL").unwrap())
+        );
+        assert_eq!(
+            inputs.corridors,
+            BTreeSet::from([UsdcCorridor::BASE_CCTP]),
+            "Base's cash vault is served via CCTP, so the gate must check its hop"
         );
         assert!(inputs.kms_api_key.is_none());
         assert_eq!(format!("{:?}", inputs.api_private_key), "Some([REDACTED])");
@@ -13678,6 +13693,57 @@ mod tests {
                 })
             ),
             "got {error:?}"
+        );
+    }
+
+    /// The deploy gate checks a corridor only if the loader serves it, so a
+    /// configured Relay corridor must reach the gate inputs next to Base's
+    /// CCTP one, with its chain hedged for the gate's vault calls.
+    #[cfg(feature = "wallet-turnkey")]
+    #[test]
+    fn load_turnkey_approval_policy_inputs_carry_a_configured_relay_corridor() {
+        let mut config = robinhood_relay_corridor_config();
+        config["wallet"] = toml::from_str(
+            r#"
+            kind = "turnkey"
+            address = "0x6666666666666666666666666666666666666666"
+            organization_id = "00000000-0000-4000-8000-000000000001"
+            "#,
+        )
+        .unwrap();
+        let mut secrets: toml::Table =
+            toml::from_str(include_str!("../../../example.secrets.toml")).unwrap();
+        secrets["wallet"] = toml::from_str(
+            r#"api_private_key = "0000000000000000000000000000000000000000000000000000000000000001""#,
+        )
+        .unwrap();
+
+        let inputs = Ctx::turnkey_approval_inputs_from_text(
+            &config.to_string(),
+            Path::new("config.toml"),
+            TokenFile::Skipped,
+            &secrets.to_string(),
+            Path::new("secrets.toml"),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            inputs.corridors,
+            BTreeSet::from([
+                UsdcCorridor::BASE_CCTP,
+                UsdcCorridor::HubRouted {
+                    chain: Chain::Robinhood,
+                    hop: HopKind::Relay,
+                },
+            ])
+        );
+        assert!(
+            inputs
+                .hedged
+                .iter()
+                .any(|hedged| hedged.chain == Chain::Robinhood),
+            "the gate refuses a corridor whose chain is not hedged"
         );
     }
 
