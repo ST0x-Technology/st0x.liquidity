@@ -7588,7 +7588,9 @@ transfer dispatch. It does not calculate cross-venue inventory imbalances.
     balance: they come from aggregate events, and no poll would restore them. A
     forced broker snapshot applied by that recovery sets the symbol's Hedging
     available to the broker reading and keeps the mint's Hedging inflight, so
-    the mint's own `TokensReceived` still finds it to subtract
+    the mint's own `TokensReceived` still finds it to subtract. Because that
+    reading may already count the mint's shares, a kept non-zero inflight also
+    requests an offchain equity reconcile, which applies after the mint ends
   - **Ownership**: determined by active rebalancing aggregate IDs --
     `issuer_request_id` / `tokenization_request_id` for mints,
     `tokenization_request_id` / `redemption_tx` for redemptions -- not by

@@ -4390,9 +4390,39 @@ impl RebalancingService {
             }
         }?;
 
+        // The forced write kept these symbols' mint inflight, but the broker
+        // reading may already count those shares (a provider rejection that
+        // returned them, or a read from before `MintAccepted`). The mint's
+        // terminal event then settles cleanly and nothing would correct the
+        // double count, so request a reconcile, which waits for the mint.
+        let kept_mint_inflight_symbols = match &event {
+            OffchainEquity { positions, .. } => positions
+                .keys()
+                .filter(|symbol| {
+                    !updated.has_pending_offchain_order(symbol)
+                        && updated.active_mint(symbol).is_some()
+                })
+                .filter_map(|symbol| {
+                    let inflight = updated.equity_inflight(symbol, Venue::Hedging)?;
+                    Some(
+                        inflight
+                            .is_zero()
+                            .map(|is_zero| (!is_zero).then(|| symbol.clone())),
+                    )
+                })
+                .flatten_ok()
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => Vec::new(),
+        };
+
         *inventory = updated;
         drop(inventory);
         drop(suppression_guard);
+
+        for symbol in &kept_mint_inflight_symbols {
+            self.divergence_gate
+                .request_offchain_equity_reconcile(symbol);
+        }
 
         debug!(target: "rebalance", "Force-applied inventory snapshot after recovery");
 
@@ -39583,6 +39613,11 @@ mod tests {
             Some(shares(48)),
             "The forced broker write must still correct Hedging available"
         );
+        assert_eq!(
+            trigger.divergence_gate.pending_offchain_equity_reconciles(),
+            vec![symbol.clone()],
+            "A kept mint inflight must request a reconcile for a reading that may count it"
+        );
 
         harness
             .receive::<TokenizedEquityMint>(id.clone(), make_tokens_received())
@@ -39596,18 +39631,12 @@ mod tests {
             "TokensReceived must release the mint's Hedging inflight"
         );
         // The reset leaves the vault slot uninitialized until the next vault
-        // read, so the credit lands on zero.
+        // read, so the credit lands on zero. A deferred settlement would skip
+        // this credit.
         assert_eq!(
             inventory.onchain_equity_available_at(&symbol, Chain::Base),
             Some(shares(30)),
-            "TokensReceived must credit the minted shares to MarketMaking"
-        );
-        drop(inventory);
-        assert_eq!(
-            trigger.divergence_gate.pending_offchain_equity_reconciles(),
-            Vec::<Symbol>::new(),
-            "A mint whose inflight survived recovery must settle without deferring to a \
-             forced reconcile"
+            "TokensReceived must complete the kept inflight instead of deferring"
         );
     }
 
