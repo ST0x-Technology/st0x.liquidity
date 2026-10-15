@@ -577,6 +577,7 @@ pub async fn poll_for_done_job_referencing(
             continue;
         };
 
+        // A substring match: the job's full type name is crate-private.
         let done: Result<Vec<(Vec<u8>,)>, _> =
             sqlx::query_as("SELECT job FROM Jobs WHERE job_type LIKE ? AND status = 'Done'")
                 .bind(format!("%{job_type}%"))

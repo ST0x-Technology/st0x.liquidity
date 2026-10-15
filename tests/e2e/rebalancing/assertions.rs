@@ -65,6 +65,22 @@ pub(crate) fn test_alerts() -> st0x_config::AlertsCtx {
     )
 }
 
+/// The bot's Alpaca config against `broker`, with the mock's credentials.
+pub(crate) fn test_broker_ctx(broker: &AlpacaBrokerMock) -> BrokerCtx {
+    BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
+        auth: st0x_execution::AlpacaBrokerAuth::Basic {
+            api_key: TEST_API_KEY.to_owned(),
+            api_secret: TEST_API_SECRET.to_owned(),
+        },
+        account_id: AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b")),
+        mode: Some(AlpacaBrokerApiMode::Mock(broker.base_url())),
+        asset_cache_ttl: Duration::from_secs(3600),
+        time_in_force: TimeInForce::Day,
+        counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+        hedge_floor: st0x_execution::HedgeFloor::default(),
+    })
+}
+
 /// The hedging table the e2e Ctx builder needs alongside a chain listing:
 /// every listed symbol gets a policy, plus the broker-side cash reserve.
 fn hedging_with_reserve(
@@ -133,19 +149,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
     /// vault-direct minting, which needs no orchestrator address.
     orchestrator: Option<st0x_config::OrchestratorConfig>,
 ) -> anyhow::Result<Ctx> {
-    let alpaca_auth = AlpacaBrokerApiCtx {
-        auth: st0x_execution::AlpacaBrokerAuth::Basic {
-            api_key: TEST_API_KEY.to_owned(),
-            api_secret: TEST_API_SECRET.to_owned(),
-        },
-        account_id: AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b")),
-        mode: Some(AlpacaBrokerApiMode::Mock(broker.base_url())),
-        asset_cache_ttl: Duration::from_secs(3600),
-        time_in_force: TimeInForce::Day,
-        counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
-        hedge_floor: st0x_execution::HedgeFloor::default(),
-    };
-    let broker_ctx = BrokerCtx::AlpacaBrokerApi(alpaca_auth);
+    let broker_ctx = test_broker_ctx(broker);
 
     let equities: HashMap<Symbol, ChainEquityAsset> = equity_tokens
         .iter()
@@ -237,19 +241,7 @@ pub(crate) fn build_usdc_rebalancing_ctx<BP>(
 where
     BP: Provider + Clone,
 {
-    let alpaca_auth = AlpacaBrokerApiCtx {
-        auth: st0x_execution::AlpacaBrokerAuth::Basic {
-            api_key: TEST_API_KEY.to_owned(),
-            api_secret: TEST_API_SECRET.to_owned(),
-        },
-        account_id: AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b")),
-        mode: Some(AlpacaBrokerApiMode::Mock(broker.base_url())),
-        asset_cache_ttl: Duration::from_secs(3600),
-        time_in_force: TimeInForce::Day,
-        counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
-        hedge_floor: st0x_execution::HedgeFloor::default(),
-    };
-    let broker_ctx = BrokerCtx::AlpacaBrokerApi(alpaca_auth);
+    let broker_ctx = test_broker_ctx(broker);
 
     let equities: HashMap<Symbol, ChainEquityAsset> = equity_tokens
         .iter()

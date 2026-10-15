@@ -25,7 +25,9 @@ use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-use st0x_bridge::relay::{BasisPoints, QuoteRequest, deploy_relay_end, quote_body_for_test};
+use st0x_bridge::relay::{
+    BasisPoints, QuoteRequest, RelayEndContracts, deploy_relay_end, quote_body_for_test,
+};
 use st0x_evm::{Chain, IERC20};
 use st0x_hedge::bindings::{IRaindexV6, RaindexV6};
 
@@ -45,6 +47,9 @@ pub const RELAY_FEE_BPS: u64 = 5;
 pub fn relay_fill_amount(deposit: U256) -> U256 {
     deposit - deposit * U256::from(RELAY_FEE_BPS) / U256::from(10_000)
 }
+
+/// The API key the bot sends and the mock requires on every request.
+pub const RELAY_API_KEY: &str = "e2e-relay-key";
 
 /// Anvil key of the solver, whose stable a fill pays out.
 const SOLVER_KEY: usize = 5;
@@ -78,12 +83,20 @@ impl RobinhoodChain {
             .arg("--slots-in-an-epoch")
             .arg("1")
             .spawn();
-        let provider = signing_provider(&anvil, 0);
+        let provider = key_provider(
+            &B256::from_slice(&anvil.keys()[0].to_bytes()),
+            &anvil.endpoint(),
+        )?;
         let owner = anvil.addresses()[0];
 
         let orderbook = *RaindexV6::deploy(&provider).await?.address();
         deploy_tofu_singleton(&provider).await?;
-        etch_relay_end(&provider, Chain::Robinhood, true).await?;
+        let RelayEndContracts { stable, .. } =
+            etch_relay_depository(&provider, Chain::Robinhood).await?;
+        let code = provider.get_code_at(stable).await?;
+        provider
+            .anvil_set_code(Chain::Robinhood.settlement_stable().address, code)
+            .await?;
 
         Ok(Self {
             anvil,
@@ -157,14 +170,13 @@ impl RobinhoodChain {
     }
 }
 
-/// Etches Relay's depository at its pinned address on `chain`, and, with
-/// `stable`, a `MockStable` at the chain's settlement stable. Ethereum keeps
-/// the USDC the CCTP harness etched there.
-async fn etch_relay_end<P: Provider>(
+/// Deploys the Relay stand-ins on `chain` and etches the depository at
+/// Relay's pinned address there. Returns the deployed stand-ins, so a chain
+/// without a stable at its settlement address can etch the stable too.
+async fn etch_relay_depository<P: Provider>(
     provider: &P,
     chain: Chain,
-    stable: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<RelayEndContracts> {
     let depository = chain
         .relay_depository()
         .ok_or_else(|| anyhow::anyhow!("{chain} has no Relay depository"))?;
@@ -173,30 +185,44 @@ async fn etch_relay_end<P: Provider>(
     let code = provider.get_code_at(deployed.depository).await?;
     provider.anvil_set_code(depository, code).await?;
 
-    if stable {
-        let code = provider.get_code_at(deployed.stable).await?;
-        provider
-            .anvil_set_code(chain.settlement_stable().address, code)
-            .await?;
-    }
-
-    Ok(())
+    Ok(deployed)
 }
 
-/// One order the mock quoted, keyed by its order id (also its request id).
+/// One order the mock quoted, keyed by its order id.
 #[derive(Clone)]
 struct RelayOrder {
+    user: Address,
+    origin: Chain,
     destination: Chain,
     recipient: Address,
     amount_in: U256,
     amount_out: U256,
-    deposit_tx: Option<TxHash>,
+    deposit: Option<OrderDeposit>,
     fill_tx: Option<TxHash>,
+}
+
+/// The deposit that funded an order, as its depository log names it.
+#[derive(Clone, Copy)]
+struct OrderDeposit {
+    tx: TxHash,
+    amount: U256,
+}
+
+/// One deposit the solver saw, for a test to assert on.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SeenDeposit {
+    /// What the deposit log moved into the depository.
+    pub amount: U256,
+    /// What the quote promised to pay for it.
+    pub amount_out: U256,
+    pub filled: bool,
 }
 
 #[derive(Default)]
 struct RelayState {
     orders: HashMap<B256, RelayOrder>,
+    /// Relay's `requestId`, the status API's handle, to the order id.
+    request_ids: HashMap<B256, B256>,
     quotes_served: usize,
     fills_held: bool,
 }
@@ -229,7 +255,7 @@ pub struct RelayMock {
 impl RelayMock {
     /// Etches Relay's depository on the Ethereum chain at
     /// `ethereum_endpoint`, then starts the API and the solver over it and
-    /// `robinhood`.
+    /// `robinhood`. Ethereum keeps the USDC the CCTP harness etched there.
     pub async fn start(
         robinhood: &RobinhoodChain,
         ethereum_endpoint: String,
@@ -240,10 +266,9 @@ impl RelayMock {
             relayer: dev_key(RELAYER_KEY),
             minter: dev_key(MINTER_KEY),
         };
-        etch_relay_end(
+        etch_relay_depository(
             &key_provider(&keys.minter, &ethereum_endpoint)?,
             Chain::Ethereum,
-            false,
         )
         .await?;
 
@@ -252,7 +277,9 @@ impl RelayMock {
 
         let quote_state = Arc::clone(&state);
         server.mock(|when, then| {
-            when.method(POST).path("/quote/v2");
+            when.method(POST)
+                .path("/quote/v2")
+                .header("x-api-key", RELAY_API_KEY);
             then.respond_with(move |request: &HttpMockRequest| {
                 match quote_response(&quote_state, request.body().as_ref()) {
                     Ok(body) => json_response(200, &body),
@@ -266,7 +293,9 @@ impl RelayMock {
 
         let status_state = Arc::clone(&state);
         server.mock(|when, then| {
-            when.method(GET).path("/intents/status/v3");
+            when.method(GET)
+                .path("/intents/status/v3")
+                .header("x-api-key", RELAY_API_KEY);
             then.respond_with(move |request: &HttpMockRequest| {
                 let request_id = request
                     .uri()
@@ -282,7 +311,7 @@ impl RelayMock {
         let solver = tokio::spawn(run_solver(
             Arc::clone(&state),
             keys,
-            [
+            vec![
                 SolverChain {
                     chain: Chain::Robinhood,
                     endpoint: robinhood.endpoint(),
@@ -319,13 +348,18 @@ impl RelayMock {
         lock(&self.state).quotes_served
     }
 
-    /// Every deposit the solver saw, as `(amount_in, amount_out, filled)`.
-    pub fn deposits(&self) -> Vec<(U256, U256, bool)> {
+    /// Every deposit the solver matched to a quoted order.
+    pub fn deposits(&self) -> Vec<SeenDeposit> {
         lock(&self.state)
             .orders
             .values()
-            .filter(|order| order.deposit_tx.is_some())
-            .map(|order| (order.amount_in, order.amount_out, order.fill_tx.is_some()))
+            .filter_map(|order| {
+                Some(SeenDeposit {
+                    amount: order.deposit?.amount,
+                    amount_out: order.amount_out,
+                    filled: order.fill_tx.is_some(),
+                })
+            })
             .collect()
     }
 }
@@ -351,13 +385,6 @@ fn json_response(status: u16, body: &Value) -> HttpMockResponse {
     }
 }
 
-fn chain_by_id(chain_id: u64) -> anyhow::Result<Chain> {
-    Chain::ALL
-        .into_iter()
-        .find(|chain| chain.chain_id() == chain_id)
-        .ok_or_else(|| anyhow::anyhow!("no chain has id {chain_id}"))
-}
-
 /// Builds the quote for one `POST /quote/v2` body and records its order.
 fn quote_response(state: &Mutex<RelayState>, body: &[u8]) -> anyhow::Result<Value> {
     let request: Value = serde_json::from_slice(body)?;
@@ -370,7 +397,10 @@ fn quote_response(state: &Mutex<RelayState>, body: &[u8]) -> anyhow::Result<Valu
         let id = field(name)?
             .as_u64()
             .ok_or_else(|| anyhow::anyhow!("{name} is not a number"))?;
-        chain_by_id(id)
+        Chain::ALL
+            .into_iter()
+            .find(|chain| chain.chain_id() == id)
+            .ok_or_else(|| anyhow::anyhow!("no chain has id {id}"))
     };
     let address = |name: &str| -> anyhow::Result<Address> {
         Ok(serde_json::from_value(field(name)?.clone())?)
@@ -400,18 +430,22 @@ fn quote_response(state: &Mutex<RelayState>, body: &[u8]) -> anyhow::Result<Valu
 
     let mut quote = quote_body_for_test(&quote_request, amount_out, amount_out)?;
     let order_id: B256 = serde_json::from_value(quote["protocol"]["v2"]["orderId"].clone())?;
-    // One request id per order, so each status read names its own order.
-    quote["requestId"] = json!(order_id);
+    // Relay's request id is its own handle, distinct from the order id.
+    let request_id = B256::random();
+    quote["requestId"] = json!(request_id);
 
     {
         let mut state = lock(state);
         state.quotes_served += 1;
+        state.request_ids.insert(request_id, order_id);
         state.orders.entry(order_id).or_insert(RelayOrder {
+            user: quote_request.user,
+            origin: quote_request.origin,
             destination: quote_request.destination,
             recipient: quote_request.recipient,
             amount_in: quote_request.amount,
             amount_out,
-            deposit_tx: None,
+            deposit: None,
             fill_tx: None,
         });
     }
@@ -421,11 +455,14 @@ fn quote_response(state: &Mutex<RelayState>, body: &[u8]) -> anyhow::Result<Valu
 }
 
 fn status_body(state: &RelayState, request_id: Option<B256>) -> Value {
-    let Some(order) = request_id.and_then(|id| state.orders.get(&id)) else {
+    let Some(order) = request_id
+        .and_then(|id| state.request_ids.get(&id))
+        .and_then(|order_id| state.orders.get(order_id))
+    else {
         return json!({"status": "waiting"});
     };
 
-    match (order.deposit_tx, order.fill_tx) {
+    match (order.deposit.map(|deposit| deposit.tx), order.fill_tx) {
         (Some(deposit), Some(fill)) => {
             json!({"status": "success", "inTxHashes": [deposit], "txHashes": [fill]})
         }
@@ -438,11 +475,7 @@ fn status_body(state: &RelayState, request_id: Option<B256>) -> Value {
 
 /// Scans both depositories for deposits of quoted orders and fills each
 /// one on its destination chain, unless fills are held.
-async fn run_solver<const CHAINS: usize>(
-    state: Arc<Mutex<RelayState>>,
-    keys: SolverKeys,
-    chains: [SolverChain; CHAINS],
-) {
+async fn run_solver(state: Arc<Mutex<RelayState>>, keys: SolverKeys, chains: Vec<SolverChain>) {
     let mut scanned: HashMap<Chain, u64> = HashMap::new();
 
     loop {
@@ -487,28 +520,46 @@ async fn scan_deposits(
         )
         .await?;
 
-    let deposits: Vec<(B256, Option<TxHash>)> = logs
+    let deposits: Vec<(RelayErc20Deposit, TxHash)> = logs
         .iter()
         .filter_map(|log| {
             let deposit = RelayErc20Deposit::decode_log_data(log.data()).ok()?;
-            Some((deposit.id, log.transaction_hash))
+            Some((deposit, log.transaction_hash?))
         })
         .collect();
-    record_deposits(&mut lock(state), deposits);
+    record_deposits(&mut lock(state), solver_chain.chain, deposits);
     scanned.insert(solver_chain.chain, head);
 
     Ok(())
 }
 
-/// Marks each quoted order a deposit pays as deposited, first deposit wins.
-fn record_deposits(state: &mut RelayState, deposits: Vec<(B256, Option<TxHash>)>) {
-    for (order_id, deposit_tx) in deposits {
+/// Marks each quoted order a deposit on `chain` funds as deposited, first
+/// deposit wins. As Relay does, a deposit funds its order only from the
+/// quote's user, in the origin stable, for the quoted amount.
+fn record_deposits(
+    state: &mut RelayState,
+    chain: Chain,
+    deposits: Vec<(RelayErc20Deposit, TxHash)>,
+) {
+    for (deposit, tx) in deposits {
+        let order_id = deposit.id;
         let Some(order) = state.orders.get_mut(&order_id) else {
             warn!(%order_id, "Relay mock saw a deposit it never quoted");
             continue;
         };
-        if order.deposit_tx.is_none() {
-            order.deposit_tx = deposit_tx;
+        let funds_order = order.origin == chain
+            && deposit.from == order.user
+            && deposit.token == chain.settlement_stable().address
+            && deposit.amount == order.amount_in;
+        if !funds_order {
+            warn!(%order_id, amount = %deposit.amount, "Relay mock saw a deposit that does not fund its order");
+            continue;
+        }
+        if order.deposit.is_none() {
+            order.deposit = Some(OrderDeposit {
+                tx,
+                amount: deposit.amount,
+            });
             debug!(%order_id, "Relay mock saw a deposit");
         }
     }
@@ -527,7 +578,7 @@ async fn fill_deposits(
         state
             .orders
             .iter()
-            .filter(|(_, order)| order.deposit_tx.is_some() && order.fill_tx.is_none())
+            .filter(|(_, order)| order.deposit.is_some() && order.fill_tx.is_none())
             .map(|(id, order)| (*id, order.clone()))
             .collect()
     };
@@ -618,14 +669,4 @@ fn key_provider(key: &B256, endpoint: &str) -> anyhow::Result<DynProvider> {
         .wallet(EthereumWallet::from(PrivateKeySigner::from_bytes(key)?))
         .connect_http(endpoint.parse()?)
         .erased())
-}
-
-fn signing_provider(anvil: &AnvilInstance, key: usize) -> DynProvider {
-    let signer = PrivateKeySigner::from_bytes(&B256::from_slice(&anvil.keys()[key].to_bytes()))
-        .unwrap_or_else(|_| unreachable!("Anvil keys are valid"));
-
-    ProviderBuilder::new()
-        .wallet(EthereumWallet::from(signer))
-        .connect_http(anvil.endpoint_url())
-        .erased()
 }

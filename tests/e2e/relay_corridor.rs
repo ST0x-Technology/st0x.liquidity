@@ -20,15 +20,14 @@ use tokio::task::JoinHandle;
 use st0x_bridge::corridor::{HopKind, UsdcCorridor};
 use st0x_bridge::relay::RelayApiKey;
 use st0x_config::{
-    AlertsCtx, BrokerCtx, ChainCtx, Ctx, HedgedChain, InventoryMode, RelayHopCtx, UsdcCorridorCtx,
-    UsdcCorridors,
+    AlertsCtx, ChainCtx, Ctx, HedgedChain, InventoryMode, OnchainWalletCtx, RelayHopCtx,
+    UsdcCorridorCtx, UsdcCorridors, test_issuance_status_ctx,
 };
 use st0x_evm::{Chain, IERC20, Wallet};
-use st0x_execution::alpaca_broker_api::{TEST_API_KEY, TEST_API_SECRET};
-use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
 use st0x_finance::Usdc;
 use st0x_hedge::{
-    AllocationCtx, ChainAssets, ChainCashAsset, ImbalanceThreshold, OperationMode, RebalancingCtx,
+    AllocationCtx, BotGasValuationConfig, ChainAssets, ChainCashAsset, ChainEquities,
+    ImbalanceThreshold, OperationMode, RebalancingCtx,
 };
 
 use crate::assert::{StoredEvent, assert_event_subsequence, assert_single_clean_aggregate};
@@ -37,8 +36,8 @@ use crate::poll::{
     connect_db, fetch_events_by_type, poll_for_done_job_referencing, poll_for_events_with_timeout,
     spawn_bot,
 };
-use crate::rebalancing::assertions::test_wallet;
-use crate::relay::{RelayMock, RobinhoodChain, relay_fill_amount};
+use crate::rebalancing::assertions::{test_broker_ctx, test_wallet};
+use crate::relay::{RELAY_API_KEY, RelayMock, RobinhoodChain, SeenDeposit, relay_fill_amount};
 use crate::test_infra::TestInfra;
 
 const ROBINHOOD_RELAY: UsdcCorridor = UsdcCorridor::HubRouted {
@@ -60,6 +59,11 @@ const FAILURE_EVENTS: &[&str] = &[
     "SwapDepositReverted",
     "SwapEscrowUnresolved",
     "RedepositStarted",
+    "SwapRequoted",
+    "ReturnedToSource",
+    "BridgingCompletionRecovered",
+    "DepositCompletionRecovered",
+    "OperatorReconciled",
 ];
 
 /// The chain-to-Alpaca transfer's events, in order.
@@ -85,6 +89,9 @@ struct RelayCorridor<P> {
     robinhood: RobinhoodChain,
     relay: RelayMock,
     usdg_vault: B256,
+    /// Pinned at setup, so a restarted bot boots with the same config.
+    base_deployment_block: u64,
+    robinhood_deployment_block: u64,
     _alpaca_deposit_watcher: JoinHandle<()>,
 }
 
@@ -129,7 +136,12 @@ impl RelayCorridor<()> {
             .start_deposit_watcher(ethereum, USDC_ETHEREUM, robinhood.owner)
             .await?;
 
+        let base_deployment_block = infra.base_chain.provider.get_block_number().await?;
+        let robinhood_deployment_block = robinhood.provider.get_block_number().await?;
+
         Ok(RelayCorridor {
+            base_deployment_block,
+            robinhood_deployment_block,
             infra,
             cctp,
             robinhood,
@@ -143,7 +155,7 @@ impl RelayCorridor<()> {
 impl<P: Provider + Clone> RelayCorridor<P> {
     /// The bot's config: hedging on Base, and the Robinhood Relay corridor
     /// as the only active cash corridor, balanced at 50% within 10%.
-    async fn ctx(&self) -> anyhow::Result<Ctx> {
+    fn ctx(&self) -> anyhow::Result<Ctx> {
         let base = &self.infra.base_chain;
         let ethereum_endpoint = &self.cctp.ethereum_endpoint;
         let wallet = |endpoint: &str| -> anyhow::Result<Arc<dyn Wallet<Provider = RootProvider>>> {
@@ -186,17 +198,17 @@ impl<P: Provider + Clone> RelayCorridor<P> {
                 max_deposit_revert_redrives: 5,
             },
         )
-        .with_relay_api_key(RelayApiKey::from("e2e-relay-key".to_owned()));
+        .with_relay_api_key(RelayApiKey::from(RELAY_API_KEY.to_owned()));
 
         let mut ctx = Ctx::for_test()
             .database_url(self.infra.db_path.display().to_string())
             .rpc_url(base.endpoint().parse()?)
             .orderbook(base.orderbook)
-            .deployment_block(base.provider.get_block_number().await?)
-            .broker(alpaca_broker_ctx(&self.infra))
+            .deployment_block(self.base_deployment_block)
+            .broker(test_broker_ctx(&self.infra.broker_service))
             .rebalancing(Box::new(rebalancing))
             .order_owner(base.owner)
-            .wallet(st0x_config::OnchainWalletCtx::from_wallets(
+            .wallet(OnchainWalletCtx::from_wallets(
                 wallet(&base.endpoint())?,
                 ethereum_wallet.clone(),
                 ethereum_wallet,
@@ -204,11 +216,11 @@ impl<P: Provider + Clone> RelayCorridor<P> {
             ))
             .assets(self.infra.assets_config())
             .inventory_poll_interval_secs(2)
-            .issuance(st0x_config::test_issuance_status_ctx(
+            .issuance(test_issuance_status_ctx(
                 self.infra.issuance_base_url.clone(),
             ))
             .redemption_wallet(Address::random())
-            .bot_gas_valuation(st0x_hedge::BotGasValuationConfig {
+            .bot_gas_valuation(BotGasValuationConfig {
                 chainlink_feed: base.mock_chainlink_feed,
             })
             .alerts(AlertsCtx::for_test(
@@ -230,9 +242,9 @@ impl<P: Provider + Clone> RelayCorridor<P> {
                 .orderbook(self.robinhood.orderbook)
                 .inventory(InventoryMode::Legacy)
                 .vault_owner(self.robinhood.owner)
-                .deployment_block(self.robinhood.provider.get_block_number().await?)
+                .deployment_block(self.robinhood_deployment_block)
                 .assets(ChainAssets {
-                    equities: st0x_hedge::ChainEquities {
+                    equities: ChainEquities {
                         symbols: HashMap::new(),
                         operational_limit: None,
                     },
@@ -285,7 +297,11 @@ impl<P: Provider + Clone> RelayCorridor<P> {
         let amount_in = stable_units(amount_in);
         assert_eq!(
             self.relay.deposits(),
-            vec![(amount_in, relay_fill_amount(amount_in), true)],
+            vec![SeenDeposit {
+                amount: amount_in,
+                amount_out: relay_fill_amount(amount_in),
+                filled: true,
+            }],
             "Relay should have seen one deposit and filled it",
         );
         assert_eq!(
@@ -302,21 +318,6 @@ impl<P: Provider + Clone> RelayCorridor<P> {
 
         Ok(())
     }
-}
-
-fn alpaca_broker_ctx<P>(infra: &TestInfra<P>) -> BrokerCtx {
-    BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
-        auth: st0x_execution::AlpacaBrokerAuth::Basic {
-            api_key: TEST_API_KEY.to_owned(),
-            api_secret: TEST_API_SECRET.to_owned(),
-        },
-        account_id: AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b")),
-        mode: Some(AlpacaBrokerApiMode::Mock(infra.broker_service.base_url())),
-        asset_cache_ttl: Duration::from_secs(3600),
-        time_in_force: TimeInForce::Day,
-        counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
-        hedge_floor: st0x_execution::HedgeFloor::default(),
-    })
 }
 
 fn single_aggregate_id(events: &[StoredEvent]) -> String {
@@ -338,7 +339,7 @@ fn count_of(events: &[StoredEvent], event_type: &str) -> usize {
 #[test_log::test(tokio::test)]
 async fn relay_corridor_moves_usdg_from_robinhood_to_alpaca() -> anyhow::Result<()> {
     let corridor = RelayCorridor::start("30000", float!(10000)).await?;
-    let mut bot = spawn_bot(corridor.ctx().await?);
+    let mut bot = spawn_bot(corridor.ctx()?);
 
     poll_for_events_with_timeout(
         &mut bot,
@@ -367,7 +368,7 @@ async fn relay_corridor_moves_usdg_from_robinhood_to_alpaca() -> anyhow::Result<
 #[test_log::test(tokio::test)]
 async fn relay_corridor_moves_usdc_from_alpaca_to_robinhood() -> anyhow::Result<()> {
     let corridor = RelayCorridor::start("2000", float!(18000)).await?;
-    let mut bot = spawn_bot(corridor.ctx().await?);
+    let mut bot = spawn_bot(corridor.ctx()?);
 
     poll_for_events_with_timeout(
         &mut bot,
@@ -410,12 +411,12 @@ async fn relay_corridor_moves_usdc_from_alpaca_to_robinhood() -> anyhow::Result<
 /// A bot stopped while Relay holds its USDG deposit resumes the same
 /// transfer on restart: it reads the deposit's status instead of quoting,
 /// withdrawing or depositing again, proves the fill once Relay pays it, and
-/// finishes the transfer through the same job.
+/// finishes the transfer.
 #[test_log::test(tokio::test)]
 async fn interrupted_relay_transfer_resumes_after_restart() -> anyhow::Result<()> {
     let corridor = RelayCorridor::start("30000", float!(10000)).await?;
     corridor.relay.hold_fills();
-    let mut bot = spawn_bot(corridor.ctx().await?);
+    let mut bot = spawn_bot(corridor.ctx()?);
 
     poll_for_events_with_timeout(
         &mut bot,
@@ -441,7 +442,7 @@ async fn interrupted_relay_transfer_resumes_after_restart() -> anyhow::Result<()
     let quotes_before_restart = corridor.relay.quotes_served();
 
     corridor.relay.release_fills();
-    let mut bot = spawn_bot(corridor.ctx().await?);
+    let mut bot = spawn_bot(corridor.ctx()?);
 
     poll_for_events_with_timeout(
         &mut bot,
