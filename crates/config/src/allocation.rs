@@ -333,6 +333,7 @@ mod tests {
         ChainConfig {
             lifecycle,
             required_confirmations: 1,
+            rpc_url: None,
             trading: Some(trading),
         }
     }
@@ -341,6 +342,7 @@ mod tests {
         ChainConfig {
             lifecycle: ChainLifecycle::Active,
             required_confirmations: 1,
+            rpc_url: None,
             trading: None,
         }
     }

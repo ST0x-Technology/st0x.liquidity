@@ -20,6 +20,7 @@ use crate::assets::{ChainAssets, ChainEquityAsset, OperationMode};
 use crate::enablement::{
     ChainEnablementError, ChainLifecycle, check_enablement, first_equity_matching,
 };
+use crate::loader::StartupNotice;
 
 /// Which block tag to use as the fill-ingestion cutoff.
 ///
@@ -228,6 +229,20 @@ pub struct ChainConfig {
     /// every chain. Required on every entry: the bot submits transactions on
     /// transport-only chains too.
     pub required_confirmations: u64,
+    /// HTTP RPC endpoint for this chain. Drives continuous `eth_getLogs` fill
+    /// polling, every read-only contract call, and wallet operations (single
+    /// transport, no WebSocket).
+    ///
+    /// Must be an archive node, or otherwise retain state back to the oldest
+    /// block a read can pin to: the historic block-pinned bot-gas ETH/USD
+    /// valuation call (ADR 0020) fails against a pruned node once the target
+    /// receipt block ages out, surfacing as a typed, logged RPC error rather
+    /// than silently falling back to another block.
+    ///
+    /// `Option` only while the deprecated secrets-file copy
+    /// ([`ChainSecrets::rpc_url`]) is still accepted; [`ChainRegistry::new`]
+    /// refuses a chain with neither.
+    pub rpc_url: Option<Url>,
     /// Present when the bot trades on this chain. Absent for a chain that is
     /// only a cash corridor endpoint, which has no orderbook, no vaults and no
     /// fills to ingest.
@@ -343,18 +358,14 @@ impl TradingConfig {
     }
 }
 
+/// MIGRATION SHIM, removed next release: the secrets-file copy of a chain's RPC endpoint.
+///
+/// The endpoint is config ([`ChainConfig::rpc_url`]), but deployed secret
+/// versions still carry it here, so it is accepted with a warning when the
+/// config table has none and ignored when it has one.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChainSecrets {
-    /// HTTP RPC endpoint for this chain. Drives continuous `eth_getLogs` fill
-    /// polling, every read-only contract call, and wallet operations (single
-    /// transport, no WebSocket).
-    ///
-    /// Must be an archive node, or otherwise retain state back to the oldest
-    /// block a read can pin to: the historic block-pinned bot-gas ETH/USD
-    /// valuation call (ADR 0020) fails against a pruned node once the target
-    /// receipt block ages out, surfacing as a typed, logged RPC error rather
-    /// than silently falling back to another block.
     pub rpc_url: Url,
 }
 
@@ -515,11 +526,10 @@ impl HedgedChain {
 
 /// Every chain the bot is configured to act on.
 ///
-/// Built once at startup from the `[chains.<name>]` config tables paired with
-/// their `[chains.<name>]` secrets entries. A chain described in one file but
-/// not the other is a misconfiguration, not a chain to skip: acting on a chain
-/// with no RPC, or holding an RPC for a chain with no addresses, are both
-/// states where fund routing is undefined.
+/// Built once at startup from the `[chains.<name>]` config tables, each with
+/// its `rpc_url`. A chain with no RPC, or a deprecated secrets-file RPC for a
+/// chain with no enabled table, is a misconfiguration, not a chain to skip:
+/// both are states where fund routing is undefined.
 ///
 /// The primary chain is its own field rather than an entry in a map, so
 /// "exactly one primary" holds by construction instead of being re-checked
@@ -568,10 +578,10 @@ pub enum ChainRegistryError {
         lifecycle: ChainLifecycle,
     },
     #[error(
-        "[chains.{chain}] is configured but the secrets file has no [chains.{chain}] \
-         entry supplying its rpc_url"
+        "[chains.{chain}] has no rpc_url: set it in the config file's [chains.{chain}] \
+         table"
     )]
-    MissingSecrets { chain: Chain },
+    MissingRpcUrl { chain: Chain },
     #[error(
         "the secrets file has a [chains.{chain}] entry but the config file has no enabled \
          [chains.{chain}] table: the table is missing, or its lifecycle is \"disabled\" and \
@@ -760,7 +770,9 @@ impl ChainRole {
 }
 
 impl ChainRegistry {
-    /// Pairs each configured chain with its secrets entry.
+    /// Resolves each enabled chain's RPC endpoint: its config `rpc_url`, or
+    /// else the deprecated secrets-file copy, with a startup notice either
+    /// time the secrets file still carries one.
     ///
     /// Admits any number of hedged chains -- each one drives its own fill
     /// watcher and its own vault polling -- but refuses anything other than
@@ -771,6 +783,7 @@ impl ChainRegistry {
     pub fn new(
         configs: &BTreeMap<Chain, ChainConfig>,
         mut secrets: BTreeMap<Chain, ChainSecrets>,
+        startup_notices: &mut Vec<StartupNotice>,
     ) -> Result<Self, ChainRegistryError> {
         let EnabledChains {
             enabled: configs,
@@ -779,18 +792,34 @@ impl ChainRegistry {
             trading_table,
         } = enabled_chains(configs)?;
 
-        let mut take_rpc_url = |chain: Chain| {
-            secrets
-                .remove(&chain)
-                .ok_or(ChainRegistryError::MissingSecrets { chain })
-                .map(|entry| entry.rpc_url)
+        let mut take_rpc_url = |chain: Chain, config: &ChainConfig| {
+            let from_secrets = secrets.remove(&chain).map(|entry| entry.rpc_url);
+            match (config.rpc_url.clone(), from_secrets) {
+                (Some(rpc_url), Some(_)) => {
+                    startup_notices.push(StartupNotice::warning(format!(
+                        "[chains.{chain}] rpc_url is set in both files; the config file's \
+                         value is used and the deprecated secrets-file copy is ignored -- \
+                         remove it from the secrets file"
+                    )));
+                    Ok(rpc_url)
+                }
+                (Some(rpc_url), None) => Ok(rpc_url),
+                (None, Some(rpc_url)) => {
+                    startup_notices.push(StartupNotice::warning(format!(
+                        "[chains.{chain}] rpc_url in the secrets file is deprecated and moves \
+                         to the config file's [chains.{chain}] table (removed next release)"
+                    )));
+                    Ok(rpc_url)
+                }
+                (None, None) => Err(ChainRegistryError::MissingRpcUrl { chain }),
+            }
         };
 
         let primary = HedgedChain::new(
             primary_chain,
             chain_config,
             trading_table,
-            take_rpc_url(primary_chain)?,
+            take_rpc_url(primary_chain, chain_config)?,
         )?;
 
         let mut secondary = BTreeMap::new();
@@ -804,7 +833,7 @@ impl ChainRegistry {
                 Some(trading) => {
                     secondary.insert(
                         *chain,
-                        HedgedChain::new(*chain, config, trading, take_rpc_url(*chain)?)?,
+                        HedgedChain::new(*chain, config, trading, take_rpc_url(*chain, config)?)?,
                     );
                 }
                 None => {
@@ -812,7 +841,7 @@ impl ChainRegistry {
                         *chain,
                         ChainCtx {
                             chain: *chain,
-                            rpc_url: take_rpc_url(*chain)?,
+                            rpc_url: take_rpc_url(*chain, config)?,
                             required_confirmations: config.required_confirmations,
                         },
                     );
@@ -835,8 +864,8 @@ impl ChainRegistry {
     /// and hands back the primary chain and its table so the caller can keep
     /// validating against them.
     ///
-    /// [`Self::new`] performs these same checks plus the config/secrets
-    /// pairing (each chain's `rpc_url`), which is why the secrets-free
+    /// [`Self::new`] performs these same checks plus resolving each chain's
+    /// `rpc_url` (which may still come from secrets), which is why the secrets-free
     /// `validate-config` path calls this one instead: a chain table that
     /// fails here fails startup too, whatever the secrets file holds.
     pub fn validate_configs(
@@ -1178,6 +1207,7 @@ mod tests {
         ChainConfig {
             lifecycle: ChainLifecycle::Active,
             required_confirmations: 3,
+            rpc_url: None,
             trading: None,
         }
     }
@@ -1384,6 +1414,7 @@ mod tests {
         ChainConfig {
             lifecycle: ChainLifecycle::Active,
             required_confirmations: 3,
+            rpc_url: None,
             trading,
         }
     }
@@ -1410,7 +1441,8 @@ mod tests {
 
     #[test]
     fn registry_rejects_an_empty_config() {
-        let error = ChainRegistry::new(&BTreeMap::new(), BTreeMap::new()).unwrap_err();
+        let error =
+            ChainRegistry::new(&BTreeMap::new(), BTreeMap::new(), &mut Vec::new()).unwrap_err();
 
         assert!(
             matches!(error, ChainRegistryError::NoChains),
@@ -1430,8 +1462,12 @@ mod tests {
             (Chain::Ethereum, ethereum),
         ]);
 
-        let error =
-            ChainRegistry::new(&configs, secrets_for(&[Chain::Base, Chain::Ethereum])).unwrap_err();
+        let error = ChainRegistry::new(
+            &configs,
+            secrets_for(&[Chain::Base, Chain::Ethereum]),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -1456,7 +1492,7 @@ mod tests {
         config.lifecycle = ChainLifecycle::Disabled;
         let configs = BTreeMap::from([(Chain::Base, config)]);
 
-        let error = ChainRegistry::new(&configs, BTreeMap::new()).unwrap_err();
+        let error = ChainRegistry::new(&configs, BTreeMap::new(), &mut Vec::new()).unwrap_err();
 
         assert!(
             matches!(error, ChainRegistryError::NoEnabledChains),
@@ -1468,7 +1504,8 @@ mod tests {
     fn registry_rejects_a_config_with_no_hedged_chain() {
         let configs = BTreeMap::from([(Chain::Ethereum, chain_config(None))]);
 
-        let error = ChainRegistry::new(&configs, secrets_for(&[Chain::Ethereum])).unwrap_err();
+        let error = ChainRegistry::new(&configs, secrets_for(&[Chain::Ethereum]), &mut Vec::new())
+            .unwrap_err();
 
         assert!(
             matches!(error, ChainRegistryError::NoHedgedChain),
@@ -1489,8 +1526,12 @@ mod tests {
             ),
         ]);
 
-        let registry =
-            ChainRegistry::new(&configs, secrets_for(&[Chain::Base, Chain::Ethereum])).unwrap();
+        let registry = ChainRegistry::new(
+            &configs,
+            secrets_for(&[Chain::Base, Chain::Ethereum]),
+            &mut Vec::new(),
+        )
+        .unwrap();
 
         assert_eq!(registry.primary().chain, Chain::Base);
         let hedged: Vec<Chain> = registry.hedged().map(|chain| chain.chain).collect();
@@ -1512,7 +1553,8 @@ mod tests {
     #[test]
     fn hedged_iterates_the_primary_when_no_secondary_exists() {
         let configs = BTreeMap::from([(Chain::Base, chain_config(Some(trading_config_toml())))]);
-        let registry = ChainRegistry::new(&configs, secrets_for(&[Chain::Base])).unwrap();
+        let registry =
+            ChainRegistry::new(&configs, secrets_for(&[Chain::Base]), &mut Vec::new()).unwrap();
 
         let hedged: Vec<Chain> = registry.hedged().map(|chain| chain.chain).collect();
         assert_eq!(hedged, vec![Chain::Base]);
@@ -1537,8 +1579,12 @@ mod tests {
             (Chain::Ethereum, chain_config(Some(trading_config_toml()))),
         ]);
 
-        let error =
-            ChainRegistry::new(&configs, secrets_for(&[Chain::Base, Chain::Ethereum])).unwrap_err();
+        let error = ChainRegistry::new(
+            &configs,
+            secrets_for(&[Chain::Base, Chain::Ethereum]),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -1559,7 +1605,8 @@ mod tests {
             chain_config(Some(primary_trading_config_toml(false))),
         )]);
 
-        let error = ChainRegistry::new(&configs, secrets_for(&[Chain::Base])).unwrap_err();
+        let error =
+            ChainRegistry::new(&configs, secrets_for(&[Chain::Base]), &mut Vec::new()).unwrap_err();
 
         assert!(
             matches!(
@@ -1595,8 +1642,12 @@ mod tests {
             (Chain::Ethereum, chain_config(Some(ethereum))),
         ]);
 
-        let registry =
-            ChainRegistry::new(&configs, secrets_for(&[Chain::Base, Chain::Ethereum])).unwrap();
+        let registry = ChainRegistry::new(
+            &configs,
+            secrets_for(&[Chain::Base, Chain::Ethereum]),
+            &mut Vec::new(),
+        )
+        .unwrap();
 
         let listing = &registry
             .hedged_chain(Chain::Ethereum)
@@ -1661,7 +1712,8 @@ mod tests {
             config.lifecycle = lifecycle;
             let configs = BTreeMap::from([(Chain::Base, config)]);
 
-            let error = ChainRegistry::new(&configs, secrets_for(&[Chain::Base])).unwrap_err();
+            let error = ChainRegistry::new(&configs, secrets_for(&[Chain::Base]), &mut Vec::new())
+                .unwrap_err();
 
             assert!(matches!(
                 error,
@@ -1674,18 +1726,19 @@ mod tests {
     }
 
     #[test]
-    fn registry_rejects_a_chain_with_no_secrets_entry() {
+    fn registry_rejects_a_chain_with_no_rpc_url() {
         let configs = BTreeMap::from([
             (Chain::Base, chain_config(Some(trading_config_toml()))),
             (Chain::Ethereum, chain_config(None)),
         ]);
 
-        let error = ChainRegistry::new(&configs, secrets_for(&[Chain::Base])).unwrap_err();
+        let error =
+            ChainRegistry::new(&configs, secrets_for(&[Chain::Base]), &mut Vec::new()).unwrap_err();
 
         assert!(
             matches!(
                 error,
-                ChainRegistryError::MissingSecrets {
+                ChainRegistryError::MissingRpcUrl {
                     chain: Chain::Ethereum
                 }
             ),
@@ -1694,11 +1747,82 @@ mod tests {
     }
 
     #[test]
+    fn registry_takes_rpc_urls_from_the_config_tables_without_notices() {
+        let mut base = chain_config(Some(trading_config_toml()));
+        base.rpc_url = Some(rpc_url_for(Chain::Base));
+        let mut ethereum = chain_config(None);
+        ethereum.rpc_url = Some(rpc_url_for(Chain::Ethereum));
+        let configs = BTreeMap::from([(Chain::Base, base), (Chain::Ethereum, ethereum)]);
+        let mut notices = Vec::new();
+
+        let registry = ChainRegistry::new(&configs, BTreeMap::new(), &mut notices).unwrap();
+
+        assert_eq!(
+            registry.rpc_url(Chain::Base),
+            Some(&rpc_url_for(Chain::Base))
+        );
+        assert_eq!(
+            registry.rpc_url(Chain::Ethereum),
+            Some(&rpc_url_for(Chain::Ethereum))
+        );
+        assert_eq!(notices, Vec::new());
+    }
+
+    #[test]
+    fn registry_falls_back_to_the_secrets_rpc_url_with_a_deprecation_warning() {
+        let mut base = chain_config(Some(trading_config_toml()));
+        base.rpc_url = Some(rpc_url_for(Chain::Base));
+        let configs = BTreeMap::from([(Chain::Base, base), (Chain::Ethereum, chain_config(None))]);
+        let mut notices = Vec::new();
+
+        let registry =
+            ChainRegistry::new(&configs, secrets_for(&[Chain::Ethereum]), &mut notices).unwrap();
+
+        assert_eq!(
+            registry.rpc_url(Chain::Ethereum),
+            Some(&rpc_url_for(Chain::Ethereum))
+        );
+        assert_eq!(
+            notices,
+            vec![StartupNotice::warning(
+                "[chains.ethereum] rpc_url in the secrets file is deprecated and moves to \
+                 the config file's [chains.ethereum] table (removed next release)"
+            )]
+        );
+    }
+
+    #[test]
+    fn registry_prefers_the_config_rpc_url_and_warns_about_the_ignored_secrets_copy() {
+        let config_url = Url::parse("https://base-mainnet.g.alchemy.com/v2").unwrap();
+        let mut base = chain_config(Some(trading_config_toml()));
+        base.rpc_url = Some(config_url.clone());
+        let configs = BTreeMap::from([(Chain::Base, base)]);
+        let mut notices = Vec::new();
+
+        let registry =
+            ChainRegistry::new(&configs, secrets_for(&[Chain::Base]), &mut notices).unwrap();
+
+        assert_eq!(registry.rpc_url(Chain::Base), Some(&config_url));
+        assert_eq!(
+            notices,
+            vec![StartupNotice::warning(
+                "[chains.base] rpc_url is set in both files; the config file's value is \
+                 used and the deprecated secrets-file copy is ignored -- remove it from the \
+                 secrets file"
+            )]
+        );
+    }
+
+    #[test]
     fn registry_rejects_a_secrets_entry_with_no_config_table() {
         let configs = BTreeMap::from([(Chain::Base, chain_config(Some(trading_config_toml())))]);
 
-        let error =
-            ChainRegistry::new(&configs, secrets_for(&[Chain::Base, Chain::HyperEvm])).unwrap_err();
+        let error = ChainRegistry::new(
+            &configs,
+            secrets_for(&[Chain::Base, Chain::HyperEvm]),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -1721,6 +1845,7 @@ mod tests {
                 ChainConfig {
                     lifecycle: ChainLifecycle::ObserveOnly,
                     required_confirmations: 1,
+                    rpc_url: None,
                     trading: None,
                 },
             ),
@@ -1729,6 +1854,7 @@ mod tests {
         let registry = ChainRegistry::new(
             &configs,
             secrets_for(&[Chain::Base, Chain::Ethereum, Chain::Robinhood]),
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -1766,6 +1892,7 @@ mod tests {
                 ChainConfig {
                     lifecycle: ChainLifecycle::Active,
                     required_confirmations: 3,
+                    rpc_url: None,
                     trading: Some(trading_config_toml()),
                 },
             ),
@@ -1774,13 +1901,18 @@ mod tests {
                 ChainConfig {
                     lifecycle: ChainLifecycle::Active,
                     required_confirmations: 12,
+                    rpc_url: None,
                     trading: None,
                 },
             ),
         ]);
 
-        let registry =
-            ChainRegistry::new(&configs, secrets_for(&[Chain::Base, Chain::Ethereum])).unwrap();
+        let registry = ChainRegistry::new(
+            &configs,
+            secrets_for(&[Chain::Base, Chain::Ethereum]),
+            &mut Vec::new(),
+        )
+        .unwrap();
 
         assert_eq!(
             registry.primary().required_confirmations,

@@ -2427,10 +2427,10 @@ holds no record yet (the latest copy is what a first boot records).
 The two modes differ only in how much of the input they have:
 
 - **With `--secrets`** it applies every rule, the config/secrets cross-checks
-  included: broker credentials and the type they resolve to, each chain's
-  `rpc_url`, wallet keys, and the pricing and issuance API keys. This is the
-  deploy gate described below, run against the staged candidate files while the
-  old process is still serving.
+  included: broker credentials and the type they resolve to, any chain `rpc_url`
+  still read from the secrets file, wallet keys, and the pricing and issuance
+  API keys. This is the deploy gate described below, run against the staged
+  candidate files while the old process is still serving.
 - **Without `--secrets`** it applies every rule the config file can be judged
   against alone: its schema (an unknown key is a failure, never a silently
   ignored line), the port, chain, asset-table and `[rebalancing]` cross-field
@@ -2722,22 +2722,28 @@ _Configuration management_:
   activation to `/run/agenix/`
 - `st0x`-kind binaries use `--config` + `--secrets` flags; `plain`-kind units
   invoke their package binary with declared `args`
-- The secrets file carries only actual secrets: per-chain `rpc_url` entries, the
-  `[rest_api]` key pair, the `[issuance]` `api_key`, the `[relay]` `api_key`,
-  and (legacy Alpaca only) the `[broker]` `api_key`/`api_secret` pair under its
-  `type` tag. Everything else that once lived there is identity, not
-  credentials, and belongs in the plaintext config: the broker `type`, `mode`,
-  `account_id` and (keyless variant) `client_id`/`kms_key_version` in the config
-  `[broker]` section, and the issuance `base_url` in the config `[issuance]`
-  section. (Migration note, one release: the deprecated secrets-file copies of
-  these identity fields are still accepted with a warning, because deployed
-  secret versions carry them; a field set differently in both files is refused
-  at startup rather than silently resolved. The keyless alpaca-broker-api-kms
-  `[broker]` table migrates all-or-nothing: while it remains in the secrets file
-  its fields stay required there, and the migration step is to delete the whole
-  table once the config carries the identity. The shims and this tolerance are
-  removed next release, together with the `[alerts]` shims described under
-  Operational Alerting.)
+- The secrets file carries only actual secrets: the `[rest_api]` key pair, the
+  `[wallet]` credentials of a credential-bearing wallet, the `[pricing]`
+  `api_key` when pricing authenticates with a static key, the `[issuance]`
+  `api_key`, the `[relay]` `api_key`, and (legacy Alpaca only) the `[broker]`
+  `api_key`/`api_secret` pair under its `type` tag. A KMS-stamped Turnkey wallet
+  takes `[wallet] kms_api_key` from the config instead, and
+  `[pricing] gcp_id_token = true` replaces the pricing key with the machine's
+  Google identity. Everything else that once lived there is identity or
+  endpoint, not credentials, and belongs in the plaintext config: the broker
+  `type`, `mode`, `account_id` and (keyless variant)
+  `client_id`/`kms_key_version` in the config `[broker]` section, the issuance
+  `base_url` in the config `[issuance]` section, and each chain's `rpc_url` in
+  its config `[chains.<name>]` table. (Migration note, one release: the
+  deprecated secrets-file copies of these fields are still accepted with a
+  warning, because deployed secret versions carry them; when a field is set
+  differently in both files, the config value wins and the secrets-file copy is
+  ignored with a startup warning, since the config is the copy operators now
+  edit. The keyless alpaca-broker-api-kms `[broker]` table migrates
+  all-or-nothing: while it remains in the secrets file its fields stay required
+  there, and the migration step is to delete the whole table once the config
+  carries the identity. The shims and this tolerance are removed next release,
+  together with the `[alerts]` shims described under Operational Alerting.)
 - Every chain RPC client, the bot's providers and the signing wallets alike, is
   built through `st0x-rpc`. An `rpc_url` that is a bare
   `https://<network>.g.alchemy.com/v2` carries no API key: each request sends an

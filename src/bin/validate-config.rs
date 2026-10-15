@@ -26,7 +26,7 @@ use st0x_config::{Ctx, CtxError, StartupNotice, TokenFile, fetch_gate_token_file
     about = "Validate a st0x-hedge config file",
     long_about = "Validates a plaintext config TOML. With --secrets, additionally runs the \
                   config/secrets cross-checks the deploy gate runs (broker credentials, \
-                  per-chain rpc_url, wallet keys, pricing and issuance API keys). Without \
+                  deprecated per-chain rpc_url, wallet keys, pricing and issuance API keys). Without \
                   it, only the config file is judged -- enough for CI, which has no secrets."
 )]
 struct Args {

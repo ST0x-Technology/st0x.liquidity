@@ -322,7 +322,7 @@ struct IssuanceSecretsToml {
     /// now lives in the config file's `[issuance]` section. The deprecated
     /// secrets-file copy is still accepted for one release because deployed
     /// secret versions carry it; [`issuance_ctx`] warns when it is used and
-    /// refuses a value that conflicts with the config one.
+    /// ignores it, with a warning, when the config sets a different one.
     base_url: Option<Url>,
     api_key: String,
 }
@@ -693,6 +693,8 @@ impl std::fmt::Debug for TravelRuleConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Secrets {
+    /// MIGRATION SHIM, removed next release: see [`ChainSecrets`].
+    #[serde(default)]
     chains: BTreeMap<Chain, ChainSecrets>,
     /// `Option` because the KMS and dry-run brokers carry no credentials at
     /// all: their identity lives in the config file's `[broker]` section and
@@ -721,8 +723,8 @@ struct Secrets {
 /// other field is identity, whose home is now the config file's `[broker]`
 /// section; the copies below are MIGRATION SHIMS, removed next release,
 /// accepted because deployed secret versions still carry the identity here.
-/// [`resolve_broker`] warns when identity comes from this table and refuses
-/// values that conflict with the config file's.
+/// [`resolve_broker`] warns when identity comes from this table and ignores
+/// values that differ from the config file's, with a warning.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant, clippy::enum_variant_names)] // isn't relevant for a brief startup step
@@ -1062,25 +1064,29 @@ impl From<BrokerSecrets> for SecretsBrokerParts {
     }
 }
 
-/// Merges one broker-identity field from its two possible locations. Both
-/// present and equal is tolerated (the migration window where the config
-/// release has landed but the secret still carries the old copy); both
-/// present and different is refused rather than silently picking one.
+/// Merges one broker-identity field from its two possible locations. The
+/// config value wins when both are set: during the migration window the
+/// deployed secret still carries the old copy, and a differing one is
+/// ignored with a startup warning.
 fn merge_broker_field<Value: PartialEq>(
     field: &'static str,
     config_value: Option<Value>,
     secrets_value: Option<Value>,
-) -> Result<Option<Value>, CtxError> {
+    startup_notices: &mut Vec<StartupNotice>,
+) -> Option<Value> {
     match (config_value, secrets_value) {
         (Some(from_config), Some(from_secrets)) => {
-            if from_config == from_secrets {
-                Ok(Some(from_config))
-            } else {
-                Err(CtxError::BrokerIdentityConflict { field })
+            if from_config != from_secrets {
+                startup_notices.push(StartupNotice::warning(format!(
+                    "[broker] {field} is set differently in the config and secrets files; \
+                     the config file's value is used and the deprecated secrets-file copy \
+                     is ignored -- remove it from the secrets file"
+                )));
             }
+            Some(from_config)
         }
-        (Some(value), None) | (None, Some(value)) => Ok(Some(value)),
-        (None, None) => Ok(None),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
     }
 }
 
@@ -1106,8 +1112,8 @@ fn refuse_broker_fields_not_for_kind(
 /// Assembles the broker from its two halves: identity in the config file
 /// (preferred home) and credentials in the secrets file. The deprecated
 /// identity copies in the secrets file are still accepted for one release
-/// (see [`BrokerSecrets`]); a field set differently in both places is
-/// refused.
+/// (see [`BrokerSecrets`]); a field set differently in both places takes
+/// the config value.
 /// The merged broker identity, ready for per-kind validation. Exists so the
 /// `match` arms in [`resolve_broker`] destructure it EXHAUSTIVELY: adding an
 /// identity field breaks compilation in every arm instead of being silently
@@ -1187,7 +1193,8 @@ fn resolve_broker(
         "type",
         broker_config.and_then(|config| config.kind),
         secrets_parts.as_ref().map(|parts| parts.kind),
-    )?
+        startup_notices,
+    )
     .ok_or(CtxError::MissingBrokerType)?;
 
     let SecretsBrokerParts {
@@ -1212,22 +1219,26 @@ fn resolve_broker(
         "mode",
         broker_config.and_then(|config| config.mode.clone()),
         secrets_mode,
-    )?;
+        startup_notices,
+    );
     let account_id = merge_broker_field(
         "account_id",
         broker_config.and_then(|config| config.account_id),
         secrets_account_id,
-    )?;
+        startup_notices,
+    );
     let client_id = merge_broker_field(
         "client_id",
         broker_config.and_then(|config| config.client_id.clone()),
         secrets_client_id,
-    )?;
+        startup_notices,
+    );
     let kms_key_version = merge_broker_field(
         "kms_key_version",
         broker_config.and_then(|config| config.kms_key_version.clone()),
         secrets_kms_key_version,
-    )?;
+        startup_notices,
+    );
 
     let identity = ResolvedIdentity {
         mode,
@@ -2041,6 +2052,17 @@ fn validate_config(
             path: config_path.to_path_buf(),
             source,
         })?;
+
+        // The wallet signs on every enabled chain, so the transport rule
+        // `OnchainWalletCtx::new` applies holds for each config `rpc_url`.
+        for (chain, chain_config) in &config.chains {
+            if chain_config.lifecycle == ChainLifecycle::Disabled {
+                continue;
+            }
+            if let Some(rpc_url) = &chain_config.rpc_url {
+                crate::wallet::require_secure_wallet_rpc_url(rpc_url, *chain)?;
+            }
+        }
     }
 
     let travel_rule = config
@@ -2463,7 +2485,7 @@ fn parse_and_validate_with(
     // below $1.
     let execution_threshold = broker.execution_threshold()?;
 
-    let chains = ChainRegistry::new(&config.chains, secrets.chains)?;
+    let chains = ChainRegistry::new(&config.chains, secrets.chains, &mut startup_notices)?;
     let (wallet_inputs, wallet_meta) =
         validate_wallet_inputs(config.wallet, secrets.wallet, &chains, config_path)?;
 
@@ -2597,8 +2619,8 @@ fn extended_hours_broker_windows(
 /// secrets file, `base_url` from the config file (preferred) or its
 /// deprecated secrets-file copy. Both must be present somewhere and the URL
 /// must parse -- no silent fallbacks for an endpoint the rebalancing freeze
-/// guard depends on. A `base_url` set differently in both files is refused
-/// rather than silently resolved.
+/// guard depends on. A `base_url` set differently in both files takes the
+/// config value, with a startup warning.
 fn issuance_ctx(
     config: Option<IssuanceConfig>,
     secrets: Option<IssuanceSecretsToml>,
@@ -2621,11 +2643,14 @@ fn issuance_ctx(
 
     let base_url = match (config.map(|config| config.base_url), secrets.base_url) {
         (Some(from_config), Some(from_secrets)) => {
-            if from_config == from_secrets {
-                from_config
-            } else {
-                return Err(CtxError::IssuanceBaseUrlConflict);
+            if from_config != from_secrets {
+                startup_notices.push(StartupNotice::warning(
+                    "[issuance] base_url is set differently in the config and secrets \
+                     files; the config file's value is used and the deprecated \
+                     secrets-file copy is ignored -- remove it from the secrets file",
+                ));
             }
+            from_config
         }
         (Some(base_url), None) | (None, Some(base_url)) => base_url,
         (None, None) => return Err(CtxError::MissingIssuanceBaseUrl),
@@ -2839,8 +2864,8 @@ impl Ctx {
     /// the same function the boot path runs, so a rule broken here breaks
     /// startup too. What it cannot judge is anything the secrets file
     /// supplies: broker credentials (and the broker type the deprecated
-    /// secrets `[broker]` table may still carry), per-chain `rpc_url`s, wallet
-    /// keys, pricing and issuance API keys. Those stay for the deploy-time
+    /// secrets `[broker]` table may still carry), deprecated per-chain
+    /// `rpc_url`s, wallet keys, pricing and issuance API keys. Those stay for the deploy-time
     /// [`validate_files`](Self::validate_files) gate.
     ///
     /// This is what lets CI check every config the repository ships on each
@@ -3208,11 +3233,6 @@ pub enum CtxError {
          deprecated, in the secrets file's [broker] table)"
     )]
     MissingBrokerType,
-    #[error(
-        "[broker] {field} is set to different values in the config and secrets \
-         files; remove the deprecated secrets-file copy"
-    )]
-    BrokerIdentityConflict { field: &'static str },
     #[error("[broker] {field} does not apply to broker type \"{kind}\"")]
     BrokerFieldNotForKind {
         field: &'static str,
@@ -3225,11 +3245,6 @@ pub enum CtxError {
          the secrets file's [broker] table"
     )]
     MissingBrokerCredentials,
-    #[error(
-        "[issuance] base_url is set to different values in the config and secrets \
-         files; remove the deprecated secrets-file copy"
-    )]
-    IssuanceBaseUrlConflict,
     #[error(
         "[issuance] base_url must be set in the config file (or, deprecated, in \
          the secrets file's [issuance] section)"
@@ -3531,11 +3546,9 @@ impl CtxError {
             Self::NegativeHedgeFloor { .. } => "negative hedge floor",
             Self::KmsBrokerRequiresProductionMode => "kms broker auth requires production mode",
             Self::MissingBrokerType => "missing broker type",
-            Self::BrokerIdentityConflict { .. } => "broker identity conflict",
             Self::BrokerFieldNotForKind { .. } => "broker field not for kind",
             Self::MissingBrokerField { .. } => "missing broker field",
             Self::MissingBrokerCredentials => "missing broker credentials",
-            Self::IssuanceBaseUrlConflict => "issuance base_url conflict",
             Self::MissingIssuanceBaseUrl => "missing issuance base_url",
             Self::MissingCloseFlattenCrossMaxBps => "missing close flatten cross max bps",
             Self::CloseFlattenCrossMaxBpsOutOfRange { .. } => {
@@ -7003,7 +7016,7 @@ mod tests {
 
     /// The migration window: the config release has landed (identity in
     /// config) while the deployed secret still carries the old copy. Equal
-    /// values are tolerated; see the conflict test for differing ones.
+    /// values are tolerated; differing ones take the config value.
     #[tokio::test]
     async fn duplicated_equal_broker_identity_is_tolerated() {
         let config = broker_identity_config_toml(
@@ -7073,15 +7086,51 @@ mod tests {
         }
     }
 
-    /// A field set differently in both files must fail startup rather than
-    /// silently prefer either copy: whichever file the operator believed
-    /// they changed, half their intent would be discarded.
+    /// The config copy is the one the operator now edits, so it wins; the
+    /// stale secrets-file copy is reported, not acted on.
     #[tokio::test]
-    async fn conflicting_broker_account_id_is_refused() {
+    async fn conflicting_broker_account_id_takes_the_config_value() {
         let config = broker_identity_config_toml(
             r#"type = "alpaca-broker-api"
             account_id = "aaaaaaaa-eeee-aaaa-dddd-beeeeeeeeeef""#,
         );
+        let secrets = alpaca_secrets_toml();
+
+        let ctx = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let BrokerCtx::AlpacaBrokerApi(alpaca) = &ctx.broker;
+        assert_eq!(
+            alpaca.account_id,
+            "aaaaaaaa-eeee-aaaa-dddd-beeeeeeeeeef"
+                .parse::<AlpacaAccountId>()
+                .unwrap()
+        );
+        let expected = StartupNotice::warning(
+            "[broker] account_id is set differently in the config and secrets files; the \
+             config file's value is used and the deprecated secrets-file copy is ignored -- \
+             remove it from the secrets file",
+        );
+        assert!(
+            ctx.startup_notices.contains(&expected),
+            "{expected} missing from {:?}",
+            ctx.startup_notices
+        );
+    }
+
+    /// The config type wins, so the secrets file's credential pair is judged
+    /// against the keyless type and refused rather than silently dropped.
+    #[tokio::test]
+    async fn conflicting_broker_type_takes_the_config_value() {
+        let config = broker_identity_config_toml(r#"type = "alpaca-broker-api-kms""#);
         let secrets = alpaca_secrets_toml();
 
         let error = Ctx::load_files(
@@ -7098,33 +7147,12 @@ mod tests {
         assert!(
             matches!(
                 error,
-                CtxError::BrokerIdentityConflict {
-                    field: "account_id"
+                CtxError::BrokerFieldNotForKind {
+                    field: "api_key/api_secret",
+                    kind: "alpaca-broker-api-kms",
                 }
             ),
-            "expected BrokerIdentityConflict for account_id, got: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn conflicting_broker_type_is_refused() {
-        let config = broker_identity_config_toml(r#"type = "alpaca-broker-api-kms""#);
-        let secrets = alpaca_secrets_toml();
-
-        let error = Ctx::load_files(
-            config.path(),
-            secrets.path(),
-            TokenSource::Running {
-                registry_file: None,
-                registry_state: None,
-            },
-        )
-        .await
-        .unwrap_err();
-
-        assert!(
-            matches!(error, CtxError::BrokerIdentityConflict { field: "type" }),
-            "expected BrokerIdentityConflict for type, got: {error}"
+            "expected the secrets credentials refused for the config type, got: {error}"
         );
     }
 
@@ -7242,7 +7270,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn issuance_base_url_conflict_is_refused() {
+    async fn issuance_base_url_conflict_takes_the_config_value() {
         let config = broker_identity_config_toml(
             r#"type = "alpaca-broker-api"
             account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef""#,
@@ -7254,7 +7282,7 @@ mod tests {
             api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899""#,
         );
 
-        let error = Ctx::load_files(
+        let ctx = Ctx::load_files(
             config.path(),
             secrets.path(),
             TokenSource::Running {
@@ -7263,11 +7291,18 @@ mod tests {
             },
         )
         .await
-        .unwrap_err();
+        .unwrap();
 
+        assert_eq!(ctx.issuance.base_url.as_str(), "http://issuance.test:8000/");
+        let expected = StartupNotice::warning(
+            "[issuance] base_url is set differently in the config and secrets files; the \
+             config file's value is used and the deprecated secrets-file copy is ignored -- \
+             remove it from the secrets file",
+        );
         assert!(
-            matches!(error, CtxError::IssuanceBaseUrlConflict),
-            "expected IssuanceBaseUrlConflict, got: {error}"
+            ctx.startup_notices.contains(&expected),
+            "{expected} missing from {:?}",
+            ctx.startup_notices
         );
     }
 
@@ -8288,7 +8323,7 @@ mod tests {
 
     #[tokio::test]
     async fn wallet_without_rpc_urls_fails() {
-        let config = toml_file(
+        let config = toml_file(&format!(
             r#"
             database_url = ":memory:"
             log_level = "debug"
@@ -8314,6 +8349,7 @@ mod tests {
             ingestion_cutoff = "safe"
             order_fill_poll_interval_secs = 1
             primary = true
+            redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
             [chains.ethereum]
             lifecycle = "active"
@@ -8340,8 +8376,9 @@ mod tests {
             [wallet]
             kind = "private-key"
             address = "0x0000000000000000000000000000000000000001"
-        "#,
-        );
+            {REQUIRED_TOPOLOGY_SECTIONS}
+        "#
+        ));
 
         let secrets = toml_file(
             r#"
@@ -8366,14 +8403,14 @@ mod tests {
             },
         )
         .await;
-        let error = result.unwrap_err();
-        let detail = std::error::Error::source(&error)
-            .map(std::string::ToString::to_string)
-            .unwrap_or_default();
         assert!(
-            detail.contains("chains"),
-            "a secrets file supplying no chain endpoints must fail naming the \
-             missing table, got: {detail}"
+            matches!(
+                result,
+                Err(CtxError::ChainRegistry(
+                    crate::chain::ChainRegistryError::MissingRpcUrl { chain: Chain::Base }
+                ))
+            ),
+            "a chain with no rpc_url in either file must be refused, got {result:?}"
         );
     }
 
@@ -8470,7 +8507,7 @@ mod tests {
             matches!(
                 result,
                 Err(CtxError::ChainRegistry(
-                    crate::chain::ChainRegistryError::MissingSecrets {
+                    crate::chain::ChainRegistryError::MissingRpcUrl {
                         chain: Chain::HyperEvm
                     }
                 ))
@@ -11039,6 +11076,31 @@ mod tests {
     }
 
     #[test]
+    fn validate_config_file_rejects_a_remote_http_rpc_url_on_a_signing_chain() {
+        let example = std::fs::read_to_string(example_config_toml()).unwrap();
+        let config = toml_file(&example.replace(
+            "rpc_url = \"https://base-mainnet.example.com\"",
+            "rpc_url = \"http://base-mainnet.example.com\"",
+        ));
+
+        let error = Ctx::validate_config_file(config.path(), TokenFile::Skipped).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::Wallet(crate::wallet::WalletCtxError::InsecureRpcUrl {
+                    chain: Chain::Base
+                })
+            ),
+            "{error:?}"
+        );
+
+        let omitted =
+            toml_file(&example.replace("rpc_url = \"https://base-mainnet.example.com\"", ""));
+        Ctx::validate_config_file(omitted.path(), TokenFile::Skipped).unwrap();
+    }
+
+    #[test]
     fn validate_config_file_rejects_an_unknown_key() {
         let config_str = format!(
             "{}\nnot_a_real_setting = 1\n",
@@ -13236,7 +13298,7 @@ mod tests {
 
     #[test]
     fn validate_files_rejects_wallet_without_rpc_urls() {
-        let config = toml_file(
+        let config = toml_file(&format!(
             r#"
             database_url = ":memory:"
             log_level = "debug"
@@ -13262,6 +13324,7 @@ mod tests {
             ingestion_cutoff = "safe"
             order_fill_poll_interval_secs = 1
             primary = true
+            redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
             [chains.ethereum]
             lifecycle = "active"
@@ -13288,8 +13351,9 @@ mod tests {
             [wallet]
             kind = "private-key"
             address = "0x0000000000000000000000000000000000000001"
-        "#,
-        );
+            {REQUIRED_TOPOLOGY_SECTIONS}
+        "#
+        ));
         let secrets = toml_file(
             r#"
             [broker]
@@ -13307,9 +13371,13 @@ mod tests {
         let error =
             Ctx::validate_files(config.path(), secrets.path(), TokenFile::Skipped).unwrap_err();
         assert!(
-            matches!(error, CtxError::SecretsToml { .. }),
-            "a secrets file supplying no chain endpoints must fail to parse, \
-             got {error:?}"
+            matches!(
+                error,
+                CtxError::ChainRegistry(crate::chain::ChainRegistryError::MissingRpcUrl {
+                    chain: Chain::Base
+                })
+            ),
+            "a chain with no rpc_url in either file must be refused, got {error:?}"
         );
     }
 
