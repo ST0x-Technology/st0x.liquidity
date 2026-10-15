@@ -12722,23 +12722,16 @@ mod tests {
                 .unwrap();
         }
 
-        // Snapshot-error recovery drops the started mint's inflight while its
-        // tracking stays `Started`, and re-bases available to the broker.
-        trigger
-            .on_snapshot_recovery(
-                RebalancingServiceError::Inventory(InventoryViewError::Equity(
-                    InventoryError::InsufficientAvailable {
-                        requested: shares(1),
-                        available: shares(0),
-                    },
-                )),
-                InventorySnapshotEvent::OffchainEquity {
-                    positions: BTreeMap::from([(symbol.clone(), shares(90))]),
-                    fetched_at: Utc::now(),
-                },
-            )
-            .await
-            .unwrap();
+        // The started mint's inflight is gone while its tracking stays
+        // `Started` (snapshot recovery now keeps an active mint's inflight, so
+        // this models the wipe directly).
+        {
+            let mut inventory = trigger.inventory.write().await;
+            *inventory = inventory
+                .clone()
+                .clear_equity_inflight_at(&symbol, Chain::Base, Venue::Hedging, Utc::now())
+                .unwrap();
+        }
 
         let failed = TokenizedEquityMint::Failed {
             chain: Chain::Base,
