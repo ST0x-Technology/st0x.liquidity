@@ -4498,8 +4498,8 @@ impl InventoryView {
     /// Force a broker equity snapshot onto every symbol without an open
     /// hedge order, advancing only those symbols' watermarks. An active
     /// mint's symbol gets the broker reading as available but keeps its
-    /// Hedging inflight: the mint is that inflight's only writer until its
-    /// terminal event, and its `TokensReceived` must find it to subtract.
+    /// Hedging inflight: the mint owns that inflight until its terminal
+    /// event, and its `TokensReceived` must find it to subtract.
     fn force_apply_offchain_equity(
         self,
         positions: &BTreeMap<Symbol, FractionalShares>,
@@ -4523,7 +4523,9 @@ impl InventoryView {
                 let mint_inflight = view
                     .active_mint(symbol)
                     .and_then(|_| view.equity_inflight(symbol, Venue::Hedging));
-                if let Some(inflight) = mint_inflight {
+                if let Some(inflight) = mint_inflight
+                    && !inflight.is_zero()?
+                {
                     debug!(
                         target: "inventory",
                         %symbol,
