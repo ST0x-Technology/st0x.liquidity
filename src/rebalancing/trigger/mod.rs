@@ -222,6 +222,14 @@ pub(crate) enum UsdcResumeError {
         state: &'static str,
     },
     #[error(
+        "rebalance {id} holds at {state}, which no resume moves on: settle every \
+         listed Relay order by hand, then run `transfer reconcile --kind usdc`"
+    )]
+    HeldForReconcile {
+        id: UsdcRebalanceId,
+        state: &'static str,
+    },
+    #[error(
         "another USDC transfer is already in flight (job row {row_id}, \
          {age_secs}s old); the worker drives it -- wait or investigate that job"
     )]
@@ -1238,6 +1246,7 @@ fn relay_hold_step(state: &UsdcRebalance) -> &'static str {
 
     match state {
         UsdcRebalance::SwapFailed { .. }
+        | UsdcRebalance::SwapOverdeposited { .. }
         | UsdcRebalance::SwapRefunded {
             short_of_floor: Some(_),
             ..
@@ -1430,6 +1439,7 @@ impl RearmPolicy {
             | UsdcRebalance::SwapRefunded { .. }
             | UsdcRebalance::SwapEscrowUnresolved { .. }
             | UsdcRebalance::SwapFailed { .. }
+            | UsdcRebalance::SwapOverdeposited { .. }
             | UsdcRebalance::Redepositing { .. }
             | UsdcRebalance::ReturnedToSource { .. }
             | UsdcRebalance::Bridged { .. }
@@ -1490,6 +1500,7 @@ impl RearmPolicy {
             | UsdcRebalance::AwaitingAttestation { .. }
             | UsdcRebalance::Attested { .. }
             | UsdcRebalance::SwapFailed { .. }
+            | UsdcRebalance::SwapOverdeposited { .. }
             | UsdcRebalance::ReturnedToSource { .. }
             | UsdcRebalance::Bridged { .. }
             | UsdcRebalance::DepositInitiated { .. }
@@ -7255,6 +7266,7 @@ impl RebalancingService {
             | UsdcRebalance::SwapRefunded { .. }
             | UsdcRebalance::SwapEscrowUnresolved { .. }
             | UsdcRebalance::SwapFailed { .. }
+            | UsdcRebalance::SwapOverdeposited { .. }
             | UsdcRebalance::Redepositing { .. }
             | UsdcRebalance::Bridged { .. }
             | UsdcRebalance::BridgingFailed { .. }
@@ -7264,6 +7276,14 @@ impl RebalancingService {
         };
         if clean_terminal {
             return Err(UsdcResumeError::AlreadyTerminal {
+                id: id.clone(),
+                state: state.state_name(),
+            });
+        }
+        // The job would refuse it too, but only after the enqueue was
+        // reported to the operator as accepted.
+        if let UsdcRebalance::SwapOverdeposited { .. } = state {
+            return Err(UsdcResumeError::HeldForReconcile {
                 id: id.clone(),
                 state: state.state_name(),
             });
@@ -10498,6 +10518,7 @@ impl RebalancingService {
                 | DepositFailed { .. }
                 | ConversionFailed { .. }
                 | SwapFailed { .. }
+                | SwapOverdeposited { .. }
                 | ReturnedToSource { .. }
                 | OperatorReconciled { .. }
                 | ConversionConfirmed {
@@ -10719,8 +10740,8 @@ mod tests {
     use crate::test_utils::rebalancing_enabled_equities;
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
     use crate::usdc_rebalance::{
-        ConversionAmounts, RedepositReason, RefundSide, TransferRef, UsdcRebalance,
-        UsdcRebalanceCommand, UsdcRebalanceId, swap_quote_for_test,
+        ConversionAmounts, FoundSwapDeposit, RedepositReason, RefundSide, TransferRef,
+        UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId, swap_quote_for_test,
     };
     use crate::vault_lookup::MockVaultLookup;
     use crate::vault_registry::VaultRegistryCommand;
@@ -39475,8 +39496,8 @@ mod tests {
 
     /// A Relay transfer whose stable went back into its vault clears its
     /// active claim and guard, credits the vault side with what came back and
-    /// releases what the refund kept; one Relay failed with nothing paid back
-    /// keeps its guard and claim.
+    /// releases what the refund kept; one Relay failed with nothing paid back,
+    /// or held overdeposited, keeps its guard and claim.
     #[tokio::test]
     async fn relay_returned_to_source_clears_and_swap_failed_preserves() {
         let robinhood_relay = UsdcCorridor::HubRouted {
@@ -39513,7 +39534,12 @@ mod tests {
             failed_at: Utc::now(),
         };
 
-        for (terminal, clears) in [(returned, true), (failed, false)] {
+        let overdeposited = UsdcRebalanceEvent::SwapOverdeposited {
+            deposits: Vec::new(),
+            held_at: Utc::now(),
+        };
+
+        for (terminal, clears) in [(returned, true), (failed, false), (overdeposited, false)] {
             let trigger = make_trigger_with_inventory(with_onchain_usdc(
                 InventoryView::default().with_usdc(usdc(500), usdc(500)),
                 Chain::Robinhood,
@@ -39569,7 +39595,7 @@ mod tests {
                 assert_eq!(
                     active,
                     Some(id.clone()),
-                    "SwapFailed keeps the active claim"
+                    "{terminal:?} keeps the active claim"
                 );
                 assert!(trigger.usdc_tracking.read().await.contains_key(&id));
                 assert!(trigger.usdc_guards.is_held(Chain::Robinhood));
@@ -48937,8 +48963,8 @@ mod tests {
 
     /// Every Relay swap state a resume moves on is re-armed at startup when
     /// its job is lost, even past a terminal job row, also a deposit the
-    /// escrow scan adopted; a short refund, a refund paid at the other end
-    /// and a Relay failure stay held for the operator.
+    /// escrow scan adopted; a short refund, a refund paid at the other end,
+    /// a Relay failure and an overdeposit hold stay held for the operator.
     #[tokio::test]
     async fn recover_usdc_guard_rearms_every_relay_swap_state() {
         let quote = UsdcRebalanceCommand::QuoteSwap {
@@ -48989,6 +49015,7 @@ mod tests {
                 },
             },
         ];
+        let overdeposited = overdeposited_hold();
 
         for direction in [
             RebalanceDirection::BaseToAlpaca,
@@ -49069,6 +49096,7 @@ mod tests {
                     "SwapFailed",
                     false,
                 ),
+                (overdeposited.clone(), "SwapOverdeposited", false),
             ]
             .into_iter()
             .chain(redepositing)
@@ -49247,6 +49275,135 @@ mod tests {
         assert_eq!(job.corridor, ROBINHOOD_RELAY);
         assert_eq!(job.amount, usdc(200));
         assert!(trigger.usdc_guards.is_held(Chain::Robinhood));
+    }
+
+    /// After `relay_withdrawn`: the deposit of order 0x0d reverted, then the
+    /// escrow scan of the re-quote found it, for another amount than its
+    /// quote, and recorded the overdeposit hold.
+    fn overdeposited_hold() -> Vec<UsdcRebalanceCommand> {
+        vec![
+            UsdcRebalanceCommand::QuoteSwap {
+                quote: Box::new(swap_quote_for_test(
+                    U256::from(100_000_000u64),
+                    B256::repeat_byte(0x0d),
+                )),
+            },
+            UsdcRebalanceCommand::PrepareSwapDeposit {
+                approve: None,
+                deposit: PreparedTransaction::for_test(TxHash::repeat_byte(0xa2), 6),
+            },
+            UsdcRebalanceCommand::RecordSwapDepositReverted {
+                deposit_tx: TxHash::repeat_byte(0xa2),
+            },
+            UsdcRebalanceCommand::RequoteSwap {
+                quote: Box::new(swap_quote_for_test(
+                    U256::from(100_000_000u64),
+                    B256::repeat_byte(0x0e),
+                )),
+            },
+            UsdcRebalanceCommand::HoldOverdepositedSwap {
+                deposits: vec![FoundSwapDeposit {
+                    request_id: B256::repeat_byte(0x5e),
+                    order_id: B256::repeat_byte(0x0d),
+                    deposit_tx: TxHash::repeat_byte(0xa2),
+                    deposit_block: 9,
+                    amount: U256::from(99_000_000u64),
+                }],
+            },
+        ]
+    }
+
+    /// A Robinhood-to-Alpaca transfer held overdeposited keeps its guard
+    /// across a restart, and a manual resume refuses it up front; once the
+    /// operator reconciles it from the CLI, the timed-out sweep releases the
+    /// guard without another restart.
+    #[tokio::test]
+    async fn reconciled_overdeposited_swap_frees_the_corridor_after_a_restart() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        for command in relay_withdrawn(RebalanceDirection::BaseToAlpaca)
+            .into_iter()
+            .chain(overdeposited_hold())
+        {
+            store.send(&id, command).await.unwrap();
+        }
+        assert_eq!(
+            store.load(&id).await.unwrap().unwrap().state_name(),
+            "SwapOverdeposited"
+        );
+        let config = RebalancingServiceConfig {
+            usdc: UsdcCorridors::for_test(
+                OperationMode::Enabled,
+                [active_corridor(Chain::Robinhood, HopKind::Relay)],
+            )
+            .with_relay_hop(Chain::Robinhood, relay_bounds(1, 200)),
+            ..with_cash_on(test_config(), &[Chain::Robinhood])
+        };
+        let trigger = make_trigger_with_inventory_config(InventoryView::default(), config).await;
+        attach_stores(
+            &trigger,
+            pool.clone(),
+            test_store::<UsdcRebalance>(pool.clone(), ()),
+        )
+        .await;
+
+        trigger.recover_usdc_guard(&pool, &store).await.unwrap();
+        assert!(trigger.usdc_guards.is_held(Chain::Robinhood));
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0
+        );
+
+        let error = trigger
+            .resume_usdc_transfer(&pool, &id, RebalanceDirection::BaseToAlpaca)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                UsdcResumeError::HeldForReconcile {
+                    state: "SwapOverdeposited",
+                    ..
+                }
+            ),
+            "got {error:?}"
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0
+        );
+
+        let past_timeout = Utc::now()
+            + chrono::Duration::from_std(trigger.config.transfer_timeout).unwrap()
+            + chrono::Duration::seconds(1);
+        trigger
+            .expire_stuck_usdc_rebalances(past_timeout)
+            .await
+            .unwrap();
+        assert!(
+            trigger.usdc_guards.is_held(Chain::Robinhood),
+            "the sweep must hold the guard while the hold is not reconciled"
+        );
+
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+                },
+            )
+            .await
+            .unwrap();
+        trigger
+            .expire_stuck_usdc_rebalances(past_timeout)
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_guards.is_held(Chain::Robinhood),
+            "the sweep must release the guard of the reconciled hold"
+        );
     }
 
     /// A Relay transfer whose job apalis still owns is not re-armed again:

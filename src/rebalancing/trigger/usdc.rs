@@ -361,6 +361,7 @@ impl UsdcRebalanceStage {
             | BridgingFailed { .. }
             | DepositFailed { .. }
             | SwapFailed { .. }
+            | SwapOverdeposited { .. }
             | ReturnedToSource { .. }
             | OperatorReconciled { .. } => None,
         }
@@ -1077,7 +1078,7 @@ impl RebalancingService {
         //   - `WithdrawalFailed` is always pre-burn (nothing left the source),
         //     so absent tracking correctly clears.
         match event {
-            DepositFailed { .. } | SwapFailed { .. } => true,
+            DepositFailed { .. } | SwapFailed { .. } | SwapOverdeposited { .. } => true,
             ConversionFailed { .. } => match self.usdc_tracking.read().await.get(id) {
                 Some(tracking) => tracking.is_post_burn(),
                 None => self.durable_guard_hold(id).await,
@@ -1317,9 +1318,9 @@ impl RebalancingService {
                     self.cancel_tracked_usdc_rebalance(id).await?
                 }
             }
-            // A Relay failure holds its guard like a post-burn failure: the
-            // classifier always preserves it.
-            SwapFailed { .. } => {
+            // A Relay failure or overdeposit hold holds its guard like a
+            // post-burn failure: the classifier always preserves it.
+            SwapFailed { .. } | SwapOverdeposited { .. } => {
                 self.warn_if_post_burn_tracking_missing(id).await;
                 UsdcSettlementOutcome::Reconciled
             }

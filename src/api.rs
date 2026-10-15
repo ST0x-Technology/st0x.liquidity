@@ -2159,13 +2159,15 @@ fn usdc_resume_error_response(error: &UsdcResumeError) -> (StatusCode, String) {
     use UsdcResumeError::{
         Aggregate, AlreadyInFlight, AlreadyTerminal, ApalisDatabase, CashDivergenceEngaged,
         CashRestartTainted, CorridorChoice, CorridorNotServed, Database, DirectionMismatch,
-        EveryCorridorLatched, GasNotReady, GuardHeldElsewhere, NotFound, NotReady, Queue,
+        EveryCorridorLatched, GasNotReady, GuardHeldElsewhere, HeldForReconcile, NotFound,
+        NotReady, Queue,
     };
 
     match error {
         NotFound(_) => (StatusCode::NOT_FOUND, error.to_string()),
         DirectionMismatch { .. }
         | AlreadyTerminal { .. }
+        | HeldForReconcile { .. }
         | CorridorNotServed { .. }
         | CorridorChoice(_) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
         AlreadyInFlight { .. }
@@ -12339,6 +12341,16 @@ mod tests {
             state: "Reconciled",
         });
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let (status, message) = usdc_resume_error_response(&UsdcResumeError::HeldForReconcile {
+            id: id.clone(),
+            state: "SwapOverdeposited",
+        });
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            message.contains("transfer reconcile --kind usdc"),
+            "the refusal must name the exit; got: {message}"
+        );
 
         let (status, message) = usdc_resume_error_response(&UsdcResumeError::CorridorNotServed {
             id,

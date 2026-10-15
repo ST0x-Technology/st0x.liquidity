@@ -456,11 +456,14 @@ fn usdc_rebalance_failure(event: &UsdcRebalanceEvent) -> Option<(FailureEventTyp
         UsdcRebalanceEvent::WithdrawalFailed { failed_at, .. } => {
             Some((FailureEventType::WithdrawalFailed, *failed_at))
         }
-        // The Relay swap is the hop, as the CCTP bridge is: a swap that failed,
-        // or ended with the stable back in its vault, counts with the
-        // bridge's failures.
+        // The Relay swap is the hop, as the CCTP bridge is: a swap that failed
+        // or holds overdeposited, or ended with the stable back in its vault,
+        // counts with the bridge's failures.
         UsdcRebalanceEvent::BridgingFailed { failed_at, .. }
         | UsdcRebalanceEvent::SwapFailed { failed_at, .. }
+        | UsdcRebalanceEvent::SwapOverdeposited {
+            held_at: failed_at, ..
+        }
         | UsdcRebalanceEvent::ReturnedToSource {
             returned_at: failed_at,
             ..
@@ -1510,6 +1513,15 @@ mod tests {
                 failed_at: timestamp(0),
             }
             .event_type()
+        );
+
+        // A Relay overdeposit hold counts with the hop's failures.
+        assert_eq!(
+            usdc_rebalance_failure(&UsdcRebalanceEvent::SwapOverdeposited {
+                deposits: Vec::new(),
+                held_at: timestamp(5),
+            }),
+            Some((FailureEventType::BridgingFailed, timestamp(5)))
         );
 
         let (event_type, _) = usdc_rebalance_failure(&UsdcRebalanceEvent::DepositFailed {
