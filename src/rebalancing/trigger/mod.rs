@@ -39612,6 +39612,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn offchain_equity_snapshot_recovery_reconciles_a_reading_that_already_has_the_mints_shares()
+     {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory =
+            InventoryView::default().with_equity(symbol.clone(), shares(20), shares(80));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = issuer_request_id("mint-rejected-across-offchain-snapshot-recovery");
+
+        for event in [
+            make_mint_requested(&symbol, float!(30)),
+            make_mint_accepted(),
+        ] {
+            harness
+                .receive::<TokenizedEquityMint>(id.clone(), event)
+                .await
+                .unwrap();
+        }
+
+        // The provider rejected the mint and returned the shares, so the
+        // broker reading already holds the 30 the kept inflight still counts.
+        trigger
+            .on_snapshot_recovery(
+                RebalancingServiceError::Inventory(InventoryViewError::Equity(
+                    InventoryError::NegativeInflight {
+                        value: FractionalShares::new(float!(-1)),
+                    },
+                )),
+                InventorySnapshotEvent::OffchainEquity {
+                    positions: BTreeMap::from([(symbol.clone(), shares(80))]),
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        harness
+            .receive::<TokenizedEquityMint>(id.clone(), make_mint_acceptance_failed())
+            .await
+            .unwrap();
+
+        let [(_, generation)] = trigger
+            .divergence_gate
+            .claim_pending_offchain_equity_reconciles()[..]
+        else {
+            panic!("a forced write that kept a mint's inflight must request an offchain reconcile");
+        };
+
+        trigger
+            .on_snapshot(InventorySnapshotEvent::OffchainEquityReconciled {
+                symbol: symbol.clone(),
+                position: shares(80),
+                fetched_at: Utc::now() + ChronoDuration::seconds(5),
+                ledger_position: Some(shares(110)),
+                consecutive_polls: 0,
+                generation: Some(generation),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_available(&symbol, Venue::Hedging),
+            Some(shares(80)),
+            "the reconcile must drop the shares the cancelled mint counted twice"
+        );
+    }
+
+    #[tokio::test]
     async fn recovery_path_expires_timed_out_mints_before_reapplying_inflight() {
         let symbol = Symbol::new("AAPL").unwrap();
         let fetched_at = Utc::now();
