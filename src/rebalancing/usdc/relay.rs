@@ -8912,7 +8912,7 @@ mod tests {
                 &relay_api,
                 store.clone(),
                 RelayHopCtx {
-                    fill_timeout: Duration::from_millis(1),
+                    fill_timeout: Duration::ZERO,
                     ..relay_bounds()
                 },
             )
@@ -8990,7 +8990,7 @@ mod tests {
                 &relay_api,
                 store.clone(),
                 RelayHopCtx {
-                    fill_timeout: Duration::from_millis(1),
+                    fill_timeout: Duration::ZERO,
                     ..relay_bounds()
                 },
             )
@@ -9198,7 +9198,7 @@ mod tests {
                 &relay_api,
                 store.clone(),
                 RelayHopCtx {
-                    fill_timeout: Duration::from_millis(1),
+                    fill_timeout: Duration::ZERO,
                     ..relay_bounds()
                 },
             )
