@@ -326,7 +326,7 @@ impl UsdcRebalanceStage {
                 Some(Self::SwapQuoted)
             }
             SwapDepositPrepared { .. } => Some(Self::SwapDepositPrepared),
-            SwapDeposited { .. } => Some(Self::SwapDeposited),
+            SwapDeposited { .. } | SwapDepositAdopted { .. } => Some(Self::SwapDeposited),
             SwapRefunded { .. }
             | SwapCompletionRecovered {
                 payment: SwapRecovery::Refund { .. },
@@ -405,7 +405,14 @@ impl UsdcRebalanceStage {
             (Self::SwapDepositPrepared, SwapDepositPrepared { prepared_at, .. }) => {
                 Some(*prepared_at)
             }
-            (Self::SwapDeposited, SwapDeposited { deposited_at, .. }) => Some(*deposited_at),
+            (
+                Self::SwapDeposited,
+                SwapDeposited { deposited_at, .. }
+                | SwapDepositAdopted {
+                    adopted_at: deposited_at,
+                    ..
+                },
+            ) => Some(*deposited_at),
             (Self::Bridged, Bridged { minted_at, .. }) => Some(*minted_at),
             (Self::Bridged, BridgingCompletionRecovered { recovered_at, .. })
             | (Self::DepositConfirmed, DepositCompletionRecovered { recovered_at, .. }) => {
@@ -1171,6 +1178,7 @@ impl RebalancingService {
             | SwapDepositReverted { .. }
             | SwapDepositPrepared { .. }
             | SwapDeposited { .. }
+            | SwapDepositAdopted { .. }
             | SwapRefunded { .. }
             | SwapEscrowUnresolved { .. }
             | SwapCompletionRecovered {
@@ -3821,6 +3829,15 @@ mod tests {
         entry.track_progress(&withdrawal_confirmed_event());
         assert_eq!(entry.stage, UsdcRebalanceStage::WithdrawalConfirmed);
         assert_eq!(entry.last_progress_at, ts(103));
+
+        entry.track_progress(&UsdcRebalanceEvent::SwapDepositAdopted {
+            order_id: B256::repeat_byte(0x0a),
+            deposit_tx: TxHash::repeat_byte(0xc2),
+            deposit_block: 12,
+            adopted_at: ts(150),
+        });
+        assert_eq!(entry.stage, UsdcRebalanceStage::SwapDeposited);
+        assert_eq!(entry.last_progress_at, ts(150));
     }
 
     #[test]

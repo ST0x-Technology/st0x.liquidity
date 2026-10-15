@@ -685,6 +685,7 @@ impl StoredOperation {
             | UsdcRebalanceEvent::SwapApprovePrepared { .. }
             | UsdcRebalanceEvent::SwapDepositPrepared { .. }
             | UsdcRebalanceEvent::SwapDeposited { .. }
+            | UsdcRebalanceEvent::SwapDepositAdopted { .. }
             | UsdcRebalanceEvent::SwapRequoted { .. }
             | UsdcRebalanceEvent::SwapDepositReverted { .. }
             | UsdcRebalanceEvent::RelayFillVerified { .. }
@@ -1001,7 +1002,11 @@ fn observed_at(event: &UsdcRebalanceEvent) -> DateTime<Utc> {
         | UsdcRebalanceEvent::SwapDepositPrepared { prepared_at, .. } => *prepared_at,
         UsdcRebalanceEvent::SwapQuoted { quoted_at, .. }
         | UsdcRebalanceEvent::SwapRequoted { quoted_at, .. } => *quoted_at,
-        UsdcRebalanceEvent::SwapDeposited { deposited_at, .. } => *deposited_at,
+        UsdcRebalanceEvent::SwapDeposited { deposited_at, .. }
+        | UsdcRebalanceEvent::SwapDepositAdopted {
+            adopted_at: deposited_at,
+            ..
+        } => *deposited_at,
         UsdcRebalanceEvent::SwapDepositReverted { reverted_at, .. } => *reverted_at,
         UsdcRebalanceEvent::RelayFillVerified { filled_at, .. } => *filled_at,
         UsdcRebalanceEvent::SwapRefunded { refunded_at, .. } => *refunded_at,

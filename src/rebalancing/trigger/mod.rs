@@ -10657,6 +10657,7 @@ mod tests {
     use rain_math_float::Float;
     use serde_json::json;
     use sqlx::SqlitePool;
+    use st0x_bridge::SwapDeposit;
     use st0x_bridge::corridor::HopKind;
     use st0x_config::{
         ChainCashAsset, ChainEquities, ChainEquityAsset, ExecutionThreshold, ImbalanceThreshold,
@@ -48935,7 +48936,8 @@ mod tests {
     }
 
     /// Every Relay swap state a resume moves on is re-armed at startup when
-    /// its job is lost, even past a terminal job row; a short refund, a
+    /// its job is lost, even past a terminal job row, also a deposit the
+    /// escrow scan adopted; a short refund, a
     /// refund paid at the other end and a Relay failure stay held for the
     /// operator.
     #[tokio::test]
@@ -48964,6 +48966,30 @@ mod tests {
         let fail = UsdcRebalanceCommand::FailSwap {
             reason: "Relay reported Failure".to_string(),
         };
+        // The deposit of order 0x0d reverted, then a reorg landed it, and the
+        // escrow scan of the re-quote adopted it: the latest event is the
+        // adoption.
+        let adopted = vec![
+            quote.clone(),
+            prepare.clone(),
+            UsdcRebalanceCommand::RecordSwapDepositReverted {
+                deposit_tx: TxHash::repeat_byte(0xa2),
+            },
+            UsdcRebalanceCommand::RequoteSwap {
+                quote: Box::new(swap_quote_for_test(
+                    U256::from(100_000_000u64),
+                    B256::repeat_byte(0x0e),
+                )),
+            },
+            UsdcRebalanceCommand::AdoptSwapDeposit {
+                deposit: SwapDeposit {
+                    tx: TxHash::repeat_byte(0xa2),
+                    order_id: B256::repeat_byte(0x0d),
+                    amount: U256::from(100_000_000u64),
+                    block: 9,
+                },
+            },
+        ];
 
         for direction in [
             RebalanceDirection::BaseToAlpaca,
@@ -48993,6 +49019,7 @@ mod tests {
                     "SwapDeposited",
                     true,
                 ),
+                (adopted.clone(), "SwapDeposited", true),
                 (
                     vec![
                         quote.clone(),

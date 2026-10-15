@@ -77,7 +77,9 @@ that did not complete may need Relay's manual review. Where the outcome hangs on
 `TRANSACTION_NOT_INCLUDED` failure), a body without the field is
 `RelayError::Decode`, never an empty list: a not-included failure that dropped
 the field must not settle as a terminal `Failure`. `Decode` is not retried
-within the call.
+within the call. Within the fill window the hop waits out a `failure` whose
+`deposit_txs` do not list the transfer's deposit: an adopted deposit of a
+reverted order can first read Relay's failure of the reverted attempt.
 
 A `failure` with `TRANSACTION_NOT_INCLUDED` that still lists a tx is
 `IntentStatus::NotIncluded` (not terminal): that tx may confirm later. With no
@@ -304,7 +306,9 @@ counting the inclusion block (`RelayCtx` takes each end's count, at least 1): a
 lagging load-balanced node may not have indexed the newest blocks, and a deposit
 there is not confirmed yet. Orders stay fillable for about a week
 (`RelayQuote::deadline`), so the scan takes whatever floor the caller gives it;
-no shorter window is assumed.
+no shorter window is assumed. The hop adopts one found deposit, of an order
+quoted for the current quote's amount, as the transfer's deposit, and holds on
+any other find (see SPEC.md, "Relay recovery").
 
 ### Proofs
 

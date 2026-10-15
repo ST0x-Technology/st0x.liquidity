@@ -485,6 +485,7 @@ fn usdc_rebalance_failure(event: &UsdcRebalanceEvent) -> Option<(FailureEventTyp
         | UsdcRebalanceEvent::SwapApprovePrepared { .. }
         | UsdcRebalanceEvent::SwapDepositPrepared { .. }
         | UsdcRebalanceEvent::SwapDeposited { .. }
+        | UsdcRebalanceEvent::SwapDepositAdopted { .. }
         | UsdcRebalanceEvent::SwapRequoted { .. }
         | UsdcRebalanceEvent::SwapDepositReverted { .. }
         | UsdcRebalanceEvent::RelayFillVerified { .. }
