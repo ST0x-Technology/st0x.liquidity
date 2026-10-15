@@ -147,13 +147,15 @@ impl BridgeDirection {
 #[cfg(any(test, feature = "test-support"))]
 pub const TOKEN_MESSENGER_V2: Address = address!("0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d");
 #[cfg(not(any(test, feature = "test-support")))]
-const TOKEN_MESSENGER_V2: Address = address!("0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d");
+pub(crate) const TOKEN_MESSENGER_V2: Address =
+    address!("0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d");
 
 /// CCTP MessageTransmitterV2 contract address (same on all supported chains).
 #[cfg(any(test, feature = "test-support"))]
 pub const MESSAGE_TRANSMITTER_V2: Address = address!("0x81D40F21F12A8F0E3252Bccb954D722d4c464B64");
 #[cfg(not(any(test, feature = "test-support")))]
-const MESSAGE_TRANSMITTER_V2: Address = address!("0x81D40F21F12A8F0E3252Bccb954D722d4c464B64");
+pub(crate) const MESSAGE_TRANSMITTER_V2: Address =
+    address!("0x81D40F21F12A8F0E3252Bccb954D722d4c464B64");
 
 #[cfg(any(test, feature = "test-support"))]
 pub const CIRCLE_API_BASE: &str = "https://iris-api.circle.com";

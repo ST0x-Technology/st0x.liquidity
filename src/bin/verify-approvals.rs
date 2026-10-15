@@ -47,11 +47,12 @@ async fn verify(
         }
         Ok(ApprovalPolicyVerification::Verified {
             target_count,
+            corridor_call_count,
             policy_count,
         }) => {
             eprintln!(
                 "Turnkey approval policy verification passed: {target_count} startup targets \
-                 covered by {policy_count} policies"
+                 and {corridor_call_count} corridor calls covered by {policy_count} policies"
             );
             std::process::ExitCode::SUCCESS
         }

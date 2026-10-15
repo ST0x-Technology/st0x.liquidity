@@ -296,8 +296,16 @@ automated path for this, the operator deposits it. Prerequisites, all per chain:
   `approve`, Raindex `deposit4`/`withdraw4` against the chain's orderbook or
   inventory, ERC-4626 `deposit`/`redeem` on the wrapper vaults, and the plain
   ERC-20 `transfer` to the issuer redemption wallet. The deploy gate
-  (`verify-approvals`) proves the approval policies; the rest are exercised by
-  the commands below.
+  (`verify-approvals`) proves the approval policies and, for each served cash
+  corridor, every call it signs on both of its ends, each on its own chain id:
+  the hop calls (CCTP: the USDC approve, `depositForBurn` and `receiveMessage`;
+  Relay: the stable's approve to the depository and `depositErc20`), the
+  corridor chain's vault `withdraw4`/`deposit4`, and the Ethereum USDC
+  `transfer` to Alpaca. The Alpaca deposit address is only known at run time, so
+  the gate cannot prove a condition on the `transfer` recipient and refuses a
+  policy that constrains it; the policy requirements for the Alpaca transfer are
+  in [RAI-3384](https://linear.app/makeitrain/issue/RAI-3384). The rest are
+  exercised by the commands below.
 
 Then, per asset:
 
