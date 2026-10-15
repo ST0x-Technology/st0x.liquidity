@@ -2626,10 +2626,12 @@ impl RebalancingService {
                     self.usdc_guards.release(&id);
                 }
                 UsdcTimeoutCleanup::PreservedPostBurn { tracking, elapsed } => {
-                    self.usdc_guards
-                        .hold(tracking.corridor.chain(), &id, tracking.direction);
-                    self.usdc_guards
-                        .record_amount(&id, tracking.initiated_amount);
+                    self.usdc_guards.hold(
+                        tracking.corridor.chain(),
+                        &id,
+                        tracking.direction,
+                        tracking.initiated_amount,
+                    );
 
                     // The preserved entry keeps its original `last_progress_at`,
                     // so every subsequent sweep re-selects it. Log once per stuck
@@ -2723,15 +2725,15 @@ impl RebalancingService {
                         None => queue.push(job).await?,
                     }
                     self.usdc_guards
-                        .hold(corridor.chain(), &id, tracking.direction);
+                        .hold(corridor.chain(), &id, tracking.direction, amount);
                 }
                 UsdcTimeoutCleanup::HeldForUnservedCorridor {
                     corridor,
                     direction,
                     amount,
                 } => {
-                    self.usdc_guards.hold(corridor.chain(), &id, direction);
-                    self.usdc_guards.record_amount(&id, amount);
+                    self.usdc_guards
+                        .hold(corridor.chain(), &id, direction, amount);
                     self.page_unserved_corridor_once(&id, corridor, direction)
                         .await;
                 }
@@ -2740,10 +2742,12 @@ impl RebalancingService {
                     elapsed,
                     state,
                 } => {
-                    self.usdc_guards
-                        .hold(tracking.corridor.chain(), &id, tracking.direction);
-                    self.usdc_guards
-                        .record_amount(&id, tracking.initiated_amount);
+                    self.usdc_guards.hold(
+                        tracking.corridor.chain(),
+                        &id,
+                        tracking.direction,
+                        tracking.initiated_amount,
+                    );
                     self.page_relay_withdrawal_hold_once(&id, &tracking, elapsed, &state)
                         .await;
                 }
@@ -2765,8 +2769,12 @@ impl RebalancingService {
         state: &'static str,
         recovery: &'static str,
     ) {
-        self.usdc_guards
-            .hold(tracking.corridor.chain(), id, tracking.direction);
+        self.usdc_guards.hold(
+            tracking.corridor.chain(),
+            id,
+            tracking.direction,
+            tracking.initiated_amount,
+        );
 
         let first_log = self
             .unconfirmed_burn_hold_logged
@@ -6583,7 +6591,10 @@ impl RebalancingService {
         // The id is minted before the claim so the guard records which
         // transfer holds it; a refused or undispatched claim leaves no row.
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let guard = match self.usdc_guards.try_claim(chain, &id, sized.direction()) {
+        let guard = match self
+            .usdc_guards
+            .try_claim(chain, &id, sized.direction(), sized.amount())
+        {
             Ok(guard) => guard,
             Err(refusal) => {
                 debug!(
@@ -6595,7 +6606,6 @@ impl RebalancingService {
                 return;
             }
         };
-        self.usdc_guards.record_amount(&id, sized.amount());
 
         self.dispatch_claimed_usdc_operation(
             usdc, usdc_limit, reserved, admission, sized, id, guard,
@@ -6633,7 +6643,7 @@ impl RebalancingService {
             );
             return;
         }
-        self.usdc_guards.record_amount(&id, operation.amount());
+        guard.resize(operation.amount());
 
         // Again under the claim: a conversion that failed after the read
         // above holds before its guard is released, so a claim taken on that
@@ -7251,16 +7261,15 @@ impl RebalancingService {
         // 2. Another holder on this corridor does not: gate 2 proved it holds
         // nothing durably (a racing trigger claim, or one a separate process
         // already made terminal), so this id joins it as a holder once the
-        // push succeeds. A claim records its amount at once, so the other
-        // corridors count it through the awaits below.
-        let claim = match self
-            .usdc_guards
-            .try_claim(state.corridor().chain(), id, direction)
-        {
-            Ok(claim) => {
-                self.usdc_guards.record_amount(id, state.amount());
-                Some(claim)
-            }
+        // push succeeds. A claim carries its amount, so the other corridors
+        // count it through the awaits below.
+        let claim = match self.usdc_guards.try_claim(
+            state.corridor().chain(),
+            id,
+            direction,
+            state.amount(),
+        ) {
+            Ok(claim) => Some(claim),
             Err(ClaimRefusal::CorridorHeld) => None,
             Err(
                 refusal @ (ClaimRefusal::AlpacaOutboundElsewhere | ClaimRefusal::CorridorUnread),
@@ -7332,8 +7341,8 @@ impl RebalancingService {
                 if let Some(claim) = claim {
                     claim.defuse();
                 }
-                self.usdc_guards.hold(corridor.chain(), id, direction);
-                self.usdc_guards.record_amount(id, amount);
+                self.usdc_guards
+                    .hold(corridor.chain(), id, direction, amount);
                 // An operator resuming a USDC transfer re-arms the under-funded page.
                 self.underfunded_alerts.reset_all();
                 info!(
@@ -7453,7 +7462,7 @@ impl RebalancingService {
         // run two transfers on one corridor.
         let claim = self
             .usdc_guards
-            .try_claim(chain, &id, direction)
+            .try_claim(chain, &id, direction, amount)
             .map_err(|refusal| {
                 warn!(target: "rebalance", %id, %refusal, "Manual USDC transfer refused");
                 match refusal {
@@ -7463,7 +7472,6 @@ impl RebalancingService {
                     | ClaimRefusal::CorridorUnread => UsdcResumeError::GuardHeldElsewhere,
                 }
             })?;
-        self.usdc_guards.record_amount(&id, amount);
 
         // Redeem the admission and hold the gate through the push, like the
         // trigger's dispatch: a cash engagement during the awaits above
@@ -8870,8 +8878,8 @@ impl RebalancingService {
         }
 
         for (id, corridor, direction, amount) in &held {
-            self.usdc_guards.hold(corridor.chain(), id, *direction);
-            self.usdc_guards.record_amount(id, *amount);
+            self.usdc_guards
+                .hold(corridor.chain(), id, *direction, *amount);
         }
         let unclassified = !unresolved_ids.is_empty() || !unparseable.is_empty();
         if unclassified {
@@ -14415,6 +14423,7 @@ mod tests {
             Chain::Base,
             &UsdcRebalanceId(Uuid::new_v4()),
             RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
         );
 
         trigger.check_and_trigger_usdc().await;
@@ -15500,9 +15509,12 @@ mod tests {
         let trigger = make_trigger().await;
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
         assert!(trigger.usdc_guards.is_held(Chain::Base));
 
         trigger.usdc_guards.release(&id);
@@ -20854,9 +20866,12 @@ mod tests {
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Ethereum, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Ethereum,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
 
         harness
             .receive::<UsdcRebalance>(
@@ -21214,9 +21229,12 @@ mod tests {
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
 
         harness
             .receive::<UsdcRebalance>(
@@ -21382,9 +21400,12 @@ mod tests {
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
 
         harness
             .receive::<UsdcRebalance>(
@@ -21589,9 +21610,12 @@ mod tests {
             let harness = ReactorHarness::new(Arc::clone(&trigger));
             let id = UsdcRebalanceId(Uuid::new_v4());
 
-            trigger
-                .usdc_guards
-                .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+            trigger.usdc_guards.hold(
+                Chain::Base,
+                &id,
+                RebalanceDirection::AlpacaToBase,
+                Usdc::ZERO,
+            );
 
             for event in scenario.events {
                 harness
@@ -21625,9 +21649,12 @@ mod tests {
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
 
         for event in [
             make_usdc_conversion_initiated(RebalanceDirection::AlpacaToBase, usdc(400)),
@@ -22114,9 +22141,12 @@ mod tests {
         let id = seed_converting_alpaca_to_base(&store).await;
         force_market_making_push_failure(&trigger).await;
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
 
         let error = trigger
             .resume_usdc_transfer(&pool, &id, RebalanceDirection::AlpacaToBase)
@@ -22174,7 +22204,12 @@ mod tests {
         drop(
             trigger
                 .usdc_guards
-                .try_claim(Chain::Base, &id, RebalanceDirection::AlpacaToBase)
+                .try_claim(
+                    Chain::Base,
+                    &id,
+                    RebalanceDirection::AlpacaToBase,
+                    Usdc::ZERO,
+                )
                 .expect("the returned id must hold the Base guard"),
         );
         assert!(
@@ -22182,7 +22217,8 @@ mod tests {
                 trigger.usdc_guards.try_claim(
                     Chain::Base,
                     &UsdcRebalanceId(Uuid::new_v4()),
-                    RebalanceDirection::AlpacaToBase
+                    RebalanceDirection::AlpacaToBase,
+                    Usdc::ZERO
                 ),
                 Err(ClaimRefusal::CorridorHeld)
             ),
@@ -22264,9 +22300,12 @@ mod tests {
     async fn manual_start_is_refused_while_another_id_holds_the_corridor_guard() {
         let (trigger, pool, _store) = make_resume_trigger().await;
         let other = UsdcRebalanceId(Uuid::new_v4());
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &other, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &other,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
 
         let error = trigger
             .start_manual_usdc_transfer(
@@ -22736,9 +22775,12 @@ mod tests {
             let harness = ReactorHarness::new(Arc::clone(&trigger));
             let id = UsdcRebalanceId(Uuid::new_v4());
 
-            trigger
-                .usdc_guards
-                .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+            trigger.usdc_guards.hold(
+                Chain::Base,
+                &id,
+                RebalanceDirection::BaseToAlpaca,
+                Usdc::ZERO,
+            );
 
             for event in scenario.events {
                 harness
@@ -22767,9 +22809,12 @@ mod tests {
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
 
         harness
             .receive::<UsdcRebalance>(
@@ -22854,9 +22899,12 @@ mod tests {
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
 
         harness
             .receive::<UsdcRebalance>(
@@ -22935,9 +22983,12 @@ mod tests {
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
 
         harness
             .receive::<UsdcRebalance>(
@@ -22999,9 +23050,12 @@ mod tests {
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
 
         // No prior Initiated/BridgingInitiated events: in-memory tracking is empty,
         // mirroring a restart where only the nonce proves the burn happened.
@@ -23050,9 +23104,12 @@ mod tests {
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
 
         for event in [
             make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(400)),
@@ -23118,9 +23175,12 @@ mod tests {
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
 
         for event in [
             make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(400)),
@@ -23202,9 +23262,12 @@ mod tests {
                     base_usdc_rebalance(RebalanceDirection::BaseToAlpaca),
                 );
         }
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
         assert!(!trigger.usdc_tracking.read().await.contains_key(&id));
         assert_eq!(
             trigger.inventory.read().await.active_usdc_rebalance(),
@@ -23274,9 +23337,12 @@ mod tests {
                     base_usdc_rebalance(RebalanceDirection::AlpacaToBase),
                 );
         }
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
         assert!(!trigger.usdc_tracking.read().await.contains_key(&id));
         // Sanity: 400 moved from Hedging available (900 -> 500) to inflight.
         assert_usdc_inventory_balances(&trigger, usdc(100), Usdc::ZERO, usdc(500), usdc(400)).await;
@@ -23477,9 +23543,12 @@ mod tests {
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
 
         for event in [
             make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(400)),
@@ -23557,9 +23626,12 @@ mod tests {
         let trigger = reactor.clone();
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
         trigger.usdc_tracking.write().await.insert(
             id.clone(),
             usdc::UsdcRebalanceTracking {
@@ -25501,9 +25573,12 @@ mod tests {
         let id = UsdcRebalanceId(Uuid::new_v4());
 
         // Mark USDC as in-progress.
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
         assert!(trigger.usdc_guards.is_held(Chain::Base));
 
         harness
@@ -25542,9 +25617,12 @@ mod tests {
         let id = UsdcRebalanceId(Uuid::new_v4());
 
         // The guard is armed when the rebalance is initiated.
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
 
         // Initiated sets up tracking so the recovery event has bridged-amount
         // context; the guard stays held (non-terminal).
@@ -25599,9 +25677,12 @@ mod tests {
         let id = UsdcRebalanceId(Uuid::new_v4());
 
         // The guard is armed when the rebalance is initiated.
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
 
         harness
             .receive::<UsdcRebalance>(
@@ -25671,9 +25752,12 @@ mod tests {
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
 
         harness
             .receive::<UsdcRebalance>(id.clone(), make_usdc_bridged())
@@ -25718,9 +25802,12 @@ mod tests {
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
 
         harness
             .receive::<UsdcRebalance>(
@@ -25768,9 +25855,12 @@ mod tests {
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
 
         harness
             .receive::<UsdcRebalance>(
@@ -25831,9 +25921,12 @@ mod tests {
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
         trigger.usdc_tracking.write().await.insert(
             id.clone(),
             usdc::UsdcRebalanceTracking {
@@ -25934,9 +26027,12 @@ mod tests {
             .await
             .unwrap();
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
         trigger.usdc_tracking.write().await.insert(
             id.clone(),
             usdc::UsdcRebalanceTracking {
@@ -26001,9 +26097,12 @@ mod tests {
         .await;
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
         trigger.usdc_tracking.write().await.insert(
             id.clone(),
             usdc::UsdcRebalanceTracking {
@@ -26146,9 +26245,12 @@ mod tests {
         .await
         .unwrap();
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
         trigger.usdc_tracking.write().await.insert(
             id.clone(),
             usdc::UsdcRebalanceTracking {
@@ -26203,9 +26305,12 @@ mod tests {
             .await
             .unwrap();
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
         trigger.usdc_tracking.write().await.insert(
             id.clone(),
             usdc::UsdcRebalanceTracking {
@@ -26266,9 +26371,12 @@ mod tests {
             .await
             .unwrap();
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
         trigger.usdc_tracking.write().await.insert(
             id.clone(),
             usdc::UsdcRebalanceTracking {
@@ -29966,9 +30074,12 @@ mod tests {
             .await
             .unwrap();
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
         trigger.usdc_tracking.write().await.insert(
             id.clone(),
             usdc::UsdcRebalanceTracking {
@@ -30023,9 +30134,12 @@ mod tests {
         let trigger = reactor.clone();
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
         trigger.usdc_tracking.write().await.insert(
             id.clone(),
             usdc::UsdcRebalanceTracking {
@@ -30102,9 +30216,12 @@ mod tests {
         let trigger = reactor.clone();
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
         trigger.usdc_tracking.write().await.insert(
             id.clone(),
             usdc::UsdcRebalanceTracking {
@@ -30213,9 +30330,12 @@ mod tests {
         // tracking shows a post-burn stage (BridgingInitiated), as it was when
         // DepositFailed arrived. The CLI's OperatorReconciled event only advanced
         // the durable store; in-memory state did not change.
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
         trigger.usdc_tracking.write().await.insert(
             id.clone(),
             usdc::UsdcRebalanceTracking {
@@ -30341,9 +30461,12 @@ mod tests {
             )
             .await;
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
         // last_progress_at = now: elapsed is ~0, well within the 30-minute
         // transfer_timeout. The sweep must still detect Reconciled and clear.
         trigger.usdc_tracking.write().await.insert(
@@ -30461,9 +30584,12 @@ mod tests {
             .await;
 
         let seed_tracking = || async {
-            trigger
-                .usdc_guards
-                .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+            trigger.usdc_guards.hold(
+                Chain::Base,
+                &id,
+                RebalanceDirection::BaseToAlpaca,
+                Usdc::ZERO,
+            );
             trigger.usdc_tracking.write().await.insert(
                 id.clone(),
                 usdc::UsdcRebalanceTracking {
@@ -30559,9 +30685,12 @@ mod tests {
             )
             .await;
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
         trigger.usdc_tracking.write().await.insert(
             id.clone(),
             usdc::UsdcRebalanceTracking {
@@ -30629,9 +30758,12 @@ mod tests {
         // Do NOT call set_stores -- usdc_store stays None.
 
         let id = UsdcRebalanceId(Uuid::new_v4());
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
         trigger.usdc_tracking.write().await.insert(
             id.clone(),
             usdc::UsdcRebalanceTracking {
@@ -30740,9 +30872,12 @@ mod tests {
             )
             .await;
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
         trigger.usdc_tracking.write().await.insert(
             id.clone(),
             usdc::UsdcRebalanceTracking {
@@ -30849,9 +30984,12 @@ mod tests {
             .await;
 
         let id = UsdcRebalanceId(Uuid::new_v4());
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
         trigger.usdc_tracking.write().await.insert(
             id.clone(),
             usdc::UsdcRebalanceTracking {
@@ -30927,9 +31065,12 @@ mod tests {
             .await;
 
         let id = UsdcRebalanceId(Uuid::new_v4());
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
         trigger.usdc_tracking.write().await.insert(
             id.clone(),
             usdc::UsdcRebalanceTracking {
@@ -31049,9 +31190,12 @@ mod tests {
             )
             .await;
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
         trigger.usdc_tracking.write().await.insert(
             id.clone(),
             usdc::UsdcRebalanceTracking {
@@ -31414,9 +31558,12 @@ mod tests {
             .await
             .unwrap();
         // The trigger's claim for this transfer.
-        service
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+        service.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
 
         let past_timeout = Utc::now() + ChronoDuration::minutes(31);
         service
@@ -32033,9 +32180,12 @@ mod tests {
         let trigger = reactor.clone();
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
         trigger.usdc_tracking.write().await.insert(
             id.clone(),
             usdc::UsdcRebalanceTracking {
@@ -32131,9 +32281,12 @@ mod tests {
         .await;
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
         trigger.usdc_tracking.write().await.insert(
             id.clone(),
             usdc::UsdcRebalanceTracking {
@@ -32515,9 +32668,12 @@ mod tests {
             )
             .await;
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            id,
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
         trigger.usdc_tracking.write().await.insert(
             id.clone(),
             usdc::UsdcRebalanceTracking {
@@ -34131,6 +34287,7 @@ mod tests {
                         chain,
                         &UsdcRebalanceId(Uuid::new_v4()),
                         RebalanceDirection::BaseToAlpaca,
+                        Usdc::ZERO,
                     ),
                     Err(ClaimRefusal::Unclassified)
                 ),
@@ -34176,6 +34333,7 @@ mod tests {
                         chain,
                         &UsdcRebalanceId(Uuid::new_v4()),
                         RebalanceDirection::BaseToAlpaca,
+                        Usdc::ZERO,
                     ),
                     Err(ClaimRefusal::Unclassified)
                 ),
@@ -34383,9 +34541,12 @@ mod tests {
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
         // Restart-re-armed state: guard latched, no tracking entry.
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
 
         harness
             .receive::<UsdcRebalance>(id.clone(), make_usdc_conversion_failed())
@@ -34499,9 +34660,12 @@ mod tests {
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
 
         harness
             .receive::<UsdcRebalance>(id.clone(), make_usdc_conversion_failed())
@@ -34543,9 +34707,12 @@ mod tests {
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
 
         harness
             .receive::<UsdcRebalance>(
@@ -34598,9 +34765,12 @@ mod tests {
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
 
         harness
             .receive::<UsdcRebalance>(
@@ -35228,9 +35398,12 @@ mod tests {
         let id = UsdcRebalanceId(Uuid::new_v4());
 
         // Set in_progress flag
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
         assert!(trigger.usdc_guards.is_held(Chain::Base));
 
         // React to events including Initiated (required for react to process)
@@ -38869,7 +39042,12 @@ mod tests {
             let id = UsdcRebalanceId(Uuid::new_v4());
             trigger
                 .usdc_guards
-                .try_claim(Chain::Robinhood, &id, RebalanceDirection::BaseToAlpaca)
+                .try_claim(
+                    Chain::Robinhood,
+                    &id,
+                    RebalanceDirection::BaseToAlpaca,
+                    Usdc::ZERO,
+                )
                 .unwrap()
                 .defuse();
             let initiated = make_usdc_initiated_on(
@@ -38928,7 +39106,12 @@ mod tests {
     ) {
         trigger
             .usdc_guards
-            .try_claim(Chain::Robinhood, id, RebalanceDirection::BaseToAlpaca)
+            .try_claim(
+                Chain::Robinhood,
+                id,
+                RebalanceDirection::BaseToAlpaca,
+                Usdc::ZERO,
+            )
             .unwrap()
             .defuse();
         let mut history = vec![make_usdc_initiated_on(
@@ -39079,7 +39262,12 @@ mod tests {
         let id = UsdcRebalanceId(Uuid::new_v4());
         trigger
             .usdc_guards
-            .try_claim(Chain::Robinhood, &id, RebalanceDirection::BaseToAlpaca)
+            .try_claim(
+                Chain::Robinhood,
+                &id,
+                RebalanceDirection::BaseToAlpaca,
+                Usdc::ZERO,
+            )
             .unwrap()
             .defuse();
         let received = Usdc::new(float!(100.2));
@@ -41815,6 +42003,7 @@ mod tests {
             Chain::Base,
             &UsdcRebalanceId(Uuid::new_v4()),
             RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
         );
 
         UsdcRebalancingCheck.perform(&trigger).await.unwrap();
@@ -41942,9 +42131,12 @@ mod tests {
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
 
         harness
             .receive::<UsdcRebalance>(
@@ -41987,9 +42179,12 @@ mod tests {
         let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
         // Tracking IS present (unlike the "no tracking" regression test
         // above), but initiated_amount has no matching inflight reservation
         // at the source venue, so settle_transfer's confirm_inflight
@@ -42085,9 +42280,12 @@ mod tests {
         let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
         trigger.usdc_tracking.write().await.insert(
             id.clone(),
             usdc::UsdcRebalanceTracking {
@@ -42191,9 +42389,12 @@ mod tests {
         let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
         trigger.usdc_tracking.write().await.insert(
             id.clone(),
             usdc::UsdcRebalanceTracking {
@@ -42268,9 +42469,12 @@ mod tests {
         let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
         // Tracking IS present with source_transfer_started() true (stage
         // Initiated, past the pre-withdrawal ConversionInitiated/Confirmed
         // stages), but initiated_amount has no matching inflight reservation
@@ -42348,9 +42552,12 @@ mod tests {
             );
         let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
 
         harness
             .receive::<UsdcRebalance>(id.clone(), make_usdc_withdrawal_failed())
@@ -42596,9 +42803,12 @@ mod tests {
             .with_withdrawable_cash_cents(90_000);
         let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
 
         fail_alpaca_to_base_conversion(&harness, &id).await;
 
@@ -42938,7 +43148,7 @@ mod tests {
         let id = UsdcRebalanceId(Uuid::new_v4());
         let guard = trigger
             .usdc_guards
-            .try_claim(Chain::Base, &id, sized.direction())
+            .try_claim(Chain::Base, &id, sized.direction(), Usdc::ZERO)
             .unwrap();
         trigger.hold_after_conversion_failure(Utc::now()).await;
 
@@ -43168,9 +43378,12 @@ mod tests {
         )
         .await
         .unwrap();
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
 
         harness
             .receive::<UsdcRebalance>(id.clone(), make_usdc_withdrawal_failed())
@@ -43253,9 +43466,12 @@ mod tests {
             .await
             .unwrap();
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
 
         harness
             .receive::<UsdcRebalance>(
@@ -43329,9 +43545,12 @@ mod tests {
         let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
         // Tracking is present with source_transfer_started() true (stage
         // Initiated, past the pre-withdrawal conversion stages) so the cancel
         // path runs its inventory update rather than short-circuiting to
@@ -44727,10 +44946,12 @@ mod tests {
     {
         let trigger = robinhood_trigger_beside_a_base_transfer().await;
         let base = UsdcRebalanceId(Uuid::new_v4());
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &base, RebalanceDirection::BaseToAlpaca);
-        trigger.usdc_guards.record_amount(&base, usdc(50));
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &base,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(50),
+        );
 
         trigger.check_and_trigger_usdc().await;
 
@@ -44760,8 +44981,8 @@ mod tests {
                     Chain::Robinhood,
                     &robinhood,
                     RebalanceDirection::BaseToAlpaca,
+                    amount,
                 );
-                trigger.usdc_guards.record_amount(&robinhood, amount);
             }
 
             trigger.check_and_trigger_usdc().await;
@@ -45446,9 +45667,12 @@ mod tests {
                 store.clone(),
             )
             .await;
-        trigger
-            .usdc_guards
-            .hold(Chain::Robinhood, &id, RebalanceDirection::AlpacaToBase);
+        trigger.usdc_guards.hold(
+            Chain::Robinhood,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
+        );
         trigger.usdc_tracking.write().await.insert(
             id.clone(),
             usdc::UsdcRebalanceTracking {
@@ -46041,6 +46265,7 @@ mod tests {
                         chain,
                         &UsdcRebalanceId(Uuid::new_v4()),
                         RebalanceDirection::BaseToAlpaca,
+                        Usdc::ZERO,
                     ),
                     Err(ClaimRefusal::Unclassified)
                 ),
@@ -46084,13 +46309,17 @@ mod tests {
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let base_id = UsdcRebalanceId(Uuid::new_v4());
         let robinhood_id = UsdcRebalanceId(Uuid::new_v4());
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &base_id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &base_id,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
         trigger.usdc_guards.hold(
             Chain::Robinhood,
             &robinhood_id,
             RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
         );
 
         harness
@@ -46251,6 +46480,7 @@ mod tests {
             Chain::Robinhood,
             &UsdcRebalanceId(Uuid::new_v4()),
             RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
         );
         outbound.check_and_trigger_usdc().await;
         assert_eq!(
@@ -46266,6 +46496,7 @@ mod tests {
             Chain::Robinhood,
             &UsdcRebalanceId(Uuid::new_v4()),
             RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
         );
         inbound.check_and_trigger_usdc().await;
         assert_eq!(
@@ -46303,6 +46534,7 @@ mod tests {
                         chain,
                         &UsdcRebalanceId(Uuid::new_v4()),
                         RebalanceDirection::BaseToAlpaca,
+                        Usdc::ZERO,
                     ),
                     Err(ClaimRefusal::Unclassified)
                 ),
@@ -46515,6 +46747,7 @@ mod tests {
             Chain::Base,
             &UsdcRebalanceId(Uuid::new_v4()),
             RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
         ) else {
             panic!("a transfer whose corridor could not be loaded must block new claims");
         };
@@ -46555,6 +46788,7 @@ mod tests {
                 Chain::Base,
                 &UsdcRebalanceId(Uuid::new_v4()),
                 RebalanceDirection::BaseToAlpaca,
+                Usdc::ZERO,
             )
             .expect("Base is free once the transfer's corridor is read");
     }
@@ -47114,9 +47348,12 @@ mod tests {
         let (trigger, pool, store) = make_resume_trigger().await;
         let id = seed_converting_alpaca_to_base(&store).await;
         let stale = UsdcRebalanceId(Uuid::new_v4());
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &stale, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &stale,
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
+        );
 
         trigger
             .resume_usdc_transfer(&pool, &id, RebalanceDirection::AlpacaToBase)
@@ -47130,6 +47367,7 @@ mod tests {
                     Chain::Base,
                     &UsdcRebalanceId(Uuid::new_v4()),
                     RebalanceDirection::BaseToAlpaca,
+                    Usdc::ZERO,
                 ),
                 Err(ClaimRefusal::CorridorHeld)
             ),
@@ -47147,11 +47385,13 @@ mod tests {
             Chain::Base,
             &UsdcRebalanceId(Uuid::new_v4()),
             RebalanceDirection::BaseToAlpaca,
+            Usdc::ZERO,
         );
         trigger.usdc_guards.hold(
             Chain::Robinhood,
             &UsdcRebalanceId(Uuid::new_v4()),
             RebalanceDirection::AlpacaToBase,
+            Usdc::ZERO,
         );
 
         let error = trigger
@@ -47233,7 +47473,9 @@ mod tests {
                 store,
             )
             .await;
-        trigger.usdc_guards.hold(Chain::Robinhood, id, direction);
+        trigger
+            .usdc_guards
+            .hold(Chain::Robinhood, id, direction, Usdc::ZERO);
         trigger.usdc_tracking.write().await.insert(
             id.clone(),
             usdc::UsdcRebalanceTracking {

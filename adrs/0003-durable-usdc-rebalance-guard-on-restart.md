@@ -181,7 +181,8 @@ on the Alpaca side marks an incoming transfer until it lands (its first event
 marks only the source chain), so two corridors over their band in one check both
 sized a transfer to Alpaca against the same balance and overshot.
 
-Decision: each hold records its transfer's amount, and a chain-to-Alpaca
+Decision: each hold records its transfer's amount, published with the holder in
+one guard step so no corridor reads a hold without it, and a chain-to-Alpaca
 decision on one corridor adds the amounts of the other corridors'
 chain-to-Alpaca holds to the Alpaca balance. We project rather than serialize: a
 stuck hold or the fixed chain order would otherwise block every other corridor's

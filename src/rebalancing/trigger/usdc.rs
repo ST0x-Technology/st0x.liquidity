@@ -875,8 +875,8 @@ impl RebalancingService {
             },
         };
 
-        self.usdc_guards.hold(corridor.chain(), id, direction);
-        self.usdc_guards.record_amount(id, amount);
+        self.usdc_guards
+            .hold(corridor.chain(), id, direction, amount);
     }
 
     /// Latches every corridor until a restart for a post-burn failure whose
@@ -941,17 +941,14 @@ impl RebalancingService {
                     amount,
                     holds_guard,
                 } => {
-                    let holder = holds_guard.then_some((corridor.chain(), direction));
+                    let holder = holds_guard.then_some((corridor.chain(), direction, amount));
                     self.usdc_guards.resolve_unread(&id, holder);
-                    if holds_guard {
-                        self.usdc_guards.record_amount(&id, amount);
-                    }
                     let mut inventory = self.inventory.write().await;
                     if inventory.active_usdc_rebalance_entry(&id).is_none() {
                         continue;
                     }
                     *inventory = match holder {
-                        Some((chain, direction)) => inventory.clone().set_active_usdc_rebalance(
+                        Some((chain, direction, _)) => inventory.clone().set_active_usdc_rebalance(
                             id,
                             ActiveUsdcRebalance::Known { chain, direction },
                         ),
