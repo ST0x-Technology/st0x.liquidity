@@ -49415,6 +49415,90 @@ mod tests {
         );
     }
 
+    /// A restart at `SwapQuoted` re-arms the job with no tracking, and the
+    /// resumed job then records the overdeposit hold: the hold must still be
+    /// tracked, so that the sweep releases the guard once the operator
+    /// reconciles it from the CLI, without another restart.
+    #[tokio::test]
+    async fn overdeposit_hold_recorded_after_a_restart_frees_the_corridor_once_reconciled() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let mut commands = relay_withdrawn(RebalanceDirection::BaseToAlpaca)
+            .into_iter()
+            .chain(overdeposited_hold())
+            .collect::<Vec<_>>();
+        let hold = commands.pop().unwrap();
+        for command in commands {
+            store.send(&id, command).await.unwrap();
+        }
+        assert_eq!(
+            store.load(&id).await.unwrap().unwrap().state_name(),
+            "SwapQuoted"
+        );
+        let config = RebalancingServiceConfig {
+            usdc: UsdcCorridors::for_test(
+                OperationMode::Enabled,
+                [active_corridor(Chain::Robinhood, HopKind::Relay)],
+            )
+            .with_relay_hop(Chain::Robinhood, relay_bounds(1, 200)),
+            ..with_cash_on(test_config(), &[Chain::Robinhood])
+        };
+        let trigger = make_trigger_with_inventory_config(InventoryView::default(), config).await;
+        attach_stores(
+            &trigger,
+            pool.clone(),
+            test_store::<UsdcRebalance>(pool.clone(), ()),
+        )
+        .await;
+        trigger.recover_usdc_guard(&pool, &store).await.unwrap();
+        assert!(trigger.usdc_guards.is_held(Chain::Robinhood));
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            1
+        );
+        // The re-armed job records the hold below and ends.
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Done' WHERE job_type = ?")
+            .bind(std::any::type_name::<TransferUsdcToHedging>())
+            .execute(trigger.transfer_usdc_to_hedging_queue.pool())
+            .await
+            .unwrap();
+
+        let UsdcRebalanceCommand::HoldOverdepositedSwap { deposits } = &hold else {
+            panic!("expected the hold command, got {hold:?}");
+        };
+        let overdeposited = UsdcRebalanceEvent::SwapOverdeposited {
+            deposits: deposits.clone(),
+            held_at: Utc::now(),
+        };
+        store.send(&id, hold).await.unwrap();
+        trigger
+            .on_usdc_rebalance(id.clone(), overdeposited)
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+                },
+            )
+            .await
+            .unwrap();
+        let past_timeout = Utc::now()
+            + chrono::Duration::from_std(trigger.config.transfer_timeout).unwrap()
+            + chrono::Duration::seconds(1);
+        trigger
+            .expire_stuck_usdc_rebalances(past_timeout)
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_guards.is_held(Chain::Robinhood),
+            "the sweep must release the guard of the reconciled hold"
+        );
+    }
+
     /// A Relay transfer whose job apalis still owns is not re-armed again:
     /// two jobs would drive one transfer.
     #[tokio::test]
