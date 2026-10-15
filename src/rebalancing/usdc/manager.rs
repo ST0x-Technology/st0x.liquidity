@@ -2853,6 +2853,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
             | UsdcRebalance::SwapRefunded { .. }
             | UsdcRebalance::SwapEscrowUnresolved { .. }
             | UsdcRebalance::SwapFailed { .. }
+            | UsdcRebalance::SwapOverdeposited { .. }
             | UsdcRebalance::Redepositing { .. }
             | UsdcRebalance::ReturnedToSource { .. }
             | UsdcRebalance::DepositFailed { .. }
@@ -4659,6 +4660,7 @@ impl<
                 | SwapRefunded { .. }
                 | SwapEscrowUnresolved { .. }
                 | SwapFailed { .. }
+                | SwapOverdeposited { .. }
                 | Redepositing { .. }
                 | ReturnedToSource { .. }),
             ) => Err(UsdcTransferError::StateOffHop {
@@ -5833,6 +5835,7 @@ impl<
                 | UsdcRebalance::SwapRefunded { .. }
                 | UsdcRebalance::SwapEscrowUnresolved { .. }
                 | UsdcRebalance::SwapFailed { .. }
+                | UsdcRebalance::SwapOverdeposited { .. }
                 | UsdcRebalance::Redepositing { .. }
                 | UsdcRebalance::ReturnedToSource { .. }),
             ) => Err(UsdcTransferError::StateOffHop {

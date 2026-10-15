@@ -682,6 +682,7 @@ async fn ingest_rebalance(
         | UsdcRebalanceEvent::ReturnedToSource { .. }
         | UsdcRebalanceEvent::SwapEscrowUnresolved { .. }
         | UsdcRebalanceEvent::SwapFailed { .. }
+        | UsdcRebalanceEvent::SwapOverdeposited { .. }
         | UsdcRebalanceEvent::RedepositStarted { .. }
         | UsdcRebalanceEvent::RedepositSubmitted { .. }
         | UsdcRebalanceEvent::AttestationTimedOut { .. }

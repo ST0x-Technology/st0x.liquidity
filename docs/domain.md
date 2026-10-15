@@ -212,6 +212,12 @@ vault <-> hop <-> Ethereum wallet <-> Alpaca.
   a reverted order the escrow scan found on chain, of both its order's and the
   current quote's amount, taken from `SwapQuoted` as the swap's deposit into
   `SwapDeposited`.
+- **Overdeposited swap** (`HoldOverdepositedSwap` -> `SwapOverdeposited`): the
+  hold on any other find of the escrow scan, deposits of several reverted orders
+  or one of another amount, so more of the transfer's stable is with Relay or
+  refunded at the hub than one attempt's amount. It lists each **found deposit**
+  (`FoundSwapDeposit`: request id, order id, deposit tx, block, amount) and ends
+  only with `transfer reconcile`.
 - **Late adoption** (`RecoverSwapCompletion` -> `SwapCompletionRecovered`): a
   fill or refund of the failed order of a `SwapFailed`, proven after the
   transfer stopped waiting for it, adopted into `Bridged` or `SwapRefunded`.

@@ -694,11 +694,14 @@ impl StoredOperation {
             | UsdcRebalanceEvent::RedepositStarted { .. }
             | UsdcRebalanceEvent::RedepositSubmitted { .. }
             | UsdcRebalanceEvent::AttestationTimedOut { .. } => {}
-            // A Relay failure, or the stable put back into its vault: the
-            // transfer did not move the cash.
+            // A Relay failure or hold, or the stable put back into its vault:
+            // the transfer did not move the cash.
             UsdcRebalanceEvent::SwapFailed {
                 failed_at: ended_at,
                 ..
+            }
+            | UsdcRebalanceEvent::SwapOverdeposited {
+                held_at: ended_at, ..
             }
             | UsdcRebalanceEvent::ReturnedToSource {
                 returned_at: ended_at,
@@ -994,7 +997,10 @@ fn observed_at(event: &UsdcRebalanceEvent) -> DateTime<Utc> {
         | UsdcRebalanceEvent::WithdrawalFailed { failed_at, .. }
         | UsdcRebalanceEvent::BridgingFailed { failed_at, .. }
         | UsdcRebalanceEvent::DepositFailed { failed_at, .. }
-        | UsdcRebalanceEvent::SwapFailed { failed_at, .. } => *failed_at,
+        | UsdcRebalanceEvent::SwapFailed { failed_at, .. }
+        | UsdcRebalanceEvent::SwapOverdeposited {
+            held_at: failed_at, ..
+        } => *failed_at,
         UsdcRebalanceEvent::WithdrawalSubmitting { submitting_at, .. }
         | UsdcRebalanceEvent::BridgingSubmitting { submitting_at, .. } => *submitting_at,
         UsdcRebalanceEvent::DepositSendPrepared { prepared_at, .. }
@@ -2098,6 +2104,18 @@ mod tests {
 
         let recovered = fold_operation("op-relay", &events).unwrap();
         assert_eq!(recovered.status, RebalanceTimingStatus::InProgress);
+    }
+
+    #[test]
+    fn relay_overdeposit_hold_marks_operation_failed() {
+        let events = vec![UsdcRebalanceEvent::SwapOverdeposited {
+            deposits: Vec::new(),
+            held_at: timestamp(100),
+        }];
+
+        let operation = fold_operation("op-relay-hold", &events).unwrap();
+
+        assert_eq!(operation.status, RebalanceTimingStatus::Failed);
     }
 
     #[test]

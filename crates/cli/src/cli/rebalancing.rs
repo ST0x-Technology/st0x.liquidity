@@ -1196,6 +1196,7 @@ fn classify_fail_bridging_reload(state: Option<&UsdcRebalance>) -> FailBridgingO
             | UsdcRebalance::SwapRefunded { .. }
             | UsdcRebalance::SwapEscrowUnresolved { .. }
             | UsdcRebalance::SwapFailed { .. }
+            | UsdcRebalance::SwapOverdeposited { .. }
             | UsdcRebalance::Redepositing { .. }
             | UsdcRebalance::ReturnedToSource { .. }
             | UsdcRebalance::Bridged { .. }
@@ -1519,6 +1520,7 @@ pub(super) async fn clear_pending_burn_command<Writer: Write>(
         | UsdcRebalance::SwapRefunded { .. }
         | UsdcRebalance::SwapEscrowUnresolved { .. }
         | UsdcRebalance::SwapFailed { .. }
+        | UsdcRebalance::SwapOverdeposited { .. }
         | UsdcRebalance::Redepositing { .. }
         | UsdcRebalance::ReturnedToSource { .. }
         | UsdcRebalance::Bridged { .. }
