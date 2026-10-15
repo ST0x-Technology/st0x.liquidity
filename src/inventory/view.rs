@@ -608,6 +608,31 @@ where
             Ok(inventory.set_polled_venue(venue, chain, balance))
         })
     }
+
+    /// Like [`Self::force_on_snapshot`], but keeps the target slot's
+    /// inflight. For a recovery write whose inflight an active aggregate
+    /// still owns and will settle itself.
+    fn force_on_snapshot_keeping_inflight<E: std::fmt::Debug + Send + 'static>(
+        venue: Venue,
+        snapshot_balance: T,
+        recovering_from: E,
+    ) -> Box<dyn FnOnce(Self, Chain) -> Result<Self, InventoryError<T>> + Send> {
+        Box::new(move |inventory, chain| {
+            let balance = inventory.get_venue(venue, chain).unwrap_or_default();
+            warn!(
+                target: "inventory",
+                ?recovering_from,
+                inflight = ?balance.inflight(),
+                "Force-applying snapshot to recover from error, keeping inflight"
+            );
+
+            Ok(inventory.set_polled_venue(
+                venue,
+                chain,
+                balance.apply_snapshot_keeping_inflight(snapshot_balance),
+            ))
+        })
+    }
 }
 
 /// Locations where USDC may sit in transit between venues.
@@ -2523,7 +2548,8 @@ impl InventoryView {
     /// mint debits Hedging available on `MintAccepted`, so that symbol keeps
     /// its whole Hedging balance and watermark: no poll restores the
     /// inflight, and a dropped balance would fail the mint's own `Start`. A
-    /// forced broker snapshot applied after the reset still overwrites it.
+    /// forced broker snapshot applied after the reset corrects its available
+    /// and keeps its inflight.
     /// Every other field is intentionally defaulted, which is why this uses
     /// functional-update syntax rather than an exhaustive literal: a future
     /// field should default here unless it is guard state.
@@ -4602,7 +4628,10 @@ impl InventoryView {
     }
 
     /// Force a broker equity snapshot onto every symbol without an open
-    /// hedge order, advancing only those symbols' watermarks.
+    /// hedge order, advancing only those symbols' watermarks. An active
+    /// mint's symbol gets the broker reading as available but keeps its
+    /// Hedging inflight: the mint owns that inflight until its terminal
+    /// event, and its `TokensReceived` must find it to subtract.
     fn force_apply_offchain_equity(
         self,
         positions: &BTreeMap<Symbol, FractionalShares>,
@@ -4624,16 +4653,19 @@ impl InventoryView {
                 }
 
                 let primary_chain = view.primary_chain;
-                view.update_equity(
-                    symbol,
-                    Inventory::force_on_snapshot(
+                let reason = Arc::clone(reason);
+                let force = if view.active_mint(symbol).is_some() {
+                    Inventory::force_on_snapshot_keeping_inflight(
                         Venue::Hedging,
                         *snapshot_balance,
-                        Arc::clone(reason),
-                    ),
-                    now,
-                )
-                .map(|view| view.reset_equity_snapshot_skip(symbol, Venue::Hedging, primary_chain))
+                        reason,
+                    )
+                } else {
+                    Inventory::force_on_snapshot(Venue::Hedging, *snapshot_balance, reason)
+                };
+                view.update_equity(symbol, force, now).map(|view| {
+                    view.reset_equity_snapshot_skip(symbol, Venue::Hedging, primary_chain)
+                })
             })
             .map(|view| {
                 let applied: Vec<&Symbol> = positions
@@ -7067,6 +7099,63 @@ mod tests {
             Some(shares(100)),
             "a broker snapshot older than the kept watermark must not overwrite \
              the balance the mint will debit"
+        );
+    }
+
+    #[test]
+    fn force_apply_offchain_equity_keeps_only_an_active_mints_hedging_inflight() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let tsla = Symbol::new("TSLA").unwrap();
+        let now = Utc::now();
+        let view = InventoryView::default()
+            .with_equity(aapl.clone(), shares(0), shares(100))
+            .with_equity(tsla.clone(), shares(0), shares(50))
+            .set_active_mint(aapl.clone(), Chain::Base, IssuerRequestId::generate())
+            .update_equity(
+                &aapl,
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, shares(30)),
+                now,
+            )
+            .unwrap()
+            .update_equity(
+                &tsla,
+                Inventory::set_inflight(Venue::Hedging, shares(5)),
+                now,
+            )
+            .unwrap();
+
+        let forced = view
+            .force_apply_snapshot_event(
+                &InventorySnapshotEvent::OffchainEquity {
+                    positions: BTreeMap::from([
+                        (aapl.clone(), shares(68)),
+                        (tsla.clone(), shares(40)),
+                    ]),
+                    fetched_at: now,
+                },
+                now,
+                Arc::new(InventoryViewError::UsdBalanceConversion(0)),
+            )
+            .unwrap();
+
+        assert_eq!(
+            forced.equity_available(&aapl, Venue::Hedging),
+            Some(shares(68)),
+            "the broker reading must still correct the active mint's available"
+        );
+        assert_eq!(
+            forced.equity_inflight(&aapl, Venue::Hedging),
+            Some(shares(30)),
+            "the active mint must stay the only writer of its Hedging inflight"
+        );
+        assert_eq!(
+            forced.equity_available(&tsla, Venue::Hedging),
+            Some(shares(40))
+        );
+        assert_eq!(
+            forced.equity_inflight(&tsla, Venue::Hedging),
+            Some(FractionalShares::ZERO),
+            "a symbol without an active mint keeps the forced write's inflight clear"
         );
     }
 

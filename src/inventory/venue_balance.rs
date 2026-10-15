@@ -205,7 +205,8 @@ where
 
     /// Set available to the snapshot balance and keep inflight as is. Only
     /// for a caller that has already established the inflight is not part
-    /// of what the venue reports, such as startup-stranded redemptions.
+    /// of what the venue reports, such as startup-stranded redemptions, or
+    /// a forced recovery write that requests a reconcile for the case it is.
     pub(super) fn apply_snapshot_keeping_inflight(self, snapshot_balance: T) -> Self {
         Self {
             available: snapshot_balance,
