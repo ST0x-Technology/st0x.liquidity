@@ -9613,6 +9613,122 @@ mod tests {
         );
     }
 
+    /// A hold on deposits of several reverted orders whose lone approve the
+    /// node dropped does not end the attempt as done: it fails, so that a
+    /// later attempt sends the approve again, whose nonce every later send
+    /// from the wallet waits behind.
+    #[tokio::test]
+    async fn hold_on_several_reverted_deposits_sends_a_dropped_lone_approve_again() {
+        let rig = RelayRig::deploy().await;
+        MintableStable::new(rig.chain_contracts.stable, &rig.chain.deployer())
+            .mint(rig.chain.bot, U256::from(AMOUNT_IN))
+            .send()
+            .await
+            .unwrap()
+            .watch()
+            .await
+            .unwrap();
+        let second_order_id = B256::repeat_byte(0x0b);
+        rig.deposit_on_chain(REVERTED_ORDER_ID).await;
+        rig.deposit_on_chain(second_order_id).await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let quotes = mock_quote_unavailable(&relay_api);
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_reverted_and_requoted_toward_hub(&rig, &store, &id).await;
+        let mut second =
+            exact_quote(&rig.chain.bot_wallet, rig.chain_contracts, second_order_id).await;
+        second.request_id = B256::repeat_byte(0x5f);
+        let last = exact_quote(
+            &rig.chain.bot_wallet,
+            rig.chain_contracts,
+            B256::repeat_byte(0x0f),
+        )
+        .await;
+        let reverted = PreparedTransaction::for_test(TxHash::repeat_byte(0xa8), 41);
+        let approve_step = last.approve.clone().unwrap();
+        for command in [
+            UsdcRebalanceCommand::RequoteSwap {
+                quote: Box::new(second),
+            },
+            UsdcRebalanceCommand::PrepareSwapDeposit {
+                approve: None,
+                deposit: reverted.clone(),
+            },
+            UsdcRebalanceCommand::RecordSwapDepositReverted {
+                deposit_tx: reverted.tx_hash(),
+            },
+            UsdcRebalanceCommand::RequoteSwap {
+                quote: Box::new(last),
+            },
+        ] {
+            store.send(&id, command).await.unwrap();
+        }
+        let approve = rig
+            .chain
+            .bot_wallet
+            .prepare_pending(approve_step.to, approve_step.data, "split approve")
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::PrepareSwapApprove {
+                    approve: approve.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let chain_wallet: TestWallet = Arc::new(
+            BroadcastWitness::new(rig.chain.bot_wallet.clone(), store.clone(), id.clone())
+                .dropping_next_broadcast_of(approve.tx_hash()),
+        );
+        let transfer = rig
+            .transfer_through(
+                &server,
+                &relay_api,
+                store.clone(),
+                relay_bounds(),
+                chain_wallet,
+                BotGasReceiptCostEnqueuer::Disabled,
+            )
+            .await;
+        let attempt = || {
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+            )
+        };
+
+        attempt()
+            .await
+            .expect("the attempt ends")
+            .expect_err("the hold left its approve unsent");
+        assert_eq!(
+            store.load(&id).await.unwrap().unwrap().state_name(),
+            "SwapQuoted"
+        );
+
+        attempt()
+            .await
+            .expect("the retry ends")
+            .expect("the retry confirms the approve and holds");
+        let receipt = rig
+            .chain
+            .bot_wallet
+            .provider()
+            .get_transaction_receipt(approve.tx_hash())
+            .await
+            .unwrap();
+        assert!(receipt.is_some(), "the retry did not send the approve");
+        assert_eq!(
+            store.load(&id).await.unwrap().unwrap().state_name(),
+            "SwapQuoted"
+        );
+        quotes.assert_calls(0);
+    }
+
     /// An escrow left unresolved past its fill window adopts a refund Relay
     /// paid later on the origin chain, and returns it to the vault.
     #[tokio::test]
