@@ -199,3 +199,8 @@ with uneven chain balances the first one can land below its band once a later
 one's transfer lands, and cash moves back through Alpaca for a few checks; this
 coupling is accepted as a risk on RAI-3385, to revisit with a joint cash
 allocation if it shows up in production.
+
+Rollback: a build that does not hold live job rows at startup does not count an
+eventless row on the other corridors, so their first checks can send too much to
+Alpaca. Roll back to it only once every live USDC job row's transfer has
+recorded its first event or the row has finished.
