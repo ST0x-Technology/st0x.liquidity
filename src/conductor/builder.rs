@@ -209,7 +209,7 @@ pub fn configured_equity_symbols(ctx: &Ctx) -> HashSet<Symbol> {
 /// The equities one chain operates: either switch on counts, both off does
 /// not. A chain lists its own, so a symbol traded on one chain alone is
 /// required there and nowhere else.
-fn chain_equity_symbols(assets: &st0x_config::ChainAssets) -> HashSet<Symbol> {
+pub(crate) fn chain_equity_symbols(assets: &st0x_config::ChainAssets) -> HashSet<Symbol> {
     assets
         .equities
         .symbols

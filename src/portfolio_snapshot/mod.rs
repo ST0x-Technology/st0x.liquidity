@@ -708,86 +708,61 @@ mod tests {
 
     const ZERO: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
 
-    fn legacy_row(location: serde_json::Value, asset: serde_json::Value) -> serde_json::Value {
-        json!({
-            "location": location,
-            "asset": asset,
-            "available": ZERO,
-            "inflight": ZERO,
-            "usd_mark": null,
-            "mark_captured_at": null,
-        })
+    /// One location as persisted before the per-chain migration: its
+    /// read-model label and serde shape, the asset it is seeded with, and the
+    /// location it must become.
+    struct LegacyLocation {
+        label: &'static str,
+        payload: serde_json::Value,
+        asset: PortfolioAsset,
+        migrated: PortfolioLocation,
     }
 
-    /// Every location shape persisted before the per-chain migration, with
-    /// the location each must become.
-    fn legacy_locations() -> Vec<(
-        &'static str,
-        serde_json::Value,
-        serde_json::Value,
-        PortfolioLocation,
-    )> {
+    fn legacy_locations() -> Vec<LegacyLocation> {
+        let aapl = || PortfolioAsset::Equity(Symbol::new("AAPL").unwrap());
+        let onchain = |chain, form| PortfolioLocation::Onchain { chain, form };
+        let market_making = |chain: &'static str, label, chain_variant| LegacyLocation {
+            label,
+            payload: json!({"MarketMaking": chain}),
+            asset: aapl(),
+            migrated: onchain(chain_variant, OnchainForm::MarketMaking),
+        };
+
         vec![
-            (
-                "market_making:base",
-                json!({"MarketMaking": "base"}),
-                json!({"Equity": "AAPL"}),
-                PortfolioLocation::Onchain {
-                    chain: Chain::Base,
-                    form: OnchainForm::MarketMaking,
-                },
-            ),
-            (
-                "market_making:robinhood",
-                json!({"MarketMaking": "robinhood"}),
-                json!({"Equity": "AAPL"}),
-                PortfolioLocation::Onchain {
-                    chain: Chain::Robinhood,
-                    form: OnchainForm::MarketMaking,
-                },
-            ),
-            (
-                "hedging",
-                json!("Hedging"),
-                json!({"Equity": "AAPL"}),
-                PortfolioLocation::Offchain,
-            ),
-            (
-                "ethereum_wallet:ethereum",
-                json!("EthereumWallet"),
-                json!("Usdc"),
-                PortfolioLocation::Onchain {
-                    chain: Chain::Ethereum,
-                    form: OnchainForm::WalletUnwrapped,
-                },
-            ),
-            (
-                "base_wallet_unwrapped:base",
-                json!("BaseWalletUnwrapped"),
-                json!("Usdc"),
-                PortfolioLocation::Onchain {
-                    chain: Chain::Base,
-                    form: OnchainForm::WalletUnwrapped,
-                },
-            ),
-            (
-                "base_wallet_unwrapped:base",
-                json!("BaseWalletUnwrapped"),
-                json!({"Equity": "AAPL"}),
-                PortfolioLocation::Onchain {
-                    chain: Chain::Base,
-                    form: OnchainForm::WalletUnwrapped,
-                },
-            ),
-            (
-                "base_wallet_wrapped:base",
-                json!("BaseWalletWrapped"),
-                json!({"Equity": "AAPL"}),
-                PortfolioLocation::Onchain {
-                    chain: Chain::Base,
-                    form: OnchainForm::WalletWrapped,
-                },
-            ),
+            market_making("base", "market_making:base", Chain::Base),
+            market_making("ethereum", "market_making:ethereum", Chain::Ethereum),
+            market_making("hyperevm", "market_making:hyperevm", Chain::HyperEvm),
+            market_making("robinhood", "market_making:robinhood", Chain::Robinhood),
+            LegacyLocation {
+                label: "hedging",
+                payload: json!("Hedging"),
+                asset: aapl(),
+                migrated: PortfolioLocation::Offchain,
+            },
+            LegacyLocation {
+                label: "ethereum_wallet:ethereum",
+                payload: json!("EthereumWallet"),
+                asset: PortfolioAsset::Usdc,
+                migrated: onchain(Chain::Ethereum, OnchainForm::WalletUnwrapped),
+            },
+            LegacyLocation {
+                label: "base_wallet_unwrapped:base",
+                payload: json!("BaseWalletUnwrapped"),
+                asset: PortfolioAsset::Usdc,
+                migrated: onchain(Chain::Base, OnchainForm::WalletUnwrapped),
+            },
+            LegacyLocation {
+                label: "base_wallet_unwrapped:base",
+                payload: json!("BaseWalletUnwrapped"),
+                asset: aapl(),
+                migrated: onchain(Chain::Base, OnchainForm::WalletUnwrapped),
+            },
+            LegacyLocation {
+                label: "base_wallet_wrapped:base",
+                payload: json!("BaseWalletWrapped"),
+                asset: aapl(),
+                migrated: onchain(Chain::Base, OnchainForm::WalletWrapped),
+            },
         ]
     }
 
@@ -799,12 +774,7 @@ mod tests {
         let pool = pool_migrated_up_to(LAST_MIGRATION_BEFORE_PER_CHAIN_PORTFOLIO_LOCATIONS).await;
         let legacy = legacy_locations();
 
-        for (label, _, asset, _) in &legacy {
-            let asset = if *asset == json!("Usdc") {
-                "USDC"
-            } else {
-                "AAPL"
-            };
+        for location in &legacy {
             sqlx::query(
                 "INSERT INTO portfolio_snapshot \
                  (et_day, captured_at, location, asset, available_balance, inflight_balance, \
@@ -812,8 +782,8 @@ mod tests {
                  VALUES ('2026-09-01', '2026-09-01T04:05:00+00:00', ?, ?, '7', '0', '1', \
                   '2026-09-01T04:00:00+00:00')",
             )
-            .bind(label)
-            .bind(asset)
+            .bind(location.label)
+            .bind(location.asset.to_string())
             .execute(&pool)
             .await
             .unwrap();
@@ -821,7 +791,16 @@ mod tests {
 
         let rows: Vec<serde_json::Value> = legacy
             .iter()
-            .map(|(_, location, asset, _)| legacy_row(location.clone(), asset.clone()))
+            .map(|location| {
+                json!({
+                    "location": location.payload,
+                    "asset": location.asset,
+                    "available": ZERO,
+                    "inflight": ZERO,
+                    "usd_mark": null,
+                    "mark_captured_at": null,
+                })
+            })
             .collect();
         let event = json!({"Captured": {"captured_at": "2026-09-01T04:05:00Z", "rows": rows}});
         sqlx::query(
@@ -846,26 +825,27 @@ mod tests {
 
         sqlx::migrate!().run(&pool).await.unwrap();
 
-        let mut migrated_labels: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT location, asset, available_balance FROM portfolio_snapshot ORDER BY location, asset",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        migrated_labels.sort();
-        let mut expected_labels: Vec<(String, String, String)> = legacy
+        let mut migrated_rows: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT location, asset, available_balance FROM portfolio_snapshot")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        migrated_rows.sort();
+        let mut expected_rows: Vec<(String, String, String)> = legacy
             .iter()
-            .map(|(_, _, asset, location)| {
-                let asset = if *asset == json!("Usdc") {
-                    "USDC"
-                } else {
-                    "AAPL"
-                };
-                (location.to_string(), asset.to_string(), "7".to_string())
+            .map(|location| {
+                (
+                    location.migrated.to_string(),
+                    location.asset.to_string(),
+                    "7".to_string(),
+                )
             })
             .collect();
-        expected_labels.sort();
-        assert_eq!(migrated_labels, expected_labels);
+        expected_rows.sort();
+        assert_eq!(migrated_rows, expected_rows);
+
+        let expected_locations: Vec<PortfolioLocation> =
+            legacy.iter().map(|location| location.migrated).collect();
 
         let payload: String = sqlx::query_scalar(
             "SELECT payload FROM events WHERE aggregate_type = 'PortfolioSnapshot'",
@@ -878,8 +858,6 @@ mod tests {
         else {
             panic!("expected Captured, got {payload}");
         };
-        let expected_locations: Vec<PortfolioLocation> =
-            legacy.iter().map(|(_, _, _, location)| *location).collect();
         assert_eq!(
             rows.iter().map(|row| row.row.location).collect::<Vec<_>>(),
             expected_locations

@@ -179,7 +179,7 @@ mod tests {
     use st0x_execution::Symbol;
 
     use super::*;
-    use crate::inventory::view::OnchainForm;
+    use crate::inventory::OnchainForm;
 
     fn symbol(value: &str) -> Symbol {
         Symbol::new(value).unwrap()

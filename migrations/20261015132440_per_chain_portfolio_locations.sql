@@ -48,7 +48,7 @@ DROP TABLE portfolio_snapshot;
 ALTER TABLE portfolio_snapshot_new RENAME TO portfolio_snapshot;
 CREATE INDEX idx_portfolio_snapshot_et_day ON portfolio_snapshot (et_day);
 
--- PortfolioSnapshot event and snapshot payloads embed PortfolioLocation,
+-- PortfolioSnapshot Captured events and snapshot payloads embed PortfolioLocation,
 -- which is now `{"Onchain":{"chain":..,"form":..}}` or `"Offchain"`. Legacy
 -- payloads are rewritten in place (exact serde spelling, no whitespace in
 -- serde_json output), one REPLACE per legacy variant and per chain a
@@ -64,7 +64,8 @@ UPDATE events
        '"location":{"MarketMaking":"ethereum"}', '"location":{"Onchain":{"chain":"ethereum","form":"MarketMaking"}}'),
        '"location":{"MarketMaking":"hyperevm"}', '"location":{"Onchain":{"chain":"hyperevm","form":"MarketMaking"}}'),
        '"location":{"MarketMaking":"robinhood"}', '"location":{"Onchain":{"chain":"robinhood","form":"MarketMaking"}}')
- WHERE aggregate_type = 'PortfolioSnapshot';
+ WHERE aggregate_type = 'PortfolioSnapshot'
+   AND event_type = 'PortfolioSnapshotEvent::Captured';
 
 UPDATE snapshots
    SET payload = REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(

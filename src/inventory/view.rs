@@ -694,7 +694,7 @@ impl From<InFlightEquityLocation> for InFlightEquityLocationRepr {
     }
 }
 
-/// Where a balance tracked in a daily portfolio snapshot (RAI-1457) sits:
+/// Where a balance tracked in a daily portfolio snapshot sits:
 /// onchain on one chain, in one [`OnchainForm`], or offchain at the broker.
 ///
 /// USDC observed in a wallet is never "wrapped" (no wrapped-USDC concept
@@ -8967,10 +8967,11 @@ mod tests {
         assert_eq!(PortfolioLocation::Offchain.to_string(), "offchain");
     }
 
-    /// The labels the per-chain migration rewrote no longer parse, so a row
-    /// it missed fails the read instead of being misattributed.
+    /// The labels the per-chain migration rewrote no longer parse, nor does
+    /// an unknown chain, so a row it missed fails the read instead of being
+    /// misattributed.
     #[test]
-    fn legacy_portfolio_location_labels_are_rejected() {
+    fn legacy_and_unknown_portfolio_location_labels_are_rejected() {
         for legacy in [
             "hedging",
             "ethereum_wallet:ethereum",

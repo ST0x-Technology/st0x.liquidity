@@ -392,23 +392,26 @@ mod tests {
         assert_eq!(marked, 0, "a refused repair must not price any row");
     }
 
-    /// The guard derives the market-making location from the configured
-    /// primary chain: a snapshot captured on a non-Base chain persists
-    /// `market_making:<chain>` rows, and a guard hardcoded to
-    /// `market_making:base` would miss them and let the repair price vault
-    /// shares as underlying.
+    /// The capture converts a wrapped row only at the ratio of a chain that
+    /// lists the symbol, so a symbol configured on Base still holds vault
+    /// shares in a row on a chain that does not list it, and the repair must
+    /// refuse to price it.
     #[tokio::test]
-    async fn portfolio_snapshot_repair_refuses_wrapped_rows_on_a_non_base_primary_chain() {
+    async fn portfolio_snapshot_repair_refuses_wrapped_rows_on_a_chain_not_listing_the_symbol() {
         let pool = setup_test_db().await;
         let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
-        let symbol = Symbol::new("QSEP").unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
         seed_missing_portfolio_marks_at(
             &pool,
             day,
             &symbol,
             &[
                 PortfolioLocation::Onchain {
-                    chain: Chain::Ethereum,
+                    chain: Chain::Base,
+                    form: OnchainForm::MarketMaking,
+                },
+                PortfolioLocation::Onchain {
+                    chain: Chain::Robinhood,
                     form: OnchainForm::MarketMaking,
                 },
                 PortfolioLocation::Offchain,
@@ -416,8 +419,7 @@ mod tests {
         )
         .await;
 
-        let mut ctx = ctx_with_equities(&["AAPL"]);
-        ctx.chains.primary_mut().chain = Chain::Ethereum;
+        let ctx = ctx_with_equities(&["AAPL"]);
         let error = set_portfolio_snapshot_mark_command(
             &mut Vec::new(),
             &pool,
@@ -435,10 +437,8 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            error
-                .to_string()
-                .contains("vault shares, not underlying shares"),
-            "wrapped rows on the configured non-Base chain must refuse; got: {error}"
+            error.to_string().contains("its 1 wrapped-location row(s)"),
+            "only the Robinhood row is unconverted; got: {error}"
         );
     }
 

@@ -8,6 +8,7 @@ pub(crate) use registry_candidate::{
     CandidateContractError, validate_registry_candidate_contracts,
 };
 
+pub(crate) use builder::chain_equity_symbols;
 pub use builder::configured_equity_symbols;
 mod exit;
 pub(crate) mod job;

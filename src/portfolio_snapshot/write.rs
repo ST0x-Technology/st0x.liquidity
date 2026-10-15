@@ -151,7 +151,7 @@ pub(crate) struct PortfolioSnapshotCtx {
     /// onchain wrapped equity in the first place, so no row would ever need
     /// conversion.
     pub(crate) wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
-    /// The equities each polled bot wallet's wallet slots require, keyed by
+    /// The equities each polled chain's bot-wallet slots require, keyed by
     /// chain: one entry per chain whose equity wallet the poller reads, with
     /// that chain's own equities (`src/conductor/builder.rs`). A chain whose
     /// wallet is not polled has no entry, so the capture never waits on a
@@ -1021,13 +1021,13 @@ fn capped_retry_backoff(boundary: Option<DateTime<Utc>>, now: DateTime<Utc>) -> 
 /// be kept, valued at a ratio config no longer has, and priced at an
 /// underlying mark.
 ///
-/// Wrapped wallet shares are chain-qualified for the same reason: their
-/// ratio is that chain's vault's. Unwrapped wallet tokens and the broker
-/// book need no ratio, and a symbol any hedged chain trades is hedged, so
-/// those rows are judged against the union.
+/// Wrapped wallet shares are judged against the same per-chain set, since
+/// their ratio is that chain's vault's too; the historical-mark repair reads
+/// that set to refuse pricing an unconverted row. Unwrapped wallet tokens
+/// and the broker book need no ratio, and a symbol any hedged chain trades is
+/// hedged, so those rows are judged against the union.
 struct ConfiguredEquities<'ctx> {
     market_making: &'ctx BTreeMap<Chain, MarketMakingSlots>,
-    wallet: &'ctx BTreeMap<Chain, HashSet<Symbol>>,
     /// Every hedged chain's equities, not just the primary's: a symbol traded
     /// on a secondary chain alone is still hedged, so judging its Offchain
     /// row against the primary's table alone would strand it unmarked and
@@ -1039,12 +1039,7 @@ impl<'ctx> ConfiguredEquities<'ctx> {
     fn of(ctx: &'ctx PortfolioSnapshotCtx) -> Self {
         Self {
             market_making: &ctx.market_making,
-            wallet: &ctx.wallet_equity_symbols,
-            hedged: ctx
-                .hedged_equity_symbols()
-                .into_iter()
-                .chain(ctx.wallet_equity_symbols.values().flatten().cloned())
-                .collect(),
+            hedged: ctx.hedged_equity_symbols().into_iter().collect(),
         }
     }
 
@@ -1052,18 +1047,11 @@ impl<'ctx> ConfiguredEquities<'ctx> {
         match location {
             PortfolioLocation::Onchain {
                 chain,
-                form: OnchainForm::MarketMaking,
+                form: OnchainForm::MarketMaking | OnchainForm::WalletWrapped,
             } => self
                 .market_making
                 .get(&chain)
                 .is_some_and(|slots| slots.equity_symbols.contains(symbol)),
-            PortfolioLocation::Onchain {
-                chain,
-                form: OnchainForm::WalletWrapped,
-            } => self
-                .wallet
-                .get(&chain)
-                .is_some_and(|symbols| symbols.contains(symbol)),
             PortfolioLocation::Onchain {
                 form: OnchainForm::WalletUnwrapped,
                 ..
@@ -3723,9 +3711,8 @@ mod tests {
         );
     }
 
-    /// Only the primary chain's assets table feeds the wallet-transit symbol
-    /// set, but the capture reads every hedged chain's market-making balances.
-    /// A symbol traded on a secondary chain alone must still be marked: left
+    /// The capture reads every hedged chain's market-making balances, so a
+    /// symbol traded on a secondary chain alone must still be marked: left
     /// unmarked, its nonzero row excludes the whole day with `MissingMark` and
     /// the capital series loses that day entirely.
     #[tokio::test]
@@ -4102,11 +4089,10 @@ mod tests {
         );
     }
 
-    /// Tokens a failed transfer left in a secondary chain's bot wallet are
-    /// capital under management: the capture values them at that chain's own
-    /// wallet slots, wrapped shares at that chain's vault ratio.
-    #[tokio::test]
-    async fn a_secondary_chains_wallet_equity_is_captured_at_its_own_wallet_slots() {
+    /// Captures a day on which Robinhood's bot wallet holds 3 unwrapped and 2
+    /// wrapped AAPL, with Robinhood's vault at a 1.5 ratio, and returns the
+    /// persisted AAPL wallet rows as `(location, inflight_balance)`.
+    async fn capture_robinhood_wallet_rows(robinhood_lists_aapl: bool) -> Vec<(String, String)> {
         let (pool, apalis_pool) = setup_test_pools().await;
         let now = Utc::now();
 
@@ -4116,6 +4102,15 @@ mod tests {
                 FractionalShares::new(float!(10)),
                 FractionalShares::new(float!(5)),
             )
+            .apply_equity_snapshot(
+                Venue::MarketMaking,
+                Chain::Robinhood,
+                [(&aapl(), &FractionalShares::ZERO)],
+                now,
+                None,
+                now,
+            )
+            .unwrap()
             .set_inflight_equity_at_location(
                 InFlightEquityLocation::WalletUnwrapped(Chain::Robinhood),
                 &BTreeMap::from([(aapl(), FractionalShares::new(float!(3)))]),
@@ -4149,8 +4144,15 @@ mod tests {
             ]),
         )
         .await;
-        ctx.wallet_equity_symbols
-            .insert(Chain::Robinhood, HashSet::from([aapl()]));
+        if robinhood_lists_aapl {
+            ctx.market_making.insert(
+                Chain::Robinhood,
+                MarketMakingSlots {
+                    equity_symbols: HashSet::from([aapl()]),
+                    usdc_tracking_enabled: false,
+                },
+            );
+        }
         mark_all_required_fresh(&ctx);
 
         job_for_today()
@@ -4158,7 +4160,7 @@ mod tests {
             .await
             .unwrap();
 
-        let wallet_rows: Vec<(String, String)> = sqlx::query_as(
+        sqlx::query_as(
             "SELECT location, inflight_balance FROM portfolio_snapshot \
              WHERE et_day = ? AND asset = 'AAPL' AND location LIKE 'wallet_%' \
              ORDER BY location",
@@ -4166,15 +4168,35 @@ mod tests {
         .bind(et_day(Utc::now()).to_string())
         .fetch_all(&pool)
         .await
-        .unwrap();
+        .unwrap()
+    }
 
+    /// Tokens a failed transfer left in a secondary chain's bot wallet are
+    /// capital under management: the capture values them at that chain's own
+    /// wallet slots, wrapped shares at that chain's vault ratio.
+    #[tokio::test]
+    async fn a_secondary_chains_wallet_equity_is_captured_at_its_own_wallet_slots() {
         assert_eq!(
-            wallet_rows,
+            capture_robinhood_wallet_rows(true).await,
             vec![
                 ("wallet_unwrapped:robinhood".to_string(), "3".to_string()),
                 ("wallet_wrapped:robinhood".to_string(), "3".to_string()),
             ],
             "3 unwrapped tokens as-is, 2 wrapped shares * Robinhood's own 1.5 ratio"
+        );
+    }
+
+    /// A wrapped wallet row is valued only at a ratio its own chain lists the
+    /// symbol for: Base listing AAPL does not license Robinhood's ratio, so
+    /// the row stays in vault-share units, to be forced unpriceable.
+    #[tokio::test]
+    async fn a_wrapped_wallet_row_on_a_chain_not_listing_the_symbol_is_left_unconverted() {
+        assert_eq!(
+            capture_robinhood_wallet_rows(false).await,
+            vec![
+                ("wallet_unwrapped:robinhood".to_string(), "3".to_string()),
+                ("wallet_wrapped:robinhood".to_string(), "2".to_string()),
+            ],
         );
     }
 
