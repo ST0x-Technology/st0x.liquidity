@@ -12239,6 +12239,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recheck_after_broker_snapshot_does_not_debit_hedging_available_twice() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let reactor = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(0), shares(100)),
+            &symbol,
+        )
+        .await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let mint_id = issuer_request_id("mint-recheck-after-snapshot");
+        let tok = tokenization_request_id("TOK-1");
+
+        // The mint starts (100 -> 90 + 10 inflight), then fails explicitly and
+        // cancels its inflight back to available (100).
+        for event in [
+            make_mint_requested(&symbol, float!(10)),
+            make_mint_accepted(),
+            make_mint_acceptance_failed(),
+        ] {
+            harness
+                .receive::<TokenizedEquityMint>(mint_id.clone(), event)
+                .await
+                .unwrap();
+        }
+
+        // The provider took the shares, so the broker reports 90.
+        apply_and_dispatch_snapshot(
+            reactor.clone(),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::OffchainEquity {
+                positions: BTreeMap::from([(symbol.clone(), shares(90))]),
+                fetched_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_available(&symbol, Venue::Hedging),
+            Some(shares(90)),
+            "the broker snapshot must re-base Hedging available"
+        );
+
+        let failed = TokenizedEquityMint::Failed {
+            chain: Chain::Base,
+            symbol: symbol.clone(),
+            quantity: float!(10),
+            reason: "test failure".to_string(),
+            requested_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+        trigger
+            .rebuild_mint_tracking_for_recovery(&mint_id, &failed, tok.clone())
+            .await
+            .unwrap();
+        harness
+            .receive::<TokenizedEquityMint>(
+                mint_id.clone(),
+                TokenizedEquityMintEvent::ProviderCompletionRecovered {
+                    issuer_request_id: mint_id.clone(),
+                    wallet: Address::ZERO,
+                    tokenization_request_id: tok,
+                    tx_hash: TxHash::random(),
+                    shares_minted: U256::from(10u64),
+                    fees: None,
+                    recovered_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::Hedging),
+            Some(shares(90)),
+            "the recheck must not debit shares the broker snapshot already excluded"
+        );
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(10))
+        );
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(0))
+        );
+    }
+
+    #[tokio::test]
     async fn recovery_after_timeout_mint_failure_clears_tombstone_and_moves_equity() {
         let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
