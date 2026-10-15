@@ -26,8 +26,15 @@
 server_port = 8001
 # HTTP port for the apalis-board job queue UI.
 board_port = 8002
-# Minimum stdout log level. Docker's gcplogs driver exports TRACE to GCP.
+# Minimum stdout log level. The Ops Agent ships every stdout line to GCP.
 log_level = "trace"
+# One flattened JSON object per stdout line: the text is at "message" and each
+# event field is a top-level key, which the Ops Agent parses into Cloud
+# Logging (`liquidity-bot`). Rollback: "text". Ship this only after the VM
+# replace (`replace_bot_vm`) installs the Ops Agent `bot_json` parser, and
+# only on a build with `st0x-alpaca` v0.3.1 or later (not v1.20.2). Nothing
+# checks either; a config-only release from master ships it as is.
+log_format = "json"
 # Directory and minimum level for local rotated log files. INFO reduces
 # within-day volume on the 10 GB SQLite disk; seven-file retention caps file
 # count, not bytes, so it is not a hard disk-usage bound.

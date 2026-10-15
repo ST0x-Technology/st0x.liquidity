@@ -59,10 +59,11 @@ shipped config sets one yet.
   value is refused with `400` before the handler runs. Authentication precedes
   body capture, so in-service denials use `not_identified`/`not_provided`; Cloud
   IAP edge rejections never reach the application. The event is an ordinary
-  stdout log line, which Docker's `gcplogs` driver forwards to Cloud Logging as
-  message text. VictoriaLogs receives the compatible event only when
-  `[telemetry]` configures the OTLP log exporter. Responses echo the UUID in
-  `x-request-id`, and the operator CLI prints it when a write fails.
+  stdout log line. With `log_format = "json"`, the Ops Agent parses its fields
+  into top-level `jsonPayload` fields in Cloud Logging. VictoriaLogs receives
+  the compatible event only when `[telemetry]` configures the OTLP log exporter.
+  Responses echo the UUID in `x-request-id`, and the operator CLI prints it when
+  a write fails.
 - **Public Incident Messaging**: The
   [`scripts/turnkey-message`](scripts/turnkey-message/README.md) utility
   prepares, signs, verifies, sends, and reads zero-value Base messages from an

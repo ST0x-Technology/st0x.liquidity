@@ -16,11 +16,12 @@ hide audit successes. When local daily files are enabled, `log_dir` and
 counterpart. The local file layer uses only `file_log_level`, so `RUST_LOG`
 cannot increase disk usage.
 
-Production uses `log_level = "trace"` so Docker's `gcplogs` driver exports full
-diagnostics, while `file_log_level = "info"` limits the rotating files stored
-beside SQLite. Rotation retains seven daily files, which caps file count but not
-bytes. The lower file level reduces within-day growth and disk-exhaustion risk;
-it does not enforce a per-file byte limit or filesystem quota.
+Production uses `log_level = "trace"` so its log shipper exports full
+diagnostics (Docker's `gcplogs` driver until the VM replace below, then the Ops
+Agent), while `file_log_level = "info"` limits the rotating files stored beside
+SQLite. Rotation retains seven daily files, which caps file count but not bytes.
+The lower file level reduces within-day growth and disk-exhaustion risk; it does
+not enforce a per-file byte limit or filesystem quota.
 
 ## Console format
 
@@ -66,8 +67,14 @@ the t0.devops liquidity exporter (`ship_botlogs`, which feeds the
 `liquidity-botlogs` log) read `fields` and `fields.message` from `/logs`, which
 serves these files.
 
-Switch an environment to `json` only where the log shipper parses JSON, and
-staging before production. Staging logs JSON. Unflattened JSON (any build before
+Switch an environment to `json` only where the log shipper parses JSON, and only
+on a build whose `st0x-alpaca` is v0.3.1 or later. Before it (v1.20.2 and
+earlier), each failed tokenization request writes two `message` keys on one
+line. Staging logs JSON. Production's config sets `json`, but production gets it
+only after two manual steps, in this order: first `replace_bot_vm` puts the VM
+on the Ops Agent with the `bot_json` `parse_json` step, then a
+`production-release` on a build with `st0x-alpaca` v0.3.1 or later ships the
+config. No release check enforces this order. Unflattened JSON (any build before
 the flattening) puts the text at `jsonPayload.fields.message`, where no
 extractor looks. Rollback is `log_format = "text"`.
 
@@ -284,11 +291,14 @@ the pipeline that pages operators even while you focus on one subsystem.
 ## Operations audit delivery
 
 `operations_audit` carries the stable `st0x.operations.audit.v1` fields. The
-event is an ordinary stdout log line in the configured `log_format`, so Docker's
-`gcplogs` driver forwards it to Cloud Logging as message text, like every other
-record. The schema is compatible with VictoriaLogs, but VictoriaLogs receives
-events only when `[telemetry]` configures its OTLP exporter; the deployed
-configs currently rely on stdout and do not invent an OTLP endpoint.
+event is an ordinary stdout log line in the configured `log_format`. Where the
+bot logs `json` on the Ops Agent (staging, and production after the rollout in
+[Console format](#console-format)), the agent parses each audit field into a
+top-level `jsonPayload` field of the `liquidity-bot` log, like every other
+record. Until then, production's `gcplogs` driver forwards it as message text.
+The schema is compatible with VictoriaLogs, but VictoriaLogs receives events
+only when `[telemetry]` configures its OTLP exporter; the deployed configs
+currently rely on stdout and do not invent an OTLP endpoint.
 
 The recorder can synchronously detect that the tracing target is disabled. That
 immediate refusal emits a dimensioned ERROR on `operational_alert` so it remains
