@@ -364,6 +364,7 @@ pub(crate) mod tests {
     use st0x_float_macro::float;
 
     use super::*;
+    use crate::inventory::RebalancingBands;
     use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::inventory::view::{ChainEquityBalance, ChainUsdcBalance};
     use crate::metrics::liquidity::tests::{SeriesKey, parse_exposition, series};
@@ -532,6 +533,7 @@ pub(crate) mod tests {
                 base_wallet_unwrapped: shares(unwrapped),
                 base_wallet_wrapped: shares(wrapped),
             },
+            chains: Vec::new(),
         }
     }
 
@@ -554,9 +556,10 @@ pub(crate) mod tests {
     }
 
     /// Prefixed symbols, a symbol with nothing available, every optional
-    /// cash reading present, and the reserve taken from the gross balance.
+    /// cash reading present, the reserve taken from the gross balance, and
+    /// per-chain vault rows the exporter does not read.
     pub(crate) fn state_fixture() -> StateFixture {
-        StateFixture {
+        let mut fixture = StateFixture {
             settings: dto_settings(None),
             inventory: st0x_dto::Inventory {
                 per_symbol: vec![
@@ -607,6 +610,7 @@ pub(crate) mod tests {
                         ethereum_wallet: Some(Usdc::new(float!(3))),
                         base_wallet: None,
                     },
+                    chains: Vec::new(),
                 },
             },
             positions: vec![
@@ -619,7 +623,41 @@ pub(crate) mod tests {
                 price("tSPYM", float!(7), "2099-01-01T00:00:00Z"),
                 price("wtTSLA", float!(9), "2000-01-01T00:00:00Z"),
             ],
-        }
+        };
+
+        let band = |target, deviation| Some(st0x_dto::RebalancingBand { target, deviation });
+        fixture.inventory.per_symbol[1].chains = vec![
+            st0x_dto::ChainEquityInventory {
+                chain: st0x_dto::ChainName::Base,
+                available: shares(float!(12.5)),
+                inflight: shares(float!(2)),
+                band: band(float!(0.4), float!(0.1)),
+            },
+            st0x_dto::ChainEquityInventory {
+                chain: st0x_dto::ChainName::Robinhood,
+                available: shares(float!(6)),
+                inflight: shares(float!(0)),
+                band: None,
+            },
+        ];
+        fixture.inventory.usdc.chains = vec![
+            st0x_dto::ChainUsdcInventory {
+                chain: st0x_dto::ChainName::Base,
+                symbol: "USDC".to_string(),
+                available: Usdc::new(float!(2500.5)),
+                inflight: Usdc::new(float!(100)),
+                band: band(float!(0.4), float!(0.1)),
+            },
+            st0x_dto::ChainUsdcInventory {
+                chain: st0x_dto::ChainName::Robinhood,
+                symbol: "USDG".to_string(),
+                available: Usdc::new(float!(700)),
+                inflight: Usdc::new(float!(0)),
+                band: None,
+            },
+        ];
+
+        fixture
     }
 
     /// A configured reserve above withdrawable cash, no gross reading, and
@@ -649,6 +687,7 @@ pub(crate) mod tests {
                     withdrawable_cash: Some(Usdc::new(float!(800))),
                     alpaca_usdc: None,
                     inflight_cash: st0x_dto::InFlightCash::empty(),
+                    chains: Vec::new(),
                 },
             },
             positions: Vec::new(),
@@ -1039,7 +1078,7 @@ pub(crate) mod tests {
             .with_withdrawable_cash_cents(80_000);
 
         let from_view = InventoryInput::from_view(&view, &BTreeSet::from([Chain::Base]));
-        let from_dashboard = input_from_dto(&view.to_dto());
+        let from_dashboard = input_from_dto(&view.to_dto(&RebalancingBands::default()));
 
         assert_eq!(from_view.symbols, from_dashboard.symbols);
         assert_eq!(from_view.usdc, from_dashboard.usdc);

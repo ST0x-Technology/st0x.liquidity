@@ -13,7 +13,7 @@ use tracing::{debug, warn};
 
 use st0x_dto::{InventorySnapshot, Statement};
 
-use super::InventoryView;
+use super::{InventoryView, RebalancingBands};
 use crate::metrics::liquidity::inventory::{InventoryPublisher, InventoryRead};
 
 /// Thread-safe inventory that publishes a snapshot whenever the write guard
@@ -22,6 +22,7 @@ pub(crate) struct BroadcastingInventory {
     view: RwLock<InventoryView>,
     sender: broadcast::Sender<Statement>,
     liq_metrics: Option<InventoryPublisher>,
+    bands: RebalancingBands,
 }
 
 impl BroadcastingInventory {
@@ -30,7 +31,14 @@ impl BroadcastingInventory {
             view: RwLock::new(view),
             sender,
             liq_metrics: None,
+            bands: RebalancingBands::default(),
         }
+    }
+
+    /// Lists each of `bands`' hedged chains apart in every dashboard
+    /// snapshot, with its band; without it the snapshots list no chain.
+    pub(crate) fn with_rebalancing_bands(self, bands: RebalancingBands) -> Self {
+        Self { bands, ..self }
     }
 
     /// Also publishes the `liq_*` inventory series on every guard release.
@@ -59,6 +67,11 @@ impl BroadcastingInventory {
         self.view.read().await
     }
 
+    /// The dashboard snapshot of the current view.
+    pub(crate) async fn to_dto(&self) -> st0x_dto::Inventory {
+        self.view.read().await.to_dto(&self.bands)
+    }
+
     /// Publishes the `liq_*` inventory series again from the current view.
     /// Covers quiet periods and any write path that skipped the publish; a
     /// write that lands meanwhile carries a newer generation and wins.
@@ -82,6 +95,7 @@ impl BroadcastingInventory {
         BroadcastingWriteGuard {
             guard: self.view.write().await,
             sender: &self.sender,
+            bands: &self.bands,
             liq_metrics: PendingPublish {
                 publisher: self.liq_metrics.as_ref(),
                 read: None,
@@ -111,6 +125,7 @@ impl BroadcastingInventory {
 pub(crate) struct BroadcastingWriteGuard<'a> {
     guard: RwLockWriteGuard<'a, InventoryView>,
     sender: &'a broadcast::Sender<Statement>,
+    bands: &'a RebalancingBands,
     liq_metrics: PendingPublish<'a>,
 }
 
@@ -158,7 +173,7 @@ impl Drop for BroadcastingWriteGuard<'_> {
         }
 
         let snapshot = InventorySnapshot {
-            inventory: self.guard.to_dto(),
+            inventory: self.guard.to_dto(self.bands),
             fetched_at: Utc::now(),
         };
 
@@ -173,9 +188,10 @@ impl Drop for BroadcastingWriteGuard<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::{Arc, Mutex, OnceLock, Weak};
 
+    use st0x_evm::Chain;
     use st0x_execution::{FractionalShares, Symbol};
     use st0x_float_macro::float;
 
@@ -340,7 +356,7 @@ mod tests {
     #[tokio::test]
     async fn read_returns_default_inventory() {
         let (inventory, _receiver) = create_broadcasting_inventory();
-        let dto = inventory.read().await.to_dto();
+        let dto = inventory.to_dto().await;
 
         assert!(dto.per_symbol.is_empty());
     }
@@ -358,7 +374,7 @@ mod tests {
             *guard = std::mem::take(&mut *guard).with_equity(symbol.clone(), onchain, offchain);
         }
 
-        let dto = inventory.read().await.to_dto();
+        let dto = inventory.to_dto().await;
 
         assert_eq!(dto.per_symbol.len(), 1);
         assert_eq!(dto.per_symbol[0].symbol, symbol);
@@ -421,6 +437,48 @@ mod tests {
         }
     }
 
+    /// The bands attached at construction reach both the broadcast snapshot
+    /// and the initial-state read, so each lists the hedged chain's vault.
+    #[tokio::test]
+    async fn snapshots_list_each_hedged_chain_with_its_band() {
+        let (sender, mut receiver) = broadcast::channel(16);
+        let symbol = Symbol::new("TSLA").unwrap();
+        let band = st0x_dto::RebalancingBand {
+            target: float!(0.5),
+            deviation: float!(0.1),
+        };
+        let inventory = BroadcastingInventory::new(InventoryView::default(), sender)
+            .with_rebalancing_bands(RebalancingBands {
+                hedged: BTreeSet::from([Chain::Base]),
+                equity: BTreeMap::from([((symbol.clone(), Chain::Base), band)]),
+                usdc: BTreeMap::new(),
+            });
+
+        {
+            let mut guard = inventory.write().await;
+            *guard = std::mem::take(&mut *guard).with_equity(
+                symbol,
+                FractionalShares::new(float!(100)),
+                FractionalShares::new(float!(50)),
+            );
+        }
+
+        let expected = serde_json::json!([{
+            "chain": "base",
+            "available": "100",
+            "inflight": "0",
+            "band": { "target": "0.5", "deviation": "0.1" }
+        }]);
+        let Statement::InventorySnapshot(snapshot) = receiver.recv().await.unwrap() else {
+            panic!("expected an inventory snapshot");
+        };
+        let broadcast = serde_json::to_value(&snapshot.inventory).unwrap();
+        assert_eq!(broadcast["perSymbol"][0]["chains"], expected);
+
+        let read = serde_json::to_value(inventory.to_dto().await).unwrap();
+        assert_eq!(read["perSymbol"][0]["chains"], expected);
+    }
+
     #[tokio::test]
     async fn each_write_broadcasts_independently() {
         let (inventory, mut receiver) = create_broadcasting_inventory();
@@ -479,7 +537,7 @@ mod tests {
             *guard = std::mem::take(&mut *guard).with_equity(symbol.clone(), onchain, offchain);
         }
 
-        let dto = inventory.read().await.to_dto();
+        let dto = inventory.to_dto().await;
 
         assert_eq!(dto.per_symbol.len(), 1);
         assert_eq!(dto.per_symbol[0].symbol, symbol);

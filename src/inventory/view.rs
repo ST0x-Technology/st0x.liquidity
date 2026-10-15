@@ -11,17 +11,22 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, warn};
 
 use st0x_config::ImbalanceThreshold;
-use st0x_dto::{InFlightCash, InFlightEquity, SymbolInventory, UsdcInventory};
+use st0x_dto::{
+    ChainEquityInventory, ChainUsdcInventory, InFlightCash, InFlightEquity, SymbolInventory,
+    UsdcInventory,
+};
 use st0x_evm::Chain;
 use st0x_execution::{Direction, FractionalShares, HasZero, Symbol};
 use st0x_finance::{Usd, Usdc};
 use st0x_tokenization::IssuerRequestId;
 
+use super::RebalancingBands;
 use super::divergence::{PersistentBrokerCashDivergence, PersistentBrokerDivergence};
 use super::snapshot::InventorySnapshotEvent;
 use super::venue_balance::{InventoryError, VenueBalance};
 use crate::equity_redemption::{RedemptionAggregateId, StrandedRedemption};
 use crate::offchain::order::OffchainOrderId;
+use crate::performance::infra::chain_name;
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceId};
 
 /// Error type for inventory view operations.
@@ -1186,12 +1191,36 @@ impl InventoryView {
     }
 
     /// Converts the in-memory inventory view to a DTO for dashboard
-    /// serialization.
-    pub(crate) fn to_dto(&self) -> st0x_dto::Inventory {
+    /// serialization. The flat fields stay the primary chain's; `chains`
+    /// lists each hedged chain's vault with its band from `bands`.
+    pub(crate) fn to_dto(&self, bands: &RebalancingBands) -> st0x_dto::Inventory {
+        let OnchainByChain {
+            equities: chain_equities,
+            usdc: chain_usdc,
+        } = self.onchain_by_chain(&bands.hedged);
+
+        let mut equity_chains = chain_equities
+            .into_iter()
+            .map(|balance| {
+                let row = ChainEquityInventory {
+                    chain: chain_name(balance.chain),
+                    available: balance.available,
+                    inflight: balance.inflight,
+                    band: bands
+                        .equity
+                        .get(&(balance.symbol.clone(), balance.chain))
+                        .copied(),
+                };
+
+                (balance.symbol, row)
+            })
+            .into_group_map();
+
         let per_symbol = self
             .symbol_balances()
             .into_iter()
             .map(|balances| SymbolInventory {
+                chains: equity_chains.remove(&balances.symbol).unwrap_or_default(),
                 symbol: balances.symbol,
                 onchain_available: balances.onchain_available,
                 onchain_inflight: balances.onchain_inflight,
@@ -1201,6 +1230,17 @@ impl InventoryView {
                     base_wallet_unwrapped: balances.base_wallet_unwrapped,
                     base_wallet_wrapped: balances.base_wallet_wrapped,
                 },
+            })
+            .collect();
+
+        let usdc_chains = chain_usdc
+            .into_iter()
+            .map(|balance| ChainUsdcInventory {
+                chain: chain_name(balance.chain),
+                symbol: balance.chain.settlement_stable().symbol.to_string(),
+                available: balance.available,
+                inflight: balance.inflight,
+                band: bands.usdc.get(&balance.chain).copied(),
             })
             .collect();
 
@@ -1221,6 +1261,7 @@ impl InventoryView {
                     ethereum_wallet: usdc.ethereum_wallet,
                     base_wallet: usdc.base_wallet,
                 },
+                chains: usdc_chains,
             },
         }
     }
@@ -5767,7 +5808,7 @@ mod tests {
                 "a Robinhood wallet event must not touch Base's wrapped slot",
             );
             assert_eq!(
-                view.to_dto().per_symbol[0]
+                view.to_dto(&RebalancingBands::default()).per_symbol[0]
                     .inflight_equity
                     .base_wallet_unwrapped,
                 shares(1),
@@ -8019,7 +8060,7 @@ mod tests {
             .apply_snapshot_event(&usdc_on(Chain::Ethereum, 50_000), now)
             .unwrap();
 
-        let dto = view.to_dto();
+        let dto = view.to_dto(&RebalancingBands::default());
 
         assert_eq!(dto.per_symbol.len(), 1);
         assert_eq!(dto.per_symbol[0].onchain_available, shares(50));
@@ -8036,7 +8077,8 @@ mod tests {
     /// cannot pass here.
     #[test]
     fn to_dto_names_the_primary_chains_settlement_stable() {
-        let dto = InventoryView::for_primary_chain(Chain::Robinhood).to_dto();
+        let dto =
+            InventoryView::for_primary_chain(Chain::Robinhood).to_dto(&RebalancingBands::default());
 
         assert_eq!(dto.usdc.symbol, "USDG");
     }
@@ -8122,11 +8164,86 @@ mod tests {
             }
         );
 
-        let dto = view.to_dto();
+        let dto = view.to_dto(&RebalancingBands::default());
         assert_eq!(dto.per_symbol[0].onchain_available, shares(50));
         assert_eq!(dto.per_symbol[0].onchain_inflight, shares(5));
         assert_eq!(dto.usdc.onchain_available, Usdc::new(float!(2000)));
         assert_eq!(dto.usdc.symbol, "USDC");
+    }
+
+    /// Each hedged chain's vault is listed under its symbol and in the cash
+    /// row, with the band the config holds it to; a chain the config does
+    /// not hedge is left out, and the flat fields stay the primary chain's.
+    #[test]
+    fn to_dto_lists_each_hedged_chains_vault_with_its_band() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let view = InventoryView {
+            equities: HashMap::from([(
+                aapl.clone(),
+                Inventory {
+                    onchain: BTreeMap::from([
+                        (Chain::Base, venue(50, 5)),
+                        (Chain::Robinhood, venue(9, 1)),
+                        (Chain::Ethereum, venue(3, 0)),
+                    ]),
+                    offchain: Some(venue(40, 0)),
+                    last_rebalancing: None,
+                    unpolled_onchain: BTreeSet::new(),
+                },
+            )]),
+            usdc: Inventory {
+                onchain: BTreeMap::from([
+                    (Chain::Base, usdc_venue(2000, 250)),
+                    (Chain::Robinhood, usdc_venue(300, 0)),
+                ]),
+                offchain: Some(usdc_venue(1000, 0)),
+                last_rebalancing: None,
+                unpolled_onchain: BTreeSet::new(),
+            },
+            ..InventoryView::for_primary_chain(Chain::Base)
+        };
+        let band = |target, deviation| st0x_dto::RebalancingBand { target, deviation };
+        let bands = RebalancingBands {
+            hedged: BTreeSet::from([Chain::Base, Chain::Robinhood]),
+            equity: BTreeMap::from([((aapl, Chain::Robinhood), band(float!(0.3), float!(0.05)))]),
+            usdc: BTreeMap::from([(Chain::Base, band(float!(0.5), float!(0.2)))]),
+        };
+
+        let dto = serde_json::to_value(view.to_dto(&bands)).unwrap();
+
+        assert_eq!(dto["perSymbol"][0]["onchainAvailable"], json!("50"));
+        assert_eq!(
+            dto["perSymbol"][0]["chains"],
+            json!([
+                { "chain": "base", "available": "50", "inflight": "5", "band": null },
+                {
+                    "chain": "robinhood",
+                    "available": "9",
+                    "inflight": "1",
+                    "band": { "target": "0.3", "deviation": "0.05" }
+                }
+            ])
+        );
+        assert_eq!(dto["usdc"]["onchainAvailable"], json!("2000"));
+        assert_eq!(
+            dto["usdc"]["chains"],
+            json!([
+                {
+                    "chain": "base",
+                    "symbol": "USDC",
+                    "available": "2000",
+                    "inflight": "250",
+                    "band": { "target": "0.5", "deviation": "0.2" }
+                },
+                {
+                    "chain": "robinhood",
+                    "symbol": "USDG",
+                    "available": "300",
+                    "inflight": "0",
+                    "band": null
+                }
+            ])
+        );
     }
 
     /// The production vault reads (`apply_snapshot_event`, which hydration
@@ -8265,7 +8382,7 @@ mod tests {
             .with_equity(aapl.clone(), shares(100), shares(50))
             .with_usdc(Usdc::new(float!(10000)), Usdc::new(float!(5000)));
 
-        let dto = view.to_dto();
+        let dto = view.to_dto(&RebalancingBands::default());
 
         assert_eq!(dto.per_symbol.len(), 1);
 
@@ -8325,7 +8442,7 @@ mod tests {
             primary_chain: Chain::Base,
         };
 
-        let dto = view.to_dto();
+        let dto = view.to_dto(&RebalancingBands::default());
 
         let tsla_dto = &dto.per_symbol[0];
         assert_eq!(
@@ -8394,7 +8511,7 @@ mod tests {
             primary_chain: Chain::Base,
         };
 
-        let dto = view.to_dto();
+        let dto = view.to_dto(&RebalancingBands::default());
 
         let spy_dto = &dto.per_symbol[0];
         assert_eq!(spy_dto.onchain_available, FractionalShares::new(float!(75)));
@@ -8425,7 +8542,7 @@ mod tests {
                 fetched_at,
             );
 
-        let dto = view.to_dto();
+        let dto = view.to_dto(&RebalancingBands::default());
 
         assert_eq!(
             dto.usdc.inflight_cash.ethereum_wallet,
@@ -8441,14 +8558,14 @@ mod tests {
             ..InventoryView::default()
         };
 
-        let dto = view.to_dto();
+        let dto = view.to_dto(&RebalancingBands::default());
 
         assert_eq!(dto.usdc.withdrawable_cash, Some(Usdc::new(float!(32000))));
     }
 
     #[test]
     fn to_dto_withdrawable_cash_is_none_when_broker_omitted_field() {
-        let dto = InventoryView::default().to_dto();
+        let dto = InventoryView::default().to_dto(&RebalancingBands::default());
 
         assert_eq!(dto.usdc.withdrawable_cash, None);
     }
@@ -8458,7 +8575,7 @@ mod tests {
     /// "observed as zero".
     #[test]
     fn to_dto_inflight_cash_is_none_for_unobserved_locations() {
-        let dto = InventoryView::default().to_dto();
+        let dto = InventoryView::default().to_dto(&RebalancingBands::default());
 
         assert_eq!(dto.usdc.inflight_cash.ethereum_wallet, None);
         assert_eq!(dto.usdc.inflight_cash.base_wallet, None);
@@ -8478,7 +8595,7 @@ mod tests {
                 now,
             )
             .unwrap()
-            .to_dto();
+            .to_dto(&RebalancingBands::default());
 
         assert_eq!(
             dto.usdc.alpaca_usdc,
@@ -8503,7 +8620,7 @@ mod tests {
                 reason,
             )
             .unwrap()
-            .to_dto();
+            .to_dto(&RebalancingBands::default());
 
         assert_eq!(
             dto.usdc.alpaca_usdc,
@@ -8536,7 +8653,7 @@ mod tests {
                 fetched_at,
             );
 
-        let dto = view.to_dto();
+        let dto = view.to_dto(&RebalancingBands::default());
         let aapl_dto = &dto.per_symbol[0];
 
         assert_eq!(aapl_dto.symbol, aapl);
@@ -8558,7 +8675,7 @@ mod tests {
             fetched_at,
         );
 
-        let dto = view.to_dto();
+        let dto = view.to_dto(&RebalancingBands::default());
         let aapl_dto = &dto.per_symbol[0];
 
         assert_eq!(aapl_dto.symbol, aapl);
@@ -8593,7 +8710,7 @@ mod tests {
             .unwrap();
 
         // Verify inflight is set in DTO
-        let dto = view.to_dto();
+        let dto = view.to_dto(&RebalancingBands::default());
         let aapl = &dto.per_symbol[0];
         assert_eq!(
             aapl.onchain_inflight, transfer_quantity,
@@ -8608,7 +8725,7 @@ mod tests {
 
         // Inflight MUST still be present — the polling snapshot
         // should not clear inflight set by the transfer trigger.
-        let dto = view.to_dto();
+        let dto = view.to_dto(&RebalancingBands::default());
         let aapl = &dto.per_symbol[0];
         assert_eq!(
             aapl.onchain_inflight, transfer_quantity,
@@ -8643,7 +8760,7 @@ mod tests {
             )
             .unwrap();
 
-        let dto = view.to_dto();
+        let dto = view.to_dto(&RebalancingBands::default());
         let aapl = &dto.per_symbol[0];
         assert_eq!(
             aapl.onchain_inflight, transfer_quantity,
@@ -8912,7 +9029,7 @@ mod tests {
         fn set_inflight_cash_keeps_freshest_per_location(
             calls in prop::collection::vec(arb_call(), 0..16),
         ) {
-            let dto = apply_calls(&calls).to_dto();
+            let dto = apply_calls(&calls).to_dto(&RebalancingBands::default());
 
             for location in LOCATIONS {
                 let expected = calls
@@ -8941,7 +9058,7 @@ mod tests {
                 call.location = target;
             }
 
-            let dto = apply_calls(&calls).to_dto();
+            let dto = apply_calls(&calls).to_dto(&RebalancingBands::default());
             prop_assert_eq!(dto_slot(&dto, untouched), None);
         }
 
@@ -8975,7 +9092,7 @@ mod tests {
             calls in prop::collection::vec(arb_call(), 0..16),
         ) {
             let view = apply_calls(&calls);
-            let dto = view.to_dto();
+            let dto = view.to_dto(&RebalancingBands::default());
 
             for location in LOCATIONS {
                 prop_assert_eq!(dto_slot(&dto, location), view.inflight_cash_at(location));

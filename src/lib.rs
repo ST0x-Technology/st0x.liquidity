@@ -328,7 +328,8 @@ async fn run_bot_session_inner(
         .publishing_liq_metrics(metrics::liquidity::inventory::InventoryPublisher::new(
             &ctx,
             &metrics::liquidity::LIQ_FAMILIES,
-        )),
+        ))
+        .with_rebalancing_bands(inventory::RebalancingBands::from_ctx(&ctx)),
     );
     let equity_prices = dashboard::equity_price::EquityPriceStore::new(
         ctx.chains.hedged().map(|hedged| &hedged.assets),

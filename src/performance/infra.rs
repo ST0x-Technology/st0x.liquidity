@@ -69,7 +69,7 @@ async fn chain_block_lag(
 
 /// The dashboard's chain discriminator for a chain the bot operates on.
 /// Exhaustive so a chain added to `Chain` cannot reach the report unnamed.
-fn chain_name(chain: Chain) -> ChainName {
+pub(crate) fn chain_name(chain: Chain) -> ChainName {
     match chain {
         Chain::Base => ChainName::Base,
         Chain::Ethereum => ChainName::Ethereum,

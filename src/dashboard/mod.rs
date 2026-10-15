@@ -254,7 +254,7 @@ async fn send_initial_state(
     state: &AppState,
     trade_protocol: TradeProtocol,
 ) -> bool {
-    let inventory_dto = state.inventory.read().await.to_dto();
+    let inventory_dto = state.inventory.to_dto().await;
     let transfers = transfer_loader::load_transfers(&state.pool).await;
     let mut warnings = transfers.warnings;
     let trades = match query_trades(&state.pool, &TradeQuery::newest(trade_protocol)).await {

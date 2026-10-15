@@ -116,7 +116,8 @@ const makeCurrentState = (overrides: Partial<CurrentState> = {}): CurrentState =
       inflightCash: {
         ethereumWallet: null,
         baseWallet: null
-      }
+      },
+      chains: []
     }
   },
   positions: [],
@@ -439,7 +440,8 @@ describe('createWebSocket', () => {
                   inflightEquity: {
                     baseWalletUnwrapped: '0',
                     baseWalletWrapped: '0'
-                  }
+                  },
+                  chains: []
                 }
               ]
             },
@@ -743,7 +745,8 @@ describe('createWebSocket', () => {
             inflightEquity: {
               baseWalletUnwrapped: '0',
               baseWalletWrapped: '0'
-            }
+            },
+            chains: []
           }
         ],
         usdc: {
@@ -755,7 +758,8 @@ describe('createWebSocket', () => {
           offchainGross: null,
           withdrawableCash: null,
           alpacaUsdc: null,
-          inflightCash: { ethereumWallet: null, baseWallet: null }
+          inflightCash: { ethereumWallet: null, baseWallet: null },
+          chains: []
         }
       }
 
