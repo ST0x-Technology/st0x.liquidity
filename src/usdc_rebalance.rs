@@ -1321,12 +1321,13 @@ impl Display for FoundSwapDeposit {
             request_id,
             order_id,
             deposit_tx,
-            deposit_block: _,
+            deposit_block,
             amount,
         } = self;
         write!(
             formatter,
-            "request {request_id} (order {order_id}, deposit {deposit_tx} of {amount})"
+            "request {request_id} (order {order_id}, deposit {deposit_tx} in block \
+             {deposit_block} of {amount})"
         )
     }
 }
@@ -9179,7 +9180,8 @@ mod tests {
             };
             for deposit in &deposits {
                 assert!(
-                    failure_reason.contains(&deposit.request_id.to_string()),
+                    failure_reason.contains(&deposit.request_id.to_string())
+                        && failure_reason.contains(&format!("in block {}", deposit.deposit_block)),
                     "{failure_reason}"
                 );
             }
