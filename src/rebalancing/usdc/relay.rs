@@ -9444,12 +9444,13 @@ mod tests {
 
     /// Two reverted orders landed a deposit each, so Relay holds the
     /// transfer's amount twice: the scan adopts neither, even the one Relay
-    /// paid, and holds the transfer at `SwapQuoted` for the operator. The
-    /// attempt ends with one page naming each order's request, the key
-    /// `stox relay status` takes, and reads nothing again.
+    /// paid, and records the hold at `SwapOverdeposited`, guard held and
+    /// reconcilable. The attempt ends with one page naming each order's
+    /// request, the key `stox relay status` takes; a resume of the hold is
+    /// refused and pages nothing more.
     #[tokio::test]
     #[tracing_test::traced_test]
-    async fn escrow_scan_holds_when_two_reverted_orders_landed_deposits() {
+    async fn several_found_deposits_hold_at_swap_overdeposited() {
         let rig = RelayRig::deploy().await;
         rig.withdraw_to_hub(U256::from(2 * AMOUNT_IN)).await;
         let second_order_id = B256::repeat_byte(0x0b);
@@ -9477,33 +9478,31 @@ mod tests {
             .await;
         let id = UsdcRebalanceId(Uuid::new_v4());
         record_two_reverted_and_requoted_toward_chain(&rig, &store, &id, second_order_id).await;
+        let attempt = || {
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+            )
+        };
 
-        tokio::time::timeout(
-            Duration::from_secs(60),
-            transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
-        )
-        .await
-        .expect("the attempt ends")
-        .unwrap();
+        attempt().await.expect("the attempt ends").unwrap();
 
         let state = store.load(&id).await.unwrap().unwrap();
-        let UsdcRebalance::SwapQuoted {
-            reverted_quotes, ..
-        } = &state
-        else {
-            panic!("expected SwapQuoted, got {state:?}");
-        };
-        assert_eq!(
-            reverted_quotes
-                .iter()
-                .map(|quote| quote.order_id)
-                .collect::<Vec<_>>(),
-            vec![REVERTED_ORDER_ID, second_order_id]
-        );
+        assert_eq!(state.state_name(), "SwapOverdeposited", "{state:?}");
         assert!(state.holds_rebalance_guard());
+        assert!(state.is_reconcilable_failure());
         paid_status.assert_calls(0);
         pending_status.assert_calls(0);
         quotes.assert_calls(0);
+
+        let resumed = attempt().await.expect("the resume ends").unwrap_err();
+        assert!(
+            matches!(
+                &resumed,
+                UsdcTransferError::PreviouslyFailedAggregate { id: held } if *held == id
+            ),
+            "got {resumed:?}"
+        );
         let requests = [B256::repeat_byte(0x5e), B256::repeat_byte(0x5f)];
         logs_assert(|lines: &[&str]| {
             match lines
