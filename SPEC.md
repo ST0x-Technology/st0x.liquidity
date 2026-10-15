@@ -2144,14 +2144,15 @@ after, since a captured day can never be amended. The required market-making
 balances are per hedged chain: each chain requires the equities and the cash its
 own assets table declares, so a chain the poller reads is a chain the capture
 waits for. Likewise each chain whose equity wallet is polled requires its
-unwrapped and wrapped wallet slots for its own equities, like Base's. This is a
-PRESENCE check, not a freshness check: a balance that is merely present (e.g.
-replayed from a persisted `InventorySnapshot` at startup, without ever being
-re-polled this run) still satisfies it on its own. An earlier attempt at a
-time-window freshness gate was reverted: the underlying `InventorySnapshot`
-suppresses events, and their watermarks, on unchanged balances, so tying
-freshness to that watermark freezes on a static book and the window would
-eventually block every future capture.
+unwrapped and wrapped wallet slots for its own equities, like Base's. Presence
+alone does not admit a capture: a balance restored from a persisted
+`InventorySnapshot` satisfies presence only, and every required slot must also
+have a successful poll recorded on or after the target ET day's midnight (see
+**Poll-driven freshness gate** below). That freshness signal comes from
+`PollFreshness`, never from `InventorySnapshot` event watermarks: the snapshot
+suppresses events, and their watermarks, on unchanged balances, so a watermark
+gate freezes on a static book and would eventually block every future capture --
+which is why an earlier watermark-based gate was reverted.
 
 A vault-registry symbol can outlive its config entry (registry seeds are
 permanent events, config entries are not), and such a symbol has no wrapper
