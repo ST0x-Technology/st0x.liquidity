@@ -9154,6 +9154,42 @@ mod tests {
         }
     }
 
+    /// The hold's evidence names each found deposit once, under its reverted
+    /// order's request: a deposit listed twice would stand for a second one,
+    /// and another request would become the operator's lookup key.
+    #[tokio::test]
+    async fn overdeposit_hold_refuses_duplicate_or_mismatched_evidence() {
+        let requoted = twice_reverted_and_requoted(RebalanceDirection::BaseToAlpaca);
+        let listed = |order_id| FoundSwapDeposit {
+            request_id: B256::repeat_byte(0x5e),
+            ..found_deposit(order_id, 100_000_000)
+        };
+
+        for (deposits, refused) in [
+            (vec![listed(0x0a), listed(0x0a)], "one deposit listed twice"),
+            (
+                vec![
+                    listed(0x0a),
+                    FoundSwapDeposit {
+                        request_id: B256::repeat_byte(0x77),
+                        ..listed(0x0b)
+                    },
+                ],
+                "another order's request",
+            ),
+        ] {
+            let error = TestHarness::<UsdcRebalance>::with(())
+                .given(requoted.clone())
+                .when(UsdcRebalanceCommand::HoldOverdepositedSwap { deposits })
+                .await
+                .then_expect_error();
+            assert!(
+                matches!(&error, LifecycleError::Apply(_)),
+                "{refused}: got {error:?}"
+            );
+        }
+    }
+
     /// The hold takes only what is not one adoptable deposit: a lone deposit
     /// of its order's and the current quote's input, an empty list, an order
     /// that never reverted, or a state other than `SwapQuoted` is refused; a
