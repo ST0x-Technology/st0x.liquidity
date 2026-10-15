@@ -349,6 +349,9 @@ st0x-liquidity-client --env <env> capital reset-allowance --network <chain>
 # starts the transfer on the bot's worker and prints its id at once; --chain
 # picks the served corridor and may be left out while the bot serves one
 st0x-liquidity-client --env <env> capital transfer-usdc --direction <to-raindex|to-alpaca> --amount <amount> [--chain <chain>]
+# starts the mint (to-raindex) or redemption (to-alpaca) on the bot's equity
+# transfer workers and prints its transfer id at once
+st0x-liquidity-client --env <env> capital transfer-equity --direction <to-raindex|to-alpaca> --symbol <symbol> --quantity <shares> [--network <chain>]
 # burns only and prints the burn tx and its status; it prints its operation id
 # to stderr first: rerun with --operation-id <id> to report that same burn
 st0x-liquidity-client --env <env> capital cctp-bridge --from <ethereum|base> --amount <amount> [--operation-id <id>]
@@ -382,6 +385,26 @@ burn, follow
 [Settling a post-burn Base to Alpaca failure by hand](#settling-a-post-burn-base-to-alpaca-failure-by-hand)
 instead.
 
+`capital transfer-equity` starts a mint (`to-raindex`) or a redemption
+(`to-alpaca`) of `--quantity` shares of `--symbol` on the chain `--network`
+names, on the bot's equity transfer workers, the path the equity rebalancer
+uses. It prints the transfer id at once: the mint's issuer request id or the
+redemption id. Follow it with `read transfer-events mint <id>` or
+`read transfer-events redemption <id>`, and recover a stuck one with
+`debug recheck mint <id>` or `debug recheck redemption <id>`. A quantity that is
+not a positive decimal, or a malformed symbol, is refused with `400`. It answers
+`503` until startup completes and the bot's rebalancing is wired, and while the
+chain's signing wallet cannot be shown to pay gas. It answers `422` when the
+chain's listing of the symbol is not `rebalancing = "enabled"` (the workers
+refuse a paused or disabled listing) or the token is not in the chain's token
+registry. It answers `409` while another verb holds the recovery lock, while the
+symbol is frozen for a dividend or issuance cannot confirm it is not, while a
+snapshot divergence for the symbol is engaged or its balance is restart tainted,
+while another equity transfer of the symbol holds its guard or has a live job,
+and when the position refuses to reserve the shares (the message names the
+reason) or the reservation is invalidated before dispatch. So retrying it cannot
+start a second transfer of the symbol alongside the first.
+
 A bot release from before operation ids ignores the id and burns on every call,
 so the bot ships before this client: after deploy, and after a rollback of the
 bot, a rerun with `--operation-id` against an older bot burns again. The client
@@ -411,8 +434,8 @@ gives up, which takes up to 5 minutes for inclusion plus 30 minutes for the
 confirmations. Until then every verb that takes the recovery lock answers `409`:
 `debug resume`, `debug recheck`, `debug resume-usdc`, `debug reconcile-usdc`,
 `debug fail-usdc-transfer`, `debug fail-equity-transfer`,
-`capital transfer-usdc`, a `capital cctp-bridge` with a new operation id, and
-`debug cctp complete-mint`. Most say
+`capital transfer-usdc`, `capital transfer-equity`, a `capital cctp-bridge` with
+a new operation id, and `debug cctp complete-mint`. Most say
 `A resume or recheck operation is already in progress`; `debug resume` says
 `A resume operation is already in progress` and `debug fail-equity-transfer`
 says `A transfer recovery operation is already in progress`. `complete-mint`
@@ -501,8 +524,8 @@ failed, and a rerun with the same operation id burns once. A `500` that says the
 bot cannot tell whether the burn was recorded keeps its nonce reserved until a
 restart: rerun with the same operation id only after the restart. Every capital
 verb answers `503` until the bot finishes starting. The tokenization and issuer
-verbs (`transfer-equity`, `wrap-equity`, `unwrap-equity`, `donate-equity`,
-`dividend-bump`) have no client subcommand and stay on `st0x-cli`.
+verbs `wrap-equity`, `unwrap-equity`, `donate-equity` and `dividend-bump` have
+no client subcommand.
 
 ### Taking a Listing off Rebalancing
 

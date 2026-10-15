@@ -114,7 +114,7 @@ use crate::wrapped_equity_recovery::{WrappedEquityRecoveryJob, WrappedEquityReco
 
 pub(crate) use equity::{EquityRebalancingCheck, EquityRebalancingCheckScheduler};
 #[cfg(test)]
-pub(crate) use freeze::StubFreezeReader;
+pub(crate) use freeze::{FreezeCheckError, StubFreezeReader};
 pub(crate) use usdc::{
     USDC_WITHDRAW_REJECTION_COOLDOWN, UsdcRebalancingCheck, UsdcRebalancingCheckScheduler,
 };
@@ -274,6 +274,124 @@ pub(crate) enum UsdcResumeError {
     ApalisDatabase(#[from] sqlx_apalis::Error),
     #[error("failed to enqueue the USDC transfer job: {0}")]
     Queue(#[from] QueuePushError),
+}
+
+/// Why a manual equity transfer start (`capital transfer-equity`) could not
+/// be enqueued. One variant per gate of
+/// [`RebalancingService::start_manual_equity_transfer`], each saying what
+/// clears it; the API maps them onto HTTP statuses the way it maps
+/// [`UsdcResumeError`]: configuration refusals, single flight conflicts, not
+/// ready states, and infrastructure failures.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ManualEquityTransferError {
+    #[error(
+        "the equity transfer stores or the Position authority are not wired yet (conductor \
+         still starting); retry shortly"
+    )]
+    NotReady,
+    #[error("{chain} has no equity rebalancing table in this build; nothing was enqueued")]
+    ChainNotConfigured { chain: Chain },
+    #[error(
+        "equity rebalancing is {mode} for {symbol} on {chain}; a manual transfer needs \
+         rebalancing = \"enabled\" on that listing"
+    )]
+    ListingNotEnabled {
+        symbol: Symbol,
+        chain: Chain,
+        mode: RebalancingMode,
+    },
+    #[error(
+        "{symbol} is not in the {chain} vault registry, so the transfer has no vault to land \
+         in or withdraw from; register the token first"
+    )]
+    NotInRegistry { symbol: Symbol, chain: Chain },
+    #[error("the {chain} vault registry cannot resolve {symbol}: {source}")]
+    Registry {
+        symbol: Symbol,
+        chain: Chain,
+        #[source]
+        source: TokenAddressError,
+    },
+    #[error("{symbol} is frozen for a dividend; retry once issuance unfreezes it")]
+    Frozen { symbol: Symbol },
+    #[error(
+        "issuance could not confirm {symbol} is not frozen for a dividend ({source}); retry \
+         once issuance answers"
+    )]
+    FreezeUnconfirmed {
+        symbol: Symbol,
+        #[source]
+        source: freeze::FreezeCheckError,
+    },
+    #[error(
+        "an unresolved snapshot divergence for {symbol} blocks fresh equity transfers; retry \
+         once the inventory poller has reconciled it"
+    )]
+    DivergenceEngaged { symbol: Symbol },
+    #[error(
+        "the {symbol} balance is restart tainted, which blocks fresh equity transfers; retry \
+         once the inventory poller has rebased it on the broker"
+    )]
+    RestartTainted { symbol: Symbol },
+    #[error(
+        "the {chain} signing wallet is not gas ready ({source}); fund it if it is below its \
+         gas threshold, or retry if its balance could not be read"
+    )]
+    GasNotReady {
+        chain: Chain,
+        #[source]
+        source: GasReadinessFailure,
+    },
+    #[error(
+        "another equity transfer or a recovery holds the {symbol} transfer guard; wait for it \
+         to finish, or fail or reconcile it first"
+    )]
+    GuardHeld { symbol: Symbol },
+    #[error(
+        "an equity transfer for {symbol} is already in flight (job row {row_id}, {age_secs}s \
+         old); the worker drives it, so wait or investigate that job"
+    )]
+    AlreadyInFlight {
+        symbol: Symbol,
+        row_id: String,
+        age_secs: i64,
+    },
+    #[error("the {symbol} Position refused the transfer reservation: {reason}")]
+    PositionRefused {
+        symbol: Symbol,
+        #[source]
+        reason: PositionError,
+    },
+    #[error(
+        "the {symbol} transfer reservation was invalidated before dispatch; nothing was \
+         enqueued, retry once the Position settles"
+    )]
+    ReservationInvalidated { symbol: Symbol },
+    #[error(transparent)]
+    Trigger(equity::EquityTriggerError),
+    #[error(transparent)]
+    ApalisDatabase(#[from] sqlx_apalis::Error),
+    #[error("failed to enqueue the equity transfer job: {0}")]
+    Queue(#[from] QueuePushError),
+}
+
+impl From<equity::EquityTriggerError> for ManualEquityTransferError {
+    fn from(error: equity::EquityTriggerError) -> Self {
+        match error {
+            equity::EquityTriggerError::PositionAuthorityNotWired => Self::NotReady,
+            error => Self::Trigger(error),
+        }
+    }
+}
+
+/// Why an equity transfer job was not enqueued. The enqueue logs each case
+/// itself: the trigger only needs to know it did not dispatch, while a manual
+/// start reports the reason to the operator.
+#[derive(Debug)]
+enum EquityEnqueueRefusal {
+    InFlight { row_id: String, age_secs: i64 },
+    Query(sqlx_apalis::Error),
+    Push(QueuePushError),
 }
 
 /// Builds the manual-resume idempotency key: the transfer id plus its
@@ -1734,15 +1852,7 @@ impl RebalancingService {
     }
 
     async fn equity_chain_gas_is_ready(&self, chain: Chain) -> bool {
-        let readiness = self
-            .equity_gas_readiness
-            .read()
-            .await
-            .get(&chain)
-            .cloned()
-            .unwrap_or(ConfiguredGasReadiness::Unwired);
-
-        match readiness.ensure_ready(TransferGasRoute::Equity).await {
+        match self.ensure_equity_chain_gas_ready(chain).await {
             Ok(()) => true,
             Err(error) => {
                 warn!(
@@ -1755,6 +1865,20 @@ impl RebalancingService {
                 false
             }
         }
+    }
+
+    /// Proves the equity signing wallet on `chain` can pay gas. The trigger
+    /// skips a chain that fails this; a manual equity transfer refuses with
+    /// the failure. A chain without a wired check fails closed.
+    async fn ensure_equity_chain_gas_ready(&self, chain: Chain) -> Result<(), GasReadinessFailure> {
+        let readiness = self
+            .equity_gas_readiness
+            .read()
+            .await
+            .get(&chain)
+            .cloned()
+            .unwrap_or(ConfiguredGasReadiness::Unwired);
+        readiness.ensure_ready(TransferGasRoute::Equity).await
     }
 
     /// Proves the signing wallets of the USDC corridor on `chain` (its own
@@ -5227,19 +5351,55 @@ impl RebalancingService {
         Ok((store, threshold))
     }
 
-    /// Reserves `symbol` for the planned `direction`. A redemption brings the
-    /// broker shares, so it also carries how many shares the broker can sell
-    /// today: the Position then admits it over a due sell hedge that the
-    /// broker can place none of, which otherwise waits for this very
-    /// redemption.
-    /// With no broker reading the capacity is unknown, so the redemption keeps
-    /// the strict rule.
+    /// Reserves `symbol` for the trigger's planned `direction` through
+    /// [`Self::reserve_equity_transfer`], counting and logging a Position
+    /// refusal as a skip.
     async fn try_reserve_equity_transfer(
         &self,
         symbol: &Symbol,
         reservation_id: EquityTransferReservationId,
         direction: PlannedDirection,
     ) -> Result<bool, equity::EquityTriggerError> {
+        let Err(error) = self
+            .reserve_equity_transfer(symbol, reservation_id, direction)
+            .await?
+        else {
+            return Ok(true);
+        };
+
+        // A due hedge holding a redemption back is otherwise
+        // indistinguishable from an idle symbol, so it is counted next
+        // to the planner's own decline reasons.
+        if matches!(error, PositionError::EquityTransferBlockedByHedge { .. }) {
+            counter!("equity_plan_declined_total", "reason" => "blocked_by_hedge").increment(1);
+        }
+        debug!(
+            target: "rebalance",
+            %symbol,
+            %reservation_id,
+            reason = %error,
+            "Skipped equity trigger: Position rejected transfer reservation"
+        );
+        Ok(false)
+    }
+
+    /// Reserves `symbol` for `direction`. A redemption brings the broker
+    /// shares, so it also carries how many shares the broker can sell today:
+    /// the Position then admits it over a due sell hedge that the broker can
+    /// place none of, which otherwise waits for this very redemption.
+    /// With no broker reading the capacity is unknown, so the redemption keeps
+    /// the strict rule.
+    ///
+    /// The inner `Err` is the Position's admission refusal (a pending hedge,
+    /// another reservation, a failed order anchor, a due hedge), which the
+    /// trigger skips on and a manual start reports; the outer one is a
+    /// failure to reach the Position.
+    async fn reserve_equity_transfer(
+        &self,
+        symbol: &Symbol,
+        reservation_id: EquityTransferReservationId,
+        direction: PlannedDirection,
+    ) -> Result<Result<(), PositionError>, equity::EquityTriggerError> {
         let (store, threshold) = self.position_authority().await?;
         let hedgeable = match direction {
             PlannedDirection::Mint => None,
@@ -5269,7 +5429,7 @@ impl RebalancingService {
             },
         );
         match store.send(symbol, command).await {
-            Ok(()) => Ok(true),
+            Ok(()) => Ok(Ok(())),
             Err(AggregateError::UserError(LifecycleError::Apply(error)))
                 if matches!(
                     &error,
@@ -5280,21 +5440,7 @@ impl RebalancingService {
                         | PositionError::EquityTransferHedgeEligibilityUnknown { .. }
                 ) =>
             {
-                // A due hedge holding a redemption back is otherwise
-                // indistinguishable from an idle symbol, so it is counted next
-                // to the planner's own decline reasons.
-                if matches!(error, PositionError::EquityTransferBlockedByHedge { .. }) {
-                    counter!("equity_plan_declined_total", "reason" => "blocked_by_hedge")
-                        .increment(1);
-                }
-                debug!(
-                    target: "rebalance",
-                    %symbol,
-                    %reservation_id,
-                    reason = %error,
-                    "Skipped equity trigger: Position rejected transfer reservation"
-                );
-                Ok(false)
+                Ok(Err(error))
             }
             Err(error) => Err(error.into()),
         }
@@ -6307,28 +6453,17 @@ impl RebalancingService {
                 direction,
                 quantity,
             } = operation;
-            let dispatched = match direction {
-                PlannedDirection::Mint => {
-                    self.enqueue_transfer_equity_to_market_making_with_reservation(
-                        symbol.clone(),
-                        quantity.inner(),
-                        chain,
-                        guard.generation(),
-                        reservation_id,
-                    )
-                    .await
-                }
-                PlannedDirection::Redemption => {
-                    self.enqueue_transfer_equity_to_hedging_with_reservation(
-                        symbol.clone(),
-                        quantity.inner(),
-                        chain,
-                        guard.generation(),
-                        reservation_id,
-                    )
-                    .await
-                }
-            };
+            let dispatched = self
+                .enqueue_equity_transfer(
+                    symbol,
+                    direction,
+                    quantity.inner(),
+                    chain,
+                    guard.generation(),
+                    reservation_id,
+                )
+                .await
+                .is_ok();
 
             if dispatched {
                 info!(
@@ -7583,6 +7718,204 @@ impl RebalancingService {
         }
     }
 
+    /// Starts a manual equity transfer of `quantity` shares of `symbol` on
+    /// `chain` (`capital transfer-equity`): a mint from Alpaca into Raindex
+    /// for [`PlannedDirection::Mint`], a redemption from Raindex back to Alpaca
+    /// for [`PlannedDirection::Redemption`], on the equity transfer workers the
+    /// trigger dispatches to. Returns the Position reservation id, which is
+    /// also the job's aggregate id: the mint's issuer request id or the
+    /// redemption aggregate id.
+    ///
+    /// The operator sizes the transfer, so nothing is planned and no cooldown
+    /// applies. Otherwise the gates are the trigger's, in the trigger's order,
+    /// each refusing where the trigger skips: the listing must start
+    /// operations and the token must be in the chain's registry (the planner's
+    /// own per chain checks), then the dividend freeze (failing closed when
+    /// issuance cannot answer), the snapshot divergence, the restart taint, the
+    /// chain's gas, the in memory guard, the job row dedupe, and the Position
+    /// reservation. As in the trigger's dispatch, the divergence is checked
+    /// again after the reservation and the reservation is confirmed before the
+    /// enqueue. A refusal after the reservation releases it, a refusal after
+    /// the guard claim drops the guard, and a dispatch keeps both and records
+    /// the chain's cooldown, exactly as the trigger does.
+    pub(crate) async fn start_manual_equity_transfer(
+        &self,
+        symbol: &Symbol,
+        direction: PlannedDirection,
+        quantity: Positive<FractionalShares>,
+        chain: Chain,
+    ) -> Result<EquityTransferReservationId, ManualEquityTransferError> {
+        let mint_store = self.mint_store.read().await.as_ref().map(Arc::clone);
+        let redemption_store = self.redemption_store.read().await.as_ref().map(Arc::clone);
+        let (Some(mint_store), Some(redemption_store)) = (mint_store, redemption_store) else {
+            warn!(
+                target: "rebalance",
+                %symbol,
+                "Manual equity transfer refused: stores not wired yet"
+            );
+            return Err(ManualEquityTransferError::NotReady);
+        };
+        self.position_authority().await?;
+
+        let Some(chain_config) = self.config.chains.get(&chain) else {
+            return Err(ManualEquityTransferError::ChainNotConfigured { chain });
+        };
+        let mode = chain_config.assets.rebalancing_mode(symbol);
+        if !mode.starts_operations() {
+            return Err(ManualEquityTransferError::ListingNotEnabled {
+                symbol: symbol.clone(),
+                chain,
+                mode,
+            });
+        }
+
+        match self.load_token_address(chain, symbol).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Err(ManualEquityTransferError::NotInRegistry {
+                    symbol: symbol.clone(),
+                    chain,
+                });
+            }
+            Err(source) => {
+                return Err(ManualEquityTransferError::Registry {
+                    symbol: symbol.clone(),
+                    chain,
+                    source,
+                });
+            }
+        }
+
+        // No reader means the freeze guard is disabled by config, which the
+        // trigger honors too.
+        let freeze_status = self.freeze_status.read().await.clone();
+        if let Some(reader) = freeze_status {
+            match reader.is_frozen(symbol).await {
+                Ok(false) => {}
+                Ok(true) => {
+                    return Err(ManualEquityTransferError::Frozen {
+                        symbol: symbol.clone(),
+                    });
+                }
+                Err(source) => {
+                    return Err(ManualEquityTransferError::FreezeUnconfirmed {
+                        symbol: symbol.clone(),
+                        source,
+                    });
+                }
+            }
+        }
+
+        if self.divergence_gate.is_engaged(symbol) {
+            return Err(ManualEquityTransferError::DivergenceEngaged {
+                symbol: symbol.clone(),
+            });
+        }
+        if self.is_restart_tainted(symbol).await {
+            return Err(ManualEquityTransferError::RestartTainted {
+                symbol: symbol.clone(),
+            });
+        }
+
+        // The worker gates gas itself, but only after the enqueue, where its
+        // job would park holding the guard and the reservation. Refusing here
+        // mirrors the planner skipping a chain that is not gas ready.
+        if let Err(source) = self.ensure_equity_chain_gas_ready(chain).await {
+            return Err(ManualEquityTransferError::GasNotReady { chain, source });
+        }
+
+        let Some(guard) = self.try_claim_equity_guard_for_transfer(symbol) else {
+            return Err(ManualEquityTransferError::GuardHeld {
+                symbol: symbol.clone(),
+            });
+        };
+
+        // Checked before the reservation, so a refusal appends no Position
+        // events. The enqueue checks again under the same guard.
+        if let Some((row_id, age_secs)) = Self::in_flight_equity_transfer(
+            self.transfer_equity_to_market_making_queue.pool(),
+            symbol,
+            Some(mint_store.as_ref()),
+            Some(redemption_store.as_ref()),
+        )
+        .await?
+        {
+            return Err(ManualEquityTransferError::AlreadyInFlight {
+                symbol: symbol.clone(),
+                row_id,
+                age_secs,
+            });
+        }
+
+        let reservation_id = EquityTransferReservationId::generate();
+        if let Err(reason) = self
+            .reserve_equity_transfer(symbol, reservation_id, direction)
+            .await?
+        {
+            return Err(ManualEquityTransferError::PositionRefused {
+                symbol: symbol.clone(),
+                reason,
+            });
+        }
+
+        let attempt = async {
+            if self.divergence_gate.is_engaged(symbol) {
+                return Err(ManualEquityTransferError::DivergenceEngaged {
+                    symbol: symbol.clone(),
+                });
+            }
+            if !self.confirm_equity_transfer(symbol, reservation_id).await? {
+                return Err(ManualEquityTransferError::ReservationInvalidated {
+                    symbol: symbol.clone(),
+                });
+            }
+
+            self.enqueue_equity_transfer(
+                symbol,
+                direction,
+                quantity.inner(),
+                chain,
+                guard.generation(),
+                reservation_id,
+            )
+            .await
+            .map_err(|refusal| match refusal {
+                EquityEnqueueRefusal::InFlight { row_id, age_secs } => {
+                    ManualEquityTransferError::AlreadyInFlight {
+                        symbol: symbol.clone(),
+                        row_id,
+                        age_secs,
+                    }
+                }
+                EquityEnqueueRefusal::Query(error) => error.into(),
+                EquityEnqueueRefusal::Push(error) => error.into(),
+            })
+        }
+        .await;
+
+        if let Err(error) = attempt {
+            self.release_pre_enqueue_equity_transfer(symbol, reservation_id)
+                .await;
+            return Err(error);
+        }
+
+        guard.defuse();
+        self.equity_cooldowns
+            .write()
+            .await
+            .insert((symbol.clone(), chain), Utc::now());
+        info!(
+            target: "rebalance",
+            %symbol,
+            %chain,
+            ?direction,
+            %quantity,
+            %reservation_id,
+            "Enqueued manual equity transfer for the transfer worker"
+        );
+        Ok(reservation_id)
+    }
+
     /// Returns the oldest non-terminal equity transfer job for this symbol in
     /// *either* direction (the row id and its age in seconds), if any.
     ///
@@ -7815,6 +8148,43 @@ impl RebalancingService {
         }
     }
 
+    /// Enqueues the equity transfer job for `direction` under the Position
+    /// reservation `reservation_id`: a mint for [`PlannedDirection::Mint`], a
+    /// redemption for [`PlannedDirection::Redemption`]. Shared by the
+    /// trigger's dispatch and a manual start.
+    async fn enqueue_equity_transfer(
+        &self,
+        symbol: &Symbol,
+        direction: PlannedDirection,
+        quantity: FractionalShares,
+        chain: Chain,
+        generation: equity::GuardGeneration,
+        reservation_id: EquityTransferReservationId,
+    ) -> Result<(), EquityEnqueueRefusal> {
+        match direction {
+            PlannedDirection::Mint => {
+                self.enqueue_transfer_equity_to_market_making_with_reservation(
+                    symbol.clone(),
+                    quantity,
+                    chain,
+                    generation,
+                    reservation_id,
+                )
+                .await
+            }
+            PlannedDirection::Redemption => {
+                self.enqueue_transfer_equity_to_hedging_with_reservation(
+                    symbol.clone(),
+                    quantity,
+                    chain,
+                    generation,
+                    reservation_id,
+                )
+                .await
+            }
+        }
+    }
+
     /// Enqueues a [`TransferEquityToMarketMaking`] apalis job for a
     /// hedging->market-making equity mint. The aggregate id reuses the
     /// Position reservation UUID so terminal lifecycle events can release the
@@ -7835,6 +8205,7 @@ impl RebalancingService {
             EquityTransferReservationId::generate(),
         )
         .await
+        .is_ok()
     }
 
     async fn enqueue_transfer_equity_to_market_making_with_reservation(
@@ -7844,7 +8215,7 @@ impl RebalancingService {
         chain: Chain,
         generation: equity::GuardGeneration,
         reservation_id: EquityTransferReservationId,
-    ) -> bool {
+    ) -> Result<(), EquityEnqueueRefusal> {
         // A non-terminal row in flight longer than this is treated as likely
         // stuck: the suppression is logged at warn (with the row id and age)
         // so it is actionable rather than silently freezing the symbol.
@@ -7874,7 +8245,7 @@ impl RebalancingService {
                      symbol looks stuck and is suppressing new rebalances; investigate \
                      before it starves market making",
                 );
-                return false;
+                return Err(EquityEnqueueRefusal::InFlight { row_id, age_secs });
             }
             Ok(Some((row_id, age_secs))) => {
                 debug!(
@@ -7886,7 +8257,7 @@ impl RebalancingService {
                     "Skipped equity mint enqueue: a non-terminal equity transfer for \
                      this symbol already exists; apalis will resume it",
                 );
-                return false;
+                return Err(EquityEnqueueRefusal::InFlight { row_id, age_secs });
             }
             Ok(None) => {}
             Err(error) => {
@@ -7897,7 +8268,7 @@ impl RebalancingService {
                     "Failed to query for in-flight equity transfers; \
                      skipping enqueue to avoid double-pushing",
                 );
-                return false;
+                return Err(EquityEnqueueRefusal::Query(error));
             }
         }
 
@@ -7924,7 +8295,7 @@ impl RebalancingService {
                     %quantity,
                     "Enqueued TransferEquityToMarketMaking job for equity mint",
                 );
-                true
+                Ok(())
             }
 
             Err(QueuePushError(error)) => {
@@ -7935,7 +8306,7 @@ impl RebalancingService {
                     %quantity,
                     "Failed to enqueue TransferEquityToMarketMaking job",
                 );
-                false
+                Err(EquityEnqueueRefusal::Push(QueuePushError(error)))
             }
         }
     }
@@ -7959,6 +8330,7 @@ impl RebalancingService {
             EquityTransferReservationId::generate(),
         )
         .await
+        .is_ok()
     }
 
     async fn enqueue_transfer_equity_to_hedging_with_reservation(
@@ -7968,7 +8340,7 @@ impl RebalancingService {
         chain: Chain,
         generation: equity::GuardGeneration,
         reservation_id: EquityTransferReservationId,
-    ) -> bool {
+    ) -> Result<(), EquityEnqueueRefusal> {
         const STUCK_TRANSFER_WARN_AFTER_SECS: i64 = 15 * 60;
 
         let mut queue = self.transfer_equity_to_hedging_queue.clone();
@@ -7995,7 +8367,7 @@ impl RebalancingService {
                      this symbol looks stuck and is suppressing new rebalances; \
                      investigate before it starves hedging",
                 );
-                return false;
+                return Err(EquityEnqueueRefusal::InFlight { row_id, age_secs });
             }
             Ok(Some((row_id, age_secs))) => {
                 debug!(
@@ -8007,7 +8379,7 @@ impl RebalancingService {
                     "Skipped equity redemption enqueue: a non-terminal equity transfer \
                      for this symbol already exists; apalis will resume it",
                 );
-                return false;
+                return Err(EquityEnqueueRefusal::InFlight { row_id, age_secs });
             }
             Ok(None) => {}
             Err(error) => {
@@ -8018,7 +8390,7 @@ impl RebalancingService {
                     "Failed to query for in-flight equity transfers; \
                      skipping enqueue to avoid double-pushing",
                 );
-                return false;
+                return Err(EquityEnqueueRefusal::Query(error));
             }
         }
 
@@ -8045,7 +8417,7 @@ impl RebalancingService {
                     %quantity,
                     "Enqueued TransferEquityToHedging job for equity redemption",
                 );
-                true
+                Ok(())
             }
 
             Err(QueuePushError(error)) => {
@@ -8056,7 +8428,7 @@ impl RebalancingService {
                     %quantity,
                     "Failed to enqueue TransferEquityToHedging job",
                 );
-                false
+                Err(EquityEnqueueRefusal::Push(QueuePushError(error)))
             }
         }
     }
@@ -22570,6 +22942,622 @@ mod tests {
             "got {error:?}"
         );
         assert!(market_making_job_rows(&trigger).await.is_empty());
+    }
+
+    /// A trigger that passes every gate of a manual equity transfer of AAPL
+    /// on Base: its listing is enabled, the token is in the Base registry, the
+    /// Position is initialized neutral, and the equity stores and the
+    /// Position authority are wired.
+    async fn manual_equity_trigger(symbol: &Symbol) -> Arc<RebalancingService> {
+        manual_equity_trigger_with_config(symbol, test_config()).await
+    }
+
+    async fn manual_equity_trigger_with_config(
+        symbol: &Symbol,
+        config: RebalancingServiceConfig,
+    ) -> Arc<RebalancingService> {
+        manual_equity_trigger_and_pool(symbol, config).await.0
+    }
+
+    async fn manual_equity_trigger_and_pool(
+        symbol: &Symbol,
+        config: RebalancingServiceConfig,
+    ) -> (Arc<RebalancingService>, SqlitePool) {
+        let (trigger, pool) = make_trigger_with_inventory_registry_wrappers_and_pool(
+            InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
+            symbol,
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
+            config,
+        )
+        .await;
+        attach_equity_stores(
+            &trigger,
+            pool.clone(),
+            test_store::<TokenizedEquityMint>(pool.clone(), EquityTransferServices::panicking()),
+            test_store::<EquityRedemption>(pool.clone(), EquityTransferServices::panicking()),
+        )
+        .await;
+        (trigger, pool)
+    }
+
+    async fn equity_reservation(
+        trigger: &RebalancingService,
+        symbol: &Symbol,
+    ) -> Option<crate::position::EquityTransferReservation> {
+        trigger
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap()
+            .load(symbol)
+            .await
+            .unwrap()
+            .and_then(|position| position.equity_transfer_reservation)
+    }
+
+    fn equity_guard_claimed(trigger: &RebalancingService, symbol: &Symbol) -> bool {
+        trigger
+            .equity_in_progress
+            .read()
+            .unwrap()
+            .contains_key(symbol)
+    }
+
+    /// A refused manual equity transfer queues no job, holds no Position
+    /// reservation, and leaves the symbol's transfer guard free.
+    async fn assert_manual_equity_start_left_nothing(
+        trigger: &RebalancingService,
+        symbol: &Symbol,
+    ) {
+        assert_eq!(count_pending_equity_mint_jobs(trigger).await, 0);
+        assert_eq!(count_pending_equity_redemption_jobs(trigger).await, 0);
+        assert_eq!(equity_reservation(trigger, symbol).await, None);
+        assert!(
+            !equity_guard_claimed(trigger, symbol),
+            "a refused start must leave the transfer guard free"
+        );
+    }
+
+    fn manual_shares(quantity: i64) -> Positive<FractionalShares> {
+        Positive::new(shares(quantity)).unwrap()
+    }
+
+    /// How many Position transfer reservation events were ever recorded: a
+    /// gate that refuses before the reservation leaves none, while a refusal
+    /// after it leaves a reservation and its release.
+    async fn position_reservation_events(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events \
+             WHERE aggregate_type = 'Position' \
+               AND event_type LIKE 'PositionEvent::EquityTransfer%'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// A manual mint is queued under its Position reservation: the job's
+    /// issuer request id is the returned id, the reservation is confirmed
+    /// under that id, and the guard and the chain's cooldown stay held for
+    /// the worker, as after the trigger's own dispatch.
+    #[tokio::test]
+    async fn manual_equity_transfer_enqueues_a_mint_under_its_reservation() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = manual_equity_trigger(&symbol).await;
+
+        let id = trigger
+            .start_manual_equity_transfer(
+                &symbol,
+                PlannedDirection::Mint,
+                manual_shares(3),
+                Chain::Base,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(count_pending_equity_redemption_jobs(&trigger).await, 0);
+        let jobs = take_pending_equity_mint_jobs(&trigger).await;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].issuer_request_id.0, id.into_uuid());
+        assert_eq!(jobs[0].symbol, symbol);
+        assert_eq!(jobs[0].quantity, shares(3));
+        assert_eq!(jobs[0].chain, Chain::Base);
+        assert_eq!(
+            equity_reservation(&trigger, &symbol).await,
+            Some(crate::position::EquityTransferReservation {
+                id,
+                status: EquityTransferReservationStatus::Confirmed,
+            })
+        );
+        assert!(
+            equity_guard_claimed(&trigger, &symbol),
+            "the worker owns the guard once the job is queued"
+        );
+        assert!(
+            trigger
+                .equity_cooldowns
+                .read()
+                .await
+                .contains_key(&(symbol.clone(), Chain::Base)),
+            "a manual dispatch starts the chain's cooldown like the trigger's"
+        );
+    }
+
+    /// A manual redemption is queued as the redemption job, under the
+    /// reservation id as its aggregate id.
+    #[tokio::test]
+    async fn manual_equity_transfer_enqueues_a_redemption_under_its_reservation() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = manual_equity_trigger(&symbol).await;
+
+        let id = trigger
+            .start_manual_equity_transfer(
+                &symbol,
+                PlannedDirection::Redemption,
+                manual_shares(2),
+                Chain::Base,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 0);
+        let jobs = take_pending_equity_redemption_jobs(&trigger).await;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].aggregate_id.0, id.into_uuid());
+        assert_eq!(jobs[0].quantity, shares(2));
+        assert_eq!(
+            equity_reservation(&trigger, &symbol)
+                .await
+                .map(|reservation| reservation.id),
+            Some(id)
+        );
+        assert!(equity_guard_claimed(&trigger, &symbol));
+    }
+
+    #[tokio::test]
+    async fn manual_equity_transfer_is_refused_before_the_stores_are_wired() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let (trigger, _pool) = make_trigger_with_inventory_registry_wrappers_and_pool(
+            InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
+            &symbol,
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
+            test_config(),
+        )
+        .await;
+
+        let error = trigger
+            .start_manual_equity_transfer(
+                &symbol,
+                PlannedDirection::Mint,
+                manual_shares(1),
+                Chain::Base,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, ManualEquityTransferError::NotReady),
+            "got {error:?}"
+        );
+        assert_manual_equity_start_left_nothing(&trigger, &symbol).await;
+    }
+
+    /// The workers refuse a paused listing, so the start refuses it up front
+    /// rather than queue a job that cannot run.
+    #[tokio::test]
+    async fn manual_equity_transfer_is_refused_on_a_paused_listing() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mut config = test_config();
+        config
+            .chains
+            .get_mut(&Chain::Base)
+            .unwrap()
+            .assets
+            .equities
+            .symbols
+            .get_mut(&symbol)
+            .unwrap()
+            .rebalancing = RebalancingMode::Paused;
+        let trigger = manual_equity_trigger_with_config(&symbol, config).await;
+
+        let error = trigger
+            .start_manual_equity_transfer(
+                &symbol,
+                PlannedDirection::Mint,
+                manual_shares(1),
+                Chain::Base,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                ManualEquityTransferError::ListingNotEnabled {
+                    mode: RebalancingMode::Paused,
+                    chain: Chain::Base,
+                    ..
+                }
+            ),
+            "got {error:?}"
+        );
+        assert_manual_equity_start_left_nothing(&trigger, &symbol).await;
+    }
+
+    #[tokio::test]
+    async fn manual_equity_transfer_is_refused_for_a_token_missing_from_the_registry() {
+        let registered = Symbol::new("AAPL").unwrap();
+        let unregistered = Symbol::new("TSLA").unwrap();
+        let trigger = manual_equity_trigger(&registered).await;
+
+        let error = trigger
+            .start_manual_equity_transfer(
+                &unregistered,
+                PlannedDirection::Mint,
+                manual_shares(1),
+                Chain::Base,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                ManualEquityTransferError::NotInRegistry { symbol, chain: Chain::Base }
+                    if *symbol == unregistered
+            ),
+            "got {error:?}"
+        );
+        assert_manual_equity_start_left_nothing(&trigger, &unregistered).await;
+    }
+
+    /// The dividend freeze refuses a frozen symbol and, failing closed like
+    /// the trigger, one issuance cannot confirm is unfrozen.
+    #[tokio::test]
+    async fn manual_equity_transfer_is_refused_while_the_symbol_may_be_frozen() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = manual_equity_trigger(&symbol).await;
+
+        trigger
+            .set_freeze_status_reader(Arc::new(StubFreezeReader::Frozen))
+            .await;
+        let error = trigger
+            .start_manual_equity_transfer(
+                &symbol,
+                PlannedDirection::Mint,
+                manual_shares(1),
+                Chain::Base,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ManualEquityTransferError::Frozen { .. }),
+            "got {error:?}"
+        );
+        assert_manual_equity_start_left_nothing(&trigger, &symbol).await;
+
+        trigger
+            .set_freeze_status_reader(Arc::new(StubFreezeReader::Indeterminate))
+            .await;
+        let error = trigger
+            .start_manual_equity_transfer(
+                &symbol,
+                PlannedDirection::Mint,
+                manual_shares(1),
+                Chain::Base,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ManualEquityTransferError::FreezeUnconfirmed { .. }),
+            "got {error:?}"
+        );
+        assert_manual_equity_start_left_nothing(&trigger, &symbol).await;
+    }
+
+    /// An engaged divergence refuses before the reservation, so the Position
+    /// records nothing, rather than only at the check after it.
+    #[tokio::test]
+    async fn manual_equity_transfer_is_refused_while_a_divergence_is_engaged() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let (trigger, pool) = manual_equity_trigger_and_pool(&symbol, test_config()).await;
+        trigger
+            .divergence_gate()
+            .engage(InventoryScope::Hedging, &symbol);
+
+        let error = trigger
+            .start_manual_equity_transfer(
+                &symbol,
+                PlannedDirection::Redemption,
+                manual_shares(1),
+                Chain::Base,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, ManualEquityTransferError::DivergenceEngaged { .. }),
+            "got {error:?}"
+        );
+        assert_manual_equity_start_left_nothing(&trigger, &symbol).await;
+        assert_eq!(position_reservation_events(&pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn manual_equity_transfer_is_refused_while_the_balance_is_restart_tainted() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = manual_equity_trigger(&symbol).await;
+        trigger
+            .inventory
+            .write_without_broadcast()
+            .await
+            .set_pending_offchain_orders(HashMap::from([(symbol.clone(), OffchainOrderId::new())]));
+
+        let error = trigger
+            .start_manual_equity_transfer(
+                &symbol,
+                PlannedDirection::Mint,
+                manual_shares(1),
+                Chain::Base,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, ManualEquityTransferError::RestartTainted { .. }),
+            "got {error:?}"
+        );
+        assert_manual_equity_start_left_nothing(&trigger, &symbol).await;
+    }
+
+    /// A signing wallet below its gas threshold refuses the start before the
+    /// guard claim, where the worker would otherwise park holding the guard
+    /// and the reservation.
+    #[tokio::test]
+    async fn manual_equity_transfer_is_refused_while_the_signing_wallet_is_not_gas_ready() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = manual_equity_trigger(&symbol).await;
+        trigger
+            .set_equity_gas_readiness(base_equity_gas(GasReadiness::for_test(
+                U256::ZERO,
+                U256::from(1_u64),
+                U256::MAX,
+                U256::from(1_u64),
+            )))
+            .await;
+
+        let error = trigger
+            .start_manual_equity_transfer(
+                &symbol,
+                PlannedDirection::Mint,
+                manual_shares(1),
+                Chain::Base,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                ManualEquityTransferError::GasNotReady {
+                    chain: Chain::Base,
+                    ..
+                }
+            ),
+            "got {error:?}"
+        );
+        assert_manual_equity_start_left_nothing(&trigger, &symbol).await;
+    }
+
+    /// Another holder of the symbol's guard (a trigger dispatch in flight or
+    /// a recovery) refuses the start, which takes no reservation.
+    #[tokio::test]
+    async fn manual_equity_transfer_is_refused_while_the_guard_is_claimed() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = manual_equity_trigger(&symbol).await;
+        let held = trigger
+            .try_claim_equity_guard_for_transfer(&symbol)
+            .unwrap();
+
+        let error = trigger
+            .start_manual_equity_transfer(
+                &symbol,
+                PlannedDirection::Mint,
+                manual_shares(1),
+                Chain::Base,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, ManualEquityTransferError::GuardHeld { .. }),
+            "got {error:?}"
+        );
+        assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 0);
+        assert_eq!(equity_reservation(&trigger, &symbol).await, None);
+        drop(held);
+        assert!(!equity_guard_claimed(&trigger, &symbol));
+    }
+
+    /// A live equity transfer job row for the symbol, in either direction,
+    /// refuses the start before the reservation, so the Position records
+    /// nothing, and releases its guard.
+    #[tokio::test]
+    async fn manual_equity_transfer_is_refused_while_a_transfer_job_is_in_flight() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let (trigger, pool) = manual_equity_trigger_and_pool(&symbol, test_config()).await;
+        trigger
+            .transfer_equity_to_hedging_queue
+            .clone()
+            .push(TransferEquityToHedging {
+                chain: Chain::Base,
+                aggregate_id: RedemptionAggregateId(Uuid::new_v4()),
+                symbol: symbol.clone(),
+                quantity: shares(1),
+                generation: equity::GuardGeneration::default(),
+                backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
+            })
+            .await
+            .unwrap();
+
+        let error = trigger
+            .start_manual_equity_transfer(
+                &symbol,
+                PlannedDirection::Mint,
+                manual_shares(1),
+                Chain::Base,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, ManualEquityTransferError::AlreadyInFlight { .. }),
+            "got {error:?}"
+        );
+        assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 0);
+        assert_eq!(
+            count_pending_equity_redemption_jobs(&trigger).await,
+            1,
+            "only the job already in flight is queued"
+        );
+        assert_eq!(
+            position_reservation_events(&pool).await,
+            0,
+            "a job in flight must refuse before the Position reserves"
+        );
+        assert!(!equity_guard_claimed(&trigger, &symbol));
+    }
+
+    /// A Position refusal reaches the operator with its reason: a due hedge
+    /// keeps a mint out under the strict rule, and nothing is left behind.
+    #[tokio::test]
+    async fn manual_equity_transfer_reports_the_position_refusal() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = manual_equity_trigger(&symbol).await;
+        let position_store = trigger
+            .position_store
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: shares(1),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let error = trigger
+            .start_manual_equity_transfer(
+                &symbol,
+                PlannedDirection::Mint,
+                manual_shares(1),
+                Chain::Base,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                ManualEquityTransferError::PositionRefused {
+                    reason: PositionError::EquityTransferBlockedByHedge { .. },
+                    ..
+                }
+            ),
+            "got {error:?}"
+        );
+        assert_manual_equity_start_left_nothing(&trigger, &symbol).await;
+    }
+
+    /// Engages the symbol's snapshot divergence as the Position records a
+    /// transfer reservation, the window between a manual start's
+    /// reservation and its dispatch.
+    struct EngageDivergenceOnReservation {
+        gate: Arc<InventoryDivergenceGate>,
+    }
+
+    deps!(EngageDivergenceOnReservation, [Position]);
+
+    #[async_trait]
+    impl Reactor for EngageDivergenceOnReservation {
+        type Error = Never;
+
+        async fn react(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+        ) -> Result<(), Self::Error> {
+            let (symbol, event) = event.into_inner();
+            if matches!(event, PositionEvent::EquityTransferReserved { .. }) {
+                self.gate.engage(InventoryScope::Hedging, &symbol);
+            }
+            Ok(())
+        }
+    }
+
+    /// A refusal after the reservation, here a divergence engaged while the
+    /// Position recorded it, releases the reservation and the guard, as the
+    /// trigger's dispatch does.
+    #[tokio::test]
+    async fn manual_equity_transfer_releases_its_reservation_when_refused_before_dispatch() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let (trigger, pool) = manual_equity_trigger_and_pool(&symbol, test_config()).await;
+        // Swaps in a Position store over the same events whose reactor
+        // engages the divergence as the reservation is recorded.
+        let (position, position_projection) = StoreBuilder::<Position>::new(pool)
+            .with(Arc::new(EngageDivergenceOnReservation {
+                gate: trigger.divergence_gate(),
+            }))
+            .build(())
+            .await
+            .unwrap();
+        trigger
+            .set_position_authority(
+                position,
+                position_projection,
+                ExecutionThreshold::whole_share(),
+            )
+            .await;
+
+        let error = trigger
+            .start_manual_equity_transfer(
+                &symbol,
+                PlannedDirection::Mint,
+                manual_shares(1),
+                Chain::Base,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, ManualEquityTransferError::DivergenceEngaged { .. }),
+            "got {error:?}"
+        );
+        assert_manual_equity_start_left_nothing(&trigger, &symbol).await;
     }
 
     /// Fails every attempt of an Alpaca to Base transfer the way a refused

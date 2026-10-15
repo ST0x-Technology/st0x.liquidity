@@ -19,6 +19,6 @@ pub(crate) use spawn::{
 pub(crate) use trigger::drain_pending_jobs;
 pub(crate) use trigger::{
     ChainRebalancingConfig, EquityRebalancingCheck, EquityRebalancingCheckScheduler,
-    RebalancingSchedulers, RebalancingService, RebalancingServiceConfig, UsdcRebalancingCheck,
-    UsdcRebalancingCheckScheduler, UsdcResumeError,
+    ManualEquityTransferError, RebalancingSchedulers, RebalancingService, RebalancingServiceConfig,
+    UsdcRebalancingCheck, UsdcRebalancingCheckScheduler, UsdcResumeError,
 };

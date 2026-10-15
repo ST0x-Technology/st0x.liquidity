@@ -183,18 +183,31 @@ pub(crate) struct SetEquityMarkRequest {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TransferUsdcRequest {
-    pub(crate) direction: TransferUsdcDirection,
+    pub(crate) direction: TransferDirection,
     pub(crate) amount: DecimalAmount,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) chain: Option<&'static str>,
 }
 
-/// The venue a USDC transfer moves funds to, kebab cased on the wire exactly
-/// as the bot's transfer request expects it: `to-raindex` is the bot's
-/// `AlpacaToBase` and `to-alpaca` its `BaseToAlpaca`.
+/// Body of `POST /liquidity-capital/transfer-equity`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TransferEquityRequest {
+    pub(crate) direction: TransferDirection,
+    pub(crate) symbol: String,
+    /// Decimal number of shares; fractional shares are allowed.
+    pub(crate) quantity: DecimalAmount,
+    pub(crate) chain: &'static str,
+}
+
+/// The venue a USDC or equity transfer moves funds to, kebab cased on the
+/// wire exactly as the bot's `TransferDirectionWire` expects it. For USDC,
+/// `to-raindex` is the bot's `AlpacaToBase` and `to-alpaca` its
+/// `BaseToAlpaca`; for equity, `to-raindex` is a mint and `to-alpaca` a
+/// redemption.
 #[derive(Clone, Copy, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
-pub(crate) enum TransferUsdcDirection {
+pub(crate) enum TransferDirection {
     /// Transfer to Raindex (onchain venue).
     ToRaindex,
     /// Transfer to Alpaca (offchain venue).

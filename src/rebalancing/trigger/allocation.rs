@@ -15,7 +15,7 @@ use crate::inventory::VenueBalance;
 use crate::position::PriceObservation;
 
 /// Maximum decimal places for Alpaca tokenization API quantities.
-const ALPACA_QUANTITY_MAX_DECIMAL_PLACES: u8 = 9;
+pub(crate) const ALPACA_QUANTITY_MAX_DECIMAL_PLACES: u8 = 9;
 
 /// One symbol's inventory and limits across every venue the caller could
 /// vouch for.
