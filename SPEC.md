@@ -9207,22 +9207,17 @@ types via `ts-rs`. The DTO crate is the source of truth for all wire formats.
 ##### Inventory per chain
 
 The inventory payload (the `current_state` seed and every `inventory_snapshot`)
-keeps its flat figures for the primary chain: each symbol's and the cash row's
-`onchain*` fields are the primary chain's vault, as the t0.devops liquidity
-exporter reads them. Beside them, each symbol and the cash row carry `chains`:
-one entry per hedged chain whose vault a snapshot has read, the primary chain
-included, the same chains as the `liq_equity_chain_*` and `liq_usdc_chain_*`
-series. An equity entry is in that chain's wrapped vault shares, so entries
-never sum across chains. A cash entry names its chain's settlement stable. Each
-entry carries `band`, the target share and deviation band the rebalancer holds
-that vault to, as decimal strings. For an equity it is the listing's own
-`target_share` on that chain, else the chain's
-`[rebalancing.allocation].targets` entry, inside
-`[rebalancing.allocation].deviation`; enabled and paused listings have one, a
-disabled listing has none. For cash it is the band of the chain's configured
-corridor, whatever the USDC mode; a chain without a corridor has none. The
-`settings` fields `equityTarget`, `equityDeviation`, `usdcTarget` and
-`usdcDeviation` keep their primary-chain meaning.
+keeps its flat `onchain*` figures for the primary chain's vault, as the
+t0.devops liquidity exporter reads them. Beside them, each symbol and the cash
+row carry `chains`: one entry per hedged chain whose vault a snapshot has read,
+the same chains as the `liq_equity_chain_*` and `liq_usdc_chain_*` series. An
+equity entry is in that chain's wrapped vault shares, so entries never sum
+across chains; a cash entry names its chain's settlement stable. Each entry's
+`band` is the Target Share and Deviation Band the rebalancer holds that vault
+to, as decimal strings. An enabled or paused listing has one, a disabled listing
+none. A chain whose cash asset rebalances has its configured corridor's band,
+whatever the USDC mode; any other chain has none. The `settings` band fields
+keep their meaning.
 
 ##### TanStack Query Integration
 

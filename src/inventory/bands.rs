@@ -22,8 +22,9 @@ pub(crate) struct RebalancingBands {
 impl RebalancingBands {
     /// An equity's band on a chain is its `target_share` there, else the
     /// chain's allocation target, inside the allocation deviation. Enabled
-    /// and paused listings have one; a disabled listing does not. A chain's
-    /// cash band is its configured corridor's, whatever the USDC mode.
+    /// and paused listings have one; a disabled listing does not. A chain
+    /// whose cash asset rebalances has its corridor's band, whatever the
+    /// USDC mode.
     pub(crate) fn from_ctx(ctx: &Ctx) -> Self {
         let allocation = &ctx.rebalancing.allocation;
 
@@ -63,10 +64,17 @@ impl RebalancingBands {
             })
             .collect();
 
+        let rebalances_cash = |chain| {
+            ctx.chains
+                .hedged_chain(chain)
+                .and_then(|hedged| hedged.assets.rebalancing_cash())
+                .is_some()
+        };
         let usdc = ctx
             .rebalancing
             .usdc
             .configured()
+            .filter(|usdc| rebalances_cash(usdc.corridor.chain()))
             .map(|usdc| {
                 let band = RebalancingBand {
                     target: usdc.threshold.target,
@@ -92,9 +100,9 @@ mod tests {
 
     use st0x_bridge::corridor::{HopKind, UsdcCorridor};
     use st0x_config::{
-        ChainAssets, ChainEquities, ChainEquityAsset, HedgedChain, ImbalanceThreshold,
-        OperationMode, RebalancingMode, TargetShare, UsdcCorridorCtx, UsdcCorridors,
-        create_test_ctx_with_order_owner,
+        ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, HedgedChain,
+        ImbalanceThreshold, OperationMode, RebalancingMode, TargetShare, UsdcCorridorCtx,
+        UsdcCorridors, create_test_ctx_with_order_owner,
     };
     use st0x_float_macro::float;
 
@@ -126,7 +134,8 @@ mod tests {
 
     /// A listing's own `target_share` wins over its chain's default, a
     /// paused listing keeps its band, a disabled one has none, and a cash
-    /// corridor shows its band while the USDC mode is disabled.
+    /// corridor shows its band while the USDC mode is disabled, but only on a
+    /// chain whose cash asset rebalances.
     #[test]
     fn bands_resolve_each_listings_effective_target() {
         let mut ctx = create_test_ctx_with_order_owner(address!(
@@ -154,7 +163,11 @@ mod tests {
                             (symbol("TSLA"), listing(RebalancingMode::Paused, None)),
                         ]),
                     },
-                    cash: None,
+                    cash: Some(ChainCashAsset {
+                        vault_ids: Vec::new(),
+                        rebalancing: OperationMode::Enabled,
+                        operational_limit: None,
+                    }),
                 })
                 .call(),
         );
@@ -164,16 +177,25 @@ mod tests {
             .insert(Chain::Robinhood, TargetShare::new(float!(0.2)).unwrap());
         ctx.rebalancing.usdc = UsdcCorridors::for_test(
             OperationMode::Disabled,
-            [UsdcCorridorCtx {
-                corridor: UsdcCorridor::HubRouted {
-                    chain: Chain::Robinhood,
-                    hop: HopKind::Relay,
+            [
+                UsdcCorridorCtx {
+                    corridor: UsdcCorridor::HubRouted {
+                        chain: Chain::Robinhood,
+                        hop: HopKind::Relay,
+                    },
+                    threshold: ImbalanceThreshold {
+                        target: float!(0.25),
+                        deviation: float!(0.125),
+                    },
                 },
-                threshold: ImbalanceThreshold {
-                    target: float!(0.25),
-                    deviation: float!(0.125),
+                UsdcCorridorCtx {
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    threshold: ImbalanceThreshold {
+                        target: float!(0.6),
+                        deviation: float!(0.2),
+                    },
                 },
-            }],
+            ],
         );
 
         let bands = RebalancingBands::from_ctx(&ctx);
