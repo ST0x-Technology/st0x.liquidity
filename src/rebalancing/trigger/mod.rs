@@ -3575,7 +3575,7 @@ impl RebalancingService {
                         let result = if inventory.active_usdc_rebalance_entry(id).is_some() {
                             inventory
                                 .clone()
-                                .clear_usdc_inflight_at(
+                                .release_usdc_inflight_at(
                                     tracking.corridor.chain(),
                                     tracking.source_venue(),
                                     now,
@@ -3590,11 +3590,11 @@ impl RebalancingService {
                             Err(error) => {
                                 drop(inventory);
                                 // In practice this branch cannot be triggered:
-                                // `clear_usdc_inflight_at` only fails when the
-                                // resulting inflight would be negative
-                                // (`Inventory::set_inflight` guards against
-                                // this), and zeroing inflight always produces a
-                                // non-negative result. The branch is retained as
+                                // zeroing inflight never goes negative
+                                // (`Inventory::set_inflight` guards this), and
+                                // debiting the gross figure only fails on a
+                                // Float or cents-conversion error. The branch
+                                // is retained as
                                 // a defensive layer: if a future inventory
                                 // operation can fail, re-inserting tracking
                                 // ensures the next sweep tick retries rather
@@ -3803,7 +3803,7 @@ impl RebalancingService {
         if inventory.active_usdc_rebalance_entry(id).is_some() {
             *inventory = inventory
                 .clone()
-                .clear_usdc_inflight_at(tracking.corridor.chain(), tracking.source_venue(), now)?
+                .release_usdc_inflight_at(tracking.corridor.chain(), tracking.source_venue(), now)?
                 .clear_active_usdc_rebalance(id);
         }
         drop(inventory);
@@ -25672,6 +25672,209 @@ mod tests {
             vec![],
             "the landed $50 is at the broker; the check must not send it again"
         );
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .usdc_balances()
+                .offchain_gross,
+            Some(usdc(100))
+        );
+    }
+
+    /// Lands a Base-to-Alpaca transfer of `amount` through the reactor.
+    async fn land_base_to_alpaca(trigger: &Arc<RebalancingService>, amount: Usdc) {
+        let harness = ReactorHarness::new(Arc::clone(trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger
+            .usdc_guards
+            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca, amount);
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_initiated(RebalanceDirection::BaseToAlpaca, amount),
+            )
+            .await
+            .unwrap();
+        harness
+            .receive::<UsdcRebalance>(
+                id,
+                make_usdc_conversion_confirmed(RebalanceDirection::BaseToAlpaca, amount, amount),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// A broker reading that already held the landed cash ($90 net, $100
+    /// gross) is counted twice by the landing, in the ledger and the gross
+    /// figure alike. A cash reconcile replaces both and the check plans
+    /// nothing.
+    #[tokio::test]
+    async fn gross_counted_twice_by_a_landing_is_restored_by_the_cash_reconcile() {
+        let trigger = make_reserve_trigger_base_200_alpaca_50().await;
+        {
+            let mut inventory = trigger.inventory.write().await;
+            *inventory = inventory
+                .clone()
+                .with_usdc(usdc(200), usdc(90))
+                .with_offchain_gross_usd_cents(10_000);
+        }
+
+        land_base_to_alpaca(&trigger, usdc(50)).await;
+        let balances = trigger.inventory.read().await.usdc_balances();
+        assert_eq!(balances.offchain_gross, Some(usdc(150)));
+        assert_eq!(balances.offchain_available, usdc(140));
+
+        apply_and_dispatch_snapshot(
+            Arc::clone(&trigger),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::OffchainUsdReconciled {
+                usd_balance_cents: 9_000,
+                gross_usd_cents: Some(10_000),
+                fetched_at: Utc::now(),
+                ledger_usdc: Some(usdc(140)),
+                consecutive_polls: 3,
+            },
+        )
+        .await
+        .unwrap();
+
+        let balances = trigger.inventory.read().await.usdc_balances();
+        assert_eq!(balances.offchain_gross, Some(usdc(100)));
+        assert_eq!(balances.offchain_available, usdc(90));
+        // The landing's check and the reconcile's, both on the restored figures.
+        assert_eq!(usdc::drain_pending_usdc_jobs(&trigger).await, 2);
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+    }
+
+    /// Without a reserve there is no gross reading: the landing leaves it
+    /// absent and the band reads the ledger, which already holds the cash.
+    #[tokio::test]
+    async fn landed_base_to_alpaca_without_reserve_reads_the_ledger() {
+        let inventory = InventoryView::default().with_usdc(usdc(200), usdc(50));
+        let config = RebalancingServiceConfig {
+            usdc: UsdcCorridors::base_cctp(ImbalanceThreshold {
+                target: float!(0.6),
+                deviation: float!(0.05),
+            }),
+            ..test_config()
+        };
+        let trigger = make_trigger_with_inventory_config(inventory, config).await;
+
+        land_base_to_alpaca(&trigger, usdc(50)).await;
+
+        assert_eq!(usdc::drain_pending_usdc_jobs(&trigger).await, 1);
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+        let balances = trigger.inventory.read().await.usdc_balances();
+        assert_eq!(balances.offchain_gross, None);
+        assert_eq!(balances.offchain_available, usdc(100));
+    }
+
+    /// The withdrawal twin: Base holds 50 and the broker $200 gross; 100 is
+    /// withdrawn to Base and lands. Base 150 against $100 at the broker is
+    /// 0.6, so the check the landing queues must plan nothing. The deposit
+    /// carries no vault block, so no pinned vault read holds that check.
+    #[tokio::test]
+    async fn landed_alpaca_to_base_with_reserve_plans_no_second_transfer() {
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(50), usdc(190))
+            .with_offchain_gross_usd_cents(20_000)
+            .with_withdrawable_cash_cents(19_000);
+        let config = RebalancingServiceConfig {
+            cash_reserved: Some(Positive::new(Usd::new(float!(10))).unwrap()),
+            usdc: UsdcCorridors::base_cctp(ImbalanceThreshold {
+                target: float!(0.6),
+                deviation: float!(0.05),
+            }),
+            ..test_config()
+        };
+        let trigger = make_trigger_with_inventory_config(inventory, config).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.check_and_trigger_usdc().await;
+        assert_eq!(
+            take_pending_usdc_transfer_jobs(&trigger).await,
+            vec![UsdcRebalanceOperation::AlpacaToBase { amount: usdc(100) }]
+        );
+
+        trigger.usdc_guards.release_every_holder();
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            usdc(100),
+        );
+        for event in [
+            make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(100)),
+            make_usdc_bridged_with_amounts(usdc(100), Usdc::ZERO),
+            make_usdc_deposit_confirmed(RebalanceDirection::AlpacaToBase),
+        ] {
+            harness
+                .receive::<UsdcRebalance>(id.clone(), event)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(usdc::drain_pending_usdc_jobs(&trigger).await, 1);
+        assert_eq!(
+            take_pending_usdc_transfer_jobs(&trigger).await,
+            vec![],
+            "the $100 left the broker; the check must not withdraw more"
+        );
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .usdc_balances()
+                .offchain_gross,
+            Some(usdc(100))
+        );
+    }
+
+    /// An operator resolving an Alpaca-to-Base transfer releases the Hedging
+    /// inflight with no credit: the $100 left the broker, so the gross figure
+    /// drops by it too. The event names $400; the release, not the event,
+    /// sizes the debit.
+    #[tokio::test]
+    async fn operator_reconciled_alpaca_to_base_debits_the_gross_broker_cash() {
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(50), usdc(190))
+            .with_offchain_gross_usd_cents(20_000);
+        let config = RebalancingServiceConfig {
+            cash_reserved: Some(Positive::new(Usd::new(float!(10))).unwrap()),
+            ..test_config()
+        };
+        let trigger = make_trigger_with_inventory_config(inventory, config).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            usdc(100),
+        );
+        for event in [
+            make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(100)),
+            make_usdc_operator_reconciled(RebalanceDirection::AlpacaToBase),
+        ] {
+            harness
+                .receive::<UsdcRebalance>(id.clone(), event)
+                .await
+                .unwrap();
+        }
+
+        let balances = trigger.inventory.read().await.usdc_balances();
+        assert_eq!(balances.offchain_inflight, Usdc::ZERO);
+        assert_eq!(balances.offchain_available, usdc(90));
+        assert_eq!(balances.offchain_gross, Some(usdc(100)));
     }
 
     #[tokio::test]
@@ -30367,6 +30570,7 @@ mod tests {
         // Set active_usdc_rebalance to verify the sweep clears it (finding #9).
         let inventory = InventoryView::default()
             .with_usdc(usdc(500), usdc(900))
+            .with_offchain_gross_usd_cents(90_000)
             .update_usdc(
                 Inventory::transfer(Venue::MarketMaking, TransferOp::Start, usdc(400)),
                 now,
@@ -30455,6 +30659,11 @@ mod tests {
             inventory.active_usdc_rebalance(),
             None,
             "sweep must clear active_usdc_rebalance after CLI reconcile"
+        );
+        assert_eq!(
+            inventory.usdc_balances().offchain_gross,
+            Some(usdc(900)),
+            "a released Base inflight never reached Alpaca, so the gross figure stays"
         );
         drop(inventory);
     }
@@ -31229,6 +31438,7 @@ mod tests {
         // AlpacaToBase: source venue is Hedging (USDC leaves the Alpaca side).
         let inventory = InventoryView::default()
             .with_usdc(usdc(100), usdc(900))
+            .with_offchain_gross_usd_cents(90_000)
             .update_usdc(
                 Inventory::transfer(Venue::Hedging, TransferOp::Start, usdc(400)),
                 now,
@@ -31310,6 +31520,11 @@ mod tests {
             inventory.active_usdc_rebalance(),
             None,
             "sweep must clear active_usdc_rebalance after reconcile"
+        );
+        assert_eq!(
+            inventory.usdc_balances().offchain_gross,
+            Some(usdc(500)),
+            "the released $400 left Alpaca, so the gross figure drops by it"
         );
         drop(inventory);
     }
@@ -31604,6 +31819,53 @@ mod tests {
             !trigger.post_burn_timeout_alerted.read().await.contains(&id),
             "no burn is recorded, so the after burn stall page must not fire",
         );
+    }
+
+    /// A CLI reconcile of an Alpaca-to-Base `BridgingFailed` before any burn
+    /// reaches the sweep's pre-burn clear, not the reactor. The withdrawal
+    /// moved the $400 off Alpaca, so the gross figure drops by it too.
+    #[tokio::test]
+    async fn sweep_pre_burn_clear_of_a_reconciled_alpaca_to_base_debits_the_gross() {
+        let now = Utc::now();
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc(400);
+
+        seed_withdrawal_complete_alpaca_to_base(&store, &id, amount).await;
+        for command in [
+            UsdcRebalanceCommand::FailBridging {
+                reason: "operator: bridge never started".to_string(),
+            },
+            UsdcRebalanceCommand::ReconcileStuckRebalance {
+                reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+            },
+        ] {
+            store.send(&id, command).await.unwrap();
+        }
+        let trigger = make_trigger_with_timed_out_alpaca_to_base_tracking(
+            &pool,
+            store,
+            &id,
+            amount,
+            usdc::UsdcRebalanceStage::WithdrawalConfirmed,
+            now,
+        )
+        .await;
+        {
+            let mut inventory = trigger.inventory.write().await;
+            *inventory = inventory.clone().with_offchain_gross_usd_cents(90_000);
+        }
+
+        trigger
+            .expire_stuck_usdc_rebalances(now + ChronoDuration::seconds(5))
+            .await
+            .unwrap();
+
+        assert!(!trigger.usdc_guards.is_held(Chain::Base));
+        let balances = trigger.inventory.read().await.usdc_balances();
+        assert_eq!(balances.offchain_inflight, Usdc::ZERO);
+        assert_eq!(balances.offchain_gross, Some(usdc(500)));
     }
 
     /// An AlpacaToBase transfer stranded in `BridgingSubmitting` with no

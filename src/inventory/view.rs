@@ -14,7 +14,7 @@ use st0x_config::ImbalanceThreshold;
 use st0x_dto::{InFlightCash, InFlightEquity, SymbolInventory, UsdcInventory};
 use st0x_evm::Chain;
 use st0x_execution::{Direction, FractionalShares, HasZero, Symbol};
-use st0x_finance::{Usd, Usdc};
+use st0x_finance::{Usd, Usdc, UsdcToCentsError};
 use st0x_tokenization::IssuerRequestId;
 
 use super::divergence::{PersistentBrokerCashDivergence, PersistentBrokerDivergence};
@@ -35,6 +35,8 @@ pub enum InventoryViewError {
     Float(#[from] FloatError),
     #[error("failed to convert USD balance cents {0} to USDC")]
     UsdBalanceConversion(i64),
+    #[error("failed to convert the gross broker cash to cents")]
+    GrossCents(#[from] UsdcToCentsError),
     #[error("inventory delta was deferred pending an authoritative venue snapshot")]
     DeferredSnapshotReconciliation,
 }
@@ -1165,6 +1167,49 @@ impl InventoryView {
         } else {
             Ok(None)
         }
+    }
+
+    /// Moves the gross broker cash as a settled USDC transfer moved the Hedging
+    /// ledger: `received` in from a chain, `sent` out to one. The poll drops an
+    /// unchanged reading, so it does not refresh this. Rounds down to cents; a
+    /// debit above the reading clears it. No reading (no reserve) stays absent.
+    pub(crate) fn settle_offchain_gross(
+        self,
+        from: Venue,
+        sent: Usdc,
+        received: Usdc,
+    ) -> Result<Self, InventoryViewError> {
+        let Some(cents) = self.offchain_gross_usd_cents else {
+            return Ok(self);
+        };
+        let gross =
+            Usdc::from_cents(cents).ok_or(InventoryViewError::UsdBalanceConversion(cents))?;
+
+        let settled = match from {
+            Venue::MarketMaking => (gross + received)?,
+            Venue::Hedging => (gross - sent)?,
+        };
+
+        if settled.lt(&Usdc::ZERO)? {
+            warn!(
+                target: "inventory",
+                gross_usd_cents = cents,
+                ?sent,
+                "Clearing the gross broker cash: the settled debit exceeds it; \
+                 reserve-configured USDC checks skip until the next broker read"
+            );
+            return Ok(Self {
+                offchain_gross_usd_cents: None,
+                ..self
+            });
+        }
+
+        let (whole_cents, _sub_cent) = settled.truncate_to_decimals(2)?;
+
+        Ok(Self {
+            offchain_gross_usd_cents: Some(whole_cents.to_cents()?),
+            ..self
+        })
     }
 
     /// Maximum USDC that may leave Alpaca while preserving the configured
@@ -3238,6 +3283,27 @@ impl InventoryView {
             },
             now,
         )
+    }
+
+    /// Zeroes `venue`'s USDC inflight with no destination credit, for funds
+    /// an operator resolved off the ledger. A Hedging release left the broker,
+    /// so it debits the gross broker cash by the same amount.
+    pub(crate) fn release_usdc_inflight_at(
+        self,
+        chain: Chain,
+        venue: Venue,
+        now: DateTime<Utc>,
+    ) -> Result<Self, InventoryViewError> {
+        let released = match venue {
+            Venue::Hedging => self.usdc.offchain.map(VenueBalance::inflight),
+            Venue::MarketMaking => None,
+        };
+        let cleared = self.clear_usdc_inflight_at(chain, venue, now)?;
+
+        match released {
+            Some(released) => cleared.settle_offchain_gross(venue, released, Usdc::ZERO),
+            None => Ok(cleared),
+        }
     }
 
     /// Zeroes the USDC inflight at `venue` in `chain`'s slot: a transfer
@@ -11155,6 +11221,67 @@ mod tests {
             .unwrap();
 
         assert_eq!(capacity, Usdc::new(float!(102.10)));
+    }
+
+    fn gross_after(
+        gross_cents: Option<i64>,
+        from: Venue,
+        sent: Usdc,
+        received: Usdc,
+    ) -> Option<Usdc> {
+        let view = gross_cents.map_or_else(InventoryView::default, |cents| {
+            InventoryView::default().with_offchain_gross_usd_cents(cents)
+        });
+
+        view.settle_offchain_gross(from, sent, received)
+            .unwrap()
+            .usdc_balances()
+            .offchain_gross
+    }
+
+    #[test]
+    fn settled_transfer_moves_the_gross_broker_cash_by_the_ledger_change() {
+        let fifty = Usdc::new(float!(50));
+        let landed = Usdc::new(float!(49.5));
+
+        assert_eq!(
+            gross_after(Some(10_000), Venue::MarketMaking, fifty, landed),
+            Some(Usdc::new(float!(149.5))),
+            "a chain-to-Alpaca landing credits what Alpaca received"
+        );
+        assert_eq!(
+            gross_after(Some(10_000), Venue::Hedging, fifty, landed),
+            Some(Usdc::new(float!(50))),
+            "an Alpaca-to-chain landing debits what left Alpaca"
+        );
+        assert_eq!(
+            gross_after(None, Venue::MarketMaking, fifty, landed),
+            None,
+            "no reserve, no gross reading to move"
+        );
+    }
+
+    #[test]
+    fn settled_gross_rounds_down_to_whole_cents() {
+        let sub_cent = Usdc::new(float!(0.019999));
+
+        assert_eq!(
+            gross_after(Some(10_000), Venue::MarketMaking, sub_cent, sub_cent),
+            Some(Usdc::new(float!(100.01)))
+        );
+        assert_eq!(
+            gross_after(Some(10_000), Venue::Hedging, sub_cent, sub_cent),
+            Some(Usdc::new(float!(99.98)))
+        );
+    }
+
+    #[test]
+    fn settled_debit_above_the_gross_clears_it() {
+        let gross_after_debit =
+            |sent| gross_after(Some(5_000), Venue::Hedging, Usdc::new(sent), Usdc::ZERO);
+
+        assert_eq!(gross_after_debit(float!(50.01)), None);
+        assert_eq!(gross_after_debit(float!(50)), Some(Usdc::ZERO));
     }
 
     #[test]
