@@ -401,6 +401,18 @@ pub enum UsdcTransferError {
         #[source]
         source: Box<RelayError>,
     },
+    /// Deposits of reverted Relay orders are on chain and the approves that
+    /// went out alone do not confirm yet: the transfer records nothing, and
+    /// the job sends them again later at no retry cost.
+    #[error(
+        "USDC rebalance {id}: deposits of reverted Relay orders are on chain, but the lone \
+         approves do not confirm yet: {source}"
+    )]
+    FoundSwapDepositApprovesUnconfirmed {
+        id: UsdcRebalanceId,
+        #[source]
+        source: Box<UsdcTransferError>,
+    },
     /// The fill window passed with no fill or refund proven: the transfer
     /// holds its guard and the job reads Relay's status again slowly.
     #[error("USDC rebalance {id}: Relay deposit {deposit_tx} is unresolved past its fill window")]
@@ -887,6 +899,7 @@ impl UsdcTransferError {
             | Self::SwapPaymentUnverified { .. }
             | Self::SwapQuoteTransient { .. }
             | Self::SwapEscrowUnresolved { .. }
+            | Self::FoundSwapDepositApprovesUnconfirmed { .. }
             | Self::EthereumChainMissing(_) => None,
         }
     }
@@ -972,6 +985,7 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::SwapPaymentUnverified { .. }
             | Self::SwapQuoteTransient { .. }
             | Self::SwapEscrowUnresolved { .. }
+            | Self::FoundSwapDepositApprovesUnconfirmed { .. }
             | Self::EthereumChainMissing(_) => false,
         }
     }

@@ -1748,12 +1748,12 @@ where
     /// reorg may have landed: `Proceed` when none is on chain. Once one is
     /// found, the approves that went out alone are sent again, confirmed and
     /// their gas queued, since the adoption or a reconcile ending the hold
-    /// drops them. A lone found deposit of the current quote's input is
-    /// adopted as the swap's deposit once they confirm (until then the
-    /// attempt ends with nothing recorded, for the retry), and `Adopted`
-    /// returned for the caller to read Relay's status of it. Any other find,
-    /// deposits of several orders or one of another input, pages and holds
-    /// at `SwapQuoted`: `Ended`.
+    /// drops them; until they confirm the attempt pages and ends with
+    /// nothing recorded (`FoundSwapDepositApprovesUnconfirmed`). A lone found
+    /// deposit of its order's and the current quote's input is then adopted
+    /// as the swap's deposit, and `Adopted` returned for the caller to read
+    /// Relay's status of it. Any other find, deposits of several orders or
+    /// one of another input, pages and holds at `SwapQuoted`: `Ended`.
     async fn adopt_reverted_deposit(
         &self,
         id: &UsdcRebalanceId,
@@ -1801,22 +1801,13 @@ where
             })
             .join(", ");
 
-        // Every later send from the wallet waits behind their nonces.
-        let deadline = Instant::now() + self.hop.bounds.quote_max_age;
+        self.send_found_deposit_approves(id, split_approves, side, &deposits)
+            .await?;
+
         match found.as_slice() {
             [(deposit, quote)]
                 if deposit.amount == current.amount_in && deposit.amount == quote.amount_in =>
             {
-                // The adoption drops the approves from the transfer: nothing
-                // would send them again or book their gas after it.
-                self.hop
-                    .broadcast_split_approves(id, split_approves, side, deadline)
-                    .await?;
-                self.confirm_split_approves(id, split_approves, side)
-                    .await
-                    .inspect_err(|error| {
-                        warn!(target: "rebalance", %id, %error, %deposits, "The deposit of a reverted Relay order is on chain, but the lone approves do not confirm yet; adopting nothing until they do");
-                    })?;
                 let order_id = quote.order_id;
                 self.cqrs
                     .send(
@@ -1846,9 +1837,23 @@ where
                 error!(target: "operational_alert", alert = true, kind = AlertKind::RevertedRelayOrderDepositsOnChain.as_str(), %id, %deposits, "Deposits of several reverted Relay orders are on chain; the transfer adopts none and holds its guard at SwapQuoted for the operator: check each listed request with `stox relay status`");
             }
         }
+        Ok(BeforeSigning::Ended)
+    }
 
-        // The hold keeps the approves at `SwapQuoted`, so one that is not
-        // sent or confirmed yet is sent again by the next resume.
+    /// Sends again and confirms the approves of a `SwapQuoted` that went out
+    /// alone, once the escrow scan found deposits of reverted orders, and
+    /// queues their gas. Ones that do not confirm page the found `deposits`
+    /// and end the attempt with `FoundSwapDepositApprovesUnconfirmed`, which
+    /// the job sends again later at no retry cost: every later send from the
+    /// wallet waits behind their nonces.
+    async fn send_found_deposit_approves(
+        &self,
+        id: &UsdcRebalanceId,
+        split_approves: &[PreparedTransaction],
+        side: HopDirection,
+        deposits: &str,
+    ) -> Result<(), UsdcTransferError> {
+        let deadline = Instant::now() + self.hop.bounds.quote_max_age;
         let sent = match self
             .hop
             .broadcast_split_approves(id, split_approves, side, deadline)
@@ -1857,10 +1862,19 @@ where
             Ok(()) => self.confirm_split_approves(id, split_approves, side).await,
             Err(error) => Err(error),
         };
-        if let Err(error) = sent {
-            warn!(target: "rebalance", %id, %error, "Holding with lone Relay approves unconfirmed; the next resume sends and confirms them again");
+
+        match sent {
+            Ok(()) => Ok(()),
+            // Its own interception re-queues a failed gas enqueue.
+            Err(error @ UsdcTransferError::BotGasEnqueue(_)) => Err(error),
+            Err(error) => {
+                error!(target: "operational_alert", alert = true, kind = AlertKind::RelayFoundDepositApprovesUnconfirmed.as_str(), %id, %error, %deposits, "Deposits of reverted Relay orders are on chain, but the lone approves do not confirm; the transfer records nothing and holds its guard at SwapQuoted, and the job sends them again later: check the listed requests with `stox relay status`");
+                Err(UsdcTransferError::FoundSwapDepositApprovesUnconfirmed {
+                    id: id.clone(),
+                    source: Box::new(error),
+                })
+            }
         }
-        Ok(BeforeSigning::Ended)
     }
 
     /// The fill or refund of `quote`'s order that Relay reports and the chain
@@ -9217,9 +9231,9 @@ mod tests {
     }
 
     /// A lone approve the node dropped is confirmed before the found deposit
-    /// is adopted: the attempt ends at `SwapQuoted` with nothing recorded,
-    /// logging the found deposit, and the retry sends the approve again and
-    /// adopts the deposit.
+    /// is adopted: the attempt pages the found deposit and ends at
+    /// `SwapQuoted` with nothing recorded, for a retry at no retry cost, and
+    /// the retry sends the approve again and adopts the deposit.
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn adoption_waits_for_an_unconfirmed_lone_approve() {
@@ -9284,8 +9298,12 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                UsdcTransferError::RelayBridge(inner)
-                    if matches!(**inner, RelayBridgeError::Evm(EvmError::TransactionDropped { .. }))
+                UsdcTransferError::FoundSwapDepositApprovesUnconfirmed { source, .. }
+                    if matches!(
+                        &**source,
+                        UsdcTransferError::RelayBridge(inner)
+                            if matches!(**inner, RelayBridgeError::Evm(EvmError::TransactionDropped { .. }))
+                    )
             ),
             "got {error:?}"
         );
@@ -9299,10 +9317,12 @@ mod tests {
             lines
                 .iter()
                 .any(|line| {
-                    line.contains("lone approves do not confirm") && line.contains(&request)
+                    line.contains("operational_alert")
+                        && line.contains("lone approves do not confirm")
+                        && line.contains(&request)
                 })
                 .then_some(())
-                .ok_or_else(|| "no warning names the found deposit's request".to_string())
+                .ok_or_else(|| "no page names the found deposit's request".to_string())
         });
 
         let retry = attempt().await.expect("the retry ends");
@@ -9319,8 +9339,8 @@ mod tests {
                 .filter(|line| line.contains("operational_alert"))
                 .count()
             {
-                0 => Ok(()),
-                pages => Err(format!("expected no page, got {pages}")),
+                1 => Ok(()),
+                pages => Err(format!("expected only the approve's page, got {pages}")),
             }
         });
     }
@@ -9701,10 +9721,17 @@ mod tests {
             )
         };
 
-        attempt()
+        let error = attempt()
             .await
             .expect("the attempt ends")
             .expect_err("the hold left its approve unsent");
+        assert!(
+            matches!(
+                &error,
+                UsdcTransferError::FoundSwapDepositApprovesUnconfirmed { .. }
+            ),
+            "got {error:?}"
+        );
         assert_eq!(
             store.load(&id).await.unwrap().unwrap().state_name(),
             "SwapQuoted"

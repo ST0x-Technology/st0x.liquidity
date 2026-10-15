@@ -5490,9 +5490,9 @@ signing a second deposit while an earlier one may still land:
   holds the transfer's amount, so adopting one payment would release the guard
   with the other still at Relay. Nor is one whose order was quoted for another
   amount (before an Alpaca-to-chain refund at the hub, whose re-quote is for the
-  refunded amount). Either pages once and holds at `SwapQuoted` for the
-  operator, with nothing read again until a resume or a restart. A scan that
-  fails is retried and signs nothing either.
+  refunded amount). Either pages once its lone approves confirm (see below) and
+  holds at `SwapQuoted` for the operator, with nothing read again until a resume
+  or a restart. A scan that fails is retried and signs nothing either.
 - **Late adoption.** `SwapCompletionRecovered` adopts a proven late payment of
   the failed order of a `SwapFailed`, through `transfer recheck`, keeping the
   reverted quotes for the escrow scan, which reads them again once the transfer
@@ -5510,11 +5510,12 @@ signing a second deposit while an earlier one may still land:
   payment of its deposited order with `ConfirmSwapFill` or `RecordSwapRefund`.
   Once a deposit of a reverted order is found, approves that went out alone are
   sent again, confirmed and their gas queued, before a `SwapQuoted` adopts it or
-  holds: the adoption drops them, and so does a reconcile ending the hold. One
-  that does not confirm yet keeps the deposit from being adopted (the attempt
-  retries and records nothing); a hold pages anyway and keeps them for the next
-  resume. Superseding an order adds its id to `signed_order_ids` and never drops
-  one.
+  holds: the adoption drops them, and so does a reconcile ending the hold. While
+  one does not confirm, the transfer neither adopts nor holds: each attempt
+  pages the found deposits, records nothing and ends with
+  `FoundSwapDepositApprovesUnconfirmed`, which the job re-queues after 10
+  minutes at no retry cost. Superseding an order adds its id to
+  `signed_order_ids` and never drops one.
 
 ##### Crash-safe resume
 

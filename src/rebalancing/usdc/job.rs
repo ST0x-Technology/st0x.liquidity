@@ -194,6 +194,11 @@ const SWAP_PAYMENT_UNVERIFIED_REDRIVE_DELAY: Duration = Duration::from_secs(30 *
 /// after the quote.
 const SWAP_ESCROW_RECHECK_DELAY: Duration = Duration::from_secs(30 * 60);
 
+/// Delay before sending again the lone approves of a transfer whose escrow
+/// scan found deposits of reverted orders: each attempt that does not
+/// confirm them pages.
+const FOUND_SWAP_DEPOSIT_APPROVES_REDRIVE_DELAY: Duration = Duration::from_secs(10 * 60);
+
 /// When to read Relay's status again for a deposit confirmed at
 /// `deposited_at`. A deposit stamped after `now` (clock skew) counts as
 /// fresh.
@@ -451,10 +456,12 @@ where
 /// or on the chain: the fill not paid yet (`RelayFillPending`), a reverted
 /// deposit the next attempt re-quotes (`SwapDepositReverted`), a quote that
 /// failed transiently (`SwapQuoteTransient`), a payment that does not prove
-/// (`SwapPaymentUnverified`, paged on every read), or an escrow unresolved
-/// past its fill window (`SwapEscrowUnresolved`, read slowly). Each attempt
-/// reads Relay's status once, so the single-concurrency worker never blocks
-/// on a fill.
+/// (`SwapPaymentUnverified`, paged on every read), an escrow unresolved past
+/// its fill window (`SwapEscrowUnresolved`, read slowly), or lone approves
+/// that do not confirm behind found deposits of reverted orders
+/// (`FoundSwapDepositApprovesUnconfirmed`, paged on every attempt). Each
+/// attempt reads Relay's status once, so the single-concurrency worker never
+/// blocks on a fill.
 async fn intercept_relay_wait<Ctx, TaskJob>(
     job: &TaskJob,
     job_queue: &JobQueue<TaskJob>,
@@ -496,6 +503,10 @@ where
         Err(UsdcTransferError::SwapEscrowUnresolved { id, deposit_tx }) => {
             info!(target: "rebalance", %id, %deposit_tx, delay = ?SWAP_ESCROW_RECHECK_DELAY, "Relay escrow unresolved; reading its status again later");
             SWAP_ESCROW_RECHECK_DELAY
+        }
+        Err(UsdcTransferError::FoundSwapDepositApprovesUnconfirmed { id, source }) => {
+            warn!(target: "rebalance", %id, %source, delay = ?FOUND_SWAP_DEPOSIT_APPROVES_REDRIVE_DELAY, "Lone Relay approves do not confirm behind found deposits; sending them again later");
+            FOUND_SWAP_DEPOSIT_APPROVES_REDRIVE_DELAY
         }
         Ok(()) | Err(_) => return ControlFlow::Continue(result),
     };
@@ -3513,55 +3524,72 @@ mod tests {
         }
     }
 
-    /// An escrow unresolved past its fill window re-queues the job after the
-    /// slow re-check delay at no retry or redrive cost: the job keeps reading
-    /// Relay instead of ending with the guard held and nothing driving it.
-    /// The escrow paged once, when it was recorded, so the re-queue pages
-    /// nothing.
+    /// An escrow unresolved past its fill window, and lone approves that do
+    /// not confirm behind found deposits of reverted orders, re-queue the job
+    /// after their delay at no retry or redrive cost: the job keeps driving
+    /// the transfer instead of ending with the guard held. Both paged in the
+    /// hop, so the re-queue pages nothing.
     #[tokio::test]
-    async fn unresolved_escrow_is_read_again_slowly() {
-        let pool = setup_queue_pool().await;
-        let notifier = Arc::new(CapturingNotifier::default());
-        let ctx = TransferUsdcToHedgingCtx {
-            notifier: notifier.clone(),
-            ..hedging_ctx(
-                Arc::new(EndsWith(|id| UsdcTransferError::SwapEscrowUnresolved {
+    async fn unresolved_escrow_and_unconfirmed_found_deposit_approves_are_requeued() {
+        type HeldEnd = fn(&UsdcRebalanceId) -> UsdcTransferError;
+        let held: [(HeldEnd, Duration); 2] = [
+            (
+                |id| UsdcTransferError::SwapEscrowUnresolved {
                     id: id.clone(),
                     deposit_tx: TxHash::repeat_byte(0xd1),
-                })),
-                &pool,
-            )
-        };
-        let job = TransferUsdcToHedging {
-            corridor: UsdcCorridor::HubRouted {
-                chain: Chain::Robinhood,
-                hop: HopKind::Relay,
-            },
-            id: UsdcRebalanceId(Uuid::new_v4()),
-            amount: Usdc::new(float!(100)),
-            revert_redrive_attempts: 1,
-            backpressure_streak: BackpressureStreak(2),
-        };
+                },
+                SWAP_ESCROW_RECHECK_DELAY,
+            ),
+            (
+                |id| UsdcTransferError::FoundSwapDepositApprovesUnconfirmed {
+                    id: id.clone(),
+                    source: Box::new(UsdcTransferError::SwapDepositReverted {
+                        id: id.clone(),
+                        deposit_tx: TxHash::repeat_byte(0xd2),
+                    }),
+                },
+                FOUND_SWAP_DEPOSIT_APPROVES_REDRIVE_DELAY,
+            ),
+        ];
 
-        let before = Utc::now().timestamp();
-        Job::perform(&job, &ctx)
-            .await
-            .expect("a held escrow re-queues without failing the attempt");
-        let after = Utc::now().timestamp();
+        for (end, delay) in held {
+            let pool = setup_queue_pool().await;
+            let notifier = Arc::new(CapturingNotifier::default());
+            let ctx = TransferUsdcToHedgingCtx {
+                notifier: notifier.clone(),
+                ..hedging_ctx(Arc::new(EndsWith(end)), &pool)
+            };
+            let job = TransferUsdcToHedging {
+                corridor: UsdcCorridor::HubRouted {
+                    chain: Chain::Robinhood,
+                    hop: HopKind::Relay,
+                },
+                id: UsdcRebalanceId(Uuid::new_v4()),
+                amount: Usdc::new(float!(100)),
+                revert_redrive_attempts: 1,
+                backpressure_streak: BackpressureStreak(2),
+            };
 
-        let (payload, run_at) = pending_job_row::<TransferUsdcToHedging>(&pool).await;
-        let requeued: TransferUsdcToHedging = serde_json::from_slice(&payload).unwrap();
-        assert_eq!(requeued.id, job.id);
-        assert_eq!(
-            requeued.revert_redrive_attempts,
-            job.revert_redrive_attempts
-        );
-        let delay = i64::try_from(SWAP_ESCROW_RECHECK_DELAY.as_secs()).unwrap();
-        assert!(
-            run_at >= before + delay - 1 && run_at <= after + delay + 1,
-            "run_at {run_at} is not {delay}s after {before}..{after}"
-        );
-        assert_eq!(notifier.kinds(), Vec::<AlertKind>::new());
+            let before = Utc::now().timestamp();
+            Job::perform(&job, &ctx)
+                .await
+                .expect("a held transfer re-queues without failing the attempt");
+            let after = Utc::now().timestamp();
+
+            let (payload, run_at) = pending_job_row::<TransferUsdcToHedging>(&pool).await;
+            let requeued: TransferUsdcToHedging = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(requeued.id, job.id);
+            assert_eq!(
+                requeued.revert_redrive_attempts,
+                job.revert_redrive_attempts
+            );
+            let delay = i64::try_from(delay.as_secs()).unwrap();
+            assert!(
+                run_at >= before + delay - 1 && run_at <= after + delay + 1,
+                "run_at {run_at} is not {delay}s after {before}..{after}"
+            );
+            assert_eq!(notifier.kinds(), Vec::<AlertKind>::new());
+        }
     }
 
     struct UnwiredGasReadinessBaseToAlpaca;
