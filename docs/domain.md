@@ -369,7 +369,7 @@ The type is `DeviationBand`.
 
 A target share together with the deviation band around it: the range one chain's
 vault is held to for an equity, or a cash corridor's target and deviation. The
-dashboard inventory carries one per chain entry. The DTO type is
+dashboard inventory carries at most one per chain entry. The DTO type is
 `RebalancingBand`.
 
 ### Minimum Operation Size

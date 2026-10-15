@@ -9213,11 +9213,13 @@ row carry `chains`: one entry per hedged chain whose vault a snapshot has read,
 the same chains as the `liq_equity_chain_*` and `liq_usdc_chain_*` series. An
 equity entry is in that chain's wrapped vault shares, so entries never sum
 across chains; a cash entry names its chain's settlement stable. Each entry's
-`band` is the Target Share and Deviation Band the rebalancer holds that vault
-to, as decimal strings. An enabled or paused listing has one, a disabled listing
-none. A chain whose cash asset rebalances has its configured corridor's band,
-whatever the USDC mode; any other chain has none. The `settings` band fields
-keep their meaning.
+`band` holds a target and a deviation as decimal strings. For an equity they are
+the listing's Target Share on that chain and the Deviation Band; an enabled or
+paused listing has one, a disabled listing none. For cash they are the chain's
+corridor threshold: the target share of that vault plus the broker cash held
+onchain, and its deviation. A chain whose cash asset rebalances has it, whatever
+the USDC mode; any other chain has none. The `settings` band fields keep their
+meaning.
 
 ##### TanStack Query Integration
 

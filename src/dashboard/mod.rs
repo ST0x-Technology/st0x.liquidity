@@ -327,8 +327,8 @@ pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
         let rebalancing = &ctx.rebalancing;
         // The band of the one corridor the USDC trigger can act on, whatever
         // its chain; with several, the primary chain's, until the UI reads
-        // each chain's band from the inventory. The trigger skips a corridor whose
-        // chain does not rebalance its cash asset.
+        // each chain's band from the inventory. The trigger skips a corridor
+        // whose chain does not rebalance its cash asset.
         let primary = ctx.chains.primary().chain;
         let rebalances_cash = |usdc: &&UsdcCorridorCtx| {
             ctx.chains

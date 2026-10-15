@@ -127,8 +127,8 @@ mod tests {
 
     /// A listing's own `target_share` wins over its chain's default, a
     /// paused listing keeps its band, a disabled one has none, and a cash
-    /// corridor shows its band while the USDC mode is disabled, but only on a
-    /// chain whose cash asset rebalances.
+    /// corridor shows its band while the USDC mode is disabled, but not on a
+    /// chain whose cash asset does not rebalance.
     #[test]
     fn bands_resolve_each_listings_effective_target() {
         let mut ctx = create_test_ctx_with_order_owner(address!(
@@ -137,6 +137,11 @@ mod tests {
         let aapl = Symbol::new("AAPL").unwrap();
         let tsla = Symbol::new("TSLA").unwrap();
         assert_eq!(ctx.chains.primary().chain, Chain::Base);
+        ctx.chains.primary_mut().assets.cash = Some(ChainCashAsset {
+            vault_ids: Vec::new(),
+            rebalancing: OperationMode::Disabled,
+            operational_limit: None,
+        });
         ctx.chains.primary_mut().assets.equities.symbols.extend([
             (aapl.clone(), listing(RebalancingMode::Enabled, None)),
             (tsla.clone(), listing(RebalancingMode::Disabled, None)),

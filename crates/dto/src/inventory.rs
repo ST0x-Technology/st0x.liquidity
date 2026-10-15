@@ -49,7 +49,9 @@ pub struct ChainEquityInventory {
 }
 
 /// The share of the total a chain's vault is held at, and how far it may
-/// drift before the rebalancer acts, both fractions in `[0, 1]`.
+/// drift before the rebalancer acts, both fractions in `[0, 1]`. For equity
+/// the total is the symbol's on every venue; for cash, the chain's vault plus
+/// the broker cash.
 #[derive(Debug, Clone, Copy, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct RebalancingBand {
