@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use tracing::warn;
+use tracing::error;
 
 use st0x_config::Ctx;
 use st0x_dto::RebalancingBand;
@@ -45,7 +45,7 @@ impl RebalancingBands {
                     .target_share
                     .or_else(|| allocation.targets.get(&chain).copied())
                 else {
-                    warn!(
+                    error!(
                         target: "dashboard",
                         %symbol,
                         %chain,
@@ -96,6 +96,7 @@ impl RebalancingBands {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, address};
+    use serde_json::json;
     use std::collections::HashMap;
 
     use st0x_bridge::corridor::{HopKind, UsdcCorridor};
@@ -124,14 +125,6 @@ mod tests {
         }
     }
 
-    fn symbol(name: &str) -> Symbol {
-        Symbol::new(name).unwrap()
-    }
-
-    fn wire(band: Option<RebalancingBand>) -> serde_json::Value {
-        serde_json::to_value(band).unwrap()
-    }
-
     /// A listing's own `target_share` wins over its chain's default, a
     /// paused listing keeps its band, a disabled one has none, and a cash
     /// corridor shows its band while the USDC mode is disabled, but only on a
@@ -141,10 +134,12 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(address!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
+        let aapl = Symbol::new("AAPL").unwrap();
+        let tsla = Symbol::new("TSLA").unwrap();
         assert_eq!(ctx.chains.primary().chain, Chain::Base);
         ctx.chains.primary_mut().assets.equities.symbols.extend([
-            (symbol("AAPL"), listing(RebalancingMode::Enabled, None)),
-            (symbol("TSLA"), listing(RebalancingMode::Disabled, None)),
+            (aapl.clone(), listing(RebalancingMode::Enabled, None)),
+            (tsla.clone(), listing(RebalancingMode::Disabled, None)),
         ]);
         ctx.chains.insert_secondary(
             HedgedChain::test()
@@ -154,13 +149,13 @@ mod tests {
                         operational_limit: None,
                         symbols: HashMap::from([
                             (
-                                symbol("AAPL"),
+                                aapl.clone(),
                                 listing(
                                     RebalancingMode::Enabled,
                                     Some(TargetShare::new(float!(0.3)).unwrap()),
                                 ),
                             ),
-                            (symbol("TSLA"), listing(RebalancingMode::Paused, None)),
+                            (tsla.clone(), listing(RebalancingMode::Paused, None)),
                         ]),
                     },
                     cash: Some(ChainCashAsset {
@@ -171,10 +166,10 @@ mod tests {
                 })
                 .call(),
         );
-        ctx.rebalancing
-            .allocation
-            .targets
-            .insert(Chain::Robinhood, TargetShare::new(float!(0.2)).unwrap());
+        ctx.rebalancing.allocation.targets = BTreeMap::from([
+            (Chain::Base, TargetShare::new(float!(0.5)).unwrap()),
+            (Chain::Robinhood, TargetShare::new(float!(0.2)).unwrap()),
+        ]);
         ctx.rebalancing.usdc = UsdcCorridors::for_test(
             OperationMode::Disabled,
             [
@@ -204,27 +199,27 @@ mod tests {
             bands.hedged,
             BTreeSet::from([Chain::Base, Chain::Robinhood])
         );
-        let equity = |name: &str, chain| wire(bands.equity.get(&(symbol(name), chain)).copied());
+        let equity = |symbol: &Symbol, chain| {
+            serde_json::to_value(bands.equity.get(&(symbol.clone(), chain))).unwrap()
+        };
+        let usdc = |chain| serde_json::to_value(bands.usdc.get(&chain)).unwrap();
         assert_eq!(
-            equity("AAPL", Chain::Base),
-            serde_json::json!({ "target": "0.5", "deviation": "0.1" })
+            equity(&aapl, Chain::Base),
+            json!({ "target": "0.5", "deviation": "0.1" })
         );
         assert_eq!(
-            equity("AAPL", Chain::Robinhood),
-            serde_json::json!({ "target": "0.3", "deviation": "0.1" })
+            equity(&aapl, Chain::Robinhood),
+            json!({ "target": "0.3", "deviation": "0.1" })
         );
         assert_eq!(
-            equity("TSLA", Chain::Robinhood),
-            serde_json::json!({ "target": "0.2", "deviation": "0.1" })
+            equity(&tsla, Chain::Robinhood),
+            json!({ "target": "0.2", "deviation": "0.1" })
         );
-        assert_eq!(equity("TSLA", Chain::Base), serde_json::json!(null));
+        assert_eq!(equity(&tsla, Chain::Base), json!(null));
         assert_eq!(
-            wire(bands.usdc.get(&Chain::Robinhood).copied()),
-            serde_json::json!({ "target": "0.25", "deviation": "0.125" })
+            usdc(Chain::Robinhood),
+            json!({ "target": "0.25", "deviation": "0.125" })
         );
-        assert_eq!(
-            wire(bands.usdc.get(&Chain::Base).copied()),
-            serde_json::json!(null)
-        );
+        assert_eq!(usdc(Chain::Base), json!(null));
     }
 }

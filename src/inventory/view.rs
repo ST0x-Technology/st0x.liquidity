@@ -24,9 +24,9 @@ use super::RebalancingBands;
 use super::divergence::{PersistentBrokerCashDivergence, PersistentBrokerDivergence};
 use super::snapshot::InventorySnapshotEvent;
 use super::venue_balance::{InventoryError, VenueBalance};
+use crate::dashboard::chain_name;
 use crate::equity_redemption::{RedemptionAggregateId, StrandedRedemption};
 use crate::offchain::order::OffchainOrderId;
-use crate::performance::infra::chain_name;
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceId};
 
 /// Error type for inventory view operations.

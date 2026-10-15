@@ -188,6 +188,7 @@ impl Drop for BroadcastingWriteGuard<'_> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -463,7 +464,7 @@ mod tests {
             );
         }
 
-        let expected = serde_json::json!([{
+        let expected = json!([{
             "chain": "base",
             "available": "100",
             "inflight": "0",
