@@ -9407,17 +9407,17 @@ impl RebalancingService {
         // Restore a single canonical pre-recovery inventory shape -- the
         // Hedging in-flight holding `quantity` -- so the
         // ProviderCompletionRecovered reactor arm can complete it uniformly
-        // regardless of how the mint failed. No branch debits available:
-        // recheck runs only after the provider took the shares, so a broker
-        // snapshot since the failure may already exclude them.
+        // regardless of how the mint failed. No branch debits available, and
+        // every branch forces an offchain reconcile: recheck runs only after
+        // the provider took the shares, and whether available still counts
+        // them depends on what ran since the failure (a cancel crediting them
+        // back, a broker snapshot excluding them, a provider poll re-setting
+        // the in-flight). The broker read re-bases available either way.
         // - a timeout cleared the in-flight without crediting available and
         //   tombstoned the aggregate (so the reactor ignores late events), so we
-        //   drop the tombstone and re-set the in-flight (available stays debited);
-        // - any other failure left the in-flight at zero, and available may or
-        //   may not still count the shares (a cancel credited them back, a
-        //   broker snapshot since then excluded them). We re-set the in-flight
-        //   and force an offchain reconcile so available re-bases to the
-        //   broker's position.
+        //   drop the tombstone and re-set the in-flight;
+        // - a failure that cancelled or never started left the in-flight at
+        //   zero, so we re-set it.
         // Peek (don't yet remove) the timeout markers so a failure in the
         // fallible inventory update below leaves them intact -- a failed rebuild
         // does not run the caller's rollback, so consuming them up front would
@@ -9429,11 +9429,11 @@ impl RebalancingService {
             .get(id)
             .map(|tombstone| tombstone.timed_out_at);
 
-        // A third shape the timeout/explicit branches below do not cover: the
+        // A third shape the timeout/zero-inflight branches below do not cover: the
         // failure left the in-flight already established (a `Start` ran but the
         // failure never cancelled it back to available -- e.g. an out-of-process
         // `transfer fail`, or a reactor that recorded the failure without
-        // running `cancel`). That is already the canonical pre-complete shape,
+        // running `cancel` -- or a provider poll re-set it). That is already the canonical pre-complete shape,
         // so recovery keeps it and its rollback leaves the in-flight in place.
         let inflight_already_established = self
             .inventory
@@ -9444,25 +9444,22 @@ impl RebalancingService {
             .transpose()?
             .is_some_and(|is_zero| !is_zero);
 
-        let (rollback, forces_offchain_reconcile) = if let Some(timed_out_at) = timed_out_at {
+        let rollback = if let Some(timed_out_at) = timed_out_at {
             let suppressed_at = self
                 .suppressed_inflight_symbols
                 .read()
                 .await
                 .get(&(symbol.clone(), entity.chain()))
                 .copied();
-            (
-                RecoveryRollback::RestoreTombstone {
-                    chain: entity.chain(),
-                    timed_out_at,
-                    suppressed_at,
-                },
-                false,
-            )
+            RecoveryRollback::RestoreTombstone {
+                chain: entity.chain(),
+                timed_out_at,
+                suppressed_at,
+            }
         } else if inflight_already_established {
-            (RecoveryRollback::TrackingOnly, false)
+            RecoveryRollback::TrackingOnly
         } else {
-            (RecoveryRollback::ClearInflight, true)
+            RecoveryRollback::ClearInflight
         };
         let update = Inventory::set_inflight(Venue::Hedging, quantity);
 
@@ -9532,10 +9529,8 @@ impl RebalancingService {
                 .remove(&(symbol.clone(), entity.chain()));
         }
 
-        if forces_offchain_reconcile {
-            self.divergence_gate
-                .request_offchain_equity_reconcile(symbol);
-        }
+        self.divergence_gate
+            .request_offchain_equity_reconcile(symbol);
 
         let mut mint_tracking = self.mint_tracking.write().await;
         let hedging_start = mint_tracking
@@ -12484,6 +12479,107 @@ mod tests {
         };
         assert_eq!(hedging, Some(shares(90)));
         assert_eq!(market_making, Some(shares(10)));
+        assert_eq!(
+            trigger.divergence_gate.pending_offchain_equity_reconciles(),
+            vec![symbol.clone()],
+            "a broker snapshot may have re-based available since the timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn recheck_over_provider_polled_inflight_forces_offchain_reconcile() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mint_id = issuer_request_id("mint-recheck-over-polled-inflight");
+        let tok = tokenization_request_id("TOK-1");
+        // The failure cancelled back to available (100), then a provider poll
+        // re-set the Hedging in-flight while the request still read pending.
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(100))
+            .update_equity(
+                &symbol,
+                Inventory::set_inflight(Venue::Hedging, shares(10)),
+                Utc::now(),
+            )
+            .unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let failed = TokenizedEquityMint::Failed {
+            chain: Chain::Base,
+            symbol: symbol.clone(),
+            quantity: float!(10),
+            reason: "test failure".to_string(),
+            requested_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+
+        trigger
+            .rebuild_mint_tracking_for_recovery(&mint_id, &failed, tok.clone())
+            .await
+            .unwrap();
+        trigger
+            .on_mint(
+                mint_id.clone(),
+                provider_completion_recovered(&mint_id, tok, 10),
+            )
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(10))
+        );
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(0))
+        );
+        drop(inventory);
+        assert_eq!(
+            trigger.divergence_gate.pending_offchain_equity_reconciles(),
+            vec![symbol.clone()],
+            "available still counts the shares the provider took, so a broker \
+             read must re-base it"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_failure_after_zero_inflight_recheck_does_not_credit_available() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mint_id = issuer_request_id("mint-late-failure-after-recheck");
+        let trigger = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(0), shares(100)),
+            &symbol,
+        )
+        .await;
+        let failed = TokenizedEquityMint::Failed {
+            chain: Chain::Base,
+            symbol: symbol.clone(),
+            quantity: float!(10),
+            reason: "rejected".to_string(),
+            requested_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+
+        // MintAcceptanceFailed is committed, but its reactor runs only after
+        // the recheck rebuild restored the in-flight without a debit.
+        trigger
+            .rebuild_mint_tracking_for_recovery(&mint_id, &failed, tokenization_request_id("TOK-1"))
+            .await
+            .unwrap();
+        trigger
+            .on_mint(mint_id, make_mint_acceptance_failed())
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::Hedging),
+            Some(shares(100)),
+            "the failure must not credit an in-flight the rebuild never debited"
+        );
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(0))
+        );
     }
 
     #[tokio::test]
@@ -13533,7 +13629,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rollback_after_explicit_mint_dispatch_failure_restores_available() {
+    async fn rollback_after_explicit_mint_dispatch_failure_clears_inflight() {
         let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
         let mint_id = issuer_request_id("mint-explicit-rollback");
