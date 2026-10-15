@@ -13696,6 +13696,57 @@ mod tests {
         );
     }
 
+    /// The deploy gate checks a corridor only if the loader serves it, so a
+    /// configured Relay corridor must reach the gate inputs next to Base's
+    /// CCTP one, with its chain hedged for the gate's vault calls.
+    #[cfg(feature = "wallet-turnkey")]
+    #[test]
+    fn load_turnkey_approval_policy_inputs_carry_a_configured_relay_corridor() {
+        let mut config = robinhood_relay_corridor_config();
+        config["wallet"] = toml::from_str(
+            r#"
+            kind = "turnkey"
+            address = "0x6666666666666666666666666666666666666666"
+            organization_id = "00000000-0000-4000-8000-000000000001"
+            "#,
+        )
+        .unwrap();
+        let mut secrets: toml::Table =
+            toml::from_str(include_str!("../../../example.secrets.toml")).unwrap();
+        secrets["wallet"] = toml::from_str(
+            r#"api_private_key = "0000000000000000000000000000000000000000000000000000000000000001""#,
+        )
+        .unwrap();
+
+        let inputs = Ctx::turnkey_approval_inputs_from_text(
+            &config.to_string(),
+            Path::new("config.toml"),
+            TokenFile::Skipped,
+            &secrets.to_string(),
+            Path::new("secrets.toml"),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            inputs.corridors,
+            BTreeSet::from([
+                UsdcCorridor::BASE_CCTP,
+                UsdcCorridor::HubRouted {
+                    chain: Chain::Robinhood,
+                    hop: HopKind::Relay,
+                },
+            ])
+        );
+        assert!(
+            inputs
+                .hedged
+                .iter()
+                .any(|hedged| hedged.chain == Chain::Robinhood),
+            "the gate refuses a corridor whose chain is not hedged"
+        );
+    }
+
     #[test]
     fn robinhood_corridor_naming_cctp_is_still_refused() {
         let mut config = robinhood_relay_corridor_config();
