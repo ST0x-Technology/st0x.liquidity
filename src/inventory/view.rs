@@ -1204,7 +1204,15 @@ impl InventoryView {
             });
         }
 
-        let (whole_cents, _sub_cent) = settled.truncate_to_decimals(2)?;
+        let (whole_cents, sub_cent) = settled.truncate_to_decimals(2)?;
+
+        if !sub_cent.is_zero()? {
+            debug!(
+                target: "inventory",
+                ?sub_cent,
+                "Gross broker cash rounds down to whole cents; the Hedging ledger keeps the remainder"
+            );
+        }
 
         Ok(Self {
             offchain_gross_usd_cents: Some(whole_cents.to_cents()?),
