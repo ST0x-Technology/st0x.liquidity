@@ -160,10 +160,11 @@ documentation.
 The chain registry enforces four rules at startup, each failing closed rather
 than skipping the chain:
 
-- Every `[chains.<name>]` table needs a matching `[chains.<name>]` secrets entry
-  supplying its `rpc_url`, and vice versa. Acting on a chain with no endpoint,
-  and holding an endpoint for a chain with no addresses, both leave fund routing
-  undefined.
+- Every enabled `[chains.<name>]` table needs an `rpc_url`. Acting on a chain
+  with no endpoint leaves fund routing undefined. For one release the deprecated
+  secrets-file `[chains.<name>] rpc_url` is still read, with a startup warning,
+  when the config table has none, and ignored when it has one; a secrets entry
+  for a chain with no enabled config table is refused.
 - Any number of chains may carry a `[trading]` table -- each hedged chain drives
   its own fill watcher and its own vault polling -- but exactly one of them must
   set `primary = true`. Zero or several primary claimants leave the chain the
@@ -209,9 +210,10 @@ and [registry metrics](docs/observability.md#registry-reloads).
 Without `--secrets` it judges the config file alone: schema (unknown keys are
 rejected), the port, chain, asset and `[rebalancing]` cross-field rules, and
 every value the config carries on its own. What it cannot see is what the
-secrets file supplies -- broker credentials, per-chain `rpc_url`s, wallet keys,
-pricing and issuance API keys -- which stays the deploy gate's job. Both modes
-run the same checks the bot runs at boot, so a rule broken here breaks startup.
+secrets file supplies -- broker credentials, wallet keys, pricing and issuance
+API keys, and any deprecated per-chain `rpc_url` a config table omits -- which
+stays the deploy gate's job. Both modes run the same checks the bot runs at
+boot, so a rule broken here breaks startup.
 
 Because the secrets-free mode needs nothing but the file, CI validates every
 config the repository ships (`config/**/*.toml`, `example.config.toml`,
