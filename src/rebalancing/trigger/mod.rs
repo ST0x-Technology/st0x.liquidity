@@ -47575,8 +47575,9 @@ mod tests {
     }
 
     /// An Alpaca-to-chain refund paid in full to the chain wallet holds its
-    /// guard across a restart; once the operator reconciles it from the CLI,
-    /// the sweep releases the guard and the corridor sends again.
+    /// guard across a restart, and the timed-out sweep keeps it held and pages;
+    /// once the operator reconciles it from the CLI, the sweep releases the
+    /// guard and the corridor sends again.
     #[tokio::test]
     async fn reconciled_chain_wallet_refund_frees_the_corridor_after_a_restart() {
         let pool = crate::test_utils::setup_test_db().await;
@@ -47645,6 +47646,34 @@ mod tests {
         trigger.recover_usdc_guard(&pool, &store).await.unwrap();
         assert!(trigger.usdc_guards.is_held(Chain::Robinhood));
 
+        let past_timeout = Utc::now()
+            + chrono::Duration::from_std(trigger.config.transfer_timeout).unwrap()
+            + chrono::Duration::seconds(1);
+        trigger
+            .expire_stuck_usdc_rebalances(past_timeout)
+            .await
+            .unwrap();
+        assert!(
+            trigger.usdc_guards.is_held(Chain::Robinhood),
+            "the sweep must hold the guard while the refund is not reconciled"
+        );
+        assert!(
+            !trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "the sweep must not tombstone the unreconciled refund"
+        );
+        assert!(
+            trigger
+                .relay_withdrawal_hold_alerted
+                .read()
+                .await
+                .contains(&id),
+            "the sweep must page that the refund sits outside the vault"
+        );
+
         store
             .send(
                 &id,
@@ -47655,7 +47684,7 @@ mod tests {
             .await
             .unwrap();
         trigger
-            .expire_stuck_usdc_rebalances(Utc::now())
+            .expire_stuck_usdc_rebalances(past_timeout)
             .await
             .unwrap();
 
