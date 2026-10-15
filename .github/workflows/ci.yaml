@@ -130,30 +130,15 @@ jobs:
           workspaces: ". -> target/test"
           save-if: ${{ env.UNTRUSTED_PR != 'true' }}
 
-      # The board JSON must match its generator, with every liq_ selector
-      # pinned to the exporter job; compare.py is the staging parity tool.
-      - name: Board generator and liq-parity checks
-        run: |
-          nix develop .#ci-backend -c bash -c "
-            set -euxo pipefail
-            python3 observability/gen-t0-liquidity.py --check
-            python3 scripts/liq-parity/test_compare.py
-          "
-
       # Build the test binaries once into a nextest archive shared by all four
-      # partitions, and run clippy and rustdoc here since this is the single
-      # full compile.
-      - name: Build nextest archive, run clippy and docs
+      # partitions. Clippy and rustdoc run in backend-lint, so the test shards
+      # wait only for this compile.
+      - name: Build nextest archive
         run: |
           nix develop .#ci-backend -c bash -c "
             set -euxo pipefail
             cargo nextest archive --workspace --all-features --profile ci \
               --archive-file \"\$RUNNER_TEMP/nextest-archive.tar.zst\"
-            cargo clippy --workspace --all-targets --all-features
-            # rain-math-float is upstream source nix materializes under .tmp/,
-            # so it is a workspace member we do not own; exclude it rather than
-            # gate CI on its rustdoc warnings.
-            cargo doc --workspace --no-deps --all-features --exclude rain-math-float
           "
 
       # Blacksmith transparently redirects the native Actions cache to
@@ -164,6 +149,84 @@ jobs:
         with:
           path: ${{ runner.temp }}/nextest-archive.tar.zst
           key: ${{ runner.os }}-nextest-${{ github.run_id }}-${{ github.run_attempt }}
+
+  # Clippy, rustdoc, and the Python board checks need their own compile (clippy
+  # cannot reuse test-profile artifacts), so they run beside backend-build
+  # instead of after it, off the test shards' critical path.
+  backend-lint:
+    name: backend lint
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_DIR: target/lint
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          persist-credentials: false
+
+      - name: Configure Git fetch fail-fast
+        run: |
+          git config --global http.lowSpeedLimit 524288
+          git config --global http.lowSpeedTime 60
+
+      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035  # v34
+        with:
+          # Nix 2.24-2.28 fail to resolve rainix's overridden `foundry` input
+          # (`cannot find flake 'flake:foundry'`); the fix landed in 2.30. v30
+          # of this action only shipped up to 2.26, so use v34 and pin a
+          # working release.
+          nix_version: "2.31.2"
+          nix_conf: |
+            accept-flake-config = true
+            fallback = true
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            keep-env-derivations = true
+            keep-outputs = true
+
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71  # v17
+        continue-on-error: true
+        with:
+          name: rainlanguage
+          authToken: ${{ env.UNTRUSTED_PR != 'true' && secrets.CACHIX_AUTH_TOKEN || '' }}
+          skipPush: ${{ env.UNTRUSTED_PR == 'true' }}
+          useDaemon: false
+
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569  # v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 8G
+          save: ${{ env.UNTRUSTED_PR != 'true' }}
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          prefix-key: rust-${{ github.workflow }}
+          workspaces: ". -> target/lint"
+          save-if: ${{ env.UNTRUSTED_PR != 'true' }}
+
+      # The board JSON must match its generator, with every liq_ selector
+      # pinned to the exporter job; compare.py is the staging parity tool.
+      - name: Board generator and liq-parity checks
+        run: |
+          nix develop .#ci-backend -c bash -c "
+            set -euxo pipefail
+            python3 observability/gen-t0-liquidity.py --check
+            python3 scripts/liq-parity/test_compare.py
+          "
+
+      - name: Clippy and docs
+        run: |
+          nix develop .#ci-backend -c bash -c "
+            set -euxo pipefail
+            cargo clippy --workspace --all-targets --all-features
+            # rain-math-float is upstream source nix materializes under .tmp/,
+            # so it is a workspace member we do not own; exclude it rather than
+            # gate CI on its rustdoc warnings.
+            cargo doc --workspace --no-deps --all-features --exclude rain-math-float
+          "
 
   backend-test:
     name: backend test ${{ matrix.partition }} of 4
@@ -234,7 +297,7 @@ jobs:
 
   backend:
     name: backend
-    needs: [changes, backend-build, backend-test]
+    needs: [changes, backend-build, backend-lint, backend-test]
     # Inspect every dependency state, including failures, skips, and
     # cancellations, so this required check cannot pass without validation.
     if: ${{ always() }}
@@ -253,8 +316,8 @@ jobs:
             echo "Docs-only change - backend validation not required."
             exit 0
           fi
-          if [ "${{ needs.backend-build.result }}" != "success" ] || [ "${{ needs.backend-test.result }}" != "success" ]; then
-            echo "backend validation failed (build=${{ needs.backend-build.result }}, test=${{ needs.backend-test.result }})"
+          if [ "${{ needs.backend-build.result }}" != "success" ] || [ "${{ needs.backend-lint.result }}" != "success" ] || [ "${{ needs.backend-test.result }}" != "success" ]; then
+            echo "backend validation failed (build=${{ needs.backend-build.result }}, lint=${{ needs.backend-lint.result }}, test=${{ needs.backend-test.result }})"
             exit 1
           fi
 

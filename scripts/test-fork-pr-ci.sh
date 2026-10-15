@@ -96,12 +96,16 @@ expected_wiring = {
     "needs" => "changes",
     "if" => "${{ needs.changes.outputs.code == 'true' }}"
   },
+  "backend-lint" => {
+    "needs" => "changes",
+    "if" => "${{ needs.changes.outputs.code == 'true' }}"
+  },
   "backend-test" => {
     "needs" => %w[changes backend-build],
     "if" => "${{ needs.changes.outputs.code == 'true' }}"
   },
   "backend" => {
-    "needs" => %w[changes backend-build backend-test],
+    "needs" => %w[changes backend-build backend-lint backend-test],
     "if" => "${{ always() }}"
   },
   "dashboard-build" => {
@@ -215,20 +219,24 @@ check_gate.call(
     needs.changes.result
     needs.changes.outputs.code
     needs.backend-build.result
+    needs.backend-lint.result
     needs.backend-test.result
   ],
   [
-    [%w[success false skipped skipped], true],
-    [%w[success true success success], true],
-    [%w[success true failure success], false],
-    [%w[success true skipped success], false],
-    [%w[success true cancelled success], false],
-    [%w[success true success failure], false],
-    [%w[success true success skipped], false],
-    [%w[success true success cancelled], false],
-    [%w[failure unknown skipped skipped], false],
-    [%w[skipped unknown skipped skipped], false],
-    [%w[cancelled unknown skipped skipped], false]
+    [%w[success false skipped skipped skipped], true],
+    [%w[success true success success success], true],
+    [%w[success true failure success success], false],
+    [%w[success true skipped success success], false],
+    [%w[success true cancelled success success], false],
+    [%w[success true success failure success], false],
+    [%w[success true success skipped success], false],
+    [%w[success true success cancelled success], false],
+    [%w[success true success success failure], false],
+    [%w[success true success success skipped], false],
+    [%w[success true success success cancelled], false],
+    [%w[failure unknown skipped skipped skipped], false],
+    [%w[skipped unknown skipped skipped skipped], false],
+    [%w[cancelled unknown skipped skipped skipped], false]
   ]
 )
 
@@ -316,12 +324,12 @@ if [ "$parsed_action_count" -ne "$action_line_count" ]; then
   exit 1
 fi
 
-assert_count 5 '      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6'
+assert_count 6 '      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6'
 assert_count 1 '      - uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590  # v3'
-assert_count 4 '      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035  # v34'
-assert_count 4 '      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71  # v17'
-assert_count 4 '      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569  # v7'
-assert_count 1 '      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2'
+assert_count 5 '      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035  # v34'
+assert_count 5 '      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71  # v17'
+assert_count 5 '      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569  # v7'
+assert_count 2 '      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2'
 assert_count 1 '        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6'
 assert_count 1 '        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6'
 
@@ -347,10 +355,10 @@ RUBY
 # from a branch naming convention. Dependabot uses an in-repository branch but
 # receives the same restricted token and secret treatment as a fork.
 assert_line "  UNTRUSTED_PR: \${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.fork || github.event.pull_request.user.login == 'dependabot[bot]') }}"
-assert_count 4 "          authToken: \${{ env.UNTRUSTED_PR != 'true' && secrets.CACHIX_AUTH_TOKEN || '' }}"
-assert_count 4 "          skipPush: \${{ env.UNTRUSTED_PR == 'true' }}"
-assert_count 4 "          save: \${{ env.UNTRUSTED_PR != 'true' }}"
-assert_count 1 "          save-if: \${{ env.UNTRUSTED_PR != 'true' }}"
+assert_count 5 "          authToken: \${{ env.UNTRUSTED_PR != 'true' && secrets.CACHIX_AUTH_TOKEN || '' }}"
+assert_count 5 "          skipPush: \${{ env.UNTRUSTED_PR == 'true' }}"
+assert_count 5 "          save: \${{ env.UNTRUSTED_PR != 'true' }}"
+assert_count 2 "          save-if: \${{ env.UNTRUSTED_PR != 'true' }}"
 
 # The pull request files API truncates after 3,000 files. The workflow must run
 # full CI at that boundary rather than accepting a docs-only false negative.
