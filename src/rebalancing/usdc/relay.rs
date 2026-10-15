@@ -8775,6 +8775,117 @@ mod tests {
         quotes.assert_calls(0);
     }
 
+    /// Records a Robinhood-to-Alpaca transfer whose deposit for
+    /// `REVERTED_ORDER_ID` (request `0x5e..`) reverted, re-quoted under order
+    /// `0x0f..` with request `0x6f..`, no pair signed for it.
+    async fn record_reverted_and_requoted_toward_hub(
+        rig: &RelayRig,
+        store: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+    ) {
+        record_quoted(
+            store,
+            id,
+            exact_quote(
+                &rig.chain.bot_wallet,
+                rig.chain_contracts,
+                REVERTED_ORDER_ID,
+            )
+            .await,
+        )
+        .await;
+        let reverted = PreparedTransaction::for_test(TxHash::repeat_byte(0xa7), 40);
+        let mut requoted = exact_quote(
+            &rig.chain.bot_wallet,
+            rig.chain_contracts,
+            B256::repeat_byte(0x0f),
+        )
+        .await;
+        requoted.request_id = B256::repeat_byte(0x6f);
+        for command in [
+            UsdcRebalanceCommand::PrepareSwapDeposit {
+                approve: None,
+                deposit: reverted.clone(),
+            },
+            UsdcRebalanceCommand::RecordSwapDepositReverted {
+                deposit_tx: reverted.tx_hash(),
+            },
+            UsdcRebalanceCommand::RequoteSwap {
+                quote: Box::new(requoted),
+            },
+        ] {
+            store.send(id, command).await.unwrap();
+        }
+    }
+
+    /// A reorg landed the deposit of a reverted Robinhood-to-Alpaca order,
+    /// and Relay failed that order with nothing paid: the escrow scan adopts
+    /// the deposit, and the normal payment path records `SwapFailed`, paged
+    /// once and reconcilable, with the guard held. Nothing is quoted.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn found_reverted_deposit_that_relay_failed_holds_at_swap_failed_toward_hub() {
+        let rig = RelayRig::deploy().await;
+        let late_deposit = rig.deposit_on_chain(REVERTED_ORDER_ID).await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_status_of(
+            &relay_api,
+            B256::repeat_byte(0x5e),
+            json!({
+                "status": "failure",
+                "failReason": "TTL_EXPIRED",
+                "inTxHashes": [late_deposit],
+                "txHashes": []
+            }),
+        );
+        let quotes = mock_quote_unavailable(&relay_api);
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_reverted_and_requoted_toward_hub(&rig, &store, &id).await;
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(60),
+            transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends");
+
+        let state = store.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::SwapFailed {
+            quote,
+            deposit_tx,
+            reverted_quotes,
+            ..
+        } = &state
+        else {
+            panic!("expected SwapFailed, got {state:?} after {outcome:?}");
+        };
+        outcome.unwrap();
+        assert_eq!(quote.order_id, REVERTED_ORDER_ID);
+        assert_eq!(*deposit_tx, late_deposit);
+        assert!(reverted_quotes.is_empty(), "{reverted_quotes:?}");
+        assert!(state.holds_rebalance_guard());
+        assert!(state.is_reconcilable_failure());
+        quotes.assert_calls(0);
+        logs_assert(|lines: &[&str]| {
+            match lines
+                .iter()
+                .filter(|line| {
+                    line.contains("operational_alert")
+                        && line.contains("Relay failed the swap with nothing paid back")
+                })
+                .count()
+            {
+                1 => Ok(()),
+                pages => Err(format!("expected one SwapFailed page, got {pages}")),
+            }
+        });
+    }
+
     /// A reverted order's deposit held for its payment sends again the
     /// approves that went out alone and queues their gas: a node may have
     /// dropped them, every later send from the wallet waits behind their
