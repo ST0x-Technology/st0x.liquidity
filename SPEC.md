@@ -5458,12 +5458,12 @@ signing a second deposit while an earlier one may still land:
   corridor, so a `WithdrawalComplete` resumes through the Relay hop (the binding
   quote) and never reaches a CCTP burn. A short or destination-side
   `SwapRefunded` and a `SwapFailed` are holds for the operator and are not
-  re-armed; a short late refund adopted by the escrow scan or by
-  `transfer recheck` (which pages it) holds the same way. The vault deposit of a
-  `Redepositing` is recorded only after its broadcast, so a crash between the
-  two leaves no tx to confirm, and the re-armed job sends a second deposit: it
-  reverts and pages when the first one already took the USDG, or, with more USDG
-  in the wallet, lands too.
+  re-armed; a short refund of a deposit the escrow scan adopted, or one adopted
+  by `transfer recheck` (which pages it), holds the same way. The vault deposit
+  of a `Redepositing` is recorded only after its broadcast, so a crash between
+  the two leaves no tx to confirm, and the re-armed job sends a second deposit:
+  it reverts and pages when the first one already took the USDG, or, with more
+  USDG in the wallet, lands too.
 - **Re-broadcast, never re-sign.** The persisted envelopes are restored before
   any other send from their wallet (see "Relay hop"), and a resume of
   `SwapDepositPrepared` broadcasts exactly those bytes. A new pair is signed
@@ -5477,18 +5477,18 @@ signing a second deposit while an earlier one may still land:
   bot scans the origin chain's depository from the lowest `origin_from_block` of
   those quotes for our deposits of their order ids, so no new pair is signed and
   nothing is redeposited from `SwapQuoted` while one of them is on chain. A
-  deposit found is never left behind. One found deposit of the current quote's
-  `amount_in` is adopted as the swap's deposit (`AdoptSwapDeposit` ->
-  `SwapDepositAdopted` -> `SwapDeposited` on that order's quote, which leaves
-  `reverted_quotes`) and read through the normal path (steps 6 to 8): its fill
-  window starts at the adoption, and a failure Relay reports ends at
-  `SwapFailed`, paged once. Deposits of several reverted orders found together
-  are never adopted: each holds the transfer's amount, so adopting one payment
-  would release the guard with the other still at Relay. Nor is one whose order
-  was quoted for another amount (before an Alpaca-to-chain refund at the hub,
-  whose re-quote is for the refunded amount). Either pages once and holds at
-  `SwapQuoted` for the operator, with nothing read again until a resume or a
-  restart. A scan that fails is retried and signs nothing either.
+  deposit found is never left behind. One found deposit of both its order's and
+  the current quote's `amount_in` is adopted as the swap's deposit
+  (`AdoptSwapDeposit` -> `SwapDepositAdopted` -> `SwapDeposited` on that order's
+  quote, which leaves `reverted_quotes`) and read through the normal path (steps
+  6 to 8): its fill window starts at the adoption, and a failure Relay reports
+  ends at `SwapFailed`, paged once. Deposits of several reverted orders found
+  together are never adopted: each holds the transfer's amount, so adopting one
+  payment would release the guard with the other still at Relay. Nor is one
+  whose order was quoted for another amount (before an Alpaca-to-chain refund at
+  the hub, whose re-quote is for the refunded amount). Either pages once and
+  holds at `SwapQuoted` for the operator, with nothing read again until a resume
+  or a restart. A scan that fails is retried and signs nothing either.
 - **Late adoption.** `SwapCompletionRecovered` adopts a proven late payment of
   the failed order of a `SwapFailed`, through `transfer recheck`, keeping the
   reverted quotes for the escrow scan, which reads them again once the transfer
@@ -5676,7 +5676,8 @@ enum UsdcRebalanceCommand {
     // Adopts, from `SwapQuoted`, the deposit of a reverted order the escrow
     // scan found on chain as the swap's deposit (-> `SwapDeposited` on that
     // order's quote). Refused for an order that is not a reverted one, and
-    // for a deposit of another amount than the current quote's `amount_in`.
+    // for a deposit of another amount than its order's or the current
+    // quote's `amount_in`.
     AdoptSwapDeposit { deposit: SwapDeposit<B256> },
     // Replaces an expired or already-signed quote on `SwapQuoted` (same
     // input), or quotes again an Alpaca-to-chain refund paid at the hub (its

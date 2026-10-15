@@ -1827,7 +1827,7 @@ where
             // this order was quoted: adopting its deposit would book the
             // transfer on another amount.
             [(deposit, _)] => {
-                error!(target: "operational_alert", alert = true, kind = AlertKind::RevertedRelayOrderDepositOnChain.as_str(), %id, %deposits, deposited = %deposit.amount, current = %current.amount_in, "A deposit of a reverted Relay order is on chain, quoted for another amount than the current quote; the transfer does not adopt it and holds its guard at SwapQuoted for the operator: check the listed request with `stox relay status`");
+                error!(target: "operational_alert", alert = true, kind = AlertKind::RevertedRelayOrderDepositOnChain.as_str(), %id, %deposits, deposited = %deposit.amount, current = %current.amount_in, "A deposit of a reverted Relay order is on chain, for another amount than its quote or the current quote; the transfer does not adopt it and holds its guard at SwapQuoted for the operator: check the listed request with `stox relay status`");
             }
             // Each deposit holds the transfer's amount, so adopting one would
             // release the guard with the other still at Relay.
@@ -8498,7 +8498,7 @@ mod tests {
         quotes.assert_calls(0);
     }
 
-    /// Adopting a reverted order's late fill drops the transfer's lone
+    /// Adopting a reverted order's found deposit drops the transfer's lone
     /// approves, so they are confirmed and their gas queued first: nothing
     /// sends them again or books their gas once the transfer is `Bridged`.
     #[tokio::test]
@@ -8577,8 +8577,8 @@ mod tests {
         quotes.assert_calls(0);
     }
 
-    /// A reverted order's late refund at the hub, adopted by the escrow scan,
-    /// is quoted again and its next pair signed and sent in the same attempt:
+    /// A late refund at the hub of a reverted order whose deposit the escrow
+    /// scan adopted is quoted again and its next pair signed and sent in the same attempt:
     /// the hub wallet's prepare lock the scan ran under is released first.
     #[tokio::test]
     async fn adopted_late_refund_at_the_hub_signs_the_next_pair() {
@@ -8677,8 +8677,8 @@ mod tests {
     }
 
     /// A reorg landed the deposit of a reverted Robinhood-to-Alpaca order,
-    /// and Relay refunded it on Robinhood: the escrow scan adopts the refund
-    /// and returns it to the vault. Nothing is quoted or signed.
+    /// and Relay refunded it on Robinhood: the escrow scan adopts the deposit,
+    /// and the refund Relay reports for it returns to the vault. Nothing is quoted or signed.
     #[tokio::test]
     async fn adopted_late_refund_on_the_chain_returns_to_the_vault() {
         let rig = RelayRig::deploy().await;
@@ -9267,7 +9267,7 @@ mod tests {
                 .iter()
                 .filter(|line| {
                     line.contains("operational_alert")
-                        && line.contains("quoted for another amount")
+                        && line.contains("for another amount")
                         && line.contains(&request)
                 })
                 .count()

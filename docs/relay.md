@@ -307,8 +307,8 @@ counting the inclusion block (`RelayCtx` takes each end's count, at least 1): a
 lagging load-balanced node may not have indexed the newest blocks, and a deposit
 there is not confirmed yet. Orders stay fillable for about a week
 (`RelayQuote::deadline`), so the scan takes whatever floor the caller gives it;
-no shorter window is assumed. The hop adopts one found deposit, of an order
-quoted for the current quote's amount, as the transfer's deposit, and holds on
+no shorter window is assumed. The hop adopts one found deposit, of both its
+order's and the current quote's amount, as the transfer's deposit, and holds on
 any other find (see SPEC.md, "Relay recovery").
 
 ### Proofs

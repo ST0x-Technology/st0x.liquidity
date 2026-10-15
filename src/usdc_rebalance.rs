@@ -6474,9 +6474,9 @@ impl UsdcRebalance {
     }
 
     /// Adopts the escrow scan's deposit of a reverted order as the swap's
-    /// deposit: only from `SwapQuoted`, and only for a deposit of the current
-    /// quote's input, since one of an order quoted before a refund re-quote
-    /// would book the transfer on another amount.
+    /// deposit: only from `SwapQuoted`, and only for a deposit of both its
+    /// order's and the current quote's input, since one of an order quoted
+    /// before a refund re-quote would book the transfer on another amount.
     fn transition_adopt_swap_deposit(
         &self,
         deposit: SwapDeposit<B256>,
