@@ -3498,12 +3498,19 @@ fn relay_hop_setups(
                 format!("the {chain} Relay corridor needs [relay] api_key in the secrets file")
             })?;
 
+            let client = RelayClient::new(Some(api_key))?;
+            #[cfg(feature = "test-support")]
+            let client = match &rebalancing_ctx.relay_api_base {
+                Some(api_base) => client.with_api_base(api_base.clone()),
+                None => client,
+            };
+
             Ok((
                 *chain,
                 RelayHopSetup {
                     bounds: *bounds,
                     chain_confirmations,
-                    client: RelayClient::new(Some(api_key))?,
+                    client,
                 },
             ))
         })
