@@ -77,8 +77,9 @@ where
                 dependency: Dependency::Rpc,
                 operation,
                 duration: started.elapsed(),
-                // Transport errors embed the request URL, which carries the
-                // provider API key -- scrub before it reaches the database.
+                // The transport keeps the URL out of its errors, but an HTTP
+                // error body passes through as the provider sent it -- scrub
+                // any API key before it reaches the database.
                 error: result
                     .as_ref()
                     .err()

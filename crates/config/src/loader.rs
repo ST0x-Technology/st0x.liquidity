@@ -26,6 +26,7 @@ use st0x_execution::{
 };
 use st0x_finance::Usdc;
 use st0x_float_macro::float;
+use st0x_rpc::JwtEnv;
 
 #[cfg(any(test, feature = "test-support"))]
 use crate::InventoryAdapters;
@@ -2726,6 +2727,11 @@ impl Ctx {
         let parts =
             parse_and_validate_with(&config_str, config_path, tokens, &secrets_str, secrets_path)?;
 
+        let wallet_rpc_notices = parts
+            .wallet_inputs
+            .signing_chains
+            .rpc_transport_notices(&JwtEnv::from_env());
+
         // Async wallet construction — the only step that requires network
         // access and cannot run in the deploy-time validator.
         let wallet = crate::wallet::OnchainWalletCtx::new(
@@ -2772,7 +2778,11 @@ impl Ctx {
             broker: parts.broker,
             telemetry: parts.telemetry,
             alerts: parts.alerts,
-            startup_notices: parts.startup_notices,
+            startup_notices: parts
+                .startup_notices
+                .into_iter()
+                .chain(wallet_rpc_notices)
+                .collect(),
             registry,
             pricing: parts.pricing,
             rebalancing: parts.rebalancing,
@@ -7025,6 +7035,36 @@ mod tests {
              the fields seen, got: {:?}",
             ctx.startup_notices
         );
+    }
+
+    #[cfg(feature = "wallet-private-key")]
+    #[tokio::test]
+    async fn load_files_records_each_wallet_rpc_transport() {
+        let config = broker_identity_config_toml(
+            r#"type = "alpaca-broker-api"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef""#,
+        );
+        let secrets = alpaca_secrets_toml();
+
+        let ctx = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        for chain in [Chain::Base, Chain::Ethereum, Chain::HyperEvm] {
+            let expected = StartupNotice::info(format!("{chain} wallet RPC: plain HTTP"));
+            assert!(
+                ctx.startup_notices.contains(&expected),
+                "{expected} missing from {:?}",
+                ctx.startup_notices
+            );
+        }
     }
 
     /// A field set differently in both files must fail startup rather than
