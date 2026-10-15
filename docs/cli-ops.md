@@ -885,15 +885,25 @@ touches it, and when:
   transfer runbook") keep it held until `transfer reconcile` settles them.
 - **Restart**: the guards reset; `recover_usdc_guard` re-derives each corridor's
   holders from durable state (`holds_rebalance_guard`) and re-arms resumable
-  jobs. A candidate that cannot be loaded or parsed latches every corridor until
-  a restart classifies it, and pages "USDC rebalancing is LATCHED on every
-  corridor with no automated recovery: found at startup"; so does a post-burn
-  failure whose corridor the running bot cannot read, which pages once per
-  transfer ("USDC rebalancing is LATCHED on every corridor with no automated
-  recovery"). Repair the transfer, then restart. A transfer whose aggregate
-  fails to load (a store error, possibly transient) instead blocks every
-  corridor until the timeout sweep reads it and pages "USDC rebalancing is
-  BLOCKED on every corridor"; retry or restart if it persists.
+  jobs. It also holds the corridor of each live USDC job row (`Pending`,
+  `Queued`, `Running`, or `Failed` with retries left) whose transfer has no
+  events yet, with the payload's amount, and logs "Held the corridor of a live
+  USDC job row with no recorded transfer on startup": such a hold has no
+  transfer aggregate behind it. It follows the transfer once the job writes its
+  first event, and is released when the job fails for good without recording
+  anything. A live row whose payload does not parse or whose transfer does not
+  load gets no hold ("Failed to parse a live USDC job payload on startup",
+  "Failed to load the transfer of a live USDC job row on startup"); the queue
+  check still refuses new transfers its row covers. A candidate that cannot be
+  loaded or parsed latches every corridor until a restart classifies it, and
+  pages "USDC rebalancing is LATCHED on every corridor with no automated
+  recovery: found at startup"; so does a post-burn failure whose corridor the
+  running bot cannot read, which pages once per transfer ("USDC rebalancing is
+  LATCHED on every corridor with no automated recovery"). Repair the transfer,
+  then restart. A transfer whose aggregate fails to load (a store error,
+  possibly transient) instead blocks every corridor until the timeout sweep
+  reads it and pages "USDC rebalancing is BLOCKED on every corridor"; retry or
+  restart if it persists.
 - **Single-flight for manual commands**: the resume endpoint refuses while any
   live or retryable USDC job row exists on the transfer's corridor (either
   direction) or while another aggregate durably holds that corridor's guard (for
