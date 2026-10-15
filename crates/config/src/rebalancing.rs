@@ -886,6 +886,9 @@ pub struct RebalancingCtx {
     /// `MessageTransmitterV2` contract address (test-only override).
     #[cfg(feature = "test-support")]
     pub message_transmitter: Address,
+    /// Relay API base URL (test-only override); `None` keeps Relay's own.
+    #[cfg(feature = "test-support")]
+    pub relay_api_base: Option<String>,
 }
 
 impl RebalancingCtx {
@@ -943,6 +946,8 @@ impl RebalancingCtx {
             token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
             #[cfg(feature = "test-support")]
             message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
+            #[cfg(feature = "test-support")]
+            relay_api_base: None,
         })
     }
 }
@@ -986,6 +991,8 @@ impl RebalancingCtx {
             token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
             #[cfg(feature = "test-support")]
             message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
+            #[cfg(feature = "test-support")]
+            relay_api_base: None,
         }
     }
 }
@@ -1024,6 +1031,7 @@ impl RebalancingCtx {
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
             token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
             message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
+            relay_api_base: None,
         }
     }
 
@@ -1045,6 +1053,14 @@ impl RebalancingCtx {
     ) -> Self {
         self.token_messenger = token_messenger;
         self.message_transmitter = message_transmitter;
+        self
+    }
+
+    /// Sets the Relay API base URL override (for e2e tests with a mock
+    /// Relay API).
+    #[must_use]
+    pub fn with_relay_api_base(mut self, base_url: String) -> Self {
+        self.relay_api_base = Some(base_url);
         self
     }
 }
