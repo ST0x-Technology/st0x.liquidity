@@ -3701,6 +3701,8 @@ impl EventSourced for UsdcRebalance {
     // v17: `reverted_quotes` on the swap states, `quote`, `first_deposit`
     // and `refund_requotes` on `SwapFailed`, and `SwapCompletionRecovered`,
     // whose refund carries `short_of_floor`.
+    // v18: `adopted` on `SwapDeposited` and `SwapEscrowUnresolved`, for a
+    // deposit the escrow scan adopted, whose Relay failure is waited out.
     const SCHEMA_VERSION: u64 = 18;
 
     fn originate(event: &Self::Event) -> Option<Self> {
