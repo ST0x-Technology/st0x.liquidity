@@ -2416,7 +2416,8 @@ impl InventoryView {
     /// mint debits Hedging available on `MintAccepted`, so that symbol keeps
     /// its whole Hedging balance and watermark: no poll restores the
     /// inflight, and a dropped balance would fail the mint's own `Start`. A
-    /// forced broker snapshot applied after the reset still overwrites it.
+    /// forced broker snapshot applied after the reset corrects its available
+    /// and keeps its inflight.
     /// Every other field is intentionally defaulted, which is why this uses
     /// functional-update syntax rather than an exhaustive literal: a future
     /// field should default here unless it is guard state.
@@ -4495,7 +4496,10 @@ impl InventoryView {
     }
 
     /// Force a broker equity snapshot onto every symbol without an open
-    /// hedge order, advancing only those symbols' watermarks.
+    /// hedge order, advancing only those symbols' watermarks. An active
+    /// mint's symbol gets the broker reading as available but keeps its
+    /// Hedging inflight: the mint is that inflight's only writer until its
+    /// terminal event, and its `TokensReceived` must find it to subtract.
     fn force_apply_offchain_equity(
         self,
         positions: &BTreeMap<Symbol, FractionalShares>,
@@ -4516,14 +4520,36 @@ impl InventoryView {
                     return Ok(view);
                 }
 
+                let mint_inflight = view
+                    .active_mint(symbol)
+                    .and_then(|_| view.equity_inflight(symbol, Venue::Hedging));
+                if let Some(inflight) = mint_inflight {
+                    debug!(
+                        target: "inventory",
+                        %symbol,
+                        ?inflight,
+                        "Forced offchain equity snapshot keeps the active mint's \
+                         Hedging inflight"
+                    );
+                }
+
                 let primary_chain = view.primary_chain;
+                let reason = Arc::clone(reason);
                 view.update_equity(
                     symbol,
-                    Inventory::force_on_snapshot(
-                        Venue::Hedging,
-                        *snapshot_balance,
-                        Arc::clone(reason),
-                    ),
+                    move |inventory, chain| {
+                        let forced = Inventory::force_on_snapshot(
+                            Venue::Hedging,
+                            *snapshot_balance,
+                            reason,
+                        )(inventory, chain)?;
+                        match mint_inflight {
+                            Some(inflight) => {
+                                Inventory::set_inflight(Venue::Hedging, inflight)(forced, chain)
+                            }
+                            None => Ok(forced),
+                        }
+                    },
                     now,
                 )
                 .map(|view| view.reset_equity_snapshot_skip(symbol, Venue::Hedging, primary_chain))
