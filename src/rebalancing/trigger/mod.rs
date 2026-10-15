@@ -53,8 +53,8 @@ use st0x_tokenization::{ClientRequestId, IssuerRequestId, TokenizationRequestId}
 use st0x_wrapper::{Wrapper, WrapperError};
 
 use self::allocation::{
-    ChainSlot, DeclineReason, EquityPlan, EquityPlanInput, Participation, PlannedDirection,
-    PlannedOperation, chain_bands, plan_equity_operation,
+    ChainSlot, DeclineReason, EquityPlan, EquityPlanInput, ManualSizingRefusal, Participation,
+    PlannedDirection, PlannedOperation, chain_bands, check_manual_operation, plan_equity_operation,
 };
 use self::freeze::FreezeStatusReader;
 use self::usdc::UsdcRebalanceOperation;
@@ -367,6 +367,12 @@ pub(crate) enum ManualEquityTransferError {
          enqueued, retry once the Position settles"
     )]
     ReservationInvalidated { symbol: Symbol },
+    #[error("a manual transfer of {symbol} on {chain} is refused: {refusal}")]
+    Sizing {
+        symbol: Symbol,
+        chain: Chain,
+        refusal: ManualSizingRefusal,
+    },
     #[error(transparent)]
     Trigger(equity::EquityTriggerError),
     #[error(transparent)]
@@ -7726,13 +7732,17 @@ impl RebalancingService {
     /// also the job's aggregate id: the mint's issuer request id or the
     /// redemption aggregate id.
     ///
-    /// The operator sizes the transfer, so nothing is planned and no cooldown
-    /// applies. Otherwise the gates are the trigger's, in the trigger's order,
-    /// each refusing where the trigger skips: the listing must start
-    /// operations and the token must be in the chain's registry (the planner's
-    /// own per chain checks), then the dividend freeze (failing closed when
-    /// issuance cannot answer), the snapshot divergence, the restart taint, the
-    /// chain's gas, the in memory guard, the job row dedupe, and the Position
+    /// The operator sizes the transfer, so the band, the ranking and the
+    /// cooldown do not apply, but the quantity must pass the planner's own
+    /// sizing rules (`check_manual_operation`): every venue read with nothing
+    /// in flight, the listing's operational limit, the broker floors for a
+    /// mint, and the minimum operation value. Otherwise the gates are the
+    /// trigger's, in the trigger's order, each refusing where the trigger
+    /// skips: the listing must start operations and the token must be in the
+    /// chain's registry (the planner's own per chain checks), then the
+    /// dividend freeze (failing closed when issuance cannot answer), the
+    /// snapshot divergence, the restart taint, the chain's gas, the sizing
+    /// rules, the in memory guard, the job row dedupe, and the Position
     /// reservation. As in the trigger's dispatch, the divergence is checked
     /// again after the reservation and the reservation is confirmed before the
     /// enqueue. A refusal after the reservation releases it, a refusal after
@@ -7822,6 +7832,21 @@ impl RebalancingService {
         // mirrors the planner skipping a chain that is not gas ready.
         if let Err(source) = self.ensure_equity_chain_gas_ready(chain).await {
             return Err(ManualEquityTransferError::GasNotReady { chain, source });
+        }
+
+        // Before the guard claim and the reservation, so a refusal appends no
+        // Position events.
+        let refusal = match self.equity_plan_input(symbol).await? {
+            Some(input) => check_manual_operation(&input, chain, direction, quantity.inner())
+                .map_err(equity::EquityTriggerError::from)?,
+            None => Some(ManualSizingRefusal::PriceMissing),
+        };
+        if let Some(refusal) = refusal {
+            return Err(ManualEquityTransferError::Sizing {
+                symbol: symbol.clone(),
+                chain,
+                refusal,
+            });
         }
 
         let Some(guard) = self.try_claim_equity_guard_for_transfer(symbol) else {
@@ -23492,6 +23517,79 @@ mod tests {
             "got {error:?}"
         );
         assert_manual_equity_start_left_nothing(&trigger, &symbol).await;
+    }
+
+    /// A mint larger than what the broker holds above its floors is refused
+    /// before the guard and the reservation: the fixture's broker holds 50
+    /// shares with no floors, so 51 would take it negative.
+    #[tokio::test]
+    async fn manual_equity_transfer_refuses_a_mint_below_the_broker_floor() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let (trigger, pool) = manual_equity_trigger_and_pool(&symbol, test_config()).await;
+
+        let error = trigger
+            .start_manual_equity_transfer(
+                &symbol,
+                PlannedDirection::Mint,
+                manual_shares(51),
+                Chain::Base,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                ManualEquityTransferError::Sizing {
+                    chain: Chain::Base,
+                    refusal: ManualSizingRefusal::BelowBrokerFloor { mintable },
+                    ..
+                } if *mintable == shares(50)
+            ),
+            "got {error:?}"
+        );
+        assert_manual_equity_start_left_nothing(&trigger, &symbol).await;
+        assert_eq!(position_reservation_events(&pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn manual_equity_transfer_refuses_a_quantity_above_the_operational_limit() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mut config = test_config();
+        config
+            .chains
+            .get_mut(&Chain::Base)
+            .unwrap()
+            .assets
+            .equities
+            .symbols
+            .get_mut(&symbol)
+            .unwrap()
+            .operational_limit = Some(manual_shares(2));
+        let (trigger, pool) = manual_equity_trigger_and_pool(&symbol, config).await;
+
+        let error = trigger
+            .start_manual_equity_transfer(
+                &symbol,
+                PlannedDirection::Redemption,
+                manual_shares(3),
+                Chain::Base,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                ManualEquityTransferError::Sizing {
+                    refusal: ManualSizingRefusal::AboveOperationalLimit { limit },
+                    ..
+                } if *limit == shares(2)
+            ),
+            "got {error:?}"
+        );
+        assert_manual_equity_start_left_nothing(&trigger, &symbol).await;
+        assert_eq!(position_reservation_events(&pool).await, 0);
     }
 
     /// Engages the symbol's snapshot divergence as the Position records a

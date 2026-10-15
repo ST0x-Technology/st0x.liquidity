@@ -414,7 +414,9 @@ pub(super) async fn transfer_usdc(
 /// keep a start from racing a transfer in flight. Everything after the
 /// startup gate runs detached, so a request dropped between the enqueue and
 /// the guard it keeps cannot release the guard and the reservation with the
-/// job still queued.
+/// job still queued. The detached task holds a projection write slot for the
+/// whole start, since it writes Position events, so a view rebuild cannot
+/// replay them while the live projection also applies them.
 pub(super) async fn transfer_equity(
     State(state): State<AppState>,
     Audited(request): Audited<TransferEquityRequest>,
@@ -438,6 +440,10 @@ pub(super) async fn transfer_equity(
         "transfer-equity",
         symbol.clone(),
         async move {
+            // Admitted before the recovery lock, like the other recovery
+            // routes: a start parked behind a rebuild holds no lock.
+            let _projection_write = state.projection_maintenance.enter().await;
+
             let _guard = state.resume_lock.0.try_lock().map_err(|_| {
                 (
                     StatusCode::CONFLICT,

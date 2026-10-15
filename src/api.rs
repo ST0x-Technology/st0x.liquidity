@@ -2184,8 +2184,9 @@ fn usdc_resume_error_response(error: &UsdcResumeError) -> (StatusCode, String) {
 
 /// Maps a [`ManualEquityTransferError`] to an HTTP status and operator facing
 /// message, with the split of [`usdc_resume_error_response`]: a listing that
-/// cannot start operations or a token missing from the chain's registry is
-/// `422` (fix the config or the registry), a single flight or Position
+/// cannot start operations, a token missing from the chain's registry, or a
+/// quantity the planner's sizing rules refuse is `422` (fix the config, the
+/// registry, or the quantity), a single flight or Position
 /// conflict is `409` (wait for or resolve the other transfer, the freeze or
 /// the divergence), a bot still starting or a signing wallet short of gas is
 /// `503`, and a store, queue, or database failure stays a generic `500` (the
@@ -2196,14 +2197,15 @@ fn manual_equity_transfer_error_response(
     use ManualEquityTransferError::{
         AlreadyInFlight, ApalisDatabase, ChainNotConfigured, DivergenceEngaged, FreezeUnconfirmed,
         Frozen, GasNotReady, GuardHeld, ListingNotEnabled, NotInRegistry, NotReady,
-        PositionRefused, Queue, Registry, ReservationInvalidated, RestartTainted, Trigger,
+        PositionRefused, Queue, Registry, ReservationInvalidated, RestartTainted, Sizing, Trigger,
     };
 
     match error {
-        ChainNotConfigured { .. } | ListingNotEnabled { .. } | NotInRegistry { .. } => {
-            (StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
-        }
-        Registry {
+        ChainNotConfigured { .. }
+        | ListingNotEnabled { .. }
+        | NotInRegistry { .. }
+        | Sizing { .. }
+        | Registry {
             source: TokenAddressError::UnwiredRegistry { .. } | TokenAddressError::Uninitialized,
             ..
         } => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
@@ -12686,6 +12688,17 @@ mod tests {
                 },
                 StatusCode::CONFLICT,
             ),
+            (
+                Refusal::Sizing {
+                    symbol: symbol.clone(),
+                    chain: Chain::Base,
+                    refusal:
+                        crate::rebalancing::trigger::allocation::ManualSizingRefusal::AboveOperationalLimit {
+                            limit: st0x_execution::FractionalShares::new(float!(2)),
+                        },
+                },
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
         ];
         for (refusal, expected) in refusals {
             let (status, message) = manual_equity_transfer_error_response(&refusal);
@@ -16408,6 +16421,14 @@ mod tests {
                     .await
                     .map(|_| ())
             }
+            "transfer-equity" => {
+                // The startup gate comes first on capital routes, before the
+                // detached task this test parks.
+                state.health.set_ready();
+                capital::transfer_equity(State(state), capital_request(transfer_equity_body("1.5")))
+                    .await
+                    .map(|_| ())
+            }
             other => panic!("unknown recovery route {other}"),
         };
         outcome.map_err(|(status, _)| status)
@@ -16419,7 +16440,14 @@ mod tests {
     /// with 409 for the whole replay. Taking the lock first fails this test.
     #[tokio::test]
     async fn recovery_routes_wait_for_a_rebuild_without_holding_the_resume_lock() {
-        for route in ["resume", "fail", "recheck", "fail-usdc", "reconcile-usdc"] {
+        for route in [
+            "resume",
+            "fail",
+            "recheck",
+            "fail-usdc",
+            "reconcile-usdc",
+            "transfer-equity",
+        ] {
             let (state, _gate) =
                 recovery_state_with_driver_pause(EquityTransferServices::panicking()).await;
             let rebuild = state.projection_maintenance.pause().await.unwrap();
