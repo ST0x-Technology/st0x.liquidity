@@ -40,10 +40,9 @@ would collide with those keys. A test in `crates/config/src/telemetry.rs`
 `debug!`, `info!`, `warn!`, `error!` and `event!` call under `src/` and
 `crates/`, in its `(`, `[` and `{` forms, for these names. It does not see
 fields that another macro passes through, such as OpenTelemetry's `otel_warn!`.
-This rule covers the dependencies too: `st0x-alpaca` v0.2.1 logs
-`Tokenization
-request failed` with a `message` field that holds the Alpaca error
-body. ST0x-Technology/st0x.alpaca#11 renames it to `error_body`.
+This rule covers the dependencies too: the pinned `st0x-alpaca` (v0.3.1) logs
+the Alpaca error body of a failed tokenization request as `error_body`, not
+`message`.
 
 Where `[telemetry]` is set (e2e, local), OpenTelemetry's own internal logs
 (targets starting with `opentelemetry`, for example
@@ -67,11 +66,9 @@ the t0.devops liquidity exporter (`ship_botlogs`, which feeds the
 `liquidity-botlogs` log) read `fields` and `fields.message` from `/logs`, which
 serves these files.
 
-Switch an environment to `json` only where the log shipper parses JSON, staging
-before production, and only on a build whose `st0x-alpaca` has that rename
-(st0x.alpaca#11 released and bumped here). Before it, each failed tokenization
-request writes two `message` keys on one line. Unflattened JSON (any build
-before the flattening) puts the text at `jsonPayload.fields.message`, where no
+Switch an environment to `json` only where the log shipper parses JSON, and
+staging before production. Staging logs JSON. Unflattened JSON (any build before
+the flattening) puts the text at `jsonPayload.fields.message`, where no
 extractor looks. Rollback is `log_format = "text"`.
 
 The active GCP configs are `config/staging/st0x-hedge.toml` and
