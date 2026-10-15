@@ -5284,7 +5284,13 @@ failure:
    or refund Relay names but the chain still does not show is paged and read
    again every 30 minutes, as an unproven one is (step 7). Within the window a
    `failure` with `DEPOSIT_REORGED` waits as well, as the deposit may be
-   included again; past it, it is a failure (step 8).
+   included again; past the window it is a failure (step 8). A deposit the
+   escrow scan adopted (`adopted` on the state) shares its request with the
+   reverted attempt, and Relay's failure of that attempt can list the same
+   signed deposit: within the window any `failure` or failed refund of it waits,
+   and past the window one whose deposits (`inTxHashes`) list it is a failure,
+   while one that does not leaves it at `SwapEscrowUnresolved`, read again every
+   30 minutes. A failure of a deposit the bot signed is a failure at once.
 7. A `success` is adopted only once `verify_fill` proves its one fill tx on the
    destination chain (see `docs/relay.md`, Proofs): `ConfirmSwapFill` ->
    `RelayFillVerified` -> `Bridged` with `HopEvidence::Relay`, its
@@ -5423,7 +5429,12 @@ reconciles one only after its hold's page. A reconcile that lands while the job
 runs ends it there, since `Reconciled` refuses every later swap command. The
 operator exit of a chain-to-Alpaca transfer held at `WithdrawalComplete` or
 `SwapQuoted` is `transfer resume --kind usdc --direction to-alpaca`: the job
-re-quotes and signs, or redeposits on a refusal, as the bot's own retry does. An
+re-quotes and signs, or redeposits on a refusal, as the bot's own retry does. A
+`SwapQuoted` held on found deposits of reverted orders (several, or one of
+another amount; see "Escrow scan") is the exception: a resume only scans and
+pages them again, a chain-to-Alpaca one has no CLI exit, and an Alpaca-to-chain
+one is reconciled once every listed order is settled. A recorded hold state for
+it, with `transfer reconcile` as its only exit, is not in this build. An
 Alpaca-to-chain transfer held at `WithdrawalComplete` after a refused binding
 quote resumes the same way, `--direction to-raindex`, or is failed with
 `fail-usdc-transfer` and reconciled. On the shared Ethereum wallet's credit
@@ -5455,12 +5466,12 @@ signing a second deposit while an earlier one may still land:
   corridor, so a `WithdrawalComplete` resumes through the Relay hop (the binding
   quote) and never reaches a CCTP burn. A short or destination-side
   `SwapRefunded` and a `SwapFailed` are holds for the operator and are not
-  re-armed; a short late refund adopted by the escrow scan or by
-  `transfer recheck` (which pages it) holds the same way. The vault deposit of a
-  `Redepositing` is recorded only after its broadcast, so a crash between the
-  two leaves no tx to confirm, and the re-armed job sends a second deposit: it
-  reverts and pages when the first one already took the USDG, or, with more USDG
-  in the wallet, lands too.
+  re-armed; a short refund of a deposit the escrow scan adopted, or one adopted
+  by `transfer recheck` (which pages it), holds the same way. The vault deposit
+  of a `Redepositing` is recorded only after its broadcast, so a crash between
+  the two leaves no tx to confirm, and the re-armed job sends a second deposit:
+  it reverts and pages when the first one already took the USDG, or, with more
+  USDG in the wallet, lands too.
 - **Re-broadcast, never re-sign.** The persisted envelopes are restored before
   any other send from their wallet (see "Relay hop"), and a resume of
   `SwapDepositPrepared` broadcasts exactly those bytes. A new pair is signed
@@ -5474,34 +5485,42 @@ signing a second deposit while an earlier one may still land:
   bot scans the origin chain's depository from the lowest `origin_from_block` of
   those quotes for our deposits of their order ids, so no new pair is signed and
   nothing is redeposited from `SwapQuoted` while one of them is on chain. A
-  deposit found is never left behind: its order's status is read, and a fill or
-  refund that proves is adopted (`RecoverSwapCompletion` ->
-  `SwapCompletionRecovered`). Until then the transfer signs nothing, pages, and
-  reads it again every 30 minutes. Deposits of several reverted orders found
-  together are never adopted: each holds the transfer's amount, so adopting one
-  payment would release the guard with the other still at Relay; the transfer
-  pages and holds at `SwapQuoted` for the operator. A scan that fails is retried
-  and signs nothing either.
-- **Late adoption.** `SwapCompletionRecovered` adopts a proven late payment of a
-  signed order: from `SwapQuoted`, a reverted order whose deposit the scan
-  found, which leaves `reverted_quotes`; from `SwapFailed`, through
-  `transfer recheck`, the failed order itself, keeping the reverted quotes for
-  the escrow scan, which reads them again once the transfer is back at
-  `SwapQuoted`; while it is `SwapFailed` nothing scans them. A fill continues as
-  any `Bridged`, and the other reverted orders are no longer watched; a refund
-  continues as any `SwapRefunded` of that order (redeposited, re-quoted or
-  held). Only an Alpaca-to-chain refund's re-quote goes back to `SwapQuoted`: a
-  chain-to-Alpaca refund is redeposited with no scan first, so, as after a fill,
-  a deposit of another reverted order that lands later is left to the operator.
-  An earlier refund at the hub is not counted among the found deposits: when the
-  scan of its re-quote finds and adopts an older reverted order, that refund
-  stays in the Ethereum wallet, untracked, for the operator. `transfer recheck`
-  of an unresolved escrow records a proven payment of its deposited order with
-  `ConfirmSwapFill` or `RecordSwapRefund`. Once a deposit of a reverted order is
-  found, approves that went out alone are sent again, confirmed and their gas
-  queued, before a `SwapQuoted` adopts it or holds: a reconcile ending the hold
-  drops them. Superseding an order adds its id to `signed_order_ids` and never
-  drops one.
+  deposit found is never left behind. One found deposit of both its order's and
+  the current quote's `amount_in` is adopted as the swap's deposit
+  (`AdoptSwapDeposit` -> `SwapDepositAdopted` -> `SwapDeposited` on that order's
+  quote, which leaves `reverted_quotes`) and read through the normal path (steps
+  6 to 8): its fill window starts at the adoption, and a failure Relay reports
+  for it past the window, listing the deposit, ends at `SwapFailed`, paged once.
+  Deposits of several reverted orders found together are never adopted: each
+  holds the transfer's amount, so adopting one payment would release the guard
+  with the other still at Relay. Nor is one whose order was quoted for another
+  amount (before an Alpaca-to-chain refund at the hub, whose re-quote is for the
+  refunded amount). Either pages once its lone approves confirm (see below) and
+  holds at `SwapQuoted` for the operator, with nothing read again until a resume
+  or a restart. A scan that fails is retried and signs nothing either.
+- **Late adoption.** `SwapCompletionRecovered` adopts a proven late payment of
+  the failed order of a `SwapFailed`, through `transfer recheck`, keeping the
+  reverted quotes for the escrow scan, which reads them again once the transfer
+  is back at `SwapQuoted`; while it is `SwapFailed` nothing scans them. The
+  command is refused from `SwapQuoted`; a `SwapCompletionRecovered` recorded
+  there by an earlier build still replays. A fill continues as any `Bridged`,
+  and the other reverted orders are no longer watched; a refund continues as any
+  `SwapRefunded` of that order (redeposited, re-quoted or held). Only an
+  Alpaca-to-chain refund's re-quote goes back to `SwapQuoted`: a chain-to-Alpaca
+  refund is redeposited with no scan first, so, as after a fill, a deposit of
+  another reverted order that lands later is left to the operator. An earlier
+  refund at the hub is never booked against an older order's deposit: that order
+  was quoted for more than the refund's re-quote, so the scan holds instead of
+  adopting it. `transfer recheck` of an unresolved escrow records a proven
+  payment of its deposited order with `ConfirmSwapFill` or `RecordSwapRefund`.
+  Once a deposit of a reverted order is found, approves that went out alone are
+  sent again, confirmed and their gas queued, before a `SwapQuoted` adopts it or
+  holds: the adoption drops them, and so does a reconcile ending the hold. While
+  one does not confirm, the transfer neither adopts nor holds: each attempt
+  pages the found deposits, records nothing and ends with
+  `FoundSwapDepositApprovesUnconfirmed`, which the job re-queues after 10
+  minutes at no retry cost. Superseding an order adds its id to
+  `signed_order_ids` and never drops one.
 
 ##### Crash-safe resume
 
@@ -5664,6 +5683,12 @@ enum UsdcRebalanceCommand {
     // Records the persisted deposit once it has the origin chain's
     // confirmations; refused for any other tx.
     ConfirmSwapDeposit { deposit_tx: TxHash, deposit_block: u64 },
+    // Adopts, from `SwapQuoted`, the deposit of a reverted order the escrow
+    // scan found on chain as the swap's deposit (-> `SwapDeposited` on that
+    // order's quote). Refused for an order that is not a reverted one, and
+    // for a deposit of another amount than its order's or the current
+    // quote's `amount_in`.
+    AdoptSwapDeposit { deposit: SwapDeposit<B256> },
     // Replaces an expired or already-signed quote on `SwapQuoted` (same
     // input), or quotes again an Alpaca-to-chain refund paid at the hub (its
     // input is `amount_refunded`); always an order id never signed before.
@@ -5680,9 +5705,9 @@ enum UsdcRebalanceCommand {
     FailSwap { reason: String },
     // The fill window passed with no terminal status.
     RecordSwapEscrowUnresolved,
-    // A fill or refund proven late for a signed order: from `SwapQuoted` a
-    // reverted order whose deposit the escrow scan found on chain, from
-    // `SwapFailed` the failed order. The same floors as `ConfirmSwapFill` and
+    // A fill or refund proven late for the failed order of a `SwapFailed`;
+    // refused from `SwapQuoted`, though a recorded `SwapCompletionRecovered`
+    // from there still replays. The same floors as `ConfirmSwapFill` and
     // `RecordSwapRefund`: a fill against that order's quote, a refund against
     // the transfer's first deposit.
     RecoverSwapCompletion { order_id: B256, deposit_tx: TxHash, payment: RecoveredSwapPayment },
@@ -5796,6 +5821,15 @@ enum UsdcRebalanceEvent {
         prepared_at: DateTime<Utc>,
     },
     SwapDeposited { deposit_tx: TxHash, deposit_block: u64, deposited_at: DateTime<Utc> },
+    // The escrow scan's found deposit of reverted order `order_id`, adopted
+    // as the swap's deposit: -> `SwapDeposited` on that order's quote, its
+    // fill window counted from `adopted_at`.
+    SwapDepositAdopted {
+        order_id: B256,
+        deposit_tx: TxHash,
+        deposit_block: u64,
+        adopted_at: DateTime<Utc>,
+    },
     SwapRequoted { quote: SwapQuote, quoted_at: DateTime<Utc> },
     SwapDepositReverted { deposit_tx: TxHash, reverted_at: DateTime<Utc> },
     // `fee_collected` is the input less `amount_received`; `relayer_fee` is

@@ -208,9 +208,13 @@ vault <-> hop <-> Ethereum wallet <-> Alpaca.
   mined and reverted. A reorg may still land one, so the **escrow scan** looks
   for our deposits of their order ids in the origin chain's depository before a
   new pair is signed or the stable is redeposited.
+- **Adopted deposit** (`AdoptSwapDeposit` -> `SwapDepositAdopted`): a deposit of
+  a reverted order the escrow scan found on chain, of both its order's and the
+  current quote's amount, taken from `SwapQuoted` as the swap's deposit into
+  `SwapDeposited`.
 - **Late adoption** (`RecoverSwapCompletion` -> `SwapCompletionRecovered`): a
-  fill or refund of a signed order proven after the transfer stopped waiting for
-  it, adopted into `Bridged` or `SwapRefunded`.
+  fill or refund of the failed order of a `SwapFailed`, proven after the
+  transfer stopped waiting for it, adopted into `Bridged` or `SwapRefunded`.
 
 A corridor is configured under `[rebalancing.usdc.corridors.<chain>]` and
 recorded on each `UsdcRebalance` when it starts. Not to be confused with the
