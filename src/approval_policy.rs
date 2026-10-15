@@ -1761,6 +1761,58 @@ mod tests {
         );
     }
 
+    /// An allow that pins the first word of `depositForBurn` or the Alpaca
+    /// `transfer` cannot be proven to cover them, so they stay missing while
+    /// every other call is covered by its own exact allow.
+    #[test]
+    fn allow_pinning_an_unknown_first_word_fails_closed() {
+        let corridor = UsdcCorridor::BASE_CCTP;
+        let mut calls = corridor.hop_calls().unwrap();
+        calls.extend(cash_leg_calls(corridor, &corridor_chains()).unwrap());
+        let policies = calls
+            .iter()
+            .map(|call| {
+                let pin = match call.function {
+                    "depositForBurn" => format!(" && eth.tx.data[34..74] == '{WALLET:x}'"),
+                    "transfer" => format!(" && eth.tx.data[34..74] in ['{WALLET:x}']"),
+                    _ => String::new(),
+                };
+
+                tag_allow(&format!(
+                    "eth.tx.chain_id == {} && eth.tx.to == '{:#x}' && \
+                     eth.tx.data[0..10] == '{:#x}'{pin}",
+                    call.chain.chain_id(),
+                    call.to,
+                    call.selector,
+                ))
+            })
+            .collect();
+
+        let error = verify_corridor_ends(
+            &BTreeSet::from([corridor]),
+            &corridor_chains(),
+            &snapshot(policies),
+            WALLET,
+        )
+        .unwrap_err();
+        let ChainCoverageError::MissingCorridorCoverage(missing) = error else {
+            panic!("expected missing corridor coverage, got {error:?}");
+        };
+
+        assert_eq!(
+            missing
+                .missing
+                .iter()
+                .map(|call| (call.chain, call.function))
+                .collect::<Vec<_>>(),
+            vec![
+                (Chain::Base, "depositForBurn"),
+                (Chain::Ethereum, "depositForBurn"),
+                (Chain::Ethereum, "transfer"),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn registry_reload_with_an_added_corridor_queries_turnkey() {
         let running = st0x_config::TurnkeyApprovalPolicyInputs {
