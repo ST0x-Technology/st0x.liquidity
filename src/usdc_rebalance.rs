@@ -9144,8 +9144,8 @@ mod tests {
     #[tokio::test]
     async fn overdeposit_hold_refuses_an_adoptable_or_unknown_deposit() {
         let requoted = twice_reverted_and_requoted(RebalanceDirection::BaseToAlpaca);
-        let hold = |deposits: Vec<FoundSwapDeposit>| UsdcRebalanceCommand::HoldOverdepositedSwap {
-            deposits,
+        let hold_command = |deposits: Vec<FoundSwapDeposit>| {
+            UsdcRebalanceCommand::HoldOverdepositedSwap { deposits }
         };
 
         for (deposits, refused) in [
@@ -9154,7 +9154,7 @@ mod tests {
         ] {
             let error = TestHarness::<UsdcRebalance>::with(())
                 .given(requoted.clone())
-                .when(hold(deposits))
+                .when(hold_command(deposits))
                 .await
                 .then_expect_error();
             assert!(
@@ -9169,7 +9169,7 @@ mod tests {
 
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(requoted.clone())
-            .when(hold(vec![
+            .when(hold_command(vec![
                 found_deposit(0x0a, 100_000_000),
                 found_deposit(0x0c, 100_000_000),
             ]))
@@ -9186,7 +9186,7 @@ mod tests {
 
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(requoted.clone())
-            .when(hold(vec![found_deposit(0x0b, 99_000_000)]))
+            .when(hold_command(vec![found_deposit(0x0b, 99_000_000)]))
             .await
             .events();
         let held = [requoted, events].concat();
@@ -9199,7 +9199,7 @@ mod tests {
         );
 
         for command in [
-            hold(vec![
+            hold_command(vec![
                 found_deposit(0x0a, 100_000_000),
                 found_deposit(0x0b, 100_000_000),
             ]),

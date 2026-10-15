@@ -48530,6 +48530,18 @@ mod tests {
                 vec![settle],
                 vec![to_raindex],
             ),
+            (
+                RebalanceDirection::BaseToAlpaca,
+                overdeposited_hold(),
+                vec![settle],
+                vec![to_alpaca],
+            ),
+            (
+                RebalanceDirection::AlpacaToBase,
+                overdeposited_hold(),
+                vec![settle],
+                vec![to_raindex],
+            ),
         ];
 
         for (direction, tail, named, unnamed) in cases {
