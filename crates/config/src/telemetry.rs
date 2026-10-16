@@ -36,6 +36,10 @@ use url::Url;
 
 use crate::{LogFormat, LogLevel};
 
+mod line_cap;
+
+use line_cap::CappedLine;
+
 /// Retain one week of daily log files. Older files are pruned automatically as
 /// new ones roll. This caps file count, not bytes; sink-level filtering reduces
 /// within-day growth separately.
@@ -112,7 +116,9 @@ where
 /// that parses the line finds the text at `message` (Cloud Logging:
 /// `jsonPayload.message`) and each field under its own name. Span context
 /// stays under `span` and `spans`. The rolling file layer keeps the nested
-/// `fields` shape on purpose (see [`file_fmt_layer`]).
+/// `fields` shape on purpose (see [`file_fmt_layer`]). [`CappedLine`] keeps
+/// each JSON line under Docker's 16 KiB split, so a long line is never cut
+/// into unparsed pieces.
 fn console_fmt_layer<S, W>(
     log_format: LogFormat,
     env_filter: EnvFilter,
@@ -126,10 +132,10 @@ where
     match log_format {
         LogFormat::Json => tracing_subscriber::fmt::layer()
             .fmt_fields(JsonFields::new())
-            .event_format(JsonWithOtelLines(
+            .event_format(CappedLine(JsonWithOtelLines(
                 tracing_subscriber::fmt::format().json().flatten_event(true),
                 OtelLineShape::Flat,
-            ))
+            )))
             .with_ansi(false)
             .with_writer(writer)
             .with_filter(console_filter::<S>(env_filter))
@@ -951,6 +957,97 @@ mod tests {
                 })
             );
         }
+    }
+
+    /// A TRACE event with a 100 KB field, the size of a full Alpaca Broker API
+    /// response body, is one console line that Docker does not split: valid
+    /// JSON with its message, level, target and timestamp, and the field cut
+    /// with a marker.
+    #[test]
+    fn json_console_layer_caps_a_line_with_a_100_kb_field() {
+        let writer = SharedWriter::default();
+        let layer = console_fmt_layer(
+            LogFormat::Json,
+            mk_crate_filter(tracing::Level::TRACE),
+            ConsoleTextStyle::Compact,
+            writer.clone(),
+        );
+        let subscriber = Registry::default().with(layer);
+        let body = "x".repeat(100_000);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::trace!(target: "broker", body = %body, status = 200, "Alpaca Broker API response");
+        });
+
+        let output = String::from_utf8(writer.0.lock().clone()).unwrap();
+        assert_eq!(output.lines().count(), 1);
+        assert!(
+            output.len() <= line_cap::MAX_CONSOLE_LINE_BYTES,
+            "{}",
+            output.len()
+        );
+        let entry: serde_json::Value = serde_json::from_str(output.trim_end()).unwrap();
+        assert_eq!(entry["message"], "Alpaca Broker API response");
+        assert_eq!(entry["level"], "TRACE");
+        assert_eq!(entry["target"], "broker");
+        assert!(entry["timestamp"].is_string());
+        assert_eq!(entry["status"], 200);
+        let cut_body = entry["body"].as_str().unwrap();
+        let (kept, marker) = cut_body.split_once("...[").unwrap();
+        assert_eq!(marker, format!("truncated {} bytes]", 100_000 - kept.len()));
+        assert!(body.starts_with(kept));
+    }
+
+    /// The cap does not touch a line that fits: it is byte-identical to the
+    /// line the uncapped JSON formatter writes.
+    #[test]
+    fn json_console_cap_leaves_a_line_that_fits_byte_identical() {
+        fn emit(layer: Box<dyn Layer<Registry> + Send + Sync>, writer: &SharedWriter) -> Vec<u8> {
+            let subscriber = Registry::default().with(layer);
+            tracing::subscriber::with_default(subscriber, || {
+                let span = tracing::info_span!("recheck", aggregate_id = "abc-123");
+                let _entered = span.enter();
+                tracing::error!(
+                    target: "operational_alert",
+                    alert = true,
+                    kind = "Low gas",
+                    detail = %"d".repeat(10_000),
+                    "Low gas: byte-identical pin €"
+                );
+            });
+            writer.0.lock().clone()
+        }
+
+        let format = || {
+            JsonWithOtelLines(
+                tracing_subscriber::fmt::format()
+                    .json()
+                    .flatten_event(true)
+                    .without_time(),
+                OtelLineShape::Flat,
+            )
+        };
+        let capped_writer = SharedWriter::default();
+        let capped = tracing_subscriber::fmt::layer()
+            .fmt_fields(JsonFields::new())
+            .event_format(CappedLine(format()))
+            .with_ansi(false)
+            .with_writer(capped_writer.clone())
+            .boxed();
+        let uncapped_writer = SharedWriter::default();
+        let uncapped = tracing_subscriber::fmt::layer()
+            .fmt_fields(JsonFields::new())
+            .event_format(format())
+            .with_ansi(false)
+            .with_writer(uncapped_writer.clone())
+            .boxed();
+
+        let capped = emit(capped, &capped_writer);
+        let uncapped = emit(uncapped, &uncapped_writer);
+
+        assert!(uncapped.len() > 10_000, "{}", uncapped.len());
+        assert!(uncapped.len() <= line_cap::MAX_CONSOLE_LINE_BYTES);
+        assert_eq!(capped, uncapped);
     }
 
     /// An OpenTelemetry export error records only `name` and `error`, so its

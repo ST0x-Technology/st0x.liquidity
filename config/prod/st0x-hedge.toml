@@ -26,8 +26,11 @@
 server_port = 8001
 # HTTP port for the apalis-board job queue UI.
 board_port = 8002
-# Minimum stdout log level. The Ops Agent ships every stdout line to GCP.
-log_level = "trace"
+# Minimum stdout log level. The Ops Agent ships every stdout line to GCP, so
+# TRACE stays off here: it is too much volume and cost (measured 2026-10-16 at
+# about 8 GiB/day, 99% of it TRACE). Raise it only as a deliberate, temporary
+# step, and set it back after.
+log_level = "debug"
 # One flattened JSON object per stdout line: the text is at "message" and each
 # event field is a top-level key, which the Ops Agent parses into Cloud
 # Logging (`liquidity-bot`). Rollback: "text". Ship this only after the VM

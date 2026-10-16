@@ -16,12 +16,14 @@ hide audit successes. When local daily files are enabled, `log_dir` and
 counterpart. The local file layer uses only `file_log_level`, so `RUST_LOG`
 cannot increase disk usage.
 
-Production uses `log_level = "trace"` so its log shipper exports full
-diagnostics (Docker's `gcplogs` driver until the VM replace below, then the Ops
-Agent), while `file_log_level = "info"` limits the rotating files stored beside
-SQLite. Rotation retains seven daily files, which caps file count but not bytes.
-The lower file level reduces within-day growth and disk-exhaustion risk; it does
-not enforce a per-file byte limit or filesystem quota.
+Production uses `log_level = "debug"`, so its log shipper (Docker's `gcplogs`
+driver until the VM replace below, then the Ops Agent) does not export TRACE to
+GCP. TRACE is too much volume and cost: on 2026-10-16 production at TRACE wrote
+about 8 GiB/day, and 99% of it was TRACE. Raise it only as a deliberate,
+temporary step. `file_log_level = "info"` limits the rotating files stored
+beside SQLite. Rotation retains seven daily files, which caps file count but not
+bytes. The lower file level reduces within-day growth and disk-exhaustion risk;
+it does not enforce a per-file byte limit or filesystem quota.
 
 ## Console format
 
@@ -44,6 +46,33 @@ fields that another macro passes through, such as OpenTelemetry's `otel_warn!`.
 This rule covers the dependencies too: the pinned `st0x-alpaca` (v0.3.1) logs
 the Alpaca error body of a failed tokenization request as `error_body`, not
 `message`.
+
+Each console JSON line is at most 16000 bytes, newline included. Docker's
+json-file driver splits a line longer than 16 KiB (16384 bytes) into partial
+records, and the Ops Agent does not join them again. Each piece then reaches
+Cloud Logging as unparsed text in `jsonPayload.message`, and none of it parses.
+On 2026-10-16 at TRACE, such pieces were 84% of production's log bytes: they
+were `st0x_alpaca` TRACE lines with whole Alpaca Broker API response bodies. So
+`CappedLine` (`crates/config/src/telemetry/line_cap.rs`) checks every console
+JSON line before it is written:
+
+- A line that fits is written byte for byte as the formatter made it.
+- A longer line has its longest string values cut first, in event fields and
+  span context, and each cut value ends with `...[truncated N bytes]`. Strings
+  shorter than 64 bytes are not cut.
+- `timestamp`, `level` and `target` never change. `message` is cut only if the
+  line is still too long after every other string is cut.
+- If that is still not enough (for example, a very large array of numbers), the
+  line keeps only `timestamp`, `level`, `target` and `message`, plus
+  `line_original_bytes`, the length of the original line. `message` is then cut
+  only as far as this shorter line needs.
+- A line that still does not fit (only if a dependency logs a too-long field
+  named `timestamp`, `level` or `target`) is replaced with a line that says it
+  was dropped, with a new timestamp and `line_original_bytes`.
+- Each cut is on a character boundary, so the line stays valid UTF-8 JSON. A
+  capped line keeps its top-level key order.
+
+The rolling file layer has no cap: Docker does not read those files.
 
 Where `[telemetry]` is set (e2e, local), OpenTelemetry's own internal logs
 (targets starting with `opentelemetry`, for example
@@ -555,10 +584,10 @@ Both the exporter sidecar and the bot serve `liq_*`, so a selector without a job
 would add the two together. The liquidity boards have a `Source` variable,
 `$source`, and every `liq_` selector on them reads `job=~"$source"`:
 
-| Source               | Job matcher                          |
-| -------------------- | ------------------------------------ |
-| `exporter` (default) | `t0-liquidity-exporter`              |
-| `bot`                | `t0-liquidity\|t0-liquidity-staging` |
+| Source          | Job matcher                          |
+| --------------- | ------------------------------------ |
+| `bot` (default) | `t0-liquidity\|t0-liquidity-staging` |
+| `exporter`      | `t0-liquidity-exporter`              |
 
 The bot's job is `t0-liquidity` in production and `t0-liquidity-staging` in
 staging. `$env` already picks the project, so one regex covers both. PromQL
@@ -570,9 +599,9 @@ The bot never emits `liq_up`, so the header's Bot pill reads the exporter's
 A stopped bot shows red on either source. A stopped exporter shows no data, not
 red, because the exporter's own `up` says nothing about the bot.
 
-Pick `bot` to compare the two side by side. Stage 4 of the migration flips the
-default to `bot` in `SOURCE_VAR`, a one-line change; a later stage removes the
-variable with the exporter.
+`bot` is the default (Stage 4 of the migration, `SOURCE_VAR`). Pick `exporter`
+to compare the two side by side; a later stage removes the variable with the
+exporter.
 
 The log panels follow `Source` too. A Cloud Logging query cannot pick its log by
 a variable, so each one queries both logs, and its first transformation keeps
@@ -605,9 +634,9 @@ lines: one more Cloud Logging list call per panel against the project's read
 quota. The plugin shows a throttled call as missing rows, not as an error. The
 bot source holds rows only once the bot logs JSON (`log_format = "json"`) and
 its stdout reaches Cloud Logging as `liquidity-bot`; until then it shows empty
-log panels. Stage 4 flips them with the metrics, in the same `SOURCE_VAR`
-change, after staging shows rows on the bot source, and a later stage removes
-the exporter's queries.
+log panels. Stage 4 made `bot` the default for them and the metrics in one
+`SOURCE_VAR` change, once staging and production both showed rows on the bot
+source; a later stage removes the exporter's queries.
 
 `observability/gen-t0-liquidity.py` adds the matcher and fails if any `liq_`
 selector is left without exactly `job=~"$source"`.
