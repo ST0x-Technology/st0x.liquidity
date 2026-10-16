@@ -220,6 +220,13 @@ pub(crate) struct AppState {
     /// in memory, so a restart frees it. The bot's own
     /// withdrawals (the USDC transfer workers) do not take this lock.
     pub(crate) vault_withdraw_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes `capital wrap-equity`, `capital unwrap-equity` and
+    /// `capital redeem` per symbol, from before the first read until the tx's
+    /// fate is proven, or until a restart after a panic while confirming. All
+    /// three move the same symbol's shares in the bot's wallet and answer at
+    /// the broadcast, before the balance moves, so without it a rerun on the
+    /// strength of that balance would move the shares a second time.
+    pub(crate) equity_wallet_locks: Arc<api::EquityWalletLocks>,
     pub(crate) projection_maintenance: Arc<conductor::projection_pause::ProjectionMaintenance>,
     pub(crate) pnl_report_admission: dashboard::pnl::PnlReportAdmission,
     pub(crate) pnl_ledger: Arc<dashboard::pnl::PnlLedger>,
@@ -393,6 +400,7 @@ async fn run_bot_session_inner(
         resume_lock,
         vault_deposit_lock: Arc::new(tokio::sync::Mutex::new(())),
         vault_withdraw_lock: Arc::new(tokio::sync::Mutex::new(())),
+        equity_wallet_locks: Arc::default(),
         projection_maintenance: projection_maintenance.clone(),
         pnl_report_admission: dashboard::pnl::pnl_report_admission(),
         pnl_ledger: pnl_ledger.clone(),

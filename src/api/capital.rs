@@ -17,6 +17,7 @@
 //! waits for them. Every capital route refuses until startup completes, like
 //! `process-tx`.
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -29,16 +30,22 @@ use futures_util::FutureExt as _;
 use futures_util::future::BoxFuture;
 use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::{error, info, warn};
 
 use st0x_bridge::Bridge;
 use st0x_bridge::corridor::UsdcCorridor;
-use st0x_config::{HedgedChain, OnchainWalletCtx};
+use st0x_config::{BrokerCtx, HedgedChain, OnchainWalletCtx};
 use st0x_event_sorcery::Store;
 use st0x_evm::{Chain, Evm, IERC20, MinedTx, OpenChainErrorRegistry, PreparedTransaction, Wallet};
 use st0x_finance::{FractionalShares, HasZero, Positive, Symbol, Usdc};
 use st0x_float_serde::format_float_with_fallback;
 use st0x_raindex::{Raindex, RaindexError, RaindexService, RaindexVaultId, RevokeOutcome};
+use st0x_tokenization::{
+    AlpacaTokenizationService, IssuerRequestId, RedemptionSendReceipt, TokenizationRequestStatus,
+    Tokenizer, TokenizerError,
+};
+use st0x_wrapper::{Wrapper, WrapperError, WrapperService};
 
 use super::{
     ErrorResponse, OpsError, UsdcDriverPauseRequest, answer_from_detached,
@@ -53,11 +60,14 @@ use crate::cctp_burn::{
     bot_cctp_bridge, burn_receipt_fate, record_burn_fate, scrubbed, settle_burn_from_receipt,
     signed_by_source_wallet, verify_burn_superseded,
 };
+use crate::native_gas::{GasReadiness, TransferGasRoute};
 use crate::operations_audit::{Audited, AuditedRequest};
-use crate::rebalancing::UsdcResumeError;
+use crate::rebalancing::trigger::InProgressGuard;
 use crate::rebalancing::trigger::allocation::{
     ALPACA_QUANTITY_MAX_DECIMAL_PLACES, PlannedDirection,
 };
+use crate::rebalancing::{RebalancingService, UsdcResumeError, to_wrapped_equities};
+use crate::tokenized_equity_mint::{TOKENIZED_EQUITY_DECIMALS, TokenizedEquityMint};
 use crate::usdc_rebalance::RebalanceDirection;
 
 /// The direction of a manual USDC or equity transfer, spelled on the wire
@@ -142,15 +152,23 @@ pub(super) struct TransferEquityRequest {
     /// Chain whose Raindex vault the shares land in (`to-raindex`) or leave
     /// (`to-alpaca`), as for `st0x-cli transfer-equity --network`.
     chain: Chain,
+    /// Issuer request id of an existing mint to resume instead of starting
+    /// one, as for `st0x-cli transfer-equity --issuer-request-id`; only with
+    /// `to-raindex`.
+    #[serde(default)]
+    issuer_request_id: Option<IssuerRequestId>,
 }
 
 impl AuditedRequest for TransferEquityRequest {
     fn audit_targets(&self) -> Vec<String> {
-        vec![
+        [
             self.direction.wire_name().to_string(),
             self.symbol.clone(),
             self.chain.to_string(),
         ]
+        .into_iter()
+        .chain(self.issuer_request_id.iter().map(ToString::to_string))
+        .collect()
     }
 }
 
@@ -329,6 +347,83 @@ pub(super) struct ResetAllowanceResponse {
     tx: Option<TxHash>,
 }
 
+/// Wire contract shared by the wrap and unwrap routes.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct WrapRequest {
+    /// Ticker of the tokenized equity, as for `st0x-cli wrap-equity
+    /// --symbol`.
+    symbol: String,
+    /// Decimal shares with at most 18 decimals: underlying shares to wrap, or
+    /// wrapped shares to unwrap, as for `--quantity`.
+    quantity: String,
+    /// Chain whose trading table lists the equity and its wrapper, as for
+    /// `--network`.
+    chain: Chain,
+}
+
+impl AuditedRequest for WrapRequest {
+    fn audit_targets(&self) -> Vec<String> {
+        vec![self.symbol.clone(), self.chain.to_string()]
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct WrapResponse {
+    chain: Chain,
+    symbol: String,
+    quantity: String,
+    wrap_tx: TxHash,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct UnwrapResponse {
+    chain: Chain,
+    symbol: String,
+    quantity: String,
+    unwrap_tx: TxHash,
+}
+
+/// Wire contract for the redeem route.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct RedeemRequest {
+    /// Ticker of the tokenized equity, as for `st0x-cli alpaca-redeem
+    /// --symbol`.
+    symbol: String,
+    /// Decimal underlying shares with at most 18 decimals.
+    quantity: String,
+    /// Chain whose wallet sends the shares, as for `--network`.
+    chain: Chain,
+    /// Alpaca's redemption wallet on `chain`, as for `--redemption-wallet`;
+    /// left out, the chain's own `[chains.<name>.trading].redemption_wallet`.
+    #[serde(default)]
+    redemption_wallet: Option<Address>,
+}
+
+impl AuditedRequest for RedeemRequest {
+    fn audit_targets(&self) -> Vec<String> {
+        [self.symbol.clone(), self.chain.to_string()]
+            .into_iter()
+            .chain(self.redemption_wallet.iter().map(ToString::to_string))
+            .collect()
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct RedeemResponse {
+    chain: Chain,
+    symbol: String,
+    quantity: String,
+    redemption_wallet: Address,
+    /// The underlying the chain's wrapper attested as its `asset()`.
+    token: Address,
+    transfer_tx: TxHash,
+}
+
 /// Starts a USDC transfer between Alpaca and Raindex on the bot's own
 /// transfer worker and returns the new transfer's id without waiting for it.
 /// Progress is observed like any rebalance. Mirrors `st0x-cli transfer-usdc`,
@@ -417,6 +512,9 @@ pub(super) async fn transfer_usdc(
 /// job still queued. The detached task holds a projection write slot for the
 /// whole start, since it writes Position events, so a view rebuild cannot
 /// replay them while the live projection also applies them.
+///
+/// With `issuerRequestId` it resumes that existing mint instead and never
+/// starts one; see [`resume_equity_mint`].
 pub(super) async fn transfer_equity(
     State(state): State<AppState>,
     Audited(request): Audited<TransferEquityRequest>,
@@ -426,11 +524,24 @@ pub(super) async fn transfer_equity(
         symbol,
         quantity,
         chain,
+        issuer_request_id,
     } = request;
     let direction = PlannedDirection::from(wire_direction);
     let symbol = Symbol::new(symbol.as_str())
         .map_err(|error| ops_precondition_error(format!("invalid symbol {symbol:?}: {error}")))?;
     let quantity = positive_shares(&quantity)?;
+    if let Some(issuer_request_id) = issuer_request_id {
+        let TransferDirectionWire::ToRaindex = wire_direction else {
+            return Err(ops_precondition_error(
+                "issuerRequestId names a mint to resume, so it applies only to direction \
+                 to-raindex",
+            ));
+        };
+        require_startup_complete(&state, "transfer-equity")?;
+        return resume_equity_mint(state, issuer_request_id, symbol, chain)
+            .await
+            .map(Json);
+    }
     require_startup_complete(&state, "transfer-equity")?;
 
     let detached_tasks = state.detached_tasks.clone();
@@ -493,6 +604,150 @@ pub(super) async fn transfer_equity(
         chain,
         outcome: "enqueued",
     }))
+}
+
+/// Resumes the mint `id` (one `st0x-cli transfer-equity` started, or the
+/// bot) and never starts a new one. It drives the mint through
+/// `CrossVenueEquityTransfer::resume_mint`, the path `debug resume` and
+/// `debug recheck mint` take for an interrupted mint: it continues from the
+/// aggregate's persisted state, and a mint still at `MintRequested` replays
+/// its request under its own issuer request id, which Alpaca dedupes, so it
+/// cannot mint twice. A mint the CLI started has no job row; startup already
+/// rebuilt its tracking and guard and restored its Position reservation, which
+/// the trigger releases when the mint ends.
+///
+/// Ordered like a fresh start: the projection write slot, the resume lock and
+/// the recovery handle, then the checks: the mint must exist (404), its
+/// recorded chain and symbol must be the request's (422 naming the recorded
+/// ones, since another chain's orderbook and issuer wallet or another
+/// symbol's Position and vault would be used), it must not have ended (409),
+/// and nothing else may drive it (409, [`RebalancingService::mint_driver`]).
+/// The route then answers `resumed` with the recorded quantity and runs the
+/// resume on the detached task, holding the slot and the lock until it ends,
+/// as `debug resume` holds them: the resume polls Alpaca and confirms the
+/// wrap and the deposit, which outlast the load balancer's 60 second cut.
+async fn resume_equity_mint(
+    state: AppState,
+    id: IssuerRequestId,
+    symbol: Symbol,
+    chain: Chain,
+) -> Result<TransferEquityResponse, OpsError> {
+    let detached_tasks = state.detached_tasks.clone();
+    answer_from_detached(&detached_tasks, "transfer-equity", id.clone(), async move {
+        // Admitted before the recovery lock, like the other recovery routes:
+        // a resume parked behind a rebuild holds no lock.
+        let projection_write = state.projection_maintenance.enter().await;
+        let resume_guard = Arc::clone(&state.resume_lock.0)
+            .try_lock_owned()
+            .map_err(|_| {
+                conflict("A resume or recheck operation is already in progress".to_string())
+            })?;
+        let handle = state.recovery.get().ok_or_else(recovery_not_ready)?;
+
+        let recorded = st0x_event_sorcery::load_entity::<TokenizedEquityMint>(&state.pool, &id)
+            .await
+            .map_err(|error| {
+                error!(%id, ?error, "Failed to load the mint to resume");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "Failed to load the mint to resume".to_string(),
+                    }),
+                )
+            })?
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        error: format!(
+                            "No mint with issuer request id {id} exists; a resume never starts \
+                             a new one"
+                        ),
+                    }),
+                )
+            })?;
+        let recorded_chain = recorded.chain();
+        if recorded_chain != chain {
+            return Err(unprocessable(format!(
+                "mint {id} was requested on {recorded_chain}; resuming it on {chain} would use \
+                 another chain's orderbook and issuer wallet. Resume it with chain \
+                 {recorded_chain}"
+            )));
+        }
+        let recorded_symbol = recorded.symbol();
+        if *recorded_symbol != symbol {
+            return Err(unprocessable(format!(
+                "mint {id} was requested for {recorded_symbol}; resuming it as {symbol} would \
+                 use another symbol's Position and vault. Resume it with symbol \
+                 {recorded_symbol}"
+            )));
+        }
+        if let Some(ended) = ended_mint(&recorded) {
+            return Err(conflict(format!(
+                "mint {id} has already {ended}; there is nothing to resume"
+            )));
+        }
+        let driver = handle
+            .rebalancing_service
+            .mint_driver(&id, &symbol)
+            .await
+            .map_err(|error| {
+                error!(%id, ?error, "Failed to check what drives the mint to resume");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "Failed to check whether the bot already drives the mint"
+                            .to_string(),
+                    }),
+                )
+            })?;
+        if let Some(driver) = driver {
+            warn!(%id, %symbol, %driver, "Mint resume refused: the mint already has a driver");
+            return Err(conflict(format!(
+                "mint {id} is already driven by {driver}; retry once it has stopped"
+            )));
+        }
+
+        let quantity = FractionalShares::new(recorded.quantity());
+        info!(%id, %symbol, %chain, %quantity, "Equity mint resume started via API");
+        let response = TransferEquityResponse {
+            transfer_id: id.to_string(),
+            direction: TransferDirectionWire::ToRaindex,
+            symbol: symbol.to_string(),
+            quantity: quantity.to_string(),
+            chain,
+            outcome: "resumed",
+        };
+        let transfer = Arc::clone(&handle.transfer);
+        let resume = async move {
+            let _held = (projection_write, resume_guard);
+            match transfer.resume_mint(&id).await {
+                Ok(()) => info!(%id, %symbol, %chain, "Equity mint resumed via API"),
+                Err(error) => error!(
+                    %id, %symbol, %chain, ?error,
+                    "Equity mint resume via API failed; check the mint's events before \
+                     resuming it again"
+                ),
+            }
+        };
+        Ok::<_, OpsError>((response, resume))
+    })
+    .await
+}
+
+/// How a mint that can no longer progress ended, or `None` while it can.
+const fn ended_mint(mint: &TokenizedEquityMint) -> Option<&'static str> {
+    match mint {
+        TokenizedEquityMint::DepositedIntoRaindex { .. } => Some("been deposited into Raindex"),
+        TokenizedEquityMint::Failed { .. } => Some("failed"),
+        TokenizedEquityMint::Reconciled { .. } => Some("been reconciled"),
+        TokenizedEquityMint::MintRequested { .. }
+        | TokenizedEquityMint::MintAccepted { .. }
+        | TokenizedEquityMint::TokensReceived { .. }
+        | TokenizedEquityMint::WrapSubmitted { .. }
+        | TokenizedEquityMint::TokensWrapped { .. }
+        | TokenizedEquityMint::VaultDepositSubmitted { .. } => None,
+    }
 }
 
 /// Deposits `amount` of `token` into a Raindex vault on the chosen chain:
@@ -1402,6 +1657,465 @@ pub(super) async fn reset_allowance(
     }))
 }
 
+/// Deposits `quantity` underlying shares of `symbol` into the chain's ERC-4626
+/// wrapper from the bot's wallet there, which receives the wrapped shares.
+/// Mirrors `st0x-cli wrap-equity`, signed by the bot's own wallet; see
+/// [`run_wrapper_operation`].
+pub(super) async fn wrap_equity(
+    State(state): State<AppState>,
+    Audited(request): Audited<WrapRequest>,
+) -> Result<Json<WrapResponse>, OpsError> {
+    let WrapRequest {
+        symbol,
+        quantity,
+        chain,
+    } = request;
+    let (symbol, quantity, amount) = equity_wallet_input(&symbol, &quantity)?;
+    let wrap_tx =
+        run_wrapper_operation(&state, WrapperOperation::Wrap, chain, &symbol, amount).await?;
+
+    Ok(Json(WrapResponse {
+        chain,
+        symbol: symbol.to_string(),
+        quantity: quantity.inner().to_string(),
+        wrap_tx,
+    }))
+}
+
+/// Redeems `quantity` wrapped shares of `symbol` from the chain's ERC-4626
+/// wrapper, owned by and paid out to the bot's wallet there. Mirrors
+/// `st0x-cli unwrap-equity`, signed by the bot's own wallet; see
+/// [`run_wrapper_operation`].
+pub(super) async fn unwrap_equity(
+    State(state): State<AppState>,
+    Audited(request): Audited<WrapRequest>,
+) -> Result<Json<UnwrapResponse>, OpsError> {
+    let WrapRequest {
+        symbol,
+        quantity,
+        chain,
+    } = request;
+    let (symbol, quantity, amount) = equity_wallet_input(&symbol, &quantity)?;
+    let unwrap_tx =
+        run_wrapper_operation(&state, WrapperOperation::Unwrap, chain, &symbol, amount).await?;
+
+    Ok(Json(UnwrapResponse {
+        chain,
+        symbol: symbol.to_string(),
+        quantity: quantity.inner().to_string(),
+        unwrap_tx,
+    }))
+}
+
+/// Which wrapper operation a wrap route runs; each names its route.
+#[derive(Clone, Copy)]
+enum WrapperOperation {
+    Wrap,
+    Unwrap,
+}
+
+impl WrapperOperation {
+    const fn route(self) -> &'static str {
+        match self {
+            Self::Wrap => "wrap-equity",
+            Self::Unwrap => "unwrap-equity",
+        }
+    }
+}
+
+/// Wraps or unwraps `amount` (18 decimals) of `symbol` on `chain` through the
+/// chain's wrapper, built on the bot's signer from the chain's asset table as
+/// the conductor builds its own, so the route shares the bot's nonce state.
+///
+/// Ordered like the vault routes: input and config checks, the startup gate,
+/// then a detached task that holds the symbol's lock and the bot's equity
+/// transfer guard (`claim_equity_wallet`) from before its first read until
+/// the tx's fate is proven, checks the signer's gas, and sends. A wrap first
+/// approves the wrapper when its allowance is short and awaits that approve,
+/// as `Wrapper::submit_wrap` does for the bot's own wraps; the deposit or
+/// redeem itself is answered at its broadcast, since the chain's required
+/// confirmations outlast the load balancer's 60 second cut. The task then
+/// awaits the confirmation through `Wrapper::confirm_wrap` or
+/// `Wrapper::confirm_unwrap`, waits again while the outcome is unknown, and
+/// logs what the wallet received. A failed send frees the claim, like
+/// `st0x-cli`: its error cannot tell whether the tx went out, which
+/// `onchain_failure` tells the operator to check before retrying.
+async fn run_wrapper_operation(
+    state: &AppState,
+    operation: WrapperOperation,
+    chain: Chain,
+    symbol: &Symbol,
+    amount: U256,
+) -> Result<TxHash, OpsError> {
+    let route = operation.route();
+    let (trading, wallet) = equity_chain_signer(state, chain, symbol)?;
+    require_startup_complete(state, route)?;
+    let handle = state.recovery.get().ok_or_else(recovery_not_ready)?;
+    let rebalancing = Arc::clone(&handle.rebalancing_service);
+    let locks = Arc::clone(&state.equity_wallet_locks);
+    // Checked under the claim, with the balance read.
+    let gas = equity_gas_readiness(state, chain, &wallet);
+    let required_confirmations = trading.required_confirmations;
+    let owner = wallet.address();
+    let wrapper = WrapperService::new(
+        Arc::clone(&wallet),
+        to_wrapped_equities(&trading.assets.equities.symbols),
+    );
+    let wrapped_token = wrapper
+        .lookup_derivative(symbol)
+        .map_err(|error| unprocessable(error.to_string()))?;
+    let symbol = symbol.clone();
+
+    answer_from_detached(&state.detached_tasks, route, symbol.clone(), async move {
+        let claim = claim_equity_wallet(&locks, &rebalancing, &symbol, chain, route)?;
+        ensure_equity_gas(&*gas?, route, chain).await?;
+
+        let submitted = match operation {
+            WrapperOperation::Wrap => wrapper.submit_wrap(wrapped_token, amount, owner).await,
+            WrapperOperation::Unwrap => {
+                wrapper
+                    .submit_unwrap(wrapped_token, amount, owner, owner)
+                    .await
+            }
+        };
+        let tx = submitted.map_err(|error| wrapper_submit_failure(route, chain, &error))?;
+        info!(
+            route, %chain, %symbol, %wrapped_token, %amount, %tx,
+            "Equity wallet operation broadcast via API"
+        );
+
+        let confirm = async move {
+            let wait = async {
+                loop {
+                    let confirmed = match operation {
+                        WrapperOperation::Wrap => wrapper
+                            .confirm_wrap(wrapped_token, tx)
+                            .await
+                            .map(|confirmation| confirmation.shares),
+                        WrapperOperation::Unwrap => wrapper
+                            .confirm_unwrap(wrapped_token, tx)
+                            .await
+                            .map(|confirmation| confirmation.assets),
+                    };
+                    let error = match confirmed {
+                        Ok(received) => {
+                            info!(
+                                route, %chain, %symbol, %amount, %received, %tx,
+                                "Equity wallet operation confirmed via API"
+                            );
+                            return;
+                        }
+                        Err(error) => error,
+                    };
+                    let mined = mined_or_unknown(&wallet, route, chain, tx).await;
+                    match wrapper_tx_fate(&error, mined.as_ref(), required_confirmations) {
+                        TxFate::Confirmed => {
+                            info!(
+                                route, %chain, %symbol, %amount, %tx, ?error,
+                                "Equity wallet operation confirmed via API"
+                            );
+                            return;
+                        }
+                        TxFate::Failed => {
+                            error!(
+                                route, %chain, %symbol, %amount, %tx, ?error,
+                                "Equity wallet operation broadcast via API did not confirm"
+                            );
+                            return;
+                        }
+                        TxFate::Unknown => {
+                            warn!(
+                                route, %chain, %symbol, %amount, %tx, ?error,
+                                "Equity wallet operation broadcast via API is not confirmed yet; \
+                                 keeping its lock and waiting again"
+                            );
+                            tokio::time::sleep(CONFIRM_RETRY_DELAY).await;
+                        }
+                    }
+                }
+            };
+            hold_until_proven(claim, route, &symbol, tx, wait).await;
+        };
+        Ok::<_, OpsError>((tx, confirm))
+    })
+    .await
+}
+
+/// A refused wrap or unwrap send. An unwrap above the wrapper's `maxRedeem`
+/// for the bot's wallet is refused before any tx, so it is a 422 naming what
+/// the wallet can redeem; anything else may have reached the chain, so it is
+/// the generic onchain 500.
+fn wrapper_submit_failure(route: &'static str, chain: Chain, error: &WrapperError) -> OpsError {
+    if let WrapperError::RedeemExceedsMax { .. } = error {
+        warn!(route, %chain, %error, "Equity wallet operation refused before its send");
+        return unprocessable(format!("{route} refused: {error}"));
+    }
+    onchain_failure(route, chain, error)
+}
+
+/// The tx's own canonical receipt, or `None` when it cannot be read, which
+/// proves nothing either way.
+async fn mined_or_unknown(
+    wallet: &Arc<dyn Wallet<Provider = RootProvider>>,
+    route: &'static str,
+    chain: Chain,
+    tx: TxHash,
+) -> Option<MinedTx> {
+    st0x_evm::mined_tx(wallet.provider(), tx)
+        .await
+        .unwrap_or_else(|read_error| {
+            warn!(route, %chain, %tx, ?read_error, "Could not read the tx's receipt");
+            None
+        })
+}
+
+/// The tokenization client a redemption sends and polls through.
+type RedemptionTokenizer = AlpacaTokenizationService<Arc<dyn Wallet<Provider = RootProvider>>>;
+
+/// Sends `quantity` shares of `symbol`'s underlying tokenized equity from the
+/// bot's wallet on `chain` to Alpaca's redemption wallet there, and Alpaca
+/// redeems them into the account. Mirrors `st0x-cli alpaca-redeem`, kept to
+/// drain a paused chain, where `transfer-equity` starts no new transfer.
+///
+/// The token is the chain's wrapper `asset()`, attested like the CLI does
+/// (`Wrapper::attest_underlying`), never a pasted address. The redemption
+/// wallet is the request's, or else the chain's own
+/// `[chains.<name>.trading].redemption_wallet`, like the CLI's
+/// `resolve_redemption_wallet`. The tokenization client is built from the
+/// bot's broker ctx and signer as the conductor builds its own.
+///
+/// Ordered and claimed like the wrap routes. The transfer is sent once and
+/// never retried: it carries no idempotency key, so a retry could send the
+/// shares twice (RAI-1494). The route answers at its broadcast; the detached
+/// task confirms it, holding the claim until its fate is proven, then polls
+/// Alpaca until it detects the transfer and until the redemption finishes,
+/// and logs the request id and the final status. Neither poll is awaited by
+/// the request, since both can outlast the load balancer's 60 second cut.
+pub(super) async fn redeem(
+    State(state): State<AppState>,
+    Audited(request): Audited<RedeemRequest>,
+) -> Result<Json<RedeemResponse>, OpsError> {
+    let RedeemRequest {
+        symbol,
+        quantity,
+        chain,
+        redemption_wallet,
+    } = request;
+    let (symbol, quantity, amount) = equity_wallet_input(&symbol, &quantity)?;
+    let (trading, wallet) = equity_chain_signer(&state, chain, &symbol)?;
+    let redemption_wallet = match redemption_wallet {
+        Some(redemption_wallet) => redemption_wallet,
+        None => state.ctx.redemption_wallet(chain).map_err(|error| {
+            unprocessable(format!(
+                "{error}; pass redemptionWallet or configure it for {chain}"
+            ))
+        })?,
+    };
+    require_startup_complete(&state, "redeem")?;
+    let handle = state.recovery.get().ok_or_else(recovery_not_ready)?;
+    let rebalancing = Arc::clone(&handle.rebalancing_service);
+    let locks = Arc::clone(&state.equity_wallet_locks);
+    // Checked under the claim, with the balance read.
+    let gas = equity_gas_readiness(&state, chain, &wallet);
+    let required_confirmations = trading.required_confirmations;
+    let wrapper = WrapperService::new(
+        Arc::clone(&wallet),
+        to_wrapped_equities(&trading.assets.equities.symbols),
+    );
+    let BrokerCtx::AlpacaBrokerApi(alpaca) = &state.ctx.broker;
+    let tokenizer: RedemptionTokenizer = AlpacaTokenizationService::new(
+        alpaca.base_url().to_string(),
+        alpaca.account_id,
+        alpaca.auth.clone(),
+        Arc::clone(&wallet),
+        chain,
+        Some(redemption_wallet),
+    )
+    .map_err(|error| {
+        error!(%chain, ?error, "Capital route refused: the Alpaca tokenization client failed to build");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "The bot could not build its Alpaca tokenization client".to_string(),
+            }),
+        )
+    })?;
+    let task_symbol = symbol.clone();
+
+    let (token, transfer_tx) = answer_from_detached(
+        &state.detached_tasks,
+        "redeem",
+        symbol.clone(),
+        async move {
+            let symbol = task_symbol;
+            let claim = claim_equity_wallet(&locks, &rebalancing, &symbol, chain, "redeem")?;
+            ensure_equity_gas(&*gas?, "redeem", chain).await?;
+
+            let token = wrapper
+                .attest_underlying(&symbol)
+                .await
+                .map_err(|error| match error {
+                    WrapperError::VaultAssetMismatch { .. } => {
+                        warn!(%chain, %symbol, %error, "Redemption refused before its send");
+                        unprocessable(format!("redeem refused: {error}"))
+                    }
+                    other => onchain_failure("redeem", chain, &other),
+                })?;
+
+            // Sent exactly once: the transfer carries no idempotency key
+            // (unlike a mint's issuer request id), so a retry could send the
+            // shares twice (RAI-1494).
+            let transfer_tx = tokenizer
+                .submit_redemption_send(token, amount)
+                .await
+                .map_err(|error| onchain_failure("redeem", chain, &error))?;
+            info!(
+                %chain, %symbol, %token, %redemption_wallet, %amount, %transfer_tx,
+                "Redemption transfer broadcast via API"
+            );
+
+            let follow = async move {
+                let wait = confirm_redemption_transfer(
+                    &tokenizer,
+                    &wallet,
+                    &symbol,
+                    chain,
+                    transfer_tx,
+                    required_confirmations,
+                );
+                if hold_until_proven(claim, "redeem", &symbol, transfer_tx, wait).await {
+                    follow_alpaca_redemption(&tokenizer, &symbol, chain, transfer_tx).await;
+                }
+            };
+            Ok::<_, OpsError>(((token, transfer_tx), follow))
+        },
+    )
+    .await?;
+
+    Ok(Json(RedeemResponse {
+        chain,
+        symbol: symbol.to_string(),
+        quantity: quantity.inner().to_string(),
+        redemption_wallet,
+        token: token.address(),
+        transfer_tx,
+    }))
+}
+
+/// Awaits the redemption transfer's confirmation like the wrap routes, and
+/// returns whether it moved the shares: `false` once it reverted, which moves
+/// none.
+async fn confirm_redemption_transfer(
+    tokenizer: &RedemptionTokenizer,
+    wallet: &Arc<dyn Wallet<Provider = RootProvider>>,
+    symbol: &Symbol,
+    chain: Chain,
+    transfer_tx: TxHash,
+    required_confirmations: u64,
+) -> bool {
+    loop {
+        let error = match tokenizer.confirm_redemption_send(transfer_tx).await {
+            Ok(RedemptionSendReceipt::Succeeded) => {
+                info!(%chain, %symbol, %transfer_tx, "Redemption transfer confirmed via API");
+                return true;
+            }
+            Ok(RedemptionSendReceipt::Reverted { cause }) => {
+                error!(
+                    %chain, %symbol, %transfer_tx, cause,
+                    "Redemption transfer sent via API reverted; no shares moved"
+                );
+                return false;
+            }
+            Err(error) => error,
+        };
+        let mined = mined_or_unknown(wallet, "redeem", chain, transfer_tx).await;
+        match redemption_send_fate(&error, mined.as_ref(), required_confirmations) {
+            TxFate::Confirmed => {
+                info!(
+                    %chain, %symbol, %transfer_tx, ?error,
+                    "Redemption transfer confirmed via API"
+                );
+                return true;
+            }
+            TxFate::Failed => {
+                error!(
+                    %chain, %symbol, %transfer_tx, ?error,
+                    "Redemption transfer sent via API did not confirm"
+                );
+                return false;
+            }
+            TxFate::Unknown => {
+                warn!(
+                    %chain, %symbol, %transfer_tx, ?error,
+                    "Redemption transfer sent via API is not confirmed yet; keeping its lock \
+                     and waiting again"
+                );
+                tokio::time::sleep(CONFIRM_RETRY_DELAY).await;
+            }
+        }
+    }
+}
+
+/// Polls Alpaca until it detects the confirmed redemption transfer and the
+/// redemption reaches a terminal status, and logs both, as `st0x-cli
+/// alpaca-redeem` printed them. The client keeps the bot's default
+/// backpressure policy: a throttled lookup is waited out inside the poll, as
+/// in the bot's own redemption jobs, where the CLI handed it back and retried
+/// it with `retry_on_backpressure`.
+async fn follow_alpaca_redemption(
+    tokenizer: &RedemptionTokenizer,
+    symbol: &Symbol,
+    chain: Chain,
+    transfer_tx: TxHash,
+) {
+    let detected = match tokenizer.poll_for_redemption(&transfer_tx).await {
+        Ok(request) => request,
+        Err(error) => {
+            error!(
+                %chain, %symbol, %transfer_tx, ?error,
+                "Alpaca did not report a redemption of the transfer sent via API; check its \
+                 tokenization requests before sending again"
+            );
+            return;
+        }
+    };
+    info!(
+        %chain, %symbol, %transfer_tx, request_id = %detected.id, status = ?detected.status,
+        "Alpaca detected the redemption transfer sent via API"
+    );
+
+    let finished = if detected.status == TokenizationRequestStatus::Pending {
+        match tokenizer.poll_redemption_until_complete(&detected.id).await {
+            Ok(request) => request,
+            Err(error) => {
+                error!(
+                    %chain, %symbol, %transfer_tx, request_id = %detected.id, ?error,
+                    "Alpaca's redemption of the transfer sent via API did not finish; check its \
+                     tokenization request"
+                );
+                return;
+            }
+        }
+    } else {
+        detected
+    };
+
+    match finished.status {
+        TokenizationRequestStatus::Completed => info!(
+            %chain, %symbol, %transfer_tx, request_id = %finished.id,
+            "Alpaca completed the redemption sent via API"
+        ),
+        TokenizationRequestStatus::Rejected => error!(
+            %chain, %symbol, %transfer_tx, request_id = %finished.id,
+            "Alpaca rejected the redemption sent via API"
+        ),
+        TokenizationRequestStatus::Pending => warn!(
+            %chain, %symbol, %transfer_tx, request_id = %finished.id,
+            "Alpaca's redemption of the transfer sent via API is still pending after its poll"
+        ),
+    }
+}
+
 /// Parses a decimal amount and refuses a zero or negative one, both as a 400.
 /// `wrap` lifts the parsed value into the amount type the route works in.
 fn positive_amount<Amount: HasZero + Into<Float>>(
@@ -1425,17 +2139,23 @@ fn positive_usdc(amount: &str) -> Result<(Positive<Usdc>, U256), OpsError> {
     Ok((amount, raw))
 }
 
-/// Parses a decimal share quantity and refuses, as a 400, one that is not
-/// positive or is finer than the nine decimals the tokenization API takes
-/// (the precision the rebalancer truncates its own quantities to), so the
-/// worker never receives a quantity Alpaca would reject.
-fn positive_shares(quantity: &str) -> Result<Positive<FractionalShares>, OpsError> {
+/// Parses a decimal share quantity and refuses, as a 400, one that does not
+/// parse or is not positive.
+fn positive_quantity(quantity: &str) -> Result<Positive<FractionalShares>, OpsError> {
     let parsed = Float::parse(quantity.to_string()).map_err(|error| {
         ops_precondition_error(format!("invalid quantity {quantity:?}: {error}"))
     })?;
-    let shares = Positive::new(FractionalShares::new(parsed)).map_err(|_| {
-        ops_precondition_error(format!("quantity must be positive, got {quantity}"))
-    })?;
+    Positive::new(FractionalShares::new(parsed))
+        .map_err(|_| ops_precondition_error(format!("quantity must be positive, got {quantity}")))
+}
+
+/// Parses a decimal share quantity like [`positive_quantity`] and refuses, as
+/// a 400, one finer than the nine decimals the tokenization API takes (the
+/// precision the rebalancer truncates its own quantities to), so the worker
+/// never receives a quantity Alpaca would reject.
+fn positive_shares(quantity: &str) -> Result<Positive<FractionalShares>, OpsError> {
+    let shares = positive_quantity(quantity)?;
+    let parsed = shares.inner().inner();
     let (_, lossless) = parsed
         .to_fixed_decimal_lossy(ALPACA_QUANTITY_MAX_DECIMAL_PLACES)
         .map_err(|error| ops_precondition_error(format!("invalid quantity {quantity}: {error}")))?;
@@ -1445,6 +2165,31 @@ fn positive_shares(quantity: &str) -> Result<Positive<FractionalShares>, OpsErro
         )));
     }
     Ok(shares)
+}
+
+/// Parses the symbol and the share quantity of a wrap, unwrap or redeem, as
+/// a 400 when either is malformed, and converts the quantity to the token's
+/// smallest unit at the 18 decimals of every tokenized equity and wrapper.
+/// The CLI's `to_u256_18_decimals` truncates a finer quantity; the route
+/// refuses it instead, so it never moves less than it was asked to.
+fn equity_wallet_input(
+    symbol: &str,
+    quantity: &str,
+) -> Result<(Symbol, Positive<FractionalShares>, U256), OpsError> {
+    let parsed_symbol = Symbol::new(symbol)
+        .map_err(|error| ops_precondition_error(format!("invalid symbol {symbol:?}: {error}")))?;
+    let shares = positive_quantity(quantity)?;
+    let (amount, lossless) = shares
+        .inner()
+        .inner()
+        .to_fixed_decimal_lossy(TOKENIZED_EQUITY_DECIMALS)
+        .map_err(|error| ops_precondition_error(format!("invalid quantity {quantity}: {error}")))?;
+    if !lossless {
+        return Err(ops_precondition_error(format!(
+            "quantity {quantity} has more than {TOKENIZED_EQUITY_DECIMALS} decimals"
+        )));
+    }
+    Ok((parsed_symbol, shares, amount))
 }
 
 /// Resolves the burn amount from exactly one of `amount` and `all`; both or
@@ -1525,9 +2270,17 @@ fn hedged_chain_signer(
         )));
     };
 
-    // A chain without a signer (Robinhood without its optional one) is
-    // refused rather than signed with another chain's wallet, as in the CLI;
-    // it is a gap in the bot's config, so it is a 500 like a missing wallet.
+    Ok((trading, chain_signer(state, chain)?))
+}
+
+/// The bot's signer on `chain`. A chain without a signer (Robinhood without
+/// its optional one) is refused rather than signed with another chain's
+/// wallet, as in the CLI; it is a gap in the bot's config, so it is a 500
+/// like a missing wallet.
+fn chain_signer(
+    state: &AppState,
+    chain: Chain,
+) -> Result<Arc<dyn Wallet<Provider = RootProvider>>, OpsError> {
     let wallet = crate::conductor::chain_wallet(bot_wallets(state)?, chain).map_err(|error| {
         error!(%chain, ?error, "Capital route refused: the bot has no signer for the chain");
         (
@@ -1538,7 +2291,203 @@ fn hedged_chain_signer(
         )
     })?;
 
-    Ok((trading, Arc::clone(wallet)))
+    Ok(Arc::clone(wallet))
+}
+
+/// The chain a wrap, unwrap or redeem acts on and the bot's signer there,
+/// resolved like the CLI's `wrap_context`: the chain's trading table must list
+/// `symbol`, whose underlying and wrapper addresses come from that listing.
+/// A chain without the table, or a symbol it does not list, is a 422, as for
+/// the listing checks of `transfer-equity`. Both are config checks, made
+/// before the wallet is required.
+fn equity_chain_signer<'state>(
+    state: &'state AppState,
+    chain: Chain,
+    symbol: &Symbol,
+) -> Result<
+    (
+        &'state HedgedChain,
+        Arc<dyn Wallet<Provider = RootProvider>>,
+    ),
+    OpsError,
+> {
+    let Some(trading) = state.ctx.chains.hedged_chain(chain) else {
+        return Err(unprocessable(format!(
+            "{chain} has no [chains.{chain}.trading] table, so it lists no tokenized \
+             equity or wrapper"
+        )));
+    };
+    let listed = &trading.assets.equities.symbols;
+    if !listed.contains_key(symbol) {
+        let mut available: Vec<String> = listed.keys().map(ToString::to_string).collect();
+        available.sort();
+        return Err(unprocessable(format!(
+            "{symbol} is not listed in [chains.{chain}.trading.assets.equities]; listed: [{}]",
+            available.join(", ")
+        )));
+    }
+
+    Ok((trading, chain_signer(state, chain)?))
+}
+
+fn unprocessable(message: String) -> OpsError {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(ErrorResponse { error: message }),
+    )
+}
+
+fn conflict(message: String) -> OpsError {
+    (StatusCode::CONFLICT, Json(ErrorResponse { error: message }))
+}
+
+/// One lock per symbol, shared by `wrap-equity`, `unwrap-equity` and
+/// `redeem`; see `AppState::equity_wallet_locks`. The map grows only by the
+/// symbols a chain lists, since the routes check the listing first.
+#[derive(Default)]
+pub(crate) struct EquityWalletLocks(parking_lot::Mutex<HashMap<Symbol, Arc<Mutex<()>>>>);
+
+impl EquityWalletLocks {
+    /// `symbol`'s lock for a detached task to own, or `None` while another
+    /// request holds it.
+    pub(crate) fn try_lock(&self, symbol: &Symbol) -> Option<OwnedMutexGuard<()>> {
+        let lock = Arc::clone(self.0.lock().entry(symbol.clone()).or_default());
+        lock.try_lock_owned().ok()
+    }
+}
+
+/// What a wrap, unwrap or redeem holds from before its first read until its
+/// tx's fate is proven: the symbol's lock, and the bot's equity transfer
+/// guard for the symbol, so the bot starts no mint or redemption of the
+/// symbol while the operator moves its shares in the wallet.
+struct EquityWalletClaim {
+    _lock: OwnedMutexGuard<()>,
+    _bot_guard: InProgressGuard,
+}
+
+/// Takes the symbol's lock, then the bot's equity transfer guard for it,
+/// refusing with 409 when either is held: another wrap, unwrap or redeem of
+/// the symbol whose outcome is not proven yet, or a transfer or recovery the
+/// bot runs on it.
+fn claim_equity_wallet(
+    locks: &EquityWalletLocks,
+    rebalancing: &RebalancingService,
+    symbol: &Symbol,
+    chain: Chain,
+    route: &'static str,
+) -> Result<EquityWalletClaim, OpsError> {
+    let Some(lock) = locks.try_lock(symbol) else {
+        warn!(route, %chain, %symbol, "Equity wallet operation refused: the symbol's lock is held");
+        return Err(conflict(format!(
+            "Another wrap, unwrap or redeem of {symbol} is in progress or its outcome is \
+             unknown; check the bot logs for it before retrying"
+        )));
+    };
+    let Some(bot_guard) = rebalancing.try_claim_equity_guard_for_transfer(symbol) else {
+        warn!(
+            route, %chain, %symbol,
+            "Equity wallet operation refused: the bot's equity transfer guard is held"
+        );
+        return Err(conflict(format!(
+            "The bot is moving {symbol} between Alpaca and Raindex or holds it for a \
+             recovery; retry once that transfer has finished"
+        )));
+    };
+
+    Ok(EquityWalletClaim {
+        _lock: lock,
+        _bot_guard: bot_guard,
+    })
+}
+
+/// The gas check of the bot's signer on `chain`, against that chain's own
+/// `[alerts.low_balance_thresholds]` entry: `GasReadiness::for_equity_chain`,
+/// as the conductor builds the check a manual equity transfer passes, and as
+/// `st0x-cli transfer-equity` built it. Built here rather than read from the
+/// trigger, which wires one only for the chains that rebalance equity, so a
+/// paused chain being drained has none. A missing threshold is a gap in the
+/// bot's config, so it is a 500.
+fn equity_gas_readiness(
+    state: &AppState,
+    chain: Chain,
+    wallet: &Arc<dyn Wallet<Provider = RootProvider>>,
+) -> Result<Arc<GasReadiness>, OpsError> {
+    let wallets = bot_wallets(state)?;
+    let readiness = state.ctx.alerts.as_ref().map_or_else(
+        || {
+            Err(anyhow::anyhow!(
+                "[alerts] gas thresholds are not configured"
+            ))
+        },
+        |alerts| {
+            GasReadiness::for_equity_chain(
+                alerts,
+                chain,
+                wallet,
+                wallets.base_wallet(),
+                wallets.ethereum_wallet(),
+            )
+        },
+    );
+    readiness.map_err(|error| {
+        error!(%chain, ?error, "Capital route refused: the bot cannot check its signer's gas");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("The bot has no gas threshold for {chain}"),
+            }),
+        )
+    })
+}
+
+/// Refuses with 503, as `transfer-equity` does, while the signer the check
+/// covers cannot pay gas or its balance cannot be read.
+async fn ensure_equity_gas(
+    readiness: &GasReadiness,
+    route: &'static str,
+    chain: Chain,
+) -> Result<(), OpsError> {
+    readiness
+        .ensure_ready(TransferGasRoute::Equity)
+        .await
+        .map_err(|error| {
+            warn!(route, %chain, %error, "Equity wallet operation refused: the signer is not gas ready");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: format!("The {chain} signing wallet is not gas ready: {error}"),
+                }),
+            )
+        })
+}
+
+/// Runs `confirm`, which returns once the tx's fate is proven, and frees
+/// `claim` after it. A panic would unwind through the claim and free the lock
+/// and the bot's guard while the fate is unknown, so it is caught here, the
+/// claim is kept until a restart, and the panic resumes for the watcher's
+/// join failure log.
+async fn hold_until_proven<Proven>(
+    claim: EquityWalletClaim,
+    route: &'static str,
+    symbol: &Symbol,
+    tx: TxHash,
+    confirm: impl Future<Output = Proven>,
+) -> Proven {
+    match std::panic::AssertUnwindSafe(confirm).catch_unwind().await {
+        Ok(proven) => {
+            drop(claim);
+            proven
+        }
+        Err(panic) => {
+            error!(
+                route, %symbol, %tx,
+                "Equity wallet confirmation panicked; keeping its lock and the bot's guard \
+                 until a restart. Check the tx onchain before retrying"
+            );
+            std::mem::forget(claim);
+            std::panic::resume_unwind(panic);
+        }
+    }
 }
 
 /// Which vault operation a vault route runs; each names its route.
@@ -1574,18 +2523,18 @@ struct VaultOutcome {
     tx: TxHash,
 }
 
-/// How long a vault route waits before it awaits its tx's confirmation again
+/// How long a capital route waits before it awaits its tx's confirmation again
 /// after an inconclusive outcome (a receipt timeout, a drop report, or an RPC
 /// failure). The graceful shutdown drain has its own timeout, so the wait
 /// never blocks exit.
 #[cfg(not(test))]
-const VAULT_CONFIRM_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+const CONFIRM_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
 #[cfg(test)]
-const VAULT_CONFIRM_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+const CONFIRM_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// What a vault tx's confirmation attempt proved.
+/// What the confirmation attempt of a tx a capital route sent proved.
 #[derive(Debug, PartialEq, Eq)]
-enum VaultTxFate {
+enum TxFate {
     Confirmed,
     /// The tx mined and failed: a status 0 receipt at the chain's required
     /// confirmations, or a decoded revert, which the wallet only produces from
@@ -1598,28 +2547,32 @@ enum VaultTxFate {
     Unknown,
 }
 
-/// Decides a vault tx's fate after `confirm_tx` failed with `error`, from the
-/// error and from `mined`, the tx's own canonical receipt as the node shows it
-/// now. The receipt decides whenever it has `required_confirmations`, so a
-/// revert whose replay cannot be decoded (no revert data, or pruned state)
+/// The fate `mined`, a tx's own canonical receipt as the node shows it now,
+/// proves on its own: it decides whenever it has `required_confirmations`, so
+/// a revert whose replay cannot be decoded (no revert data, or pruned state)
 /// still ends the wait.
+fn receipt_fate(mined: Option<&MinedTx>, required_confirmations: u64) -> Option<TxFate> {
+    let mined = mined.filter(|mined| mined.confirmations >= required_confirmations)?;
+    Some(if mined.succeeded {
+        TxFate::Confirmed
+    } else {
+        TxFate::Failed
+    })
+}
+
+/// Decides a vault tx's fate after `confirm_tx` failed with `error`: its
+/// receipt decides first ([`receipt_fate`]), then the error.
 fn vault_tx_fate(
     error: &RaindexError,
     mined: Option<&MinedTx>,
     required_confirmations: u64,
-) -> VaultTxFate {
-    if let Some(mined) = mined
-        && mined.confirmations >= required_confirmations
-    {
-        return if mined.succeeded {
-            VaultTxFate::Confirmed
-        } else {
-            VaultTxFate::Failed
-        };
+) -> TxFate {
+    if let Some(fate) = receipt_fate(mined, required_confirmations) {
+        return fate;
     }
     match error {
-        RaindexError::Evm(evm) if evm.is_revert() => VaultTxFate::Failed,
-        RaindexError::InsufficientVaultLiquidity { .. } => VaultTxFate::Failed,
+        RaindexError::Evm(evm) if evm.is_revert() => TxFate::Failed,
+        RaindexError::InsufficientVaultLiquidity { .. } => TxFate::Failed,
         RaindexError::Evm(_)
         | RaindexError::Contract(_)
         | RaindexError::Float(_)
@@ -1629,7 +2582,55 @@ fn vault_tx_fate(
         | RaindexError::ScanInconclusive { .. }
         | RaindexError::ScanAnomalousLog { .. }
         | RaindexError::MissingOperatorRole { .. }
-        | RaindexError::WithdrawReceiptNotVisible { .. } => VaultTxFate::Unknown,
+        | RaindexError::WithdrawReceiptNotVisible { .. } => TxFate::Unknown,
+    }
+}
+
+/// Decides a wrap or unwrap tx's fate after its confirmation failed with
+/// `error`, like [`vault_tx_fate`]. A receipt the wrapper read but could not
+/// account for (no `Deposit` or `Withdraw` event, or no transfer of the
+/// underlying to the receiver) also ends the wait: the tx mined, and waiting
+/// again cannot change its receipt.
+fn wrapper_tx_fate(
+    error: &WrapperError,
+    mined: Option<&MinedTx>,
+    required_confirmations: u64,
+) -> TxFate {
+    if let Some(fate) = receipt_fate(mined, required_confirmations) {
+        return fate;
+    }
+    match error {
+        WrapperError::Evm(evm) if evm.is_revert() => TxFate::Failed,
+        WrapperError::MissingDepositEvent
+        | WrapperError::MissingWithdrawEvent
+        | WrapperError::MissingUnderlyingTransfer { .. } => TxFate::Failed,
+        WrapperError::Evm(_)
+        | WrapperError::SymbolNotConfigured(_)
+        | WrapperError::RedeemExceedsMax { .. }
+        | WrapperError::VaultAssetMismatch { .. }
+        | WrapperError::Contract(_)
+        | WrapperError::Ratio(_)
+        | WrapperError::MissingBlockNumber { .. } => TxFate::Unknown,
+    }
+}
+
+/// Decides a redemption transfer's fate after its confirmation failed with
+/// `error`, like [`vault_tx_fate`]. A reverted transfer is reported by the
+/// confirmation itself, not as an error.
+fn redemption_send_fate(
+    error: &TokenizerError,
+    mined: Option<&MinedTx>,
+    required_confirmations: u64,
+) -> TxFate {
+    if let Some(fate) = receipt_fate(mined, required_confirmations) {
+        return fate;
+    }
+    match error {
+        TokenizerError::Evm(evm) if evm.is_revert() => TxFate::Failed,
+        TokenizerError::Evm(_)
+        | TokenizerError::Alpaca(_)
+        | TokenizerError::MissingRedemptionWallet
+        | TokenizerError::MintVerification(_) => TxFate::Unknown,
     }
 }
 
@@ -1746,14 +2747,14 @@ async fn run_vault_operation(
                         None
                     });
                     match vault_tx_fate(&error, mined.as_ref(), required_confirmations) {
-                        VaultTxFate::Confirmed => {
+                        TxFate::Confirmed => {
                             info!(
                                 route, %chain, %token, %vault_id, %amount_raw, %tx, ?error,
                                 "Vault operation confirmed via API"
                             );
                             return;
                         }
-                        VaultTxFate::Failed => {
+                        TxFate::Failed => {
                             error!(
                                 route, %chain, %token, %vault_id, %amount_raw, %tx, ?error,
                                 "Vault operation broadcast via API did not confirm"
@@ -1763,13 +2764,13 @@ async fn run_vault_operation(
                         // A receipt timeout, a drop report, or an RPC failure
                         // proves nothing: the tx can still land, and releasing
                         // the lock would let a rerun send a second one.
-                        VaultTxFate::Unknown => {
+                        TxFate::Unknown => {
                             warn!(
                                 route, %chain, %token, %vault_id, %amount_raw, %tx, ?error,
                                 "Vault operation broadcast via API is not confirmed yet; keeping \
                                  its lock and waiting again"
                             );
-                            tokio::time::sleep(VAULT_CONFIRM_RETRY_DELAY).await;
+                            tokio::time::sleep(CONFIRM_RETRY_DELAY).await;
                         }
                     }
                 }
@@ -1930,7 +2931,7 @@ mod tests {
     /// may still be pending on another node.
     #[test]
     fn a_drop_report_without_a_receipt_leaves_the_fate_unknown() {
-        assert_eq!(vault_tx_fate(&dropped(), None, 3), VaultTxFate::Unknown);
+        assert_eq!(vault_tx_fate(&dropped(), None, 3), TxFate::Unknown);
     }
 
     /// The tx's own receipt at the required depth decides over the error,
@@ -1939,11 +2940,11 @@ mod tests {
     fn a_receipt_at_the_required_depth_decides_the_fate() {
         assert_eq!(
             vault_tx_fate(&dropped(), Some(&mined(true, 3)), 3),
-            VaultTxFate::Confirmed
+            TxFate::Confirmed
         );
         assert_eq!(
             vault_tx_fate(&unreplayable(), Some(&mined(false, 3)), 3),
-            VaultTxFate::Failed
+            TxFate::Failed
         );
     }
 
@@ -1953,11 +2954,11 @@ mod tests {
     fn a_shallow_receipt_does_not_decide_the_fate() {
         assert_eq!(
             vault_tx_fate(&unreplayable(), Some(&mined(false, 2)), 3),
-            VaultTxFate::Unknown
+            TxFate::Unknown
         );
         assert_eq!(
             vault_tx_fate(&dropped(), Some(&mined(true, 2)), 3),
-            VaultTxFate::Unknown
+            TxFate::Unknown
         );
         assert_eq!(
             vault_tx_fate(
@@ -1967,7 +2968,7 @@ mod tests {
                 None,
                 3
             ),
-            VaultTxFate::Failed
+            TxFate::Failed
         );
     }
 

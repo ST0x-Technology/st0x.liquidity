@@ -434,10 +434,11 @@ cutover and printed the id of. Pass `--direction to-raindex` and the symbol and
 `--network` the mint was started with. It never starts a new mint, so it cannot
 mint twice: it answers `400` with `to-alpaca`, `404` when no mint has that id,
 `422` naming the recorded chain and symbol when they differ from the request,
-and `409` when the mint is already in a terminal state. Otherwise it answers
-with that id as `transferId` and `outcome` `resumed`, and the mint continues on
-the bot's equity transfer workers; follow it with
-`read transfer-events mint <id>`.
+and `409` when the mint has already ended, while another verb holds the recovery
+lock, or while a bot job or the wrapped or unwrapped equity recovery already
+drives that mint. Otherwise it answers with that id as `transferId`, the
+recorded quantity, and `outcome` `resumed`, and the mint continues on the bot's
+equity transfer workers; follow it with `read transfer-events mint <id>`.
 
 A bot release from before operation ids ignores the id and burns on every call,
 so the bot ships before this client: after deploy, and after a rollback of the
@@ -570,18 +571,23 @@ logs each step; the answer never waits for either. The send is never retried, so
 a `redeem` that answered `500` may still have sent its tokens: check the wallet
 onchain and the redemption in Alpaca before rerunning.
 
-`wrap-equity`, `unwrap-equity` and `redeem` refuse a malformed body or a
-quantity that is not a positive decimal with `400`. They answer `503` until the
-bot finishes starting and while the chain's signing wallet cannot be shown to
-pay gas, and `422` for a chain without a `[chains.<name>.trading]` table or a
-symbol the chain does not list. The three share one lock per symbol, taken
-before the first balance read and held until the bot logs the outcome of the tx:
-while it is held, another `wrap-equity`, `unwrap-equity` or `redeem` of that
-symbol answers `409`. They also answer `409` while the bot's own equity transfer
-of the symbol holds its guard, so they cannot move the wallet's shares from
-under a mint or redemption the bot is running. A verb that answered `500` holds
-no lock. The lock lives in memory, so after a bot restart check the wallet
-onchain before rerunning.
+`wrap-equity`, `unwrap-equity` and `redeem` refuse a malformed body, or a
+quantity that is not a positive decimal or is finer than 18 decimals, with
+`400`. They answer `503` until the bot finishes starting and while the chain's
+signing wallet cannot be shown to pay gas, and `500` when the chain has no
+wallet, signer or gas threshold configured. They answer `422` for a chain
+without a `[chains.<name>.trading]` table or a symbol that table does not list,
+for a wrapper whose `asset()` differs from the configured underlying, for an
+`unwrap-equity` above the wrapper's `maxRedeem`, and for a `redeem` without
+`--redemption-wallet` on a chain with no configured `redemption_wallet`. The
+three share one lock per symbol, taken before the first balance read and held
+until the bot logs the outcome of the tx: while it is held, another
+`wrap-equity`, `unwrap-equity` or `redeem` of that symbol answers `409`. They
+also answer `409` while the bot's own equity transfer of the symbol holds its
+guard, so they cannot move the wallet's shares from under a mint or redemption
+the bot is running. They do not take the recovery lock. A verb that answered
+`500` holds no lock. The lock lives in memory, so after a bot restart check the
+wallet onchain before rerunning.
 
 A request that times out on the client may still complete in the bot; check the
 bot logs and the chain for the transaction before retrying a vault or allowance

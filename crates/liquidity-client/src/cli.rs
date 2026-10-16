@@ -1151,64 +1151,6 @@ mod tests {
             } if id.to_string() == mint
         ));
 
-        assert!(matches!(
-            capital(&[
-                "wrap-equity",
-                "--symbol",
-                "AAPL",
-                "--quantity",
-                "1.5",
-                "--network",
-                "ethereum",
-            ])
-            .unwrap(),
-            Capital::WrapEquity {
-                symbol,
-                quantity,
-                network: super::HedgedChain::Ethereum,
-            } if symbol == "AAPL" && quantity == self::amount("1.5")
-        ));
-        assert!(matches!(
-            capital(&["unwrap-equity", "-s", "TSLA", "-q", "2", "--network", "robinhood"])
-                .unwrap(),
-            Capital::UnwrapEquity {
-                symbol,
-                quantity,
-                network: super::HedgedChain::Robinhood,
-            } if symbol == "TSLA" && quantity == self::amount("2")
-        ));
-        assert!(matches!(
-            capital(&[
-                "redeem",
-                "--symbol",
-                "AAPL",
-                "--quantity",
-                "0.5",
-                "--network",
-                "ethereum",
-                "--redemption-wallet",
-                TOKEN,
-            ])
-            .unwrap(),
-            Capital::Redeem {
-                symbol,
-                quantity,
-                network: super::HedgedChain::Ethereum,
-                redemption_wallet: Some(wallet),
-            } if symbol == "AAPL"
-                && quantity == self::amount("0.5")
-                && wallet == TOKEN.parse::<EvmAddress>().unwrap()
-        ));
-        assert!(matches!(
-            capital(&["redeem", "-s", "TSLA", "-q", "3"]).unwrap(),
-            Capital::Redeem {
-                symbol,
-                quantity,
-                redemption_wallet: None,
-                ..
-            } if symbol == "TSLA" && quantity == self::amount("3")
-        ));
-
         let Capital::VaultDeposit(deposit) = capital(&[
             "vault-deposit",
             "-a",
@@ -1288,6 +1230,70 @@ mod tests {
                 "{argv:?} must require its flags"
             );
         }
+    }
+
+    /// The equity wallet verbs keep the flag names and short flags of their
+    /// st0x-cli counterparts, and `redeem` sends a redemption wallet only when
+    /// one is given.
+    #[test]
+    fn parses_equity_wallet_verbs() {
+        assert!(matches!(
+            capital(&[
+                "wrap-equity",
+                "--symbol",
+                "AAPL",
+                "--quantity",
+                "1.5",
+                "--network",
+                "ethereum",
+            ])
+            .unwrap(),
+            Capital::WrapEquity {
+                symbol,
+                quantity,
+                network: super::HedgedChain::Ethereum,
+            } if symbol == "AAPL" && quantity == self::amount("1.5")
+        ));
+        assert!(matches!(
+            capital(&["unwrap-equity", "-s", "TSLA", "-q", "2", "--network", "robinhood"])
+                .unwrap(),
+            Capital::UnwrapEquity {
+                symbol,
+                quantity,
+                network: super::HedgedChain::Robinhood,
+            } if symbol == "TSLA" && quantity == self::amount("2")
+        ));
+        assert!(matches!(
+            capital(&[
+                "redeem",
+                "--symbol",
+                "AAPL",
+                "--quantity",
+                "0.5",
+                "--network",
+                "ethereum",
+                "--redemption-wallet",
+                TOKEN,
+            ])
+            .unwrap(),
+            Capital::Redeem {
+                symbol,
+                quantity,
+                network: super::HedgedChain::Ethereum,
+                redemption_wallet: Some(wallet),
+            } if symbol == "AAPL"
+                && quantity == self::amount("0.5")
+                && wallet == TOKEN.parse::<EvmAddress>().unwrap()
+        ));
+        assert!(matches!(
+            capital(&["redeem", "-s", "TSLA", "-q", "3"]).unwrap(),
+            Capital::Redeem {
+                symbol,
+                quantity,
+                redemption_wallet: None,
+                ..
+            } if symbol == "TSLA" && quantity == self::amount("3")
+        ));
     }
 
     /// Like st0x-cli, every capital `--network` defaults to base.
