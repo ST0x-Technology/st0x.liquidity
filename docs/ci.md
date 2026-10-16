@@ -86,6 +86,26 @@ Use a pull request event for merge-blocking validation. Reserve
 `workflow_dispatch` for manual runs whose result does not need to become a pull
 request status check.
 
+## Test shards
+
+The eight `backend test` shards do not `need` `backend build`. They start with
+the run, install Nix, and realize the `ci-backend` dev shell while the archive
+compiles. Then `scripts/wait-for-job.sh` polls `backend build` through the
+Actions API (`actions: read`) until it completes, and fails unless it succeeded.
+The `GITHUB_TOKEN` gets 1,000 API requests per hour per repository, shared by
+every run, so the polls are conditional requests: a `304 Not Modified` does not
+count against that limit. Each step that starts or ends in `backend build`
+changes the job, so a shard spends about one request per step change. A near
+rate-limit reset is waited out, a far one fails the shard with a clear message,
+and other API errors only delay the next poll. A shard also fails if the run
+shows no `backend build` job for 5 minutes. The shard timeout (45 minutes)
+covers the wait for the build. The trade-off: each run holds eight runners from
+its start, so they sit idle while the build compiles, about one minute on a warm
+run and up to 30 minutes on a cold fork run, to save about 35 s of setup. A
+re-run of only the failed shards restores the archive from the attempt whose
+build succeeded. The slowest e2e tests (about 80 s) start first, so a shard
+takes little more than its slowest test.
+
 ## Persistent target directories
 
 `backend build` and `backend lint` keep their cargo target directories
