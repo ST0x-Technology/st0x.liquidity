@@ -59,13 +59,13 @@ nothing enqueued). The `backfill-worker` fetches the logs and pushes an
 success. The cutoff tag is unrelated to `required_confirmations`, which governs
 only transaction-submission paths.
 
-Each hedged chain has its own required `order_fill_poll_interval_secs` and
-independent backfill queue. All fill scans, including startup catch-up and
-durable retries, split inclusive block ranges using explicit chain constants:
-Base, Ethereum and Robinhood use 1000 blocks per request; HyperEVM uses 50. This
-applies to both OrderBook filters and the combined inventory settlement filter.
-The partition iterator is lazy and handles the full unsigned block-number range
-without arithmetic overflow.
+Each hedged chain has its own required `order_fill_poll_interval_secs`,
+independent backfill queue, and trade-accounting queue and worker. All fill
+scans, including startup catch-up and durable retries, split inclusive block
+ranges using explicit chain constants: Base, Ethereum and Robinhood use 1000
+blocks per request; HyperEVM uses 50. This applies to both OrderBook filters and
+the combined inventory settlement filter. The partition iterator is lazy and
+handles the full unsigned block-number range without arithmetic overflow.
 
 The 50-block HyperEVM cap follows the
 [official JSON-RPC contract](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/hyperevm/json-rpc).
@@ -861,9 +861,15 @@ Rows queued before per-chain queues carry the bare type name, which no worker
 reads. At startup, after the apalis tables exist and before any worker spawns,
 `DexTradeAccountingQueues::relabel_legacy_rows` moves every live legacy row onto
 the queue of the chain its payload names (the same serde rule the worker uses,
-so a chainless payload is Base). A live row whose payload does not decode fails
-startup and nothing is relabeled. Terminal rows keep the old label until the
-retention sweep deletes them.
+so a chainless payload is Base). A live row whose payload does not decode, or
+names a chain this config does not hedge, fails startup and nothing is
+relabeled. Terminal rows keep the old label until the retention sweep deletes
+them.
+
+Rolling back to a single-queue binary strands every live `@chain` row, because
+its one worker reads only the bare label. Before starting the old binary, move
+them back:
+`UPDATE Jobs SET job_type = '<type_name>' WHERE job_type LIKE '<type_name>@%' AND (status IN ('Pending', 'Queued', 'Running') OR (status = 'Failed' AND attempts < max_attempts))`.
 
 Implements `Job<AccountantCtx<Node, Exec>>`. The `perform()` method runs the
 hedging pipeline:

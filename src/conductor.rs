@@ -277,7 +277,8 @@ async fn setup_apalis_queues(
         );
     }
 
-    let relabeled = DexTradeAccountingQueues::relabel_legacy_rows(apalis_pool).await?;
+    let accounting_queues = DexTradeAccountingQueues::new(apalis_pool, chains);
+    let relabeled = accounting_queues.relabel_legacy_rows(apalis_pool).await?;
     if relabeled > 0 {
         info!(
             relabeled,
@@ -286,7 +287,7 @@ async fn setup_apalis_queues(
     }
 
     Ok((
-        DexTradeAccountingQueues::new(apalis_pool, chains),
+        accounting_queues,
         BackfillQueues::new(apalis_pool, chains),
         DashboardTradeDelivery::new(apalis_pool, pool, event_sender, equity_prices),
         RebalancingSchedulers::new(apalis_pool),

@@ -8979,14 +8979,15 @@ sequenceDiagram
 ```
 
 On startup, backfill pushes historical events after the persisted backfill
-checkpoint as `AccountForDexTrade` jobs into the same queue. The worker starts
-after backfill completes, so historical jobs are enqueued before live events are
-processed. Successful backfill advances the checkpoint to the cutoff block.
+checkpoint as `AccountForDexTrade` jobs into the chain's accounting queue. The
+worker starts after backfill completes, so historical jobs are enqueued before
+live events are processed. Successful backfill advances the checkpoint to the
+cutoff block.
 
 The diagram above shows `ClearV3`/`TakeOrderV3`, the direct-orderbook fill
 source. In `managed` inventory mode, `OperatorDeposit`/`OperatorWithdraw`
 settlement pairs on the shared `RaindexInventory` are a third fill source pushed
-into the same `AccountForDexTrade` queue as an `InventoryTrade`; see
+into the chain's `AccountForDexTrade` queue as an `InventoryTrade`; see
 "InventoryTrade: a third fill source" above for the pairing rules.
 
 **Target Flow** (lifecycle workflows, future):

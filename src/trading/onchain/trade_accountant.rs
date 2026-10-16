@@ -84,10 +84,12 @@ impl DexTradeAccountingQueues {
     /// which no worker reads) onto the queue of the chain its payload names.
     /// The payload is decoded with the worker's own serde rules, so a
     /// chainless payload lands on Base, as the worker would run it. A payload
-    /// that does not decode fails the whole relabel rather than guess a chain.
-    /// Terminal rows are left for the retention sweep. Runs at startup, after
-    /// the apalis tables exist and before any worker spawns; idempotent.
+    /// that does not decode, or names a chain with no queue here, fails the
+    /// whole relabel: the row may be the only record of its fill. Terminal
+    /// rows are left for the retention sweep. Runs at startup, after the
+    /// apalis tables exist and before any worker spawns; idempotent.
     pub(crate) async fn relabel_legacy_rows(
+        &self,
         apalis_pool: &apalis_sqlite::SqlitePool,
     ) -> Result<u64, RelabelLegacyAccountingRowsError> {
         let legacy = std::any::type_name::<AccountForDexTrade>();
@@ -115,8 +117,13 @@ impl DexTradeAccountingQueues {
                 }
             };
 
+            let chain = job.trade.chain;
+            let Some(queue) = self.for_chain(chain) else {
+                return Err(RelabelLegacyAccountingRowsError::UnhedgedChain { id, chain });
+            };
+
             relabeled += sqlx_apalis::query("UPDATE Jobs SET job_type = ? WHERE id = ?")
-                .bind(format!("{legacy}@{}", job.trade.chain))
+                .bind(queue.queue_key())
                 .bind(&id)
                 .execute(&mut *transaction)
                 .await?
@@ -139,6 +146,11 @@ pub(crate) enum RelabelLegacyAccountingRowsError {
         #[source]
         source: serde_json::Error,
     },
+    #[error(
+        "live trade accounting job {id} is for {chain}, which this config does not hedge; \
+         hedge {chain} again or resolve the row before starting"
+    )]
+    UnhedgedChain { id: String, chain: Chain },
     #[error("failed to relabel legacy trade accounting jobs: {0}")]
     Database(#[from] apalis_sqlite::SqlxError),
 }
@@ -3020,10 +3032,21 @@ mod tests {
     #[tokio::test]
     async fn perform_reschedules_with_incremented_streak_on_a_preflight_429_without_placing_a_hedge()
      {
+        assert_preflight_429_reschedules_onto_the_fill_chain_queue(Chain::Base).await;
+    }
+
+    /// The successor goes back onto the fill's own chain's queue, not the
+    /// primary's: only that chain's worker may run it.
+    #[tokio::test]
+    async fn perform_reschedules_a_secondary_chain_fill_onto_its_own_chain_queue() {
+        assert_preflight_429_reschedules_onto_the_fill_chain_queue(Chain::Ethereum).await;
+    }
+
+    async fn assert_preflight_429_reschedules_onto_the_fill_chain_queue(chain: Chain) {
         let (pool, apalis_pool) = setup_test_pools().await;
         let asserter = Asserter::new();
 
-        let usdc_token = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+        let usdc_token = chain.settlement_stable().address;
         let equity_token = address!("0x5CdA0E1cA4ce2Af96315F7F8963c85399c172204");
         let operator = address!("0x8b8b6e0507c125934c6129563f48e48c66f86475");
 
@@ -3056,7 +3079,7 @@ mod tests {
 
         let event = RaindexTradeEvent::InventoryTrade(Box::new(inventory_trade));
         let job = AccountForDexTrade {
-            trade: EmittedOnChain::from_log(Chain::Base, event, &log).unwrap(),
+            trade: EmittedOnChain::from_log(chain, event, &log).unwrap(),
             backpressure_streak: BackpressureStreak::default(),
         };
 
@@ -3091,25 +3114,37 @@ mod tests {
         };
 
         let cache = SymbolCache::default();
-        cache.preload_symbol(st0x_evm::Chain::Base, usdc_token, "USDC");
-        cache.preload_symbol(st0x_evm::Chain::Base, equity_token, "wtCOIN");
+        cache.preload_symbol(chain, usdc_token, "USDC");
+        cache.preload_symbol(chain, equity_token, "wtCOIN");
 
-        let accountant_ctx = build_test_accountant_ctx(
+        let mut fill_chain = ctx.chains.primary().clone();
+        fill_chain.chain = chain;
+
+        let mut accountant_ctx = build_test_accountant_ctx(
             pool.clone(),
             &apalis_pool,
             ctx,
             cache,
-            provider,
+            ProviderBuilder::new().connect_mocked_client(Asserter::new()),
             executor,
             ExecutionThreshold::shares(Positive::new(FractionalShares::new(float!(0.01))).unwrap()),
         )
         .await;
+        accountant_ctx.chains.insert(
+            chain,
+            ChainAccounting {
+                contracts: crate::onchain::raindex_contracts(&fill_chain),
+                trading: fill_chain,
+                evm: st0x_evm::ReadOnlyEvm::new(provider),
+                job_queue: DexTradeAccountingJobQueue::new_namespaced(&apalis_pool, chain.as_str()),
+            },
+        );
 
         // The 429 must reschedule (Ok(())) through the REAL Job::perform
         // entry point, not propagate as Err.
         job.perform(&accountant_ctx).await.unwrap();
 
-        assert_eq!(successor_backpressure_streak(&apalis_pool).await, 1);
+        assert_eq!(successor_backpressure_streak(&apalis_pool, chain).await, 1);
 
         // The fill was still accounted (the guard commits before any Alpaca
         // touch), but no hedge order was placed -- this job is
@@ -3386,22 +3421,28 @@ mod tests {
         );
     }
 
-    async fn successor_backpressure_streak(apalis_pool: &apalis_sqlite::SqlitePool) -> i64 {
-        let streaks: Vec<i64> = sqlx_apalis::query_scalar(
-            "SELECT json_extract(CAST(job AS TEXT), '$.backpressure_streak') FROM Jobs \
-             WHERE job_type = ?",
+    /// The streak of the one successor row, which must be on `chain`'s queue.
+    async fn successor_backpressure_streak(
+        apalis_pool: &apalis_sqlite::SqlitePool,
+        chain: Chain,
+    ) -> i64 {
+        let rows: Vec<(String, i64)> = sqlx_apalis::query_as(
+            "SELECT job_type, json_extract(CAST(job AS TEXT), '$.backpressure_streak') FROM Jobs",
         )
-        .bind(account_for_dex_trade_job_type())
         .fetch_all(apalis_pool)
         .await
         .unwrap();
 
+        let expected_type = format!("{}@{chain}", std::any::type_name::<AccountForDexTrade>());
         assert_eq!(
-            streaks.len(),
-            1,
-            "a 429 must enqueue exactly one AccountForDexTrade successor"
+            rows.iter()
+                .map(|(job_type, _)| job_type.as_str())
+                .collect::<Vec<_>>(),
+            vec![expected_type.as_str()],
+            "a 429 must enqueue exactly one AccountForDexTrade successor, on the fill's chain"
         );
-        streaks.into_iter().next().unwrap()
+        let [(_, streak)] = <[_; 1]>::try_from(rows).unwrap();
+        streak
     }
 
     #[test]
@@ -3456,7 +3497,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(successor_backpressure_streak(&apalis_pool).await, 1);
+        assert_eq!(
+            successor_backpressure_streak(&apalis_pool, Chain::Base).await,
+            1
+        );
     }
 
     #[tokio::test]
