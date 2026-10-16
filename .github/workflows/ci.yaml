@@ -42,7 +42,9 @@ env:
 jobs:
   backend-build:
     name: backend build
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    # Sixteen cores: a cold build compiles all 614 crates, and its dependency
+    # graph and the parallel frontend use them (2m17 against 2m54 on eight).
+    runs-on: blacksmith-16vcpu-ubuntu-2404
     timeout-minutes: 30
     env:
       # Non-incremental: the parallel frontend below crashed rustc's
@@ -163,9 +165,10 @@ jobs:
           fi
           ./scripts/sync-source-mtimes.sh prepare
 
-      # Build the test binaries once into a nextest archive shared by all eight
-      # partitions. Clippy runs in backend-lint and rustdoc in backend-docs, so
-      # the test shards wait only for this compile.
+      # Build every test binary into the archive the unit shards use. With
+      # --all-features this archive still holds the e2e binary, which the unit
+      # shards filter out; the e2e shards use backend-build-e2e's archive.
+      # Clippy and rustdoc run in their own jobs.
       - name: Build nextest archive
         run: |
           nix develop .#ci-backend -c bash -c "
@@ -176,14 +179,160 @@ jobs:
             ./scripts/sync-source-mtimes.sh record
           "
 
-      # Blacksmith transparently redirects the native Actions cache to
-      # colocated storage. GitHub artifacts still use remote Azure storage,
-      # which made each test shard spend ~20 minutes downloading this file.
       - name: Save nextest archive
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6
         with:
           path: ${{ runner.temp }}/nextest-archive.tar.zst
           key: ${{ runner.os }}-nextest-${{ github.run_id }}-${{ github.run_attempt }}
+
+  backend-build-e2e:
+    name: backend build e2e
+    # Sixteen cores: a cold build compiles all 614 crates, and its dependency
+    # graph and the parallel frontend use them (2m17 against 2m54 on eight).
+    runs-on: blacksmith-16vcpu-ubuntu-2404
+    timeout-minutes: 30
+    env:
+      # Non-incremental: the parallel frontend below crashed rustc's
+      # incremental dependency graph, and with it a changed crate recompiles
+      # faster in full than single-threaded from incremental state. The target
+      # directory still persists on a sticky disk, so unchanged crates stay
+      # built.
+      CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_DIR: target/e2e
+      # No debug info in CI test binaries: a cold build took 132 s instead of
+      # 141 s and the shards' archive halved (717 to 366 MB). Panic messages
+      # still carry file and line; only backtraces lose line numbers.
+      CARGO_PROFILE_DEV_DEBUG: "false"
+      CARGO_PROFILE_TEST_DEBUG: "false"
+      # Parallel rustc frontend for workspace crates (see the script). Cargo
+      # fingerprints only the wrapper's path, so sync-source-mtimes.sh treats
+      # the script as a build-wide input.
+      RUSTC_WORKSPACE_WRAPPER: ${{ github.workspace }}/scripts/rustc-parallel-frontend.sh
+      # Registry and git sources live on the same sticky disk. Swatinem's
+      # rust-cache is not used here: its save step prunes workspace-crate and
+      # incremental artifacts from the target directory before the disk
+      # commits.
+      CARGO_HOME: ${{ github.workspace }}/target/e2e/cargo-home
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          persist-credentials: false
+
+      - name: Configure Git fetch fail-fast
+        run: |
+          git config --global http.lowSpeedLimit 524288
+          git config --global http.lowSpeedTime 60
+
+      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035  # v34
+        with:
+          # Nix 2.24-2.28 fail to resolve rainix's overridden `foundry` input
+          # (`cannot find flake 'flake:foundry'`); the fix landed in 2.30. v30
+          # of this action only shipped up to 2.26, so use v34 and pin a
+          # working release.
+          nix_version: "2.31.2"
+          nix_conf: |
+            accept-flake-config = true
+            fallback = true
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            keep-env-derivations = true
+            keep-outputs = true
+
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71  # v17
+        continue-on-error: true
+        with:
+          name: rainlanguage
+          authToken: ${{ env.UNTRUSTED_PR != 'true' && secrets.CACHIX_AUTH_TOKEN || '' }}
+          skipPush: ${{ env.UNTRUSTED_PR == 'true' }}
+          useDaemon: false
+
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569  # v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 8G
+          save: ${{ env.UNTRUSTED_PR != 'true' }}
+
+      # The sticky disk key embeds a hash of a repository secret. The `commit`
+      # input below is part of the workflow file, which a pull request can
+      # edit, so it cannot stop a fork from committing a snapshot. A fork run
+      # gets no secrets, so it cannot name this disk, and it skips the disk
+      # and builds cold. Same-repository runs have the secret, but they can
+      # already push to Cachix with it, so the trust level does not change.
+      # The mask keeps the derived key out of the public logs.
+      - name: Derive persistent target disk key
+        id: target-disk
+        if: ${{ env.UNTRUSTED_PR != 'true' }}
+        env:
+          DISK_KEY_SECRET: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        run: |
+          if [ -z "$DISK_KEY_SECRET" ]; then
+            echo "CACHIX_AUTH_TOKEN is not set, so the target disk key cannot be derived" >&2
+            exit 1
+          fi
+          key=$(printf 'st0x-target-disk:%s' "$DISK_KEY_SECRET" | sha256sum | cut -c1-32)
+          echo "::add-mask::$key"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+
+      # The target directory lives on a Blacksmith sticky disk: each run
+      # mounts the last snapshot. Only master pushes (reviewed, merged code)
+      # save the disk that pull request and master runs use, so pull request
+      # runs never replace it. Manual dispatches use and save their own
+      # `-dispatch` disk, which no other run reads, so a branch can measure
+      # cache changes without touching the master disk. The next step makes
+      # only changed sources newer than the snapshot's build. Registry and git
+      # dependencies fingerprint by version and stay built.
+      - name: Mount persistent target directory
+        if: ${{ env.UNTRUSTED_PR != 'true' }}
+        uses: useblacksmith/stickydisk@3f6be1451e3cad893b778bc93495c80452a5da26  # v1.7.2
+        with:
+          key: ${{ steps.target-disk.outputs.key }}-target-e2e-v1${{ github.event_name == 'workflow_dispatch' && '-dispatch' || '' }}
+          path: ${{ github.workspace }}/target/e2e
+          commit: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/master') }}
+
+      # A fresh disk mounts root-owned. A saving run clears the disk once it
+      # holds more than 40 GiB (one full build is about 7), since stale
+      # artifacts from older toolchains and dependency versions are never
+      # collected. The fresh ext4 volume also holds a root-owned lost+found
+      # (mode 700) that the runner user cannot remove, so the wipe runs with
+      # sudo and keeps it. The snapshot records the git content hashes of the
+      # tree it compiled; sync-source-mtimes.sh then makes only the sources
+      # whose content differs newer than that build, so cargo reruns rustc
+      # just for the crates they belong to. A changed lockfile, manifest,
+      # toolchain, Nix file, or migration makes every source newer instead.
+      - name: Prepare persistent target directory
+        if: ${{ env.UNTRUSTED_PR != 'true' }}
+        run: |
+          sudo chown "$(id -u):$(id -g)" "$CARGO_TARGET_DIR"
+          used=$(df --output=used -BG "$CARGO_TARGET_DIR" | tail -1 | tr -dc '0-9')
+          echo "target disk holds ${used} GiB"
+          if [ "${{ github.event_name }}" != pull_request ] && [ "$used" -gt 40 ]; then
+            sudo find "$CARGO_TARGET_DIR" -mindepth 1 -maxdepth 1 ! -name lost+found -exec rm -rf {} +
+          fi
+          ./scripts/sync-source-mtimes.sh prepare
+
+      # The e2e suite is the slowest test work (about 80 s a shard), and its
+      # binary needs only the st0x-hedge library, not the larger unit-test
+      # harness. Built in its own job, it is ready for the e2e shards while
+      # backend-build still compiles the rest; in one job the two compiles ran
+      # back to back.
+      - name: Build e2e archive
+        run: |
+          nix develop .#ci-backend -c bash -c "
+            set -euxo pipefail
+            ./scripts/clean-stale-rain-math-float.sh
+            cargo nextest archive --workspace --all-features --profile ci --test e2e \
+              --archive-file \"\$RUNNER_TEMP/nextest-e2e-archive.tar.zst\"
+            ./scripts/sync-source-mtimes.sh record
+          "
+
+      # Blacksmith transparently redirects the native Actions cache to
+      # colocated storage. GitHub artifacts still use remote Azure storage,
+      # which made each test shard spend ~20 minutes downloading this file.
+      - name: Save e2e archive
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6
+        with:
+          path: ${{ runner.temp }}/nextest-e2e-archive.tar.zst
+          key: ${{ runner.os }}-nextest-e2e-${{ github.run_id }}-${{ github.run_attempt }}
 
   # Clippy and the Python board checks need their own compile (clippy cannot
   # reuse test-profile artifacts), so they run beside backend-build instead of
@@ -441,14 +590,15 @@ jobs:
             ./scripts/sync-source-mtimes.sh record
           "
 
-  # The shards start with the run instead of after backend-build: they install
-  # Nix and realize the dev shell while the archive compiles, then wait for
-  # backend-build through the read-only Actions API and fail if it does not
+  # The shards start with the run instead of after their build job: they
+  # install Nix and realize the dev shell while the archive compiles, then wait
+  # for their build job (backend-build-e2e for the e2e shards, backend-build for
+  # the unit shards) through the read-only Actions API and fail if it does not
   # succeed. That moves ~35 s of setup per shard off the critical path.
   backend-test:
-    name: backend test ${{ matrix.partition }} of 8
+    name: backend test ${{ matrix.suite }} ${{ matrix.partition }} of ${{ matrix.suite == 'e2e' && 8 || 4 }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
-    # Covers the wait for backend-build (itself up to 30 minutes) as well as
+    # Covers the wait for the build job (itself up to 30 minutes) as well as
     # the archive restore and the tests.
     timeout-minutes: 45
     permissions:
@@ -457,8 +607,20 @@ jobs:
     strategy:
       fail-fast: false
 
+      # Eight e2e shards start on the e2e archive; four shards run every other
+      # test from the full archive.
       matrix:
+        suite: [e2e, unit]
         partition: [1, 2, 3, 4, 5, 6, 7, 8]
+        exclude:
+          - suite: unit
+            partition: 5
+          - suite: unit
+            partition: 6
+          - suite: unit
+            partition: 7
+          - suite: unit
+            partition: 8
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
@@ -501,39 +663,43 @@ jobs:
       - name: Realize the backend dev shell
         run: nix develop .#ci-backend -c true
 
-      # wait-for-job.sh polls with conditional requests, so eight shards per
+      # wait-for-job.sh polls with conditional requests, so twelve shards per
       # run stay well inside the GITHUB_TOKEN rate limit, and fails the shard
-      # unless backend-build succeeded.
+      # unless its build job succeeded.
       - name: Wait for backend build
         env:
           GH_TOKEN: ${{ github.token }}
-        run: ./scripts/wait-for-job.sh "backend build"
+        run: ./scripts/wait-for-job.sh "${{ matrix.suite == 'e2e' && 'backend build e2e' || 'backend build' }}"
 
       # A re-run of only the failed shards has a new run_attempt, while the
-      # archive belongs to the attempt whose backend-build succeeded.
+      # archive belongs to the attempt whose build job succeeded.
       - name: Restore nextest archive
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6
         with:
-          path: ${{ runner.temp }}/nextest-archive.tar.zst
-          key: ${{ runner.os }}-nextest-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: ${{ runner.os }}-nextest-${{ github.run_id }}-
+          path: ${{ runner.temp }}/nextest-${{ matrix.suite == 'e2e' && 'e2e-' || '' }}archive.tar.zst
+          key: ${{ runner.os }}-nextest-${{ matrix.suite == 'e2e' && 'e2e-' || '' }}${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ${{ runner.os }}-nextest-${{ matrix.suite == 'e2e' && 'e2e-' || '' }}${{ github.run_id }}-
           fail-on-cache-miss: true
 
-      # Test binaries come from the archive built in backend-build; no recompile.
+      # Test binaries come from the shard's build job archive; no recompile.
       # count: deals each binary's tests round-robin, so every shard gets an
       # even share of the slow e2e tests (hash: left one shard with most).
-      - name: test ${{ matrix.partition }} of 8
+      - name: test ${{ matrix.suite }} ${{ matrix.partition }}
+        env:
+          ARCHIVE: ${{ runner.temp }}/nextest-${{ matrix.suite == 'e2e' && 'e2e-' || '' }}archive.tar.zst
+          SUITE_FILTER: ${{ matrix.suite == 'e2e' && 'binary(=e2e)' || 'not binary(=e2e)' }}
+          PARTITION: count:${{ matrix.partition }}/${{ matrix.suite == 'e2e' && 8 || 4 }}
         run: |
           nix develop .#ci-backend -c bash -c "
             set -euxo pipefail
-            cargo nextest run --archive-file \"\$RUNNER_TEMP/nextest-archive.tar.zst\" \
+            cargo nextest run --archive-file \"\$ARCHIVE\" \
               --workspace-remap . --profile ci \
-              --partition count:${{ matrix.partition }}/8
+              -E \"\$SUITE_FILTER\" --partition \"\$PARTITION\"
           "
 
   backend:
     name: backend
-    needs: [backend-build, backend-lint, backend-docs, backend-test]
+    needs: [backend-build, backend-build-e2e, backend-lint, backend-docs, backend-test]
     # Inspect every dependency state, including failures, skips, and
     # cancellations, so this required check cannot pass without validation.
     if: ${{ always() }}
@@ -542,8 +708,8 @@ jobs:
     steps:
       - name: Check backend validation
         run: |
-          if [ "${{ needs.backend-build.result }}" != "success" ] || [ "${{ needs.backend-lint.result }}" != "success" ] || [ "${{ needs.backend-docs.result }}" != "success" ] || [ "${{ needs.backend-test.result }}" != "success" ]; then
-            echo "backend validation failed (build=${{ needs.backend-build.result }}, lint=${{ needs.backend-lint.result }}, docs=${{ needs.backend-docs.result }}, test=${{ needs.backend-test.result }})"
+          if [ "${{ needs.backend-build.result }}" != "success" ] || [ "${{ needs.backend-build-e2e.result }}" != "success" ] || [ "${{ needs.backend-lint.result }}" != "success" ] || [ "${{ needs.backend-docs.result }}" != "success" ] || [ "${{ needs.backend-test.result }}" != "success" ]; then
+            echo "backend validation failed (build=${{ needs.backend-build.result }}, build-e2e=${{ needs.backend-build-e2e.result }}, lint=${{ needs.backend-lint.result }}, docs=${{ needs.backend-docs.result }}, test=${{ needs.backend-test.result }})"
             exit 1
           fi
 

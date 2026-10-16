@@ -92,11 +92,12 @@ end
 
 expected_wiring = {
   "backend-build" => { "needs" => nil, "if" => nil },
+  "backend-build-e2e" => { "needs" => nil, "if" => nil },
   "backend-lint" => { "needs" => nil, "if" => nil },
   "backend-docs" => { "needs" => nil, "if" => nil },
   "backend-test" => { "needs" => nil, "if" => nil },
   "backend" => {
-    "needs" => %w[backend-build backend-lint backend-docs backend-test],
+    "needs" => %w[backend-build backend-build-e2e backend-lint backend-docs backend-test],
     "if" => "${{ always() }}"
   },
   "dashboard-build" => { "needs" => nil, "if" => nil },
@@ -120,6 +121,35 @@ expected_wiring.each do |job_name, expected|
     warn "#{job_name}.#{key} must be #{value.inspect}, got #{job[key].inspect}"
     exit 1
   end
+end
+
+# Every shard of a suite must run, and each suite's partition total must match
+# its shard count. A dropped shard with an unchanged `count:N/8` total, or a
+# filter that lets a test into both suites or neither, would pass with tests
+# that never run.
+test_job = jobs.fetch("backend-test")
+matrix = test_job.fetch("strategy").fetch("matrix")
+shards = matrix.fetch("suite").product(matrix.fetch("partition")).reject do |suite, partition|
+  matrix.fetch("exclude", []).include?({ "suite" => suite, "partition" => partition })
+end
+expected_shards = (1..8).map { |partition| ["e2e", partition] } + (1..4).map { |partition| ["unit", partition] }
+unless shards.sort == expected_shards.sort
+  warn "backend-test must run e2e partitions 1-8 and unit partitions 1-4, got #{shards.inspect}"
+  exit 1
+end
+test_step = test_job.fetch("steps").find { |step| step["name"] == "test ${{ matrix.suite }} ${{ matrix.partition }}" }
+expected_test_env = {
+  "ARCHIVE" => "${{ runner.temp }}/nextest-${{ matrix.suite == 'e2e' && 'e2e-' || '' }}archive.tar.zst",
+  "SUITE_FILTER" => "${{ matrix.suite == 'e2e' && 'binary(=e2e)' || 'not binary(=e2e)' }}",
+  "PARTITION" => "count:${{ matrix.partition }}/${{ matrix.suite == 'e2e' && 8 || 4 }}"
+}
+unless test_step && test_step["env"] == expected_test_env
+  warn "the backend-test step must select each suite's archive, filter, and partition total, got #{test_step && test_step["env"].inspect}"
+  exit 1
+end
+unless test_step["run"].include?('-E \"\$SUITE_FILTER\" --partition \"\$PARTITION\"')
+  warn "the backend-test step must pass SUITE_FILTER and PARTITION to nextest"
+  exit 1
 end
 
 %w[backend dashboard hooks].each do |job_name|
@@ -195,25 +225,29 @@ check_gate.call(
   "Check backend validation",
   %w[
     needs.backend-build.result
+    needs.backend-build-e2e.result
     needs.backend-lint.result
     needs.backend-docs.result
     needs.backend-test.result
   ],
   [
-    [%w[success success success success], true],
-    [%w[failure success success success], false],
-    [%w[skipped success success success], false],
-    [%w[cancelled success success success], false],
-    [%w[success failure success success], false],
-    [%w[success skipped success success], false],
-    [%w[success cancelled success success], false],
-    [%w[success success failure success], false],
-    [%w[success success skipped success], false],
-    [%w[success success cancelled success], false],
-    [%w[success success success failure], false],
-    [%w[success success success skipped], false],
-    [%w[success success success cancelled], false],
-    [%w[skipped skipped skipped skipped], false]
+    [%w[success success success success success], true],
+    [%w[failure success success success success], false],
+    [%w[skipped success success success success], false],
+    [%w[cancelled success success success success], false],
+    [%w[success failure success success success], false],
+    [%w[success skipped success success success], false],
+    [%w[success cancelled success success success], false],
+    [%w[success success failure success success], false],
+    [%w[success success skipped success success], false],
+    [%w[success success cancelled success success], false],
+    [%w[success success success failure success], false],
+    [%w[success success success skipped success], false],
+    [%w[success success success cancelled success], false],
+    [%w[success success success success failure], false],
+    [%w[success success success success skipped], false],
+    [%w[success success success success cancelled], false],
+    [%w[skipped skipped skipped skipped skipped], false]
   ]
 )
 
@@ -262,8 +296,8 @@ dispatch_suffix = "${{ github.event_name == 'workflow_dispatch' && '-dispatch' |
 sticky_disk_jobs = jobs.select do |_, job|
   job.fetch("steps", []).any? { |step| step["uses"].to_s.start_with?("useblacksmith/stickydisk@") }
 end
-unless sticky_disk_jobs.keys.sort == %w[backend-build backend-docs backend-lint]
-  warn "only backend-build, backend-docs, and backend-lint may use sticky disks, got #{sticky_disk_jobs.keys.inspect}"
+unless sticky_disk_jobs.keys.sort == %w[backend-build backend-build-e2e backend-docs backend-lint]
+  warn "only backend-build, backend-build-e2e, backend-docs, and backend-lint may use sticky disks, got #{sticky_disk_jobs.keys.inspect}"
   exit 1
 end
 sticky_disk_jobs.each do |name, job|
@@ -341,16 +375,16 @@ if [ "$parsed_action_count" -ne "$action_line_count" ]; then
   exit 1
 fi
 
-assert_count 7 '      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6'
+assert_count 8 '      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6'
 assert_absent 'dorny/paths-filter@'
-assert_count 7 '      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035  # v34'
-assert_count 7 '      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71  # v17'
-assert_count 7 '      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569  # v7'
+assert_count 8 '      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035  # v34'
+assert_count 8 '      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71  # v17'
+assert_count 8 '      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569  # v7'
 # Swatinem/rust-cache prunes workspace-crate and incremental artifacts from the
 # target directory in its save step, which would empty the sticky disks.
 assert_absent 'Swatinem/rust-cache@'
-assert_count 3 '        uses: useblacksmith/stickydisk@3f6be1451e3cad893b778bc93495c80452a5da26  # v1.7.2'
-assert_count 1 '        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6'
+assert_count 4 '        uses: useblacksmith/stickydisk@3f6be1451e3cad893b778bc93495c80452a5da26  # v1.7.2'
+assert_count 2 '        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6'
 assert_count 1 '        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6'
 
 # Keep actionlint aware of every custom runner label used by this workflow.
@@ -363,6 +397,7 @@ expected = %w[
   blacksmith-2vcpu-ubuntu-2404
   blacksmith-4vcpu-ubuntu-2404
   blacksmith-8vcpu-ubuntu-2404
+  blacksmith-16vcpu-ubuntu-2404
 ]
 
 unless labels == expected
@@ -375,45 +410,47 @@ RUBY
 # from a branch naming convention. Dependabot uses an in-repository branch but
 # receives the same restricted token and secret treatment as a fork.
 assert_line "  UNTRUSTED_PR: \${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.fork || github.event.pull_request.user.login == 'dependabot[bot]') }}"
-assert_count 7 "          authToken: \${{ env.UNTRUSTED_PR != 'true' && secrets.CACHIX_AUTH_TOKEN || '' }}"
-assert_count 7 "          skipPush: \${{ env.UNTRUSTED_PR == 'true' }}"
-assert_count 7 "          save: \${{ env.UNTRUSTED_PR != 'true' }}"
+assert_count 8 "          authToken: \${{ env.UNTRUSTED_PR != 'true' && secrets.CACHIX_AUTH_TOKEN || '' }}"
+assert_count 8 "          skipPush: \${{ env.UNTRUSTED_PR == 'true' }}"
+assert_count 8 "          save: \${{ env.UNTRUSTED_PR != 'true' }}"
 # A sticky disk snapshot is shared by every later run, so only reviewed code
 # may commit the shared disk: master pushes. Pull requests (fork or not) never
 # commit. A manual dispatch (any branch) commits only its own -dispatch disk,
 # which no pull request or master run mounts.
-assert_count 3 "          commit: \${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/master') }}"
+assert_count 4 "          commit: \${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/master') }}"
 assert_count 1 "          key: \${{ steps.target-disk.outputs.key }}-target-test-v1\${{ github.event_name == 'workflow_dispatch' && '-dispatch' || '' }}"
+assert_count 1 "          key: \${{ steps.target-disk.outputs.key }}-target-e2e-v1\${{ github.event_name == 'workflow_dispatch' && '-dispatch' || '' }}"
 assert_count 1 "          key: \${{ steps.target-disk.outputs.key }}-target-lint-v1\${{ github.event_name == 'workflow_dispatch' && '-dispatch' || '' }}"
 assert_count 1 "          key: \${{ steps.target-disk.outputs.key }}-target-docs-v1\${{ github.event_name == 'workflow_dispatch' && '-dispatch' || '' }}"
 # The over-40 GiB wipe must not touch the root-owned lost+found of the fresh
 # ext4 disk, or rm fails, the master push job fails, and no snapshot commits.
-assert_count 3 "            sudo find \"\$CARGO_TARGET_DIR\" -mindepth 1 -maxdepth 1 ! -name lost+found -exec rm -rf {} +"
+assert_count 4 "            sudo find \"\$CARGO_TARGET_DIR\" -mindepth 1 -maxdepth 1 ! -name lost+found -exec rm -rf {} +"
 # Every saving run (master push or dispatch) must be able to wipe its disk, or
 # a dispatch disk fills up; pull request runs never save, so they never wipe.
-assert_count 3 "          if [ \"\${{ github.event_name }}\" != pull_request ] && [ \"\$used\" -gt 40 ]; then"
+assert_count 4 "          if [ \"\${{ github.event_name }}\" != pull_request ] && [ \"\$used\" -gt 40 ]; then"
 # A snapshot keeps its mtimes and may be newer than this checkout, so after
 # the mount every source whose content differs from the tree the snapshot
 # recorded must be made newer than it, or cargo can skip a changed crate; each
 # build records its tree only after it succeeds. rain-math-float lives in the
 # Nix store (mtime 1), so its artifacts must be cleaned when its source
 # changes, before each build on the disk.
-assert_count 3 '          ./scripts/sync-source-mtimes.sh prepare'
-assert_count 3 '            ./scripts/sync-source-mtimes.sh record'
+assert_count 4 '          ./scripts/sync-source-mtimes.sh prepare'
+assert_count 4 '            ./scripts/sync-source-mtimes.sh record'
 assert_line '        run: ./scripts/test-sync-source-mtimes.sh'
 # The test archive builds workspace crates with rustc's parallel frontend; the
 # wrapper's own test runs in the hooks job.
-assert_count 1 "      RUSTC_WORKSPACE_WRAPPER: \${{ github.workspace }}/scripts/rustc-parallel-frontend.sh"
+assert_count 2 "      RUSTC_WORKSPACE_WRAPPER: \${{ github.workspace }}/scripts/rustc-parallel-frontend.sh"
 assert_line '        run: ./scripts/test-rustc-parallel-frontend.sh'
-assert_count 3 '            ./scripts/clean-stale-rain-math-float.sh'
+assert_count 4 '            ./scripts/clean-stale-rain-math-float.sh'
 # The test shards start with the run and wait for backend-build themselves.
 # wait-for-job.sh fails unless the build succeeded (test-wait-for-job.sh checks
 # it), the token stays read-only, and a re-run of only the failed shards must
 # find the archive of the attempt whose build succeeded.
-assert_line '        run: ./scripts/wait-for-job.sh "backend build"'
+# The e2e shards wait for the e2e build, the unit shards for the full build.
+assert_line "        run: ./scripts/wait-for-job.sh \"\${{ matrix.suite == 'e2e' && 'backend build e2e' || 'backend build' }}\""
 assert_line '        run: ./scripts/test-wait-for-job.sh'
 assert_line '      actions: read'
-assert_line "          restore-keys: \${{ runner.os }}-nextest-\${{ github.run_id }}-"
+assert_line "          restore-keys: \${{ runner.os }}-nextest-\${{ matrix.suite == 'e2e' && 'e2e-' || '' }}\${{ github.run_id }}-"
 assert_line '        run: ./scripts/test-clean-stale-rain-math-float.sh'
 
 if grep -R -n -F 'external-pr/' \
