@@ -117,16 +117,23 @@ where
             let run = worker.run();
             tokio::pin!(run);
             // `run` first: its first poll emits `Event::Start`, which hands
-            // over the context the shutdown branch stops.
-            let result = tokio::select! {
-                biased;
-                result = &mut run => result,
-                () = self.shutdown.cancelled() => {
-                    attempt.stop_worker();
-                    if let Err(error) = run.await {
-                        error!(chain = %self.chain, %error, "Trade accounting worker failed while stopping");
+            // over the context the shutdown branch stops. A worker that
+            // outlives a full interval lifts a halt on a worker exit, which
+            // has no job to succeed.
+            let result = loop {
+                tokio::select! {
+                    biased;
+                    result = &mut run => break result,
+                    () = self.shutdown.cancelled() => {
+                        attempt.stop_worker();
+                        if let Err(error) = run.await {
+                            error!(chain = %self.chain, %error, "Trade accounting worker failed while stopping");
+                        }
+                        return;
                     }
-                    return;
+                    () = tokio::time::sleep(self.redrive_interval), if halt.is_on_worker_exit() => {
+                        halt.resume_after_worker_exit();
+                    }
                 }
             };
 
@@ -280,8 +287,17 @@ impl ChainHalt {
         } = failure;
         let mut halted = self.halted.lock().unwrap_or_else(PoisonError::into_inner);
 
-        if halted.as_ref() == Some(&halt) {
-            warn!(target: "hedge", %chain, %worker, %error, "Re-driven trade accounting job failed again; the chain stays observe-only");
+        // The same halt again, or a worker exit while a job holds the chain:
+        // that job still has to succeed or be killed first.
+        let already_halted = match (halted.as_ref(), &halt) {
+            (Some(current), _) if *current == halt => true,
+            (Some(Halt::Job(_)), Halt::WorkerExit) => true,
+            (None | Some(Halt::Job(_) | Halt::WorkerExit), Halt::Job(_) | Halt::WorkerExit) => {
+                false
+            }
+        };
+        if already_halted {
+            warn!(target: "hedge", %chain, %worker, %error, "Trade accounting failed again; the chain stays observe-only");
             return;
         }
 
@@ -290,14 +306,22 @@ impl ChainHalt {
         metrics::gauge!(CHAIN_OBSERVE_ONLY_GAUGE, "chain" => chain.as_str()).set(1.0);
 
         let interval = self.redrive_interval.as_secs();
-        let message = format!(
-            "st0x-hedge: {worker}: {error_msg}: {error}; {halt}; {chain} is now observe-only: \
-             its later fills are not accounted or hedged until this job succeeds, re-driven every \
-             {interval}s, or its row is marked Killed; other chains continue; this fill may \
-             already be in Position, so check Position for it before hedging it by hand, and \
-             set the row to Killed if you do",
-            error_msg = self.error_msg,
-        );
+        let error_msg = self.error_msg;
+        let message = match &halt {
+            Halt::Job(_) => format!(
+                "st0x-hedge: {worker}: {error_msg}: {error}; {halt}; {chain} is now \
+                 observe-only: its later fills are not accounted or hedged until this job \
+                 succeeds, re-driven every {interval}s, or its row is marked Killed; other \
+                 chains continue; this fill may already be in Position: to hedge it by hand, \
+                 first mark the row Killed, then check Position for it"
+            ),
+            Halt::WorkerExit => format!(
+                "st0x-hedge: {worker}: {error_msg}: trade accounting worker exited: {error}; \
+                 {chain} is now \
+                 observe-only: its fills are not accounted or hedged until a worker, restarted \
+                 every {interval}s, runs for {interval}s or accounts a fill; other chains continue"
+            ),
+        };
         spawn_terminal_failure_alert(Arc::clone(&self.notifier), worker, message);
     }
 
@@ -308,15 +332,26 @@ impl ChainHalt {
         }
     }
 
-    /// Lifts a halt on a worker exit once a new worker polls its queue
-    /// cleanly; a halt on a job waits for that job.
+    fn is_on_worker_exit(&self) -> bool {
+        match *self.halted.lock().unwrap_or_else(PoisonError::into_inner) {
+            Some(Halt::WorkerExit) => true,
+            Some(Halt::Job(_)) | None => false,
+        }
+    }
+
+    /// Lifts a halt on a worker exit; a halt on a job waits for that job.
     fn resume_after_worker_exit(&self) {
-        let worker_exited = matches!(
-            *self.halted.lock().unwrap_or_else(PoisonError::into_inner),
-            Some(Halt::WorkerExit)
-        );
-        if worker_exited {
-            self.resume("its restarted worker polls cleanly");
+        let mut halted = self.halted.lock().unwrap_or_else(PoisonError::into_inner);
+        match *halted {
+            Some(Halt::WorkerExit) => {
+                *halted = None;
+                drop(halted);
+                self.log_resumed(
+                    &Halt::WorkerExit,
+                    "its restarted worker ran a full interval",
+                );
+            }
+            Some(Halt::Job(_)) | None => {}
         }
     }
 
@@ -330,6 +365,10 @@ impl ChainHalt {
             return;
         };
 
+        self.log_resumed(&halt, reason);
+    }
+
+    fn log_resumed(&self, halt: &Halt, reason: &str) {
         let chain = self.chain;
         metrics::gauge!(CHAIN_OBSERVE_ONLY_GAUGE, "chain" => chain.as_str()).set(0.0);
         info!(target: "hedge", %chain, %halt, "Trade accounting on {chain} resumed: {reason}; hedging continues");
@@ -347,7 +386,6 @@ fn on_event(
             *attempt.ctx.lock().unwrap_or_else(PoisonError::into_inner) = Some(ctx.clone());
         }
         Event::Success => halt.resume("its halted job was accounted"),
-        Event::Idle => halt.resume_after_worker_exit(),
         Event::Error(error) => {
             let worker = ctx.name().clone();
             error!(%error, %worker, chain = %halt.chain, "Trade accounting job failed after retries; the chain is now observe-only");
@@ -368,7 +406,7 @@ fn on_event(
                 });
             }
         }
-        Event::HeartBeat | Event::Custom(_) | Event::Stop => {}
+        Event::Idle | Event::HeartBeat | Event::Custom(_) | Event::Stop => {}
     }
 }
 
@@ -378,4 +416,95 @@ enum RedriveError {
     Requeue(#[from] apalis_sqlite::SqlxError),
     #[error("failed to read the status of the job that halted the chain")]
     Status(#[from] StatusLookupError),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::alerts::CapturingNotifier;
+
+    fn chain_halt(notifier: &Arc<CapturingNotifier>) -> ChainHalt {
+        ChainHalt {
+            chain: Chain::HyperEvm,
+            notifier: Arc::clone(notifier) as Arc<dyn Notifier>,
+            redrive_interval: Duration::from_secs(60),
+            error_msg: "Job failed after retries",
+            halted: Mutex::new(None),
+        }
+    }
+
+    fn failure(halt: Halt) -> WorkerFailure {
+        WorkerFailure {
+            halt,
+            worker: "order-fill-worker-hyperevm-0".to_owned(),
+            error: "boom".to_owned(),
+        }
+    }
+
+    async fn pages(notifier: &CapturingNotifier, expected: usize) -> Vec<String> {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while notifier.messages().len() < expected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the halt must page");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        notifier.messages()
+    }
+
+    /// A worker that exits while a job holds the chain must not replace that
+    /// halt: the job still has to be re-driven before later fills run.
+    #[tokio::test]
+    async fn a_worker_exit_during_a_job_halt_keeps_the_job_halt() {
+        let notifier = Arc::new(CapturingNotifier::default());
+        let halt = chain_halt(&notifier);
+        let row = TaskIdentity::for_test("poison");
+
+        halt.begin(failure(Halt::Job(row.clone())));
+        halt.begin(failure(Halt::WorkerExit));
+        halt.resume_after_worker_exit();
+
+        assert_eq!(halt.halted_row(), Some(row));
+        assert_eq!(pages(&notifier, 1).await.len(), 1, "one halt, one page");
+    }
+
+    /// A worker exit has no job to succeed: it is the same halt until a
+    /// worker runs a full interval or accounts a fill.
+    #[tokio::test]
+    async fn a_worker_exit_halt_pages_once_and_lifts_after_a_clean_interval() {
+        let notifier = Arc::new(CapturingNotifier::default());
+        let halt = chain_halt(&notifier);
+
+        halt.begin(failure(Halt::WorkerExit));
+        halt.begin(failure(Halt::WorkerExit));
+        assert!(halt.is_on_worker_exit());
+
+        halt.resume_after_worker_exit();
+
+        assert!(!halt.is_on_worker_exit());
+        let pages = pages(&notifier, 1).await;
+        assert_eq!(pages.len(), 1, "one halt, one page: {pages:?}");
+        assert!(
+            pages[0].contains("trade accounting worker exited: boom"),
+            "{}",
+            pages[0]
+        );
+    }
+
+    /// A job failing after a worker-exit halt is a new halt on that job.
+    #[tokio::test]
+    async fn a_job_failure_after_a_worker_exit_halts_on_the_job() {
+        let notifier = Arc::new(CapturingNotifier::default());
+        let halt = chain_halt(&notifier);
+        let row = TaskIdentity::for_test("poison");
+
+        halt.begin(failure(Halt::WorkerExit));
+        halt.begin(failure(Halt::Job(row.clone())));
+
+        assert_eq!(halt.halted_row(), Some(row));
+        assert_eq!(pages(&notifier, 2).await.len(), 2);
+    }
 }
