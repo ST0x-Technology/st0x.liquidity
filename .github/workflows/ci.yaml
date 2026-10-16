@@ -42,7 +42,7 @@ env:
 jobs:
   backend-build:
     name: backend build
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: blacksmith-16vcpu-ubuntu-2404
     timeout-minutes: 30
     env:
       # Non-incremental: the parallel frontend below crashed rustc's
@@ -138,7 +138,7 @@ jobs:
         if: ${{ env.UNTRUSTED_PR != 'true' }}
         uses: useblacksmith/stickydisk@3f6be1451e3cad893b778bc93495c80452a5da26  # v1.7.2
         with:
-          key: ${{ steps.target-disk.outputs.key }}-target-test-v1${{ github.event_name == 'workflow_dispatch' && '-dispatch' || '' }}
+          key: ${{ steps.target-disk.outputs.key }}-target-test-probe4${{ github.event_name == 'workflow_dispatch' && '-dispatch' || '' }}
           path: ${{ github.workspace }}/target/test
           commit: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/master') }}
 
@@ -190,7 +190,7 @@ jobs:
   # after it, off the test shards' critical path.
   backend-lint:
     name: backend lint
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: blacksmith-16vcpu-ubuntu-2404
     timeout-minutes: 30
     env:
       CARGO_INCREMENTAL: "1"
@@ -272,7 +272,7 @@ jobs:
         if: ${{ env.UNTRUSTED_PR != 'true' }}
         uses: useblacksmith/stickydisk@3f6be1451e3cad893b778bc93495c80452a5da26  # v1.7.2
         with:
-          key: ${{ steps.target-disk.outputs.key }}-target-lint-v1${{ github.event_name == 'workflow_dispatch' && '-dispatch' || '' }}
+          key: ${{ steps.target-disk.outputs.key }}-target-lint-probe4${{ github.event_name == 'workflow_dispatch' && '-dispatch' || '' }}
           path: ${{ github.workspace }}/target/lint
           commit: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/master') }}
 
@@ -404,7 +404,7 @@ jobs:
         if: ${{ env.UNTRUSTED_PR != 'true' }}
         uses: useblacksmith/stickydisk@3f6be1451e3cad893b778bc93495c80452a5da26  # v1.7.2
         with:
-          key: ${{ steps.target-disk.outputs.key }}-target-docs-v1${{ github.event_name == 'workflow_dispatch' && '-dispatch' || '' }}
+          key: ${{ steps.target-disk.outputs.key }}-target-docs-probe4${{ github.event_name == 'workflow_dispatch' && '-dispatch' || '' }}
           path: ${{ github.workspace }}/target/docs
           commit: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/master') }}
 
