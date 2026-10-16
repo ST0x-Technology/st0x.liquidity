@@ -275,9 +275,14 @@ check_gate.call(
 # A sticky disk snapshot is shared by every later run, and a pull request can
 # edit this workflow, including the `commit` input. So the disk key must embed
 # a value derived from a secret that fork runs never receive, untrusted runs
-# must skip the disk, and only master pushes may commit.
+# must skip the disk. Master pushes commit the shared disk, and manual
+# dispatches commit only their own -dispatch disk, which no pull request or
+# master run mounts.
 untrusted_only = "${{ env.UNTRUSTED_PR != 'true' }}"
-master_push_only = "${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}"
+# Master pushes save the shared disk. A manual dispatch saves only its own
+# -dispatch disk, which the key suffix keeps apart from the shared one.
+commit_scope = "${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/master') }}"
+dispatch_suffix = "${{ github.event_name == 'workflow_dispatch' && '-dispatch' || '' }}"
 sticky_disk_jobs = jobs.select do |_, job|
   job.fetch("steps", []).any? { |step| step["uses"].to_s.start_with?("useblacksmith/stickydisk@") }
 end
@@ -300,8 +305,9 @@ sticky_disk_jobs.each do |name, job|
     with = step.fetch("with")
     unless step["if"] == untrusted_only &&
            with["key"].start_with?("${{ steps.target-disk.outputs.key }}-") &&
-           with["commit"] == master_push_only
-      warn "#{name} sticky disk must skip untrusted runs, use the secret-derived key, and commit only on master pushes"
+           with["key"].end_with?(dispatch_suffix) &&
+           with["commit"] == commit_scope
+      warn "#{name} sticky disk must skip untrusted runs, use the secret-derived key, keep dispatch runs on their own disk, and commit only on master pushes and dispatches"
       exit 1
     end
   end
@@ -397,17 +403,27 @@ assert_count 5 "          authToken: \${{ env.UNTRUSTED_PR != 'true' && secrets.
 assert_count 5 "          skipPush: \${{ env.UNTRUSTED_PR == 'true' }}"
 assert_count 5 "          save: \${{ env.UNTRUSTED_PR != 'true' }}"
 # A sticky disk snapshot is shared by every later run, so only reviewed code
-# may commit one: master pushes. Pull requests (fork or not) and manual
-# dispatches of arbitrary branches must not.
-assert_count 2 "          commit: \${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}"
+# may commit the shared disk: master pushes. Pull requests (fork or not) never
+# commit. A manual dispatch (any branch) commits only its own -dispatch disk,
+# which no pull request or master run mounts.
+assert_count 2 "          commit: \${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/master') }}"
+assert_count 1 "          key: \${{ steps.target-disk.outputs.key }}-target-test-v1\${{ github.event_name == 'workflow_dispatch' && '-dispatch' || '' }}"
+assert_count 1 "          key: \${{ steps.target-disk.outputs.key }}-target-lint-v1\${{ github.event_name == 'workflow_dispatch' && '-dispatch' || '' }}"
 # The over-40 GiB wipe must not touch the root-owned lost+found of the fresh
 # ext4 disk, or rm fails, the master push job fails, and no snapshot commits.
 assert_count 2 "            sudo find \"\$CARGO_TARGET_DIR\" -mindepth 1 -maxdepth 1 ! -name lost+found -exec rm -rf {} +"
-# A snapshot keeps its mtimes and may be newer than this checkout, so every
-# tracked source must be touched after the mount, or cargo can skip a changed
-# crate. rain-math-float lives in the Nix store (mtime 1), so its artifacts
-# must be cleaned when its source changes, before each build on the disk.
-assert_count 2 '          git ls-files -z | xargs -0 touch -h'
+# Every saving run (master push or dispatch) must be able to wipe its disk, or
+# a dispatch disk fills up; pull request runs never save, so they never wipe.
+assert_count 2 "          if [ \"\${{ github.event_name }}\" != pull_request ] && [ \"\$used\" -gt 40 ]; then"
+# A snapshot keeps its mtimes and may be newer than this checkout, so after
+# the mount every source whose content differs from the tree the snapshot
+# recorded must be made newer than it, or cargo can skip a changed crate; each
+# build records its tree only after it succeeds. rain-math-float lives in the
+# Nix store (mtime 1), so its artifacts must be cleaned when its source
+# changes, before each build on the disk.
+assert_count 2 '          ./scripts/sync-source-mtimes.sh prepare'
+assert_count 2 '            ./scripts/sync-source-mtimes.sh record'
+assert_line '        run: ./scripts/test-sync-source-mtimes.sh'
 assert_count 2 '            ./scripts/clean-stale-rain-math-float.sh'
 assert_line '        run: ./scripts/test-clean-stale-rain-math-float.sh'
 

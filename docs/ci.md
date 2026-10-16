@@ -97,8 +97,10 @@ harness, which no dependency cache or sccache can reuse; rustc's incremental
 state can.
 
 - Each trusted run mounts the last saved snapshot. Only master pushes save one,
-  so normal pull request runs and manual `workflow_dispatch` runs never replace
-  it.
+  so pull request runs never replace it. A manual `workflow_dispatch` run mounts
+  and saves its own `-dispatch` disk instead, which no pull request or master
+  run reads, so a branch can measure a warm build without writing the master
+  disk.
 - The `commit` input alone is not a trust boundary: a pull request can edit the
   workflow, and the stickydisk action has no branch scoping. So the disk key
   embeds a masked hash of `CACHIX_AUTH_TOKEN`. Fork and Dependabot runs get no
@@ -106,25 +108,44 @@ state can.
   Same-repository runs can derive the key, but they can already push to Cachix
   with that token, so the disk adds no new trust. Rotating the token starts a
   fresh, empty disk.
-- After the mount, the job touches every tracked source, so each one is newer
-  than anything on the disk, even when a master run saved the snapshot after
-  this job's checkout. Cargo then always reruns rustc for workspace crates and
-  never trusts a stale fingerprint. rustc's incremental cache reuses only the
-  work whose source hashes still match. Registry and git dependencies
-  fingerprint by version and stay built.
+- Cargo decides whether a path crate is fresh from source mtimes, which a fresh
+  checkout resets. Each successful build records the git content hashes of the
+  tree it compiled (`scripts/sync-source-mtimes.sh record`). After the mount,
+  `sync-source-mtimes.sh prepare` gives every tracked file an old fixed mtime
+  and the current time to each file whose content hash differs from the recorded
+  tree, including files that master changed after this branch forked. Cargo then
+  reruns rustc only for crates with a changed source, and rustc's incremental
+  cache reuses whatever still matches. With no recorded tree, every file counts
+  as changed. Registry and git dependencies fingerprint by version and stay
+  built.
+- Some inputs are not in cargo's dep-info for the crate they affect. A
+  `Cargo.lock`, `Cargo.toml`, toolchain, `.cargo/`, `build.rs`, or `ci.yaml`
+  change can select an older artifact variant still on the disk, since `ci.yaml`
+  holds the cargo flags. Nix files pick the `ST0X_*_ABI` paths that `sol!` reads
+  from untracked env vars. `sqlx::migrate!` does not see a new migration, and
+  offline `query!` reads `.sqlx/` without tracking it. When any of these paths
+  changed, `prepare` treats every file as changed. `prepare` also deletes the
+  record, so a build that fails after it cannot leave a stale record on a saved
+  disk.
 - `rain-math-float` is a path dependency linked into the Nix store, where every
-  file has mtime 1, so touching cannot refresh it.
+  file has mtime 1, so mtimes cannot refresh it.
   `scripts/clean-stale-rain-math-float.sh` runs `cargo clean -p rain-math-float`
   whenever the linked store path differs from the one recorded on the disk.
 - `CARGO_HOME` (registry and git sources) lives on the same disk. These jobs do
   not use `Swatinem/rust-cache`: its save step prunes workspace-crate and
   incremental artifacts from the target directory before the disk commits.
-- A saving run wipes the disk once it holds more than 40 GiB, because cargo
-  never collects artifacts from older toolchains or dependency versions.
+- A saving run (a master push or a manual dispatch) wipes the disk once it holds
+  more than 40 GiB, because cargo never collects artifacts from older toolchains
+  or dependency versions.
 - To start from empty disks, bump the `-v1` suffix of both disk keys
   (`-target-test-v1` and `-target-lint-v1`).
+- A build that does not run `sync-source-mtimes.sh` (a re-run of a run from
+  before it, or a run after a revert) leaves fingerprints newer than the record,
+  so the next `prepare` treats every file as changed. To roll the script back
+  for good, still bump the disk keys, so no old record outlives it.
 - `scripts/test-fork-pr-ci.sh` checks the key derivation, the untrusted-run
-  skip, and the master-only commit for every sticky disk.
+  skip, the `-dispatch` key suffix, and that only master pushes and manual
+  dispatches commit a sticky disk.
 
 ## Board and parity checks
 
