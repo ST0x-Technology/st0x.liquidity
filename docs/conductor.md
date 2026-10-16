@@ -894,11 +894,23 @@ transient cause that outlasts the 1s/2s/4s retries keeps it halted until an
 operator restarts the bot. The failing fill itself may already be in `Position`
 (it failed after the position update), and then `CheckPositions` hedges it; a
 re-drive of such a row is idempotent on `(tx_hash, log_index)`. To retire a fill
-that can never be accounted, first check that `Position` does not already record
-it (`position_fill_already_recorded` on its `(tx_hash, log_index)`; an
-`OnChainTrade` alone proves nothing, it is written before the position update),
-then hedge it by hand, set its row to `Killed`, and restart; never reset a fill
-hedged by hand to `Pending`, since that hedges it twice.
+that can never be accounted, take its `trade.tx_hash` from the row's `job`
+payload (the page names the chain, block and log index) and look for its fill on
+`Position`. An `OnChainTrade` alone proves nothing: it is written before the
+position update.
+
+```sql
+SELECT COUNT(*) FROM events
+WHERE aggregate_type = 'Position'
+  AND event_type = 'PositionEvent::OnChainOrderFilled'
+  AND json_extract(payload, '$.OnChainOrderFilled.trade_id.chain') = '<chain>'
+  AND json_extract(payload, '$.OnChainOrderFilled.trade_id.tx_hash') = '<tx_hash>'
+  AND CAST(json_extract(payload, '$.OnChainOrderFilled.trade_id.log_index') AS INTEGER) = <log_index>;
+```
+
+If it is there, the position check hedges it: do not hedge it by hand. If not,
+hedge it by hand. Either way, set the row to `Killed` and restart; never reset a
+fill hedged by hand to `Pending`, since that hedges it twice.
 
 Implements `Job<AccountantCtx<Node, Exec>>`. The `perform()` method runs the
 hedging pipeline:

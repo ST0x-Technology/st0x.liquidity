@@ -3336,7 +3336,7 @@ mod tests {
             .unwrap();
         assert_eq!(placed_hedges(&accounting.pool).await, 0);
 
-        crate::conductor::redrive_halted_trade_accounting(Chain::HyperEvm, &hyperevm_queue)
+        crate::conductor::trading_queues::requeue_trade_accounting(&accounting.accounting_queues)
             .await
             .unwrap();
         let monitor_handle = accounting.spawn_workers(&FailureInjector::new());

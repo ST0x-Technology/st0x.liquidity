@@ -862,7 +862,7 @@ macro_rules! build_supervised_worker {
 
 pub(crate) use build_supervised_worker;
 
-/// Builds a supervised `Worker` that serves one `$chain`: like
+/// Builds a chain-scoped `Worker` that serves one `$chain`: like
 /// [`build_supervised_worker!`], but a terminal failure stops only this
 /// worker and pages, without the conductor-wide fail-stop (see
 /// [`on_chain_terminal_failure`]).
@@ -1618,7 +1618,7 @@ pub(crate) fn on_best_effort_terminal_failure(
 /// `1` while a chain's trade accounting is halted by a terminal failure.
 pub(crate) const CHAIN_OBSERVE_ONLY_GAUGE: &str = "trade_accounting_observe_only";
 
-/// On-event handler for a supervised worker that serves one chain: a terminal
+/// On-event handler for a chain-scoped worker that serves one chain: a terminal
 /// failure stops only this worker, so its chain drops to observe-only (its
 /// queued fills are neither accounted nor hedged) while every other chain's
 /// worker and the conductor carry on. Pages once per worker with the chain and
