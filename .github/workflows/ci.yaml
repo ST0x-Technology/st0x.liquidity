@@ -308,11 +308,19 @@ jobs:
             ./scripts/sync-source-mtimes.sh record
           "
 
+  # The shards start with the run instead of after backend-build: they install
+  # Nix and realize the dev shell while the archive compiles, then wait for
+  # backend-build through the read-only Actions API and fail if it does not
+  # succeed. That moves ~35 s of setup per shard off the critical path.
   backend-test:
     name: backend test ${{ matrix.partition }} of 8
-    needs: backend-build
     runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 30
+    # Covers the wait for backend-build (itself up to 30 minutes) as well as
+    # the archive restore and the tests.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
     strategy:
       fail-fast: false
 
@@ -357,11 +365,25 @@ jobs:
           gc-max-store-size-linux: 8G
           save: ${{ env.UNTRUSTED_PR != 'true' }}
 
+      - name: Realize the backend dev shell
+        run: nix develop .#ci-backend -c true
+
+      # wait-for-job.sh polls with conditional requests, so eight shards per
+      # run stay well inside the GITHUB_TOKEN rate limit, and fails the shard
+      # unless backend-build succeeded.
+      - name: Wait for backend build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/wait-for-job.sh "backend build"
+
+      # A re-run of only the failed shards has a new run_attempt, while the
+      # archive belongs to the attempt whose backend-build succeeded.
       - name: Restore nextest archive
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6
         with:
           path: ${{ runner.temp }}/nextest-archive.tar.zst
           key: ${{ runner.os }}-nextest-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ${{ runner.os }}-nextest-${{ github.run_id }}-
           fail-on-cache-miss: true
 
       # Test binaries come from the archive built in backend-build; no recompile.
@@ -579,6 +601,9 @@ jobs:
 
       - name: source mtime sync invariants
         run: ./scripts/test-sync-source-mtimes.sh
+
+      - name: CI job wait invariants
+        run: ./scripts/test-wait-for-job.sh
 
       - name: tailscale certificate renewal invariants
         run: nix develop .#ci-hooks -c nu scripts/validate-tailscale-cert-renewal.nu

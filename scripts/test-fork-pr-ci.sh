@@ -93,7 +93,7 @@ end
 expected_wiring = {
   "backend-build" => { "needs" => nil, "if" => nil },
   "backend-lint" => { "needs" => nil, "if" => nil },
-  "backend-test" => { "needs" => "backend-build", "if" => nil },
+  "backend-test" => { "needs" => nil, "if" => nil },
   "backend" => {
     "needs" => %w[backend-build backend-lint backend-test],
     "if" => "${{ always() }}"
@@ -396,6 +396,14 @@ assert_count 2 '          ./scripts/sync-source-mtimes.sh prepare'
 assert_count 2 '            ./scripts/sync-source-mtimes.sh record'
 assert_line '        run: ./scripts/test-sync-source-mtimes.sh'
 assert_count 2 '            ./scripts/clean-stale-rain-math-float.sh'
+# The test shards start with the run and wait for backend-build themselves.
+# wait-for-job.sh fails unless the build succeeded (test-wait-for-job.sh checks
+# it), the token stays read-only, and a re-run of only the failed shards must
+# find the archive of the attempt whose build succeeded.
+assert_line '        run: ./scripts/wait-for-job.sh "backend build"'
+assert_line '        run: ./scripts/test-wait-for-job.sh'
+assert_line '      actions: read'
+assert_line "          restore-keys: \${{ runner.os }}-nextest-\${{ github.run_id }}-"
 assert_line '        run: ./scripts/test-clean-stale-rain-math-float.sh'
 
 if grep -R -n -F 'external-pr/' \
