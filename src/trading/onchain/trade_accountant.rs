@@ -1056,7 +1056,7 @@ impl TradeAccountingError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
@@ -1106,7 +1106,7 @@ mod tests {
     };
 
     /// Answers both wrapper-ratio reads: at the fill block and the block before it.
-    fn push_identity_wrapper_ratio(asserter: &Asserter) {
+    pub(crate) fn push_identity_wrapper_ratio(asserter: &Asserter) {
         for _ in 0..2 {
             asserter.push_success(
                 &<IERC4626::convertToAssetsCall as SolCall>::abi_encode_returns(
@@ -1439,7 +1439,7 @@ mod tests {
     /// execution threshold). Extracted because this ~30-line wiring block was
     /// duplicated verbatim across every InventoryTrade/ClearV3/TakeOrderV3
     /// `perform()` test.
-    async fn build_test_accountant_ctx<Node, Exec>(
+    pub(crate) async fn build_test_accountant_ctx<Node, Exec>(
         pool: SqlitePool,
         apalis_pool: &apalis_sqlite::SqlitePool,
         ctx: Ctx,
