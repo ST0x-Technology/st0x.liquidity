@@ -10848,8 +10848,18 @@ mod tests {
         mock_status(&relay_api, json!({"status": "pending"}));
         let pool = setup_test_db().await;
         let store = Arc::new(test_store(pool.clone(), ()));
+        let (_pool, apalis_pool) = setup_test_pools().await;
         let transfer = rig
-            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .transfer_through(
+                &server,
+                &relay_api,
+                store.clone(),
+                relay_bounds(),
+                rig.chain.bot_wallet.clone(),
+                BotGasReceiptCostEnqueuer::Enabled(RecordBotGasReceiptCostJobQueue::new(
+                    &apalis_pool,
+                )),
+            )
             .await;
         let id = UsdcRebalanceId(Uuid::new_v4());
         let quote =
@@ -10890,6 +10900,22 @@ mod tests {
             panic!("expected SwapDeposited, got {state:?}");
         };
         assert_eq!(*deposit_tx, replacement);
+        assert_eq!(
+            queued_gas_costs(&apalis_pool).await,
+            vec![
+                (
+                    Chain::Ethereum,
+                    replacement,
+                    BotGasOperationCategory::RelayDeposit.to_string()
+                ),
+                (
+                    Chain::Ethereum,
+                    approve.tx_hash(),
+                    BotGasOperationCategory::RelayApprove.to_string()
+                ),
+            ],
+            "the replacement and the mined approve paid gas"
+        );
         let resumed = tokio::time::timeout(
             Duration::from_secs(30),
             transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
@@ -10939,8 +10965,18 @@ mod tests {
         let quotes = mock_quote_unavailable(&relay_api);
         let pool = setup_test_db().await;
         let store = Arc::new(test_store(pool.clone(), ()));
+        let (_pool, apalis_pool) = setup_test_pools().await;
         let transfer = rig
-            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .transfer_through(
+                &server,
+                &relay_api,
+                store.clone(),
+                relay_bounds(),
+                rig.chain.bot_wallet.clone(),
+                BotGasReceiptCostEnqueuer::Enabled(RecordBotGasReceiptCostJobQueue::new(
+                    &apalis_pool,
+                )),
+            )
             .await;
         let id = UsdcRebalanceId(Uuid::new_v4());
         let quote =
@@ -10967,6 +11003,15 @@ mod tests {
             panic!("expected SwapQuoted, got {state:?}");
         };
         assert_eq!(*deposit_cancelled_by, Some(cancel));
+        assert_eq!(
+            queued_gas_costs(&apalis_pool).await,
+            vec![(
+                Chain::Ethereum,
+                approve.tx_hash(),
+                BotGasOperationCategory::RelayApprove.to_string()
+            )],
+            "only the mined approve is the bot's own send"
+        );
         assert!(state.prepared_swap_envelopes().is_empty());
         assert!(state.is_reconcilable_failure());
 
@@ -11039,11 +11084,30 @@ mod tests {
             )
             .await;
 
-        let refusals = [
-            (TxHash::repeat_byte(0x5e), "Unconfirmed"),
-            (deposit.tx_hash(), "SupersedingTxIsTheDeposit"),
-            (approve_cancel, "SupersedingTxAtAnotherNonce"),
-            (unknown_call, "SupersedingTxNotACancelOrDeposit"),
+        let unmined = TxHash::repeat_byte(0x5e);
+        let refusals: [(TxHash, fn(&RelayBridgeError, TxHash) -> bool); 4] = [
+            (unmined, |error, superseding| {
+                matches!(error, RelayBridgeError::Unconfirmed { tx, confirmations: 0, .. }
+                    if *tx == superseding)
+            }),
+            (deposit.tx_hash(), |error, superseding| {
+                matches!(error, RelayBridgeError::SupersedingTxIsTheDeposit { tx }
+                    if *tx == superseding)
+            }),
+            (approve_cancel, |error, superseding| {
+                matches!(
+                    error,
+                    RelayBridgeError::SupersedingTxAtAnotherNonce { superseding: tx, .. }
+                        if *tx == superseding
+                )
+            }),
+            (unknown_call, |error, superseding| {
+                matches!(
+                    error,
+                    RelayBridgeError::SupersedingTxNotACancelOrDeposit { superseding: tx, .. }
+                        if *tx == superseding
+                )
+            }),
         ];
         for (superseding, expected) in refusals {
             let error = transfer
@@ -11051,11 +11115,11 @@ mod tests {
                 .await
                 .unwrap_err();
             let UsdcRecheckError::DepositNotSuperseded { source, .. } = &error else {
-                panic!("expected DepositNotSuperseded for {expected}, got {error:?}");
+                panic!("expected DepositNotSuperseded for {superseding}, got {error:?}");
             };
             assert!(
-                format!("{source:?}").starts_with(expected),
-                "expected {expected}, got {source:?}"
+                expected(source, superseding),
+                "{superseding}: got {source:?}"
             );
             let state = store.load(&id).await.unwrap().unwrap();
             assert_eq!(state.state_name(), "SwapDepositPrepared");

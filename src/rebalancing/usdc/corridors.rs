@@ -319,6 +319,7 @@ mod tests {
     #[derive(Default)]
     struct StubTransfer {
         resumed: Mutex<Vec<UsdcRebalanceId>>,
+        superseded: Mutex<Vec<(UsdcRebalanceId, TxHash)>>,
         restores: Mutex<usize>,
         cctp_recoveries: Mutex<usize>,
     }
@@ -373,9 +374,12 @@ mod tests {
         async fn supersede_swap_deposit(
             &self,
             id: &UsdcRebalanceId,
-            _superseding_tx: TxHash,
+            superseding_tx: TxHash,
         ) -> Result<RecheckOutcome, UsdcRecheckError> {
-            self.resumed.lock().unwrap().push(id.clone());
+            self.superseded
+                .lock()
+                .unwrap()
+                .push((id.clone(), superseding_tx));
             Ok(RecheckOutcome::Recovered)
         }
     }
@@ -620,10 +624,10 @@ mod tests {
         );
     }
 
-    /// A superseding tx of a signed Relay deposit reaches the service of the
-    /// transfer's recorded corridor, which signed the deposit.
+    /// A superseding tx reaches the service of the transfer's recorded
+    /// corridor, which signed the deposit it names.
     #[tokio::test]
-    async fn superseded_relay_deposit_routes_to_the_recorded_corridors_service() {
+    async fn superseding_tx_routes_to_the_recorded_corridors_service() {
         let TwoCorridors {
             transfers,
             base,
@@ -638,8 +642,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(base.resumed.lock().unwrap().is_empty());
-        assert_eq!(*robinhood.resumed.lock().unwrap(), vec![id]);
+        assert!(base.superseded.lock().unwrap().is_empty());
+        assert!(robinhood.resumed.lock().unwrap().is_empty());
+        assert_eq!(
+            *robinhood.superseded.lock().unwrap(),
+            vec![(id, TxHash::repeat_byte(0x66))]
+        );
     }
 
     /// The superseded-send check reads only the shared Ethereum wallet, so it
