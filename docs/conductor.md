@@ -931,11 +931,11 @@ WHERE id = '<row>' AND status = 'Failed';
 
 Zero rows means a re-drive holds the row: its ack does not check the status and
 would write `Failed` back over `Killed`. Wait until it is `Failed` again (the
-re-drive takes about 7s) and retry; a re-drive that succeeded instead leaves it
-`Done`, and the fill is accounted. A row left `Failed` is re-driven every
-interval, so a fill hedged by hand while its row is still `Failed` (or reset to
-`Pending`) can be hedged twice. Then, if the query finds the fill, the position
-check hedges it: do not hedge it by hand. If not, hedge it by hand.
+re-drive usually takes about 7s) and retry; a re-drive that succeeded instead
+leaves it `Done`, and the fill is accounted. A row left `Failed` is re-driven
+every interval, so a fill hedged by hand while its row is still `Failed` (or
+reset to `Pending`) can be hedged twice. Then, if the query finds the fill, the
+position check hedges it: do not hedge it by hand. If not, hedge it by hand.
 
 A worker that exits without a job failure (a backend or heartbeat error) halts
 the chain on no row. It pages once: a repeat exit does not page again, and an

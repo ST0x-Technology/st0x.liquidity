@@ -3425,6 +3425,74 @@ mod tests {
         .unwrap();
     }
 
+    /// The halted-chain re-drive resets one `Failed` row of its own queue and
+    /// leaves an operator's `Killed`, a `Done` row and other queues alone.
+    #[tokio::test]
+    async fn requeue_failed_row_resets_only_this_queues_failed_row() {
+        let apalis_pool = setup_test_apalis_pool().await;
+        let job_type = std::any::type_name::<TestJob>();
+        insert_worker(&apalis_pool, "dead-worker").await;
+        insert_locked_job(
+            &apalis_pool,
+            "failed",
+            job_type,
+            "Failed",
+            Some("dead-worker"),
+        )
+        .await;
+        sqlx_apalis::query("UPDATE Jobs SET attempts = 25 WHERE id = 'failed'")
+            .execute(&apalis_pool)
+            .await
+            .unwrap();
+        insert_locked_job(&apalis_pool, "killed", job_type, "Killed", None).await;
+        insert_locked_job(&apalis_pool, "done", job_type, "Done", None).await;
+        insert_locked_job(&apalis_pool, "other", "other::Job", "Failed", None).await;
+        let queue = JobQueue::<TestJob>::new(&apalis_pool);
+
+        for (id, reset) in [
+            ("failed", true),
+            ("killed", false),
+            ("done", false),
+            ("other", false),
+        ] {
+            assert_eq!(
+                queue
+                    .requeue_failed_row(&TaskIdentity::for_test(id))
+                    .await
+                    .unwrap(),
+                reset,
+                "{id}"
+            );
+        }
+
+        assert_eq!(status_of(&apalis_pool, "failed").await, "Pending");
+        assert_eq!(lock_by_of(&apalis_pool, "failed").await, None);
+        let attempts: i64 =
+            sqlx_apalis::query_scalar("SELECT attempts FROM Jobs WHERE id = 'failed'")
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            attempts, 0,
+            "a fresh budget, so the fetch takes the row again"
+        );
+        assert_eq!(status_of(&apalis_pool, "killed").await, "Killed");
+        assert_eq!(status_of(&apalis_pool, "other").await, "Failed");
+
+        for (id, expected) in [
+            ("killed", Some(Status::Killed)),
+            ("done", Some(Status::Done)),
+            ("other", None),
+            ("missing", None),
+        ] {
+            assert_eq!(
+                queue.status_of(&TaskIdentity::for_test(id)).await.unwrap(),
+                expected,
+                "{id}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn requeue_orphaned_resets_only_in_flight_rows_of_this_queue() {
         let apalis_pool = setup_test_apalis_pool().await;
