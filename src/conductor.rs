@@ -871,7 +871,8 @@ where
 /// start re-drives it with a fresh budget: the chain hedges again once the
 /// cause is fixed, and halts again, paging, while it is not. The row is the
 /// only record of its fill, so it never ages out as a dead letter; an operator
-/// retires it by hedging the fill by hand and marking the row `Killed`.
+/// retires it by marking the row `Killed`, after hedging the fill by hand only
+/// if `Position` does not record it (runbook in docs/conductor.md).
 async fn redrive_halted_trade_accounting(
     chain: Chain,
     queue: &DexTradeAccountingJobQueue,
