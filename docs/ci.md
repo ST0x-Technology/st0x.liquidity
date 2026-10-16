@@ -231,8 +231,8 @@ and `nix run .#ci` runs them too:
 
 - `python3 observability/gen-t0-liquidity.py --check` fails when the committed
   liquidity board JSON differs from the generator output, or when a `liq_`
-  selector does not carry the `job=~"$source"` matcher (the job the board's
-  `source` variable picks), or another generator self-check fails.
+  selector does not carry exactly the `job="$env"` matcher, or a log query reads
+  a log other than the bot's or Orders', or another generator self-check fails.
 - `python3 scripts/liq-parity/test_compare.py` tests the staging parity tool
   against a checked-in snapshot pair.
 

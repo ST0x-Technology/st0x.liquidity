@@ -13,11 +13,26 @@ type HeaderRows = {
     commit: { sha: string; at: number } | null
     info: Record<string, unknown>
   }
+  readWrapperRatios: (rows: HeaderRow[]) => Record<string, Record<string, number>>
 }
 
-const { readHeaderRows } = (await import(new URL('header-rows.js', panels).href)) as HeaderRows
+const { readHeaderRows, readWrapperRatios } = (await import(
+  new URL('header-rows.js', panels).href
+)) as HeaderRows
 
 describe('board header-rows.js', () => {
+  it("reads each symbol's newest wrapper ratio per chain, skipping rows without one", () => {
+    expect(
+      readWrapperRatios([
+        { k: 'wrapper_ratio', symbol: 'AAPL', chain: 'base', Time: 1000, Value: 1.01 },
+        { k: 'wrapper_ratio', symbol: 'AAPL', chain: 'base', Time: 2000, Value: 1.02 },
+        { k: 'wrapper_ratio', symbol: 'AAPL', chain: 'robinhood', Time: 2000, Value: 1 },
+        { k: 'wrapper_ratio', symbol: 'TSLA', chain: 'base', Time: 2000, Value: null },
+        { k: 'uptime', Time: 2000, Value: 120 }
+      ])
+    ).toEqual({ AAPL: { base: 1.02, robinhood: 1 } })
+  })
+
   it('keeps the newest row of a plain value', () => {
     const { value } = readHeaderRows([
       { k: 'uptime', Time: 2000, Value: 120 },

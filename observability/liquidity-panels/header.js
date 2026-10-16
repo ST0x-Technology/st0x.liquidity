@@ -7,16 +7,63 @@
 // commit, info, equity_target, ...) plus the string labels some of them
 // carry (git_commit on commit; broker, wallet_kind, ... on info).
 //
-// RECOVERY_GUIDE, readHeaderRows, commandLine and wireCopyButtons are not
-// defined here: the generator prepends them from recovery-guide.json,
-// header-rows.js and copy-command.js (see pills() in the generator), because
+// RECOVERY_GUIDE, readHeaderRows, readWrapperRatios, commandLine, wireCopyButtons,
+// installBoardTables, fitColumns, showTotals, scaleTables and loadInFull are
+// not defined here: the generator prepends them from recovery-guide.json,
+// header-rows.js, copy-command.js, board-tables.js, board-layout.js,
+// board-totals.js, board-scale.js and board-progressive.js (see pills() in
+// the generator), because
 // the template output is sanitized and cannot carry data into this code.
 
 const rows = Array.isArray(context.data) ? context.data : [];
 // header-rows.js, prepended.
 const { value, commit, info } = readHeaderRows(rows);
 
+// The Dashboard tab fits the window itself (FIT_WINDOW, prepended;
+// board-layout.js): it fills a tall window to the bottom and lets a short
+// one, or a phone, scroll. Grafana's autofit would squeeze every panel into
+// one screen however short it is, so it comes off a link that has it. It
+// changes the URL in place.
+const autofit = new URLSearchParams(window.location.search).has('autofitpanels');
+if (FIT_WINDOW && autofit) {
+  context.grafana.locationService.partial({ autofitpanels: null }, true);
+}
+// Then the left column's USD tables take only the rows they draw, Equities
+// the rest, Trades and Rebalances half of the right column each, and both
+// columns end level (FIT_COLUMNS, prepended; board-layout.js). Once per
+// dashboard.
+if (FIT_COLUMNS) fitColumns(window.__grafanaSceneContext, FIT_COLUMNS, window);
+// Each inventory table's total in USD after its title (TABLE_TOTALS,
+// prepended; board-totals.js).
+showTotals(document, window.__grafanaSceneContext, TABLE_TOTALS);
+// The tables shrink on a narrow window, each group by its own factor, so
+// they fit without scrolling sideways (SCALE_TABLES, prepended;
+// board-scale.js).
+for (const group of SCALE_TABLES) scaleTables(document, window.__grafanaSceneContext, group, window);
+// The log tables show a screen's entries first, then load their whole
+// history (FULL_ENTRIES, prepended; board-progressive.js).
+loadInFull(window.__grafanaSceneContext, FULL_ENTRIES);
+
 const theme = context.grafana.theme;
+// Hover text for table cells, the locked sort of tree tables, the fitted
+// column's aligned edges, each venue row's tint, the headers' hover text,
+// the tree tables' own sort, and each symbol's flags on hover
+// (board-tables.js, LOCKED_SORT_PANELS,
+// FIT_COLUMNS, ROW_TINTS, HEADER_TIPS, TREE_SORTS and ROW_TIPS, prepended).
+installBoardTables(document, {
+  lockedSortPanels: LOCKED_SORT_PANELS,
+  // Every table keeps room for its scrollbar: Grafana stretches the last
+  // column over the scrollbar's place too, which scrolls a fitted table
+  // sideways by the scrollbar's width.
+  alignedPanels: FIT_COLUMNS ? [...FIT_COLUMNS.fit, FIT_COLUMNS.fill, ...FIT_COLUMNS.split] : [],
+  rowTints: ROW_TINTS,
+  headerTips: HEADER_TIPS,
+  treeSorts: TREE_SORTS,
+  rowTips: ROW_TIPS,
+  unitTags: UNIT_TAGS,
+  wrapperRatios: readWrapperRatios(rows),
+  theme
+});
 const root = context.element;
 // The guide's commands target the environment the board shows
 // (client-env.js, prepended).

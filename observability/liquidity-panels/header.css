@@ -24,8 +24,10 @@
   overflow: hidden;
 }
 
+/* The clock, commit and uptime give way long before the pills do: a band
+   cut to "(551" reads as a wrong number, a clipped commit does not. */
 .hdr-info {
-  flex: 0 1 auto;
+  flex: 0 100 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -201,3 +203,19 @@
    against the white dialog. */
 .hdr-light .hdr-amber { color: #b45309; }
 .hdr-light .hdr-red { color: #b91c1c; }
+
+/* A phone: the metric pills scroll sideways instead of clipping, so every
+   setting stays reachable, and the clock, commit and uptime give their room
+   to them. */
+/* A phone: the whole header is one row that scrolls sideways, every item
+   at its own width, so the band pills are not squeezed out of view. */
+@media (max-width: 768px) {
+  .hdr {
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .hdr::-webkit-scrollbar { display: none; }
+  .hdr > * { flex: none; }
+  .hdr-pills { overflow: visible; }
+  .hdr-info { display: none; }
+}

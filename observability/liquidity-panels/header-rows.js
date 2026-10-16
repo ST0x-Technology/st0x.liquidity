@@ -33,4 +33,23 @@ const readHeaderRows = (rows) => {
   };
 };
 
-export { readHeaderRows };
+// Each symbol's wrapper ratio per chain, underlying shares per wrapped
+// share, from the `wrapper_ratio` rows: { symbol: { chain: ratio } }, the
+// newest row of each.
+const readWrapperRatios = (rows) => {
+  const ratios = {};
+  const seen = {};
+  for (const row of rows) {
+    if (row.k !== 'wrapper_ratio' || !row.symbol || !row.chain) continue;
+    const ratio = Number(row.Value);
+    if (row.Value === null || row.Value === '' || !Number.isFinite(ratio) || ratio <= 0) continue;
+    const key = `${row.symbol}/${row.chain}`;
+    const time = Number(row.Time) || 0;
+    if (key in seen && seen[key] > time) continue;
+    seen[key] = time;
+    (ratios[row.symbol] = ratios[row.symbol] || {})[row.chain] = ratio;
+  }
+  return ratios;
+};
+
+export { readHeaderRows, readWrapperRatios };
