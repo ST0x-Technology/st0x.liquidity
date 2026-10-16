@@ -1650,8 +1650,9 @@ pub(crate) fn on_chain_terminal_failure(
         );
         let message = format!(
             "st0x-hedge: {worker}: {error_msg}: {err}; job row {row}; {chain} is now \
-             observe-only: its fills are not accounted or hedged until restart, other chains \
-             continue"
+             observe-only: its later fills are not accounted or hedged until restart, other \
+             chains continue; this fill may already be in Position, so check its OnChainTrade \
+             before hedging it by hand"
         );
         spawn_terminal_failure_alert(Arc::clone(&notifier), worker, message);
     }

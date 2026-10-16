@@ -1734,7 +1734,8 @@ async fn accounting_job_failure_halts_its_chain() -> anyhow::Result<()> {
         .call()
         .await?;
 
-    // Attempts past the three in-process retries: the worker gave up on it.
+    // Attempts past the three in-process retries (`WORKER_RETRIES`): the
+    // worker gave up on it.
     let pool = connect_db(&infra.db_path).await?;
     let base_accounting = format!(
         "{}@{}",
@@ -1758,19 +1759,54 @@ async fn accounting_job_failure_halts_its_chain() -> anyhow::Result<()> {
     })
     .await
     .expect("the failing fill should exhaust its retries within 30s");
+
+    // A later fill on the halted chain is queued but never accounted.
+    infra
+        .base_chain
+        .take_order()
+        .symbol("AAPL")
+        .amount(sell_amount)
+        .price(onchain_price)
+        .direction(TakeDirection::SellEquity)
+        .call()
+        .await?;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let (pending,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM Jobs WHERE job_type = ? AND status = 'Pending'",
+            )
+            .bind(&base_accounting)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if pending == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("the later fill should be queued within 30s");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let (later_fill_status,): (String,) = sqlx::query_as(
+        "SELECT status FROM Jobs WHERE job_type = ? AND status <> 'Failed' \
+         ORDER BY rowid DESC LIMIT 1",
+    )
+    .bind(&base_accounting)
+    .fetch_one(&pool)
+    .await?;
+    let events_after = count_events(&pool, "OnChainTrade").await?;
     pool.close().await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
     assert!(
         !bot.is_finished(),
         "a chain's terminal accounting failure must not stop the bot"
     );
-
-    // The second trade's onchain event should NOT have been processed
-    let pool = connect_db(&infra.db_path).await?;
-    let events_after = count_events(&pool, "OnChainTrade").await?;
-    pool.close().await;
-
+    assert_eq!(
+        later_fill_status, "Pending",
+        "the halted chain must not account a later fill"
+    );
     assert_eq!(
         events_before, events_after,
         "No new OnChainTrade events should be persisted after terminal failure"

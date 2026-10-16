@@ -640,12 +640,17 @@ excellent async ecosystem for handling concurrent trading flows.
   row is the record of the halt: it stays `Failed` in the chain's queue, the
   retention sweep keeps it, and every start re-drives it with a fresh retry
   budget, so the chain hedges again once the cause is fixed and halts again,
-  paging, while it is not. To retire a fill that can never be accounted, hedge
-  it by hand, mark its row `Killed`, and restart. The halt covers hedging only:
-  rebalancing, transfers and vault balance polling on that chain continue. Every
-  poll interval the monitor enqueues a backfill range covering the blocks since
-  the persisted checkpoint, capped at the configured ingestion cutoff block
-  (must be explicitly configured; recommended value: `safe`, i.e.
+  paging, while it is not. The halt never lifts by itself, not even after a
+  transient cause such as an RPC outage that outlasts the in-process retries:
+  the operator restarts the bot to re-drive the row. The failing fill itself may
+  already be in `Position` (a step after the position update failed), and then
+  the position check hedges it. To retire a fill that can never be accounted,
+  first check that it has no `OnChainTrade`, then hedge it by hand, mark its row
+  `Killed`, and restart. The halt covers hedging only: rebalancing, transfers
+  and vault balance polling on that chain continue. Every poll interval the
+  monitor enqueues a backfill range covering the blocks since the persisted
+  checkpoint, capped at the configured ingestion cutoff block (must be
+  explicitly configured; recommended value: `safe`, i.e.
   `eth_getBlockByNumber("safe")`); the backfill worker fetches the `Clear` and
   `TakeOrder` logs for the arbitrageur's owner address and advances the
   checkpoint only on success. `required_confirmations` governs

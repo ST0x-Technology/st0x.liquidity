@@ -3310,6 +3310,13 @@ mod tests {
             "the poison row stays recorded and the later HyperEVM fill waits"
         );
 
+        let poison_row: String = sqlx_apalis::query_scalar(
+            "SELECT id FROM Jobs WHERE job_type = ? AND status = 'Failed'",
+        )
+        .bind(accounting.queue(Chain::HyperEvm).queue_key())
+        .fetch_one(&accounting.apalis_pool)
+        .await
+        .unwrap();
         let messages = accounting.notifier.messages();
         assert_eq!(
             messages.len(),
@@ -3318,6 +3325,7 @@ mod tests {
         );
         assert!(
             messages[0].contains("TakeOrderV3:hyperevm:12345:293")
+                && messages[0].contains(&format!("job row {poison_row}"))
                 && messages[0].contains("hyperevm is now observe-only"),
             "the page must name the fill and the halted chain: {}",
             messages[0]

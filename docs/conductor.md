@@ -888,9 +888,15 @@ cannot race teardown. The `Failed` row stays: the retention sweep keeps
 `{type_name}@{chain}` rows in `Failed`, and `redrive_halted_trade_accounting`
 resets them to `Pending` with `attempts = 0` at every start, before workers
 spawn. A fixed cause therefore clears the halt on the next restart, and a poison
-fill halts the chain again and pages again. To retire a fill that can never be
-accounted, hedge it by hand, set its row to `Killed`, and restart; never reset a
-fill hedged by hand to `Pending`, since that hedges it twice.
+fill halts the chain again and pages again. Unlike the process-wide fail-stop,
+which systemd restarts after 30s, nothing restarts a halted chain: even a
+transient cause that outlasts the 1s/2s/4s retries keeps it halted until an
+operator restarts the bot. The failing fill itself may already be in `Position`
+(it failed after the position update), and then `CheckPositions` hedges it; a
+re-drive of such a row is idempotent on `(tx_hash, log_index)`. To retire a fill
+that can never be accounted, first check that it has no `OnChainTrade`, then
+hedge it by hand, set its row to `Killed`, and restart; never reset a fill
+hedged by hand to `Pending`, since that hedges it twice.
 
 Implements `Job<AccountantCtx<Node, Exec>>`. The `perform()` method runs the
 hedging pipeline:
