@@ -186,13 +186,26 @@ let
     builtins.removeAttrs depsArgs [ "src" ] // { dummySrc = depsDummySrc; }
   );
 
+  # The DTO crate's own dependencies. Reusing the workspace cargoArtifacts
+  # made every dashboard CI run unpack every backend dependency to compile
+  # this one small crate.
+  dtoCargoArtifacts = craneLib.buildDepsOnly (
+    builtins.removeAttrs depsArgs [ "src" ]
+    // {
+      pname = "st0x-dto";
+      dummySrc = depsDummySrc;
+      cargoExtraArgs = "-p st0x-dto";
+    }
+  );
+
 in
 {
   # DTO crate for TypeScript codegen. Build config lives next to the crate
   # source at crates/dto/default.nix; rust.nix only supplies shared crane
   # infra.
   st0x-dto = import ./crates/dto {
-    inherit craneLib cargoArtifacts;
+    inherit craneLib;
+    cargoArtifacts = dtoCargoArtifacts;
     commonArgs = dtoArgs;
   };
 

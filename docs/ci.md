@@ -43,11 +43,11 @@ different stack branch. Only a confirmed docs-only diff short-circuits the
 backend and dashboard toolchains; their required gate jobs still execute, and
 pre-commit hooks continue to validate the documentation.
 
-The backend build, lint, and test matrix, dashboard build, and pre-commit hooks
-run in cancellable work jobs. Separate `backend`, `dashboard`, and `hooks` gate
-jobs use `always()` to inspect their results and fail on skipped, failed, or
-cancelled work. This keeps replacement runs responsive without allowing an
-obsolete run to publish a successful required check.
+The backend build, lint, and test matrix, dashboard build and lint, and
+pre-commit hooks run in cancellable work jobs. Separate `backend`, `dashboard`,
+and `hooks` gate jobs use `always()` to inspect their results and fail on
+skipped, failed, or cancelled work. This keeps replacement runs responsive
+without allowing an obsolete run to publish a successful required check.
 
 Pull requests with at least 3,000 changed files always run full CI because
 GitHub's pull request files API truncates responses at that boundary.
