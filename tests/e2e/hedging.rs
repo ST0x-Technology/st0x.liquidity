@@ -1772,14 +1772,13 @@ async fn accounting_job_failure_halts_its_chain() -> anyhow::Result<()> {
         .await?;
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            let (pending,): (i64,) = sqlx::query_as(
-                "SELECT COUNT(*) FROM Jobs WHERE job_type = ? AND status = 'Pending'",
-            )
-            .bind(&base_accounting)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            if pending == 1 {
+            // The first fill, the failing one, and this one.
+            let (rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+                .bind(&base_accounting)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            if rows >= 3 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1789,13 +1788,11 @@ async fn accounting_job_failure_halts_its_chain() -> anyhow::Result<()> {
     .expect("the later fill should be queued within 30s");
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    let (later_fill_status,): (String,) = sqlx::query_as(
-        "SELECT status FROM Jobs WHERE job_type = ? AND status <> 'Failed' \
-         ORDER BY rowid DESC LIMIT 1",
-    )
-    .bind(&base_accounting)
-    .fetch_one(&pool)
-    .await?;
+    let (later_fill_status,): (String,) =
+        sqlx::query_as("SELECT status FROM Jobs WHERE job_type = ? ORDER BY rowid DESC LIMIT 1")
+            .bind(&base_accounting)
+            .fetch_one(&pool)
+            .await?;
     let events_after = count_events(&pool, "OnChainTrade").await?;
     pool.close().await;
 
@@ -1803,8 +1800,10 @@ async fn accounting_job_failure_halts_its_chain() -> anyhow::Result<()> {
         !bot.is_finished(),
         "a chain's terminal accounting failure must not stop the bot"
     );
-    assert_eq!(
-        later_fill_status, "Pending",
+    // The chain keeps re-driving the failing fill, which may hold this one
+    // as its prefetched next row, but never past it.
+    assert_ne!(
+        later_fill_status, "Done",
         "the halted chain must not account a later fill"
     );
     assert_eq!(

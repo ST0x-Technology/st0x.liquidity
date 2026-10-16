@@ -6,10 +6,11 @@
 //! it and calls [`Job::perform`] with the shared context.
 
 use apalis::layers::retry::backoff::Backoff;
-use apalis::prelude::{Attempt, Data, TaskBuilder, TaskId, TaskSink};
+use apalis::prelude::{Attempt, Data, Status, TaskBuilder, TaskId, TaskSink};
 use apalis_core::backend::TaskSinkError;
 use apalis_core::backend::poll_strategy::{BackoffConfig, IntervalStrategy, StrategyBuilder};
 use apalis_core::error::BoxDynError;
+use apalis_core::task::status::StatusError;
 use apalis_core::worker::context::WorkerContext;
 use apalis_core::worker::event::Event;
 use apalis_sqlite::{Config, SqliteContext, SqlitePool, SqliteStorage, SqlxError};
@@ -19,12 +20,10 @@ use std::fmt;
 use std::sync::Arc;
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::{debug, error, warn};
 
 use st0x_bridge::relay::RelayError;
-use st0x_evm::Chain;
 use st0x_execution::{AlpacaBrokerApiError, AlpacaWalletError, Backpressure, Permanence};
 use st0x_tokenization::{AlpacaTokenizationError, TokenizerError};
 
@@ -628,6 +627,22 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
         Ok(result.rows_affected())
     }
 
+    /// The status of the row `task_identity` in this queue; `None` once the
+    /// row is gone.
+    pub(crate) async fn status_of(
+        &self,
+        task_identity: &TaskIdentity,
+    ) -> Result<Option<Status>, StatusLookupError> {
+        let status: Option<String> =
+            sqlx_apalis::query_scalar("SELECT status FROM Jobs WHERE id = ? AND job_type = ?")
+                .bind(task_identity.as_str())
+                .bind(self.queue_key())
+                .fetch_optional(self.pool())
+                .await?;
+
+        Ok(status.map(|status| status.parse()).transpose()?)
+    }
+
     /// Returns whether any job of this queue's task type is still in flight --
     /// i.e. present in the queue and not in a terminal state. Apalis terminal
     /// states are `Done`, `Failed`, and `Killed` (mirroring the finished-job
@@ -649,6 +664,15 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
 
         Ok(in_flight > 0)
     }
+}
+
+/// Error of [`JobQueue::status_of`].
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum StatusLookupError {
+    #[error("failed to read a job row's status")]
+    Query(#[from] SqlxError),
+    #[error("a job row has an unknown status")]
+    Unknown(#[from] StatusError),
 }
 
 /// Default upper bound on a single [`Job::perform`] invocation.
@@ -862,39 +886,6 @@ macro_rules! build_supervised_worker {
 
 pub(crate) use build_supervised_worker;
 
-/// Builds a chain-scoped `Worker` that serves one `$chain`: like
-/// [`build_supervised_worker!`], but a terminal failure stops only this
-/// worker and pages, without the conductor-wide fail-stop (see
-/// [`on_chain_terminal_failure`]).
-macro_rules! build_chain_scoped_worker {
-    (
-        ::<$ctx_type:ty, $job:ty>,
-        $chain:expr,
-        $index:expr,
-        $queue:expr,
-        $ctx:expr,
-        $notifier:expr
-        $(, $failure_injector:expr)? $(,)?
-    ) => {{
-        $crate::conductor::job::assert_terminal_failure_msg_names_a_kind!(::<$ctx_type, $job>);
-
-        build_worker_inner!(
-            ::<$ctx_type, $job>,
-            $index,
-            $queue,
-            $ctx,
-            $crate::conductor::job::on_chain_terminal_failure(
-                $chain,
-                $notifier,
-                <$job as $crate::conductor::job::Job<$ctx_type>>::TERMINAL_FAILURE_MSG,
-            )
-            $(, $failure_injector)?
-        )
-    }};
-}
-
-pub(crate) use build_chain_scoped_worker;
-
 /// Builds a best-effort `Worker` for a `Job<Ctx>` impl.
 ///
 /// A terminal job failure is logged and alerts the operator but does NOT trip
@@ -1026,7 +1017,7 @@ pub enum JobError {
 }
 
 impl JobError {
-    fn task_identity(&self) -> &TaskIdentity {
+    pub(crate) fn task_identity(&self) -> &TaskIdentity {
         match self {
             Self::Failed { task_identity, .. } => task_identity,
             #[cfg(any(test, feature = "test-support"))]
@@ -1621,53 +1612,13 @@ pub(crate) fn on_best_effort_terminal_failure(
     }
 }
 
-/// `1` while a chain's trade accounting is halted by a terminal failure.
-pub(crate) const CHAIN_OBSERVE_ONLY_GAUGE: &str = "trade_accounting_observe_only";
-
-/// On-event handler for a chain-scoped worker that serves one chain: a terminal
-/// failure stops only this worker, so its chain drops to observe-only (its
-/// queued fills are neither accounted nor hedged) while every other chain's
-/// worker and the conductor carry on. Pages once per worker with the chain and
-/// the failed row; the row stays `Failed` in the queue.
-pub(crate) fn on_chain_terminal_failure(
-    chain: Chain,
-    notifier: Arc<dyn Notifier>,
-    error_msg: &'static str,
-) -> impl Fn(&WorkerContext, &Event) + Send + Sync + 'static {
-    let halted = Arc::new(AtomicBool::new(false));
-
-    move |ctx, event| {
-        let Event::Error(err) = event else {
-            return;
-        };
-
-        let worker = ctx.name().clone();
-        error!(%err, worker = %worker, %chain, "{error_msg}; {chain} is now observe-only");
-        let _ = ctx.stop();
-
-        if halted.swap(true, Ordering::SeqCst) {
-            return;
-        }
-
-        metrics::gauge!(CHAIN_OBSERVE_ONLY_GAUGE, "chain" => chain.as_str()).set(1.0);
-        let row = find_job_error(err.as_ref().as_ref()).map_or_else(
-            || "unknown".to_owned(),
-            |job_error| job_error.task_identity().to_string(),
-        );
-        let message = format!(
-            "st0x-hedge: {worker}: {error_msg}: {err}; job row {row}; {chain} is now \
-             observe-only: its later fills are not accounted or hedged until restart, other \
-             chains continue; this fill may already be in Position, so check Position for it \
-             before hedging it by hand, then set job row {row} to Killed before restarting, or \
-             the restart re-drives it"
-        );
-        spawn_terminal_failure_alert(Arc::clone(&notifier), worker, message);
-    }
-}
-
 /// Sends a terminal job failure page off the worker's event path, bounded so
 /// a slow notifier never piles up behind a worker that keeps running.
-fn spawn_terminal_failure_alert(notifier: Arc<dyn Notifier>, worker: String, message: String) {
+pub(crate) fn spawn_terminal_failure_alert(
+    notifier: Arc<dyn Notifier>,
+    worker: String,
+    message: String,
+) {
     let kind = terminal_failure_kind(&message);
     tokio::spawn(async move {
         match tokio::time::timeout(
@@ -1697,7 +1648,9 @@ pub(crate) fn terminal_failure_kind(alert: &str) -> AlertKind {
     AlertKind::most_specific_in(alert).unwrap_or(AlertKind::JobFailedAfterRetries)
 }
 
-fn find_job_error<'a>(mut error: &'a (dyn std::error::Error + 'static)) -> Option<&'a JobError> {
+pub(crate) fn find_job_error<'a>(
+    mut error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a JobError> {
     loop {
         if let Some(job_error) = error.downcast_ref::<JobError>() {
             return Some(job_error);

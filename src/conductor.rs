@@ -2,6 +2,7 @@
 //! and trade processing. [`Conductor::run`] is the entry point.
 
 mod builder;
+mod chain_accounting;
 mod completion;
 mod registry_candidate;
 pub(crate) use registry_candidate::{
@@ -10,6 +11,7 @@ pub(crate) use registry_candidate::{
 
 pub(crate) use builder::chain_equity_symbols;
 pub use builder::configured_equity_symbols;
+pub(crate) use chain_accounting::CHAIN_OBSERVE_ONLY_GAUGE;
 mod exit;
 pub(crate) mod job;
 mod manifest;
@@ -867,9 +869,9 @@ where
     Ok(())
 }
 
-/// A `Failed` trade-accounting row is the fill that halted its chain. Every
-/// start re-drives it with a fresh budget: the chain hedges again once the
-/// cause is fixed, and halts again, paging, while it is not. The row is the
+/// A `Failed` trade-accounting row is the fill that halted its chain. A start
+/// re-drives it at once with a fresh budget, before the chain's loop takes
+/// over the interval re-drives (`chain_accounting`). The row is the
 /// only record of its fill, so it never ages out as a dead letter; an operator
 /// retires it by marking the row `Killed`, after hedging the fill by hand only
 /// if `Position` does not record it (runbook in docs/conductor.md).

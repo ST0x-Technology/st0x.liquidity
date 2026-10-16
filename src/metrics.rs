@@ -133,7 +133,7 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
          floor's residual plus any other preflight shortfall"
     );
     metrics::describe_gauge!(
-        crate::conductor::job::CHAIN_OBSERVE_ONLY_GAUGE,
+        crate::conductor::CHAIN_OBSERVE_ONLY_GAUGE,
         "1 while a terminal trade accounting failure halts the chain's hedging, by chain"
     );
     metrics::describe_gauge!(
