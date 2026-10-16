@@ -1756,7 +1756,7 @@ impl TransferUsdcToHedging {
         };
         let refusal_paging_at_once = match cause {
             DepositSendPending::Broadcast { refusal, .. } => {
-                Some(*refusal).filter(|refusal| refusal.pages_at_once())
+                Some(**refusal).filter(|refusal| refusal.pages_at_once())
             }
             DepositSendPending::Confirmation(_) | DepositSendPending::Dropped => None,
         };
@@ -2665,8 +2665,8 @@ mod tests {
     use crate::alerts::{CapturingNotifier, LogNotifier};
     use crate::native_gas::GasReadinessFailure;
     use crate::rebalancing::usdc::{
-        DepositSendRefusal, DriverNotQuiesced, UnresolvedDepositSend, UsdcDriverPause,
-        usdc_driver_pause,
+        DepositSendRefusal, DriverNotQuiesced, SupersedingTx, UnresolvedDepositSend,
+        UsdcDriverPause, usdc_driver_pause,
     };
     use crate::test_utils::setup_test_apalis_pool;
 
@@ -6328,20 +6328,38 @@ mod tests {
 
     fn refused(refusal: DepositSendRefusal) -> DepositSendPending {
         DepositSendPending::Broadcast {
-            refusal,
+            refusal: Box::new(refusal),
             source: Box::new(CctpError::Evm(EvmError::Transport(
                 alloy::transports::RpcError::local_usage_str("refused"),
             ))),
         }
     }
 
-    const PAGES_AT_ONCE: [fn() -> DepositSendPending; 3] = [
+    fn taken(superseding: SupersedingTx) -> DepositSendPending {
+        refused(DepositSendRefusal::NonceTaken {
+            nonce: 7,
+            wallet_nonce: 9,
+            superseding,
+        })
+    }
+
+    const PAGES_AT_ONCE: [fn() -> DepositSendPending; 8] = [
+        || taken(SupersedingTx::NotFound),
+        || taken(SupersedingTx::Proven(TxHash::repeat_byte(0xB2))),
         || {
-            refused(DepositSendRefusal::NonceTaken {
-                nonce: 7,
-                wallet_nonce: 9,
+            taken(SupersedingTx::PartialPayment {
+                tx: TxHash::repeat_byte(0xB2),
+                paid: U256::from(40_000_000),
+                send_amount: U256::from(99_990_000),
             })
         },
+        || taken(SupersedingTx::Unconfirmed(TxHash::repeat_byte(0xB2))),
+        || {
+            taken(SupersedingTx::PaidTheDepositAddress(TxHash::repeat_byte(
+                0xB2,
+            )))
+        },
+        || taken(SupersedingTx::Unverified(TxHash::repeat_byte(0xB2))),
         || refused(DepositSendRefusal::NoEthForGas),
         || {
             refused(DepositSendRefusal::SignerHasNoEthForGas {

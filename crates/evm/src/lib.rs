@@ -1694,6 +1694,63 @@ pub async fn mined_tx(
     }))
 }
 
+/// Returns the transaction `sender` mined at `nonce`, or `None` while the
+/// node shows nothing mined there.
+///
+/// Ethereum has no read by sender and nonce, so this binary-searches the
+/// sender's mined transaction count over past blocks for the block that
+/// consumed `nonce`, then reads that block. Past-block reads need a node that
+/// serves historical state; a node that cannot fails the read. The search
+/// stops one block below the reported head, since a load-balanced RPC can
+/// serve the head from a node that the next read does not reach. A block that
+/// holds no match, as reads served by different nodes can give, returns `None`.
+///
+/// The result is a candidate only. Whatever acts on it must check it.
+pub async fn tx_at_nonce(
+    provider: &impl Provider,
+    sender: Address,
+    nonce: u64,
+) -> alloy::transports::TransportResult<Option<TxHash>> {
+    let head = provider.get_block_number().await?.saturating_sub(1);
+    let mined_past_nonce = |block: u64| async move {
+        let count = provider
+            .get_transaction_count(sender)
+            .block_id(block.into())
+            .await?;
+        Ok::<_, alloy::transports::TransportError>(count > nonce)
+    };
+
+    if !mined_past_nonce(head).await? {
+        return Ok(None);
+    }
+
+    let (mut below, mut at) = (0, head);
+    while below < at {
+        let middle = below + (at - below) / 2;
+        if mined_past_nonce(middle).await? {
+            at = middle;
+        } else {
+            below = middle + 1;
+        }
+    }
+
+    let Some(block) = provider.get_block_by_number(at.into()).full().await? else {
+        warn!(target: "wallet", %sender, nonce, block = at, "Block that consumed the nonce is missing");
+        return Ok(None);
+    };
+
+    let found = block
+        .transactions
+        .txns()
+        .find(|tx| tx.inner.signer() == sender && Transaction::nonce(tx.inner.inner()) == nonce)
+        .map(|tx| *tx.inner.tx_hash());
+    if found.is_none() {
+        warn!(target: "wallet", %sender, nonce, block = at, "Block that consumed the nonce holds no tx from the sender at it");
+    }
+
+    Ok(found)
+}
+
 /// Polls for a transaction receipt with confirmation depth, bypassing alloy's
 /// heartbeat-based `get_receipt()` which can hang when the WebSocket
 /// subscription misses a block.
@@ -2943,6 +3000,158 @@ mod tests {
                 emitted_logs: false,
                 confirmations: 1,
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn tx_at_nonce_finds_each_mined_nonce_including_two_in_one_block() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .wallet(anvil_signer(&anvil))
+            .connect_http(anvil.endpoint_url());
+        let other_sender: PrivateKeySigner = anvil.keys()[1].clone().into();
+        let other_provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(other_sender))
+            .connect_http(anvil.endpoint_url());
+        let sender = anvil.addresses()[0];
+        let send_at = |nonce: u64, tip: u128| {
+            TransactionRequest::default()
+                .to(Address::repeat_byte(0x42))
+                .value(U256::from(1))
+                .nonce(nonce)
+                .max_priority_fee_per_gas(tip)
+                .max_fee_per_gas(10_000_000_000)
+        };
+
+        // Another sender's tx at the same nonce, ordered first in the block
+        // by its higher tip.
+        provider.anvil_set_auto_mine(false).await.unwrap();
+        let other = *other_provider
+            .send_transaction(send_at(0, 2_000_000_000))
+            .await
+            .unwrap()
+            .tx_hash();
+        let first = *provider
+            .send_transaction(send_at(0, 1_000_000_000))
+            .await
+            .unwrap()
+            .tx_hash();
+        provider.anvil_mine(Some(1), None).await.unwrap();
+        let block = provider
+            .get_block_by_number(1.into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            block.transactions.hashes().collect::<Vec<_>>(),
+            [other, first]
+        );
+        provider.anvil_mine(Some(3), None).await.unwrap();
+
+        let second = *provider
+            .send_transaction(send_at(1, 1_000_000_000))
+            .await
+            .unwrap()
+            .tx_hash();
+        let third = *provider
+            .send_transaction(send_at(2, 1_000_000_000))
+            .await
+            .unwrap()
+            .tx_hash();
+        provider.anvil_mine(Some(1), None).await.unwrap();
+        provider.anvil_set_auto_mine(true).await.unwrap();
+
+        let fourth = provider
+            .send_transaction(send_at(3, 1_000_000_000))
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap()
+            .transaction_hash;
+        provider.anvil_mine(Some(1), None).await.unwrap();
+
+        for (nonce, expected) in [(0, first), (1, second), (2, third), (3, fourth)] {
+            assert_eq!(
+                tx_at_nonce(&provider, sender, nonce).await.unwrap(),
+                Some(expected),
+                "nonce {nonce}"
+            );
+        }
+        assert_eq!(tx_at_nonce(&provider, sender, 4).await.unwrap(), None);
+    }
+
+    /// A load-balanced RPC can report a head that the next read's node lacks,
+    /// so the search stops one block below it.
+    #[tokio::test]
+    async fn tx_at_nonce_does_not_read_the_head_block() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .wallet(anvil_signer(&anvil))
+            .connect_http(anvil.endpoint_url());
+
+        provider
+            .send_transaction(
+                TransactionRequest::default()
+                    .to(Address::repeat_byte(0x42))
+                    .value(U256::from(1)),
+            )
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tx_at_nonce(&provider, anvil.addresses()[0], 0)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn tx_at_nonce_is_none_when_the_block_that_consumed_it_holds_no_match() {
+        let asserter = Asserter::new();
+        asserter.push_success(&3_u64);
+        // Mined past nonce 0 at blocks 2 and 1, not at block 0.
+        for count in [1_u64, 1, 0] {
+            asserter.push_success(&count);
+        }
+        let mut block: alloy::rpc::types::Block = alloy::rpc::types::Block::default();
+        block.header.number = 1;
+        asserter.push_success(&block);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        assert_eq!(
+            tx_at_nonce(&provider, Address::repeat_byte(0x11), 0)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn tx_at_nonce_returns_a_past_block_read_that_fails() {
+        let asserter = Asserter::new();
+        asserter.push_success(&11_u64);
+        asserter.push_success(&1_u64);
+        asserter.push_failure(alloy::rpc::json_rpc::ErrorPayload {
+            code: -32000,
+            message: "missing trie node".into(),
+            data: None,
+        });
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let error = tx_at_nonce(&provider, Address::repeat_byte(0x11), 0)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error
+                .as_error_resp()
+                .map(|payload| payload.message.as_ref()),
+            Some("missing trie node")
         );
     }
 
