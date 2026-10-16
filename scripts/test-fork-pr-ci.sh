@@ -272,6 +272,41 @@ check_gate.call(
   ]
 )
 
+# A sticky disk snapshot is shared by every later run, and a pull request can
+# edit this workflow, including the `commit` input. So the disk key must embed
+# a value derived from a secret that fork runs never receive, untrusted runs
+# must skip the disk, and only master pushes may commit.
+untrusted_only = "${{ env.UNTRUSTED_PR != 'true' }}"
+master_push_only = "${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}"
+sticky_disk_jobs = jobs.select do |_, job|
+  job.fetch("steps", []).any? { |step| step["uses"].to_s.start_with?("useblacksmith/stickydisk@") }
+end
+unless sticky_disk_jobs.keys.sort == %w[backend-build backend-lint]
+  warn "only backend-build and backend-lint may use sticky disks, got #{sticky_disk_jobs.keys.inspect}"
+  exit 1
+end
+sticky_disk_jobs.each do |name, job|
+  steps = job.fetch("steps")
+  key_step = steps.find { |step| step["id"] == "target-disk" }
+  unless key_step &&
+         key_step["if"] == untrusted_only &&
+         key_step.fetch("env", {})["DISK_KEY_SECRET"] == "${{ secrets.CACHIX_AUTH_TOKEN }}" &&
+         key_step["run"].include?('echo "::add-mask::$key"')
+    warn "#{name} must derive its sticky disk key from a secret, mask it, and skip untrusted runs"
+    exit 1
+  end
+
+  steps.select { |step| step["uses"].to_s.start_with?("useblacksmith/stickydisk@") }.each do |step|
+    with = step.fetch("with")
+    unless step["if"] == untrusted_only &&
+           with["key"].start_with?("${{ steps.target-disk.outputs.key }}-") &&
+           with["commit"] == master_push_only
+      warn "#{name} sticky disk must skip untrusted runs, use the secret-derived key, and commit only on master pushes"
+      exit 1
+    end
+  end
+end
+
 actions = []
 visit = lambda do |value|
   case value
@@ -329,7 +364,10 @@ assert_count 1 '      - uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea79
 assert_count 5 '      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035  # v34'
 assert_count 5 '      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71  # v17'
 assert_count 5 '      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569  # v7'
-assert_count 2 '      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2'
+# Swatinem/rust-cache prunes workspace-crate and incremental artifacts from the
+# target directory in its save step, which would empty the sticky disks.
+assert_absent 'Swatinem/rust-cache@'
+assert_count 2 '        uses: useblacksmith/stickydisk@3f6be1451e3cad893b778bc93495c80452a5da26  # v1.7.2'
 assert_count 1 '        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6'
 assert_count 1 '        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6'
 
@@ -358,7 +396,20 @@ assert_line "  UNTRUSTED_PR: \${{ github.event_name == 'pull_request' && (github
 assert_count 5 "          authToken: \${{ env.UNTRUSTED_PR != 'true' && secrets.CACHIX_AUTH_TOKEN || '' }}"
 assert_count 5 "          skipPush: \${{ env.UNTRUSTED_PR == 'true' }}"
 assert_count 5 "          save: \${{ env.UNTRUSTED_PR != 'true' }}"
-assert_count 2 "          save-if: \${{ env.UNTRUSTED_PR != 'true' }}"
+# A sticky disk snapshot is shared by every later run, so only reviewed code
+# may commit one: master pushes. Pull requests (fork or not) and manual
+# dispatches of arbitrary branches must not.
+assert_count 2 "          commit: \${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}"
+# The over-40 GiB wipe must not touch the root-owned lost+found of the fresh
+# ext4 disk, or rm fails, the master push job fails, and no snapshot commits.
+assert_count 2 "            sudo find \"\$CARGO_TARGET_DIR\" -mindepth 1 -maxdepth 1 ! -name lost+found -exec rm -rf {} +"
+# A snapshot keeps its mtimes and may be newer than this checkout, so every
+# tracked source must be touched after the mount, or cargo can skip a changed
+# crate. rain-math-float lives in the Nix store (mtime 1), so its artifacts
+# must be cleaned when its source changes, before each build on the disk.
+assert_count 2 '          git ls-files -z | xargs -0 touch -h'
+assert_count 2 '            ./scripts/clean-stale-rain-math-float.sh'
+assert_line '        run: ./scripts/test-clean-stale-rain-math-float.sh'
 
 # The pull request files API truncates after 3,000 files. The workflow must run
 # full CI at that boundary rather than accepting a docs-only false negative.
