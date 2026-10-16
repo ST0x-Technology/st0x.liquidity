@@ -1067,10 +1067,13 @@ answers `recovered`:
 Anything else is refused and changes nothing: a tx at another nonce or from
 another sender, one short of its confirmations, a successful tx that is neither
 a plain cancel nor our deposit of that order, and a deposit of another amount.
-Cancelling only the approve frees nothing: the deposit still mines (or reverts
-and is re-quoted). Never cancel or replace a pending Relay approve or deposit on
-the Robinhood wallet (Robinhood->Alpaca): this build has no exit for it, so the
-guard stays held. Let it mine, or escalate.
+Only a tx short of its confirmations passes on a later recheck. After any other
+refusal the deposit's nonce is still taken and this build has no exit: settle
+any order Relay holds (`relay status`) and escalate. Cancelling only the approve
+frees nothing: the deposit still mines (or reverts and is re-quoted). Never
+cancel or replace a pending Relay approve or deposit on the Robinhood wallet
+(Robinhood->Alpaca): this build has no exit for it, so the guard stays held. Let
+it mine, or escalate.
 
 `transfer reconcile` accepts an Alpaca->Robinhood `SwapQuoted` or `SwapRefunded`
 even while its job still quotes or signs (the CLI preflight and the API take it

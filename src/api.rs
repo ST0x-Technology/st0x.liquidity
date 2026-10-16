@@ -12844,11 +12844,6 @@ mod tests {
         }
     }
 
-    /// Mirrors `recheck_error_response_distinguishes_recoverability` for the
-    /// USDC recheck: an unknown rebalance is 404, aggregate-state refusals
-    /// are 422 carrying the typed reason, the transient provider failure is
-    /// 502 so the operator knows to retry, and internal failures stay a
-    /// generic 500.
     /// A superseding tx the bot could not read is retried later; one it read
     /// and refused names why, for the operator to fix or wait out.
     #[test]
@@ -12901,6 +12896,11 @@ mod tests {
         }
     }
 
+    /// Mirrors `recheck_error_response_distinguishes_recoverability` for the
+    /// USDC recheck: an unknown rebalance is 404, aggregate-state refusals
+    /// are 422 carrying the typed reason, the transient provider failure is
+    /// 502 so the operator knows to retry, and internal failures stay a
+    /// generic 500.
     #[test]
     fn usdc_recheck_error_response_distinguishes_recoverability() {
         let id = UsdcRebalanceId(uuid::Uuid::new_v4());

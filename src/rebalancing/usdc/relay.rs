@@ -11085,7 +11085,31 @@ mod tests {
             .await;
 
         let unmined = TxHash::repeat_byte(0x5e);
-        let refusals: [(TxHash, fn(&RelayBridgeError, TxHash) -> bool); 4] = [
+        let other_sender = RelayRig::signer_on(&rig.hub_anvil)
+            .send_transaction(
+                TransactionRequest::default()
+                    .with_to(rig.hub_anvil.addresses()[2])
+                    .with_input(Bytes::new()),
+            )
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap()
+            .transaction_hash;
+        rig.hub_wallet
+            .provider()
+            .anvil_mine(Some(2), None)
+            .await
+            .unwrap();
+        let refusals: [(TxHash, fn(&RelayBridgeError, TxHash) -> bool); 5] = [
+            (other_sender, |error, superseding| {
+                matches!(
+                    error,
+                    RelayBridgeError::SupersedingTxFromAnotherSender { superseding: tx, .. }
+                        if *tx == superseding
+                )
+            }),
             (unmined, |error, superseding| {
                 matches!(error, RelayBridgeError::Unconfirmed { tx, confirmations: 0, .. }
                     if *tx == superseding)
