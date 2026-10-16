@@ -491,6 +491,57 @@ jobs:
           gc-max-store-size-linux: 8G
           save: ${{ env.UNTRUSTED_PR != 'true' }}
 
+      - name: Dashboard
+        run: nix build .#st0x-dashboard
+
+  # Lint and the Turnkey message utility run beside the Nix dashboard build,
+  # which rebuilds the bindings and re-runs svelte-check, vitest, and vite on
+  # its own; in one job the two halves ran back to back.
+  dashboard-lint:
+    name: dashboard lint
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          persist-credentials: false
+
+      - name: Configure Git fetch fail-fast
+        run: |
+          git config --global http.lowSpeedLimit 524288
+          git config --global http.lowSpeedTime 60
+
+      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035  # v34
+        with:
+          # Nix 2.24-2.28 fail to resolve rainix's overridden `foundry` input
+          # (`cannot find flake 'flake:foundry'`); the fix landed in 2.30. v30
+          # of this action only shipped up to 2.26, so use v34 and pin a
+          # working release.
+          nix_version: "2.31.2"
+          nix_conf: |
+            accept-flake-config = true
+            fallback = true
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            keep-env-derivations = true
+            keep-outputs = true
+
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71  # v17
+        continue-on-error: true
+        with:
+          name: rainlanguage
+          authToken: ${{ env.UNTRUSTED_PR != 'true' && secrets.CACHIX_AUTH_TOKEN || '' }}
+          skipPush: ${{ env.UNTRUSTED_PR == 'true' }}
+          useDaemon: false
+
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569  # v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 8G
+          save: ${{ env.UNTRUSTED_PR != 'true' }}
+
       - name: Check bun.nix is up to date
         run: |
           nix run .#genBunNix
@@ -514,14 +565,11 @@ jobs:
           nix develop "$GITHUB_WORKSPACE#ci-dashboard" -c bun run typecheck
           nix develop "$GITHUB_WORKSPACE#ci-dashboard" -c bun run format:check
 
-      - name: Dashboard
-        run: nix build .#st0x-dashboard
-
   # Required dashboard check. A confirmed docs-only change may skip the real
   # build. Every other dependency state, including cancellation, fails closed.
   dashboard:
     name: dashboard
-    needs: [changes, dashboard-build]
+    needs: [changes, dashboard-build, dashboard-lint]
     if: ${{ always() }}
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 5
@@ -532,8 +580,8 @@ jobs:
             echo "Docs-only change - dashboard validation not required."
             exit 0
           fi
-          if [ "${{ needs.dashboard-build.result }}" != "success" ]; then
-            echo "dashboard validation failed (build=${{ needs.dashboard-build.result }})"
+          if [ "${{ needs.dashboard-build.result }}" != "success" ] || [ "${{ needs.dashboard-lint.result }}" != "success" ]; then
+            echo "dashboard validation failed (build=${{ needs.dashboard-build.result }}, lint=${{ needs.dashboard-lint.result }})"
             exit 1
           fi
 
