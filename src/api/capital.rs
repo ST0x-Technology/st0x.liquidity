@@ -397,18 +397,11 @@ pub(super) struct RedeemRequest {
     quantity: String,
     /// Chain whose wallet sends the shares, as for `--network`.
     chain: Chain,
-    /// Alpaca's redemption wallet on `chain`, as for `--redemption-wallet`;
-    /// left out, the chain's own `[chains.<name>.trading].redemption_wallet`.
-    #[serde(default)]
-    redemption_wallet: Option<Address>,
 }
 
 impl AuditedRequest for RedeemRequest {
     fn audit_targets(&self) -> Vec<String> {
-        [self.symbol.clone(), self.chain.to_string()]
-            .into_iter()
-            .chain(self.redemption_wallet.iter().map(ToString::to_string))
-            .collect()
+        vec![self.symbol.clone(), self.chain.to_string()]
     }
 }
 
@@ -1879,9 +1872,10 @@ type RedemptionTokenizer = AlpacaTokenizationService<Arc<dyn Wallet<Provider = R
 ///
 /// The token is the chain's wrapper `asset()`, attested like the CLI does
 /// (`Wrapper::attest_underlying`), never a pasted address. The redemption
-/// wallet is the request's, or else the chain's own
-/// `[chains.<name>.trading].redemption_wallet`, like the CLI's
-/// `resolve_redemption_wallet`. The tokenization client is built from the
+/// wallet is always the chain's own
+/// `[chains.<name>.trading].redemption_wallet`, never one the request names:
+/// a wallet chosen by the caller would let anyone in the capital group send
+/// the bot's shares out of our accounts. The tokenization client is built from the
 /// bot's broker ctx and signer as the conductor builds its own.
 ///
 /// Ordered and claimed like the wrap routes. The transfer is sent once and
@@ -1899,18 +1893,13 @@ pub(super) async fn redeem(
         symbol,
         quantity,
         chain,
-        redemption_wallet,
     } = request;
     let (symbol, quantity, amount) = equity_wallet_input(&symbol, &quantity)?;
     let (trading, wallet) = equity_chain_signer(&state, chain, &symbol)?;
-    let redemption_wallet = match redemption_wallet {
-        Some(redemption_wallet) => redemption_wallet,
-        None => state.ctx.redemption_wallet(chain).map_err(|error| {
-            unprocessable(format!(
-                "{error}; pass redemptionWallet or configure it for {chain}"
-            ))
-        })?,
-    };
+    let redemption_wallet = state
+        .ctx
+        .redemption_wallet(chain)
+        .map_err(|error| unprocessable(format!("{error}; configure it for {chain}")))?;
     require_startup_complete(&state, "redeem")?;
     let handle = state.recovery.get().ok_or_else(recovery_not_ready)?;
     let rebalancing = Arc::clone(&handle.rebalancing_service);

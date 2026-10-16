@@ -367,7 +367,7 @@ st0x-liquidity-client --env <env> capital wrap-equity --symbol <symbol> --quanti
 st0x-liquidity-client --env <env> capital unwrap-equity --symbol <symbol> --quantity <wrapped-shares> [--network <chain>]
 # sends underlying shares to Alpaca's redemption wallet for Alpaca to redeem;
 # prints the transfer tx, then the bot follows the redemption in its logs
-st0x-liquidity-client --env <env> capital redeem --symbol <symbol> --quantity <shares> [--network <chain>] [--redemption-wallet <address>]
+st0x-liquidity-client --env <env> capital redeem --symbol <symbol> --quantity <shares> [--network <chain>]
 # burns only and prints the burn tx and its status; it prints its operation id
 # to stderr first: rerun with --operation-id <id> to report that same burn
 st0x-liquidity-client --env <env> capital cctp-bridge --from <ethereum|base> --amount <amount> [--operation-id <id>]
@@ -560,9 +560,10 @@ so the wallet balances may not have changed yet when it arrives.
 
 `capital redeem` sends `--quantity` underlying tokenized shares of `--symbol`
 from the bot's wallet on `--network` to Alpaca's redemption wallet, and Alpaca
-redeems them into shares in the broker account. It sends to the redemption
-wallet the bot has configured for the chain unless `--redemption-wallet` names
-another. It is the last step of draining a paused listing (see
+redeems them into shares in the broker account. It always sends to the
+redemption wallet the bot has configured for the chain; no command can name
+another, so the verb cannot move shares out of our accounts. It is the last step
+of draining a paused listing (see
 [Taking a Listing off Rebalancing](#taking-a-listing-off-rebalancing)). It
 prints the chain, symbol, quantity, the `redemptionWallet`, the `token` it sent
 and the `transferTx` as soon as the transfer is broadcast. The bot then confirms
@@ -578,16 +579,15 @@ signing wallet cannot be shown to pay gas, and `500` when the chain has no
 wallet, signer or gas threshold configured. They answer `422` for a chain
 without a `[chains.<name>.trading]` table or a symbol that table does not list,
 for a wrapper whose `asset()` differs from the configured underlying, for an
-`unwrap-equity` above the wrapper's `maxRedeem`, and for a `redeem` without
-`--redemption-wallet` on a chain with no configured `redemption_wallet`. The
-three share one lock per symbol, taken before the first balance read and held
-until the bot logs the outcome of the tx: while it is held, another
-`wrap-equity`, `unwrap-equity` or `redeem` of that symbol answers `409`. They
-also answer `409` while the bot's own equity transfer of the symbol holds its
-guard, so they cannot move the wallet's shares from under a mint or redemption
-the bot is running. They do not take the recovery lock. A verb that answered
-`500` holds no lock. The lock lives in memory, so after a bot restart check the
-wallet onchain before rerunning.
+`unwrap-equity` above the wrapper's `maxRedeem`, and for a `redeem` on a chain
+with no configured `redemption_wallet`. The three share one lock per symbol,
+taken before the first balance read and held until the bot logs the outcome of
+the tx: while it is held, another `wrap-equity`, `unwrap-equity` or `redeem` of
+that symbol answers `409`. They also answer `409` while the bot's own equity
+transfer of the symbol holds its guard, so they cannot move the wallet's shares
+from under a mint or redemption the bot is running. They do not take the
+recovery lock. A verb that answered `500` holds no lock. The lock lives in
+memory, so after a bot restart check the wallet onchain before rerunning.
 
 A request that times out on the client may still complete in the bot; check the
 bot logs and the chain for the transaction before retrying a vault or allowance

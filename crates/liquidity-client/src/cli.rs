@@ -499,7 +499,8 @@ pub(crate) enum Capital {
     /// confirms it, polls Alpaca's detection and completion afterwards and
     /// logs them. The send is never retried: a 500 may follow a broadcast, so
     /// check the wallet onchain before rerunning. Shares the per symbol lock
-    /// of `wrap-equity`.
+    /// of `wrap-equity`. The bot always sends to the redemption wallet it has
+    /// configured for the chain; no command can name another.
     Redeem {
         /// Equity symbol (for example AAPL).
         #[arg(short = 's', long)]
@@ -511,10 +512,6 @@ pub(crate) enum Capital {
         /// `[chains.<name>.trading]` equity listing.
         #[arg(long, value_enum, default_value_t = HedgedChain::Base)]
         network: HedgedChain,
-        /// Alpaca redemption wallet to send to; omit to use the one the bot
-        /// has configured.
-        #[arg(long)]
-        redemption_wallet: Option<EvmAddress>,
     },
     /// Deposit tokens from the bot's wallet into a Raindex vault: approves,
     /// then deposits, resolving token decimals from onchain metadata. Returns
@@ -1272,28 +1269,37 @@ mod tests {
                 "0.5",
                 "--network",
                 "ethereum",
-                "--redemption-wallet",
-                TOKEN,
             ])
             .unwrap(),
             Capital::Redeem {
                 symbol,
                 quantity,
                 network: super::HedgedChain::Ethereum,
-                redemption_wallet: Some(wallet),
-            } if symbol == "AAPL"
-                && quantity == self::amount("0.5")
-                && wallet == TOKEN.parse::<EvmAddress>().unwrap()
+            } if symbol == "AAPL" && quantity == self::amount("0.5")
         ));
         assert!(matches!(
             capital(&["redeem", "-s", "TSLA", "-q", "3"]).unwrap(),
             Capital::Redeem {
                 symbol,
                 quantity,
-                redemption_wallet: None,
-                ..
+                network: super::HedgedChain::Base,
             } if symbol == "TSLA" && quantity == self::amount("3")
         ));
+
+        // The bot sends a redeem only to its configured redemption wallet, so
+        // the client has no way to name another.
+        let Err(error) = capital(&[
+            "redeem",
+            "-s",
+            "AAPL",
+            "-q",
+            "1",
+            "--redemption-wallet",
+            TOKEN,
+        ]) else {
+            panic!("redeem must not accept a redemption wallet");
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     /// Like st0x-cli, every capital `--network` defaults to base.
@@ -1493,15 +1499,6 @@ mod tests {
                 bad_token,
                 "-v",
                 VAULT,
-            ]);
-            argvs.push(vec![
-                "redeem",
-                "-s",
-                "AAPL",
-                "-q",
-                "1",
-                "--redemption-wallet",
-                bad_token,
             ]);
         }
         for bad_vault in ["0xvault", TOKEN, "1"] {

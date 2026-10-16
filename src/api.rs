@@ -11048,17 +11048,17 @@ mod tests {
         .await;
         let wrap = capital::wrap_equity(
             State(state.clone()),
-            capital_request(equity_wallet_body("wrap-equity", "1")),
+            capital_request(equity_wallet_body("1")),
         )
         .await;
         let unwrap = capital::unwrap_equity(
             State(state.clone()),
-            capital_request(equity_wallet_body("unwrap-equity", "1")),
+            capital_request(equity_wallet_body("1")),
         )
         .await;
         let redeem = capital::redeem(
             State(state.clone()),
-            capital_request(equity_wallet_body("redeem", "1")),
+            capital_request(equity_wallet_body("1")),
         )
         .await;
         let deposit =
@@ -11119,18 +11119,13 @@ mod tests {
     const EQUITY_WALLET_ROUTES: [&str; 3] = ["wrap-equity", "unwrap-equity", "redeem"];
     const TEST_REDEMPTION_WALLET: Address = address!("0x00000000000000000000000000000000000000ab");
 
-    /// The body of equity wallet `route` for AAPL on Base; a redeem names its
-    /// redemption wallet.
-    fn equity_wallet_body(route: &str, quantity: &str) -> serde_json::Value {
-        let mut body = serde_json::json!({
+    /// The body of an equity wallet route for AAPL on Base.
+    fn equity_wallet_body(quantity: &str) -> serde_json::Value {
+        serde_json::json!({
             "symbol": "AAPL",
             "quantity": quantity,
             "chain": "base",
-        });
-        if route == "redeem" {
-            body["redemptionWallet"] = serde_json::json!(TEST_REDEMPTION_WALLET);
-        }
-        body
+        })
     }
 
     /// Runs equity wallet `route` on `body`, as its JSON answer or its
@@ -11157,8 +11152,10 @@ mod tests {
 
     /// Lists `symbol` on the Base trading table over `underlying` and its
     /// `wrapper`, with rebalancing paused as on a chain being drained, so a
-    /// route that leaned on the listing starting operations would refuse.
+    /// route that leaned on the listing starting operations would refuse. The
+    /// table's redemption wallet is [`TEST_REDEMPTION_WALLET`].
     fn list_paused_equity(ctx: &mut Ctx, symbol: &str, underlying: Address, wrapper: Address) {
+        ctx.chains.primary_mut().redemption_wallet = Some(TEST_REDEMPTION_WALLET);
         ctx.chains.primary_mut().assets.equities.symbols.insert(
             Symbol::new(symbol).unwrap(),
             st0x_config::ChainEquityAsset {
@@ -11217,9 +11214,9 @@ mod tests {
         for route in EQUITY_WALLET_ROUTES {
             let mut bodies: Vec<serde_json::Value> = ["0", "-1", "abc", "1.0000000000000000001"]
                 .into_iter()
-                .map(|quantity| equity_wallet_body(route, quantity))
+                .map(equity_wallet_body)
                 .collect();
-            let mut empty_symbol = equity_wallet_body(route, "1");
+            let mut empty_symbol = equity_wallet_body("1");
             empty_symbol["symbol"] = serde_json::json!("");
             bodies.push(empty_symbol);
 
@@ -11249,7 +11246,7 @@ mod tests {
         let state = empty_app_state(ctx).await;
 
         for route in EQUITY_WALLET_ROUTES {
-            let mut other_chain = equity_wallet_body(route, "1");
+            let mut other_chain = equity_wallet_body("1");
             other_chain["chain"] = serde_json::json!("ethereum");
             let Err((status, error)) = run_equity_wallet_route(&state, route, other_chain).await
             else {
@@ -11261,7 +11258,7 @@ mod tests {
                 "{route}: {error}"
             );
 
-            let mut unlisted = equity_wallet_body(route, "1");
+            let mut unlisted = equity_wallet_body("1");
             unlisted["symbol"] = serde_json::json!("MSFT");
             let Err((status, error)) = run_equity_wallet_route(&state, route, unlisted).await
             else {
@@ -11289,7 +11286,7 @@ mod tests {
 
         for route in EQUITY_WALLET_ROUTES {
             let Err((status, error)) =
-                run_equity_wallet_route(&state, route, equity_wallet_body(route, "1")).await
+                run_equity_wallet_route(&state, route, equity_wallet_body("1")).await
             else {
                 panic!("{route} must refuse while the symbol's lock is held");
             };
@@ -11326,7 +11323,7 @@ mod tests {
 
         for route in EQUITY_WALLET_ROUTES {
             let Err((status, error)) =
-                run_equity_wallet_route(&state, route, equity_wallet_body(route, "1")).await
+                run_equity_wallet_route(&state, route, equity_wallet_body("1")).await
             else {
                 panic!("{route} must refuse while the bot's guard is held");
             };
@@ -11397,19 +11394,11 @@ mod tests {
         state.health.set_ready();
         let aapl = Symbol::new("AAPL").unwrap();
 
-        let wrap = run_equity_wallet_route(
-            &state,
-            "wrap-equity",
-            equity_wallet_body("wrap-equity", "1.5"),
-        )
-        .await
-        .unwrap_or_else(|(status, error)| panic!("wrap refused with {status}: {error}"));
-        let Err((status, _)) = run_equity_wallet_route(
-            &state,
-            "unwrap-equity",
-            equity_wallet_body("unwrap-equity", "1"),
-        )
-        .await
+        let wrap = run_equity_wallet_route(&state, "wrap-equity", equity_wallet_body("1.5"))
+            .await
+            .unwrap_or_else(|(status, error)| panic!("wrap refused with {status}: {error}"));
+        let Err((status, _)) =
+            run_equity_wallet_route(&state, "unwrap-equity", equity_wallet_body("1")).await
         else {
             panic!("an unwrap before the wrap confirms must not run");
         };
@@ -11447,19 +11436,11 @@ mod tests {
             supply - wrapped_balance
         );
 
-        let unwrap = run_equity_wallet_route(
-            &state,
-            "unwrap-equity",
-            equity_wallet_body("unwrap-equity", "0.5"),
-        )
-        .await
-        .unwrap_or_else(|(status, error)| panic!("unwrap refused with {status}: {error}"));
-        let Err((status, _)) = run_equity_wallet_route(
-            &state,
-            "wrap-equity",
-            equity_wallet_body("wrap-equity", "1"),
-        )
-        .await
+        let unwrap = run_equity_wallet_route(&state, "unwrap-equity", equity_wallet_body("0.5"))
+            .await
+            .unwrap_or_else(|(status, error)| panic!("unwrap refused with {status}: {error}"));
+        let Err((status, _)) =
+            run_equity_wallet_route(&state, "wrap-equity", equity_wallet_body("1")).await
         else {
             panic!("a wrap before the unwrap confirms must not run");
         };
@@ -11494,10 +11475,11 @@ mod tests {
 
     /// End to end through the handler against a deployed wrapper and a mock
     /// Alpaca: the route sends the wrapper's attested underlying to the
-    /// redemption wallet and answers at the broadcast, holding the symbol's
-    /// lock until the transfer confirms; the task then finds Alpaca's
-    /// redemption of that transfer and logs its completion. Exactly the
-    /// requested shares reach the redemption wallet: one transfer.
+    /// chain's configured redemption wallet, even when the request names
+    /// another, and answers at the broadcast, holding the symbol's lock until
+    /// the transfer confirms; the task then finds Alpaca's redemption of that
+    /// transfer and logs its completion. Exactly the requested shares reach
+    /// the configured wallet, in one transfer, and none reach the named one.
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn redeem_sends_the_attested_underlying_once_and_follows_alpaca_to_completion() {
@@ -11515,7 +11497,12 @@ mod tests {
         state.health.set_ready();
         let aapl = Symbol::new("AAPL").unwrap();
 
-        let answer = run_equity_wallet_route(&state, "redeem", equity_wallet_body("redeem", "2"))
+        // A caller cannot choose where the shares go: a wallet named in the
+        // request is not part of the contract and receives nothing.
+        let caller_wallet = address!("0x00000000000000000000000000000000000000cd");
+        let mut body = equity_wallet_body("2");
+        body["redemptionWallet"] = serde_json::json!(caller_wallet);
+        let answer = run_equity_wallet_route(&state, "redeem", body)
             .await
             .unwrap_or_else(|(status, error)| panic!("redeem refused with {status}: {error}"));
         assert!(
@@ -11569,6 +11556,10 @@ mod tests {
         assert_eq!(
             erc20_balance(&chain.bot_wallet, underlying, TEST_REDEMPTION_WALLET).await,
             sent
+        );
+        assert_eq!(
+            erc20_balance(&chain.bot_wallet, underlying, caller_wallet).await,
+            U256::ZERO
         );
         assert_eq!(
             erc20_balance(&chain.bot_wallet, underlying, chain.bot).await,

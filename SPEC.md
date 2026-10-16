@@ -8662,35 +8662,36 @@ effect rather than a generic intent:
   chain's ERC-4626 wrapper and `unwrap-equity` redeems `quantity` wrapped shares
   from it, both for the bot's own wallet on `chain`, and `redeem` sends
   `quantity` underlying shares from that wallet to Alpaca's redemption wallet
-  there (the request's optional `redemptionWallet`, or else the chain's own
-  `[chains.<name>.trading].redemption_wallet`), which Alpaca redeems into the
-  account. `redeem` is kept for draining a paused chain, where `transfer-equity`
-  starts nothing; its token is the wrapper's attested `asset()`, never a pasted
-  address. A quantity that is not positive or is finer than the tokens' 18
-  decimals (the CLI truncated it), or an empty symbol, is refused with `400`; a
-  chain without a `[chains.<name>.trading]` table, or a symbol that table does
-  not list, with `422` (the CLI's `--registry` fallback has no route), as is a
-  redeem without a redemption wallet to send to; then `503` until startup
-  completes. The three share one lock per symbol, and each also claims the bot's
-  own equity transfer guard for the symbol; while either is held a request
-  answers `409`, so an operator cannot move a symbol's shares in the wallet
-  under a transfer the bot runs, and the bot starts no transfer of the symbol
-  meanwhile. Then `503` while the chain's signer cannot be shown to pay gas,
-  checked against that chain's own `[alerts.low_balance_thresholds]` entry (the
-  trigger wires no gas check for a chain that rebalances no equity, such as a
-  paused chain being drained), and `422` before any send for an unwrap above the
-  wrapper's `maxRedeem` for the wallet or a wrapper whose `asset()` differs from
-  the configured underlying. A wrap still awaits its approve when the allowance
-  is short, as the bot's own wraps do. Each answers at the broadcast of its
-  deposit, redeem or transfer (`wrapTx`, `unwrapTx` or `transferTx`) and
-  confirms on the detached task like the vault verbs, holding the lock and the
-  guard until the tx's fate is proven, or until a restart after a panic while
-  confirming. The redemption transfer is sent once and never retried, since it
-  carries no idempotency key. Once it confirms, the task frees the lock and the
-  guard, polls Alpaca until it detects the transfer and until the redemption
-  finishes, and logs the request id and the final status; a throttled lookup is
-  waited out inside the poll, as in the bot's own redemption jobs. Every capital
-  route refuses with `503` until startup completes, like `process-tx`, since the
+  there, always the chain's own `[chains.<name>.trading].redemption_wallet` and
+  never one the request names, so the capital group cannot send the bot's shares
+  out of our accounts; Alpaca redeems them into the account. `redeem` is kept
+  for draining a paused chain, where `transfer-equity` starts nothing; its token
+  is the wrapper's attested `asset()`, never a pasted address. A quantity that
+  is not positive or is finer than the tokens' 18 decimals (the CLI truncated
+  it), or an empty symbol, is refused with `400`; a chain without a
+  `[chains.<name>.trading]` table, or a symbol that table does not list, with
+  `422` (the CLI's `--registry` fallback has no route), as is a redeem without a
+  redemption wallet to send to; then `503` until startup completes. The three
+  share one lock per symbol, and each also claims the bot's own equity transfer
+  guard for the symbol; while either is held a request answers `409`, so an
+  operator cannot move a symbol's shares in the wallet under a transfer the bot
+  runs, and the bot starts no transfer of the symbol meanwhile. Then `503` while
+  the chain's signer cannot be shown to pay gas, checked against that chain's
+  own `[alerts.low_balance_thresholds]` entry (the trigger wires no gas check
+  for a chain that rebalances no equity, such as a paused chain being drained),
+  and `422` before any send for an unwrap above the wrapper's `maxRedeem` for
+  the wallet or a wrapper whose `asset()` differs from the configured
+  underlying. A wrap still awaits its approve when the allowance is short, as
+  the bot's own wraps do. Each answers at the broadcast of its deposit, redeem
+  or transfer (`wrapTx`, `unwrapTx` or `transferTx`) and confirms on the
+  detached task like the vault verbs, holding the lock and the guard until the
+  tx's fate is proven, or until a restart after a panic while confirming. The
+  redemption transfer is sent once and never retried, since it carries no
+  idempotency key. Once it confirms, the task frees the lock and the guard,
+  polls Alpaca until it detects the transfer and until the redemption finishes,
+  and logs the request id and the final status; a throttled lookup is waited out
+  inside the poll, as in the bot's own redemption jobs. Every capital route
+  refuses with `503` until startup completes, like `process-tx`, since the
   startup preflights (each chain's id, the inventory `OPERATOR_ROLE`) have not
   passed before then. Each route that sends a transaction runs it on a tracked
   detached task, like `process-tx`, so a client or load balancer timeout cannot

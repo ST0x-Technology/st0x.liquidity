@@ -478,7 +478,7 @@ async fn dispatch_capital<A: TokenSource + Sync>(
             client
                 .post_capital_json(
                     "/wrap-equity",
-                    &wire::EquityWrapperRequest {
+                    &wire::EquityWalletRequest {
                         symbol,
                         quantity,
                         chain: network.wire_name(),
@@ -494,7 +494,7 @@ async fn dispatch_capital<A: TokenSource + Sync>(
             client
                 .post_capital_json(
                     "/unwrap-equity",
-                    &wire::EquityWrapperRequest {
+                    &wire::EquityWalletRequest {
                         symbol,
                         quantity,
                         chain: network.wire_name(),
@@ -506,16 +506,14 @@ async fn dispatch_capital<A: TokenSource + Sync>(
             symbol,
             quantity,
             network,
-            redemption_wallet,
         } => {
             client
                 .post_capital_json(
                     "/redeem",
-                    &wire::RedeemRequest {
+                    &wire::EquityWalletRequest {
                         symbol,
                         quantity,
                         chain: network.wire_name(),
-                        redemption_wallet,
                     },
                 )
                 .await
@@ -1303,10 +1301,10 @@ mod tests {
         Ok(())
     }
 
-    /// Both wrapper verbs send the same body, each to its own route, with the
-    /// chain from `--network`.
+    /// The equity wallet verbs send the same body, each to its own route,
+    /// with the chain from `--network`; `redeem` names no redemption wallet.
     #[tokio::test]
-    async fn wrapper_verbs_post_the_symbol_quantity_and_chain()
+    async fn equity_wallet_verbs_post_the_symbol_quantity_and_chain()
     -> Result<(), Box<dyn std::error::Error>> {
         for (command, route) in [
             (
@@ -1325,6 +1323,14 @@ mod tests {
                 },
                 "unwrap-equity",
             ),
+            (
+                Capital::Redeem {
+                    symbol: "AAPL".to_owned(),
+                    quantity: "1.5".parse()?,
+                    network: HedgedChain::Ethereum,
+                },
+                "redeem",
+            ),
         ] {
             let request = request_for(Command::Capital(command)).await?;
             assert_eq!(
@@ -1335,43 +1341,6 @@ mod tests {
                 request_body(&request),
                 serde_json::json!({ "symbol": "AAPL", "quantity": "1.5", "chain": "ethereum" })
             );
-        }
-        Ok(())
-    }
-
-    /// `redeem` sends `redemptionWallet` only when given, so the bot falls
-    /// back to its configured wallet otherwise.
-    #[tokio::test]
-    async fn redeem_posts_the_redemption_wallet_only_when_given()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let wallet = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
-        for (redemption_wallet, expected) in [
-            (
-                None,
-                serde_json::json!({ "symbol": "TSLA", "quantity": "3", "chain": "base" }),
-            ),
-            (
-                Some(wallet.parse()?),
-                serde_json::json!({
-                    "symbol": "TSLA",
-                    "quantity": "3",
-                    "chain": "base",
-                    "redemptionWallet": wallet,
-                }),
-            ),
-        ] {
-            let request = request_for(Command::Capital(Capital::Redeem {
-                symbol: "TSLA".to_owned(),
-                quantity: "3".parse()?,
-                network: HedgedChain::Base,
-                redemption_wallet,
-            }))
-            .await?;
-            assert_eq!(
-                request_line(&request),
-                "POST /liquidity-capital/redeem HTTP/1.1"
-            );
-            assert_eq!(request_body(&request), expected);
         }
         Ok(())
     }
