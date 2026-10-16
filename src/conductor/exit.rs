@@ -54,7 +54,7 @@ impl ConductorExit {
         use ConductorExit::{GracefulShutdown, JobCleanup, Monitor, Supervisor};
         match self {
             Supervisor(Ok(())) => {
-                info!("Supervisor finished");
+                info!("Supervisor task has completed");
                 Ok(())
             }
 
