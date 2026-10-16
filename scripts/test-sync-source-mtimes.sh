@@ -98,6 +98,12 @@ expect_old src/added.rs
 sync prepare
 expect_new src/added.rs
 
+# A fresh disk holds a root-owned lost+found that the runner user cannot read.
+# prepare must still work with one on the disk.
+mkdir -p "$fixture/target/test/lost+found"
+chmod 000 "$fixture/target/test/lost+found"
+trap 'chmod 700 "$fixture/target/test/lost+found"; rm -rf "$fixture"' EXIT
+
 # A build that ran after the record (for example, a re-run of a run from
 # before this script) leaves newer fingerprints, so every source counts as
 # changed. Fingerprints older than the record keep the partial sync.
