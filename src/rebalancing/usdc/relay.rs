@@ -11102,7 +11102,8 @@ mod tests {
             .anvil_mine(Some(2), None)
             .await
             .unwrap();
-        let refusals: [(TxHash, fn(&RelayBridgeError, TxHash) -> bool); 5] = [
+        type Refused = fn(&RelayBridgeError, TxHash) -> bool;
+        let refusals: [(TxHash, Refused); 5] = [
             (other_sender, |error, superseding| {
                 matches!(
                     error,

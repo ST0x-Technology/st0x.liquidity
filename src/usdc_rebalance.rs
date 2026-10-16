@@ -5475,6 +5475,7 @@ impl EventSourced for UsdcRebalance {
         }
     }
 
+    #[expect(clippy::too_many_lines)]
     async fn transition(
         &self,
         command: Self::Command,

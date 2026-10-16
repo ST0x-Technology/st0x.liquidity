@@ -549,6 +549,7 @@ impl StoredOperation {
     /// [`Self::open_if_closed`] and every close/record-unmeasured arm is a no-op
     /// when the target run is already in its terminal shape, so replaying a
     /// fully-applied event sequence yields the same stage list and durations.
+    #[expect(clippy::too_many_lines)]
     fn apply(&mut self, operation_id: &UsdcRebalanceId, event: &UsdcRebalanceEvent) {
         use StoredStageName::*;
 

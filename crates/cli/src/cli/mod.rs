@@ -1725,7 +1725,7 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
                     id,
                     operator_tx: deposit_tx
                         .map(RecheckTx::Deposit)
-                        .or(superseding_tx.map(RecheckTx::Superseding)),
+                        .or_else(|| superseding_tx.map(RecheckTx::Superseding)),
                 },
             }),
         },
