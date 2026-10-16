@@ -16,6 +16,8 @@ use alloy::providers::ProviderBuilder;
 use alloy::providers::ext::AnvilApi as _;
 use alloy::signers::local::PrivateKeySigner;
 use rain_math_float::Float;
+#[cfg(feature = "test-support")]
+use st0x_evm::Chain;
 use st0x_execution::alpaca_broker_api::OrderStatus;
 use st0x_float_macro::float;
 #[cfg(feature = "test-support")]
@@ -1674,17 +1676,13 @@ async fn duplicate_event_delivery() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// RAI-199: when a job fails terminally, the bot must halt -- not
-/// silently continue processing subsequent events with stale state.
-///
-/// This is a stopgap: a single worker failure brings down the whole
-/// system. Future work (tracked in Linear) will add system-level
-/// invariant enforcement infrastructure and robust auto-recovery so
-/// individual worker failures are isolated and state inconsistencies
-/// are made impossible, rather than relying on a full halt.
+/// When a fill's accounting fails terminally, its chain must halt -- not
+/// silently continue processing later fills with stale state. The halt is
+/// the chain's alone: the process keeps running, so the other chains keep
+/// hedging.
 #[cfg(feature = "test-support")]
 #[test_log::test(tokio::test)]
-async fn job_failure_halts_bot() -> anyhow::Result<()> {
+async fn accounting_job_failure_halts_its_chain() -> anyhow::Result<()> {
     let onchain_price = float!(155.00);
     let broker_fill_price = float!(150.25);
     let sell_amount = float!(10.75);
@@ -1736,17 +1734,36 @@ async fn job_failure_halts_bot() -> anyhow::Result<()> {
         .call()
         .await?;
 
-    // The bot should exit -- the injected failure should halt processing
-    let join_result = tokio::time::timeout(Duration::from_secs(30), &mut bot)
-        .await
-        .expect("Bot should exit within 30s after terminal job failure");
-    let inner_result = join_result.expect("Bot task should fail, not panic");
-    let error = inner_result
-        .expect_err("Bot should fail after terminal job failure, not exit successfully");
-    let chain = format!("{error:#}");
+    // Attempts past the three in-process retries: the worker gave up on it.
+    let pool = connect_db(&infra.db_path).await?;
+    let base_accounting = format!(
+        "{}@{}",
+        std::any::type_name::<st0x_hedge::AccountForDexTrade>(),
+        Chain::Base
+    );
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let (failed,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM Jobs WHERE job_type = ? AND status = 'Failed' AND attempts > 3",
+            )
+            .bind(&base_accounting)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if failed == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("the failing fill should exhaust its retries within 30s");
+    pool.close().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
     assert!(
-        chain.contains("Apalis worker failed after retries"),
-        "Bot error chain should contain TerminalJobFailure, got: {chain}"
+        !bot.is_finished(),
+        "a chain's terminal accounting failure must not stop the bot"
     );
 
     // The second trade's onchain event should NOT have been processed
@@ -1759,6 +1776,7 @@ async fn job_failure_halts_bot() -> anyhow::Result<()> {
         "No new OnChainTrade events should be persisted after terminal failure"
     );
 
+    bot.abort();
     Ok(())
 }
 

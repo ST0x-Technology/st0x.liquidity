@@ -172,7 +172,8 @@ use crate::trading::onchain::skipped_fill::{
     SkipReason, record_skipped_fill, recorded_skip_detail,
 };
 use crate::trading::onchain::trade_accountant::{
-    DexTradeAccountingQueues, NormalizedFillEconomicsError, TradeAccountingError,
+    AccountForDexTrade, DexTradeAccountingJobQueue, DexTradeAccountingQueues,
+    NormalizedFillEconomicsError, TradeAccountingError,
 };
 use crate::unwrapped_equity_recovery::{
     UnwrappedEquityRecovery, UnwrappedEquityRecoveryId, UnwrappedEquityRecoveryServices,
@@ -860,6 +861,32 @@ where
             count,
             queue = queue_label,
             "Re-queued orphaned trading job(s) for crash-safe resume",
+        );
+    }
+
+    Ok(())
+}
+
+/// A `Failed` trade-accounting row is the fill that halted its chain. Every
+/// start re-drives it with a fresh budget: the chain hedges again once the
+/// cause is fixed, and halts again, paging, while it is not. The row is the
+/// only record of its fill, so it never ages out as a dead letter; an operator
+/// retires it by hedging the fill by hand and marking the row `Killed`.
+async fn redrive_halted_trade_accounting(
+    chain: Chain,
+    queue: &DexTradeAccountingJobQueue,
+) -> anyhow::Result<()> {
+    let count = queue.requeue_failed().await.with_context(|| {
+        format!("failed to re-drive the {chain} trade accounting jobs that halted the chain")
+    })?;
+
+    if count > 0 {
+        warn!(
+            target: "hedge",
+            %chain,
+            count,
+            "Re-driving the trade accounting job(s) that halted this chain; the same warning \
+             on every restart means a poison fill",
         );
     }
 
@@ -1959,6 +1986,9 @@ fn spawn_finished_job_cleanup(
             // A completed PollOrderStatus row at the backpressure limit is
             // likewise a durable dead-letter marker. Retain only that narrow
             // subset; ordinary completed poll rows remain disposable.
+            //
+            // A failed per-chain trade accounting row is the only record of
+            // the fill that halted its chain; startup re-drives it.
             let cleanup_result = sqlx_apalis::query(
                 "DELETE FROM Jobs \
                  WHERE job_type NOT IN (?, ?, ?, ?) \
@@ -1968,6 +1998,7 @@ fn spawn_finished_job_cleanup(
                      AND json_valid(CAST(job AS TEXT)) \
                      AND json_extract(CAST(job AS TEXT), '$.backpressure_streak') >= ? \
                  ) \
+                 AND NOT (job_type LIKE ? AND status = ?) \
                  AND ( \
                      status = ? \
                      OR status = ? \
@@ -1981,6 +2012,8 @@ fn spawn_finished_job_cleanup(
             .bind(std::any::type_name::<PollOrderStatus>())
             .bind(Status::Done.to_string())
             .bind(i64::from(BACKPRESSURE_RESCHEDULE_LIMIT))
+            .bind(format!("{}@%", std::any::type_name::<AccountForDexTrade>()))
+            .bind(Status::Failed.to_string())
             .bind(Status::Done.to_string())
             .bind(Status::Killed.to_string())
             .bind(Status::Failed.to_string())
@@ -13474,6 +13507,40 @@ mod tests {
             remaining, expected,
             "transfer rows and the exhausted poll marker must survive cleanup"
         );
+    }
+
+    /// A failed per-chain accounting row is the only record of the fill that
+    /// halted its chain, so the sweep keeps it even past its retry budget.
+    #[tokio::test]
+    async fn spawn_finished_job_cleanup_retains_failed_accounting_rows() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let accounting = std::any::type_name::<AccountForDexTrade>();
+        let halting = format!("{accounting}@hyperevm");
+        insert_job_row(&apalis_pool, "halting", &halting, Status::Failed, 25, 25).await;
+        insert_job_row(
+            &apalis_pool,
+            "accounted",
+            &format!("{accounting}@base"),
+            Status::Done,
+            1,
+            25,
+        )
+        .await;
+
+        let handle = spawn_finished_job_cleanup(
+            pool.clone(),
+            apalis_pool.clone(),
+            Duration::from_secs(60),
+            crate::startup::StartupBarrier::new().token(),
+        );
+        wait_for_job_count(&apalis_pool, 1).await;
+        handle.abort();
+
+        let remaining: Vec<String> = sqlx_apalis::query_scalar("SELECT job_type FROM Jobs")
+            .fetch_all(&apalis_pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining, [halting]);
     }
 
     #[test]

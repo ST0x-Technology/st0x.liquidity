@@ -26,8 +26,8 @@ use super::exit::MonitorTaskError;
 #[cfg(any(test, feature = "test-support"))]
 use super::job::FailureInjector;
 use super::job::{
-    TerminalFailureInfo, TerminalFailureSignal, build_best_effort_worker, build_supervised_worker,
-    build_worker_inner,
+    CHAIN_OBSERVE_ONLY_GAUGE, TerminalFailureInfo, TerminalFailureSignal, build_best_effort_worker,
+    build_chain_scoped_worker, build_supervised_worker, build_worker_inner,
 };
 use super::monitor::executor_maintenance::ExecutorMaintenance;
 use super::monitor::gas::GasMonitor;
@@ -1077,7 +1077,7 @@ where
         let failure_notify_for_usdc_rebalancing_check = failure_notify.clone();
         let failure_notify_for_seed_vault_registry = failure_notify.clone();
         let failure_notify_for_check_positions = failure_notify.clone();
-        let failure_notify_for_select = failure_notify.clone();
+        let failure_notify_for_select = failure_notify;
         let best_effort_notifier_for_portfolio_snapshot = Arc::clone(&best_effort_failure_notifier);
 
         let accountant_ctx_for_backfill = accountant_ctx.clone();
@@ -1111,7 +1111,6 @@ where
                 monitor,
                 &accounting_queues,
                 &accountant_ctx,
-                &failure_notify,
                 #[cfg(any(test, feature = "test-support"))]
                 &failure_injector,
             );
@@ -1576,13 +1575,12 @@ fn register_unwrapped_equity_recovery_worker(
     })
 }
 
-/// Registers one supervised trade-accounting worker per hedged chain, so a
-/// slow chain's fill backlog never delays another chain's hedges.
+/// Registers one trade-accounting worker per hedged chain, so a slow chain's
+/// fill backlog never delays another chain's hedges.
 fn register_trade_accounting_workers<Prov, Exec>(
     mut monitor: Monitor,
     accounting_queues: &DexTradeAccountingQueues,
     accountant_ctx: &Arc<AccountantCtx<Prov, Exec>>,
-    failure_notify: &Arc<TerminalFailureSignal>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: &FailureInjector,
 ) -> Monitor
 where
@@ -1590,21 +1588,23 @@ where
     Exec: Executor + Clone + Send + Sync + 'static,
     TradeAccountingError: From<Exec::Error>,
 {
-    // Supervised: losing trade accounting compromises hedging state.
+    // Chain-scoped: a fill that cannot be accounted stops hedging on its own
+    // chain only, since the other chains' fills do not depend on it.
     for (worker_chain, chain_queue) in accounting_queues.iter() {
         let chain_queue = chain_queue.clone();
         let worker_chain = *worker_chain;
         let accountant_ctx = accountant_ctx.clone();
-        let failure_notify = failure_notify.clone();
         #[cfg(any(test, feature = "test-support"))]
         let failure_injector = failure_injector.clone();
+        metrics::gauge!(CHAIN_OBSERVE_ONLY_GAUGE, "chain" => worker_chain.as_str()).set(0.0);
         monitor = monitor.register(move |index| {
-            build_supervised_worker!(
+            build_chain_scoped_worker!(
                 ::<AccountantCtx<Prov, Exec>, AccountForDexTrade>,
+                worker_chain,
                 format_args!("{worker_chain}-{index}"),
                 chain_queue.clone(),
                 accountant_ctx.clone(),
-                failure_notify.clone(),
+                Arc::clone(&accountant_ctx.notifier),
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector.clone(),
             )
@@ -1797,7 +1797,9 @@ mod tests {
     };
     use st0x_event_sorcery::test_store;
     use st0x_evm::USDC_HYPEREVM;
-    use st0x_execution::{FractionalShares, MockExecutorCtx, Symbol, TryIntoExecutor};
+    use st0x_execution::{
+        FractionalShares, MockExecutor, MockExecutorCtx, Symbol, TryIntoExecutor,
+    };
     use st0x_finance::Usdc;
     use st0x_float_macro::float;
     use st0x_raindex::Raindex;
@@ -3167,16 +3169,21 @@ mod tests {
         .expect("the poison fill must fail terminally");
     }
 
-    /// A poison fill on one chain must stop only that chain's accounting:
-    /// the process keeps running, the other chain keeps hedging, and the
-    /// operator is paged once with the chain and the fill.
-    #[tokio::test]
-    async fn terminal_accounting_failure_on_one_chain_leaves_other_chains_hedging() {
+    /// Base hedges AAPL and HyperEVM hedges COIN, each on its own queue.
+    struct TwoChainAccounting {
+        pool: SqlitePool,
+        apalis_pool: apalis_sqlite::SqlitePool,
+        accounting_queues: DexTradeAccountingQueues,
+        accountant_ctx: Arc<AccountantCtx<MockedNode, MockExecutor>>,
+        notifier: Arc<CapturingNotifier>,
+    }
+
+    const BASE_EQUITY: Address = Address::repeat_byte(0x91);
+    const HYPEREVM_EQUITY: Address = Address::repeat_byte(0x98);
+
+    async fn two_chain_accounting() -> TwoChainAccounting {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (base_fill, base_owner) =
-            hedgeable_fill(Chain::Base, st0x_evm::USDC_BASE, Address::repeat_byte(0x91));
-        let (poison_fill, hyperevm_owner) =
-            hedgeable_fill(Chain::HyperEvm, USDC_HYPEREVM, Address::repeat_byte(0x98));
+        let (_, owner) = hedgeable_fill(Chain::Base, st0x_evm::USDC_BASE, BASE_EQUITY);
 
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.chains
@@ -3185,9 +3192,9 @@ mod tests {
 
         let cache = SymbolCache::default();
         cache.preload_symbol(Chain::Base, st0x_evm::USDC_BASE, "USDC");
-        cache.preload_symbol(Chain::Base, Address::repeat_byte(0x91), "wtAAPL");
+        cache.preload_symbol(Chain::Base, BASE_EQUITY, "wtAAPL");
         cache.preload_symbol(Chain::HyperEvm, USDC_HYPEREVM, "USDC");
-        cache.preload_symbol(Chain::HyperEvm, Address::repeat_byte(0x98), "wtCOIN");
+        cache.preload_symbol(Chain::HyperEvm, HYPEREVM_EQUITY, "wtCOIN");
         let notifier = Arc::new(CapturingNotifier::default());
         let mut accountant_ctx = build_test_accountant_ctx(
             pool.clone(),
@@ -3202,70 +3209,163 @@ mod tests {
         accountant_ctx.notifier = notifier.clone();
         accountant_ctx.chains.insert(
             Chain::Base,
-            hedging_chain(
-                &apalis_pool,
-                Chain::Base,
-                base_owner,
-                "AAPL",
-                Address::repeat_byte(0x91),
-            ),
+            hedging_chain(&apalis_pool, Chain::Base, owner, "AAPL", BASE_EQUITY),
         );
         accountant_ctx.chains.insert(
             Chain::HyperEvm,
             hedging_chain(
                 &apalis_pool,
                 Chain::HyperEvm,
-                hyperevm_owner,
+                owner,
                 "COIN",
-                Address::repeat_byte(0x98),
+                HYPEREVM_EQUITY,
             ),
         );
-        let accountant_ctx = Arc::new(accountant_ctx);
 
-        let mut hyperevm_queue = accounting_queues
-            .for_chain(Chain::HyperEvm)
-            .cloned()
-            .unwrap();
-        let hyperevm_job_type = hyperevm_queue.queue_key().to_owned();
-        let mut base_queue = accounting_queues.for_chain(Chain::Base).cloned().unwrap();
-        hyperevm_queue.push(poison_fill).await.unwrap();
+        TwoChainAccounting {
+            pool,
+            apalis_pool,
+            accounting_queues,
+            accountant_ctx: Arc::new(accountant_ctx),
+            notifier,
+        }
+    }
 
-        let failure_injector = FailureInjector::new();
-        failure_injector.arm(crate::conductor::job::JobKind::OrderFill);
-        let failure_notify = Arc::new(TerminalFailureSignal::default());
-        let monitor = register_trade_accounting_workers(
-            Monitor::new().should_restart(|_ctx, _error, _attempt| false),
-            &accounting_queues,
-            &accountant_ctx,
-            &failure_notify,
-            &failure_injector,
-        );
-        let monitor_handle = tokio::spawn(async move { monitor.run().await });
+    impl TwoChainAccounting {
+        fn queue(&self, chain: Chain) -> DexTradeAccountingJobQueue {
+            self.accounting_queues.for_chain(chain).cloned().unwrap()
+        }
 
-        wait_for_failed_row(&apalis_pool, &hyperevm_job_type).await;
-        tokio::time::timeout(Duration::from_secs(1), failure_notify.notified())
+        fn spawn_workers(&self, failure_injector: &FailureInjector) -> tokio::task::JoinHandle<()> {
+            let monitor = register_trade_accounting_workers(
+                Monitor::new().should_restart(|_ctx, _error, _attempt| false),
+                &self.accounting_queues,
+                &self.accountant_ctx,
+                failure_injector,
+            );
+            tokio::spawn(async move {
+                monitor.run().await.unwrap();
+            })
+        }
+
+        /// Pushes a HyperEVM fill that fails every attempt and waits until it
+        /// has halted HyperEVM's worker.
+        async fn halt_hyperevm(&self) -> tokio::task::JoinHandle<()> {
+            let (poison_fill, _) = hedgeable_fill(Chain::HyperEvm, USDC_HYPEREVM, HYPEREVM_EQUITY);
+            let mut hyperevm_queue = self.queue(Chain::HyperEvm);
+            hyperevm_queue.push(poison_fill).await.unwrap();
+
+            let failure_injector = FailureInjector::new();
+            failure_injector.arm(crate::conductor::job::JobKind::OrderFill);
+            let monitor_handle = self.spawn_workers(&failure_injector);
+            wait_for_failed_row(&self.apalis_pool, hyperevm_queue.queue_key()).await;
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while self.notifier.messages().is_empty() {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
             .await
-            .expect_err("one chain's poison fill must not fail-stop the process");
+            .expect("the halt must page the operator");
 
-        base_queue.push(base_fill).await.unwrap();
-        wait_for_placed_hedges(&pool, 1).await;
+            monitor_handle
+        }
+    }
 
-        let messages = notifier.messages();
+    /// A poison fill on one chain must stop only that chain's accounting:
+    /// the process keeps running, the other chain keeps hedging, the failed
+    /// chain's later fills wait unhedged, and the operator is paged once with
+    /// the chain and the fill.
+    #[tokio::test]
+    async fn terminal_accounting_failure_on_one_chain_leaves_other_chains_hedging() {
+        let accounting = two_chain_accounting().await;
+        let monitor_handle = accounting.halt_hyperevm().await;
+
+        let (mut later_hyperevm_fill, _) =
+            hedgeable_fill(Chain::HyperEvm, USDC_HYPEREVM, HYPEREVM_EQUITY);
+        later_hyperevm_fill.trade.log_index += 1;
+        accounting
+            .queue(Chain::HyperEvm)
+            .push(later_hyperevm_fill)
+            .await
+            .unwrap();
+        let (base_fill, _) = hedgeable_fill(Chain::Base, st0x_evm::USDC_BASE, BASE_EQUITY);
+        accounting.queue(Chain::Base).push(base_fill).await.unwrap();
+        wait_for_placed_hedges(&accounting.pool, 1).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert_eq!(
+            placed_hedges(&accounting.pool).await,
+            1,
+            "only the Base fill may be hedged"
+        );
+        let hyperevm_rows: Vec<String> =
+            sqlx_apalis::query_scalar("SELECT status FROM Jobs WHERE job_type = ? ORDER BY rowid")
+                .bind(accounting.queue(Chain::HyperEvm).queue_key())
+                .fetch_all(&accounting.apalis_pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            hyperevm_rows,
+            ["Failed", "Pending"],
+            "the poison row stays recorded and the later HyperEVM fill waits"
+        );
+
+        let messages = accounting.notifier.messages();
         assert_eq!(
             messages.len(),
             1,
             "the operator is paged once: {messages:?}"
         );
         assert!(
-            messages[0].contains("hyperevm")
-                && messages[0].contains("TakeOrderV3:hyperevm:12345:293"),
-            "the page must name the chain and the fill: {}",
+            messages[0].contains("TakeOrderV3:hyperevm:12345:293")
+                && messages[0].contains("hyperevm is now observe-only"),
+            "the page must name the fill and the halted chain: {}",
             messages[0]
         );
         assert!(
             !monitor_handle.is_finished(),
             "the other chain's worker must keep running"
         );
+        monitor_handle.abort();
+    }
+
+    /// The halting row must survive as more than a dead letter: the next start
+    /// re-drives it, even past its durable retry budget, and once its cause
+    /// is gone the chain hedges again.
+    #[tokio::test]
+    async fn restart_redrives_the_fill_that_halted_its_chain() {
+        let accounting = two_chain_accounting().await;
+        accounting.halt_hyperevm().await.abort();
+        let hyperevm_queue = accounting.queue(Chain::HyperEvm);
+        sqlx_apalis::query("UPDATE Jobs SET attempts = max_attempts WHERE job_type = ?")
+            .bind(hyperevm_queue.queue_key())
+            .execute(&accounting.apalis_pool)
+            .await
+            .unwrap();
+        assert_eq!(placed_hedges(&accounting.pool).await, 0);
+
+        crate::conductor::redrive_halted_trade_accounting(Chain::HyperEvm, &hyperevm_queue)
+            .await
+            .unwrap();
+        let monitor_handle = accounting.spawn_workers(&FailureInjector::new());
+
+        wait_for_placed_hedges(&accounting.pool, 1).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status: String =
+                    sqlx_apalis::query_scalar("SELECT status FROM Jobs WHERE job_type = ?")
+                        .bind(hyperevm_queue.queue_key())
+                        .fetch_one(&accounting.apalis_pool)
+                        .await
+                        .unwrap();
+                if status == "Done" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the re-driven fill must complete");
         monitor_handle.abort();
     }
 }

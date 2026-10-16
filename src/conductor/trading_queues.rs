@@ -15,7 +15,7 @@ use tracing::warn;
 use st0x_event_sorcery::{Projection, Store};
 use st0x_execution::SupportedExecutor;
 
-use super::{requeue_recovery_orphans, requeue_trading_orphans};
+use super::{redrive_halted_trade_accounting, requeue_recovery_orphans, requeue_trading_orphans};
 use crate::equity_redemption::EquityRedemption;
 use crate::inventory::BroadcastingInventory;
 use crate::offchain::order::{
@@ -99,6 +99,7 @@ pub(super) async fn setup_trading_job_queues(
     // checkpoint advances, its job row is the only record of the fill.
     for (chain, accounting_queue) in accounting_queues.iter() {
         requeue_trading_orphans(accounting_queue, &format!("{chain} trade accounting")).await?;
+        redrive_halted_trade_accounting(*chain, accounting_queue).await?;
     }
     requeue_trading_orphans(&hedge_queue, "hedge placement").await?;
     requeue_trading_orphans(&poll_status_queue, "order status polling").await?;
