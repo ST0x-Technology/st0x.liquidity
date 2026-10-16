@@ -93,7 +93,7 @@ end
 expected_wiring = {
   "backend-build" => { "needs" => nil, "if" => nil },
   "backend-lint" => { "needs" => nil, "if" => nil },
-  "backend-test" => { "needs" => "backend-build", "if" => nil },
+  "backend-test" => { "needs" => nil, "if" => nil },
   "backend" => {
     "needs" => %w[backend-build backend-lint backend-test],
     "if" => "${{ always() }}"
@@ -392,6 +392,11 @@ assert_count 2 '          ./scripts/sync-source-mtimes.sh prepare'
 assert_count 2 '            ./scripts/sync-source-mtimes.sh record'
 assert_line '        run: ./scripts/test-sync-source-mtimes.sh'
 assert_count 2 '            ./scripts/clean-stale-rain-math-float.sh'
+# The test shards start with the run and wait for backend-build themselves, so
+# they must fail unless it succeeded, and their token stays read-only.
+assert_line '              "completed success") exit 0 ;;'
+assert_line '              completed*)'
+assert_line '      actions: read'
 assert_line '        run: ./scripts/test-clean-stale-rain-math-float.sh'
 
 if grep -R -n -F 'external-pr/' \

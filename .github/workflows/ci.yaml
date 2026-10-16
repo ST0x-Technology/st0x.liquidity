@@ -307,11 +307,17 @@ jobs:
             ./scripts/sync-source-mtimes.sh record
           "
 
+  # The shards start with the run instead of after backend-build: they install
+  # Nix and realize the dev shell while the archive compiles, then wait for
+  # backend-build through the read-only Actions API and fail if it does not
+  # succeed. That moves ~35 s of setup per shard off the critical path.
   backend-test:
     name: backend test ${{ matrix.partition }} of 8
-    needs: backend-build
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
     strategy:
       fail-fast: false
 
@@ -356,11 +362,36 @@ jobs:
           gc-max-store-size-linux: 8G
           save: ${{ env.UNTRUSTED_PR != 'true' }}
 
+      - name: Realize the backend dev shell
+        run: nix develop .#ci-backend -c true
+
+      # filter=latest reports each job's most recent attempt, so a re-run of
+      # only the failed shards still sees the backend-build that succeeded.
+      - name: Wait for backend build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          while :; do
+            state=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=latest&per_page=100" \
+              --jq '.jobs[] | select(.name == "backend build") | "\(.status) \(.conclusion)"')
+            case "$state" in
+              "completed success") exit 0 ;;
+              completed*)
+                echo "backend build did not succeed: $state" >&2
+                exit 1
+                ;;
+            esac
+            sleep 5
+          done
+
+      # A re-run of only the failed shards has a new run_attempt, while the
+      # archive belongs to the attempt whose backend-build succeeded.
       - name: Restore nextest archive
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6
         with:
           path: ${{ runner.temp }}/nextest-archive.tar.zst
           key: ${{ runner.os }}-nextest-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ${{ runner.os }}-nextest-${{ github.run_id }}-
           fail-on-cache-miss: true
 
       # Test binaries come from the archive built in backend-build; no recompile.

@@ -86,6 +86,16 @@ Use a pull request event for merge-blocking validation. Reserve
 `workflow_dispatch` for manual runs whose result does not need to become a pull
 request status check.
 
+## Test shards
+
+The eight `backend test` shards do not `need` `backend build`. They start with
+the run, install Nix, and realize the `ci-backend` dev shell while the archive
+compiles. Then they poll the run's jobs through the Actions API
+(`actions: read`) until `backend build` completes, and fail unless it succeeded.
+A re-run of only the failed shards restores the archive from the attempt whose
+build succeeded. The slowest e2e tests (about 80 s) start first, so a shard
+takes little more than its slowest test.
+
 ## Persistent target directories
 
 `backend build` and `backend lint` keep their cargo target directories
