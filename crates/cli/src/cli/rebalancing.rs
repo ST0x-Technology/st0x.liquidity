@@ -1052,17 +1052,11 @@ async fn run_usdc_transfer<Writer: Write>(
         .with_backpressure_policy(BackpressurePolicy::Return),
     );
 
-    let bridge = Arc::new(CctpBridge::try_from_ctx(CctpCtx {
-        corridor: rebalancing_ctx.cctp_corridor,
-        ethereum_wallet: wallet_ctx.ethereum_wallet().clone(),
-        base_wallet: chain_wallet.clone(),
-        #[cfg(any(test, feature = "test-support"))]
-        circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
-        #[cfg(any(test, feature = "test-support"))]
-        token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
-        #[cfg(any(test, feature = "test-support"))]
-        message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
-    })?);
+    let bridge = Arc::new(CctpBridge::try_from_ctx(CctpCtx::new(
+        rebalancing_ctx.cctp_corridor,
+        wallet_ctx.ethereum_wallet().clone(),
+        chain_wallet.clone(),
+    ))?);
 
     let vault_service = Arc::new(RaindexService::new(
         chain_wallet.clone(),
@@ -1666,17 +1660,11 @@ pub(super) async fn verify_deposit_send_superseded_on_chain(
     superseding_tx: Option<TxHash>,
 ) -> anyhow::Result<()> {
     let wallet_ctx = ctx.wallet()?;
-    let bridge = CctpBridge::try_from_ctx(CctpCtx {
-        corridor: ctx.rebalancing.cctp_corridor,
-        ethereum_wallet: wallet_ctx.ethereum_wallet().clone(),
-        base_wallet: wallet_ctx.base_wallet().clone(),
-        #[cfg(any(test, feature = "test-support"))]
-        circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
-        #[cfg(any(test, feature = "test-support"))]
-        token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
-        #[cfg(any(test, feature = "test-support"))]
-        message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
-    })?;
+    let bridge = CctpBridge::try_from_ctx(CctpCtx::new(
+        ctx.rebalancing.cctp_corridor,
+        wallet_ctx.ethereum_wallet().clone(),
+        wallet_ctx.base_wallet().clone(),
+    ))?;
 
     Ok(verify_deposit_send_superseded(
         &bridge,

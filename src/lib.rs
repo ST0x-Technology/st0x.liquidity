@@ -52,7 +52,7 @@ mod cctp_burn;
 mod conductor;
 pub(crate) mod dashboard;
 mod database_file_lock;
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub mod e2e_support;
 mod equity_redemption;
 mod iap_auth;
@@ -81,7 +81,7 @@ mod telemetry;
 mod tls;
 mod trading;
 mod trading_schedule;
-#[cfg(feature = "mock")]
+#[cfg(any(test, feature = "mock"))]
 pub use st0x_tokenization::mock_api;
 mod tokenized_equity_mint;
 mod unwrapped_equity_recovery;
@@ -150,7 +150,7 @@ pub use st0x_config::{
 pub use st0x_config::{
     ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, OperationMode, RebalancingMode,
 };
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub use trading::onchain::trade_accountant::AccountForDexTrade;
 
 #[cfg(test)]

@@ -1356,7 +1356,7 @@ where
 }
 
 /// Generic apalis handler -- production build.
-#[cfg(not(feature = "test-support"))]
+#[cfg(not(any(test, feature = "test-support")))]
 pub(crate) async fn work<Ctx, J>(
     job: J,
     ctx: Data<Arc<Ctx>>,

@@ -3500,7 +3500,7 @@ fn relay_hop_setups(
             })?;
 
             let client = RelayClient::new(Some(api_key))?;
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             let client = match &rebalancing_ctx.relay_api_base {
                 Some(api_base) => client.with_api_base(api_base.clone()),
                 None => client,
