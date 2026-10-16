@@ -17,7 +17,10 @@
 set -euo pipefail
 
 job_name=${1:?usage: $0 <job name>}
-poll_seconds=${WAIT_FOR_JOB_POLL_SECONDS:-10}
+# A 304 does not count against the primary rate limit, but every poll counts
+# toward GitHub's secondary limits, and a stack submit starts several runs at
+# once. 5 s keeps those runs well under the limit and the shards' wait short.
+poll_seconds=${WAIT_FOR_JOB_POLL_SECONDS:-5}
 # The run lists every job from its start, so a job that is missing for this
 # long does not exist (for example, after a rename).
 lookup_seconds=${WAIT_FOR_JOB_LOOKUP_SECONDS:-300}
