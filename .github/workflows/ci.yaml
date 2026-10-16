@@ -342,7 +342,9 @@ jobs:
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 30
     env:
-      CARGO_INCREMENTAL: "1"
+      # Non-incremental: clippy-ci.sh runs the parallel frontend, which crashed
+      # rustc's incremental dependency graph.
+      CARGO_INCREMENTAL: "0"
       CARGO_TARGET_DIR: target/lint
       # Registry and git sources live on the same sticky disk. Swatinem's
       # rust-cache is not used here: its save step prunes workspace-crate and
@@ -461,7 +463,7 @@ jobs:
           nix develop .#ci-backend -c bash -c "
             set -euxo pipefail
             ./scripts/clean-stale-rain-math-float.sh
-            cargo clippy --workspace --all-targets --all-features
+            ./scripts/clippy-ci.sh
             ./scripts/sync-source-mtimes.sh record
           "
 
@@ -903,6 +905,9 @@ jobs:
 
       - name: rustc parallel frontend wrapper invariants
         run: ./scripts/test-rustc-parallel-frontend.sh
+
+      - name: clippy CI wrapper invariants
+        run: ./scripts/test-clippy-ci.sh
 
       - name: CI job wait invariants
         run: ./scripts/test-wait-for-job.sh

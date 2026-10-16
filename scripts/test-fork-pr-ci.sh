@@ -441,6 +441,9 @@ assert_line '        run: ./scripts/test-sync-source-mtimes.sh'
 # wrapper's own test runs in the hooks job.
 assert_count 2 "      RUSTC_WORKSPACE_WRAPPER: \${{ github.workspace }}/scripts/rustc-parallel-frontend.sh"
 assert_line '        run: ./scripts/test-rustc-parallel-frontend.sh'
+# Clippy runs the parallel frontend through clippy-ci.sh, non-incrementally.
+assert_line '            ./scripts/clippy-ci.sh'
+assert_line '        run: ./scripts/test-clippy-ci.sh'
 assert_count 4 '            ./scripts/clean-stale-rain-math-float.sh'
 # The test shards start with the run and wait for backend-build themselves.
 # wait-for-job.sh fails unless the build succeeded (test-wait-for-job.sh checks
