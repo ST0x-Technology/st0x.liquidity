@@ -760,9 +760,9 @@ WorkerBuilder::new(name)
   exhausts), `Event::Success`, `Event::Start`, `Event::Stop`. Supervised workers
   record failure info and call `ctx.stop()`. Best-effort workers inspect the
   carried SQLite attempt metadata, alert only when the row is durably terminal,
-  and never stop the worker or conductor. Chain-scoped workers
-  (`build_chain_scoped_worker!`, trade accounting) stop only themselves and page
-  from `on_event`, without the conductor-wide signal; see
+  and never stop the worker or conductor. Trade-accounting workers run outside
+  the monitor, one loop per chain, and a terminal failure stops only that
+  chain's worker until its re-drive; see
   [AccountForDexTrade](#accountfordextrade).
 
 ### Error propagation: handler failure -> bot shutdown
@@ -848,8 +848,8 @@ Monitor::new()
 ```
 
 `should_restart(false)` — terminal job failure is fail-stop. The worker must not
-restart and process the next job with stale state. For a chain-scoped worker the
-stop is the chain's alone; the monitor and every other worker keep running.
+restart and process the next job with stale state. Trade-accounting workers are
+not registered here; their per-chain loops restart them on an interval.
 
 ### AccountForDexTrade
 
@@ -877,27 +877,38 @@ so this holds for an automatic deploy-rs rollback after a later startup failure
 too. After any rollback past this change, move them back:
 `UPDATE Jobs SET job_type = '<type_name>' WHERE job_type LIKE '<type_name>@%' AND (status IN ('Pending', 'Queued', 'Running') OR (status = 'Failed' AND attempts < max_attempts))`.
 
-A terminal failure (retries exhausted) halts only that chain's worker
-(`on_chain_terminal_failure`): no conductor-wide signal, no process exit. The
-chain's later fills wait in its queue, so none of them reaches `Position` or a
-broker order, while other chains keep hedging. The handler pages once with the
-chain, the job label (event kind, chain, block, log index) and the row id, and
-sets `trade_accounting_observe_only{chain}` to 1. The page is a detached
-`tokio::spawn`, as for best-effort workers: the process does not exit, so it
-cannot race teardown. The `Failed` row stays: the retention sweep keeps
-`{type_name}@{chain}` rows in `Failed`, and `redrive_halted_trade_accounting`
-resets them to `Pending` with `attempts = 0` at every start, before workers
-spawn. A fixed cause therefore clears the halt on the next restart, and a poison
-fill halts the chain again and pages again. Unlike the process-wide fail-stop,
-which systemd restarts after 30s, nothing restarts a halted chain: even a
-transient cause that outlasts the 1s/2s/4s retries keeps it halted until an
-operator restarts the bot. The failing fill itself may already be in `Position`
-(it failed after the position update), and then `CheckPositions` hedges it; a
-re-drive of such a row is idempotent on `(tx_hash, log_index)`. To retire a fill
-that can never be accounted, take its `trade.tx_hash` from the row's `job`
-payload (the page names the chain, block and log index) and look for its fill on
-`Position`. An `OnChainTrade` alone proves nothing: it is written before the
-position update.
+A terminal failure (retries exhausted) halts only that chain's worker. The
+accounting workers run outside the apalis monitor, one loop per chain
+(`src/conductor/chain_accounting.rs`), because the monitor restarts a stopped
+worker either at once or never, and a halted chain must wait between re-drives.
+A terminal `Event::Error` stops that chain's worker: no conductor-wide signal,
+no process exit. The chain's later fills wait in its queue, so none of them
+reaches `Position` or a broker order, while other chains keep hedging. The loop
+pages once per halt with the chain, the job label (event kind, chain, block, log
+index) and the row id, and sets `trade_accounting_observe_only{chain}` to 1.
+
+Every `trade_accounting_redrive_interval_secs` the loop frees the stopped
+worker's prefetched rows (`requeue_orphaned`), resets the `Failed` row to
+`Pending` with `attempts = 0` (`requeue_failed`, keeping its `run_at`, so it is
+fetched first) and starts a new worker generation. Each generation has its own
+name, `order-fill-worker-{chain}-{generation}`: apalis refuses a worker name
+whose previous holder heartbeated within its 30s keep-alive. A re-drive that
+fails again halts the same row and logs, without a second page. The first job a
+generation completes lifts the halt: the loop logs
+`Trade accounting on {chain} resumed`, and the gauge returns to 0. A row an
+operator marks `Killed` (or deletes) lifts the halt at the next interval without
+a re-drive, and the fills behind it follow. A failed status lookup or re-queue
+is logged and retried at the next interval; the chain stays halted. The
+retention sweep keeps `{type_name}@{chain}` rows in `Failed`, and
+`redrive_halted_trade_accounting` also resets them at every start, before
+workers spawn.
+
+The failing fill itself may already be in `Position` (it failed after the
+position update), and then `CheckPositions` hedges it; a re-drive of such a row
+is idempotent on `(tx_hash, log_index)`. To retire a fill that can never be
+accounted, take its `trade.tx_hash` from the row's `job` payload (the page names
+the chain, block and log index) and look for its fill on `Position`. An
+`OnChainTrade` alone proves nothing: it is written before the position update.
 
 ```sql
 SELECT COUNT(*) FROM events
@@ -909,8 +920,9 @@ WHERE aggregate_type = 'Position'
 ```
 
 If it is there, the position check hedges it: do not hedge it by hand. If not,
-hedge it by hand. Either way, set the row to `Killed` and restart; never reset a
-fill hedged by hand to `Pending`, since that hedges it twice.
+hedge it by hand. Either way, set the row to `Killed`; no restart is needed.
+Never leave a fill hedged by hand `Failed` or reset it to `Pending`, since the
+re-drive hedges it twice.
 
 Implements `Job<AccountantCtx<Node, Exec>>`. The `perform()` method runs the
 hedging pipeline:

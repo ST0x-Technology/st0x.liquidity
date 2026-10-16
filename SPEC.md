@@ -636,24 +636,26 @@ excellent async ecosystem for handling concurrent trading flows.
   every other chain keeps hedging and the process keeps running, also when the
   halted chain is the only one. The operator is paged once per halt with the
   chain, the fill (event kind, chain, block, log index) and its job row, and the
-  `trade_accounting_observe_only` gauge reads 1 for the chain. The failed job
-  row is the record of the halt: it stays `Failed` in the chain's queue, the
-  retention sweep keeps it, and every start re-drives it with a fresh retry
-  budget, so the chain hedges again once the cause is fixed and halts again,
-  paging, while it is not. The halt never lifts by itself, not even after a
-  transient cause such as an RPC outage that outlasts the in-process retries:
-  the operator restarts the bot to re-drive the row. The failing fill itself may
-  already be in `Position` (a step after the position update failed), and then
-  the position check hedges it. To retire a fill that can never be accounted,
-  check whether `Position` already records the fill (its `OnChainTrade` alone
-  proves nothing: it is written before the position update; docs/conductor.md
-  has the query). If it does, the position check hedges it; if not, hedge it by
-  hand. Either way mark its row `Killed` and restart. A restart without `Killed`
-  re-drives the row and can hedge the fill a second time. The halt covers
-  hedging only: rebalancing, transfers and vault balance polling on that chain
-  continue. Every poll interval the monitor enqueues a backfill range covering
-  the blocks since the persisted checkpoint, capped at the configured ingestion
-  cutoff block (must be explicitly configured; recommended value: `safe`, i.e.
+  `trade_accounting_observe_only` gauge reads 1 for the chain. Every
+  `trade_accounting_redrive_interval_secs` (required top-level setting,
+  non-zero, no default) the halted chain re-drives the failed row with a fresh
+  retry budget, ahead of the fills queued behind it. A re-drive that fails again
+  is the same halt and does not page again. When the row is accounted, or as
+  soon as an operator marks it `Killed`, the chain resumes without a restart: it
+  logs the recovery, the gauge returns to 0, and the queued fills follow in
+  order. The failed row stays `Failed` in the chain's queue between re-drives
+  and the retention sweep keeps it; a start also re-drives it at once. The
+  failing fill itself may already be in `Position` (a step after the position
+  update failed), and then the position check hedges it. To retire a fill that
+  can never be accounted, check whether `Position` already records the fill (its
+  `OnChainTrade` alone proves nothing: it is written before the position update;
+  docs/conductor.md has the query). If it does, the position check hedges it; if
+  not, hedge it by hand. Either way mark its row `Killed`; a row left `Failed`
+  is re-driven and can hedge the fill a second time. The halt covers hedging
+  only: rebalancing, transfers and vault balance polling on that chain continue.
+  Every poll interval the monitor enqueues a backfill range covering the blocks
+  since the persisted checkpoint, capped at the configured ingestion cutoff
+  block (must be explicitly configured; recommended value: `safe`, i.e.
   `eth_getBlockByNumber("safe")`); the backfill worker fetches the `Clear` and
   `TakeOrder` logs for the arbitrageur's owner address and advances the
   checkpoint only on success. `required_confirmations` governs
