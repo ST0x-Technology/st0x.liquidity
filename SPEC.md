@@ -645,15 +645,17 @@ excellent async ecosystem for handling concurrent trading flows.
   the operator restarts the bot to re-drive the row. The failing fill itself may
   already be in `Position` (a step after the position update failed), and then
   the position check hedges it. To retire a fill that can never be accounted,
-  first check that it has no `OnChainTrade`, then hedge it by hand, mark its row
-  `Killed`, and restart. The halt covers hedging only: rebalancing, transfers
-  and vault balance polling on that chain continue. Every poll interval the
-  monitor enqueues a backfill range covering the blocks since the persisted
-  checkpoint, capped at the configured ingestion cutoff block (must be
-  explicitly configured; recommended value: `safe`, i.e.
-  `eth_getBlockByNumber("safe")`); the backfill worker fetches the `Clear` and
-  `TakeOrder` logs for the arbitrageur's owner address and advances the
-  checkpoint only on success. `required_confirmations` governs
+  first check that `Position` does not already record the fill (its
+  `OnChainTrade` alone proves nothing: it is written before the position
+  update), then hedge it by hand, mark its row `Killed`, and restart. A restart
+  without `Killed` re-drives the row and can hedge the fill a second time. The
+  halt covers hedging only: rebalancing, transfers and vault balance polling on
+  that chain continue. Every poll interval the monitor enqueues a backfill range
+  covering the blocks since the persisted checkpoint, capped at the configured
+  ingestion cutoff block (must be explicitly configured; recommended value:
+  `safe`, i.e. `eth_getBlockByNumber("safe")`); the backfill worker fetches the
+  `Clear` and `TakeOrder` logs for the arbitrageur's owner address and advances
+  the checkpoint only on success. `required_confirmations` governs
   transaction-submission paths only and does not affect fill ingestion. Every
   backfill path, including durable retries, uses the hedged chain's explicit
   policy: HyperEVM 50 blocks, Base, Ethereum and Robinhood 1000 blocks per

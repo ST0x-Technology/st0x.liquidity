@@ -800,7 +800,7 @@ pub(crate) use build_worker_inner;
 /// [`AlertKind`] phrase. The terminal failure page takes its kind from that
 /// text (see [`terminal_failure_kind`]), so a message without one would page
 /// as the generic job failure while the `operational_alerts` extractor reads
-/// no kind at all. Both worker macros run it, so every production worker is
+/// no kind at all. Every worker macro runs it, so every production worker is
 /// checked however the const is written.
 macro_rules! assert_terminal_failure_msg_names_a_kind {
     (::<$ctx_type:ty, $job:ty>) => {
@@ -1651,8 +1651,9 @@ pub(crate) fn on_chain_terminal_failure(
         let message = format!(
             "st0x-hedge: {worker}: {error_msg}: {err}; job row {row}; {chain} is now \
              observe-only: its later fills are not accounted or hedged until restart, other \
-             chains continue; this fill may already be in Position, so check its OnChainTrade \
-             before hedging it by hand"
+             chains continue; this fill may already be in Position, so check Position for it \
+             before hedging it by hand, then set job row {row} to Killed before restarting, or \
+             the restart re-drives it"
         );
         spawn_terminal_failure_alert(Arc::clone(&notifier), worker, message);
     }

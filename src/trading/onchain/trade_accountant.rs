@@ -1434,7 +1434,7 @@ pub(crate) mod tests {
     }
 
     /// Builds the CQRS stores, job queue, and `AccountantCtx` shared by every
-    /// `perform()` test in this module -- callers supply only what actually
+    /// `perform()` test here and the conductor's accounting worker tests -- callers supply only what actually
     /// varies per test (config `ctx`, symbol cache, provider, executor, and
     /// execution threshold). Extracted because this ~30-line wiring block was
     /// duplicated verbatim across every InventoryTrade/ClearV3/TakeOrderV3

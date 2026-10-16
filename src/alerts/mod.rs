@@ -228,7 +228,7 @@ impl AlertKind {
 /// [`AlertKind::most_specific_in`] gives it a kind.
 ///
 /// A `const fn` so the job worker macros (`build_supervised_worker!`,
-/// `build_best_effort_worker!`) can fail the build when a job's
+/// `build_best_effort_worker!`, `build_chain_scoped_worker!`) can fail the build when a job's
 /// `TERMINAL_FAILURE_MSG` names no extracted kind, however the const is
 /// written.
 pub(crate) const fn names_extracted_kind(text: &str) -> bool {

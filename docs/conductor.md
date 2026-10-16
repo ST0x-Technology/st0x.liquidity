@@ -894,8 +894,10 @@ transient cause that outlasts the 1s/2s/4s retries keeps it halted until an
 operator restarts the bot. The failing fill itself may already be in `Position`
 (it failed after the position update), and then `CheckPositions` hedges it; a
 re-drive of such a row is idempotent on `(tx_hash, log_index)`. To retire a fill
-that can never be accounted, first check that it has no `OnChainTrade`, then
-hedge it by hand, set its row to `Killed`, and restart; never reset a fill
+that can never be accounted, first check that `Position` does not already record
+it (`position_fill_already_recorded` on its `(tx_hash, log_index)`; an
+`OnChainTrade` alone proves nothing, it is written before the position update),
+then hedge it by hand, set its row to `Killed`, and restart; never reset a fill
 hedged by hand to `Pending`, since that hedges it twice.
 
 Implements `Job<AccountantCtx<Node, Exec>>`. The `perform()` method runs the

@@ -1796,7 +1796,7 @@ mod tests {
         RebalancingMode, create_test_ctx_with_order_owner,
     };
     use st0x_event_sorcery::test_store;
-    use st0x_evm::USDC_HYPEREVM;
+    use st0x_evm::{USDC_BASE, USDC_HYPEREVM};
     use st0x_execution::{
         FractionalShares, MockExecutor, MockExecutorCtx, Symbol, TryIntoExecutor,
     };
@@ -1811,7 +1811,8 @@ mod tests {
     use super::*;
     use crate::alerts::CapturingNotifier;
     use crate::bindings::IRaindexV6::{TakeOrderConfigV4, TakeOrderV3};
-    use crate::conductor::job::{BackpressureStreak, Job};
+    use crate::conductor::HttpProvider;
+    use crate::conductor::job::{BackpressureStreak, Job, JobKind, WORKER_RETRIES};
     use crate::equity_redemption::RedemptionAggregateId;
     use crate::mint_authorization::ConfiguredMintAuthorizer;
     use crate::native_gas::ConfiguredGasReadiness;
@@ -3045,23 +3046,6 @@ mod tests {
         monitor_handle.abort();
     }
 
-    type MockedNode = alloy::providers::fillers::FillProvider<
-        alloy::providers::fillers::JoinFill<
-            alloy::providers::Identity,
-            alloy::providers::fillers::JoinFill<
-                alloy::providers::fillers::GasFiller,
-                alloy::providers::fillers::JoinFill<
-                    alloy::providers::fillers::BlobGasFiller,
-                    alloy::providers::fillers::JoinFill<
-                        alloy::providers::fillers::NonceFiller,
-                        alloy::providers::fillers::ChainIdFiller,
-                    >,
-                >,
-            >,
-        >,
-        RootProvider,
-    >;
-
     /// A fill on `chain` that our order took, selling `equity` for that
     /// chain's USDC, so accounting it places one hedge.
     fn hedgeable_fill(
@@ -3104,7 +3088,7 @@ mod tests {
         owner: Address,
         symbol: &str,
         equity: Address,
-    ) -> ChainAccounting<MockedNode> {
+    ) -> ChainAccounting<HttpProvider> {
         let mut trading = HedgedChain::test().chain(chain).call();
         trading.vault_owner = owner;
         trading.orderbook = Address::repeat_byte(0x96);
@@ -3155,7 +3139,7 @@ mod tests {
                      WHERE job_type = ? AND status = 'Failed' AND attempts > ?",
                 )
                 .bind(job_type)
-                .bind(i64::try_from(crate::conductor::job::WORKER_RETRIES).unwrap())
+                .bind(i64::try_from(WORKER_RETRIES).unwrap())
                 .fetch_one(apalis_pool)
                 .await
                 .unwrap();
@@ -3174,7 +3158,7 @@ mod tests {
         pool: SqlitePool,
         apalis_pool: apalis_sqlite::SqlitePool,
         accounting_queues: DexTradeAccountingQueues,
-        accountant_ctx: Arc<AccountantCtx<MockedNode, MockExecutor>>,
+        accountant_ctx: Arc<AccountantCtx<HttpProvider, MockExecutor>>,
         notifier: Arc<CapturingNotifier>,
     }
 
@@ -3183,7 +3167,7 @@ mod tests {
 
     async fn two_chain_accounting() -> TwoChainAccounting {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (_, owner) = hedgeable_fill(Chain::Base, st0x_evm::USDC_BASE, BASE_EQUITY);
+        let (_, owner) = hedgeable_fill(Chain::Base, USDC_BASE, BASE_EQUITY);
 
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.chains
@@ -3191,7 +3175,7 @@ mod tests {
         let accounting_queues = DexTradeAccountingQueues::new(&apalis_pool, &ctx.chains);
 
         let cache = SymbolCache::default();
-        cache.preload_symbol(Chain::Base, st0x_evm::USDC_BASE, "USDC");
+        cache.preload_symbol(Chain::Base, USDC_BASE, "USDC");
         cache.preload_symbol(Chain::Base, BASE_EQUITY, "wtAAPL");
         cache.preload_symbol(Chain::HyperEvm, USDC_HYPEREVM, "USDC");
         cache.preload_symbol(Chain::HyperEvm, HYPEREVM_EQUITY, "wtCOIN");
@@ -3256,7 +3240,7 @@ mod tests {
             hyperevm_queue.push(poison_fill).await.unwrap();
 
             let failure_injector = FailureInjector::new();
-            failure_injector.arm(crate::conductor::job::JobKind::OrderFill);
+            failure_injector.arm(JobKind::OrderFill);
             let monitor_handle = self.spawn_workers(&failure_injector);
             wait_for_failed_row(&self.apalis_pool, hyperevm_queue.queue_key()).await;
             tokio::time::timeout(Duration::from_secs(3), async {
@@ -3288,7 +3272,7 @@ mod tests {
             .push(later_hyperevm_fill)
             .await
             .unwrap();
-        let (base_fill, _) = hedgeable_fill(Chain::Base, st0x_evm::USDC_BASE, BASE_EQUITY);
+        let (base_fill, _) = hedgeable_fill(Chain::Base, USDC_BASE, BASE_EQUITY);
         accounting.queue(Chain::Base).push(base_fill).await.unwrap();
         wait_for_placed_hedges(&accounting.pool, 1).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
