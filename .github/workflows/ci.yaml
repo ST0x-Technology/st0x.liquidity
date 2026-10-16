@@ -188,7 +188,7 @@ jobs:
           fi
           ./scripts/sync-source-mtimes.sh prepare
 
-      # Build the test binaries once into a nextest archive shared by all four
+      # Build the test binaries once into a nextest archive shared by all eight
       # partitions. Clippy and rustdoc run in backend-lint, so the test shards
       # wait only for this compile.
       - name: Build nextest archive
@@ -347,7 +347,7 @@ jobs:
           "
 
   backend-test:
-    name: backend test ${{ matrix.partition }} of 4
+    name: backend test ${{ matrix.partition }} of 8
     needs: [changes, backend-build]
     if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
@@ -356,7 +356,7 @@ jobs:
       fail-fast: false
 
       matrix:
-        partition: [1, 2, 3, 4]
+        partition: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
@@ -406,13 +406,13 @@ jobs:
       # Test binaries come from the archive built in backend-build; no recompile.
       # count: deals each binary's tests round-robin, so every shard gets an
       # even share of the slow e2e tests (hash: left one shard with most).
-      - name: test ${{ matrix.partition }} of 4
+      - name: test ${{ matrix.partition }} of 8
         run: |
           nix develop .#ci-backend -c bash -c "
             set -euxo pipefail
             cargo nextest run --archive-file \"\$RUNNER_TEMP/nextest-archive.tar.zst\" \
               --workspace-remap . --profile ci \
-              --partition count:${{ matrix.partition }}/4
+              --partition count:${{ matrix.partition }}/8
           "
 
   backend:
