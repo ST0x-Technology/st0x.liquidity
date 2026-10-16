@@ -389,8 +389,8 @@ assert_count 8 "          save: \${{ env.UNTRUSTED_PR != 'true' }}"
 # commit. A manual dispatch (any branch) commits only its own -dispatch disk,
 # which no pull request or master run mounts.
 assert_count 4 "          commit: \${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/master') }}"
-assert_count 1 "          key: \${{ steps.target-disk.outputs.key }}-target-test-v1\${{ github.event_name == 'workflow_dispatch' && '-dispatch' || '' }}"
-assert_count 1 "          key: \${{ steps.target-disk.outputs.key }}-target-lint-v1\${{ github.event_name == 'workflow_dispatch' && '-dispatch' || '' }}"
+assert_count 1 "          key: \${{ steps.target-disk.outputs.key }}-target-test-probe9\${{ github.event_name == 'workflow_dispatch' && '-dispatch' || '' }}"
+assert_count 1 "          key: \${{ steps.target-disk.outputs.key }}-target-lint-probe9\${{ github.event_name == 'workflow_dispatch' && '-dispatch' || '' }}"
 # The over-40 GiB wipe must not touch the root-owned lost+found of the fresh
 # ext4 disk, or rm fails, the master push job fails, and no snapshot commits.
 assert_count 4 "            sudo find \"\$CARGO_TARGET_DIR\" -mindepth 1 -maxdepth 1 ! -name lost+found -exec rm -rf {} +"
