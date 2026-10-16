@@ -112,8 +112,12 @@ expected_wiring = {
     "needs" => "changes",
     "if" => "${{ needs.changes.outputs.code == 'true' }}"
   },
+  "dashboard-lint" => {
+    "needs" => "changes",
+    "if" => "${{ needs.changes.outputs.code == 'true' }}"
+  },
   "dashboard" => {
-    "needs" => %w[changes dashboard-build],
+    "needs" => %w[changes dashboard-build dashboard-lint],
     "if" => "${{ always() }}"
   },
   "hooks-run" => { "needs" => nil, "if" => nil },
@@ -247,16 +251,20 @@ check_gate.call(
     needs.changes.result
     needs.changes.outputs.code
     needs.dashboard-build.result
+    needs.dashboard-lint.result
   ],
   [
-    [%w[success false skipped], true],
-    [%w[success true success], true],
-    [%w[success true failure], false],
-    [%w[success true skipped], false],
-    [%w[success true cancelled], false],
-    [%w[failure unknown skipped], false],
-    [%w[skipped unknown skipped], false],
-    [%w[cancelled unknown skipped], false]
+    [%w[success false skipped skipped], true],
+    [%w[success true success success], true],
+    [%w[success true failure success], false],
+    [%w[success true skipped success], false],
+    [%w[success true cancelled success], false],
+    [%w[success true success failure], false],
+    [%w[success true success skipped], false],
+    [%w[success true success cancelled], false],
+    [%w[failure unknown skipped skipped], false],
+    [%w[skipped unknown skipped skipped], false],
+    [%w[cancelled unknown skipped skipped], false]
   ]
 )
 
@@ -365,11 +373,11 @@ if [ "$parsed_action_count" -ne "$action_line_count" ]; then
   exit 1
 fi
 
-assert_count 6 '      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6'
+assert_count 7 '      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6'
 assert_count 1 '      - uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590  # v3'
-assert_count 5 '      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035  # v34'
-assert_count 5 '      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71  # v17'
-assert_count 5 '      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569  # v7'
+assert_count 6 '      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035  # v34'
+assert_count 6 '      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71  # v17'
+assert_count 6 '      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569  # v7'
 # Swatinem/rust-cache prunes workspace-crate and incremental artifacts from the
 # target directory in its save step, which would empty the sticky disks.
 assert_absent 'Swatinem/rust-cache@'
@@ -399,9 +407,9 @@ RUBY
 # from a branch naming convention. Dependabot uses an in-repository branch but
 # receives the same restricted token and secret treatment as a fork.
 assert_line "  UNTRUSTED_PR: \${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.fork || github.event.pull_request.user.login == 'dependabot[bot]') }}"
-assert_count 5 "          authToken: \${{ env.UNTRUSTED_PR != 'true' && secrets.CACHIX_AUTH_TOKEN || '' }}"
-assert_count 5 "          skipPush: \${{ env.UNTRUSTED_PR == 'true' }}"
-assert_count 5 "          save: \${{ env.UNTRUSTED_PR != 'true' }}"
+assert_count 6 "          authToken: \${{ env.UNTRUSTED_PR != 'true' && secrets.CACHIX_AUTH_TOKEN || '' }}"
+assert_count 6 "          skipPush: \${{ env.UNTRUSTED_PR == 'true' }}"
+assert_count 6 "          save: \${{ env.UNTRUSTED_PR != 'true' }}"
 # A sticky disk snapshot is shared by every later run, so only reviewed code
 # may commit the shared disk: master pushes. Pull requests (fork or not) never
 # commit. A manual dispatch (any branch) commits only its own -dispatch disk,
