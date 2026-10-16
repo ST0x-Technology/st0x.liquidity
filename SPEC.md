@@ -647,21 +647,22 @@ excellent async ecosystem for handling concurrent trading flows.
   re-drives and the retention sweep keeps it; a start also re-drives it at once.
   The failing fill itself may already be in `Position` (a step after the
   position update failed), and then the position check hedges it. To retire a
-  fill that can never be accounted, first mark its row `Killed`, since a row
-  left `Failed` is re-driven and can hedge the fill a second time. Then check
-  whether `Position` already records the fill (its `OnChainTrade` alone proves
-  nothing: it is written before the position update; docs/conductor.md has the
-  query). If it does, the position check hedges it; if not, hedge it by hand. A
-  worker that exits without a job failure halts the chain the same way, pages
-  once, and is restarted every interval; the halt lifts once a worker runs a
-  full interval or accounts a fill. The halt covers hedging only: rebalancing,
-  transfers and vault balance polling on that chain continue. Every poll
-  interval the monitor enqueues a backfill range covering the blocks since the
-  persisted checkpoint, capped at the configured ingestion cutoff block (must be
-  explicitly configured; recommended value: `safe`, i.e.
-  `eth_getBlockByNumber("safe")`); the backfill worker fetches the `Clear` and
-  `TakeOrder` logs for the arbitrageur's owner address and advances the
-  checkpoint only on success. `required_confirmations` governs
+  fill that can never be accounted, first mark its row `Killed` while it is
+  `Failed` (a re-drive in progress would overwrite it; docs/conductor.md has the
+  guarded statement), since a row left `Failed` is re-driven and can hedge the
+  fill a second time. Then check whether `Position` already records the fill
+  (its `OnChainTrade` alone proves nothing: it is written before the position
+  update; docs/conductor.md has the query). If it does, the position check
+  hedges it; if not, hedge it by hand. A worker that exits without a job failure
+  halts the chain the same way, pages once, and is restarted every interval; the
+  halt lifts once a worker runs a full interval or accounts a fill. The halt
+  covers hedging only: rebalancing, transfers and vault balance polling on that
+  chain continue. Every poll interval the monitor enqueues a backfill range
+  covering the blocks since the persisted checkpoint, capped at the configured
+  ingestion cutoff block (must be explicitly configured; recommended value:
+  `safe`, i.e. `eth_getBlockByNumber("safe")`); the backfill worker fetches the
+  `Clear` and `TakeOrder` logs for the arbitrageur's owner address and advances
+  the checkpoint only on success. `required_confirmations` governs
   transaction-submission paths only and does not affect fill ingestion. Every
   backfill path, including durable retries, uses the hedged chain's explicit
   policy: HyperEVM 50 blocks, Base, Ethereum and Robinhood 1000 blocks per

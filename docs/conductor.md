@@ -920,11 +920,21 @@ WHERE aggregate_type = 'Position'
   AND CAST(json_extract(payload, '$.OnChainOrderFilled.trade_id.log_index') AS INTEGER) = <log_index>;
 ```
 
-The row is marked `Killed` before anything else; no restart is needed. A row
-left `Failed` is re-driven every interval, so a fill hedged by hand while its
-row is still `Failed` (or reset to `Pending`) can be hedged twice. Then, if the
-query finds the fill, the position check hedges it: do not hedge it by hand. If
-not, hedge it by hand.
+The row is marked `Killed` before anything else; no restart is needed. Mark it
+only while it is `Failed`, and confirm one row changed:
+
+```sql
+UPDATE Jobs SET status = 'Killed', lock_by = NULL
+WHERE id = '<row>' AND status = 'Failed';
+```
+
+Zero rows means a re-drive holds the row: its ack does not check the status and
+would write `Failed` back over `Killed`. Wait until it is `Failed` again (the
+re-drive takes about 7s) and retry; a re-drive that succeeded instead leaves it
+`Done`, and the fill is accounted. A row left `Failed` is re-driven every
+interval, so a fill hedged by hand while its row is still `Failed` (or reset to
+`Pending`) can be hedged twice. Then, if the query finds the fill, the position
+check hedges it: do not hedge it by hand. If not, hedge it by hand.
 
 A worker that exits without a job failure (a backend or heartbeat error) halts
 the chain on no row. It pages once, a later exit or a job failure behind a job

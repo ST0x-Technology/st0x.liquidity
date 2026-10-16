@@ -313,7 +313,8 @@ impl ChainHalt {
                  observe-only: its later fills are not accounted or hedged until this job \
                  succeeds, re-driven every {interval}s, or its row is marked Killed; other \
                  chains continue; this fill may already be in Position: to hedge it by hand, \
-                 first mark the row Killed, then check Position for it"
+                 first mark the row Killed while it is Failed (see the docs/conductor.md \
+                 runbook), then check Position for it"
             ),
             Halt::WorkerExit => format!(
                 "st0x-hedge: {worker}: {error_msg}: trade accounting worker exited: {error}; \
@@ -420,8 +421,6 @@ enum RedriveError {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
     use crate::alerts::CapturingNotifier;
 
