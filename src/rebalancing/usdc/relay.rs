@@ -10930,6 +10930,7 @@ mod tests {
     /// transfer at `SwapQuoted` with the USDC at the hub: no resume, before
     /// or after a restart, quotes or signs again, and the hold reconciles.
     #[tokio::test]
+    #[tracing_test::traced_test]
     async fn hub_deposit_cancelled_at_its_nonce_holds_for_reconcile() {
         let rig = RelayRig::deploy().await;
         rig.withdraw_to_hub(U256::from(AMOUNT_IN)).await;
@@ -10989,6 +10990,7 @@ mod tests {
             assert_eq!(state.state_name(), "SwapQuoted", "{state:?}");
         }
         assert_eq!(quotes.calls(), 0, "the hold quotes nothing");
+        assert!(logs_contain("Relay deposit from the hub was cancelled"));
         assert_eq!(rig.hub_usdc().await, U256::from(AMOUNT_IN));
 
         store
