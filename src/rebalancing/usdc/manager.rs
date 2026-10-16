@@ -22,7 +22,7 @@ use st0x_bridge::cctp::{
     AttestationResponse, CctpBridge, CctpError, MintScanFloorCheck, UsdcTransferStatus,
 };
 use st0x_bridge::corridor::{HopKind, UsdcCorridor};
-use st0x_bridge::relay::RelayBridge;
+use st0x_bridge::relay::{RelayBridge, RelayBridgeError};
 use st0x_bridge::stable_endpoint::StableEndpointError;
 use st0x_bridge::{
     Attestation, Bridge, BridgeDirection, BurnReceipt, BurnTxStatus, MintReceipt, RecordedBurnScan,
@@ -7259,6 +7259,37 @@ pub(crate) enum UsdcRecheckError {
         state: &'static str,
     },
     #[error(
+        "rebalance {id} is in state {state}; a superseding tx ({tx}) applies only to an \
+         Alpaca-to-chain Relay transfer at SwapDepositPrepared"
+    )]
+    SupersedingTxNotApplicable {
+        id: UsdcRebalanceId,
+        tx: TxHash,
+        state: &'static str,
+    },
+    #[error(
+        "rebalance {id} is not on a Relay corridor; a superseding tx ({tx}) applies only to \
+         an Alpaca-to-chain Relay transfer at SwapDepositPrepared"
+    )]
+    SupersedingTxOffRelay { id: UsdcRebalanceId, tx: TxHash },
+    #[error("rebalance {id}: {superseding} does not prove the signed Relay deposit superseded")]
+    DepositNotSuperseded {
+        id: UsdcRebalanceId,
+        superseding: TxHash,
+        #[source]
+        source: Box<RelayBridgeError>,
+    },
+    #[error(
+        "rebalance {id}: replacement deposit {replacement} is of {deposited}, not the quote's \
+         input {expected}"
+    )]
+    ReplacementAmountMismatch {
+        id: UsdcRebalanceId,
+        replacement: TxHash,
+        deposited: U256,
+        expected: U256,
+    },
+    #[error(
         "rebalance {id} already records deposit send {recorded}; the \
          operator-supplied deposit tx {tx} is not attached"
     )]
@@ -7580,6 +7611,19 @@ pub(crate) trait RecheckUsdcDeposit: Send + Sync + 'static {
         prepared: &PreparedTransaction,
         superseding_tx: Option<TxHash>,
     ) -> Result<(), DepositSendNotSuperseded>;
+
+    /// Records what `superseding_tx` did at the nonce of a signed Relay
+    /// deposit, once it proves on chain. Only a Relay service has one.
+    async fn supersede_swap_deposit(
+        &self,
+        id: &UsdcRebalanceId,
+        superseding_tx: TxHash,
+    ) -> Result<RecheckOutcome, UsdcRecheckError> {
+        Err(UsdcRecheckError::SupersedingTxOffRelay {
+            id: id.clone(),
+            tx: superseding_tx,
+        })
+    }
 }
 
 /// What the startup restore of signed Alpaca deposit sends did.

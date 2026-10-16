@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use alloy::consensus::Transaction as _;
+use alloy::eips::eip2718::{EIP7702_TX_TYPE_ID, Typed2718 as _};
 use alloy::primitives::{Address, B256, Bytes, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, Log, Transaction, TransactionReceipt};
@@ -21,8 +22,8 @@ use super::quote::{StepTerms, StepTransaction, check_steps};
 use super::{AcceptedRelayQuote, QuoteField, QuoteMismatch, RelayOrderId};
 use crate::stable_endpoint::{SCAN_ATTEMPTS, SCAN_RETRY_BACKOFF, StableEndpoint};
 use crate::{
-    DepositScan, HopDirection, PreparedSwap, PreparedSwapDeposit, SwapBridge, SwapDeposit,
-    SwapPayment, SwapSide,
+    DepositScan, HopDirection, PreparedSwap, PreparedSwapDeposit, SupersededDeposit, SwapBridge,
+    SwapDeposit, SwapPayment, SwapSide,
 };
 
 /// The deposit's gas limit before the wallet's pad: the larger `gasUsed` of
@@ -125,6 +126,34 @@ pub enum RelayBridgeError {
     DepositReceiptMissing { tx: TxHash },
     #[error("tx {tx} is on neither chain yet")]
     TxNotFound { tx: TxHash },
+    #[error("superseding tx {tx} is the signed deposit itself")]
+    SupersedingTxIsTheDeposit { tx: TxHash },
+    #[error("deposit {tx} is not a readable signed tx; its signer is unknown")]
+    UnreadableDeposit { tx: TxHash },
+    #[error("superseding tx {superseding} was sent by {from}, not the deposit's signer {signer}")]
+    SupersedingTxFromAnotherSender {
+        superseding: TxHash,
+        from: Address,
+        signer: Address,
+    },
+    #[error(
+        "superseding tx {superseding} is at nonce {superseding_nonce}, not the deposit's nonce \
+         {nonce}"
+    )]
+    SupersedingTxAtAnotherNonce {
+        superseding: TxHash,
+        superseding_nonce: u64,
+        nonce: u64,
+    },
+    #[error(
+        "superseding tx {superseding} succeeded but is neither a plain cancel (a 0 value \
+         transfer to the signer with no calldata and no logs) nor our deposit for order \
+         {order_id}, so what it did is unknown"
+    )]
+    SupersedingTxNotACancelOrDeposit {
+        superseding: TxHash,
+        order_id: RelayOrderId,
+    },
     #[error("fill {txs:?} is unverified: {reason:?}")]
     FillUnverified {
         txs: Vec<TxHash>,
@@ -417,6 +446,34 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> SwapBridge for RelayBridge<EthWalle
         match direction {
             HopDirection::ToHub => self.chain.confirm_approve(approve).await,
             HopDirection::FromHub => self.hub.confirm_approve(approve).await,
+        }
+    }
+
+    async fn verify_deposit_superseded(
+        &self,
+        direction: HopDirection,
+        order_id: RelayOrderId,
+        deposit: &PreparedTransaction,
+        superseding: TxHash,
+    ) -> Result<SupersededDeposit<RelayOrderId>, RelayBridgeError> {
+        match direction {
+            HopDirection::ToHub => {
+                self.chain
+                    .verify_deposit_superseded(order_id, deposit, superseding)
+                    .await
+            }
+            HopDirection::FromHub => {
+                self.hub
+                    .verify_deposit_superseded(order_id, deposit, superseding)
+                    .await
+            }
+        }
+    }
+
+    async fn release_superseded(&self, direction: HopDirection, envelopes: &[PreparedTransaction]) {
+        match direction {
+            HopDirection::ToHub => self.chain.release_superseded(envelopes).await,
+            HopDirection::FromHub => self.hub.release_superseded(envelopes).await,
         }
     }
 
@@ -822,6 +879,85 @@ impl<W: Wallet> RelayEnd<W> {
         }
 
         Ok(())
+    }
+
+    async fn verify_deposit_superseded(
+        &self,
+        order_id: RelayOrderId,
+        deposit: &PreparedTransaction,
+        superseding: TxHash,
+    ) -> Result<SupersededDeposit<RelayOrderId>, RelayBridgeError> {
+        let tx = deposit.tx_hash();
+        if superseding == tx {
+            return Err(RelayBridgeError::SupersedingTxIsTheDeposit { tx });
+        }
+        let signer = deposit
+            .signer()
+            .ok_or(RelayBridgeError::UnreadableDeposit { tx })?;
+
+        let (receipt, block) = self.read_confirmed_receipt(superseding).await?;
+        let Some(mined) = self
+            .wallet
+            .provider()
+            .get_transaction_by_hash(superseding)
+            .await?
+        else {
+            return Err(RelayBridgeError::Unconfirmed {
+                tx: superseding,
+                confirmations: 0,
+                required: self.confirmations,
+            });
+        };
+        if receipt.from != signer {
+            return Err(RelayBridgeError::SupersedingTxFromAnotherSender {
+                superseding,
+                from: receipt.from,
+                signer,
+            });
+        }
+        if mined.nonce() != deposit.nonce() {
+            return Err(RelayBridgeError::SupersedingTxAtAnotherNonce {
+                superseding,
+                superseding_nonce: mined.nonce(),
+                nonce: deposit.nonce(),
+            });
+        }
+        if !receipt.status() {
+            return Ok(SupersededDeposit::Cancelled);
+        }
+
+        let logs = receipt.inner.logs();
+        let plain_cancel = mined.to() == Some(signer)
+            && mined.value().is_zero()
+            && mined.input().is_empty()
+            && mined.ty() != EIP7702_TX_TYPE_ID
+            && logs.is_empty();
+        if plain_cancel {
+            return Ok(SupersededDeposit::Cancelled);
+        }
+
+        logs.iter()
+            .filter_map(|log| deposit_event(log, self.depository))
+            .find(|event| self.is_ours(event) && RelayOrderId(event.id) == order_id)
+            .filter(|_| self.sent_by_us(&receipt))
+            .map(|event| {
+                SupersededDeposit::Replaced(SwapDeposit {
+                    tx: superseding,
+                    order_id,
+                    amount: event.amount,
+                    block,
+                })
+            })
+            .ok_or(RelayBridgeError::SupersedingTxNotACancelOrDeposit {
+                superseding,
+                order_id,
+            })
+    }
+
+    async fn release_superseded(&self, envelopes: &[PreparedTransaction]) {
+        for envelope in envelopes {
+            self.wallet.release_superseded(envelope.tx_hash()).await;
+        }
     }
 
     /// `tx`'s receipt and its block once it has this end's confirmations in a

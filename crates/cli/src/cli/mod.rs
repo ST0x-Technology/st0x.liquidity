@@ -40,6 +40,7 @@ use st0x_registry::SymbolCache;
 #[cfg(test)]
 use st0x_hedge::operator::bot_gas::BotGasReceiptCostEnqueuer;
 use st0x_hedge::operator::conductor::bounded_rpc_client;
+use st0x_hedge::operator::equity_transfer::RecheckTx;
 use st0x_hedge::operator::offchain::order::{OffchainOrderId, OrderPlacer};
 use st0x_hedge::operator::process_tx;
 use st0x_hedge::operator::usdc_rebalance::UsdcRebalanceId;
@@ -1020,6 +1021,12 @@ pub enum TransferCommand {
         /// before attaching it.
         #[arg(long = "deposit-tx")]
         deposit_tx: Option<TxHash>,
+        /// usdc only: the tx mined at the nonce of an Alpaca-to-chain Relay
+        /// transfer's signed deposit (`SwapDepositPrepared`): a fee-bumped
+        /// copy of the deposit, which the bot adopts, or a cancel, which holds
+        /// the transfer for reconcile. The bot proves it on Ethereum first.
+        #[arg(long = "superseding-tx", conflicts_with = "deposit_tx")]
+        superseding_tx: Option<TxHash>,
     },
 }
 
@@ -1268,7 +1275,7 @@ enum TransferRecoveryCommand {
     RecheckTransfer {
         transfer_type: RecheckTransferType,
         id: String,
-        deposit_tx: Option<TxHash>,
+        operator_tx: Option<RecheckTx>,
     },
     ResumeInterruptedTransfers,
     ReconcileUsdcTransfer {
@@ -1711,11 +1718,14 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
                 kind,
                 id,
                 deposit_tx,
+                superseding_tx,
             } => CommandRoute::Simple(SimpleCommand::Transfer {
                 command: TransferRecoveryCommand::RecheckTransfer {
                     transfer_type: kind,
                     id,
-                    deposit_tx,
+                    operator_tx: deposit_tx
+                        .map(RecheckTx::Deposit)
+                        .or(superseding_tx.map(RecheckTx::Superseding)),
                 },
             }),
         },
@@ -1954,10 +1964,10 @@ async fn run_transfer_command<W: Write>(
         TransferRecoveryCommand::RecheckTransfer {
             transfer_type,
             id,
-            deposit_tx,
+            operator_tx,
         } => {
             let result =
-                rebalancing::recheck_transfer_command(stdout, transfer_type, &id, deposit_tx, ctx)
+                rebalancing::recheck_transfer_command(stdout, transfer_type, &id, operator_tx, ctx)
                     .await;
             finish_with_log_query_url(stdout, ctx, &id, result)
         }
@@ -4187,12 +4197,51 @@ mod tests {
         .unwrap();
 
         let Ok(SimpleCommand::Transfer {
-            command: TransferRecoveryCommand::RecheckTransfer { deposit_tx, .. },
+            command: TransferRecoveryCommand::RecheckTransfer { operator_tx, .. },
         }) = classified_route(cli.command)
         else {
             panic!("expected transfer recheck simple command");
         };
-        assert_eq!(deposit_tx, Some(TxHash::with_last_byte(0xcc)));
+        assert_eq!(
+            operator_tx,
+            Some(RecheckTx::Deposit(TxHash::with_last_byte(0xcc)))
+        );
+    }
+
+    #[test]
+    fn transfer_recheck_carries_a_superseding_tx_but_not_with_a_deposit_tx() {
+        let args = [
+            "st0x-cli",
+            "transfer",
+            "recheck",
+            "--kind",
+            "usdc",
+            "--id",
+            "4efa80fb-a9c9-44dd-87bc-a726fee6fa88",
+            "--superseding-tx",
+            "0x00000000000000000000000000000000000000000000000000000000000000dd",
+        ];
+        let cli = Cli::try_parse_from(args).unwrap();
+
+        let Ok(SimpleCommand::Transfer {
+            command: TransferRecoveryCommand::RecheckTransfer { operator_tx, .. },
+        }) = classified_route(cli.command)
+        else {
+            panic!("expected transfer recheck simple command");
+        };
+        assert_eq!(
+            operator_tx,
+            Some(RecheckTx::Superseding(TxHash::with_last_byte(0xdd)))
+        );
+
+        let both = Cli::try_parse_from(args.iter().copied().chain([
+            "--deposit-tx",
+            "0x00000000000000000000000000000000000000000000000000000000000000cc",
+        ]));
+        assert_eq!(
+            both.err().map(|error| error.kind()),
+            Some(clap::error::ErrorKind::ArgumentConflict)
+        );
     }
 
     #[test]
@@ -4214,7 +4263,7 @@ mod tests {
                     TransferRecoveryCommand::RecheckTransfer {
                         transfer_type,
                         id,
-                        deposit_tx: None,
+                        operator_tx: None,
                     },
             }) => {
                 assert!(matches!(transfer_type, RecheckTransferType::Redemption));
@@ -4601,7 +4650,7 @@ mod tests {
                     TransferRecoveryCommand::RecheckTransfer {
                         transfer_type,
                         id,
-                        deposit_tx: None,
+                        operator_tx: None,
                     },
             }) => {
                 assert!(matches!(transfer_type, RecheckTransferType::Usdc));

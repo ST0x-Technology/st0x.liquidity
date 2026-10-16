@@ -28,6 +28,7 @@ use st0x_hedge::operator::bot_gas::BotGasReceiptCostEnqueuer;
 use st0x_hedge::operator::equity_redemption::{
     EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId,
 };
+use st0x_hedge::operator::equity_transfer::RecheckTx;
 use st0x_hedge::operator::mint_authorization::{ConfiguredMintAuthorizer, VaultModeReader};
 use st0x_hedge::operator::native_gas::{ConfiguredGasReadiness, GasReadiness};
 use st0x_hedge::operator::position::{EquityTransferReservationId, Position, PositionCommand};
@@ -2313,11 +2314,13 @@ pub(crate) async fn recheck_transfer_command<W: Write>(
     stdout: &mut W,
     transfer_type: RecheckTransferType,
     id: &str,
-    deposit_tx: Option<TxHash>,
+    operator_tx: Option<RecheckTx>,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    if deposit_tx.is_some() && !matches!(transfer_type, RecheckTransferType::Usdc) {
-        anyhow::bail!("--deposit-tx applies only to `transfer recheck --kind usdc`");
+    if operator_tx.is_some() && !matches!(transfer_type, RecheckTransferType::Usdc) {
+        anyhow::bail!(
+            "--deposit-tx and --superseding-tx apply only to `transfer recheck --kind usdc`"
+        );
     }
 
     let transfer_kind = match transfer_type {
@@ -2328,7 +2331,7 @@ pub(crate) async fn recheck_transfer_command<W: Write>(
         RecheckTransferType::Usdc => st0x_hedge::operator::equity_transfer::RecheckKind::Usdc,
     };
     let url =
-        st0x_hedge::operator::equity_transfer::recheck_url(ctx, transfer_kind, id, deposit_tx);
+        st0x_hedge::operator::equity_transfer::recheck_url(ctx, transfer_kind, id, operator_tx);
     writeln!(stdout, "Re-checking {transfer_type:?} {id} via {url}")?;
 
     // The outcome name is the operator-facing value documented in
@@ -3046,7 +3049,37 @@ mod tests {
             &mut Vec::new(),
             RecheckTransferType::Usdc,
             "some-id",
-            Some(TxHash::with_last_byte(0xcc)),
+            Some(RecheckTx::Deposit(TxHash::with_last_byte(0xcc))),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn usdc_recheck_passes_the_operator_superseding_tx_to_the_bot() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/transfers/recheck/usdc_bridge/some-id")
+                    .query_param(
+                        "superseding_tx",
+                        "0x00000000000000000000000000000000000000000000000000000000000000dd",
+                    );
+                then.status(200).body(r#"{"outcome":"recovered"}"#);
+            })
+            .await;
+        let mut ctx = create_base_test_ctx();
+        ctx.server_port = server.port();
+
+        recheck_transfer_command(
+            &mut Vec::new(),
+            RecheckTransferType::Usdc,
+            "some-id",
+            Some(RecheckTx::Superseding(TxHash::with_last_byte(0xdd))),
             &ctx,
         )
         .await
@@ -3063,7 +3096,7 @@ mod tests {
             &mut Vec::new(),
             RecheckTransferType::Mint,
             "some-id",
-            Some(TxHash::with_last_byte(0xcc)),
+            Some(RecheckTx::Deposit(TxHash::with_last_byte(0xcc))),
             &ctx,
         )
         .await
@@ -3071,7 +3104,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "--deposit-tx applies only to `transfer recheck --kind usdc`"
+            "--deposit-tx and --superseding-tx apply only to `transfer recheck --kind usdc`"
         );
     }
 

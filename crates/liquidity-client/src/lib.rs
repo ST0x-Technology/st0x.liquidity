@@ -242,6 +242,7 @@ async fn send_debug<A: TokenSource + Sync>(
             kind,
             id,
             deposit_tx,
+            superseding_tx,
         } => {
             let kind = match kind {
                 RecheckTransferType::Mint => "equity_mint",
@@ -249,7 +250,10 @@ async fn send_debug<A: TokenSource + Sync>(
                 RecheckTransferType::Usdc => "usdc_bridge",
             };
             let id = encode_segment(&id);
-            let params = optional_query("deposit_tx", deposit_tx);
+            let params = optional_query("deposit_tx", deposit_tx)
+                .into_iter()
+                .chain(optional_query("superseding_tx", superseding_tx))
+                .collect::<Vec<_>>();
             client
                 .post(&format!("/transfers/recheck/{kind}/{id}"), &params)
                 .await?
@@ -747,6 +751,7 @@ mod tests {
                 kind,
                 id: "abc".to_owned(),
                 deposit_tx: None,
+                superseding_tx: None,
             }))
             .await?;
             assert_eq!(
@@ -766,11 +771,32 @@ mod tests {
             kind: RecheckTransferType::Usdc,
             id: "abc".to_owned(),
             deposit_tx: Some("0xdeposit".to_owned()),
+            superseding_tx: None,
         }))
         .await?;
         assert_eq!(
             request_line(&request),
             "POST /liquidity-debug/transfers/recheck/usdc_bridge/abc?deposit_tx=0xdeposit HTTP/1.1"
+        );
+        Ok(())
+    }
+
+    /// A USDC recheck sends the tx that took a signed Relay deposit's nonce
+    /// as the `superseding_tx` query parameter the bot reads.
+    #[tokio::test]
+    async fn recheck_sends_the_superseding_tx_as_its_query_parameter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Debug(Debug::Recheck {
+            kind: RecheckTransferType::Usdc,
+            id: "abc".to_owned(),
+            deposit_tx: None,
+            superseding_tx: Some("0xcancel".to_owned()),
+        }))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-debug/transfers/recheck/usdc_bridge/abc?superseding_tx=0xcancel \
+             HTTP/1.1"
         );
         Ok(())
     }

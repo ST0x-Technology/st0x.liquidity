@@ -241,6 +241,14 @@ pub mod equity_transfer {
         Usdc,
     }
 
+    /// The tx an operator names to a USDC recheck: an Alpaca deposit send
+    /// found on chain, or the tx that took a signed Relay deposit's nonce.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum RecheckTx {
+        Deposit(TxHash),
+        Superseding(TxHash),
+    }
+
     /// A force-failure request with no auditable explanation.
     #[derive(Debug, thiserror::Error)]
     #[error("--reason must not be blank; it is persisted as the audit record")]
@@ -576,12 +584,12 @@ pub mod equity_transfer {
     }
 
     /// Returns the local server endpoint used to re-check a transfer, with
-    /// the operator-found deposit send of a USDC recheck when given.
+    /// the operator's tx of a USDC recheck when given.
     pub fn recheck_url(
         ctx: &Ctx,
         transfer_kind: RecheckKind,
         id: &str,
-        deposit_tx: Option<TxHash>,
+        operator_tx: Option<RecheckTx>,
     ) -> String {
         let kind = match transfer_kind {
             RecheckKind::Mint => "equity_mint",
@@ -593,8 +601,11 @@ pub mod equity_transfer {
             "http://127.0.0.1:{}/transfers/recheck/{kind}/{id}",
             ctx.server_port
         );
-        match deposit_tx {
-            Some(deposit_tx) => format!("{url}?deposit_tx={deposit_tx:#x}"),
+        match operator_tx {
+            Some(RecheckTx::Deposit(deposit_tx)) => format!("{url}?deposit_tx={deposit_tx:#x}"),
+            Some(RecheckTx::Superseding(superseding_tx)) => {
+                format!("{url}?superseding_tx={superseding_tx:#x}")
+            }
             None => url,
         }
     }
@@ -604,9 +615,9 @@ pub mod equity_transfer {
         ctx: &Ctx,
         transfer_kind: RecheckKind,
         id: &str,
-        deposit_tx: Option<TxHash>,
+        operator_tx: Option<RecheckTx>,
     ) -> anyhow::Result<String> {
-        let url = recheck_url(ctx, transfer_kind, id, deposit_tx);
+        let url = recheck_url(ctx, transfer_kind, id, operator_tx);
         let body = post_operator_request(&url, "transfer recheck", None).await?;
 
         Ok(serde_json::from_str::<serde_json::Value>(&body)

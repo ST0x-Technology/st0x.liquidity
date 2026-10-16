@@ -1742,18 +1742,24 @@ fn is_failure_command_refusal<Entity: st0x_event_sorcery::EventSourced>(
     }
 }
 
-/// Optional `transfer recheck` input: the Alpaca deposit send an operator
-/// found on chain for a USDC deposit that failed with no send recorded.
+/// Optional `transfer recheck` input for a USDC transfer: the Alpaca deposit
+/// send an operator found on chain for a deposit that failed with no send
+/// recorded, or the tx that took the nonce of a signed Relay deposit.
 #[derive(Deserialize, Default)]
 struct RecheckQuery {
     deposit_tx: Option<TxHash>,
+    superseding_tx: Option<TxHash>,
 }
 
-/// The operator asserts `deposit_tx` in the query string, so it identifies
-/// what the recheck acted on.
+/// The operator asserts the txs in the query string, so they identify what
+/// the recheck acted on.
 impl AuditedRequest for RecheckQuery {
     fn audit_targets(&self) -> Vec<String> {
-        self.deposit_tx.iter().map(ToString::to_string).collect()
+        self.deposit_tx
+            .iter()
+            .chain(&self.superseding_tx)
+            .map(ToString::to_string)
+            .collect()
     }
 }
 
@@ -1783,11 +1789,22 @@ async fn recheck_transfer(
         )
     })?;
 
-    if query.deposit_tx.is_some() && kind != TransferKind::UsdcBridge {
+    if (query.deposit_tx.is_some() || query.superseding_tx.is_some())
+        && kind != TransferKind::UsdcBridge
+    {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: "deposit_tx applies only to a USDC recheck".to_string(),
+                error: "deposit_tx and superseding_tx apply only to a USDC recheck".to_string(),
+            }),
+        ));
+    }
+
+    if query.deposit_tx.is_some() && query.superseding_tx.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "name either deposit_tx or superseding_tx, not both".to_string(),
             }),
         ));
     }
@@ -1872,15 +1889,24 @@ async fn recheck_transfer(
             )
             .await?;
 
-            let outcome = handle
-                .usdc_recheck
-                .recheck_deposit(&rebalance_id, query.deposit_tx)
-                .await
-                .map_err(|error| {
-                    error!(?error, %id, "Failed to recheck USDC deposit");
-                    let (status, message) = usdc_recheck_error_response(&error);
-                    (status, Json(ErrorResponse { error: message }))
-                })?;
+            let recheck = &handle.usdc_recheck;
+            let outcome = match query.superseding_tx {
+                Some(superseding_tx) => {
+                    recheck
+                        .supersede_swap_deposit(&rebalance_id, superseding_tx)
+                        .await
+                }
+                None => {
+                    recheck
+                        .recheck_deposit(&rebalance_id, query.deposit_tx)
+                        .await
+                }
+            }
+            .map_err(|error| {
+                error!(?error, %id, "Failed to recheck USDC deposit");
+                let (status, message) = usdc_recheck_error_response(&error);
+                (status, Json(ErrorResponse { error: message }))
+            })?;
 
             info!(%id, ?outcome, "USDC deposit recheck completed via API");
             return Ok(Json(RecheckResponse { outcome }));
@@ -1991,7 +2017,12 @@ fn relay_chain_unread(error: &RelayBridgeError) -> bool {
         | RelayBridgeError::DepositReceiptMissing { .. }
         | RelayBridgeError::TxNotFound { .. }
         | RelayBridgeError::FillUnverified { .. }
-        | RelayBridgeError::RefundUnverified { .. } => false,
+        | RelayBridgeError::RefundUnverified { .. }
+        | RelayBridgeError::SupersedingTxIsTheDeposit { .. }
+        | RelayBridgeError::UnreadableDeposit { .. }
+        | RelayBridgeError::SupersedingTxFromAnotherSender { .. }
+        | RelayBridgeError::SupersedingTxAtAnotherNonce { .. }
+        | RelayBridgeError::SupersedingTxNotACancelOrDeposit { .. } => false,
     }
 }
 
@@ -2005,10 +2036,11 @@ fn relay_chain_unread(error: &RelayBridgeError) -> bool {
 /// equity recheck contract.
 fn usdc_recheck_error_response(error: &UsdcRecheckError) -> (StatusCode, String) {
     use UsdcRecheckError::{
-        Alpaca, AlpacaToBaseDeposit, DepositTxAmountMismatch, DepositTxBeforeMint,
-        DepositTxConflict, DepositTxLookup, DepositTxNotApplicable, DepositTxNotMined,
-        DepositTxRead, DepositTxRecordedElsewhere, DepositTxUnchecked, NoOnchainDepositRef,
-        NotDepositFailed, NotFound, Transfer,
+        Alpaca, AlpacaToBaseDeposit, DepositNotSuperseded, DepositTxAmountMismatch,
+        DepositTxBeforeMint, DepositTxConflict, DepositTxLookup, DepositTxNotApplicable,
+        DepositTxNotMined, DepositTxRead, DepositTxRecordedElsewhere, DepositTxUnchecked,
+        NoOnchainDepositRef, NotDepositFailed, NotFound, ReplacementAmountMismatch,
+        SupersedingTxNotApplicable, SupersedingTxOffRelay, Transfer,
     };
 
     match error {
@@ -2021,7 +2053,20 @@ fn usdc_recheck_error_response(error: &UsdcRecheckError) -> (StatusCode, String)
         | DepositTxRecordedElsewhere { .. }
         | DepositTxNotMined { .. }
         | DepositTxAmountMismatch { .. }
-        | DepositTxBeforeMint { .. } => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
+        | DepositTxBeforeMint { .. }
+        | SupersedingTxNotApplicable { .. }
+        | SupersedingTxOffRelay { .. }
+        | ReplacementAmountMismatch { .. } => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
+        DepositNotSuperseded { source, .. } if relay_chain_unread(source) => (
+            StatusCode::BAD_GATEWAY,
+            "Chain RPC unavailable; retry later".to_string(),
+        ),
+        // Names why: the operator fixes the tx, or retries once it has its
+        // confirmations.
+        DepositNotSuperseded { source, .. } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("{error}: {source}"),
+        ),
         // A corridor refusal is deterministic for this build, like the resume
         // refusal: the operator needs its message, not a generic 500.
         Transfer(transfer_error) => match transfer_error.as_ref() {
@@ -10466,6 +10511,62 @@ mod tests {
         assert_eq!(
             body.error,
             "A USDC transfer is executing; retry once it is not in flight"
+        );
+    }
+
+    /// A superseding tx names what took a signed Relay deposit's nonce: it
+    /// is refused outside a USDC recheck and beside a deposit tx.
+    #[tokio::test]
+    async fn recheck_refuses_a_superseding_tx_off_usdc_or_beside_a_deposit_tx() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let id = uuid::Uuid::new_v4().to_string();
+
+        for (kind, deposit_tx) in [
+            ("equity_mint", None),
+            ("usdc_bridge", Some(TxHash::repeat_byte(0xcc))),
+        ] {
+            let Err((status, _)) = recheck_transfer(
+                State(state.clone()),
+                Path((kind.to_string(), id.clone())),
+                AuditedQuery(RecheckQuery {
+                    deposit_tx,
+                    superseding_tx: Some(TxHash::repeat_byte(0xdd)),
+                }),
+            )
+            .await
+            else {
+                panic!("the {kind} recheck must refuse the superseding tx");
+            };
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{kind}");
+        }
+    }
+
+    /// A USDC recheck with a superseding tx runs the Relay deposit check,
+    /// which a service with no Relay corridor refuses, rather than the
+    /// deposit recheck.
+    #[tokio::test]
+    async fn recheck_usdc_route_sends_a_superseding_tx_to_the_relay_deposit_check() {
+        let (state, _gate) =
+            recovery_state_with_driver_pause(EquityTransferServices::panicking()).await;
+
+        let Err((status, Json(body))) = recheck_transfer(
+            State(state),
+            Path(("usdc_bridge".to_string(), uuid::Uuid::new_v4().to_string())),
+            AuditedQuery(RecheckQuery {
+                deposit_tx: None,
+                superseding_tx: Some(TxHash::repeat_byte(0xdd)),
+            }),
+        )
+        .await
+        else {
+            panic!("a service with no Relay corridor refuses the superseding tx");
+        };
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            body.error.contains("is not on a Relay corridor"),
+            "{}",
+            body.error
         );
     }
 

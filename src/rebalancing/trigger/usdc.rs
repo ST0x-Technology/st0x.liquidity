@@ -322,11 +322,14 @@ impl UsdcRebalanceStage {
             WithdrawalConfirmed { .. } => Some(Self::WithdrawalConfirmed),
             BridgingInitiated { .. } => Some(Self::BridgingInitiated),
             BridgeAttestationReceived { .. } => Some(Self::BridgeAttestationReceived),
-            SwapQuoted { .. } | SwapRequoted { .. } | SwapDepositReverted { .. } => {
-                Some(Self::SwapQuoted)
-            }
+            SwapQuoted { .. }
+            | SwapRequoted { .. }
+            | SwapDepositReverted { .. }
+            | SwapDepositCancelled { .. } => Some(Self::SwapQuoted),
             SwapDepositPrepared { .. } => Some(Self::SwapDepositPrepared),
-            SwapDeposited { .. } | SwapDepositAdopted { .. } => Some(Self::SwapDeposited),
+            SwapDeposited { .. } | SwapDepositAdopted { .. } | SwapDepositReplaced { .. } => {
+                Some(Self::SwapDeposited)
+            }
             SwapRefunded { .. }
             | SwapCompletionRecovered {
                 payment: SwapRecovery::Refund { .. },
@@ -389,6 +392,7 @@ impl UsdcRebalanceStage {
                 Some(*quoted_at)
             }
             (Self::SwapQuoted, SwapDepositReverted { reverted_at, .. }) => Some(*reverted_at),
+            (Self::SwapQuoted, SwapDepositCancelled { cancelled_at, .. }) => Some(*cancelled_at),
             (Self::SwapRefunded, SwapRefunded { refunded_at, .. })
             | (
                 Self::SwapRefunded | Self::Bridged,
@@ -411,6 +415,10 @@ impl UsdcRebalanceStage {
                 SwapDeposited { deposited_at, .. }
                 | SwapDepositAdopted {
                     adopted_at: deposited_at,
+                    ..
+                }
+                | SwapDepositReplaced {
+                    replaced_at: deposited_at,
                     ..
                 },
             ) => Some(*deposited_at),
@@ -1177,9 +1185,11 @@ impl RebalancingService {
             | SwapQuoted { .. }
             | SwapRequoted { .. }
             | SwapDepositReverted { .. }
+            | SwapDepositCancelled { .. }
             | SwapDepositPrepared { .. }
             | SwapDeposited { .. }
             | SwapDepositAdopted { .. }
+            | SwapDepositReplaced { .. }
             | SwapRefunded { .. }
             | SwapEscrowUnresolved { .. }
             | SwapCompletionRecovered {

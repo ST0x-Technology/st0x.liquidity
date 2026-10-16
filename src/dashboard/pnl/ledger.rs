@@ -679,6 +679,8 @@ async fn ingest_rebalance(
         | UsdcRebalanceEvent::SwapDepositAdopted { .. }
         | UsdcRebalanceEvent::SwapRequoted { .. }
         | UsdcRebalanceEvent::SwapDepositReverted { .. }
+        | UsdcRebalanceEvent::SwapDepositReplaced { .. }
+        | UsdcRebalanceEvent::SwapDepositCancelled { .. }
         | UsdcRebalanceEvent::ReturnedToSource { .. }
         | UsdcRebalanceEvent::SwapEscrowUnresolved { .. }
         | UsdcRebalanceEvent::SwapFailed { .. }

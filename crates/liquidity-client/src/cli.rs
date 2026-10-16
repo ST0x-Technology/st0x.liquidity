@@ -105,6 +105,12 @@ pub(crate) enum Debug {
         /// redemption.
         #[arg(long)]
         deposit_tx: Option<String>,
+        /// USDC only: the tx mined at the nonce of an Alpaca-to-chain Relay
+        /// transfer's signed deposit (`SwapDepositPrepared`), a replacement
+        /// of the deposit or a cancel. Sent as the `superseding_tx` query
+        /// parameter; the bot proves it on chain before recording it.
+        #[arg(long, conflicts_with = "deposit_tx")]
+        superseding_tx: Option<String>,
     },
     /// Enqueue a manual resume of one USDC rebalance on the bot's transfer
     /// worker.

@@ -322,6 +322,19 @@ pub enum UsdcRebalanceError {
     /// The confirmed deposit is not the persisted signed one.
     #[error("swap deposit {recorded} is not the signed deposit {prepared}")]
     SwapDepositHashMismatch { recorded: TxHash, prepared: TxHash },
+    /// A replacement or cancel names the persisted deposit itself.
+    #[error("tx {tx} is the signed deposit itself, not one that took its nonce")]
+    SupersedingTxIsTheDeposit { tx: TxHash },
+    /// A replacement deposit funds another order than the quote's.
+    #[error("the replacement deposit funds order {order_id}, not the quote's {quoted}")]
+    ReplacedDepositOrderMismatch { order_id: B256, quoted: B256 },
+    /// Only an Alpaca-to-chain cancel holds where the operator reconciles.
+    #[error("a cancelled swap deposit is recorded only from the hub")]
+    CancelledSwapDepositOffHub,
+    /// The transfer's deposit was cancelled: it holds for `transfer reconcile`
+    /// and is never quoted or signed again.
+    #[error("the swap deposit was cancelled by {cancel_tx}; the transfer holds for reconcile")]
+    SwapDepositCancelledHeld { cancel_tx: TxHash },
     /// A Relay transfer's withdrawn stable is outside the vault; failing it
     /// would release the guard while only a redeposit can return the stable.
     #[error(
@@ -640,6 +653,13 @@ pub enum UsdcRebalanceCommand {
     /// The persisted deposit mined and reverted. Valid only from
     /// `SwapDepositPrepared`.
     RecordSwapDepositReverted { deposit_tx: TxHash },
+    /// A replacement of the persisted deposit, proven on chain at its nonce,
+    /// is the swap's deposit. Valid only from `SwapDepositPrepared`, for a
+    /// tx other than the persisted one, of the quote's order id and input.
+    ReplaceSwapDeposit { deposit: SwapDeposit<B256> },
+    /// A cancel, proven on chain at the persisted deposit's nonce, took it.
+    /// Valid only from an Alpaca-to-chain `SwapDepositPrepared`.
+    RecordSwapDepositCancelled { cancel_tx: TxHash },
     /// A fill `verify_fill` proved. Valid from `SwapDeposited` and
     /// `SwapEscrowUnresolved`.
     ConfirmSwapFill {
@@ -920,6 +940,18 @@ pub enum UsdcRebalanceEvent {
         deposit_tx: TxHash,
         reverted_at: DateTime<Utc>,
     },
+    /// Another tx at the persisted deposit's nonce deposited for its order
+    /// in its place.
+    SwapDepositReplaced {
+        deposit_tx: TxHash,
+        deposit_block: u64,
+        replaced_at: DateTime<Utc>,
+    },
+    /// A cancel took the persisted deposit's nonce, moving nothing.
+    SwapDepositCancelled {
+        cancel_tx: TxHash,
+        cancelled_at: DateTime<Utc>,
+    },
     /// Relay's fill of the deposit, proven on the destination chain.
     /// `fee_collected` is the input less `amount_received`; `relayer_fee` is
     /// the quote's part of it.
@@ -1078,6 +1110,8 @@ impl DomainEvent for UsdcRebalanceEvent {
             Self::SwapDepositAdopted { .. } => "UsdcRebalanceEvent::SwapDepositAdopted",
             Self::SwapRequoted { .. } => "UsdcRebalanceEvent::SwapRequoted",
             Self::SwapDepositReverted { .. } => "UsdcRebalanceEvent::SwapDepositReverted",
+            Self::SwapDepositReplaced { .. } => "UsdcRebalanceEvent::SwapDepositReplaced",
+            Self::SwapDepositCancelled { .. } => "UsdcRebalanceEvent::SwapDepositCancelled",
             Self::RelayFillVerified { .. } => "UsdcRebalanceEvent::RelayFillVerified",
             Self::SwapRefunded { .. } => "UsdcRebalanceEvent::SwapRefunded",
             Self::SwapEscrowUnresolved { .. } => "UsdcRebalanceEvent::SwapEscrowUnresolved",
@@ -1513,6 +1547,11 @@ pub enum UsdcRebalance {
         /// from before this field.
         #[serde(default)]
         refund_requotes: u32,
+        /// The cancel that took the nonce of the last signed deposit: the
+        /// transfer holds here for `transfer reconcile` and is never quoted
+        /// or signed again.
+        #[serde(default)]
+        deposit_cancelled_by: Option<TxHash>,
         initiated_at: DateTime<Utc>,
         quoted_at: DateTime<Utc>,
     },
@@ -3525,6 +3564,8 @@ fn recorded_burn_tx(event: &UsdcRebalanceEvent) -> Option<TxHash> {
         | SwapCompletionRecovered { .. }
         | SwapRequoted { .. }
         | SwapDepositReverted { .. }
+        | SwapDepositReplaced { .. }
+        | SwapDepositCancelled { .. }
         | RelayFillVerified { .. }
         | SwapRefunded { .. }
         | SwapEscrowUnresolved { .. }
@@ -3810,7 +3851,7 @@ impl EventSourced for UsdcRebalance {
     // v19: the `SwapOverdeposited` state and event, the recorded hold on found
     // deposits of reverted Relay orders that one attempt cannot account for.
     // A new state variant, so stale snapshots are rebuilt from events.
-    const SCHEMA_VERSION: u64 = 19;
+    const SCHEMA_VERSION: u64 = 20;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use UsdcRebalanceEvent::*;
@@ -4359,6 +4400,7 @@ impl EventSourced for UsdcRebalance {
                 split_approves: Vec::new(),
                 deposit_reverts: 0,
                 refund_requotes: 0,
+                deposit_cancelled_by: None,
                 initiated_at: *initiated_at,
                 quoted_at: *quoted_at,
             },
@@ -4376,6 +4418,7 @@ impl EventSourced for UsdcRebalance {
                     split_approves,
                     deposit_reverts,
                     refund_requotes,
+                    deposit_cancelled_by,
                     initiated_at,
                     quoted_at,
                 },
@@ -4394,6 +4437,7 @@ impl EventSourced for UsdcRebalance {
                     .collect(),
                 deposit_reverts: *deposit_reverts,
                 refund_requotes: *refund_requotes,
+                deposit_cancelled_by: *deposit_cancelled_by,
                 initiated_at: *initiated_at,
                 quoted_at: *quoted_at,
             },
@@ -4435,11 +4479,18 @@ impl EventSourced for UsdcRebalance {
                 prepared_at: *prepared_at,
             },
 
+            // A replacement at the persisted deposit's nonce is read as the
+            // deposit itself: same order, same input.
             (
                 SwapDeposited {
                     deposit_tx,
                     deposit_block,
                     deposited_at,
+                }
+                | SwapDepositReplaced {
+                    deposit_tx,
+                    deposit_block,
+                    replaced_at: deposited_at,
                 },
                 Self::SwapDepositPrepared {
                     direction,
@@ -4556,6 +4607,7 @@ impl EventSourced for UsdcRebalance {
                     split_approves,
                     deposit_reverts,
                     refund_requotes,
+                    deposit_cancelled_by,
                     initiated_at,
                     ..
                 },
@@ -4570,6 +4622,7 @@ impl EventSourced for UsdcRebalance {
                 split_approves: split_approves.clone(),
                 deposit_reverts: *deposit_reverts,
                 refund_requotes: *refund_requotes,
+                deposit_cancelled_by: *deposit_cancelled_by,
                 initiated_at: *initiated_at,
                 quoted_at: *quoted_at,
             },
@@ -4600,16 +4653,18 @@ impl EventSourced for UsdcRebalance {
                 split_approves: Vec::new(),
                 deposit_reverts: 0,
                 refund_requotes: refund_requotes.saturating_add(1),
+                deposit_cancelled_by: None,
                 initiated_at: *initiated_at,
                 quoted_at: *quoted_at,
             },
 
-            // The reverted deposit moved nothing and every envelope of the
-            // pair is mined, so no approve is left to send again. The quote's
-            // order id is signed, so the next attempt re-quotes, and the quote
-            // is kept for the escrow scan in case a reorg lands its deposit.
+            // The reverted or cancelled deposit moved nothing and every nonce
+            // of the pair is used, so no approve is left to send again. The
+            // quote's order id is signed, so a revert's next attempt
+            // re-quotes, and the quote is kept for the escrow scan in case a
+            // reorg lands its deposit. A cancel holds instead.
             (
-                SwapDepositReverted { .. },
+                event @ (SwapDepositReverted { .. } | SwapDepositCancelled { .. }),
                 Self::SwapDepositPrepared {
                     direction,
                     corridor,
@@ -4624,24 +4679,31 @@ impl EventSourced for UsdcRebalance {
                     prepared_at,
                     ..
                 },
-            ) => Self::SwapQuoted {
-                direction: *direction,
-                corridor: *corridor,
-                amount: *amount,
-                first_deposit: *first_deposit,
-                quote: quote.clone(),
-                signed_order_ids: signed_order_ids.clone(),
-                reverted_quotes: reverted_quotes
-                    .iter()
-                    .chain(std::iter::once(quote.as_ref()))
-                    .cloned()
-                    .collect(),
-                split_approves: Vec::new(),
-                deposit_reverts: deposit_reverts.saturating_add(1),
-                refund_requotes: *refund_requotes,
-                initiated_at: *initiated_at,
-                quoted_at: *prepared_at,
-            },
+            ) => {
+                let (deposit_reverts, deposit_cancelled_by) = match event {
+                    SwapDepositCancelled { cancel_tx, .. } => (*deposit_reverts, Some(*cancel_tx)),
+                    _ => (deposit_reverts.saturating_add(1), None),
+                };
+                Self::SwapQuoted {
+                    direction: *direction,
+                    corridor: *corridor,
+                    amount: *amount,
+                    first_deposit: *first_deposit,
+                    quote: quote.clone(),
+                    signed_order_ids: signed_order_ids.clone(),
+                    reverted_quotes: reverted_quotes
+                        .iter()
+                        .chain(std::iter::once(quote.as_ref()))
+                        .cloned()
+                        .collect(),
+                    split_approves: Vec::new(),
+                    deposit_reverts,
+                    refund_requotes: *refund_requotes,
+                    deposit_cancelled_by,
+                    initiated_at: *initiated_at,
+                    quoted_at: *prepared_at,
+                }
+            }
 
             (
                 RelayFillVerified {
@@ -5376,6 +5438,8 @@ impl EventSourced for UsdcRebalance {
             | HoldOverdepositedSwap { .. }
             | RequoteSwap { .. }
             | RecordSwapDepositReverted { .. }
+            | ReplaceSwapDeposit { .. }
+            | RecordSwapDepositCancelled { .. }
             | ConfirmSwapFill { .. }
             | RecordSwapRefund { .. }
             | RecordSwapEscrowUnresolved
@@ -5524,6 +5588,10 @@ impl EventSourced for UsdcRebalance {
             RequoteSwap { quote } => self.transition_requote_swap(quote),
             RecordSwapDepositReverted { deposit_tx } => {
                 self.transition_record_swap_deposit_reverted(deposit_tx)
+            }
+            ReplaceSwapDeposit { deposit } => self.transition_replace_swap_deposit(deposit),
+            RecordSwapDepositCancelled { cancel_tx } => {
+                self.transition_record_swap_deposit_cancelled(cancel_tx)
             }
             ConfirmSwapFill {
                 fill_tx,
@@ -6778,6 +6846,14 @@ impl UsdcRebalance {
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         let (input, signed_order_ids) = match self {
             Self::SwapQuoted {
+                deposit_cancelled_by: Some(cancel_tx),
+                ..
+            } => {
+                return Err(UsdcRebalanceError::SwapDepositCancelledHeld {
+                    cancel_tx: *cancel_tx,
+                });
+            }
+            Self::SwapQuoted {
                 quote: current,
                 signed_order_ids,
                 ..
@@ -6852,6 +6928,81 @@ impl UsdcRebalance {
         Ok(vec![UsdcRebalanceEvent::SwapDepositReverted {
             deposit_tx,
             reverted_at: Utc::now(),
+        }])
+    }
+
+    /// Records a replacement of the persisted deposit as the swap's deposit:
+    /// only another tx, and only of the quote's order id and input.
+    fn transition_replace_swap_deposit(
+        &self,
+        deposit: SwapDeposit<B256>,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        let Self::SwapDepositPrepared {
+            quote,
+            deposit: prepared,
+            ..
+        } = self
+        else {
+            return Err(UsdcRebalanceError::InvalidCommand {
+                command: "ReplaceSwapDeposit".to_string(),
+                state: self.state_name().to_string(),
+            });
+        };
+        let SwapDeposit {
+            tx,
+            order_id,
+            amount,
+            block,
+        } = deposit;
+        if tx == prepared.tx_hash() {
+            return Err(UsdcRebalanceError::SupersedingTxIsTheDeposit { tx });
+        }
+        if order_id != quote.order_id {
+            return Err(UsdcRebalanceError::ReplacedDepositOrderMismatch {
+                order_id,
+                quoted: quote.order_id,
+            });
+        }
+        if amount != quote.amount_in {
+            return Err(UsdcRebalanceError::AdoptedDepositAmountMismatch {
+                order_id,
+                deposited: amount,
+                expected: quote.amount_in,
+            });
+        }
+
+        Ok(vec![UsdcRebalanceEvent::SwapDepositReplaced {
+            deposit_tx: tx,
+            deposit_block: block,
+            replaced_at: Utc::now(),
+        }])
+    }
+
+    /// Records a cancel of the persisted deposit of an Alpaca-to-chain swap,
+    /// which then holds at `SwapQuoted` with the stable at the hub.
+    fn transition_record_swap_deposit_cancelled(
+        &self,
+        cancel_tx: TxHash,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        let Self::SwapDepositPrepared {
+            direction, deposit, ..
+        } = self
+        else {
+            return Err(UsdcRebalanceError::InvalidCommand {
+                command: "RecordSwapDepositCancelled".to_string(),
+                state: self.state_name().to_string(),
+            });
+        };
+        if *direction != RebalanceDirection::AlpacaToBase {
+            return Err(UsdcRebalanceError::CancelledSwapDepositOffHub);
+        }
+        if cancel_tx == deposit.tx_hash() {
+            return Err(UsdcRebalanceError::SupersedingTxIsTheDeposit { tx: cancel_tx });
+        }
+
+        Ok(vec![UsdcRebalanceEvent::SwapDepositCancelled {
+            cancel_tx,
+            cancelled_at: Utc::now(),
         }])
     }
 
@@ -8799,6 +8950,231 @@ mod tests {
         };
         assert_eq!(quote.order_id, B256::repeat_byte(0x0b));
         assert_eq!(*deposit_reverts, 1);
+    }
+
+    /// A replacement at the deposit's nonce of the quote's order and input
+    /// is read as the deposit; the signed pair is no longer restored.
+    #[tokio::test]
+    async fn replaced_deposit_enters_swap_deposited_on_the_replacement() {
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(prepared_pair(RebalanceDirection::AlpacaToBase))
+            .when(UsdcRebalanceCommand::ReplaceSwapDeposit {
+                deposit: SwapDeposit {
+                    tx: TxHash::repeat_byte(0xb2),
+                    order_id: B256::repeat_byte(0x0a),
+                    amount: U256::from(100_000_000u64),
+                    block: 42,
+                },
+            })
+            .await
+            .events();
+        let state = replay::<UsdcRebalance>(
+            [prepared_pair(RebalanceDirection::AlpacaToBase), events].concat(),
+        )
+        .unwrap()
+        .unwrap();
+
+        let UsdcRebalance::SwapDeposited {
+            deposit_tx,
+            deposit_block,
+            adopted,
+            quote,
+            ..
+        } = &state
+        else {
+            panic!("expected SwapDeposited, got {state:?}");
+        };
+        assert_eq!(*deposit_tx, TxHash::repeat_byte(0xb2));
+        assert_eq!(*deposit_block, 42);
+        assert!(!adopted);
+        assert_eq!(quote.order_id, B256::repeat_byte(0x0a));
+        assert!(state.prepared_swap_envelopes().is_empty());
+        assert!(state.holds_rebalance_guard());
+    }
+
+    /// Only another tx, of the quote's order and exact input, from
+    /// `SwapDepositPrepared` replaces the deposit.
+    #[tokio::test]
+    async fn replacement_of_another_tx_order_amount_or_state_is_refused() {
+        let replacement =
+            |tx: u8, order_id: u8, amount: u64| UsdcRebalanceCommand::ReplaceSwapDeposit {
+                deposit: SwapDeposit {
+                    tx: TxHash::repeat_byte(tx),
+                    order_id: B256::repeat_byte(order_id),
+                    amount: U256::from(amount),
+                    block: 42,
+                },
+            };
+        let prepared = prepared_pair(RebalanceDirection::AlpacaToBase);
+
+        for (command, expected) in [
+            (
+                replacement(0xa2, 0x0a, 100_000_000),
+                UsdcRebalanceError::SupersedingTxIsTheDeposit {
+                    tx: TxHash::repeat_byte(0xa2),
+                },
+            ),
+            (
+                replacement(0xb2, 0x0b, 100_000_000),
+                UsdcRebalanceError::ReplacedDepositOrderMismatch {
+                    order_id: B256::repeat_byte(0x0b),
+                    quoted: B256::repeat_byte(0x0a),
+                },
+            ),
+            (
+                replacement(0xb2, 0x0a, 99_000_000),
+                UsdcRebalanceError::AdoptedDepositAmountMismatch {
+                    order_id: B256::repeat_byte(0x0a),
+                    deposited: U256::from(99_000_000u64),
+                    expected: U256::from(100_000_000u64),
+                },
+            ),
+        ] {
+            let error = TestHarness::<UsdcRebalance>::with(())
+                .given(prepared.clone())
+                .when(command)
+                .await
+                .then_expect_error();
+            assert_eq!(
+                error.to_string(),
+                LifecycleError::<UsdcRebalance>::Apply(expected).to_string()
+            );
+        }
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(quoted(RebalanceDirection::AlpacaToBase))
+            .when(replacement(0xb2, 0x0a, 100_000_000))
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { .. })
+            ),
+            "got {error:?}"
+        );
+    }
+
+    /// A cancel of a hub deposit holds the transfer at `SwapQuoted`: no
+    /// envelope is left, nothing is quoted again, and only a reconcile
+    /// releases its guard.
+    #[tokio::test]
+    async fn cancelled_hub_deposit_holds_at_swap_quoted_for_reconcile() {
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(prepared_pair(RebalanceDirection::AlpacaToBase))
+            .when(UsdcRebalanceCommand::RecordSwapDepositCancelled {
+                cancel_tx: TxHash::repeat_byte(0xc2),
+            })
+            .await
+            .events();
+        let cancelled = [prepared_pair(RebalanceDirection::AlpacaToBase), events].concat();
+        let state = replay::<UsdcRebalance>(cancelled.clone()).unwrap().unwrap();
+
+        let UsdcRebalance::SwapQuoted {
+            deposit_cancelled_by,
+            deposit_reverts,
+            reverted_quotes,
+            signed_order_ids,
+            ..
+        } = &state
+        else {
+            panic!("expected SwapQuoted, got {state:?}");
+        };
+        assert_eq!(*deposit_cancelled_by, Some(TxHash::repeat_byte(0xc2)));
+        assert_eq!(*deposit_reverts, 0);
+        assert_eq!(
+            reverted_quotes
+                .iter()
+                .map(|quote| quote.order_id)
+                .collect::<Vec<_>>(),
+            vec![B256::repeat_byte(0x0a)]
+        );
+        assert_eq!(*signed_order_ids, vec![B256::repeat_byte(0x0a)]);
+        assert!(state.prepared_swap_envelopes().is_empty());
+        assert!(state.holds_rebalance_guard());
+        assert!(state.is_reconcilable_failure());
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(cancelled.clone())
+            .when(UsdcRebalanceCommand::RequoteSwap {
+                quote: Box::new(hundred_usdc_quote(0x0b)),
+            })
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(UsdcRebalanceError::SwapDepositCancelledHeld { cancel_tx })
+                    if cancel_tx == TxHash::repeat_byte(0xc2)
+            ),
+            "got {error:?}"
+        );
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(cancelled.clone())
+            .when(UsdcRebalanceCommand::ReconcileStuckRebalance {
+                reason: ReconcileReason::FundsMovedManually,
+            })
+            .await
+            .events();
+        let state = replay::<UsdcRebalance>([cancelled, events].concat())
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.state_name(), "Reconciled");
+        assert!(!state.holds_rebalance_guard());
+    }
+
+    /// A chain-to-Alpaca `SwapQuoted` is no reconcilable hold, so a cancel
+    /// there is refused, as is one naming the deposit itself.
+    #[tokio::test]
+    async fn cancel_off_the_hub_or_of_the_deposit_itself_is_refused() {
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(prepared_pair(RebalanceDirection::BaseToAlpaca))
+            .when(UsdcRebalanceCommand::RecordSwapDepositCancelled {
+                cancel_tx: TxHash::repeat_byte(0xc2),
+            })
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(UsdcRebalanceError::CancelledSwapDepositOffHub)
+            ),
+            "got {error:?}"
+        );
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(prepared_pair(RebalanceDirection::AlpacaToBase))
+            .when(UsdcRebalanceCommand::RecordSwapDepositCancelled {
+                cancel_tx: TxHash::repeat_byte(0xa2),
+            })
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(UsdcRebalanceError::SupersedingTxIsTheDeposit { .. })
+            ),
+            "got {error:?}"
+        );
+    }
+
+    /// A `SwapQuoted` snapshot from before the cancel hold reads as no hold.
+    #[test]
+    fn swap_quoted_snapshot_without_a_cancel_reads_as_no_hold() {
+        let state = replay::<UsdcRebalance>(quoted(RebalanceDirection::AlpacaToBase))
+            .unwrap()
+            .unwrap();
+        let mut snapshot = to_value(&state).unwrap();
+        let removed = snapshot["SwapQuoted"]
+            .as_object_mut()
+            .unwrap()
+            .remove("deposit_cancelled_by");
+        assert_eq!(removed, Some(serde_json::Value::Null));
+
+        let legacy: UsdcRebalance = from_value(snapshot).unwrap();
+
+        assert_eq!(legacy, state);
     }
 
     /// A transfer whose deposit for order 0x0a reverted, re-quoted as 0x0b.

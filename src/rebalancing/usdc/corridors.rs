@@ -215,6 +215,24 @@ impl RecheckUsdcDeposit for UsdcCorridorTransfers {
             .verify_deposit_send_superseded(id, prepared, superseding_tx)
             .await
     }
+    async fn supersede_swap_deposit(
+        &self,
+        id: &UsdcRebalanceId,
+        superseding_tx: TxHash,
+    ) -> Result<RecheckOutcome, UsdcRecheckError> {
+        let recorded = self
+            .store
+            .load(id)
+            .await
+            .map_err(|error| Box::new(UsdcTransferError::from(error)))?
+            .ok_or_else(|| UsdcRecheckError::NotFound(id.clone()))?;
+
+        self.route(id, recorded.corridor())
+            .await
+            .map_err(Box::new)?
+            .supersede_swap_deposit(id, superseding_tx)
+            .await
+    }
 }
 
 #[async_trait]
@@ -350,6 +368,15 @@ mod tests {
         ) -> Result<(), DepositSendNotSuperseded> {
             self.resumed.lock().unwrap().push(id.clone());
             Ok(())
+        }
+
+        async fn supersede_swap_deposit(
+            &self,
+            id: &UsdcRebalanceId,
+            _superseding_tx: TxHash,
+        ) -> Result<RecheckOutcome, UsdcRecheckError> {
+            self.resumed.lock().unwrap().push(id.clone());
+            Ok(RecheckOutcome::Recovered)
         }
     }
 
@@ -591,6 +618,28 @@ mod tests {
             matches!(error, UsdcRecheckError::NotFound(ref missing) if *missing == unknown),
             "got {error:?}"
         );
+    }
+
+    /// A superseding tx of a signed Relay deposit reaches the service of the
+    /// transfer's recorded corridor, which signed the deposit.
+    #[tokio::test]
+    async fn superseded_relay_deposit_routes_to_the_recorded_corridors_service() {
+        let TwoCorridors {
+            transfers,
+            base,
+            robinhood,
+            store,
+            ..
+        } = two_corridors().await;
+        let id = record_on(&store, ROBINHOOD_CCTP).await;
+
+        transfers
+            .supersede_swap_deposit(&id, TxHash::repeat_byte(0x66))
+            .await
+            .unwrap();
+
+        assert!(base.resumed.lock().unwrap().is_empty());
+        assert_eq!(*robinhood.resumed.lock().unwrap(), vec![id]);
     }
 
     /// The superseded-send check reads only the shared Ethereum wallet, so it

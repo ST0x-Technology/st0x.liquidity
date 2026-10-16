@@ -347,6 +347,16 @@ pub struct SwapDeposit<OrderId> {
     pub block: u64,
 }
 
+/// What a mined tx at the nonce of a signed deposit did instead of it.
+#[cfg(feature = "relay")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupersededDeposit<OrderId> {
+    /// It reverted, or was a plain cancel: nothing was deposited.
+    Cancelled,
+    /// It deposited for the order in the signed deposit's place.
+    Replaced(SwapDeposit<OrderId>),
+}
+
 /// What a deposit scan found, and how far it looked.
 #[cfg(feature = "relay")]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -458,6 +468,26 @@ pub trait SwapBridge: Send + Sync + 'static {
         direction: HopDirection,
         approve: &PreparedTransaction,
     ) -> Result<(), Self::Error>;
+
+    /// Proves that `superseding`, a different tx from the signer of the
+    /// signed `deposit` at its nonce, is mined with the origin chain's
+    /// confirmations, so `deposit` can never mine, and reads what it did.
+    /// A reverted tx or a plain cancel (a 0-value transfer to the signer with
+    /// no calldata and no logs, not EIP-7702) is [`SupersededDeposit::Cancelled`].
+    /// A successful tx is [`SupersededDeposit::Replaced`] only when its
+    /// receipt holds our deposit for `order_id`; anything else is refused,
+    /// since it may have moved funds.
+    async fn verify_deposit_superseded(
+        &self,
+        direction: HopDirection,
+        order_id: Self::OrderId,
+        deposit: &PreparedTransaction,
+        superseding: TxHash,
+    ) -> Result<SupersededDeposit<Self::OrderId>, Self::Error>;
+
+    /// Releases the origin wallet's reservations of `envelopes`, whose
+    /// nonces another mined tx used, so no restart restores them.
+    async fn release_superseded(&self, direction: HopDirection, envelopes: &[PreparedTransaction]);
 
     /// Returns the origin chain's head, the floor for a later
     /// [`SwapBridge::find_recent_deposits`].
