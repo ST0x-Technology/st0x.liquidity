@@ -2694,8 +2694,8 @@ fn conflict(message: String) -> OpsError {
     (StatusCode::CONFLICT, Json(ErrorResponse { error: message }))
 }
 
-/// One lock per symbol, shared by `wrap-equity`, `unwrap-equity` and
-/// `redeem`; see `AppState::equity_wallet_locks`. The map grows only by the
+/// One lock per symbol, shared by `wrap-equity`, `unwrap-equity`, `redeem`
+/// and `drain-equity`; see `AppState::equity_wallet_locks`. The map grows only by the
 /// symbols a chain lists, since the routes check the listing first.
 #[derive(Default)]
 pub(crate) struct EquityWalletLocks(parking_lot::Mutex<HashMap<Symbol, Arc<Mutex<()>>>>);
@@ -2732,7 +2732,7 @@ fn claim_equity_wallet(
     let Some(lock) = locks.try_lock(symbol) else {
         warn!(route, %chain, %symbol, "Equity wallet operation refused: the symbol's lock is held");
         return Err(conflict(format!(
-            "Another wrap, unwrap or redeem of {symbol} is in progress or its outcome is \
+            "Another wrap, unwrap, redeem or drain of {symbol} is in progress or its outcome is \
              unknown; check the bot logs for it before retrying"
         )));
     };

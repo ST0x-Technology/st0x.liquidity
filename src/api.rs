@@ -11307,7 +11307,7 @@ mod tests {
             assert_eq!(status, StatusCode::CONFLICT, "{route}: {error}");
             assert_eq!(
                 error,
-                "Another wrap, unwrap or redeem of AAPL is in progress or its outcome is \
+                "Another wrap, unwrap, redeem or drain of AAPL is in progress or its outcome is \
                  unknown; check the bot logs for it before retrying",
                 "{route}"
             );

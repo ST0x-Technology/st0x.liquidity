@@ -368,6 +368,9 @@ st0x-liquidity-client --env <env> capital unwrap-equity --symbol <symbol> --quan
 # sends underlying shares to Alpaca's redemption wallet for Alpaca to redeem;
 # prints the transfer tx, then the bot follows the redemption in its logs
 st0x-liquidity-client --env <env> capital redeem --symbol <symbol> --quantity <shares> [--network <chain>]
+# sends USDC from the bot's Ethereum wallet to Alpaca's deposit address for the
+# bot's account; prints the transfer tx, then the bot logs Alpaca's detection
+st0x-liquidity-client --env <env> capital alpaca-deposit --amount <amount>
 # drains a paused listing in one run: vault withdraw, unwrap, then redeem;
 # prints the withdrawal tx, then the bot logs each later step
 st0x-liquidity-client --env <env> capital drain-equity --symbol <symbol> --quantity <wrapped-shares> --vault-id <vault-id> [--network <chain>]
@@ -478,15 +481,16 @@ confirmations. Until then every verb that takes the recovery lock answers `409`:
 `debug resume`, `debug recheck`, `debug resume-usdc`, `debug reconcile-usdc`,
 `debug fail-usdc-transfer`, `debug fail-equity-transfer`,
 `capital transfer-usdc`, `capital transfer-equity`, a `capital cctp-bridge` with
-a new operation id, and `debug cctp complete-mint`. Most say
-`A resume or recheck operation is already in progress`; `debug resume` says
-`A resume operation is already in progress` and `debug fail-equity-transfer`
-says `A transfer recovery operation is already in progress`. `complete-mint`
-answers `502` instead while Circle has not attested the burn, since it fetches
-the attestation before it tries the lock; both mean retry. A rerun with the
-burn's own operation id is answered at once while its burn is settled or a node
-holds it; one that must send the burn again waits for the lock like any other.
-After the task finishes, the lock is free again. The outcome is
+a new operation id, `capital alpaca-deposit`, and `debug cctp complete-mint`.
+Most say `A resume or recheck operation is already in progress`; `debug resume`
+says `A resume operation is already in progress` and
+`debug fail-equity-transfer` says
+`A transfer recovery operation is already in progress`. `complete-mint` answers
+`502` instead while Circle has not attested the burn, since it fetches the
+attestation before it tries the lock; both mean retry. A rerun with the burn's
+own operation id is answered at once while its burn is settled or a node holds
+it; one that must send the burn again waits for the lock like any other. After
+the task finishes, the lock is free again. The outcome is
 `CCTP burn confirmed via API`, `CCTP burn broadcast via API reverted`, or
 `CCTP burn broadcast via API is not confirmed yet` when the receipt wait timed
 out or a drop report or RPC errors left the burn unproven; a rerun with its
@@ -616,6 +620,31 @@ bot's own equity transfer of the symbol holds its guard, so they cannot move the
 wallet's shares from under a mint or redemption the bot is running. They do not
 take the recovery lock. A verb that answered `500` holds no lock. The lock lives
 in memory, so after a bot restart check the wallet onchain before rerunning.
+
+`capital alpaca-deposit` sends `--amount` USDC from the bot's Ethereum wallet to
+the deposit address Alpaca returns for USDC on Ethereum for the bot's own
+account, which credits the broker account, as the bot's own deposit leg of a
+transfer to Alpaca does. It always sends on Ethereum (Sepolia in sandbox) the
+USDC the bot uses there, to the address Alpaca returns; no command can name a
+chain or another destination, so the verb cannot move USDC out of our accounts.
+It prints the chain, the `depositAddress`, the `amount`, the `amountRaw` in USDC
+base units and the `transferTx` as soon as the transfer is broadcast. The bot
+then waits until the transfer has Ethereum's required confirmations, polls
+Alpaca until it detects the deposit, and logs the Alpaca transfer id and its
+final status; a deposit Alpaca fails or reports with an unexpected status raises
+an operational alert. The answer never waits for either. It refuses an amount
+that is not a positive decimal or is finer than 6 decimals with `400`. It
+answers `503` until the bot finishes starting, when the USDC driver cannot be
+paused, and while the Ethereum wallet cannot be shown to pay gas, `502` when
+Alpaca cannot give the deposit address, and `409` while another verb holds the
+recovery lock, while any USDC transfer is in flight or holds a corridor guard
+(the deposit spends Ethereum wallet USDC such a transfer may need), and when the
+wallet holds less USDC than the amount (the message names both). It holds the
+recovery lock and the USDC driver pause, like `capital cctp-bridge`, until the
+transfer is mined with Ethereum's required confirmations or has failed, so the
+bot's own USDC transfers wait until then. The send is never retried: a `500`
+says the tx may have gone out, so check the wallet onchain and the deposit in
+Alpaca before rerunning.
 
 A request that times out on the client may still complete in the bot; check the
 bot logs and the chain for the transaction before retrying a vault or allowance
@@ -765,10 +794,13 @@ startup: the first orchestrator-mode mint on that chain fails at signing.
 ### USDC Deposits and Withdrawals
 
 ```
-stox alpaca-deposit -a 500           # Deposit USDC from Ethereum to Alpaca
-stox alpaca-withdraw -a 500          # Withdraw USDC from Alpaca
-stox alpaca-withdraw -a 500 -t 0x... # Withdraw to a specific address
+st0x-liquidity-client --env <env> capital alpaca-deposit -a 500  # Deposit USDC from Ethereum to Alpaca
+stox alpaca-withdraw -a 500                                      # Withdraw USDC from Alpaca
+stox alpaca-withdraw -a 500 -t 0x...                             # Withdraw to a specific address
 ```
+
+`capital alpaca-deposit` runs in the live bot and signs with the bot's Ethereum
+wallet; see the capital verbs above for what it refuses.
 
 ### USD/USDC Conversion
 
@@ -1092,11 +1124,12 @@ To move a Relay refund, or what Relay returns of a failed order, by hand:
 - USDC in the bot's Ethereum wallet goes to Alpaca. `transfer reconcile` only
   releases the guard and the Robinhood inflight; it credits neither Alpaca nor
   the vault, and it ends the transfer's held credit on the Ethereum wallet. So
-  finish the transfer by hand first, with the bot stopped (`stox alpaca-deposit`
-  sends from the bot's Ethereum wallet): send the amount to Alpaca with
-  `stox alpaca-deposit -a <amount>`, wait for Alpaca to credit it, convert it
-  with `stox alpaca-convert -d to-usd -a <amount>`, and check the Alpaca cash
-  balance. Only then run the offline
+  finish the transfer by hand first, with the bot stopped: the live
+  `capital alpaca-deposit` answers `409` while this transfer holds its guard,
+  and `stox alpaca-deposit` sends from the bot's Ethereum wallet. Send the
+  amount to Alpaca with `stox alpaca-deposit -a <amount>`, wait for Alpaca to
+  credit it, convert it with `stox alpaca-convert -d to-usd -a <amount>`, and
+  check the Alpaca cash balance. Only then run the offline
   `stox transfer reconcile --kind usdc --id <uuid> --reason funds-moved-manually`,
   before you start the bot again: until the reconcile the transfer still counts
   the USDC as held credit on the Ethereum wallet, and the next deposit send
