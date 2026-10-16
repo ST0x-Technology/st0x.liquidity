@@ -126,11 +126,12 @@ with a `PreparedTransaction`, RAI-2485):
    `transfer reconcile --kind usdc --superseding-tx <hash>`, which accepts a
    BaseToAlpaca `Bridged` with a signed send once the chain shows that tx mined
    from the bot wallet at the send's nonce with Ethereum's required
-   confirmations, paying the deposit address no USDC (so not a fee-bumped copy
-   of the send) unless another transfer signed, attached or recorded it as its
-   own deposit send, since all corridors share the deposit address. The send's
-   recovered signer must be the configured bot wallet, since nonces are per
-   sender. A mined revert -> `FailDeposit` for reconciliation, paged.
+   confirmations, paying the deposit address less than the send pays (so not a
+   fee-bumped copy of the send, which pays its full amount) unless another
+   transfer signed, attached or recorded it as its own deposit send, since all
+   corridors share the deposit address. The send's recovered signer must be the
+   configured bot wallet, since nonces are per sender. A mined revert ->
+   `FailDeposit` for reconciliation, paged.
 4. At startup the bot reserves the nonce of every signed send still on `Bridged`
    (`restore_prepared`) and rebroadcasts its exact bytes (`broadcast_prepared`,
    no confirmation wait) before any job, startup approval or stale-allowance

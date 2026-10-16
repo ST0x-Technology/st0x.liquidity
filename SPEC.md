@@ -6250,12 +6250,14 @@ enum BridgeStage { Burn, Attestation, Mint }
   and the API and CLI read it on chain before the command: they refuse unless it
   is mined from the bot's Ethereum wallet at the send's nonce, is not the send
   itself, has Ethereum's required confirmations (`[chains.ethereum]`, not the
-  primary chain's), and paid the send's deposit address no USDC (a fee-bumped
-  copy of the send did) unless another transfer signed, attached or recorded it
-  as its own deposit send. Nonces are per sender, so they also refuse a send
-  whose recovered signer is not the configured Ethereum wallet (a key rotated
-  out since). A missing receipt for the send is never proof, since a lagging
-  node shows none for a send that mined.
+  primary chain's), and paid the send's deposit address less than the send pays
+  (a fee-bumped copy of the send pays its full amount) unless another transfer
+  signed, attached or recorded it as its own deposit send. The amount alone does
+  not show who signed a smaller payment or whether Alpaca credited it, so the
+  operator checks both before reconciling. Nonces are per sender, so they also
+  refuse a send whose recovered signer is not the configured Ethereum wallet (a
+  key rotated out since). A missing receipt for the send is never proof, since a
+  lagging node shows none for a send that mined.
 
 ##### Integration Points
 
@@ -9975,12 +9977,16 @@ therefore performs an explicit fund-moving send:
      the send's nonce. Reconcile takes that different tx's hash
      (`--superseding-tx`) and refuses unless the chain shows it mined from the
      bot wallet at the send's nonce, distinct from the send, with the required
-     confirmations, and paying the send's deposit address no USDC, so a
-     fee-bumped copy of the send is refused. The deposit address is shared, so a
-     tx that paid it is accepted when another transfer signed, attached or
-     recorded it as its own deposit send. Nonces are per sender, so a send whose
-     recovered signer is not the configured bot wallet (a key rotated out since)
-     is refused. A superseding tx on a transfer with no signed send is refused.
+     confirmations, and paying the send's deposit address less than the send
+     pays, so a fee-bumped copy of the send is refused while a smaller payment
+     is accepted. The amount alone does not show who signed a smaller payment or
+     whether Alpaca credited it, so the operator checks both before reconciling
+     and picks the reason for where the USDC is now. The deposit address is
+     shared, so a tx that paid it at least the send's amount is accepted when
+     another transfer signed, attached or recorded it as its own deposit send.
+     Nonces are per sender, so a send whose recovered signer is not the
+     configured bot wallet (a key rotated out since) is refused. A superseding
+     tx on a transfer with no signed send is refused.
    - Mined reverted: it moved no USDC. The bot does not sign another send; it
      emits `FailDeposit` (the signed tx becomes the `deposit_ref`) and pages
      (`DepositSendUnresolved`). If the `FailDeposit` write fails, the job
