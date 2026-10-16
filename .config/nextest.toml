@@ -32,9 +32,13 @@ default-filter = "not test(=full_system::simulate) & not test(=full_system::full
 retries = { backoff = "exponential", count = 2, delay = "1s", jitter = true }
 slow-timeout = { period = "90s", terminate-after = 3 }
 
+# E2e tests take up to ~75s each while unit tests take milliseconds, so start
+# them first: the unit tests then fill the spare threads instead of the e2e
+# tests forming each CI shard's tail.
 [[profile.ci.overrides]]
 filter = "binary(=e2e) & not (test(=full_system::simulate) | test(=full_system::full_system_concurrent))"
 test-group = "simulate"
+priority = 50
 slow-timeout = { period = "600s", terminate-after = 2 }
 retries = { backoff = "exponential", count = 3, delay = "5s", jitter = true }
 

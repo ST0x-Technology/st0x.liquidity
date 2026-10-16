@@ -400,13 +400,15 @@ jobs:
           fail-on-cache-miss: true
 
       # Test binaries come from the archive built in backend-build; no recompile.
+      # count: deals each binary's tests round-robin, so every shard gets an
+      # even share of the slow e2e tests (hash: left one shard with most).
       - name: test ${{ matrix.partition }} of 4
         run: |
           nix develop .#ci-backend -c bash -c "
             set -euxo pipefail
             cargo nextest run --archive-file \"\$RUNNER_TEMP/nextest-archive.tar.zst\" \
               --workspace-remap . --profile ci \
-              --partition hash:${{ matrix.partition }}/4
+              --partition count:${{ matrix.partition }}/4
           "
 
   backend:
