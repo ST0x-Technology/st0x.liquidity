@@ -132,6 +132,22 @@ impl UsdcCashGuards {
         self.state().unclassified
     }
 
+    /// Why some transfer holds or blocks a corridor, on any chain: the every
+    /// corridor latch, a transfer whose aggregate failed to load, or a holder
+    /// of any chain's guard. `None` while every corridor is free.
+    pub(super) fn any_claim(&self) -> Option<ClaimRefusal> {
+        let state = self.state();
+        if state.unclassified {
+            Some(ClaimRefusal::Unclassified)
+        } else if !state.unread.is_empty() {
+            Some(ClaimRefusal::CorridorUnread)
+        } else if state.holders.values().any(|holders| !holders.is_empty()) {
+            Some(ClaimRefusal::CorridorHeld)
+        } else {
+            None
+        }
+    }
+
     /// Whether a transfer holds `chain`; the every-corridor latch is read
     /// with [`Self::is_latched`].
     #[cfg(test)]

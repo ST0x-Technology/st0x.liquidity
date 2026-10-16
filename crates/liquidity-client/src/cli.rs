@@ -513,6 +513,19 @@ pub(crate) enum Capital {
         #[arg(long, value_enum, default_value_t = HedgedChain::Base)]
         network: HedgedChain,
     },
+    /// Send USDC from the bot's Ethereum wallet to the deposit address Alpaca
+    /// gives for the bot's own account, crediting it there. Returns the
+    /// transfer tx as soon as it is broadcast; the bot confirms it, polls
+    /// Alpaca's detection afterwards and logs them. The send is never
+    /// retried: a 500 may follow a broadcast, so check the wallet onchain
+    /// before rerunning. Refused while a USDC transfer is in flight. The bot
+    /// always sends on Ethereum to the address Alpaca returns; no command can
+    /// name a chain or another destination.
+    AlpacaDeposit {
+        /// Amount of USDC to deposit, as a decimal.
+        #[arg(short = 'a', long, allow_negative_numbers = true)]
+        amount: DecimalAmount,
+    },
     /// Drain wrapped shares of an equity from a paused chain into Alpaca in
     /// one run: withdraws them from the vault, unwraps them, and sends the
     /// underlying to the redemption wallet the bot has configured for the
@@ -1218,6 +1231,33 @@ mod tests {
         assert_eq!(withdrawn, amount("100"));
         assert_eq!(network.wire_name(), "hyperevm");
 
+        for argv in [
+            &["alpaca-deposit", "--amount", "500"][..],
+            &["alpaca-deposit", "-a", "500"][..],
+        ] {
+            let Capital::AlpacaDeposit { amount: deposited } = capital(argv).unwrap() else {
+                panic!("expected alpaca-deposit from {argv:?}");
+            };
+            assert_eq!(deposited, amount("500"), "{argv:?}");
+        }
+        // The bot deposits only on Ethereum, to the address Alpaca returns for
+        // its own account, so the client has no way to name a chain or another
+        // destination.
+        for (flag, value) in [
+            ("--network", "base"),
+            ("--chain", "base"),
+            ("--deposit-address", TOKEN),
+        ] {
+            let Err(error) = capital(&["alpaca-deposit", "-a", "1", flag, value]) else {
+                panic!("alpaca-deposit must not accept {flag}");
+            };
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{flag}"
+            );
+        }
+
         let Capital::ResetAllowance { network } =
             capital(&["reset-allowance", "--network", "ethereum"]).unwrap()
         else {
@@ -1241,6 +1281,7 @@ mod tests {
             &["vault-deposit", "-a", "1", "-t", TOKEN][..],
             &["vault-withdraw", "-a", "1", "-v", VAULT][..],
             &["vault-withdraw-usdc", "--network", "base"][..],
+            &["alpaca-deposit"][..],
             &["cctp-bridge", "--amount", "1"][..],
         ] {
             let Err(error) = capital(argv) else {
@@ -1384,6 +1425,7 @@ mod tests {
                 | Capital::DrainEquity { network, .. }
                 | Capital::ResetAllowance { network } => network,
                 Capital::TransferUsdc { .. }
+                | Capital::AlpacaDeposit { .. }
                 | Capital::CctpBridge { .. }
                 | Capital::CctpBurnSupersede { .. } => {
                     panic!("{argv:?} takes no --network")
@@ -1530,6 +1572,7 @@ mod tests {
                 VAULT,
             ]);
             argvs.push(vec!["vault-withdraw-usdc", "-a", bad_amount]);
+            argvs.push(vec!["alpaca-deposit", "-a", bad_amount]);
             argvs.push(vec![
                 "cctp-bridge",
                 "--from",

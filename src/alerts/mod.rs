@@ -158,6 +158,8 @@ alert_kinds! {
         CapitalCctpBurnSendUnproven => "A recorded CCTP burn could not be sent",
         CapitalCctpBurnRecordUnknown => "Cannot tell whether a signed CCTP burn was recorded",
         CapitalEquityTxUnproven => "An operator equity wallet tx is still unproven",
+        CapitalAlpacaDepositUnproven => "An operator Alpaca deposit transfer is still unproven",
+        CapitalAlpacaDepositNotCredited => "Alpaca did not credit an operator deposit transfer",
         RecoveryActiveTransferOnOtherChain => "the symbol's active transfer is on another chain",
         RecoveryChainServicesMissing => "its chain has no equity services",
         WrappedRecoveryValidationFailed => "active aggregate validation failed",

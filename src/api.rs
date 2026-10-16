@@ -1414,6 +1414,9 @@ enum UsdcDriverPauseRequest<'a> {
     ManualTransfer { direction: RebalanceDirection },
     /// `capital cctp-bridge`, which burns the rebalancing wallet's USDC.
     CctpBurn { direction: BridgeDirection },
+    /// `capital alpaca-deposit`, which sends the Ethereum wallet's USDC to
+    /// Alpaca.
+    AlpacaDeposit,
 }
 
 /// Quiesces the USDC rebalancing driver for the caller's mutation window:
@@ -1444,6 +1447,9 @@ async fn quiesce_usdc_driver(
                 ?direction,
                 "USDC driver did not quiesce for a CCTP burn; refusing"
             ),
+            UsdcDriverPauseRequest::AlpacaDeposit => {
+                warn!("USDC driver did not quiesce for an Alpaca deposit; refusing");
+            }
         }
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -4944,6 +4950,7 @@ define_ops_api_routes! {
     capital post "/wrap-equity" => capital::wrap_equity;
     capital post "/unwrap-equity" => capital::unwrap_equity;
     capital post "/redeem" => capital::redeem;
+    capital post "/alpaca-deposit" => capital::alpaca_deposit;
     capital post "/drain-equity" => capital::drain_equity;
     capital post "/vault-deposit" => capital::vault_deposit;
     capital post "/vault-withdraw" => capital::vault_withdraw;
@@ -9388,7 +9395,7 @@ mod tests {
             .iter()
             .filter(|route| route.role == OpsRole::Capital)
             .collect::<Vec<_>>();
-        assert_eq!(capital_routes.len(), 12);
+        assert_eq!(capital_routes.len(), 13);
         for route in capital_routes {
             let verb = route
                 .path
@@ -11062,6 +11069,11 @@ mod tests {
             capital_request(equity_wallet_body("1")),
         )
         .await;
+        let alpaca_deposit = capital::alpaca_deposit(
+            State(state.clone()),
+            capital_request(serde_json::json!({"amount": "1"})),
+        )
+        .await;
         let drain = capital::drain_equity(
             State(state.clone()),
             capital_request(equity_wallet_body("1")),
@@ -11101,6 +11113,7 @@ mod tests {
             ("wrap-equity", wrap.err()),
             ("unwrap-equity", unwrap.err()),
             ("redeem", redeem.err()),
+            ("alpaca-deposit", alpaca_deposit.err()),
             ("drain-equity", drain.err()),
             ("vault-deposit", deposit.err()),
             ("vault-withdraw", withdraw.err()),
@@ -11577,6 +11590,371 @@ mod tests {
         );
         assert_eq!(
             erc20_balance(&chain.bot_wallet, underlying, chain.bot).await,
+            supply - sent
+        );
+    }
+
+    /// Runs `capital alpaca-deposit` for `amount`, as its JSON answer or its
+    /// refusal.
+    async fn run_alpaca_deposit(
+        state: &AppState,
+        amount: &str,
+    ) -> Result<serde_json::Value, (StatusCode, String)> {
+        capital::alpaca_deposit(
+            State(state.clone()),
+            capital_request(serde_json::json!({"amount": amount})),
+        )
+        .await
+        .map(|Json(answer)| serde_json::to_value(answer).unwrap())
+        .map_err(|(status, Json(error))| (status, error.error))
+    }
+
+    /// A started bot over `ctx` with an Ethereum entry, whose depth decides
+    /// the deposit transfer's fate, and whose rebalancing service runs on a
+    /// wired USDC store and the returned job pool, so the deposit's single
+    /// flight gates read real job rows and rebalances.
+    async fn alpaca_deposit_state(
+        mut ctx: Ctx,
+    ) -> (AppState, UsdcDriverGate, apalis_sqlite::SqlitePool) {
+        let ethereum_rpc = ctx.chains.primary().rpc_url.clone();
+        ctx.chains.insert_transport(st0x_config::ChainCtx {
+            chain: Chain::Ethereum,
+            rpc_url: ethereum_rpc,
+            required_confirmations: 1,
+        });
+        let state = empty_app_state(ctx).await;
+        state.health.set_ready();
+        let jobs = crate::test_utils::setup_test_apalis_pool().await;
+        let (service, store) =
+            crate::rebalancing::trigger::wire_usdc_reactor_store(&state.pool, &jobs).await;
+        let gate =
+            publish_recovery_handle(&state, service, store, EquityTransferServices::panicking())
+                .await;
+        (state, gate, jobs)
+    }
+
+    fn stub_wallet_ctx() -> Ctx {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.wallet = Some(st0x_config::OnchainWalletCtx::stub());
+        ctx
+    }
+
+    /// A zero, negative, unparseable, or off grid amount is refused as input
+    /// before the startup gate: startup has not completed, so a 503 here
+    /// would mean the amount was not checked first. `1.0000001` is finer
+    /// than USDC's six decimals.
+    #[tokio::test]
+    async fn alpaca_deposit_refuses_a_bad_amount_before_the_startup_gate() {
+        let state = empty_app_state(stub_wallet_ctx()).await;
+
+        for amount in ["0", "-5", "abc", "1.0000001"] {
+            let Err((status, error)) = run_alpaca_deposit(&state, amount).await else {
+                panic!("amount {amount} must be refused");
+            };
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{amount}: {error}");
+        }
+    }
+
+    /// The deposit spends the Ethereum wallet's USDC, so like `cctp-bridge`
+    /// it refuses while another operator write holds the resume lock.
+    #[tokio::test]
+    async fn alpaca_deposit_returns_409_while_the_resume_lock_is_held() {
+        let (state, _gate, _jobs) = alpaca_deposit_state(stub_wallet_ctx()).await;
+        let _held = state.resume_lock.0.try_lock().unwrap();
+
+        let Err((status, error)) = run_alpaca_deposit(&state, "10").await else {
+            panic!("a held resume lock must refuse the deposit");
+        };
+
+        assert_eq!(status, StatusCode::CONFLICT, "{error}");
+        assert_eq!(
+            error,
+            "A resume or recheck operation is already in progress"
+        );
+    }
+
+    /// Every USDC transfer may need the Ethereum wallet's USDC, so the
+    /// deposit refuses with 409 while any transfer is in flight (a live job
+    /// row) or still holds its corridor guard (a transfer that failed after
+    /// its burn, awaiting reconcile), before the gas check: the stub wallet
+    /// cannot pass that check, so reaching it would answer 500.
+    #[tokio::test]
+    async fn alpaca_deposit_returns_409_while_a_usdc_transfer_is_in_flight_or_holds_its_guard() {
+        let (in_flight, _gate, jobs) = alpaca_deposit_state(stub_wallet_ctx()).await;
+        crate::rebalancing::usdc::TransferUsdcToHedgingJobQueue::new(&jobs)
+            .push(crate::rebalancing::usdc::TransferUsdcToHedging {
+                id: UsdcRebalanceId(uuid::Uuid::new_v4()),
+                amount: Usdc::new(float!(50)),
+                corridor: UsdcCorridor::BASE_CCTP,
+                revert_redrive_attempts: 0,
+                backpressure_streak: crate::conductor::job::BackpressureStreak::default(),
+            })
+            .await
+            .unwrap();
+
+        let Err((status, error)) = run_alpaca_deposit(&in_flight, "10").await else {
+            panic!("a USDC transfer in flight must refuse the deposit");
+        };
+        assert_eq!(status, StatusCode::CONFLICT, "{error}");
+        assert!(
+            error.starts_with("another USDC transfer is already in flight"),
+            "{error}"
+        );
+
+        let (holding, _gate, _jobs) = alpaca_deposit_state(stub_wallet_ctx()).await;
+        seed_usdc_bridging_failed(&holding.pool, &UsdcRebalanceId(uuid::Uuid::new_v4())).await;
+
+        let Err((status, error)) = run_alpaca_deposit(&holding, "10").await else {
+            panic!("a USDC transfer holding its guard must refuse the deposit");
+        };
+        assert_eq!(status, StatusCode::CONFLICT, "{error}");
+        assert_eq!(error, UsdcResumeError::GuardHeldElsewhere.to_string());
+    }
+
+    /// A deposit state over `chain` (see [`capital_ctx_on`]) whose Ethereum
+    /// USDC is `usdc`, whose Alpaca is `alpaca`, and whose Ethereum gas
+    /// threshold is `ethereum_gas_threshold`.
+    #[cfg(feature = "test-support")]
+    async fn alpaca_deposit_state_on(
+        chain: &AnvilRaindexChain,
+        usdc: Address,
+        alpaca: &MockServer,
+        ethereum_gas_threshold: U256,
+    ) -> (
+        AppState,
+        tokio::sync::watch::Sender<ReceiptGate>,
+        UsdcDriverGate,
+    ) {
+        let (mut ctx, receipt_gate) = capital_ctx_on(chain);
+        ctx.rebalancing.cctp_corridor = st0x_bridge::cctp::CctpCorridor::with_tokens(usdc, usdc);
+        ctx.alerts = Some(st0x_config::AlertsCtx::for_test(
+            std::collections::BTreeMap::from([
+                (Chain::Base, U256::from(1_u64)),
+                (Chain::Ethereum, ethereum_gas_threshold),
+            ]),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        ));
+        let BrokerCtx::AlpacaBrokerApi(broker) = &mut ctx.broker;
+        broker.mode = Some(AlpacaBrokerApiMode::Mock(alpaca.base_url()));
+        let (state, driver_gate, _jobs) = alpaca_deposit_state(ctx).await;
+        (state, receipt_gate, driver_gate)
+    }
+
+    /// Alpaca's USDC deposit address on Ethereum in the deposit tests.
+    #[cfg(feature = "test-support")]
+    const TEST_ALPACA_DEPOSIT_ADDRESS: Address =
+        address!("0x00000000000000000000000000000000000000de");
+
+    /// Serves `TEST_ALPACA_DEPOSIT_ADDRESS` as the account's USDC deposit
+    /// address on Ethereum.
+    #[cfg(feature = "test-support")]
+    fn serve_alpaca_deposit_address(alpaca: &MockServer, state: &AppState) {
+        let BrokerCtx::AlpacaBrokerApi(broker) = &state.ctx.broker;
+        let path = format!("/v1/accounts/{}/wallets", broker.account_id);
+        alpaca.mock(|when, then| {
+            when.method(GET)
+                .path(path.as_str())
+                .query_param("asset", "USDC")
+                .query_param("network", "ethereum");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "asset_id": "5d0de74f-827b-41a7-9f74-9c07c08fe55f",
+                    "address": TEST_ALPACA_DEPOSIT_ADDRESS,
+                    "created_at": "2025-08-07T08:52:40.656166Z"
+                }));
+        });
+    }
+
+    /// The deposit refuses with 503 while the Ethereum wallet is below its
+    /// gas threshold, before it asks Alpaca or moves anything.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn alpaca_deposit_returns_503_while_the_ethereum_wallet_is_not_gas_ready() {
+        let chain = AnvilRaindexChain::deploy().await;
+        let supply = U256::from(1_000_000_000_u64);
+        let usdc = chain.deploy_bot_token(6, supply).await;
+        let alpaca = MockServer::start();
+        let (state, _receipt_gate, _driver_gate) =
+            alpaca_deposit_state_on(&chain, usdc, &alpaca, U256::MAX).await;
+        serve_alpaca_deposit_address(&alpaca, &state);
+
+        let Err((status, error)) = run_alpaca_deposit(&state, "10").await else {
+            panic!("an Ethereum wallet short of gas must refuse the deposit");
+        };
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{error}");
+        assert!(
+            error.starts_with("The ethereum signing wallet is not gas ready"),
+            "{error}"
+        );
+        assert_eq!(
+            erc20_balance(&chain.bot_wallet, usdc, chain.bot).await,
+            supply
+        );
+    }
+
+    /// Without Alpaca's deposit address there is nowhere to send, so the
+    /// deposit refuses with 502 and sends nothing.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn alpaca_deposit_returns_502_when_alpaca_gives_no_deposit_address() {
+        let chain = AnvilRaindexChain::deploy().await;
+        let supply = U256::from(1_000_000_000_u64);
+        let usdc = chain.deploy_bot_token(6, supply).await;
+        let alpaca = MockServer::start();
+        let (state, _receipt_gate, _driver_gate) =
+            alpaca_deposit_state_on(&chain, usdc, &alpaca, U256::from(1_u64)).await;
+
+        let Err((status, error)) = run_alpaca_deposit(&state, "10").await else {
+            panic!("a missing deposit address must refuse the deposit");
+        };
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{error}");
+        assert!(
+            error.starts_with("Alpaca did not give the account's USDC deposit address"),
+            "{error}"
+        );
+        assert_eq!(
+            erc20_balance(&chain.bot_wallet, usdc, chain.bot).await,
+            supply
+        );
+    }
+
+    /// A deposit above the wallet's USDC is refused with 409 naming both
+    /// amounts, and nothing reaches Alpaca's address.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn alpaca_deposit_returns_409_naming_both_amounts_when_the_balance_is_short() {
+        let chain = AnvilRaindexChain::deploy().await;
+        let supply = U256::from(1_000_000_u64);
+        let usdc = chain.deploy_bot_token(6, supply).await;
+        let alpaca = MockServer::start();
+        let (state, _receipt_gate, _driver_gate) =
+            alpaca_deposit_state_on(&chain, usdc, &alpaca, U256::from(1_u64)).await;
+        serve_alpaca_deposit_address(&alpaca, &state);
+
+        let Err((status, error)) = run_alpaca_deposit(&state, "2").await else {
+            panic!("a short balance must refuse the deposit");
+        };
+
+        assert_eq!(status, StatusCode::CONFLICT, "{error}");
+        assert_eq!(
+            error,
+            format!(
+                "Insufficient USDC balance in the bot's Ethereum wallet {}: it holds 1000000 \
+                 and the deposit needs 2000000 (USDC base units, 6 decimals); nothing was sent",
+                chain.bot
+            )
+        );
+        assert_eq!(
+            erc20_balance(&chain.bot_wallet, usdc, chain.bot).await,
+            supply
+        );
+        assert_eq!(
+            erc20_balance(&chain.bot_wallet, usdc, TEST_ALPACA_DEPOSIT_ADDRESS).await,
+            U256::ZERO
+        );
+    }
+
+    /// End to end through the handler on Anvil against a mock Alpaca: the
+    /// route answers at the broadcast with the transfer, while the resume
+    /// lock and the USDC driver pause stay held until the transfer confirms
+    /// (so no USDC transfer runs and a second deposit refuses meanwhile);
+    /// the task then finds Alpaca's deposit of that transfer and logs its
+    /// completion. Exactly the requested USDC reaches the address Alpaca
+    /// gave, in one transfer.
+    #[cfg(feature = "test-support")]
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn alpaca_deposit_sends_the_usdc_once_to_alpacas_address_and_follows_it_to_completion() {
+        let chain = AnvilRaindexChain::deploy().await;
+        let supply = U256::from(1_000_000_000_u64);
+        let usdc = chain.deploy_bot_token(6, supply).await;
+        let alpaca = MockServer::start();
+        let (state, receipt_gate, driver_gate) =
+            alpaca_deposit_state_on(&chain, usdc, &alpaca, U256::from(1_u64)).await;
+        serve_alpaca_deposit_address(&alpaca, &state);
+
+        let answer = run_alpaca_deposit(&state, "250.5")
+            .await
+            .unwrap_or_else(|(status, error)| panic!("deposit refused with {status}: {error}"));
+        assert!(
+            state.resume_lock.0.try_lock().is_err(),
+            "the deposit must hold the resume lock until its transfer confirms"
+        );
+        assert!(
+            driver_gate.is_paused(),
+            "the deposit must keep the USDC driver paused until its transfer confirms"
+        );
+        let Err((status, _)) = run_alpaca_deposit(&state, "1").await else {
+            panic!("a second deposit before the first confirms must not run");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let transfer_tx: TxHash = serde_json::from_value(answer["transferTx"].clone()).unwrap();
+        assert_eq!(
+            answer,
+            serde_json::json!({
+                "chain": "ethereum",
+                "depositAddress": TEST_ALPACA_DEPOSIT_ADDRESS,
+                "amount": "250.5",
+                "amountRaw": "250500000",
+                "transferTx": transfer_tx,
+            })
+        );
+
+        let BrokerCtx::AlpacaBrokerApi(broker) = &state.ctx.broker;
+        let transfers_path = format!("/v1/accounts/{}/wallets/transfers", broker.account_id);
+        let deposit = alpaca.mock(|when, then| {
+            when.method(GET).path(transfers_path.as_str());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!([{
+                    "id": "6a1c2e3f-0b4d-4e5f-8a9b-0c1d2e3f4a5b",
+                    "direction": "INCOMING",
+                    "amount": "250.5",
+                    "usd_value": "250.5",
+                    "chain": "ethereum",
+                    "asset": "USDC",
+                    "from_address": chain.bot,
+                    "to_address": TEST_ALPACA_DEPOSIT_ADDRESS,
+                    "status": "COMPLETE",
+                    "tx_hash": transfer_tx,
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "network_fee": "0",
+                    "fees": "0"
+                }]));
+        });
+        confirm_after_the_answer(&state, &receipt_gate).await;
+        assert!(
+            deposit.calls() > 0,
+            "the task must ask Alpaca for the deposit"
+        );
+        assert!(logs_contain("Alpaca deposit transfer confirmed via API"));
+        assert!(logs_contain("Alpaca completed the deposit sent via API"));
+        assert!(logs_contain("6a1c2e3f-0b4d-4e5f-8a9b-0c1d2e3f4a5b"));
+        assert!(
+            state.resume_lock.0.try_lock().is_ok(),
+            "the confirmed deposit must free the resume lock"
+        );
+        assert!(
+            !driver_gate.is_paused(),
+            "the confirmed deposit must resume the USDC driver"
+        );
+
+        assert_eq!(
+            mined_receipt(&chain.bot_wallet, transfer_tx).await.to,
+            Some(usdc)
+        );
+        let sent = U256::from(250_500_000_u64);
+        assert_eq!(
+            erc20_balance(&chain.bot_wallet, usdc, TEST_ALPACA_DEPOSIT_ADDRESS).await,
+            sent
+        );
+        assert_eq!(
+            erc20_balance(&chain.bot_wallet, usdc, chain.bot).await,
             supply - sent
         );
     }

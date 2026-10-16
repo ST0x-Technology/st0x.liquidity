@@ -529,6 +529,11 @@ async fn dispatch_capital<A: TokenSource + Sync>(
                 )
                 .await
         }
+        Capital::AlpacaDeposit { amount } => {
+            client
+                .post_capital_json("/alpaca-deposit", &wire::AlpacaDepositRequest { amount })
+                .await
+        }
         Capital::DrainEquity {
             symbol,
             quantity,
@@ -1461,6 +1466,25 @@ mod tests {
         assert_eq!(
             request_body(&request),
             serde_json::json!({ "chain": "base", "amount": "100" })
+        );
+        Ok(())
+    }
+
+    /// `alpaca-deposit` posts only the amount: the bot picks the chain and
+    /// the deposit address itself.
+    #[tokio::test]
+    async fn alpaca_deposit_posts_only_the_amount() -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Capital(Capital::AlpacaDeposit {
+            amount: "500".parse()?,
+        }))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-capital/alpaca-deposit HTTP/1.1"
+        );
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({ "amount": "500" })
         );
         Ok(())
     }

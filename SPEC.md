@@ -8482,17 +8482,18 @@ effect rather than a generic intent:
   `POST /liquidity-capital/{verb}` for `transfer-usdc`, `transfer-equity`,
   `wrap-equity`, `unwrap-equity`, `vault-deposit`, `vault-withdraw`,
   `vault-withdraw-usdc`, `cctp-bridge` and `reset-allowance`, the network
-  counterparts of the `st0x-cli` verbs of the same names, for `redeem`, the
-  counterpart of `st0x-cli alpaca-redeem`, and for `cctp-burn-supersede`, which
-  settles a `cctp-bridge` burn and has no `st0x-cli` counterpart. The routes
-  sign with the wallets the conductor uses, so they share its nonce manager
-  instead of running a second one. The ops load balancer times a request out
-  after 60 seconds, so no route waits on CCTP attestation, USDC or equity
-  settlement, or the confirmations of the transaction it answers with; only a
-  prerequisite approve, when an allowance is short, is awaited before that
-  broadcast. `transfer-usdc` starts a fresh transfer on the bot's own transfer
-  worker, the path the rebalancer uses, and returns its new id at once. It runs
-  on the served corridor its optional `chain` names, picked by the same rule as
+  counterparts of the `st0x-cli` verbs of the same names, for `redeem` and
+  `alpaca-deposit`, the counterparts of `st0x-cli alpaca-redeem` and
+  `st0x-cli alpaca-deposit`, and for `cctp-burn-supersede`, which settles a
+  `cctp-bridge` burn and has no `st0x-cli` counterpart. The routes sign with the
+  wallets the conductor uses, so they share its nonce manager instead of running
+  a second one. The ops load balancer times a request out after 60 seconds, so
+  no route waits on CCTP attestation, USDC or equity settlement, or the
+  confirmations of the transaction it answers with; only a prerequisite approve,
+  when an allowance is short, is awaited before that broadcast. `transfer-usdc`
+  starts a fresh transfer on the bot's own transfer worker, the path the
+  rebalancer uses, and returns its new id at once. It runs on the served
+  corridor its optional `chain` names, picked by the same rule as
   `st0x-cli transfer-usdc --chain`: `chain` may be left out while the build
   serves one corridor, and a missing or ambiguous choice is refused with `422`.
   An amount that is not positive or is finer than USDC's six decimals is refused
@@ -8647,57 +8648,88 @@ effect rather than a generic intent:
   again on every later call, since a stale rebroadcast can book it again. Any
   other successful tx is refused with `409`, since it may have moved funds; a
   failed chain read answers `502`, and an unknown id `404`. A burn whose outcome
-  is recorded or whose own receipt now decides reports that status instead. The
-  vault verbs and `reset-allowance` take neither the lock nor the pause, like
-  the `st0x-cli` verbs: pausing the driver would refuse every vault operation
-  for the length of each USDC transfer. `vault-deposit` does take its own lock
-  (`409` while another `vault-deposit` request runs): the deposit reads the
-  allowance and approves exactly the amount when it is short, so two concurrent
-  requests for a token without the startup MAX grant could overwrite each
-  other's approval. The lock covers these requests only: without the MAX grant,
-  a request can still use up the exact approval of a USDC transfer worker's
-  deposit, which then reverts and needs a redrive. `vault-withdraw` and
-  `vault-withdraw-usdc` share a withdraw lock of their own (`409` while either
-  runs), held until the outcome of the tx it answered with is known, for the
-  rerun reason below; it does not cover the bot's own transfer withdrawals.
-  `wrap-equity` deposits `quantity` underlying shares of `symbol` into the
-  chain's ERC-4626 wrapper and `unwrap-equity` redeems `quantity` wrapped shares
-  from it, both for the bot's own wallet on `chain`, and `redeem` sends
-  `quantity` underlying shares from that wallet to Alpaca's redemption wallet
-  there, always the chain's own `[chains.<name>.trading].redemption_wallet` and
-  never one the request names, so the capital group cannot send the bot's shares
-  out of our accounts; Alpaca redeems them into the account. `redeem` is kept
-  for draining a paused chain, where `transfer-equity` starts nothing; its token
-  is the wrapper's attested `asset()`, never a pasted address. `drain-equity`
-  runs a paused chain's drain in one go: it withdraws `quantity` wrapped shares
-  from the listing's vault `vaultId` (the vault withdraw lock held until that tx
-  is proven, as for `vault-withdraw`), unwraps them, and sends the underlying
-  the unwrap paid out to the configured redemption wallet, under one claim of
-  the symbol held from before the withdrawal until the transfer is proven; the
-  bot's wallet recovery waits while the claim is held, so it cannot deposit the
-  shares back into the vault between steps as it can between separate runs of
-  the three verbs. A step that fails stops the drain where it is and logs where
-  the shares are; an unwrap whose payout cannot be read stops it before the
-  transfer. A quantity that is not positive or is finer than the tokens' 18
-  decimals (the CLI truncated it), or an empty symbol, is refused with `400`; a
-  chain without a `[chains.<name>.trading]` table, or a symbol that table does
-  not list, with `422` (the CLI's `--registry` fallback has no route), as is a
-  redeem without a redemption wallet to send to; then `503` until startup
-  completes. The four share one lock per symbol, and each also claims the bot's
-  own equity transfer guard for the symbol; while either is held a request
-  answers `409`, so an operator cannot move a symbol's shares in the wallet
-  under a transfer the bot runs, and the bot starts no transfer of the symbol
-  meanwhile. Then `503` while the chain's signer cannot be shown to pay gas,
-  checked against that chain's own `[alerts.low_balance_thresholds]` entry (the
-  trigger wires no gas check for a chain that rebalances no equity, such as a
-  paused chain being drained), and `422` before any send for an unwrap above the
-  wrapper's `maxRedeem` for the wallet or a wrapper whose `asset()` differs from
-  the configured underlying. A wrap still awaits its approve when the allowance
-  is short, as the bot's own wraps do. Each answers at the broadcast of its
-  first tx (`wrapTx`, `unwrapTx`, `transferTx`, or the drain's `withdrawTx`) and
-  confirms on the detached task like the vault verbs, holding the lock and the
-  guard until the last tx's fate is proven, or until a restart after a panic
-  while confirming. A tx whose fate stays unknown for 10 minutes raises one
+  is recorded or whose own receipt now decides reports that status instead.
+  `alpaca-deposit` sends `amount` USDC from the bot's Ethereum wallet to the
+  deposit address Alpaca gives for the bot's own account, the send the
+  BaseToAlpaca deposit leg makes: the token is the corridor's Ethereum USDC and
+  the address is the one `get_wallet_address(USDC, ethereum)` returns, never one
+  the request names, so the capital group cannot send the bot's USDC out of our
+  accounts. An amount that is not positive or is finer than USDC's six decimals
+  is refused with `400`, then it refuses with `503` until startup completes,
+  takes the recovery lock (`409`) and quiesces the USDC rebalancing driver
+  (`503`), then refuses with `409` while any USDC transfer, on any corridor and
+  in either direction, is in flight or holds its corridor guard (the single
+  flight gates of `transfer-usdc` widened to every corridor: an every corridor
+  latch, a hold in memory, a live or retryable job row, or a durable guard
+  holder such as a transfer that failed after its burn and awaits reconcile),
+  since every corridor passes through that wallet and a transfer may need what
+  the deposit would take. Then `503` while the Ethereum wallet cannot be shown
+  to pay gas, checked against Ethereum's own `[alerts.low_balance_thresholds]`
+  entry, `502` when Alpaca does not give the deposit address, and `409` naming
+  the wallet's balance and the amount when the balance is short. The transfer is
+  sent once and never retried, since it carries no idempotency key; a failed
+  send answers `500` saying the transfer may still have gone out and the wallet
+  must be checked onchain before a rerun. It answers at the broadcast with
+  `chain`, `depositAddress`, `amount`, `amountRaw` and `transferTx`, and the
+  detached task holds the lock and the pause until the transfer has Ethereum's
+  required confirmations or is proven failed, waiting again while its fate is
+  unknown and raising one operational alert after 10 minutes, since meanwhile
+  every USDC transfer waits; a panic while confirming keeps both until a
+  restart. Once the transfer is proven to have moved the USDC, the task frees
+  both, polls Alpaca with `poll_deposit_by_tx_hash` until it reports the deposit
+  final, and logs the transfer id and the final status; a deposit Alpaca reports
+  failed, leaves in another status, or does not report before the poll times out
+  raises an operational alert. The vault verbs and `reset-allowance` take
+  neither the lock nor the pause, like the `st0x-cli` verbs: pausing the driver
+  would refuse every vault operation for the length of each USDC transfer.
+  `vault-deposit` does take its own lock (`409` while another `vault-deposit`
+  request runs): the deposit reads the allowance and approves exactly the amount
+  when it is short, so two concurrent requests for a token without the startup
+  MAX grant could overwrite each other's approval. The lock covers these
+  requests only: without the MAX grant, a request can still use up the exact
+  approval of a USDC transfer worker's deposit, which then reverts and needs a
+  redrive. `vault-withdraw` and `vault-withdraw-usdc` share a withdraw lock of
+  their own (`409` while either runs), held until the outcome of the tx it
+  answered with is known, for the rerun reason below; it does not cover the
+  bot's own transfer withdrawals. `wrap-equity` deposits `quantity` underlying
+  shares of `symbol` into the chain's ERC-4626 wrapper and `unwrap-equity`
+  redeems `quantity` wrapped shares from it, both for the bot's own wallet on
+  `chain`, and `redeem` sends `quantity` underlying shares from that wallet to
+  Alpaca's redemption wallet there, always the chain's own
+  `[chains.<name>.trading].redemption_wallet` and never one the request names,
+  so the capital group cannot send the bot's shares out of our accounts; Alpaca
+  redeems them into the account. `redeem` is kept for draining a paused chain,
+  where `transfer-equity` starts nothing; its token is the wrapper's attested
+  `asset()`, never a pasted address. `drain-equity` runs a paused chain's drain
+  in one go: it withdraws `quantity` wrapped shares from the listing's vault
+  `vaultId` (the vault withdraw lock held until that tx is proven, as for
+  `vault-withdraw`), unwraps them, and sends the underlying the unwrap paid out
+  to the configured redemption wallet, under one claim of the symbol held from
+  before the withdrawal until the transfer is proven; the bot's wallet recovery
+  waits while the claim is held, so it cannot deposit the shares back into the
+  vault between steps as it can between separate runs of the three verbs. A step
+  that fails stops the drain where it is and logs where the shares are; an
+  unwrap whose payout cannot be read stops it before the transfer. A quantity
+  that is not positive or is finer than the tokens' 18 decimals (the CLI
+  truncated it), or an empty symbol, is refused with `400`; a chain without a
+  `[chains.<name>.trading]` table, or a symbol that table does not list, with
+  `422` (the CLI's `--registry` fallback has no route), as is a redeem without a
+  redemption wallet to send to; then `503` until startup completes. The four
+  share one lock per symbol, and each also claims the bot's own equity transfer
+  guard for the symbol; while either is held a request answers `409`, so an
+  operator cannot move a symbol's shares in the wallet under a transfer the bot
+  runs, and the bot starts no transfer of the symbol meanwhile. Then `503` while
+  the chain's signer cannot be shown to pay gas, checked against that chain's
+  own `[alerts.low_balance_thresholds]` entry (the trigger wires no gas check
+  for a chain that rebalances no equity, such as a paused chain being drained),
+  and `422` before any send for an unwrap above the wrapper's `maxRedeem` for
+  the wallet or a wrapper whose `asset()` differs from the configured
+  underlying. A wrap still awaits its approve when the allowance is short, as
+  the bot's own wraps do. Each answers at the broadcast of its first tx
+  (`wrapTx`, `unwrapTx`, `transferTx`, or the drain's `withdrawTx`) and confirms
+  on the detached task like the vault verbs, holding the lock and the guard
+  until the last tx's fate is proven, or until a restart after a panic while
+  confirming. A tx whose fate stays unknown for 10 minutes raises one
   operational alert naming the symbol, the chain and the tx, since the held
   guard blocks rebalancing of the symbol on every chain. The redemption transfer
   is sent once and never retried, since it carries no idempotency key. Once it

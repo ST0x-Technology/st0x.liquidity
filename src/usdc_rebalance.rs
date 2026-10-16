@@ -3337,6 +3337,34 @@ pub(crate) async fn any_rebalance_holds_guard(
     chain: Chain,
     direction: RebalanceDirection,
 ) -> Result<bool, sqlx::Error> {
+    rebalance_holds_guard_where(pool, store, except, |entity| {
+        entity.corridor().chain() == chain
+            || (direction == RebalanceDirection::AlpacaToBase
+                && entity.direction() == RebalanceDirection::AlpacaToBase)
+    })
+    .await
+}
+
+/// Whether any persisted USDC rebalance holds its corridor guard, on any
+/// corridor and in either direction, with the defensive posture of
+/// [`any_rebalance_holds_guard`].
+pub(crate) async fn any_rebalance_holds_any_guard(
+    pool: &SqlitePool,
+    store: &Store<UsdcRebalance>,
+) -> Result<bool, sqlx::Error> {
+    rebalance_holds_guard_where(pool, store, None, |_| true).await
+}
+
+/// Whether a persisted USDC rebalance other than `except` for which
+/// `conflicts` holds still holds its corridor guard; unparseable candidate
+/// ids and aggregates that fail to load count as holders whatever
+/// `conflicts` says.
+async fn rebalance_holds_guard_where(
+    pool: &SqlitePool,
+    store: &Store<UsdcRebalance>,
+    except: Option<&UsdcRebalanceId>,
+    conflicts: impl Fn(&UsdcRebalance) -> bool,
+) -> Result<bool, sqlx::Error> {
     let InterruptedUsdcRebalances { ids, unparseable } =
         interrupted_usdc_rebalance_ids(pool).await?;
 
@@ -3356,10 +3384,7 @@ pub(crate) async fn any_rebalance_holds_guard(
 
         match store.load(&id).await {
             Ok(Some(entity)) => {
-                let conflicts = entity.corridor().chain() == chain
-                    || (direction == RebalanceDirection::AlpacaToBase
-                        && entity.direction() == RebalanceDirection::AlpacaToBase);
-                if entity.holds_rebalance_guard() && conflicts {
+                if entity.holds_rebalance_guard() && conflicts(&entity) {
                     return Ok(true);
                 }
             }
