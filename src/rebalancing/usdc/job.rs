@@ -41,9 +41,9 @@ use st0x_evm::{Chain, Wallet};
 use st0x_execution::{AlpacaWalletError, Backpressure};
 use st0x_finance::Usdc;
 
-use super::UsdcTransferError;
 use super::driver_pause::UsdcDriverGate;
 use super::manager::CrossVenueCashTransfer;
+use super::{DepositSendPending, UsdcTransferError};
 use crate::alerts::{AlertKind, Notifier};
 use crate::bot_gas::redrive::{BotGasFailureClassifier, redrive_on_bot_gas_failure};
 use crate::conductor::job::{
@@ -158,15 +158,17 @@ const WITHDRAWAL_SCAN_POST_DEADLINE_REDRIVE_DELAY: Duration = Duration::from_sec
 /// confirms and one signed below the market fee waits until fees drop; before
 /// the deadline the redrive is silent, and the deadline keeps that stall from
 /// becoming a multi-day outage while later sends from the wallet queue behind
-/// its nonce.
+/// its nonce. A refusal that cannot clear by itself (another tx took the nonce,
+/// or the wallet has no ETH for gas) pages without waiting for the deadline.
 const DEPOSIT_SEND_RECONCILIATION_ALERT_DEADLINE: Duration = Duration::from_secs(4 * 60 * 60);
 
 /// Delay before rebroadcasting a signed deposit send whose outcome is not
 /// known yet. Uncapped: confirmation must not consume a finite retry budget.
 const DEPOSIT_SEND_RECONCILIATION_REDRIVE_DELAY: Duration = Duration::from_secs(30);
 
-/// Redrive delay after `DEPOSIT_SEND_RECONCILIATION_ALERT_DEADLINE`, slowed
-/// to avoid alert fatigue while the idempotent rebroadcast keeps running.
+/// Redrive delay after `DEPOSIT_SEND_RECONCILIATION_ALERT_DEADLINE`, or
+/// after a refusal that pages at once, slowed to avoid alert fatigue while
+/// the idempotent rebroadcast keeps running.
 const DEPOSIT_SEND_RECONCILIATION_POST_DEADLINE_REDRIVE_DELAY: Duration =
     Duration::from_secs(30 * 60);
 
@@ -1736,7 +1738,8 @@ impl TransferUsdcToHedging {
 
     /// Redrives a signed deposit send whose outcome is not known yet, paging
     /// on every redrive once `DEPOSIT_SEND_RECONCILIATION_ALERT_DEADLINE` has
-    /// passed since the send was persisted.
+    /// passed since the send was persisted, or at once when the node refused
+    /// it for a reason that cannot clear by itself.
     async fn handle_deposit_send_reconciliation_pending(
         &self,
         ctx: &TransferUsdcToHedgingCtx,
@@ -1745,16 +1748,24 @@ impl TransferUsdcToHedging {
         let UsdcTransferError::DepositSendReconciliationPending {
             ref id,
             prepared_at,
+            ref cause,
             ..
         } = error
         else {
             return Err(error.into());
         };
+        let refusal_paging_at_once = match cause {
+            DepositSendPending::Broadcast { refusal, .. } => {
+                Some(*refusal).filter(|refusal| refusal.pages_at_once())
+            }
+            DepositSendPending::Confirmation(_) | DepositSendPending::Dropped => None,
+        };
         // A future `prepared_at` (clock skew) reads as no elapsed time.
         let elapsed = Utc::now().signed_duration_since(prepared_at).to_std().ok();
         let alert_deadline_elapsed =
             deadline_elapsed(elapsed, DEPOSIT_SEND_RECONCILIATION_ALERT_DEADLINE);
-        let redrive_delay = if alert_deadline_elapsed.is_some() {
+        let redrive_delay = if refusal_paging_at_once.is_some() || alert_deadline_elapsed.is_some()
+        {
             DEPOSIT_SEND_RECONCILIATION_POST_DEADLINE_REDRIVE_DELAY
         } else {
             DEPOSIT_SEND_RECONCILIATION_REDRIVE_DELAY
@@ -1768,7 +1779,20 @@ impl TransferUsdcToHedging {
              (guard held, redrive continues)"
         );
 
-        if let Some(elapsed) = alert_deadline_elapsed {
+        if let Some(refusal) = refusal_paging_at_once {
+            let message = format!(
+                "{error}; later sends from the Ethereum wallet queue behind its nonce. {} \
+                 Automatic rebroadcast continues every \
+                 {DEPOSIT_SEND_RECONCILIATION_POST_DEADLINE_REDRIVE_DELAY:?} (guard held).",
+                refusal.operator_step()
+            );
+            deliver_usdc_alert(
+                &ctx.notifier,
+                AlertKind::DepositSendQueuesEthereumNonce,
+                &message,
+            )
+            .await;
+        } else if let Some(elapsed) = alert_deadline_elapsed {
             let message = format!(
                 "{error}. It has stayed unconfirmed for {elapsed:?} \
                  (>{DEPOSIT_SEND_RECONCILIATION_ALERT_DEADLINE:?}). The send is never re-signed \
@@ -2625,6 +2649,7 @@ mod tests {
 
     use alloy::primitives::{Address, TxHash, U256};
     use chrono::{DateTime, Utc};
+    use itertools::Itertools;
     use reqwest::StatusCode;
     use tokio::sync::Notify;
     use uuid::{Uuid, uuid};
@@ -2640,7 +2665,7 @@ mod tests {
     use crate::alerts::{CapturingNotifier, LogNotifier};
     use crate::native_gas::GasReadinessFailure;
     use crate::rebalancing::usdc::{
-        DepositSendPending, DriverNotQuiesced, UnresolvedDepositSend, UsdcDriverPause,
+        DepositSendRefusal, DriverNotQuiesced, UnresolvedDepositSend, UsdcDriverPause,
         usdc_driver_pause,
     };
     use crate::test_utils::setup_test_apalis_pool;
@@ -6174,6 +6199,7 @@ mod tests {
 
     struct DepositSendPendingBaseToAlpaca {
         prepared_at: DateTime<Utc>,
+        cause: fn() -> DepositSendPending,
     }
 
     #[async_trait]
@@ -6188,7 +6214,7 @@ mod tests {
                 id: id.clone(),
                 tx: TxHash::from([0xDD; 32]),
                 prepared_at: self.prepared_at,
-                cause: DepositSendPending::Dropped,
+                cause: (self.cause)(),
             })
         }
     }
@@ -6198,11 +6224,12 @@ mod tests {
     /// transfer id.
     async fn run_deposit_send_pending(
         prepared_at: DateTime<Utc>,
+        cause: fn() -> DepositSendPending,
     ) -> (Vec<String>, i64, UsdcRebalanceId) {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
-            transfer: Arc::new(DepositSendPendingBaseToAlpaca { prepared_at }),
+            transfer: Arc::new(DepositSendPendingBaseToAlpaca { prepared_at, cause }),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
@@ -6237,7 +6264,8 @@ mod tests {
     /// delay, silently, and never fails the transfer.
     #[tokio::test]
     async fn hedging_job_redrives_a_pending_deposit_send_silently_before_the_deadline() {
-        let (messages, delay, _) = run_deposit_send_pending(Utc::now()).await;
+        let (messages, delay, _) =
+            run_deposit_send_pending(Utc::now(), || DepositSendPending::Dropped).await;
 
         assert!(messages.is_empty(), "got: {messages:?}");
         let expected = i64::try_from(DEPOSIT_SEND_RECONCILIATION_REDRIVE_DELAY.as_secs()).unwrap();
@@ -6252,7 +6280,10 @@ mod tests {
     #[tokio::test]
     async fn hedging_job_pages_a_pending_deposit_send_past_the_deadline() {
         let (messages, delay, id) =
-            run_deposit_send_pending(Utc::now() - chrono::Duration::hours(5)).await;
+            run_deposit_send_pending(Utc::now() - chrono::Duration::hours(5), || {
+                DepositSendPending::Dropped
+            })
+            .await;
 
         let [message] = messages.as_slice() else {
             panic!("expected one page, got: {messages:?}");
@@ -6293,6 +6324,123 @@ mod tests {
             (expected - 5..=expected + 5).contains(&delay),
             "delay {delay}s, expected ~{expected}s"
         );
+    }
+
+    fn refused(refusal: DepositSendRefusal) -> DepositSendPending {
+        DepositSendPending::Broadcast {
+            refusal,
+            source: Box::new(CctpError::Evm(EvmError::Transport(
+                alloy::transports::RpcError::local_usage_str("refused"),
+            ))),
+        }
+    }
+
+    const PAGES_AT_ONCE: [fn() -> DepositSendPending; 3] = [
+        || {
+            refused(DepositSendRefusal::NonceTaken {
+                nonce: 7,
+                wallet_nonce: 9,
+            })
+        },
+        || refused(DepositSendRefusal::NoEthForGas),
+        || {
+            refused(DepositSendRefusal::SignerHasNoEthForGas {
+                signer: Address::repeat_byte(0x11),
+            })
+        },
+    ];
+
+    const PAGES_PAST_THE_DEADLINE: [fn() -> DepositSendPending; 3] = [
+        || refused(DepositSendRefusal::NonceInUse { nonce: 7 }),
+        || refused(DepositSendRefusal::FeeBelowFloor),
+        || refused(DepositSendRefusal::Rpc),
+    ];
+
+    fn assert_post_deadline_delay(delay: i64) {
+        let expected =
+            i64::try_from(DEPOSIT_SEND_RECONCILIATION_POST_DEADLINE_REDRIVE_DELAY.as_secs())
+                .unwrap();
+        assert!(
+            (expected - 5..=expected + 5).contains(&delay),
+            "delay {delay}s, expected ~{expected}s"
+        );
+    }
+
+    /// A refusal that cannot clear by itself pages on the first redrive,
+    /// before or past the deadline, names the cause and its step, and slows
+    /// the redrive; the extractor reads the page's kind.
+    #[tokio::test]
+    async fn hedging_job_pages_a_refusal_that_cannot_clear_at_once() {
+        for (cause, prepared_at) in PAGES_AT_ONCE
+            .into_iter()
+            .cartesian_product([Utc::now(), Utc::now() - chrono::Duration::hours(5)])
+        {
+            let (messages, delay, id) = run_deposit_send_pending(prepared_at, cause).await;
+
+            let [message] = messages.as_slice() else {
+                panic!("expected one page, got: {messages:?}");
+            };
+            let DepositSendPending::Broadcast { refusal, .. } = cause() else {
+                unreachable!("every cause here is a refusal");
+            };
+            let tx = TxHash::from([0xDD; 32]);
+            assert_eq!(
+                *message,
+                format!(
+                    "USDC rebalance {id}: signed deposit send {tx} is not confirmed yet: its \
+                     broadcast was refused ({refusal}): EVM error: transport error: local usage \
+                     error: refused; later sends \
+                     from the Ethereum wallet queue behind its nonce. {} Automatic rebroadcast \
+                     continues every 1800s (guard held).",
+                    refusal.operator_step()
+                )
+            );
+            assert_eq!(
+                AlertKind::most_specific_in(message),
+                Some(AlertKind::DepositSendQueuesEthereumNonce),
+                "{message}"
+            );
+            assert_post_deadline_delay(delay);
+        }
+    }
+
+    /// A refusal that can clear by itself keeps the silent short redrive
+    /// before the deadline, and pages with its cause past it.
+    #[tokio::test]
+    async fn hedging_job_pages_a_refusal_that_can_clear_only_past_the_deadline() {
+        for cause in PAGES_PAST_THE_DEADLINE {
+            let (messages, delay, _) = run_deposit_send_pending(Utc::now(), cause).await;
+            assert!(messages.is_empty(), "got: {messages:?}");
+            let expected =
+                i64::try_from(DEPOSIT_SEND_RECONCILIATION_REDRIVE_DELAY.as_secs()).unwrap();
+            assert!(
+                (expected - 5..=expected + 5).contains(&delay),
+                "delay {delay}s, expected ~{expected}s"
+            );
+
+            let (messages, delay, _) =
+                run_deposit_send_pending(Utc::now() - chrono::Duration::hours(5), cause).await;
+            let [message] = messages.as_slice() else {
+                panic!("expected one page, got: {messages:?}");
+            };
+            let DepositSendPending::Broadcast { refusal, .. } = cause() else {
+                unreachable!("every cause here is a refusal");
+            };
+            assert!(
+                message.contains(&format!("its broadcast was refused ({refusal})")),
+                "{message}"
+            );
+            assert!(
+                message.contains(". It has stayed unconfirmed for "),
+                "{message}"
+            );
+            assert_eq!(
+                AlertKind::most_specific_in(message),
+                Some(AlertKind::DepositSendQueuesEthereumNonce),
+                "{message}"
+            );
+            assert_post_deadline_delay(delay);
+        }
     }
 
     /// Stub for `UsdcTransferError::BotGasEnqueue` on the Alpaca->Base

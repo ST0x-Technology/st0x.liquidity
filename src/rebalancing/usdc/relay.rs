@@ -2604,6 +2604,10 @@ impl<Signer: Wallet> UsdcBridgeHelper for RelayHop<Signer> {
         self.bridge.ethereum_tx_confirmations(tx_hash).await
     }
 
+    async fn ethereum_wallet_nonce(&self) -> Result<u64, StableEndpointError> {
+        self.bridge.ethereum_wallet_nonce().await
+    }
+
     async fn ethereum_tx_block(&self, tx_hash: TxHash) -> Result<u64, StableEndpointError> {
         self.bridge.ethereum_tx_block(tx_hash).await
     }

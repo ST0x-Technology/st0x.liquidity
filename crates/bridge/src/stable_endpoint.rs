@@ -111,6 +111,17 @@ impl<'wallet, W: Wallet> StableEndpoint<'wallet, W> {
         Ok(Some(head.saturating_sub(tx_block).saturating_add(1)))
     }
 
+    /// Returns how many of the wallet's transactions the node has mined at
+    /// its latest block, which is the wallet's next free nonce on chain.
+    pub async fn wallet_nonce(&self) -> Result<u64, StableEndpointError> {
+        Ok(self
+            .wallet
+            .provider()
+            .get_transaction_count(self.wallet.address())
+            .latest()
+            .await?)
+    }
+
     /// Returns `tx_hash` as mined; see [`st0x_evm::mined_tx`].
     pub async fn mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, StableEndpointError> {
         Ok(st0x_evm::mined_tx(self.wallet.provider(), tx_hash).await?)

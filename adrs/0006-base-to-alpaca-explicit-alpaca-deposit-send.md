@@ -118,11 +118,13 @@ with a `PreparedTransaction`, RAI-2485):
    the same tx, so it can never send twice, with no "maybe broadcast" state. A
    refused broadcast, an unknown receipt or a drop redrives after 30 s with no
    budget, paging on every redrive once 4 hours have passed since the send was
-   persisted (then every 30 minutes). A signed send is never re-signed or
-   fee-bumped. One that will not confirm at its current fee can still mine when
-   fees drop, so the operator settles the transfer only once a different tx is
-   mined at its nonce (another send took it, or the operator cancels it with a
-   higher-fee 0-value self-transfer at that nonce), with
+   persisted (then every 30 minutes). A refusal that cannot clear by itself (a
+   nonce another tx took, or no ETH for gas) pages on the first redrive instead,
+   then every 30 minutes. A signed send is never re-signed or fee-bumped. One
+   that will not confirm at its current fee can still mine when fees drop, so
+   the operator settles the transfer only once a different tx is mined at its
+   nonce (another send took it, or the operator cancels it with a higher-fee
+   0-value self-transfer at that nonce), with
    `transfer reconcile --kind usdc --superseding-tx <hash>`, which accepts a
    BaseToAlpaca `Bridged` with a signed send once the chain shows that tx mined
    from the bot wallet at the send's nonce with Ethereum's required
