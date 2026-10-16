@@ -198,6 +198,33 @@ pub(crate) struct TransferEquityRequest {
     /// Decimal number of shares; fractional shares are allowed.
     pub(crate) quantity: DecimalAmount,
     pub(crate) chain: &'static str,
+    /// Resumes this mint instead of starting one; omitted for a new transfer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) issuer_request_id: Option<Uuid>,
+}
+
+/// Body of `POST /liquidity-capital/wrap-equity` and
+/// `POST /liquidity-capital/unwrap-equity`: underlying shares for a wrap,
+/// wrapped shares for an unwrap.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EquityWrapperRequest {
+    pub(crate) symbol: String,
+    pub(crate) quantity: DecimalAmount,
+    pub(crate) chain: &'static str,
+}
+
+/// Body of `POST /liquidity-capital/redeem`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RedeemRequest {
+    pub(crate) symbol: String,
+    /// Decimal number of underlying shares; fractional shares are allowed.
+    pub(crate) quantity: DecimalAmount,
+    pub(crate) chain: &'static str,
+    /// Omitted to let the bot use its configured redemption wallet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) redemption_wallet: Option<EvmAddress>,
 }
 
 /// The venue a USDC or equity transfer moves funds to, kebab cased on the

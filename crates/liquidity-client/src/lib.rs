@@ -455,6 +455,7 @@ async fn dispatch_capital<A: TokenSource + Sync>(
             symbol,
             quantity,
             network,
+            issuer_request_id,
         } => {
             client
                 .post_capital_json(
@@ -464,6 +465,57 @@ async fn dispatch_capital<A: TokenSource + Sync>(
                         symbol,
                         quantity,
                         chain: network.wire_name(),
+                        issuer_request_id,
+                    },
+                )
+                .await
+        }
+        Capital::WrapEquity {
+            symbol,
+            quantity,
+            network,
+        } => {
+            client
+                .post_capital_json(
+                    "/wrap-equity",
+                    &wire::EquityWrapperRequest {
+                        symbol,
+                        quantity,
+                        chain: network.wire_name(),
+                    },
+                )
+                .await
+        }
+        Capital::UnwrapEquity {
+            symbol,
+            quantity,
+            network,
+        } => {
+            client
+                .post_capital_json(
+                    "/unwrap-equity",
+                    &wire::EquityWrapperRequest {
+                        symbol,
+                        quantity,
+                        chain: network.wire_name(),
+                    },
+                )
+                .await
+        }
+        Capital::Redeem {
+            symbol,
+            quantity,
+            network,
+            redemption_wallet,
+        } => {
+            client
+                .post_capital_json(
+                    "/redeem",
+                    &wire::RedeemRequest {
+                        symbol,
+                        quantity,
+                        chain: network.wire_name(),
+                        redemption_wallet,
                     },
                 )
                 .await
@@ -1177,7 +1229,8 @@ mod tests {
     }
 
     /// `transfer-equity` always sends `chain`, from `--network`, with the
-    /// symbol and the share quantity as typed.
+    /// symbol and the share quantity as typed, and no `issuerRequestId` key
+    /// unless one was given.
     #[tokio::test]
     async fn transfer_equity_posts_the_direction_symbol_quantity_and_chain()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1200,6 +1253,7 @@ mod tests {
                 symbol: "AAPL".to_owned(),
                 quantity: "1.5".parse()?,
                 network,
+                issuer_request_id: None,
             }))
             .await?;
             assert_eq!(
@@ -1215,6 +1269,109 @@ mod tests {
                     "chain": chain,
                 })
             );
+        }
+        Ok(())
+    }
+
+    /// `--issuer-request-id` goes to the same route as `issuerRequestId`, so
+    /// the bot resumes that mint instead of starting one.
+    #[tokio::test]
+    async fn transfer_equity_posts_the_issuer_request_id_to_resume()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Capital(Capital::TransferEquity {
+            direction: TransferDirection::ToRaindex,
+            symbol: "AAPL".to_owned(),
+            quantity: "1.5".parse()?,
+            network: HedgedChain::Base,
+            issuer_request_id: Some("6f1c2a1e-6c39-4a77-9a8e-1f0b7d6e8c11".parse()?),
+        }))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-capital/transfer-equity HTTP/1.1"
+        );
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({
+                "direction": "to-raindex",
+                "symbol": "AAPL",
+                "quantity": "1.5",
+                "chain": "base",
+                "issuerRequestId": "6f1c2a1e-6c39-4a77-9a8e-1f0b7d6e8c11",
+            })
+        );
+        Ok(())
+    }
+
+    /// Both wrapper verbs send the same body, each to its own route, with the
+    /// chain from `--network`.
+    #[tokio::test]
+    async fn wrapper_verbs_post_the_symbol_quantity_and_chain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (command, route) in [
+            (
+                Capital::WrapEquity {
+                    symbol: "AAPL".to_owned(),
+                    quantity: "1.5".parse()?,
+                    network: HedgedChain::Ethereum,
+                },
+                "wrap-equity",
+            ),
+            (
+                Capital::UnwrapEquity {
+                    symbol: "AAPL".to_owned(),
+                    quantity: "1.5".parse()?,
+                    network: HedgedChain::Ethereum,
+                },
+                "unwrap-equity",
+            ),
+        ] {
+            let request = request_for(Command::Capital(command)).await?;
+            assert_eq!(
+                request_line(&request),
+                format!("POST /liquidity-capital/{route} HTTP/1.1")
+            );
+            assert_eq!(
+                request_body(&request),
+                serde_json::json!({ "symbol": "AAPL", "quantity": "1.5", "chain": "ethereum" })
+            );
+        }
+        Ok(())
+    }
+
+    /// `redeem` sends `redemptionWallet` only when given, so the bot falls
+    /// back to its configured wallet otherwise.
+    #[tokio::test]
+    async fn redeem_posts_the_redemption_wallet_only_when_given()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let wallet = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+        for (redemption_wallet, expected) in [
+            (
+                None,
+                serde_json::json!({ "symbol": "TSLA", "quantity": "3", "chain": "base" }),
+            ),
+            (
+                Some(wallet.parse()?),
+                serde_json::json!({
+                    "symbol": "TSLA",
+                    "quantity": "3",
+                    "chain": "base",
+                    "redemptionWallet": wallet,
+                }),
+            ),
+        ] {
+            let request = request_for(Command::Capital(Capital::Redeem {
+                symbol: "TSLA".to_owned(),
+                quantity: "3".parse()?,
+                network: HedgedChain::Base,
+                redemption_wallet,
+            }))
+            .await?;
+            assert_eq!(
+                request_line(&request),
+                "POST /liquidity-capital/redeem HTTP/1.1"
+            );
+            assert_eq!(request_body(&request), expected);
         }
         Ok(())
     }

@@ -436,7 +436,8 @@ pub(crate) enum Capital {
     /// for `to-raindex`, a redemption for `to-alpaca`. Returns the new
     /// transfer id (the mint's issuer request id or the redemption id) at
     /// once; follow it with `read transfer-events` and recover it with
-    /// `debug recheck`.
+    /// `debug recheck`. With `--issuer-request-id` it resumes that mint
+    /// instead of starting one, answering `resumed`.
     TransferEquity {
         /// Direction of transfer.
         #[arg(short = 'd', long, value_enum)]
@@ -452,6 +453,68 @@ pub(crate) enum Capital {
         /// wallet and the chain's equity listing and token registry.
         #[arg(long, value_enum, default_value_t = HedgedChain::Base)]
         network: HedgedChain,
+        /// Issuer request id of a mint already started, for example by
+        /// `st0x-cli transfer-equity`, to resume instead of minting again.
+        /// Only with `to-raindex`; the symbol and network must match the
+        /// recorded mint. The bot never starts a new mint for it.
+        #[arg(long)]
+        issuer_request_id: Option<Uuid>,
+    },
+    /// Wrap tokenized equity in the bot's wallet into its ERC-4626 vault
+    /// shares. Returns the wrap tx as soon as it is broadcast; the bot
+    /// confirms it afterwards and logs the outcome. Until then a `wrap-equity`,
+    /// `unwrap-equity` or `redeem` of the same symbol answers 409, as does a
+    /// symbol whose equity transfer the bot is running.
+    WrapEquity {
+        /// Equity symbol (for example AAPL).
+        #[arg(short = 's', long)]
+        symbol: String,
+        /// Number of underlying tokenized shares to wrap, as a decimal.
+        #[arg(short = 'q', long, allow_negative_numbers = true)]
+        quantity: DecimalAmount,
+        /// Chain of the wallet and the `[chains.<name>.trading]` equity
+        /// listing; a chain without that table is refused.
+        #[arg(long, value_enum, default_value_t = HedgedChain::Base)]
+        network: HedgedChain,
+    },
+    /// Unwrap ERC-4626 vault shares in the bot's wallet into the underlying
+    /// tokenized equity. Returns the unwrap tx as soon as it is broadcast;
+    /// the bot confirms it afterwards and logs the outcome. Shares the per
+    /// symbol lock of `wrap-equity`.
+    UnwrapEquity {
+        /// Equity symbol (for example AAPL).
+        #[arg(short = 's', long)]
+        symbol: String,
+        /// Number of wrapped shares to unwrap, as a decimal.
+        #[arg(short = 'q', long, allow_negative_numbers = true)]
+        quantity: DecimalAmount,
+        /// Chain of the wallet and the `[chains.<name>.trading]` equity
+        /// listing; a chain without that table is refused.
+        #[arg(long, value_enum, default_value_t = HedgedChain::Base)]
+        network: HedgedChain,
+    },
+    /// Send tokenized equity from the bot's wallet to Alpaca's redemption
+    /// wallet for Alpaca to redeem into shares, for example to drain a paused
+    /// chain. Returns the transfer tx as soon as it is broadcast; the bot
+    /// confirms it, polls Alpaca's detection and completion afterwards and
+    /// logs them. The send is never retried: a 500 may follow a broadcast, so
+    /// check the wallet onchain before rerunning. Shares the per symbol lock
+    /// of `wrap-equity`.
+    Redeem {
+        /// Equity symbol (for example AAPL).
+        #[arg(short = 's', long)]
+        symbol: String,
+        /// Number of underlying tokenized shares to redeem, as a decimal.
+        #[arg(short = 'q', long, allow_negative_numbers = true)]
+        quantity: DecimalAmount,
+        /// Chain the tokens leave from: selects the wallet and the
+        /// `[chains.<name>.trading]` equity listing.
+        #[arg(long, value_enum, default_value_t = HedgedChain::Base)]
+        network: HedgedChain,
+        /// Alpaca redemption wallet to send to; omit to use the one the bot
+        /// has configured.
+        #[arg(long)]
+        redemption_wallet: Option<EvmAddress>,
     },
     /// Deposit tokens from the bot's wallet into a Raindex vault: approves,
     /// then deposits, resolving token decimals from onchain metadata. Returns
@@ -1054,6 +1117,7 @@ mod tests {
                 symbol,
                 quantity,
                 network: super::HedgedChain::Ethereum,
+                issuer_request_id: None,
             } if symbol == "AAPL" && quantity == self::amount("1.5")
         ));
         assert!(matches!(
@@ -1063,6 +1127,85 @@ mod tests {
                 symbol,
                 quantity,
                 network: super::HedgedChain::Base,
+                issuer_request_id: None,
+            } if symbol == "TSLA" && quantity == self::amount("3")
+        ));
+        let mint = "6f1c2a1e-6c39-4a77-9a8e-1f0b7d6e8c11";
+        assert!(matches!(
+            capital(&[
+                "transfer-equity",
+                "-d",
+                "to-raindex",
+                "-s",
+                "AAPL",
+                "-q",
+                "1",
+                "--issuer-request-id",
+                mint,
+            ])
+            .unwrap(),
+            Capital::TransferEquity {
+                direction: TransferDirection::ToRaindex,
+                issuer_request_id: Some(id),
+                ..
+            } if id.to_string() == mint
+        ));
+
+        assert!(matches!(
+            capital(&[
+                "wrap-equity",
+                "--symbol",
+                "AAPL",
+                "--quantity",
+                "1.5",
+                "--network",
+                "ethereum",
+            ])
+            .unwrap(),
+            Capital::WrapEquity {
+                symbol,
+                quantity,
+                network: super::HedgedChain::Ethereum,
+            } if symbol == "AAPL" && quantity == self::amount("1.5")
+        ));
+        assert!(matches!(
+            capital(&["unwrap-equity", "-s", "TSLA", "-q", "2", "--network", "robinhood"])
+                .unwrap(),
+            Capital::UnwrapEquity {
+                symbol,
+                quantity,
+                network: super::HedgedChain::Robinhood,
+            } if symbol == "TSLA" && quantity == self::amount("2")
+        ));
+        assert!(matches!(
+            capital(&[
+                "redeem",
+                "--symbol",
+                "AAPL",
+                "--quantity",
+                "0.5",
+                "--network",
+                "ethereum",
+                "--redemption-wallet",
+                TOKEN,
+            ])
+            .unwrap(),
+            Capital::Redeem {
+                symbol,
+                quantity,
+                network: super::HedgedChain::Ethereum,
+                redemption_wallet: Some(wallet),
+            } if symbol == "AAPL"
+                && quantity == self::amount("0.5")
+                && wallet == TOKEN.parse::<EvmAddress>().unwrap()
+        ));
+        assert!(matches!(
+            capital(&["redeem", "-s", "TSLA", "-q", "3"]).unwrap(),
+            Capital::Redeem {
+                symbol,
+                quantity,
+                redemption_wallet: None,
+                ..
             } if symbol == "TSLA" && quantity == self::amount("3")
         ));
 
@@ -1125,6 +1268,12 @@ mod tests {
             &["transfer-equity", "-d", "to-raindex", "-s", "AAPL"][..],
             &["transfer-equity", "-d", "to-raindex", "-q", "1"][..],
             &["transfer-equity", "-s", "AAPL", "-q", "1"][..],
+            &["wrap-equity", "-s", "AAPL"][..],
+            &["wrap-equity", "-q", "1"][..],
+            &["unwrap-equity", "-s", "AAPL"][..],
+            &["unwrap-equity", "-q", "1"][..],
+            &["redeem", "-s", "AAPL"][..],
+            &["redeem", "-q", "1"][..],
             &["vault-deposit", "-a", "1", "-t", TOKEN][..],
             &["vault-withdraw", "-a", "1", "-v", VAULT][..],
             &["vault-withdraw-usdc", "--network", "base"][..],
@@ -1158,11 +1307,17 @@ mod tests {
                 "-q",
                 "1",
             ][..],
+            &["wrap-equity", "-s", "AAPL", "-q", "1"][..],
+            &["unwrap-equity", "-s", "AAPL", "-q", "1"][..],
+            &["redeem", "-s", "AAPL", "-q", "1"][..],
         ] {
             let network = match capital(argv).unwrap() {
                 Capital::VaultDeposit(args) | Capital::VaultWithdraw(args) => args.network,
                 Capital::VaultWithdrawUsdc { network, .. }
                 | Capital::TransferEquity { network, .. }
+                | Capital::WrapEquity { network, .. }
+                | Capital::UnwrapEquity { network, .. }
+                | Capital::Redeem { network, .. }
                 | Capital::ResetAllowance { network } => network,
                 Capital::TransferUsdc { .. }
                 | Capital::CctpBridge { .. }
@@ -1242,6 +1397,25 @@ mod tests {
                 "--network",
                 "solana",
             ][..],
+            &[
+                "wrap-equity",
+                "-s",
+                "AAPL",
+                "-q",
+                "1",
+                "--network",
+                "solana",
+            ][..],
+            &[
+                "unwrap-equity",
+                "-s",
+                "AAPL",
+                "-q",
+                "1",
+                "--network",
+                "solana",
+            ][..],
+            &["redeem", "-s", "AAPL", "-q", "1", "--network", "solana"][..],
             &["vault-withdraw-usdc", "-a", "1", "--network", "solana"][..],
             &["reset-allowance", "--network", "solana"][..],
             &["cctp-bridge", "--from", "hyperevm", "--all"][..],
@@ -1262,10 +1436,11 @@ mod tests {
         assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
-    /// Malformed amounts, token addresses and vault ids are refused by clap
-    /// before any authentication or bot round trip.
+    /// Malformed amounts, token and redemption wallet addresses, vault ids
+    /// and issuer request ids are refused by clap before any authentication
+    /// or bot round trip.
     #[test]
-    fn capital_refuses_malformed_amount_token_and_vault_id() {
+    fn capital_refuses_malformed_amount_address_vault_id_and_issuer_request_id() {
         let mut argvs: Vec<Vec<&str>> = Vec::new();
         for bad_amount in ["0", "-1", "abc", "1e3", "0.00", "1.", ".5"] {
             argvs.push(vec!["transfer-usdc", "-d", "to-alpaca", "-a", bad_amount]);
@@ -1278,6 +1453,9 @@ mod tests {
                 "-q",
                 bad_amount,
             ]);
+            for verb in ["wrap-equity", "unwrap-equity", "redeem"] {
+                argvs.push(vec![verb, "-s", "AAPL", "-q", bad_amount]);
+            }
             argvs.push(vec![
                 "vault-deposit",
                 "-a",
@@ -1310,6 +1488,15 @@ mod tests {
                 "-v",
                 VAULT,
             ]);
+            argvs.push(vec![
+                "redeem",
+                "-s",
+                "AAPL",
+                "-q",
+                "1",
+                "--redemption-wallet",
+                bad_token,
+            ]);
         }
         for bad_vault in ["0xvault", TOKEN, "1"] {
             argvs.push(vec![
@@ -1320,6 +1507,19 @@ mod tests {
                 TOKEN,
                 "--vault-id",
                 bad_vault,
+            ]);
+        }
+        for bad_id in ["abc", "6f1c2a1e-6c39-4a77-9a8e"] {
+            argvs.push(vec![
+                "transfer-equity",
+                "-d",
+                "to-raindex",
+                "-s",
+                "AAPL",
+                "-q",
+                "1",
+                "--issuer-request-id",
+                bad_id,
             ]);
         }
         for argv in argvs {
