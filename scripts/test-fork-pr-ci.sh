@@ -356,6 +356,7 @@ expected = %w[
   blacksmith-2vcpu-ubuntu-2404
   blacksmith-4vcpu-ubuntu-2404
   blacksmith-8vcpu-ubuntu-2404
+  blacksmith-16vcpu-ubuntu-2404
 ]
 
 unless labels == expected

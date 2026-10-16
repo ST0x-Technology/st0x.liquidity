@@ -43,7 +43,9 @@ env:
 jobs:
   backend-build:
     name: backend build
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    # The build is the first stage of the critical path; rustc's codegen and
+    # the test-binary links spread across the extra cores.
+    runs-on: blacksmith-16vcpu-ubuntu-2404
     timeout-minutes: 30
     env:
       # The target directory persists on a sticky disk (below), so rustc's
