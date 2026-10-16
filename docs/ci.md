@@ -124,6 +124,14 @@ does not use it, because `cargo clippy` sets its own workspace wrapper.
   dependency graph and the parallel frontend use the cores: the compile took
   2m17 against 2m54 on 8. Clippy did not get faster, so `backend lint` stays
   on 8.
+- `backend lint` runs clippy through `scripts/clippy-ci.sh`, which passes
+  `-Zthreads` to clippy-driver for workspace crates (`cargo clippy -- ...`) and
+  sets `RUSTC_BOOTSTRAP` to the workspace's crate names, so only those crates
+  may use the unstable flag and cargo's target-info probe builds as on stable.
+  Cold, clippy took 136 s instead of 173 s locally. Build scripts that watch
+  `RUSTC_BOOTSTRAP` (proc-macro2 and anyhow) see that list, so a PR that adds,
+  removes, or renames a workspace target rebuilds them and their dependents in
+  `backend lint`.
 - The e2e suite (about 80 s a shard) needs only the `st0x-hedge` library, not
   its larger unit-test harness. `backend build e2e` builds just the e2e binary,
   on its own runner and disk, and the eight e2e shards start on its archive
@@ -158,11 +166,11 @@ so a shard takes little more than its slowest test.
 `backend build`, `backend build e2e`, `backend lint`, and `backend docs` keep
 their cargo target directories (`target/test`, `target/e2e`, `target/lint`,
 `target/docs`) on Blacksmith sticky disks, so crates whose sources did not
-change stay built. `backend lint` and `backend docs` build with
-`CARGO_INCREMENTAL=1`, so they also reuse rustc's incremental state for the
-crates that did change. The two build jobs build with `CARGO_INCREMENTAL=0` and
-the parallel frontend instead (see above): the two crashed rustc together, and a
-changed crate recompiles faster in full on all cores.
+change stay built. `backend docs` builds with `CARGO_INCREMENTAL=1`, so it also
+reuses rustc's incremental state for the crates that did change. The build jobs
+and `backend lint` build with `CARGO_INCREMENTAL=0` and the parallel frontend
+instead (see above): the two crashed rustc together, and a changed crate
+recompiles faster in full on all cores.
 
 - Each trusted run mounts the last saved snapshot. Only master pushes save one,
   so pull request runs never replace it. A manual `workflow_dispatch` run mounts
@@ -182,19 +190,19 @@ changed crate recompiles faster in full on all cores.
   `sync-source-mtimes.sh prepare` gives every tracked file an old fixed mtime
   and the current time to each file whose content hash differs from the recorded
   tree, including files that master changed after this branch forked. Cargo then
-  reruns rustc only for crates with a changed source (in `backend lint` and
-  `backend docs`, rustc's incremental cache then reuses whatever still matches).
-  With no recorded tree, every file counts as changed. Registry and git
-  dependencies fingerprint by version and stay built.
+  reruns rustc only for crates with a changed source (in `backend docs`, rustc's
+  incremental cache then reuses whatever still matches). With no recorded tree,
+  every file counts as changed. Registry and git dependencies fingerprint by
+  version and stay built.
 - Some inputs are not in cargo's dep-info for the crate they affect. A
-  `Cargo.lock`, `Cargo.toml`, toolchain, `.cargo/`, `build.rs`, or `ci.yaml`
-  change can select an older artifact variant still on the disk, since `ci.yaml`
-  holds the cargo flags. Nix files pick the `ST0X_*_ABI` paths that `sol!` reads
-  from untracked env vars. `sqlx::migrate!` does not see a new migration, and
-  offline `query!` reads `.sqlx/` without tracking it. When any of these paths
-  changed, `prepare` treats every file as changed. `prepare` also deletes the
-  record, so a build that fails after it cannot leave a stale record on a saved
-  disk.
+  `Cargo.lock`, `Cargo.toml`, toolchain, `.cargo/`, `build.rs`, `ci.yaml`, or
+  `scripts/clippy-ci.sh` change can select an older artifact variant still on
+  the disk, since those two files hold the cargo flags. Nix files pick the
+  `ST0X_*_ABI` paths that `sol!` reads from untracked env vars. `sqlx::migrate!`
+  does not see a new migration, and offline `query!` reads `.sqlx/` without
+  tracking it. When any of these paths changed, `prepare` treats every file as
+  changed. `prepare` also deletes the record, so a build that fails after it
+  cannot leave a stale record on a saved disk.
 - `rain-math-float` is a path dependency linked into the Nix store, where every
   file has mtime 1, so mtimes cannot refresh it.
   `scripts/clean-stale-rain-math-float.sh` runs `cargo clean -p rain-math-float`

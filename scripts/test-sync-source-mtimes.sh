@@ -167,6 +167,7 @@ expect_all_new_after delete_file migrations/1_a.sql
 expect_all_new_after write_file .sqlx/query-1.json
 expect_all_new_after write_file .github/workflows/ci.yaml
 expect_all_new_after write_file scripts/rustc-parallel-frontend.sh
+expect_all_new_after write_file scripts/clippy-ci.sh
 expect_all_new_after write_file src/build.rs
 expect_all_new_after delete_file src/build.rs
 expect_partial_after write_file src/Cargo.toml.rs

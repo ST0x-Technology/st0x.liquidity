@@ -23,9 +23,9 @@
 #     untracked env vars.
 #   - `sqlx::migrate!` lists only the migrations it saw at its last expansion,
 #     and offline `query!` data in .sqlx/ is read without dep-info tracking.
-#   - The cargo flags in ci.yaml, the rustc flags in the workspace wrapper
-#     (cargo fingerprints its path, not its content), and adding or removing a
-#     build.rs select an artifact variant too.
+#   - The cargo flags in ci.yaml and clippy-ci.sh, the rustc flags in the
+#     workspace wrapper (cargo fingerprints its path, not its content), and
+#     adding or removing a build.rs select an artifact variant too.
 # A change to any of them touches every file, as with no recorded tree.
 #
 # The record describes the disk only if it was the last write after a build.
@@ -37,7 +37,7 @@
 set -euo pipefail
 
 old_mtime=@946684800
-build_wide_inputs='(^|/)(Cargo\.toml|Cargo\.lock|flake\.lock|rust-toolchain(\.toml)?|build\.rs)$|^\.cargo/|\.nix$|^migrations/|^\.sqlx/|^\.github/workflows/ci\.yaml$|^scripts/rustc-parallel-frontend\.sh$'
+build_wide_inputs='(^|/)(Cargo\.toml|Cargo\.lock|flake\.lock|rust-toolchain(\.toml)?|build\.rs)$|^\.cargo/|\.nix$|^migrations/|^\.sqlx/|^\.github/workflows/ci\.yaml$|^scripts/rustc-parallel-frontend\.sh$|^scripts/clippy-ci\.sh$'
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 target_dir=${CARGO_TARGET_DIR:?CARGO_TARGET_DIR must be set}
