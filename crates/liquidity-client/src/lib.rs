@@ -457,7 +457,7 @@ async fn dispatch_capital<A: TokenSource + Sync>(
             network,
             issuer_request_id,
         } => {
-            client
+            let answer = client
                 .post_capital_json(
                     "/transfer-equity",
                     &wire::TransferEquityRequest {
@@ -468,7 +468,18 @@ async fn dispatch_capital<A: TokenSource + Sync>(
                         issuer_request_id,
                     },
                 )
-                .await
+                .await?;
+            if let Some(id) = issuer_request_id
+                && !resumed_mint(&answer, id)
+            {
+                eprintln!(
+                    "WARNING: the bot did not answer that it resumed mint {id}, so it predates \
+                     mint resume and started a NEW mint of the given quantity instead. Do not \
+                     rerun: check the new transfer with read transfer-events mint <transferId> \
+                     and fail it with debug fail-equity-transfer if it must not run"
+                );
+            }
+            Ok(answer)
         }
         Capital::WrapEquity {
             symbol,
@@ -514,6 +525,24 @@ async fn dispatch_capital<A: TokenSource + Sync>(
                         symbol,
                         quantity,
                         chain: network.wire_name(),
+                    },
+                )
+                .await
+        }
+        Capital::DrainEquity {
+            symbol,
+            quantity,
+            vault_id,
+            network,
+        } => {
+            client
+                .post_capital_json(
+                    "/drain-equity",
+                    &wire::DrainEquityRequest {
+                        symbol,
+                        quantity,
+                        chain: network.wire_name(),
+                        vault_id,
                     },
                 )
                 .await
@@ -616,6 +645,15 @@ fn records_operation(answer: &serde_json::Value, operation_id: uuid::Uuid) -> bo
             .is_some_and(serde_json::Value::is_string)
 }
 
+/// Whether a `transfer-equity --issuer-request-id` answer comes from a bot
+/// that resumed that mint: outcome `resumed` and the same id. An older bot
+/// ignores the id and starts a fresh mint of the given quantity.
+fn resumed_mint(answer: &serde_json::Value, id: uuid::Uuid) -> bool {
+    answer.get("outcome").and_then(serde_json::Value::as_str) == Some("resumed")
+        && answer.get("transferId").and_then(serde_json::Value::as_str)
+            == Some(id.to_string().as_str())
+}
+
 /// The body `vault-deposit` and `vault-withdraw` share.
 fn vault_request(args: VaultArgs) -> wire::VaultTransferRequest {
     wire::VaultTransferRequest {
@@ -635,7 +673,7 @@ mod tests {
     use std::sync::mpsc::{Receiver, channel};
     use std::time::Duration;
 
-    use super::{ApiError, dispatch, is_write, reached_bot, records_operation};
+    use super::{ApiError, dispatch, is_write, reached_bot, records_operation, resumed_mint};
     use crate::auth::{AuthError, StaticToken};
     use crate::cli::{
         Capital, Cctp, CctpSourceChain, Command, Debug, EquityTransferKind, HedgedChain,
@@ -1345,6 +1383,35 @@ mod tests {
         Ok(())
     }
 
+    /// `drain-equity` posts the symbol, the wrapped quantity, the chain and
+    /// the vault id, and no redemption wallet.
+    #[tokio::test]
+    async fn drain_equity_posts_the_symbol_quantity_chain_and_vault()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let vault_id = "0x00000000000000000000000000000000000000000000000000000000000000a1";
+        let request = request_for(Command::Capital(Capital::DrainEquity {
+            symbol: "AAPL".to_owned(),
+            quantity: "2.5".parse()?,
+            vault_id: vault_id.parse()?,
+            network: HedgedChain::Robinhood,
+        }))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-capital/drain-equity HTTP/1.1"
+        );
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({
+                "symbol": "AAPL",
+                "quantity": "2.5",
+                "chain": "robinhood",
+                "vaultId": vault_id,
+            })
+        );
+        Ok(())
+    }
+
     /// Both vault verbs send the same camelCase body, each to its own route.
     #[tokio::test]
     async fn vault_verbs_post_the_chain_token_vault_and_amount()
@@ -1504,6 +1571,32 @@ mod tests {
         assert!(records_operation(&recorded, id));
         assert!(!records_operation(&old_bot, id));
         assert!(!records_operation(&other_id, id));
+        Ok(())
+    }
+
+    /// Only an answer that resumed this exact mint counts as a resume; an
+    /// older bot's fresh start, or a resume of another id, must trigger the
+    /// new mint warning.
+    #[test]
+    fn only_an_answer_resuming_the_same_mint_counts_as_a_resume()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let id: uuid::Uuid = "6f1c2a1e-6c39-4a77-9a8e-1f0b7d6e8c11".parse()?;
+        let resumed = serde_json::json!({ "transferId": id.to_string(), "outcome": "resumed" });
+        let old_bot = serde_json::json!({
+            "transferId": uuid::Uuid::new_v4().to_string(),
+            "outcome": "enqueued",
+        });
+        let other_id = serde_json::json!({
+            "transferId": uuid::Uuid::new_v4().to_string(),
+            "outcome": "resumed",
+        });
+        let same_id_enqueued =
+            serde_json::json!({ "transferId": id.to_string(), "outcome": "enqueued" });
+
+        assert!(resumed_mint(&resumed, id));
+        assert!(!resumed_mint(&old_bot, id));
+        assert!(!resumed_mint(&other_id, id));
+        assert!(!resumed_mint(&same_id_enqueued, id));
         Ok(())
     }
 

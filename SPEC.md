@@ -195,19 +195,20 @@ Operators pause rebalancing with narrow, explicit controls:
   of the total, pause it, wait until its in-flight transfers finish, and then
   set it to `disabled`. Pausing does not move the chain's equity: the planner
   skips paused chains and `transfer-equity` refuses a new transfer on them. To
-  move that equity elsewhere first, use the capital verbs of
-  `st0x-liquidity-client` on that chain (`capital vault-withdraw`,
-  `capital unwrap-equity`, then `capital redeem` with the unwrapped quantity,
-  see docs/cli-ops.md). The Raindex vault holds the wrapped derivative, so
-  unwrap first: `capital redeem` sends only the wrapper's attested underlying,
-  never the wrapped share. Publish `rebalancing = "paused"` only after this
-  order: deploy the bot that reads `paused`, merge the `t0/check.jq` validator
-  change, then publish `paused`. On rollback, restore the token value before
-  downgrading the binary. The dashboard currently shows paused and disabled
-  listings with the same red rebalancing indicator; verify the registry mode
-  before you set `disabled`. It displays settings for the primary chain only. A
-  listing with rebalancing `enabled` or `paused` also needs
-  `wrapped_equity_recovery = "enabled"` on every chain.
+  move that equity elsewhere first, run
+  `st0x-liquidity-client capital drain-equity` on that chain (see
+  docs/cli-ops.md). It withdraws the wrapped shares from the vault, unwraps them
+  and redeems the underlying in one run under one claim of the symbol, so the
+  bot's wallet recovery cannot deposit the shares back into the vault between
+  the steps, as it can between separate `capital vault-withdraw`,
+  `capital unwrap-equity` and `capital redeem` runs. Publish
+  `rebalancing = "paused"` only after this order: deploy the bot that reads
+  `paused`, merge the `t0/check.jq` validator change, then publish `paused`. On
+  rollback, restore the token value before downgrading the binary. The dashboard
+  currently shows paused and disabled listings with the same red rebalancing
+  indicator; verify the registry mode before you set `disabled`. It displays
+  settings for the primary chain only. A listing with rebalancing `enabled` or
+  `paused` also needs `wrapped_equity_recovery = "enabled"` on every chain.
 - **Per-asset `rebalancing = "disabled"`**: removes the asset from the trigger
   whitelist. New equity rebalancing flows do not start for that asset. On a
   secondary chain where no equity is `enabled` or `paused`, the chain's equity
@@ -8554,9 +8555,10 @@ effect rather than a generic intent:
   `st0x-cli transfer-equity --issuer-request-id`, for a mint the CLI started
   before the SSH cutover. After the startup gate it takes the projection write
   slot and the recovery lock (`409`), then loads the mint: an unknown id is
-  `404`, a recorded chain or symbol other than the request's is `422` naming the
-  recorded one, an ended mint (deposited, failed or reconciled) is `409`, and so
-  is a mint something already drives: a live row of its transfer job or of the
+  `404`, a recorded chain, symbol or quantity other than the request's is `422`
+  naming the recorded one (a different quantity means the operator holds the
+  wrong id), an ended mint (deposited, failed or reconciled) is `409`, and so is
+  a mint something already drives: a live row of its transfer job or of the
   resume job startup enqueues for a mint without a job row, or a wrapped or
   unwrapped equity recovery holding its symbol, since two drivers could both
   submit its wrap or deposit. It then answers with the given id, the recorded
@@ -8666,69 +8668,81 @@ effect rather than a generic intent:
   never one the request names, so the capital group cannot send the bot's shares
   out of our accounts; Alpaca redeems them into the account. `redeem` is kept
   for draining a paused chain, where `transfer-equity` starts nothing; its token
-  is the wrapper's attested `asset()`, never a pasted address. A quantity that
-  is not positive or is finer than the tokens' 18 decimals (the CLI truncated
-  it), or an empty symbol, is refused with `400`; a chain without a
-  `[chains.<name>.trading]` table, or a symbol that table does not list, with
-  `422` (the CLI's `--registry` fallback has no route), as is a redeem without a
-  redemption wallet to send to; then `503` until startup completes. The three
-  share one lock per symbol, and each also claims the bot's own equity transfer
-  guard for the symbol; while either is held a request answers `409`, so an
-  operator cannot move a symbol's shares in the wallet under a transfer the bot
-  runs, and the bot starts no transfer of the symbol meanwhile. Then `503` while
-  the chain's signer cannot be shown to pay gas, checked against that chain's
-  own `[alerts.low_balance_thresholds]` entry (the trigger wires no gas check
-  for a chain that rebalances no equity, such as a paused chain being drained),
-  and `422` before any send for an unwrap above the wrapper's `maxRedeem` for
-  the wallet or a wrapper whose `asset()` differs from the configured
-  underlying. A wrap still awaits its approve when the allowance is short, as
-  the bot's own wraps do. Each answers at the broadcast of its deposit, redeem
-  or transfer (`wrapTx`, `unwrapTx` or `transferTx`) and confirms on the
-  detached task like the vault verbs, holding the lock and the guard until the
-  tx's fate is proven, or until a restart after a panic while confirming. The
-  redemption transfer is sent once and never retried, since it carries no
-  idempotency key. Once it confirms, the task frees the lock and the guard,
-  polls Alpaca until it detects the transfer and until the redemption finishes,
-  and logs the request id and the final status; a throttled lookup is waited out
-  inside the poll, as in the bot's own redemption jobs. Every capital route
-  refuses with `503` until startup completes, like `process-tx`, since the
-  startup preflights (each chain's id, the inventory `OPERATOR_ROLE`) have not
-  passed before then. Each route that sends a transaction runs it on a tracked
-  detached task, like `process-tx`, so a client or load balancer timeout cannot
-  drop a transaction between its broadcast and its receipt, graceful shutdown
-  waits for it, and the task logs its own outcome. The vault verbs and
-  `reset-allowance` answer at the broadcast like `cctp-bridge`, with the same
-  response bodies, since the tx hash, the raw amount and the decimals are all
-  known before the send: the 12 confirmations production requires on Ethereum
-  take about two and a half minutes, longer than the load balancer cut. These
-  verbs refuse a chain without a `[chains.<name>.trading]` table with `400`, and
-  Ethereum has none in staging or prod today, so that cost applies once Ethereum
-  gets one. The task then awaits the confirmation and logs the outcome with the
-  tx hash, so a tx that reverts after the answer shows only in the bot logs. The
-  answer does not wait for the onchain effect, so the vault balance may not have
-  moved yet when it arrives (or may have, if the tx was included quickly). The
-  vault verbs hold their lock until their tx's fate is proven: its own canonical
-  receipt at the chain's required confirmations shows it succeeded or failed, or
-  the wallet decoded its revert. After a confirmation error the task reads that
-  receipt, so a failed tx whose revert replay decodes nothing (no revert data,
-  or pruned state) still frees the lock. Any other confirmation error (a receipt
-  timeout, a drop report, a transport failure, a JSON-RPC error reply) proves
-  nothing: a lagging or load balanced RPC can report a tx dropped while another
-  node still holds it pending. So the task keeps the lock and waits for the
-  receipt again 30 seconds later; each wait can itself take up to 5 minutes for
-  inclusion plus 30 minutes for the confirmations, so the lock can stay held for
-  hours. A panic while confirming leaves the fate unknown, so the task keeps the
-  lock until a restart. A failed send frees the lock and answers `500`, like
-  `st0x-cli`: its error cannot tell whether the tx went out, so the operator
-  checks onchain before a rerun. Until the lock is freed a rerun of
-  `vault-deposit`, `vault-withdraw`, or `vault-withdraw-usdc` answers `409`
-  instead of sending a second tx. The locks live in memory, so a restart frees
-  them. A rerun of `reset-allowance` still sends a redundant `approve(0)`, which
-  moves no funds. When the allowance is short `vault-deposit` still awaits the
-  approve's confirmation before it broadcasts the deposit, so only a deposit of
-  a token without the startup MAX grant can still outlast the cut.
-  `donate-equity` and `dividend-bump` have no route here: they move equity on
-  the S01 side and belong to `s01-capital-ops`.
+  is the wrapper's attested `asset()`, never a pasted address. `drain-equity`
+  runs a paused chain's drain in one go: it withdraws `quantity` wrapped shares
+  from the listing's vault `vaultId` (the vault withdraw lock held until that tx
+  is proven, as for `vault-withdraw`), unwraps them, and sends the underlying
+  the unwrap paid out to the configured redemption wallet, under one claim of
+  the symbol held from before the withdrawal until the transfer is proven; the
+  bot's wallet recovery waits while the claim is held, so it cannot deposit the
+  shares back into the vault between steps as it can between separate runs of
+  the three verbs. A step that fails stops the drain where it is and logs where
+  the shares are; an unwrap whose payout cannot be read stops it before the
+  transfer. A quantity that is not positive or is finer than the tokens' 18
+  decimals (the CLI truncated it), or an empty symbol, is refused with `400`; a
+  chain without a `[chains.<name>.trading]` table, or a symbol that table does
+  not list, with `422` (the CLI's `--registry` fallback has no route), as is a
+  redeem without a redemption wallet to send to; then `503` until startup
+  completes. The four share one lock per symbol, and each also claims the bot's
+  own equity transfer guard for the symbol; while either is held a request
+  answers `409`, so an operator cannot move a symbol's shares in the wallet
+  under a transfer the bot runs, and the bot starts no transfer of the symbol
+  meanwhile. Then `503` while the chain's signer cannot be shown to pay gas,
+  checked against that chain's own `[alerts.low_balance_thresholds]` entry (the
+  trigger wires no gas check for a chain that rebalances no equity, such as a
+  paused chain being drained), and `422` before any send for an unwrap above the
+  wrapper's `maxRedeem` for the wallet or a wrapper whose `asset()` differs from
+  the configured underlying. A wrap still awaits its approve when the allowance
+  is short, as the bot's own wraps do. Each answers at the broadcast of its
+  first tx (`wrapTx`, `unwrapTx`, `transferTx`, or the drain's `withdrawTx`) and
+  confirms on the detached task like the vault verbs, holding the lock and the
+  guard until the last tx's fate is proven, or until a restart after a panic
+  while confirming. A tx whose fate stays unknown for 10 minutes raises one
+  operational alert naming the symbol, the chain and the tx, since the held
+  guard blocks rebalancing of the symbol on every chain. The redemption transfer
+  is sent once and never retried, since it carries no idempotency key. Once it
+  confirms, the task frees the lock and the guard, polls Alpaca until it detects
+  the transfer and until the redemption finishes, and logs the request id and
+  the final status; a throttled lookup is waited out inside the poll, as in the
+  bot's own redemption jobs. Every capital route refuses with `503` until
+  startup completes, like `process-tx`, since the startup preflights (each
+  chain's id, the inventory `OPERATOR_ROLE`) have not passed before then. Each
+  route that sends a transaction runs it on a tracked detached task, like
+  `process-tx`, so a client or load balancer timeout cannot drop a transaction
+  between its broadcast and its receipt, graceful shutdown waits for it, and the
+  task logs its own outcome. The vault verbs and `reset-allowance` answer at the
+  broadcast like `cctp-bridge`, with the same response bodies, since the tx
+  hash, the raw amount and the decimals are all known before the send: the 12
+  confirmations production requires on Ethereum take about two and a half
+  minutes, longer than the load balancer cut. These verbs refuse a chain without
+  a `[chains.<name>.trading]` table with `400`, and Ethereum has none in staging
+  or prod today, so that cost applies once Ethereum gets one. The task then
+  awaits the confirmation and logs the outcome with the tx hash, so a tx that
+  reverts after the answer shows only in the bot logs. The answer does not wait
+  for the onchain effect, so the vault balance may not have moved yet when it
+  arrives (or may have, if the tx was included quickly). The vault verbs hold
+  their lock until their tx's fate is proven: its own canonical receipt at the
+  chain's required confirmations shows it succeeded or failed, or the wallet
+  decoded its revert. After a confirmation error the task reads that receipt, so
+  a failed tx whose revert replay decodes nothing (no revert data, or pruned
+  state) still frees the lock. Any other confirmation error (a receipt timeout,
+  a drop report, a transport failure, a JSON-RPC error reply) proves nothing: a
+  lagging or load balanced RPC can report a tx dropped while another node still
+  holds it pending. So the task keeps the lock and waits for the receipt again
+  30 seconds later; each wait can itself take up to 5 minutes for inclusion plus
+  30 minutes for the confirmations, so the lock can stay held for hours. A panic
+  while confirming leaves the fate unknown, so the task keeps the lock until a
+  restart. A failed send frees the lock and answers `500`, like `st0x-cli`: its
+  error cannot tell whether the tx went out, so the operator checks onchain
+  before a rerun. Until the lock is freed a rerun of `vault-deposit`,
+  `vault-withdraw`, or `vault-withdraw-usdc` answers `409` instead of sending a
+  second tx. The locks live in memory, so a restart frees them. A rerun of
+  `reset-allowance` still sends a redundant `approve(0)`, which moves no funds.
+  When the allowance is short `vault-deposit` still awaits the approve's
+  confirmation before it broadcasts the deposit, so only a deposit of a token
+  without the startup MAX grant can still outlast the cut. `donate-equity` and
+  `dividend-bump` have no route here: they move equity on the S01 side and
+  belong to `s01-capital-ops`.
 - **`transfer resume --kind usdc` routes through the running bot.** The CLI
   posts to `POST /transfers/usdc/resume/{direction}/{id}`. The endpoint
   validates server-side (unknown id refuses -- a mistyped id must never start a

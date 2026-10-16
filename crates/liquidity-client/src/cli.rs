@@ -513,6 +513,29 @@ pub(crate) enum Capital {
         #[arg(long, value_enum, default_value_t = HedgedChain::Base)]
         network: HedgedChain,
     },
+    /// Drain wrapped shares of an equity from a paused chain into Alpaca in
+    /// one run: withdraws them from the vault, unwraps them, and sends the
+    /// underlying to the redemption wallet the bot has configured for the
+    /// chain. The bot holds the symbol for the whole drain, so its wallet
+    /// recovery cannot put the shares back into the vault between steps.
+    /// Returns the vault withdrawal tx as soon as it is broadcast; the unwrap,
+    /// the transfer and Alpaca's redemption follow in the bot's logs. The
+    /// transfer is never retried.
+    DrainEquity {
+        /// Equity symbol (for example AAPL).
+        #[arg(short = 's', long)]
+        symbol: String,
+        /// Number of wrapped shares to take out of the vault, as a decimal.
+        #[arg(short = 'q', long, allow_negative_numbers = true)]
+        quantity: DecimalAmount,
+        /// Raindex vault that holds the wrapped shares.
+        #[arg(short = 'v', long)]
+        vault_id: VaultId,
+        /// Chain being drained: selects the wallet, the vault and the
+        /// `[chains.<name>.trading]` equity listing.
+        #[arg(long, value_enum, default_value_t = HedgedChain::Base)]
+        network: HedgedChain,
+    },
     /// Deposit tokens from the bot's wallet into a Raindex vault: approves,
     /// then deposits, resolving token decimals from onchain metadata. Returns
     /// the deposit tx as soon as it is broadcast; the bot confirms it
@@ -1213,6 +1236,8 @@ mod tests {
             &["unwrap-equity", "-q", "1"][..],
             &["redeem", "-s", "AAPL"][..],
             &["redeem", "-q", "1"][..],
+            &["drain-equity", "-s", "AAPL", "-q", "1"][..],
+            &["drain-equity", "-s", "AAPL", "-v", VAULT][..],
             &["vault-deposit", "-a", "1", "-t", TOKEN][..],
             &["vault-withdraw", "-a", "1", "-v", VAULT][..],
             &["vault-withdraw-usdc", "--network", "base"][..],
@@ -1230,8 +1255,8 @@ mod tests {
     }
 
     /// The equity wallet verbs keep the flag names and short flags of their
-    /// st0x-cli counterparts, and `redeem` sends a redemption wallet only when
-    /// one is given.
+    /// st0x-cli counterparts, and `redeem` takes no redemption wallet: the bot
+    /// always sends to the one it has configured.
     #[test]
     fn parses_equity_wallet_verbs() {
         assert!(matches!(
@@ -1286,6 +1311,31 @@ mod tests {
             } if symbol == "TSLA" && quantity == self::amount("3")
         ));
 
+        let Capital::DrainEquity {
+            symbol,
+            quantity,
+            vault_id,
+            network,
+        } = capital(&[
+            "drain-equity",
+            "-s",
+            "AAPL",
+            "-q",
+            "2.5",
+            "-v",
+            VAULT,
+            "--network",
+            "robinhood",
+        ])
+        .unwrap()
+        else {
+            panic!("expected drain-equity");
+        };
+        assert_eq!(symbol, "AAPL");
+        assert_eq!(quantity, amount("2.5"));
+        assert_eq!(vault_id, VAULT.parse::<VaultId>().unwrap());
+        assert_eq!(network.wire_name(), "robinhood");
+
         // The bot sends a redeem only to its configured redemption wallet, so
         // the client has no way to name another.
         let Err(error) = capital(&[
@@ -1322,6 +1372,7 @@ mod tests {
             &["wrap-equity", "-s", "AAPL", "-q", "1"][..],
             &["unwrap-equity", "-s", "AAPL", "-q", "1"][..],
             &["redeem", "-s", "AAPL", "-q", "1"][..],
+            &["drain-equity", "-s", "AAPL", "-q", "1", "-v", VAULT][..],
         ] {
             let network = match capital(argv).unwrap() {
                 Capital::VaultDeposit(args) | Capital::VaultWithdraw(args) => args.network,
@@ -1330,6 +1381,7 @@ mod tests {
                 | Capital::WrapEquity { network, .. }
                 | Capital::UnwrapEquity { network, .. }
                 | Capital::Redeem { network, .. }
+                | Capital::DrainEquity { network, .. }
                 | Capital::ResetAllowance { network } => network,
                 Capital::TransferUsdc { .. }
                 | Capital::CctpBridge { .. }
@@ -1448,7 +1500,7 @@ mod tests {
         assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
-    /// Malformed amounts, token and redemption wallet addresses, vault ids
+    /// Malformed amounts, token addresses, vault ids
     /// and issuer request ids are refused by clap before any authentication
     /// or bot round trip.
     #[test]

@@ -239,6 +239,17 @@ pub(crate) struct VaultTransferRequest {
     pub(crate) amount: DecimalAmount,
 }
 
+/// Body of `POST /liquidity-capital/drain-equity`: wrapped shares to take out
+/// of the vault.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DrainEquityRequest {
+    pub(crate) symbol: String,
+    pub(crate) quantity: DecimalAmount,
+    pub(crate) chain: &'static str,
+    pub(crate) vault_id: VaultId,
+}
+
 /// Body of `POST /liquidity-capital/vault-withdraw-usdc`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]

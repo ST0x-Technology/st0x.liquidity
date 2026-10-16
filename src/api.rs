@@ -4944,6 +4944,7 @@ define_ops_api_routes! {
     capital post "/wrap-equity" => capital::wrap_equity;
     capital post "/unwrap-equity" => capital::unwrap_equity;
     capital post "/redeem" => capital::redeem;
+    capital post "/drain-equity" => capital::drain_equity;
     capital post "/vault-deposit" => capital::vault_deposit;
     capital post "/vault-withdraw" => capital::vault_withdraw;
     capital post "/vault-withdraw-usdc" => capital::vault_withdraw_usdc;
@@ -9387,7 +9388,7 @@ mod tests {
             .iter()
             .filter(|route| route.role == OpsRole::Capital)
             .collect::<Vec<_>>();
-        assert_eq!(capital_routes.len(), 11);
+        assert_eq!(capital_routes.len(), 12);
         for route in capital_routes {
             let verb = route
                 .path
@@ -11061,6 +11062,11 @@ mod tests {
             capital_request(equity_wallet_body("1")),
         )
         .await;
+        let drain = capital::drain_equity(
+            State(state.clone()),
+            capital_request(equity_wallet_body("1")),
+        )
+        .await;
         let deposit =
             capital::vault_deposit(State(state.clone()), capital_request(vault.clone())).await;
         let withdraw = capital::vault_withdraw(State(state.clone()), capital_request(vault)).await;
@@ -11095,6 +11101,7 @@ mod tests {
             ("wrap-equity", wrap.err()),
             ("unwrap-equity", unwrap.err()),
             ("redeem", redeem.err()),
+            ("drain-equity", drain.err()),
             ("vault-deposit", deposit.err()),
             ("vault-withdraw", withdraw.err()),
             ("vault-withdraw-usdc", withdraw_usdc.err()),
@@ -11116,15 +11123,19 @@ mod tests {
         }
     }
 
-    const EQUITY_WALLET_ROUTES: [&str; 3] = ["wrap-equity", "unwrap-equity", "redeem"];
+    const EQUITY_WALLET_ROUTES: [&str; 4] =
+        ["wrap-equity", "unwrap-equity", "redeem", "drain-equity"];
+    const DRAIN_VAULT_ID: B256 = B256::with_last_byte(7);
     const TEST_REDEMPTION_WALLET: Address = address!("0x00000000000000000000000000000000000000ab");
 
-    /// The body of an equity wallet route for AAPL on Base.
+    /// The body of an equity wallet route for AAPL on Base. `vaultId` is
+    /// the drain's vault; the other routes ignore it.
     fn equity_wallet_body(quantity: &str) -> serde_json::Value {
         serde_json::json!({
             "symbol": "AAPL",
             "quantity": quantity,
             "chain": "base",
+            "vaultId": DRAIN_VAULT_ID,
         })
     }
 
@@ -11143,6 +11154,9 @@ mod tests {
                 .await
                 .map(|Json(answer)| serde_json::to_value(answer).unwrap()),
             "redeem" => capital::redeem(State(state.clone()), capital_request(body))
+                .await
+                .map(|Json(answer)| serde_json::to_value(answer).unwrap()),
+            "drain-equity" => capital::drain_equity(State(state.clone()), capital_request(body))
                 .await
                 .map(|Json(answer)| serde_json::to_value(answer).unwrap()),
             other => panic!("unknown equity wallet route {other}"),
@@ -11567,6 +11581,158 @@ mod tests {
         );
     }
 
+    /// End to end on Anvil: one drain withdraws wrapped shares from the vault,
+    /// unwraps them and sends the underlying to the configured redemption
+    /// wallet, then follows Alpaca to completion. While the first step waits
+    /// on its receipt, the symbol's lock and the bot's guard are held (so the
+    /// wallet recovery and the other equity verbs wait), and they stay held
+    /// through every later step until the transfer is proven.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn drain_equity_withdraws_unwraps_and_redeems_under_one_claim() {
+        use alloy::providers::Provider as _;
+
+        let chain = AnvilRaindexChain::deploy().await;
+        let supply = U256::from(10_u64) * U256::from(10_u64).pow(U256::from(18_u64));
+        let underlying = chain.deploy_bot_token(18, supply).await;
+        let wrapper = deploy_test_wrapper(&chain, underlying).await;
+        let (mut ctx, gate) = equity_wallet_ctx_on(&chain, underlying, wrapper);
+        let alpaca = MockServer::start();
+        let BrokerCtx::AlpacaBrokerApi(broker) = &mut ctx.broker;
+        broker.mode = Some(AlpacaBrokerApiMode::Mock(alpaca.base_url()));
+        let requests_path = format!("/v1/accounts/{}/tokenization/requests", broker.account_id);
+        let (state, _driver_gate) =
+            recovery_state_for_ctx(ctx, EquityTransferServices::panicking()).await;
+        state.health.set_ready();
+        let aapl = Symbol::new("AAPL").unwrap();
+
+        run_equity_wallet_route(&state, "wrap-equity", equity_wallet_body("3"))
+            .await
+            .unwrap_or_else(|(status, error)| panic!("wrap refused with {status}: {error}"));
+        confirm_after_the_answer(&state, &gate).await;
+        capital_success(
+            "vault-deposit",
+            capital::vault_deposit(
+                State(state.clone()),
+                capital_request(vault_request(wrapper, DRAIN_VAULT_ID, "3")),
+            )
+            .await,
+        );
+        confirm_after_the_answer(&state, &gate).await;
+        let mut not_detected_yet = alpaca.mock(|when, then| {
+            when.method(GET).path(requests_path.as_str());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!([]));
+        });
+
+        let answer = run_equity_wallet_route(&state, "drain-equity", equity_wallet_body("2"))
+            .await
+            .unwrap_or_else(|(status, error)| panic!("drain refused with {status}: {error}"));
+        let withdraw_tx: TxHash = serde_json::from_value(answer["withdrawTx"].clone()).unwrap();
+        assert_eq!(
+            answer,
+            serde_json::json!({
+                "chain": "base",
+                "symbol": "AAPL",
+                "quantity": "2",
+                "vaultId": DRAIN_VAULT_ID,
+                "redemptionWallet": TEST_REDEMPTION_WALLET,
+                "withdrawTx": withdraw_tx,
+            })
+        );
+
+        assert!(
+            !bot_guard_free(&state, &aapl),
+            "the drain must hold the bot's guard, so wallet recovery waits"
+        );
+        let Err((status, _)) =
+            run_equity_wallet_route(&state, "unwrap-equity", equity_wallet_body("1")).await
+        else {
+            panic!("another equity verb must not run during the drain");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        state.detached_tasks.close();
+        let Err(_still_draining) =
+            tokio::time::timeout(Duration::from_millis(200), state.detached_tasks.wait()).await
+        else {
+            panic!("the drain must keep running until its transfer is proven");
+        };
+
+        gate.send_replace(ReceiptGate::Released);
+        let sent = U256::from(2_000_000_000_000_000_000_u64);
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while erc20_balance(&chain.bot_wallet, underlying, TEST_REDEMPTION_WALLET).await < sent
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the drain must send the unwrapped underlying to the redemption wallet");
+        let latest = chain
+            .bot_wallet
+            .provider()
+            .get_block_by_number(alloy::eips::BlockNumberOrTag::Latest)
+            .await
+            .unwrap()
+            .unwrap();
+        let transfer_tx = latest.transactions.hashes().next().unwrap();
+        not_detected_yet.delete();
+        let redemption = alpaca.mock(|when, then| {
+            when.method(GET).path(requests_path.as_str());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!([{
+                    "tokenization_request_id": "drain_capital_test",
+                    "type": "redeem",
+                    "status": "completed",
+                    "underlying_symbol": "AAPL",
+                    "token_symbol": "tAAPL",
+                    "qty": "2",
+                    "issuer": "st0x",
+                    "network": "base",
+                    "tx_hash": transfer_tx,
+                    "created_at": "2024-01-15T10:30:00Z"
+                }]));
+        });
+        tokio::time::timeout(Duration::from_secs(60), state.detached_tasks.wait())
+            .await
+            .expect("the drain must finish once Alpaca reports the redemption");
+        state.detached_tasks.reopen();
+        gate.send_replace(ReceiptGate::Held);
+
+        assert!(redemption.calls() > 0, "the drain must follow Alpaca");
+        assert!(logs_contain("Drain vault withdrawal broadcast via API"));
+        assert!(logs_contain("Drain unwrap broadcast via API"));
+        assert!(logs_contain("Drain redemption transfer broadcast via API"));
+        assert!(logs_contain("Alpaca completed the redemption sent via API"));
+        assert!(bot_guard_free(&state, &aapl));
+        assert!(state.equity_wallet_locks.try_lock(&aapl).is_some());
+
+        assert_eq!(
+            mined_receipt(&chain.bot_wallet, withdraw_tx).await.to,
+            Some(chain.orderbook)
+        );
+        let deposited = U256::from(3_000_000_000_000_000_000_u64);
+        assert_eq!(
+            chain.vault_balance(wrapper, DRAIN_VAULT_ID, 18).await,
+            deposited - sent
+        );
+        assert_eq!(
+            erc20_balance(&chain.bot_wallet, wrapper, chain.bot).await,
+            U256::ZERO,
+            "every withdrawn wrapped share must be unwrapped"
+        );
+        assert_eq!(
+            erc20_balance(&chain.bot_wallet, underlying, TEST_REDEMPTION_WALLET).await,
+            sent
+        );
+        assert_eq!(
+            erc20_balance(&chain.bot_wallet, underlying, chain.bot).await,
+            supply - deposited
+        );
+    }
+
     /// A transfer-equity body resuming the mint `id` of 10 AAPL on Base.
     fn mint_resume_body(id: &IssuerRequestId) -> serde_json::Value {
         serde_json::json!({
@@ -11657,9 +11823,9 @@ mod tests {
     }
 
     /// A resume continues the mint the record describes, so a request naming
-    /// another chain or symbol is a 422 that names the recorded one.
+    /// another chain, symbol or quantity is a 422 that names the recorded one.
     #[tokio::test]
-    async fn transfer_equity_resume_refuses_another_chain_or_symbol_than_recorded() {
+    async fn transfer_equity_resume_refuses_another_chain_symbol_or_quantity_than_recorded() {
         let (state, _gate) =
             recovery_state_with_driver_pause(EquityTransferServices::panicking()).await;
         state.health.set_ready();
@@ -11688,6 +11854,20 @@ mod tests {
             error.starts_with(&format!("mint {id} was requested for AAPL;"))
                 && error.ends_with("Resume it with symbol AAPL"),
             "{error}"
+        );
+
+        let mut other_quantity = mint_resume_body(&id);
+        other_quantity["quantity"] = serde_json::json!("100");
+        let Err((status, error)) = run_transfer_equity(&state, other_quantity).await else {
+            panic!("a resume with another quantity must be refused");
+        };
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+        assert_eq!(
+            error,
+            format!(
+                "mint {id} was requested for 10 shares, not 100; check the id, or resume it \
+                 with quantity 10"
+            )
         );
     }
 
@@ -11817,9 +11997,7 @@ mod tests {
             .unwrap();
         assert_eq!(tokenizer.mint_request_call_count(), 1);
 
-        let mut body = mint_resume_body(&id);
-        body["quantity"] = serde_json::json!("3");
-        let answer = run_transfer_equity(&state, body)
+        let answer = run_transfer_equity(&state, mint_resume_body(&id))
             .await
             .unwrap_or_else(|(status, error)| panic!("resume refused with {status}: {error}"));
         assert_eq!(

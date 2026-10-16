@@ -386,6 +386,45 @@ pub(super) struct UnwrapResponse {
     unwrap_tx: TxHash,
 }
 
+/// Wire contract for the drain equity route.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct DrainEquityRequest {
+    /// Ticker of the tokenized equity to drain.
+    symbol: String,
+    /// Decimal wrapped shares to take out of the vault, with at most 18
+    /// decimals.
+    quantity: String,
+    /// Chain whose listing, vault and wallet the drain runs on.
+    chain: Chain,
+    /// The Raindex vault holding the wrapped shares, as for
+    /// `vault-withdraw --vault-id`.
+    vault_id: B256,
+}
+
+impl AuditedRequest for DrainEquityRequest {
+    fn audit_targets(&self) -> Vec<String> {
+        vec![
+            self.symbol.clone(),
+            self.chain.to_string(),
+            self.vault_id.to_string(),
+        ]
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct DrainEquityResponse {
+    chain: Chain,
+    symbol: String,
+    quantity: String,
+    vault_id: B256,
+    redemption_wallet: Address,
+    /// The vault withdrawal, the drain's first tx; the unwrap and the
+    /// redemption transfer follow on the bot and appear in its logs.
+    withdraw_tx: TxHash,
+}
+
 /// Wire contract for the redeem route.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -531,7 +570,7 @@ pub(super) async fn transfer_equity(
             ));
         };
         require_startup_complete(&state, "transfer-equity")?;
-        return resume_equity_mint(state, issuer_request_id, symbol, chain)
+        return resume_equity_mint(state, issuer_request_id, symbol, quantity, chain)
             .await
             .map(Json);
     }
@@ -613,7 +652,9 @@ pub(super) async fn transfer_equity(
 /// the recovery handle, then the checks: the mint must exist (404), its
 /// recorded chain and symbol must be the request's (422 naming the recorded
 /// ones, since another chain's orderbook and issuer wallet or another
-/// symbol's Position and vault would be used), it must not have ended (409),
+/// symbol's Position and vault would be used), its recorded quantity must be
+/// the request's (422 naming it, since a different one means the operator has
+/// the wrong id), it must not have ended (409),
 /// and nothing else may drive it (409, [`RebalancingService::mint_driver`]).
 /// The route then answers `resumed` with the recorded quantity and runs the
 /// resume on the detached task, holding the slot and the lock until it ends,
@@ -623,6 +664,7 @@ async fn resume_equity_mint(
     state: AppState,
     id: IssuerRequestId,
     symbol: Symbol,
+    quantity: Positive<FractionalShares>,
     chain: Chain,
 ) -> Result<TransferEquityResponse, OpsError> {
     let detached_tasks = state.detached_tasks.clone();
@@ -675,6 +717,14 @@ async fn resume_equity_mint(
                  {recorded_symbol}"
             )));
         }
+        let recorded_quantity = FractionalShares::new(recorded.quantity());
+        if recorded_quantity != quantity.inner() {
+            return Err(unprocessable(format!(
+                "mint {id} was requested for {recorded_quantity} shares, not {}; check the id, \
+                 or resume it with quantity {recorded_quantity}",
+                quantity.inner()
+            )));
+        }
         if let Some(ended) = ended_mint(&recorded) {
             return Err(conflict(format!(
                 "mint {id} has already {ended}; there is nothing to resume"
@@ -701,7 +751,7 @@ async fn resume_equity_mint(
             )));
         }
 
-        let quantity = FractionalShares::new(recorded.quantity());
+        let quantity = recorded_quantity;
         info!(%id, %symbol, %chain, %quantity, "Equity mint resume started via API");
         let response = TransferEquityResponse {
             transfer_id: id.to_string(),
@@ -1778,60 +1828,116 @@ async fn run_wrapper_operation(
         );
 
         let confirm = async move {
-            let wait = async {
-                loop {
-                    let confirmed = match operation {
-                        WrapperOperation::Wrap => wrapper
-                            .confirm_wrap(wrapped_token, tx)
-                            .await
-                            .map(|confirmation| confirmation.shares),
-                        WrapperOperation::Unwrap => wrapper
-                            .confirm_unwrap(wrapped_token, tx)
-                            .await
-                            .map(|confirmation| confirmation.assets),
-                    };
-                    let error = match confirmed {
-                        Ok(received) => {
-                            info!(
-                                route, %chain, %symbol, %amount, %received, %tx,
-                                "Equity wallet operation confirmed via API"
-                            );
-                            return;
-                        }
-                        Err(error) => error,
-                    };
-                    let mined = mined_or_unknown(&wallet, route, chain, tx).await;
-                    match wrapper_tx_fate(&error, mined.as_ref(), required_confirmations) {
-                        TxFate::Confirmed => {
-                            info!(
-                                route, %chain, %symbol, %amount, %tx, ?error,
-                                "Equity wallet operation confirmed via API"
-                            );
-                            return;
-                        }
-                        TxFate::Failed => {
-                            error!(
-                                route, %chain, %symbol, %amount, %tx, ?error,
-                                "Equity wallet operation broadcast via API did not confirm"
-                            );
-                            return;
-                        }
-                        TxFate::Unknown => {
-                            warn!(
-                                route, %chain, %symbol, %amount, %tx, ?error,
-                                "Equity wallet operation broadcast via API is not confirmed yet; \
-                                 keeping its lock and waiting again"
-                            );
-                            tokio::time::sleep(CONFIRM_RETRY_DELAY).await;
-                        }
-                    }
-                }
-            };
+            let wait = confirm_wrapper_tx(
+                &wrapper,
+                operation,
+                wrapped_token,
+                amount,
+                PendingEquityTx {
+                    wallet: &wallet,
+                    chain,
+                    symbol: &symbol,
+                    tx,
+                    required_confirmations,
+                },
+            );
             hold_until_proven(claim, route, &symbol, tx, wait).await;
         };
         Ok::<_, OpsError>((tx, confirm))
     })
     .await
+}
+
+/// One tx the bot sent for an operator while holding a symbol's claim, as a
+/// confirmation loop needs it.
+#[derive(Clone, Copy)]
+struct PendingEquityTx<'pending> {
+    wallet: &'pending Arc<dyn Wallet<Provider = RootProvider>>,
+    chain: Chain,
+    symbol: &'pending Symbol,
+    tx: TxHash,
+    required_confirmations: u64,
+}
+
+/// What a wrap or unwrap confirmation proved.
+enum WrapperFate {
+    /// Confirmed, with what the wallet received: wrapped shares for a wrap,
+    /// underlying for an unwrap.
+    Received(U256),
+    /// The tx's receipt proves it succeeded, but the wrapper could not read
+    /// what it paid out.
+    ConfirmedUnaccounted,
+    Failed,
+}
+
+/// Awaits a wrap or unwrap tx's confirmation through `Wrapper::confirm_wrap`
+/// or `Wrapper::confirm_unwrap`, waits again while its fate is unknown, and
+/// logs what the wallet received. The caller holds the symbol's claim, so a
+/// fate that stays unknown alerts once ([`UnprovenEquityTx`]).
+async fn confirm_wrapper_tx(
+    wrapper: &impl Wrapper,
+    operation: WrapperOperation,
+    wrapped_token: Address,
+    amount: U256,
+    pending: PendingEquityTx<'_>,
+) -> WrapperFate {
+    let PendingEquityTx {
+        wallet,
+        chain,
+        symbol,
+        tx,
+        required_confirmations,
+    } = pending;
+    let route = operation.route();
+    let mut unproven = UnprovenEquityTx::new(tokio::time::Instant::now());
+    loop {
+        let confirmed = match operation {
+            WrapperOperation::Wrap => wrapper
+                .confirm_wrap(wrapped_token, tx)
+                .await
+                .map(|confirmation| confirmation.shares),
+            WrapperOperation::Unwrap => wrapper
+                .confirm_unwrap(wrapped_token, tx)
+                .await
+                .map(|confirmation| confirmation.assets),
+        };
+        let error = match confirmed {
+            Ok(received) => {
+                info!(
+                    route, %chain, %symbol, %amount, %received, %tx,
+                    "Equity wallet operation confirmed via API"
+                );
+                return WrapperFate::Received(received);
+            }
+            Err(error) => error,
+        };
+        let mined = mined_or_unknown(wallet, route, chain, tx).await;
+        match wrapper_tx_fate(&error, mined.as_ref(), required_confirmations) {
+            TxFate::Confirmed => {
+                info!(
+                    route, %chain, %symbol, %amount, %tx, ?error,
+                    "Equity wallet operation confirmed via API"
+                );
+                return WrapperFate::ConfirmedUnaccounted;
+            }
+            TxFate::Failed => {
+                error!(
+                    route, %chain, %symbol, %amount, %tx, ?error,
+                    "Equity wallet operation broadcast via API did not confirm"
+                );
+                return WrapperFate::Failed;
+            }
+            TxFate::Unknown => {
+                warn!(
+                    route, %chain, %symbol, %amount, %tx, ?error,
+                    "Equity wallet operation broadcast via API is not confirmed yet; keeping \
+                     its lock and waiting again"
+                );
+                unproven.observe(tokio::time::Instant::now(), route, chain, symbol, tx);
+                tokio::time::sleep(CONFIRM_RETRY_DELAY).await;
+            }
+        }
+    }
 }
 
 /// A refused wrap or unwrap send. An unwrap above the wrapper's `maxRedeem`
@@ -1896,10 +2002,7 @@ pub(super) async fn redeem(
     } = request;
     let (symbol, quantity, amount) = equity_wallet_input(&symbol, &quantity)?;
     let (trading, wallet) = equity_chain_signer(&state, chain, &symbol)?;
-    let redemption_wallet = state
-        .ctx
-        .redemption_wallet(chain)
-        .map_err(|error| unprocessable(format!("{error}; configure it for {chain}")))?;
+    let redemption_wallet = configured_redemption_wallet(&state, chain)?;
     require_startup_complete(&state, "redeem")?;
     let handle = state.recovery.get().ok_or_else(recovery_not_ready)?;
     let rebalancing = Arc::clone(&handle.rebalancing_service);
@@ -1911,24 +2014,7 @@ pub(super) async fn redeem(
         Arc::clone(&wallet),
         to_wrapped_equities(&trading.assets.equities.symbols),
     );
-    let BrokerCtx::AlpacaBrokerApi(alpaca) = &state.ctx.broker;
-    let tokenizer: RedemptionTokenizer = AlpacaTokenizationService::new(
-        alpaca.base_url().to_string(),
-        alpaca.account_id,
-        alpaca.auth.clone(),
-        Arc::clone(&wallet),
-        chain,
-        Some(redemption_wallet),
-    )
-    .map_err(|error| {
-        error!(%chain, ?error, "Capital route refused: the Alpaca tokenization client failed to build");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "The bot could not build its Alpaca tokenization client".to_string(),
-            }),
-        )
-    })?;
+    let tokenizer = redemption_tokenizer(&state, chain, &wallet, redemption_wallet)?;
     let task_symbol = symbol.clone();
 
     let (token, transfer_tx) = answer_from_detached(
@@ -1991,6 +2077,276 @@ pub(super) async fn redeem(
     }))
 }
 
+/// Drains `quantity` wrapped shares of `symbol` from a paused chain into
+/// Alpaca in one run: withdraws them from the vault to the bot's wallet,
+/// unwraps them, and sends the underlying the unwrap paid out to the chain's
+/// configured Alpaca redemption wallet, which Alpaca redeems into the account.
+///
+/// The three steps run under one claim of the symbol (its lock and the bot's
+/// equity transfer guard), held from before the withdrawal until the
+/// redemption transfer's fate is proven. Separately, `vault-withdraw`,
+/// `unwrap-equity` and `redeem` free the guard between steps, and the bot's
+/// wallet recovery, which waits while the guard is held, could deposit the
+/// shares back into the vault before the next step. The drain also holds the
+/// vault withdraw lock until its withdrawal's fate is proven, like
+/// `vault-withdraw`.
+///
+/// The token checks come before anything moves: the wrapped token is the
+/// listing's own, and its wrapper must attest the configured underlying. The
+/// route answers at the withdrawal's broadcast; the rest runs on the detached
+/// task, each step after the previous one is proven. A step that fails stops
+/// the drain where it is and logs where the shares are; once the claim is
+/// freed the bot's wallet recovery may deposit them back. The redemption
+/// transfer is sent once and never retried, like `redeem`, and redeems what
+/// the unwrap paid out; when the unwrap's receipt proves success but its
+/// payout cannot be read, the drain stops before the transfer.
+pub(super) async fn drain_equity(
+    State(state): State<AppState>,
+    Audited(request): Audited<DrainEquityRequest>,
+) -> Result<Json<DrainEquityResponse>, OpsError> {
+    const ROUTE: &str = "drain-equity";
+    let DrainEquityRequest {
+        symbol,
+        quantity,
+        chain,
+        vault_id,
+    } = request;
+    let (symbol, quantity, amount) = equity_wallet_input(&symbol, &quantity)?;
+    let (trading, wallet) = equity_chain_signer(&state, chain, &symbol)?;
+    let redemption_wallet = configured_redemption_wallet(&state, chain)?;
+    require_startup_complete(&state, ROUTE)?;
+    let handle = state.recovery.get().ok_or_else(recovery_not_ready)?;
+    let rebalancing = Arc::clone(&handle.rebalancing_service);
+    let locks = Arc::clone(&state.equity_wallet_locks);
+    let withdraw_lock = Arc::clone(&state.vault_withdraw_lock);
+    // Checked under the claim, with the balance read.
+    let gas = equity_gas_readiness(&state, chain, &wallet);
+    let required_confirmations = trading.required_confirmations;
+    let owner = wallet.address();
+    let wrapper = WrapperService::new(
+        Arc::clone(&wallet),
+        to_wrapped_equities(&trading.assets.equities.symbols),
+    );
+    let wrapped_token = wrapper
+        .lookup_derivative(&symbol)
+        .map_err(|error| unprocessable(error.to_string()))?;
+    let raindex = RaindexService::new(
+        Arc::clone(&wallet),
+        crate::onchain::raindex_contracts(trading),
+        owner,
+    );
+    let tokenizer = redemption_tokenizer(&state, chain, &wallet, redemption_wallet)?;
+    let task_symbol = symbol.clone();
+
+    let withdraw_tx = answer_from_detached(&state.detached_tasks, ROUTE, symbol.clone(), async move {
+        let symbol = task_symbol;
+        let claim = claim_equity_wallet(&locks, &rebalancing, &symbol, chain, ROUTE)?;
+        let withdraw_guard = withdraw_lock.try_lock_owned().map_err(|_| {
+            warn!(%chain, %symbol, "Drain refused: another vault withdrawal holds the withdraw lock");
+            conflict(
+                "Another vault withdrawal is in progress or its outcome is unknown; check the \
+                 bot logs for it before retrying"
+                    .to_string(),
+            )
+        })?;
+        ensure_equity_gas(&*gas?, ROUTE, chain).await?;
+        let token = wrapper
+            .attest_underlying(&symbol)
+            .await
+            .map_err(|error| match error {
+                WrapperError::VaultAssetMismatch { .. } => {
+                    warn!(%chain, %symbol, %error, "Drain refused before its withdrawal");
+                    unprocessable(format!("{ROUTE} refused: {error}"))
+                }
+                other => onchain_failure(ROUTE, chain, &other),
+            })?;
+        let decimals = wallet
+            .call::<OpenChainErrorRegistry, _>(wrapped_token, IERC20::decimalsCall {})
+            .await
+            .map_err(|error| onchain_failure(ROUTE, chain, &error))?;
+        if decimals != 18 {
+            error!(%chain, %symbol, %wrapped_token, decimals, "Drain refused: the wrapped token is not 18 decimals");
+            return Err(onchain_failure(
+                ROUTE,
+                chain,
+                &format!("wrapped token {wrapped_token} has {decimals} decimals, not 18"),
+            ));
+        }
+
+        let withdraw_tx = raindex
+            .submit_withdraw(wrapped_token, RaindexVaultId(vault_id), amount, decimals)
+            .await
+            .map_err(|error| onchain_failure(ROUTE, chain, &error))?;
+        info!(
+            %chain, %symbol, %wrapped_token, %vault_id, %amount, %withdraw_tx,
+            "Drain vault withdrawal broadcast via API"
+        );
+
+        let rest = async move {
+            let drained = async {
+                let withdrawn = confirm_vault_tx(
+                    &raindex,
+                    VaultTx {
+                        route: ROUTE,
+                        chain,
+                        token: wrapped_token,
+                        vault_id,
+                        amount_raw: amount,
+                        tx: withdraw_tx,
+                        required_confirmations,
+                    },
+                    Some(&symbol),
+                )
+                .await;
+                drop(withdraw_guard);
+                if !withdrawn {
+                    error!(
+                        %chain, %symbol, %withdraw_tx,
+                        "Drain stopped: its vault withdrawal did not confirm, so the shares are \
+                         still in the vault"
+                    );
+                    return None;
+                }
+
+                let unwrap_tx = match wrapper
+                    .submit_unwrap(wrapped_token, amount, owner, owner)
+                    .await
+                {
+                    Ok(unwrap_tx) => unwrap_tx,
+                    Err(error) => {
+                        error!(
+                            %chain, %symbol, %withdraw_tx, ?error,
+                            "Drain stopped after its vault withdrawal: the unwrap was not sent, \
+                             so the wrapped shares are in the bot's wallet. Check the chain for \
+                             an unwrap before running capital unwrap-equity"
+                        );
+                        return None;
+                    }
+                };
+                info!(%chain, %symbol, %amount, %unwrap_tx, "Drain unwrap broadcast via API");
+                let pending = |tx| PendingEquityTx {
+                    wallet: &wallet,
+                    chain,
+                    symbol: &symbol,
+                    tx,
+                    required_confirmations,
+                };
+                let underlying = match confirm_wrapper_tx(
+                    &wrapper,
+                    WrapperOperation::Unwrap,
+                    wrapped_token,
+                    amount,
+                    pending(unwrap_tx),
+                )
+                .await
+                {
+                    WrapperFate::Received(underlying) => underlying,
+                    WrapperFate::ConfirmedUnaccounted => {
+                        error!(
+                            %chain, %symbol, %unwrap_tx,
+                            "Drain stopped after its unwrap: the unwrap confirmed but its payout \
+                             cannot be read, so nothing was sent to Alpaca. Read the underlying \
+                             balance onchain and run capital redeem for it"
+                        );
+                        return None;
+                    }
+                    WrapperFate::Failed => {
+                        error!(
+                            %chain, %symbol, %unwrap_tx,
+                            "Drain stopped: its unwrap did not confirm, so the wrapped shares \
+                             are in the bot's wallet"
+                        );
+                        return None;
+                    }
+                };
+
+                // Sent exactly once: the transfer carries no idempotency key,
+                // so a retry could send the shares twice (RAI-1494).
+                let transfer_tx = match tokenizer.submit_redemption_send(token, underlying).await {
+                    Ok(transfer_tx) => transfer_tx,
+                    Err(error) => {
+                        error!(
+                            %chain, %symbol, %unwrap_tx, %underlying, ?error,
+                            "Drain stopped after its unwrap: the redemption transfer failed to \
+                             send, so the underlying is in the bot's wallet. Check the chain for \
+                             a transfer before running capital redeem"
+                        );
+                        return None;
+                    }
+                };
+                info!(
+                    %chain, %symbol, %token, %redemption_wallet, %underlying, %transfer_tx,
+                    "Drain redemption transfer broadcast via API"
+                );
+                confirm_redemption_transfer(
+                    &tokenizer,
+                    &wallet,
+                    &symbol,
+                    chain,
+                    transfer_tx,
+                    required_confirmations,
+                )
+                .await
+                .then_some(transfer_tx)
+            };
+            if let Some(transfer_tx) =
+                hold_until_proven(claim, ROUTE, &symbol, withdraw_tx, drained).await
+            {
+                follow_alpaca_redemption(&tokenizer, &symbol, chain, transfer_tx).await;
+            }
+        };
+        Ok::<_, OpsError>((withdraw_tx, rest))
+    })
+    .await?;
+
+    Ok(Json(DrainEquityResponse {
+        chain,
+        symbol: symbol.to_string(),
+        quantity: quantity.inner().to_string(),
+        vault_id,
+        redemption_wallet,
+        withdraw_tx,
+    }))
+}
+
+/// The chain's configured Alpaca redemption wallet, never one a request
+/// names: a wallet chosen by the caller would let anyone in the capital group
+/// send the bot's shares out of our accounts.
+fn configured_redemption_wallet(state: &AppState, chain: Chain) -> Result<Address, OpsError> {
+    state
+        .ctx
+        .redemption_wallet(chain)
+        .map_err(|error| unprocessable(format!("{error}; configure it for {chain}")))
+}
+
+/// The tokenization client a redemption sends and polls through, built from
+/// the bot's broker ctx and signer as the conductor builds its own.
+fn redemption_tokenizer(
+    state: &AppState,
+    chain: Chain,
+    wallet: &Arc<dyn Wallet<Provider = RootProvider>>,
+    redemption_wallet: Address,
+) -> Result<RedemptionTokenizer, OpsError> {
+    let BrokerCtx::AlpacaBrokerApi(alpaca) = &state.ctx.broker;
+    AlpacaTokenizationService::new(
+        alpaca.base_url().to_string(),
+        alpaca.account_id,
+        alpaca.auth.clone(),
+        Arc::clone(wallet),
+        chain,
+        Some(redemption_wallet),
+    )
+    .map_err(|error| {
+        error!(%chain, ?error, "Capital route refused: the Alpaca tokenization client failed to build");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "The bot could not build its Alpaca tokenization client".to_string(),
+            }),
+        )
+    })
+}
+
 /// Awaits the redemption transfer's confirmation like the wrap routes, and
 /// returns whether it moved the shares: `false` once it reverted, which moves
 /// none.
@@ -2002,6 +2358,7 @@ async fn confirm_redemption_transfer(
     transfer_tx: TxHash,
     required_confirmations: u64,
 ) -> bool {
+    let mut unproven = UnprovenEquityTx::new(tokio::time::Instant::now());
     loop {
         let error = match tokenizer.confirm_redemption_send(transfer_tx).await {
             Ok(RedemptionSendReceipt::Succeeded) => {
@@ -2038,6 +2395,13 @@ async fn confirm_redemption_transfer(
                     %chain, %symbol, %transfer_tx, ?error,
                     "Redemption transfer sent via API is not confirmed yet; keeping its lock \
                      and waiting again"
+                );
+                unproven.observe(
+                    tokio::time::Instant::now(),
+                    "redeem",
+                    chain,
+                    symbol,
+                    transfer_tx,
                 );
                 tokio::time::sleep(CONFIRM_RETRY_DELAY).await;
             }
@@ -2518,8 +2882,61 @@ struct VaultOutcome {
 /// never blocks exit.
 #[cfg(not(test))]
 const CONFIRM_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[cfg(test)]
 const CONFIRM_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// How long an operator equity wallet tx (a wrap, an unwrap, a redeem, or a
+/// drain's vault withdrawal) may stay unproven before the bot
+/// alerts. Its claim holds the bot's equity transfer guard for the symbol,
+/// so meanwhile rebalancing of that symbol is blocked on every chain.
+const EQUITY_TX_UNPROVEN_ALERT_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Watches an operator equity wallet tx whose fate the confirmation loop
+/// cannot prove yet, and raises one operational alert once it has stayed
+/// unproven past [`EQUITY_TX_UNPROVEN_ALERT_AFTER`]. A tx that never gets a
+/// readable receipt (dropped from the mempool, lost by the node) would
+/// otherwise block the symbol's rebalancing silently until a restart.
+struct UnprovenEquityTx {
+    since: tokio::time::Instant,
+    alerted: bool,
+}
+
+impl UnprovenEquityTx {
+    const fn new(since: tokio::time::Instant) -> Self {
+        Self {
+            since,
+            alerted: false,
+        }
+    }
+
+    /// Records one more unproven round at `now`; alerts the first time the
+    /// wait passes the bound and returns whether it alerted.
+    fn observe(
+        &mut self,
+        now: tokio::time::Instant,
+        route: &'static str,
+        chain: Chain,
+        symbol: &Symbol,
+        tx: TxHash,
+    ) -> bool {
+        let waited = now.saturating_duration_since(self.since);
+        if self.alerted || waited < EQUITY_TX_UNPROVEN_ALERT_AFTER {
+            return false;
+        }
+        self.alerted = true;
+        error!(
+            target: "operational_alert",
+            alert = true,
+            kind = AlertKind::CapitalEquityTxUnproven.as_str(),
+            route, %chain, %symbol, %tx, waited_secs = waited.as_secs(),
+            "An operator equity wallet tx is still unproven; rebalancing of the symbol is \
+             blocked on every chain until its fate is known or the bot restarts. Check the tx \
+             onchain"
+        );
+        true
+    }
+}
 
 /// What the confirmation attempt of a tx a capital route sent proved.
 #[derive(Debug, PartialEq, Eq)]
@@ -2717,59 +3134,25 @@ async fn run_vault_operation(
         info!(route, %chain, %token, %vault_id, %amount_raw, %tx, "Vault operation broadcast via API");
 
         let confirm = async move {
-            let wait = async {
-                loop {
-                    let error = match raindex.confirm_tx(tx).await {
-                        Ok(()) => {
-                            info!(
-                                route, %chain, %token, %vault_id, %amount_raw, %tx,
-                                "Vault operation confirmed via API"
-                            );
-                            return;
-                        }
-                        Err(error) => error,
-                    };
-                    // The tx's own receipt decides when the error does not:
-                    // a revert whose replay cannot be decoded still mined.
-                    let mined = raindex.mined_tx(tx).await.unwrap_or_else(|read_error| {
-                        warn!(route, %chain, %tx, ?read_error, "Could not read the vault tx's receipt");
-                        None
-                    });
-                    match vault_tx_fate(&error, mined.as_ref(), required_confirmations) {
-                        TxFate::Confirmed => {
-                            info!(
-                                route, %chain, %token, %vault_id, %amount_raw, %tx, ?error,
-                                "Vault operation confirmed via API"
-                            );
-                            return;
-                        }
-                        TxFate::Failed => {
-                            error!(
-                                route, %chain, %token, %vault_id, %amount_raw, %tx, ?error,
-                                "Vault operation broadcast via API did not confirm"
-                            );
-                            return;
-                        }
-                        // A receipt timeout, a drop report, or an RPC failure
-                        // proves nothing: the tx can still land, and releasing
-                        // the lock would let a rerun send a second one.
-                        TxFate::Unknown => {
-                            warn!(
-                                route, %chain, %token, %vault_id, %amount_raw, %tx, ?error,
-                                "Vault operation broadcast via API is not confirmed yet; keeping \
-                                 its lock and waiting again"
-                            );
-                            tokio::time::sleep(CONFIRM_RETRY_DELAY).await;
-                        }
-                    }
-                }
-            };
+            let wait = confirm_vault_tx(
+                &raindex,
+                VaultTx {
+                    route,
+                    chain,
+                    token,
+                    vault_id,
+                    amount_raw,
+                    tx,
+                    required_confirmations,
+                },
+                None,
+            );
             // A panic would unwind through the guard and free the lock while
             // the tx's fate is unknown, so it is caught here, the guard is
             // kept until a restart, and the panic resumes for the watcher's
             // join failure log.
             match std::panic::AssertUnwindSafe(wait).catch_unwind().await {
-                Ok(()) => drop(vault_guard),
+                Ok(_confirmed) => drop(vault_guard),
                 Err(panic) => {
                     error!(
                         route, %chain, %token, %vault_id, %amount_raw, %tx,
@@ -2789,6 +3172,90 @@ async fn run_vault_operation(
         Ok::<_, OpsError>((outcome, confirm))
     })
     .await
+}
+
+/// A vault tx a capital route sent, as its confirmation loop needs it.
+#[derive(Clone, Copy)]
+struct VaultTx {
+    route: &'static str,
+    chain: Chain,
+    token: Address,
+    vault_id: B256,
+    amount_raw: U256,
+    tx: TxHash,
+    required_confirmations: u64,
+}
+
+/// Awaits a vault tx's confirmation through `Raindex::confirm_tx`, as the USDC
+/// transfer worker does after its own submit, and returns whether it
+/// confirmed. Its own receipt decides when the error does not, and the loop
+/// waits again while the fate is unknown: the tx can still land, and giving up
+/// would free a lock a rerun needs to stay held. When the wait holds `held`'s
+/// equity transfer guard, a fate that stays unknown alerts once
+/// ([`UnprovenEquityTx`]).
+async fn confirm_vault_tx(
+    raindex: &impl Raindex,
+    vault_tx: VaultTx,
+    held: Option<&Symbol>,
+) -> bool {
+    let VaultTx {
+        route,
+        chain,
+        token,
+        vault_id,
+        amount_raw,
+        tx,
+        required_confirmations,
+    } = vault_tx;
+    let mut unproven = UnprovenEquityTx::new(tokio::time::Instant::now());
+    loop {
+        let error = match raindex.confirm_tx(tx).await {
+            Ok(()) => {
+                info!(
+                    route, %chain, %token, %vault_id, %amount_raw, %tx,
+                    "Vault operation confirmed via API"
+                );
+                return true;
+            }
+            Err(error) => error,
+        };
+        // The tx's own receipt decides when the error does not: a revert
+        // whose replay cannot be decoded still mined.
+        let mined = raindex.mined_tx(tx).await.unwrap_or_else(|read_error| {
+            warn!(route, %chain, %tx, ?read_error, "Could not read the vault tx's receipt");
+            None
+        });
+        match vault_tx_fate(&error, mined.as_ref(), required_confirmations) {
+            TxFate::Confirmed => {
+                info!(
+                    route, %chain, %token, %vault_id, %amount_raw, %tx, ?error,
+                    "Vault operation confirmed via API"
+                );
+                return true;
+            }
+            TxFate::Failed => {
+                error!(
+                    route, %chain, %token, %vault_id, %amount_raw, %tx, ?error,
+                    "Vault operation broadcast via API did not confirm"
+                );
+                return false;
+            }
+            // A receipt timeout, a drop report, or an RPC failure proves
+            // nothing: the tx can still land, and releasing the lock would let
+            // a rerun send a second one.
+            TxFate::Unknown => {
+                warn!(
+                    route, %chain, %token, %vault_id, %amount_raw, %tx, ?error,
+                    "Vault operation broadcast via API is not confirmed yet; keeping its lock \
+                     and waiting again"
+                );
+                if let Some(symbol) = held {
+                    unproven.observe(tokio::time::Instant::now(), route, chain, symbol, tx);
+                }
+                tokio::time::sleep(CONFIRM_RETRY_DELAY).await;
+            }
+        }
+    }
 }
 
 /// Records an onchain failure inside a capital route's detached task, where
@@ -2828,6 +3295,53 @@ mod tests {
             emitted_logs: succeeded,
             confirmations,
         }
+    }
+
+    /// An operator equity wallet tx that stays unproven pages once, only after
+    /// the bound, with the symbol, the chain and the tx, so a dropped tx that
+    /// blocks the symbol's rebalancing is never silent and never repeats.
+    #[tracing_test::traced_test]
+    #[test]
+    fn an_unproven_equity_wallet_tx_alerts_once_past_the_bound() {
+        let since = tokio::time::Instant::now();
+        let mut unproven = UnprovenEquityTx::new(since);
+        let symbol = Symbol::new("AAPL").unwrap();
+        let tx = TxHash::repeat_byte(0x42);
+        let observe = |unproven: &mut UnprovenEquityTx, after: std::time::Duration| {
+            unproven.observe(since + after, "unwrap-equity", Chain::Base, &symbol, tx)
+        };
+
+        assert!(!observe(&mut unproven, CONFIRM_RETRY_DELAY));
+        assert!(!observe(
+            &mut unproven,
+            EQUITY_TX_UNPROVEN_ALERT_AFTER.saturating_sub(std::time::Duration::from_secs(1))
+        ));
+        assert!(!logs_contain("still unproven"));
+
+        assert!(observe(&mut unproven, EQUITY_TX_UNPROVEN_ALERT_AFTER));
+        assert!(!observe(
+            &mut unproven,
+            EQUITY_TX_UNPROVEN_ALERT_AFTER + CONFIRM_RETRY_DELAY
+        ));
+        logs_assert(|lines: &[&str]| {
+            let alerts: Vec<_> = lines
+                .iter()
+                .filter(|line| line.contains("An operator equity wallet tx is still unproven"))
+                .collect();
+            match alerts.as_slice() {
+                [line]
+                    if line.contains("operational_alert")
+                        && line.contains("AAPL")
+                        && line.contains("base")
+                        && line.contains(&tx.to_string()) =>
+                {
+                    Ok(())
+                }
+                other => Err(format!(
+                    "expected one alert naming AAPL, base and the tx: {other:?}"
+                )),
+            }
+        });
     }
 
     /// The audit record names what a body-only capital route acted on, from

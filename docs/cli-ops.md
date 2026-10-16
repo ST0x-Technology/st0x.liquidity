@@ -368,6 +368,9 @@ st0x-liquidity-client --env <env> capital unwrap-equity --symbol <symbol> --quan
 # sends underlying shares to Alpaca's redemption wallet for Alpaca to redeem;
 # prints the transfer tx, then the bot follows the redemption in its logs
 st0x-liquidity-client --env <env> capital redeem --symbol <symbol> --quantity <shares> [--network <chain>]
+# drains a paused listing in one run: vault withdraw, unwrap, then redeem;
+# prints the withdrawal tx, then the bot logs each later step
+st0x-liquidity-client --env <env> capital drain-equity --symbol <symbol> --quantity <wrapped-shares> --vault-id <vault-id> [--network <chain>]
 # burns only and prints the burn tx and its status; it prints its operation id
 # to stderr first: rerun with --operation-id <id> to report that same burn
 st0x-liquidity-client --env <env> capital cctp-bridge --from <ethereum|base> --amount <amount> [--operation-id <id>]
@@ -430,15 +433,20 @@ the symbol alongside the first.
 
 `capital transfer-equity --issuer-request-id <id>` resumes a mint that was
 already started, for example one `st0x-cli transfer-equity` started before the
-cutover and printed the id of. Pass `--direction to-raindex` and the symbol and
-`--network` the mint was started with. It never starts a new mint, so it cannot
-mint twice: it answers `400` with `to-alpaca`, `404` when no mint has that id,
-`422` naming the recorded chain and symbol when they differ from the request,
-and `409` when the mint has already ended, while another verb holds the recovery
-lock, or while a bot job or the wrapped or unwrapped equity recovery already
-drives that mint. Otherwise it answers with that id as `transferId`, the
-recorded quantity, and `outcome` `resumed`, and the mint continues on the bot's
-equity transfer workers; follow it with `read transfer-events mint <id>`.
+cutover and printed the id of. Pass `--direction to-raindex` and the symbol,
+quantity and `--network` the mint was started with. It never starts a new mint,
+so it cannot mint twice: it answers `400` with `to-alpaca`, `404` when no mint
+has that id, `422` naming the recorded chain, symbol or quantity when one
+differs from the request, and `409` when the mint has already ended, while
+another verb holds the recovery lock, or while a bot job or the wrapped or
+unwrapped equity recovery already drives that mint. Otherwise it answers with
+that id as `transferId`, the recorded quantity, and `outcome` `resumed`, and the
+mint continues on the bot's equity transfer workers; follow it with
+`read transfer-events mint <id>`. A bot released before mint resume ignores the
+id and starts a new mint of the given quantity; the client then prints a
+warning, since the answer is not `resumed` for that id. Do not rerun: check the
+new transfer with `read transfer-events mint <transferId>` and fail it with
+`debug fail-equity-transfer` if it must not run.
 
 A bot release from before operation ids ignores the id and burns on every call,
 so the bot ships before this client: after deploy, and after a rollback of the
@@ -572,22 +580,42 @@ logs each step; the answer never waits for either. The send is never retried, so
 a `redeem` that answered `500` may still have sent its tokens: check the wallet
 onchain and the redemption in Alpaca before rerunning.
 
-`wrap-equity`, `unwrap-equity` and `redeem` refuse a malformed body, or a
-quantity that is not a positive decimal or is finer than 18 decimals, with
-`400`. They answer `503` until the bot finishes starting and while the chain's
-signing wallet cannot be shown to pay gas, and `500` when the chain has no
-wallet, signer or gas threshold configured. They answer `422` for a chain
+`capital drain-equity` takes `--quantity` wrapped shares of `--symbol` out of
+the listing's vault `--vault-id` on `--network`, unwraps them, and sends the
+underlying the unwrap paid out to the chain's configured redemption wallet,
+which Alpaca redeems into the broker account. It holds one claim of the symbol
+for the whole run, from before the withdrawal until the redemption transfer is
+proven, so the bot's wallet recovery cannot put the shares back into the vault
+between steps, which it can between separate `vault-withdraw`, `unwrap-equity`
+and `redeem` runs. It also holds the vault withdraw lock until the withdrawal is
+proven. It prints the chain, symbol, quantity, `vaultId`, `redemptionWallet` and
+the `withdrawTx` as soon as the withdrawal is broadcast; the bot logs the
+unwrap, the transfer and Alpaca's redemption as each happens. A step that fails
+stops the drain and the log names where the shares are; once the claim is freed,
+the bot's wallet recovery may deposit them back into the vault, and a new
+`drain-equity` can start over. The transfer is never retried. When the unwrap
+confirms but its payout cannot be read, the drain stops before the transfer;
+read the underlying balance onchain and run `capital redeem` for it.
+
+`wrap-equity`, `unwrap-equity`, `redeem` and `drain-equity` refuse a malformed
+body, or a quantity that is not a positive decimal or is finer than 18 decimals,
+with `400`. They answer `503` until the bot finishes starting and while the
+chain's signing wallet cannot be shown to pay gas, and `500` when the chain has
+no wallet, signer or gas threshold configured. They answer `422` for a chain
 without a `[chains.<name>.trading]` table or a symbol that table does not list,
 for a wrapper whose `asset()` differs from the configured underlying, for an
 `unwrap-equity` above the wrapper's `maxRedeem`, and for a `redeem` on a chain
-with no configured `redemption_wallet`. The three share one lock per symbol,
-taken before the first balance read and held until the bot logs the outcome of
-the tx: while it is held, another `wrap-equity`, `unwrap-equity` or `redeem` of
-that symbol answers `409`. They also answer `409` while the bot's own equity
-transfer of the symbol holds its guard, so they cannot move the wallet's shares
-from under a mint or redemption the bot is running. They do not take the
-recovery lock. A verb that answered `500` holds no lock. The lock lives in
-memory, so after a bot restart check the wallet onchain before rerunning.
+with no configured `redemption_wallet` (`redeem` and `drain-equity`). The four
+share one lock per symbol, taken before the first balance read and held until
+the bot logs the outcome of the last tx: while it is held, another
+`wrap-equity`, `unwrap-equity`, `redeem` or `drain-equity` of that symbol
+answers `409`. An unproven tx that holds the lock for more than 10 minutes
+raises an operational alert naming the symbol, the chain and the tx, since the
+bot cannot rebalance the symbol meanwhile. They also answer `409` while the
+bot's own equity transfer of the symbol holds its guard, so they cannot move the
+wallet's shares from under a mint or redemption the bot is running. They do not
+take the recovery lock. A verb that answered `500` holds no lock. The lock lives
+in memory, so after a bot restart check the wallet onchain before rerunning.
 
 A request that times out on the client may still complete in the bot; check the
 bot logs and the chain for the transaction before retrying a vault or allowance
@@ -644,17 +672,15 @@ while its work is still open refuses startup.
    steps as step 1.
 
 Pausing does not move the listing's equity off the chain. To move it first,
-while the listing is paused, run with `--network <chain>`:
-`capital vault-withdraw` of the wrapped shares from the listing's vault,
-`capital unwrap-equity` of that same quantity of wrapped shares, then
-`capital redeem` of the underlying quantity the unwrap released (read it from
-the wallet's balance of the underlying token onchain). The vault holds the
-wrapped derivative, so redeeming without the unwrap sends the wrong token. Run
-each step only after the bot logs that the previous step's tx confirmed. The
-chain still counts in the planner's total while paused. If the on-chain equity
-vault read of any listing in that total is stale or missing, the planner starts
-no new rebalancing for the symbol on any chain until the read is fresh again or
-that listing is `disabled`.
+while the listing is paused, run `capital drain-equity --network <chain>` with
+the wrapped quantity and the listing's vault id (see the capital verbs above).
+Do not drain with separate `capital vault-withdraw`, `capital unwrap-equity` and
+`capital redeem` runs: between them the wallet holds the shares with no claim,
+and the bot's wallet recovery deposits them back into the vault. The chain still
+counts in the planner's total while paused. If the on-chain equity vault read of
+any listing in that total is stale or missing, the planner starts no new
+rebalancing for the symbol on any chain until the read is fresh again or that
+listing is `disabled`.
 
 Before you publish `paused`, the running bot must read it, and the registry
 validator (`t0/check.jq`) must accept it. On rollback, restore the token value
