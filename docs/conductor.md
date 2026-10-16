@@ -850,8 +850,20 @@ restart and process the next job with stale state.
 ### AccountForDexTrade
 
 Defined in `src/trading/onchain/trade_accountant.rs`. Serializable wrapper
-around `EmittedOnChain<RaindexTradeEvent>`, pushed into
-`DexTradeAccountingJobQueue` by `OrderFillMonitor`.
+around `EmittedOnChain<RaindexTradeEvent>`, pushed by the backfill worker into
+the fill's chain's queue. Each hedged chain has its own namespaced queue
+(`Jobs.job_type` = `{type_name}@{chain}`, see `DexTradeAccountingQueues`) and
+its own single-concurrency worker (`order-fill-worker-{chain}-{index}`), so a
+slow chain's backlog never delays another chain's hedges. A rate-limit successor
+goes back onto the same chain's queue.
+
+Rows queued before per-chain queues carry the bare type name, which no worker
+reads. At startup, after the apalis tables exist and before any worker spawns,
+`DexTradeAccountingQueues::relabel_legacy_rows` moves every live legacy row onto
+the queue of the chain its payload names (the same serde rule the worker uses,
+so a chainless payload is Base). A live row whose payload does not decode fails
+startup and nothing is relabeled. Terminal rows keep the old label until the
+retention sweep deletes them.
 
 Implements `Job<AccountantCtx<Node, Exec>>`. The `perform()` method runs the
 hedging pipeline:

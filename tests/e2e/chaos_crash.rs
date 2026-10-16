@@ -14,6 +14,7 @@
 
 use std::time::Duration;
 
+use st0x_evm::Chain;
 use st0x_float_macro::float;
 
 use crate::chaos::{ChaosProxy, LatencyProxy};
@@ -447,7 +448,11 @@ async fn crash_mid_accounting_job_recovers_the_fill_after_restart() -> anyhow::R
     poll_for_running_job(
         &mut bot,
         &infra.db_path,
-        std::any::type_name::<st0x_hedge::AccountForDexTrade>(),
+        &format!(
+            "{}@{}",
+            std::any::type_name::<st0x_hedge::AccountForDexTrade>(),
+            Chain::Base
+        ),
         Duration::from_secs(60),
     )
     .await;

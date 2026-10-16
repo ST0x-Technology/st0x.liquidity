@@ -172,7 +172,7 @@ use crate::trading::onchain::skipped_fill::{
     SkipReason, record_skipped_fill, recorded_skip_detail,
 };
 use crate::trading::onchain::trade_accountant::{
-    DexTradeAccountingJobQueue, NormalizedFillEconomicsError, TradeAccountingError,
+    DexTradeAccountingQueues, NormalizedFillEconomicsError, TradeAccountingError,
 };
 use crate::unwrapped_equity_recovery::{
     UnwrappedEquityRecovery, UnwrappedEquityRecoveryId, UnwrappedEquityRecoveryServices,
@@ -259,7 +259,7 @@ async fn setup_apalis_queues(
     chains: &st0x_config::ChainRegistry,
     equity_prices: EquityPriceStore,
 ) -> anyhow::Result<(
-    DexTradeAccountingJobQueue,
+    DexTradeAccountingQueues,
     BackfillQueues,
     DashboardTradeDelivery,
     RebalancingSchedulers,
@@ -277,8 +277,16 @@ async fn setup_apalis_queues(
         );
     }
 
+    let relabeled = DexTradeAccountingQueues::relabel_legacy_rows(apalis_pool).await?;
+    if relabeled > 0 {
+        info!(
+            relabeled,
+            "Moved legacy trade accounting jobs onto their chain's queue"
+        );
+    }
+
     Ok((
-        DexTradeAccountingJobQueue::new(apalis_pool),
+        DexTradeAccountingQueues::new(apalis_pool, chains),
         BackfillQueues::new(apalis_pool, chains),
         DashboardTradeDelivery::new(apalis_pool, pool, event_sender, equity_prices),
         RebalancingSchedulers::new(apalis_pool),
@@ -1099,14 +1107,15 @@ impl Conductor {
         // serializes its broker submission against live hedging (ADR 0014).
         let counter_trade_submission_lock = Arc::new(Mutex::new(()));
 
-        let (job_queue, backfill_queues, dashboard_delivery, schedulers) = setup_apalis_queues(
-            &pool,
-            &apalis_pool,
-            event_sender,
-            &ctx.chains,
-            equity_prices.clone(),
-        )
-        .await?;
+        let (accounting_queues, backfill_queues, dashboard_delivery, schedulers) =
+            setup_apalis_queues(
+                &pool,
+                &apalis_pool,
+                event_sender,
+                &ctx.chains,
+                equity_prices.clone(),
+            )
+            .await?;
 
         let onchain_trade =
             setup_onchain_trade_store(&pool, dashboard_delivery.broadcaster.clone()).await?;
@@ -1267,7 +1276,7 @@ impl Conductor {
         } = setup_trading_job_queues(
             &pool,
             &apalis_pool,
-            &job_queue,
+            &accounting_queues,
             EquityRecoveryInputs {
                 wrapped_store: wrapped_equity_recovery_store,
                 unwrapped_store: unwrapped_equity_recovery_store,
@@ -1338,7 +1347,7 @@ impl Conductor {
         let conductor = builder::spawn()
             .context(conductor_ctx)
             .counter_trade_submission_lock(counter_trade_submission_lock.clone())
-            .job_queue(job_queue)
+            .accounting_queues(accounting_queues)
             .backfill_queues(backfill_queues)
             .dashboard_trade_delivery_queue(dashboard_delivery.queue)
             .dashboard_trade_delivery_ctx(dashboard_delivery.ctx)
@@ -8040,7 +8049,9 @@ mod tests {
     };
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
     use crate::trading::onchain::inclusion::EmittedOnChain;
-    use crate::trading::onchain::trade_accountant::AccountForDexTrade;
+    use crate::trading::onchain::trade_accountant::{
+        AccountForDexTrade, DexTradeAccountingJobQueue,
+    };
     use crate::unwrapped_equity_recovery::aggregate::UnwrappedEquityRecoveryId;
     use crate::unwrapped_equity_recovery::{
         UnwrappedEquityRecoveryJob, UnwrappedEquityRecoveryJobQueue,
@@ -13029,14 +13040,15 @@ mod tests {
     #[tokio::test]
     async fn requeue_trading_orphans_resets_running_accounting_rows() {
         let (_pool, apalis_pool) = setup_test_pools().await;
-        let queue = DexTradeAccountingJobQueue::new(&apalis_pool);
-        let job_type = std::any::type_name::<AccountForDexTrade>();
+        let queue = DexTradeAccountingJobQueue::new_namespaced(&apalis_pool, Chain::Base.as_str());
+        let job_type = format!("{}@base", std::any::type_name::<AccountForDexTrade>());
+        let job_type = job_type.as_str();
 
         // The lock owner must exist: Jobs.lock_by is a foreign key into Workers.
         sqlx_apalis::query(
             "INSERT INTO Workers (id, worker_type, storage_name) VALUES (?, 'test', 'test')",
         )
-        .bind("order-fill-worker-0")
+        .bind("order-fill-worker-base-0")
         .execute(&apalis_pool)
         .await
         .unwrap();
@@ -13053,7 +13065,7 @@ mod tests {
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(job_type)
         .bind(Status::Running.to_string())
-        .bind("order-fill-worker-0")
+        .bind("order-fill-worker-base-0")
         .bind(0_i64)
         .execute(&apalis_pool)
         .await

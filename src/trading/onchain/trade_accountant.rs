@@ -11,10 +11,11 @@ use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tracing::{debug, error, warn};
 
-use st0x_config::{Ctx, HedgedChain};
+use st0x_config::{ChainRegistry, Ctx, HedgedChain};
 use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::{Chain, Evm, ReadOnlyEvm};
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
@@ -44,6 +45,103 @@ use crate::vault_registry::VaultRegistry;
 
 /// Persistent job queue for DEX trade accounting.
 pub(crate) type DexTradeAccountingJobQueue = JobQueue<AccountForDexTrade>;
+
+/// One namespaced trade-accounting queue per hedged chain, each drained by
+/// its own worker, so one chain's fill backlog never delays another chain's
+/// hedges.
+#[derive(Clone)]
+pub(crate) struct DexTradeAccountingQueues(BTreeMap<Chain, DexTradeAccountingJobQueue>);
+
+impl DexTradeAccountingQueues {
+    /// Builds one namespaced queue per hedged chain in `chains`.
+    pub(crate) fn new(apalis_pool: &apalis_sqlite::SqlitePool, chains: &ChainRegistry) -> Self {
+        Self(
+            chains
+                .hedged()
+                .map(|hedged| {
+                    (
+                        hedged.chain,
+                        DexTradeAccountingJobQueue::new_namespaced(
+                            apalis_pool,
+                            hedged.chain.as_str(),
+                        ),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// The queue for `chain`; `None` when the chain is not hedged.
+    pub(crate) fn for_chain(&self, chain: Chain) -> Option<&DexTradeAccountingJobQueue> {
+        self.0.get(&chain)
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&Chain, &DexTradeAccountingJobQueue)> {
+        self.0.iter()
+    }
+
+    /// Moves every live row written before per-chain queues (bare type name,
+    /// which no worker reads) onto the queue of the chain its payload names.
+    /// The payload is decoded with the worker's own serde rules, so a
+    /// chainless payload lands on Base, as the worker would run it. A payload
+    /// that does not decode fails the whole relabel rather than guess a chain.
+    /// Terminal rows are left for the retention sweep. Runs at startup, after
+    /// the apalis tables exist and before any worker spawns; idempotent.
+    pub(crate) async fn relabel_legacy_rows(
+        apalis_pool: &apalis_sqlite::SqlitePool,
+    ) -> Result<u64, RelabelLegacyAccountingRowsError> {
+        let legacy = std::any::type_name::<AccountForDexTrade>();
+        let mut transaction = apalis_pool.begin().await?;
+
+        let rows: Vec<(String, Vec<u8>)> = sqlx_apalis::query_as(
+            "SELECT id, job FROM Jobs \
+             WHERE job_type = ? \
+             AND (status IN ('Pending', 'Queued', 'Running') \
+                  OR (status = 'Failed' AND attempts < max_attempts))",
+        )
+        .bind(legacy)
+        .fetch_all(&mut *transaction)
+        .await?;
+
+        let mut relabeled = 0;
+        for (id, payload) in rows {
+            let job: AccountForDexTrade = match serde_json::from_slice(&payload) {
+                Ok(job) => job,
+                Err(source) => {
+                    return Err(RelabelLegacyAccountingRowsError::UndecodablePayload {
+                        id,
+                        source,
+                    });
+                }
+            };
+
+            relabeled += sqlx_apalis::query("UPDATE Jobs SET job_type = ? WHERE id = ?")
+                .bind(format!("{legacy}@{}", job.trade.chain))
+                .bind(&id)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected();
+        }
+
+        transaction.commit().await?;
+        Ok(relabeled)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RelabelLegacyAccountingRowsError {
+    #[error(
+        "live trade accounting job {id} has a payload that does not decode, so its chain \
+         is unknown; fix or remove the row before starting"
+    )]
+    UndecodablePayload {
+        id: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("failed to relabel legacy trade accounting jobs: {0}")]
+    Database(#[from] apalis_sqlite::SqlxError),
+}
 
 /// An accounting job for processing a single onchain raindex trade event.
 /// It's the unified mechanism for processing both backfilled events as well as
@@ -82,6 +180,9 @@ pub(crate) struct ChainAccounting<Node> {
     /// emitting log's address for downstream processing.
     pub(crate) contracts: RaindexContracts,
     pub(crate) evm: ReadOnlyEvm<Node>,
+    /// This chain's own accounting queue; a rate-limit successor goes back
+    /// onto it.
+    pub(crate) job_queue: DexTradeAccountingJobQueue,
 }
 
 /// Bundles the shared dependencies needed by the trade accounting job.
@@ -90,12 +191,11 @@ pub(crate) struct AccountantCtx<Node, Exec> {
     pub(crate) cache: SymbolCache,
     /// One [`ChainAccounting`] per hedged chain; jobs resolve theirs from
     /// the fill payload's chain.
-    pub(crate) chains: std::collections::BTreeMap<Chain, ChainAccounting<Node>>,
+    pub(crate) chains: BTreeMap<Chain, ChainAccounting<Node>>,
     pub(crate) cqrs: TradeProcessingCqrs,
     pub(crate) vault_registry: Arc<Store<VaultRegistry>>,
     pub(crate) executor: Exec,
     pub(crate) pool: SqlitePool,
-    pub(crate) job_queue: DexTradeAccountingJobQueue,
     pub(crate) notifier: Arc<dyn Notifier>,
 }
 
@@ -294,7 +394,10 @@ where
                 }
                 Ok(())
             }
-            Err(error) => self.handle_process_queued_trade_error(ctx, error).await,
+            Err(error) => {
+                self.handle_process_queued_trade_error(&chain_ctx.job_queue, error)
+                    .await
+            }
         }
     }
 }
@@ -312,22 +415,17 @@ impl AccountForDexTrade {
     /// per-job classification table). The reschedule's value here is only:
     /// don't burn the terminal retry budget, don't latch the worker; actual
     /// completion is `CheckPositions`' job, unchanged by this plan.
-    async fn handle_process_queued_trade_error<Node, Exec>(
+    async fn handle_process_queued_trade_error(
         &self,
-        ctx: &AccountantCtx<Node, Exec>,
+        job_queue: &DexTradeAccountingJobQueue,
         error: TradeAccountingError,
-    ) -> Result<(), TradeAccountingError>
-    where
-        Node: Provider + Clone + Send + Sync + 'static,
-        Exec: Executor + Clone + Send + 'static,
-        TradeAccountingError: From<Exec::Error>,
-    {
+    ) -> Result<(), TradeAccountingError> {
         let Some(backpressure) = find_backpressure(&error) else {
             return Err(error);
         };
 
         let step = advance_backpressure(&backpressure, self.backpressure_streak);
-        let mut queue = ctx.job_queue.clone();
+        let mut queue = job_queue.clone();
         let outcome = apply_backpressure_step(step, &mut queue, |next_streak| Self {
             trade: self.trade.clone(),
             backpressure_streak: next_streak,
@@ -1382,14 +1480,17 @@ mod tests {
             placement_barrier: None,
         };
 
-        let job_queue = DexTradeAccountingJobQueue::new(apalis_pool);
-
+        let primary = ctx.chains.primary();
         let chains = std::collections::BTreeMap::from([(
-            ctx.chains.primary().chain,
+            primary.chain,
             ChainAccounting {
-                trading: ctx.chains.primary().clone(),
-                contracts: crate::onchain::raindex_contracts(ctx.chains.primary()),
+                trading: primary.clone(),
+                contracts: crate::onchain::raindex_contracts(primary),
                 evm: st0x_evm::ReadOnlyEvm::new(provider),
+                job_queue: DexTradeAccountingJobQueue::new_namespaced(
+                    apalis_pool,
+                    primary.chain.as_str(),
+                ),
             },
         )]);
 
@@ -1402,7 +1503,6 @@ mod tests {
             vault_registry,
             executor,
             pool,
-            job_queue,
         }
     }
 
@@ -1479,6 +1579,10 @@ mod tests {
                 contracts: crate::onchain::raindex_contracts(&secondary),
                 trading: secondary.clone(),
                 evm: st0x_evm::ReadOnlyEvm::new(secondary_provider),
+                job_queue: DexTradeAccountingJobQueue::new_namespaced(
+                    &apalis_pool,
+                    Chain::HyperEvm.as_str(),
+                ),
             },
         );
 
@@ -1722,6 +1826,10 @@ mod tests {
                 contracts: crate::onchain::raindex_contracts(&secondary),
                 trading: secondary,
                 evm: ReadOnlyEvm::new(secondary_provider),
+                job_queue: DexTradeAccountingJobQueue::new_namespaced(
+                    &apalis_pool,
+                    Chain::HyperEvm.as_str(),
+                ),
             },
         );
 
@@ -2111,6 +2219,10 @@ mod tests {
                         contracts: crate::onchain::raindex_contracts(&secondary),
                         trading: secondary,
                         evm: ReadOnlyEvm::new(secondary_provider),
+                        job_queue: DexTradeAccountingJobQueue::new_namespaced(
+                            &apalis_pool,
+                            chain.as_str(),
+                        ),
                     },
                 );
             }
@@ -2769,6 +2881,10 @@ mod tests {
                     contracts: crate::onchain::raindex_contracts(&secondary),
                     trading: secondary,
                     evm: st0x_evm::ReadOnlyEvm::new(provider),
+                    job_queue: DexTradeAccountingJobQueue::new_namespaced(
+                        &apalis_pool,
+                        chain.as_str(),
+                    ),
                 },
             );
 
@@ -3228,8 +3344,46 @@ mod tests {
         assert_eq!(decoded.amount, withdraw.amount);
     }
 
-    fn account_for_dex_trade_job_type() -> &'static str {
-        std::any::type_name::<AccountForDexTrade>()
+    /// Every fixture here hedges Base, so its rows sit on Base's queue.
+    fn account_for_dex_trade_job_type() -> String {
+        format!(
+            "{}@{}",
+            std::any::type_name::<AccountForDexTrade>(),
+            Chain::Base
+        )
+    }
+
+    /// Each hedged chain's accounting rows live under its own queue key, so
+    /// another chain's worker, backlog check, and orphan recovery never see
+    /// them.
+    #[tokio::test]
+    async fn accounting_queues_keep_each_chains_rows_apart() {
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let mut secondary = ctx.chains.primary().clone();
+        secondary.chain = Chain::Ethereum;
+        ctx.chains.insert_secondary(secondary);
+        let queues = DexTradeAccountingQueues::new(&apalis_pool, &ctx.chains);
+
+        let mut base_queue = queues.for_chain(Chain::Base).unwrap().clone();
+        base_queue.push(test_job()).await.unwrap();
+        let ethereum_queue = queues.for_chain(Chain::Ethereum).unwrap();
+
+        let job_types: Vec<String> = sqlx_apalis::query_scalar("SELECT job_type FROM Jobs")
+            .fetch_all(&apalis_pool)
+            .await
+            .unwrap();
+        assert_eq!(job_types, vec![account_for_dex_trade_job_type()]);
+        assert!(base_queue.has_in_flight().await.unwrap());
+        assert!(
+            !ethereum_queue.has_in_flight().await.unwrap(),
+            "another chain's rows must not read as in flight"
+        );
+        assert_eq!(
+            ethereum_queue.requeue_orphaned().await.unwrap(),
+            0,
+            "orphan recovery must not adopt another chain's rows"
+        );
     }
 
     async fn successor_backpressure_streak(apalis_pool: &apalis_sqlite::SqlitePool) -> i64 {
@@ -3295,9 +3449,12 @@ mod tests {
             retry_after: Some(Duration::from_millis(1)),
         });
 
-        job.handle_process_queued_trade_error(&accountant_ctx, error)
-            .await
-            .unwrap();
+        job.handle_process_queued_trade_error(
+            &accountant_ctx.chains[&Chain::Base].job_queue,
+            error,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(successor_backpressure_streak(&apalis_pool).await, 1);
     }
@@ -3331,9 +3488,12 @@ mod tests {
             retry_after: Some(Duration::from_millis(1)),
         });
 
-        job.handle_process_queued_trade_error(&accountant_ctx, error)
-            .await
-            .unwrap();
+        job.handle_process_queued_trade_error(
+            &accountant_ctx.chains[&Chain::Base].job_queue,
+            error,
+        )
+        .await
+        .unwrap();
 
         let job_count: i64 =
             sqlx_apalis::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
@@ -3375,7 +3535,10 @@ mod tests {
         });
 
         let result = job
-            .handle_process_queued_trade_error(&accountant_ctx, error)
+            .handle_process_queued_trade_error(
+                &accountant_ctx.chains[&Chain::Base].job_queue,
+                error,
+            )
             .await;
         let Err(TradeAccountingError::AlpacaBrokerApi(AlpacaBrokerApiError::ApiError {
             status,
