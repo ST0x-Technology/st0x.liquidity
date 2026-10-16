@@ -52,6 +52,11 @@ jobs:
       # built.
       CARGO_INCREMENTAL: "0"
       CARGO_TARGET_DIR: target/test
+      # No debug info in CI test binaries: a cold build took 132 s instead of
+      # 141 s and the shards' archive halved (717 to 366 MB). Panic messages
+      # still carry file and line; only backtraces lose line numbers.
+      CARGO_PROFILE_DEV_DEBUG: "false"
+      CARGO_PROFILE_TEST_DEBUG: "false"
       # Parallel rustc frontend for workspace crates (see the script). Cargo
       # fingerprints only the wrapper's path, so sync-source-mtimes.sh treats
       # the script as a build-wide input.
@@ -180,9 +185,9 @@ jobs:
           path: ${{ runner.temp }}/nextest-archive.tar.zst
           key: ${{ runner.os }}-nextest-${{ github.run_id }}-${{ github.run_attempt }}
 
-  # Clippy, rustdoc, and the Python board checks need their own compile (clippy
-  # cannot reuse test-profile artifacts), so they run beside backend-build
-  # instead of after it, off the test shards' critical path.
+  # Clippy and the Python board checks need their own compile (clippy cannot
+  # reuse test-profile artifacts), so they run beside backend-build instead of
+  # after it, off the test shards' critical path.
   backend-lint:
     name: backend lint
     runs-on: blacksmith-8vcpu-ubuntu-2404
@@ -302,15 +307,136 @@ jobs:
             python3 scripts/liq-parity/test_compare.py
           "
 
-      - name: Clippy and docs
+      - name: Clippy
         run: |
           nix develop .#ci-backend -c bash -c "
             set -euxo pipefail
             ./scripts/clean-stale-rain-math-float.sh
             cargo clippy --workspace --all-targets --all-features
-            # rain-math-float is upstream source nix materializes under .tmp/,
-            # so it is a workspace member we do not own; exclude it rather than
-            # gate CI on its rustdoc warnings.
+            ./scripts/sync-source-mtimes.sh record
+          "
+
+  # rustdoc runs in its own job on its own disk. After clippy in one job it
+  # added 1m17 to the lint path on a cold disk; beside clippy in that job, with
+  # a second target directory, it compiled every dependency again on the same
+  # cores and took 4m39.
+  backend-docs:
+    name: backend docs
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "1"
+      CARGO_TARGET_DIR: target/docs
+      # Registry and git sources live on the same sticky disk. Swatinem's
+      # rust-cache is not used here: its save step prunes workspace-crate and
+      # incremental artifacts from the target directory before the disk
+      # commits.
+      CARGO_HOME: ${{ github.workspace }}/target/docs/cargo-home
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          persist-credentials: false
+
+      - name: Configure Git fetch fail-fast
+        run: |
+          git config --global http.lowSpeedLimit 524288
+          git config --global http.lowSpeedTime 60
+
+      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035  # v34
+        with:
+          # Nix 2.24-2.28 fail to resolve rainix's overridden `foundry` input
+          # (`cannot find flake 'flake:foundry'`); the fix landed in 2.30. v30
+          # of this action only shipped up to 2.26, so use v34 and pin a
+          # working release.
+          nix_version: "2.31.2"
+          nix_conf: |
+            accept-flake-config = true
+            fallback = true
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            keep-env-derivations = true
+            keep-outputs = true
+
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71  # v17
+        continue-on-error: true
+        with:
+          name: rainlanguage
+          authToken: ${{ env.UNTRUSTED_PR != 'true' && secrets.CACHIX_AUTH_TOKEN || '' }}
+          skipPush: ${{ env.UNTRUSTED_PR == 'true' }}
+          useDaemon: false
+
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569  # v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 8G
+          save: ${{ env.UNTRUSTED_PR != 'true' }}
+
+      # The sticky disk key embeds a hash of a repository secret. The `commit`
+      # input below is part of the workflow file, which a pull request can
+      # edit, so it cannot stop a fork from committing a snapshot. A fork run
+      # gets no secrets, so it cannot name this disk, and it skips the disk
+      # and builds cold. Same-repository runs have the secret, but they can
+      # already push to Cachix with it, so the trust level does not change.
+      # The mask keeps the derived key out of the public logs.
+      - name: Derive persistent target disk key
+        id: target-disk
+        if: ${{ env.UNTRUSTED_PR != 'true' }}
+        env:
+          DISK_KEY_SECRET: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        run: |
+          if [ -z "$DISK_KEY_SECRET" ]; then
+            echo "CACHIX_AUTH_TOKEN is not set, so the target disk key cannot be derived" >&2
+            exit 1
+          fi
+          key=$(printf 'st0x-target-disk:%s' "$DISK_KEY_SECRET" | sha256sum | cut -c1-32)
+          echo "::add-mask::$key"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+
+      # The target directory lives on a Blacksmith sticky disk: each run
+      # mounts the last snapshot. Only master pushes (reviewed, merged code)
+      # save the disk that pull request and master runs use, so pull request
+      # runs never replace it. Manual dispatches use and save their own
+      # `-dispatch` disk, which no other run reads, so a branch can measure
+      # cache changes without touching the master disk. The next step makes
+      # only changed sources newer than the snapshot's build. Registry and git
+      # dependencies fingerprint by version and stay built.
+      - name: Mount persistent target directory
+        if: ${{ env.UNTRUSTED_PR != 'true' }}
+        uses: useblacksmith/stickydisk@3f6be1451e3cad893b778bc93495c80452a5da26  # v1.7.2
+        with:
+          key: ${{ steps.target-disk.outputs.key }}-target-docs-v1${{ github.event_name == 'workflow_dispatch' && '-dispatch' || '' }}
+          path: ${{ github.workspace }}/target/docs
+          commit: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/master') }}
+
+      # A fresh disk mounts root-owned. A saving run clears the disk once it
+      # holds more than 40 GiB (one full build is about 7), since stale
+      # artifacts from older toolchains and dependency versions are never
+      # collected. The fresh ext4 volume also holds a root-owned lost+found
+      # (mode 700) that the runner user cannot remove, so the wipe runs with
+      # sudo and keeps it. The snapshot records the git content hashes of the
+      # tree it compiled; sync-source-mtimes.sh then makes only the sources
+      # whose content differs newer than that build, so cargo reruns rustc
+      # just for the crates they belong to. A changed lockfile, manifest,
+      # toolchain, Nix file, or migration makes every source newer instead.
+      - name: Prepare persistent target directory
+        if: ${{ env.UNTRUSTED_PR != 'true' }}
+        run: |
+          sudo chown "$(id -u):$(id -g)" "$CARGO_TARGET_DIR"
+          used=$(df --output=used -BG "$CARGO_TARGET_DIR" | tail -1 | tr -dc '0-9')
+          echo "target disk holds ${used} GiB"
+          if [ "${{ github.event_name }}" != pull_request ] && [ "$used" -gt 40 ]; then
+            sudo find "$CARGO_TARGET_DIR" -mindepth 1 -maxdepth 1 ! -name lost+found -exec rm -rf {} +
+          fi
+          ./scripts/sync-source-mtimes.sh prepare
+
+      # rain-math-float is upstream source nix materializes under .tmp/, so it
+      # is a workspace member we do not own; exclude it rather than gate CI on
+      # its rustdoc warnings.
+      - name: Docs
+        run: |
+          nix develop .#ci-backend -c bash -c "
+            set -euxo pipefail
+            ./scripts/clean-stale-rain-math-float.sh
             cargo doc --workspace --no-deps --all-features --exclude rain-math-float
             ./scripts/sync-source-mtimes.sh record
           "
@@ -407,7 +533,7 @@ jobs:
 
   backend:
     name: backend
-    needs: [backend-build, backend-lint, backend-test]
+    needs: [backend-build, backend-lint, backend-docs, backend-test]
     # Inspect every dependency state, including failures, skips, and
     # cancellations, so this required check cannot pass without validation.
     if: ${{ always() }}
@@ -416,8 +542,8 @@ jobs:
     steps:
       - name: Check backend validation
         run: |
-          if [ "${{ needs.backend-build.result }}" != "success" ] || [ "${{ needs.backend-lint.result }}" != "success" ] || [ "${{ needs.backend-test.result }}" != "success" ]; then
-            echo "backend validation failed (build=${{ needs.backend-build.result }}, lint=${{ needs.backend-lint.result }}, test=${{ needs.backend-test.result }})"
+          if [ "${{ needs.backend-build.result }}" != "success" ] || [ "${{ needs.backend-lint.result }}" != "success" ] || [ "${{ needs.backend-docs.result }}" != "success" ] || [ "${{ needs.backend-test.result }}" != "success" ]; then
+            echo "backend validation failed (build=${{ needs.backend-build.result }}, lint=${{ needs.backend-lint.result }}, docs=${{ needs.backend-docs.result }}, test=${{ needs.backend-test.result }})"
             exit 1
           fi
 

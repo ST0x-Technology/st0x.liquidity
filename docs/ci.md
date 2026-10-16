@@ -106,6 +106,19 @@ drop the variable; the next run rebuilds the workspace crates once, since the
 wrapper is part of cargo's fingerprint. `backend lint` does not use it, because
 `cargo clippy` sets its own workspace wrapper.
 
+## Cold-cache critical path
+
+- rustdoc runs in its own `backend docs` job on its own disk. After clippy in
+  `backend lint` it added 1m17 to that path on a cold disk; beside clippy in the
+  same job, with a second target directory, it compiled every dependency again
+  on the same cores and took 4m39.
+- `backend build` sets `CARGO_PROFILE_DEV_DEBUG` and `CARGO_PROFILE_TEST_DEBUG`
+  to `false`: a cold build took 132 s instead of 141 s locally, and the shards'
+  archive halved (717 to 366 MB). Panic messages still carry file and line; only
+  backtraces lose line numbers.
+- The shards poll every 3 s, which costs nothing extra: unchanged polls answer
+  `304 Not Modified`.
+
 ## Test shards
 
 The eight `backend test` shards do not `need` `backend build`. They start with
@@ -128,13 +141,14 @@ takes little more than its slowest test.
 
 ## Persistent target directories
 
-`backend build` and `backend lint` keep their cargo target directories
-(`target/test`, `target/lint`) on Blacksmith sticky disks, so crates whose
-sources did not change stay built. `backend lint` builds with
-`CARGO_INCREMENTAL=1`, so clippy also reuses rustc's incremental state for the
-crates that did change. `backend build` builds with `CARGO_INCREMENTAL=0` and
-the parallel frontend instead (see above): the two crashed rustc together, and a
-changed crate recompiles faster in full on all cores.
+`backend build`, `backend lint`, and `backend docs` keep their cargo target
+directories (`target/test`, `target/lint`, `target/docs`) on Blacksmith sticky
+disks, so crates whose sources did not change stay built. `backend lint` and
+`backend docs` build with `CARGO_INCREMENTAL=1`, so they also reuse rustc's
+incremental state for the crates that did change. `backend build` builds with
+`CARGO_INCREMENTAL=0` and the parallel frontend instead (see above): the two
+crashed rustc together, and a changed crate recompiles faster in full on all
+cores.
 
 - Each trusted run mounts the last saved snapshot. Only master pushes save one,
   so pull request runs never replace it. A manual `workflow_dispatch` run mounts
@@ -154,10 +168,10 @@ changed crate recompiles faster in full on all cores.
   `sync-source-mtimes.sh prepare` gives every tracked file an old fixed mtime
   and the current time to each file whose content hash differs from the recorded
   tree, including files that master changed after this branch forked. Cargo then
-  reruns rustc only for crates with a changed source (in `backend lint`, rustc's
-  incremental cache then reuses whatever still matches). With no recorded tree,
-  every file counts as changed. Registry and git dependencies fingerprint by
-  version and stay built.
+  reruns rustc only for crates with a changed source (in `backend lint` and
+  `backend docs`, rustc's incremental cache then reuses whatever still matches).
+  With no recorded tree, every file counts as changed. Registry and git
+  dependencies fingerprint by version and stay built.
 - Some inputs are not in cargo's dep-info for the crate they affect. A
   `Cargo.lock`, `Cargo.toml`, toolchain, `.cargo/`, `build.rs`, or `ci.yaml`
   change can select an older artifact variant still on the disk, since `ci.yaml`
@@ -177,8 +191,8 @@ changed crate recompiles faster in full on all cores.
 - A saving run (a master push or a manual dispatch) wipes the disk once it holds
   more than 40 GiB, because cargo never collects artifacts from older toolchains
   or dependency versions.
-- To start from empty disks, bump the `-v1` suffix of both disk keys
-  (`-target-test-v1` and `-target-lint-v1`).
+- To start from empty disks, bump the `-v1` suffix of all three disk keys
+  (`-target-test-v1`, `-target-lint-v1`, and `-target-docs-v1`).
 - A build that does not run `sync-source-mtimes.sh` (a re-run of a run from
   before it, or a run after a revert) leaves fingerprints newer than the record,
   so the next `prepare` treats every file as changed. To roll the script back

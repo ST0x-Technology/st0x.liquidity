@@ -17,7 +17,8 @@
 set -euo pipefail
 
 job_name=${1:?usage: $0 <job name>}
-poll_seconds=${WAIT_FOR_JOB_POLL_SECONDS:-10}
+# A 304 costs nothing, so a short interval only shortens the shards' wait.
+poll_seconds=${WAIT_FOR_JOB_POLL_SECONDS:-3}
 # The run lists every job from its start, so a job that is missing for this
 # long does not exist (for example, after a rename).
 lookup_seconds=${WAIT_FOR_JOB_LOOKUP_SECONDS:-300}
