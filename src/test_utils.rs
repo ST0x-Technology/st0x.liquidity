@@ -35,7 +35,7 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::Duration;
 
 #[cfg(test)]
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 use st0x_bridge::cctp::{deploy_cctp_on_chain, link_chains, mint_usdc};
 #[cfg(test)]
 use st0x_bridge::relay::{RelayApiKey, RelayClient, deploy_relay_end};
@@ -583,7 +583,7 @@ pub(crate) use held_receipt::{HeldReceiptWallet, ReceiptGate};
 /// each. Deploying from Anvil account 1 with the same nonces lands every
 /// contract, the mint/burn USDC included, at one address on both nodes.
 #[cfg(test)]
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) struct AnvilCctpPair {
     _base_anvil: TestAnvilInstance,
     _ethereum_anvil: TestAnvilInstance,
@@ -603,7 +603,7 @@ pub(crate) struct AnvilCctpPair {
 // Two attributes, not `cfg(all(test, ...))`: clippy's `allow-unwrap-in-tests`
 // only recognizes a plain `cfg(test)` on the enclosing item.
 #[cfg(test)]
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn deploy_anvil_cctp_pair(base_usdc: U256) -> AnvilCctpPair {
     let (base_anvil, ethereum_anvil) = spawn_anvil_pair(
         Anvil::new(),

@@ -40,17 +40,20 @@ pub(crate) fn bot_cctp_bridge(
     ctx: &Ctx,
     wallets: &OnchainWalletCtx,
 ) -> Result<BotCctpBridge, CctpError> {
-    CctpBridge::try_from_ctx(CctpCtx {
-        corridor: ctx.rebalancing.cctp_corridor,
-        ethereum_wallet: Arc::clone(wallets.ethereum_wallet()),
-        base_wallet: Arc::clone(wallets.base_wallet()),
-        #[cfg(feature = "test-support")]
-        circle_api_base: ctx.rebalancing.circle_api_base.clone(),
-        #[cfg(feature = "test-support")]
-        token_messenger: ctx.rebalancing.token_messenger,
-        #[cfg(feature = "test-support")]
-        message_transmitter: ctx.rebalancing.message_transmitter,
-    })
+    let cctp = CctpCtx::new(
+        ctx.rebalancing.cctp_corridor,
+        Arc::clone(wallets.ethereum_wallet()),
+        Arc::clone(wallets.base_wallet()),
+    );
+
+    #[cfg(any(test, feature = "test-support"))]
+    let cctp = cctp.with_endpoints(
+        ctx.rebalancing.circle_api_base.clone(),
+        ctx.rebalancing.token_messenger,
+        ctx.rebalancing.message_transmitter,
+    );
+
+    CctpBridge::try_from_ctx(cctp)
 }
 
 /// The burn's chain, kebab cased on the wire (`ethereum`, `base`), matching

@@ -352,7 +352,7 @@
 
                   backend="${backendEnvPrefix}SIMULATE_BOT_PORT=$bot_port \
                     SIMULATE_BOARD_PORT=$board_port \
-                    cargo nextest run --test e2e \
+                    cargo nextest run --test e2e --features test-support,mock \
                     -E 'test(=full_system::${testFilter})' \
                     --run-ignored ignored-only --no-capture"
 

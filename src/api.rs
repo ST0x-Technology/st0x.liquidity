@@ -11730,7 +11730,7 @@ mod tests {
     /// Base wallet, reached through the ctx's test overrides, and a Circle API
     /// that only serves the fast transfer fee: nothing is minted, so no
     /// attestation is involved.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     async fn cctp_burn_state(
         starting_usdc: U256,
     ) -> (
@@ -11765,7 +11765,7 @@ mod tests {
         (cctp, circle, state)
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     async fn burn_from_base(
         state: &AppState,
         operation_id: &str,
@@ -11785,7 +11785,7 @@ mod tests {
     /// Signs a burn of `amount` from Base and records it under `operation_id`
     /// without broadcasting it, as a request that died between the record and
     /// the broadcast, or a restart in between, leaves it.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     async fn record_unbroadcast_burn(
         state: &AppState,
         operation_id: &str,
@@ -11821,7 +11821,7 @@ mod tests {
         prepared
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     async fn recorded_burn(state: &AppState, operation_id: &str) -> CctpBurnOperation {
         state
             .recovery
@@ -11838,7 +11838,7 @@ mod tests {
     /// amount and the burn tx at the broadcast as pending, keeps the resume
     /// lock held until the burn confirms, records the confirmation, and
     /// exactly that amount leaves the bot's Base wallet.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn cctp_bridge_burns_the_exact_amount_from_the_source_wallet() {
         let starting_usdc = U256::from(5_000_000_u64);
@@ -11889,7 +11889,7 @@ mod tests {
     /// same operation id while the first burn is still confirming, and again
     /// after, gets the same burn tx each time and burns once. A new id burns
     /// again.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn a_retry_with_the_same_operation_id_burns_once_and_a_new_id_burns_again() {
         let starting_usdc = U256::from(5_000_000_u64);
@@ -11940,7 +11940,7 @@ mod tests {
     /// node holds it, so the retry sends the recorded bytes under the lock,
     /// like a fresh burn. The burn tx is the recorded one, the burn confirms,
     /// and the wallet burns once.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn a_retry_broadcasts_a_burn_recorded_before_its_broadcast() {
         let starting_usdc = U256::from(5_000_000_u64);
@@ -11977,7 +11977,7 @@ mod tests {
 
     /// An operation id names one burn, so a request with another amount
     /// under it is refused instead of reporting a burn it did not ask for.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn a_different_burn_under_a_used_operation_id_is_refused() {
         let (_cctp, _circle, state) = cctp_burn_state(U256::from(5_000_000_u64)).await;
@@ -12002,7 +12002,7 @@ mod tests {
     /// pointing at the supersede route. That route refuses a tx at another
     /// nonce, settles the burn on the cancel, and a retry with its operation
     /// id then reports it superseded without burning.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn a_burn_whose_nonce_a_cancel_took_is_settled_superseded() {
         let starting_usdc = U256::from(5_000_000_u64);
@@ -12063,7 +12063,7 @@ mod tests {
     /// At startup a pending burn is rebroadcast from its recorded bytes, so a
     /// burn signed and recorded before a restart still lands once; the next
     /// start finds it mined and records it instead of restoring it again.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn startup_rebroadcasts_a_pending_burn_then_records_it_once_mined() {
         let starting_usdc = U256::from(5_000_000_u64);
@@ -12104,7 +12104,7 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     async fn supersede_burn(
         state: &AppState,
         superseding_tx: TxHash,
@@ -12123,7 +12123,7 @@ mod tests {
     /// with a higher fee, and that copy burns in the signed burn's place. The
     /// supersede route adopts it as the replacement: the operation reports
     /// `replaced` with the copy as its burn tx, and the wallet burned once.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn a_fee_bumped_copy_of_the_burn_is_adopted_as_its_replacement() {
         let starting_usdc = U256::from(5_000_000_u64);
@@ -12179,7 +12179,7 @@ mod tests {
     /// and the burn stays pending. The closest case: a `depositForBurn` of
     /// another amount to the same TokenMessenger, which also emits
     /// `MessageSent` but burned a different amount.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn a_successful_tx_at_the_nonce_that_is_neither_cancel_nor_copy_is_refused() {
         let (cctp, _circle, state) = cctp_burn_state(U256::from(5_000_000_u64)).await;
@@ -12222,7 +12222,7 @@ mod tests {
     /// records it `Reverted`, a retry reports `reverted` without burning, and
     /// the wallet keeps its USDC. A TokenMessenger that always reverts makes
     /// the burn revert.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn a_reverted_burn_is_recorded_and_never_burns() {
         use alloy::providers::ext::AnvilApi as _;
@@ -12262,7 +12262,7 @@ mod tests {
     /// nothing recorded, the route answers `500` with nothing broadcast and
     /// releases the signature's nonce: a later burn uses that nonce and
     /// mines, instead of queuing behind a burn nobody will send.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn a_signed_burn_that_fails_to_record_releases_its_nonce() {
         let starting_usdc = U256::from(5_000_000_u64);
@@ -12321,7 +12321,7 @@ mod tests {
     /// A burn whose receipt succeeded without the CCTP `MessageSent` event
     /// gave Circle nothing to attest, so it is paged and never recorded
     /// confirmed. A TokenMessenger that only stops produces such a receipt.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn a_burn_that_emitted_no_message_sent_is_never_recorded_confirmed() {
@@ -12354,7 +12354,7 @@ mod tests {
     /// is read before the named tx, so a mined burn whose receipt does not
     /// decide it (here a success without `MessageSent`) is refused, the
     /// operation stays pending, and its nonce is not released.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn a_burn_that_mined_is_never_settled_as_superseded() {
         use alloy::providers::ext::AnvilApi as _;
@@ -12396,7 +12396,7 @@ mod tests {
     /// A recorded burn signed by another key (a rotated wallet) never enters
     /// this wallet's nonce bookkeeping: startup skips it and gates the chain,
     /// and a retry answers `502` instead of reporting it in flight.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn a_burn_signed_by_another_wallet_is_neither_restored_nor_rebroadcast() {
         let (_cctp, _circle, state) = cctp_burn_state(U256::from(5_000_000_u64)).await;
@@ -12444,7 +12444,7 @@ mod tests {
     /// settled: the old key cancels it at its nonce, and the supersede route
     /// checks the cancel against the burn's own signer, not the bot's current
     /// wallet.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn a_burn_of_a_rotated_key_is_settled_by_that_keys_cancel() {
         let (cctp, _circle, state) = cctp_burn_state(U256::from(5_000_000_u64)).await;

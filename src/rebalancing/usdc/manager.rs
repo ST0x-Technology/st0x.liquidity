@@ -118,13 +118,13 @@ pub struct UsdcSettlementParams {
     pub reserved_cash: Option<Usd>,
     /// Circle attestation/fee API base URL (test-only override; production
     /// builds use the [`st0x_bridge::cctp::CIRCLE_API_BASE`] constant).
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub circle_api_base: String,
     /// `TokenMessengerV2` contract address (test-only override).
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub token_messenger: Address,
     /// `MessageTransmitterV2` contract address (test-only override).
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub message_transmitter: Address,
 }
 
@@ -142,11 +142,11 @@ impl UsdcSettlementParams {
             settlement_retry_deadline: rebalancing.settlement_retry_deadline,
             ethereum_required_confirmations: chains.required_confirmations(Chain::Ethereum),
             reserved_cash,
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             circle_api_base: rebalancing.circle_api_base.clone(),
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             token_messenger: rebalancing.token_messenger,
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             message_transmitter: rebalancing.message_transmitter,
         }
     }
@@ -7889,7 +7889,7 @@ mod tests {
     use sqlx::SqlitePool;
     use std::num::NonZeroU32;
     use std::str::FromStr;
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     use std::sync::LazyLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -8032,9 +8032,9 @@ mod tests {
         // leaves these `None`, so an unexpected walk into either method still
         // panics loudly. Gated with the constructor it feeds, which needs the
         // bridge crate's test-support attestation builder.
-        #[cfg(feature = "test-support")]
+        #[cfg(any(test, feature = "test-support"))]
         recover_attestation_message: Option<Vec<u8>>,
-        #[cfg(feature = "test-support")]
+        #[cfg(any(test, feature = "test-support"))]
         recover_mint_receipt: Option<st0x_bridge::MintReceipt>,
     }
 
@@ -8074,9 +8074,9 @@ mod tests {
                 burn_scan_calls: Mutex::new(Vec::new()),
                 repoll_error: None,
                 mint_error: None,
-                #[cfg(feature = "test-support")]
+                #[cfg(any(test, feature = "test-support"))]
                 recover_attestation_message: None,
-                #[cfg(feature = "test-support")]
+                #[cfg(any(test, feature = "test-support"))]
                 recover_mint_receipt: None,
             }
         }
@@ -8204,7 +8204,7 @@ mod tests {
             self.usdc_restored.lock().unwrap().clone()
         }
 
-        #[cfg(feature = "test-support")]
+        #[cfg(any(test, feature = "test-support"))]
         fn with_recover_mint(
             mut self,
             message: Vec<u8>,
@@ -8316,7 +8316,7 @@ mod tests {
             _direction: BridgeDirection,
             _burn_tx: TxHash,
         ) -> Result<AttestationResponse, CctpError> {
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             if let Some(message) = &self.recover_attestation_message {
                 return AttestationResponse::for_test(
                     Bytes::from(message.clone()),
@@ -8335,7 +8335,7 @@ mod tests {
             _direction: BridgeDirection,
             _attestation: &AttestationResponse,
         ) -> Result<st0x_bridge::MintReceipt, CctpError> {
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             if let Some(receipt) = &self.recover_mint_receipt {
                 return Ok(st0x_bridge::MintReceipt {
                     tx: receipt.tx,
@@ -9252,11 +9252,11 @@ mod tests {
             settlement_retry_deadline: TEST_SETTLEMENT_RETRY_DEADLINE,
             ethereum_required_confirmations: Some(3),
             reserved_cash: None,
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             circle_api_base: test_circle_fee_api_base(),
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
         }
     }
@@ -9654,7 +9654,7 @@ mod tests {
         RawPrivateKeyWallet::new(private_key, base_provider, 1).unwrap()
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     fn test_circle_fee_api_base() -> String {
         static SERVER: LazyLock<MockServer> = LazyLock::new(|| {
             let server = MockServer::start();
@@ -9678,11 +9678,11 @@ mod tests {
             corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
             ethereum_wallet: wallet.clone(),
             base_wallet: wallet.clone(),
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             circle_api_base: test_circle_fee_api_base(),
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
         })
         .unwrap();
@@ -9705,7 +9705,7 @@ mod tests {
     /// attestation polling at `circle_api_base` (a local mock), so attestation
     /// polling resolves immediately instead of retrying the real Circle endpoint
     /// for ~5 minutes. Test-support only.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     fn create_test_onchain_services_with_circle_api<Signer: Wallet + Clone>(
         wallet: Signer,
         circle_api_base: String,
@@ -12681,7 +12681,7 @@ mod tests {
 
     /// Like [`make_resume_test_manager`] but with the CCTP bridge's Circle
     /// attestation polling pointed at a local mock so attestation resolves fast.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     async fn make_resume_test_manager_with_circle_api(
         server: &MockServer,
         circle_api_base: String,
@@ -12985,7 +12985,7 @@ mod tests {
     /// the recorded `cctp_nonce` surviving into the failed state is the proof
     /// the attestation was received first: a timeout would leave the nonce
     /// `None` (and the aggregate still in `AwaitingAttestation`).
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn resume_base_to_alpaca_from_awaiting_attestation_before_deadline_records_attestation() {
         let server = MockServer::start();
@@ -13026,7 +13026,7 @@ mod tests {
 
     /// Symmetric to the Base->Alpaca happy-path resume above, for the
     /// Alpaca->Base direction.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn resume_alpaca_to_base_from_awaiting_attestation_before_deadline_records_attestation() {
         let server = MockServer::start();
@@ -13089,7 +13089,7 @@ mod tests {
     /// response must move the aggregate straight to `BridgingFailed` (immediate
     /// operator reconciliation) rather than leave it retryable in
     /// `AwaitingAttestation` until the 24h deadline.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn resume_from_awaiting_attestation_with_malformed_complete_fails_bridging() {
         let server = MockServer::start();
@@ -13284,7 +13284,7 @@ mod tests {
         })
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn resume_base_to_alpaca_from_attested_reconstructs_without_repolling_circle() {
         let server = MockServer::start();
@@ -13342,7 +13342,7 @@ mod tests {
         B256::left_padding_from(&1u64.to_be_bytes())
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn attested_attestation_response_without_message_repolls_circle() {
         let server = MockServer::start();
@@ -13378,7 +13378,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn attested_attestation_response_with_corrupt_envelope_fails_bridging() {
         let server = MockServer::start();
@@ -13425,7 +13425,7 @@ mod tests {
 
     /// An AlpacaToBase retry finds the latched `BridgingFailed` and does not
     /// alert, so an unusable persisted envelope must page at the latch.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn alpaca_to_base_corrupt_envelope_pages_the_operator() {
@@ -13471,7 +13471,7 @@ mod tests {
         )));
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn attested_attestation_response_with_mismatched_nonce_fails_bridging() {
         let server = MockServer::start();
@@ -13525,7 +13525,7 @@ mod tests {
     /// The nonce Circle answers with must be the one recorded at attestation;
     /// otherwise the resume would look up and mint a nonce that is not this
     /// transfer's.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn attested_attestation_response_without_message_rejects_a_repolled_nonce_mismatch() {
         let server = MockServer::start();
@@ -13571,7 +13571,7 @@ mod tests {
 
     /// An AlpacaToBase retry finds the latched `BridgingFailed` and does not
     /// alert, so a legacy re-poll nonce mismatch must page at the latch.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn alpaca_to_base_legacy_repoll_nonce_mismatch_pages_the_operator() {
@@ -17368,7 +17368,7 @@ mod tests {
     /// aggregate is still in `Bridging` and resumable. It must NOT latch a
     /// terminal `BridgingFailed` -- doing so would strand already-burned USDC
     /// behind manual reconciliation for a momentary destination RPC hiccup.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn resume_alpaca_to_base_destination_block_failure_stays_bridging() {
         let server = MockServer::start();
@@ -23933,7 +23933,7 @@ mod tests {
     /// nonce-increment check proves no second burn was submitted.
     ///
     /// Full dual-chain CCTP is needed to call `find_recent_burn` for real.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn resume_bridging_submitting_ethereum_adopts_existing_burn() {
         let chains = deploy_dual_chain_cctp().await;
@@ -26295,7 +26295,7 @@ mod tests {
     /// generic terminal arm and open the circuit on a transfer whose USDC
     /// already burned -- the exact multi-hour stranding this recovery path
     /// exists to fix.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn recover_from_bridging_failed_redrives_on_mint_recovery_inconclusive() {
         let server = MockServer::start();
@@ -26420,7 +26420,7 @@ mod tests {
     /// mint reports `MintRecoveryInconclusive` wrapping `recovery_error()`.
     /// Returns the resume error, the aggregate id and its `initiated_at`, and
     /// the state the aggregate is left in.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     async fn resume_bridging_failed_with_mint_recovery_error(
         recovery_error: fn() -> CctpError,
     ) -> (
@@ -26516,7 +26516,7 @@ mod tests {
     /// retries are spent), under a floor mined after the transfer started,
     /// can lie below that floor: no retry scans wider, so the recovery pages
     /// the operator and parks the transfer instead of redriving forever.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn recover_from_bridging_failed_parks_a_mint_outside_the_recovery_scan() {
@@ -26561,7 +26561,7 @@ mod tests {
     /// A recovery scan whose floor was mined before the transfer started
     /// covers every block the mint can be in, so a used nonce with no visible
     /// log is index lag: the recovery redrives instead of parking.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn recover_from_bridging_failed_redrives_a_lagging_log_in_a_covering_scan() {
@@ -26596,7 +26596,7 @@ mod tests {
 
     /// The nonce read unused below the floor places the mint in the recovery
     /// scan whatever the floor's age, so a missing log is index lag.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn recover_from_bridging_failed_redrives_a_nonce_unused_below_the_floor() {
@@ -26625,7 +26625,7 @@ mod tests {
 
     /// The nonce read used below the floor places the mint below the recovery
     /// scan whatever the floor's age, so the recovery pages and parks.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn recover_from_bridging_failed_parks_a_nonce_used_below_the_floor() {
@@ -26658,7 +26658,7 @@ mod tests {
     /// (a relayer minted a re-attested body) can never be adopted. After a
     /// restart the recovery pages once and parks: redriving could adopt the
     /// relayer mint later and send the USDC to Alpaca after the operator did.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn recover_from_bridging_failed_parks_an_unadoptable_mint() {
@@ -28289,7 +28289,7 @@ mod tests {
     /// the bot-gas ledger, like every other CCTP mint site, so the operator's
     /// action stays visible to gas-cost/P&L reconciliation (ADR 0017). The mint
     /// lands on the chain opposite the burn.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn recover_cctp_mint_enqueues_bot_gas_cost() {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
@@ -28350,7 +28350,7 @@ mod tests {
     /// enqueue fails, the recovery must still return the mint hash and amounts
     /// (flagged as gas not recorded) rather than losing the final mint in a
     /// generic failure.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn recover_cctp_mint_preserves_the_hash_when_the_gas_enqueue_fails() {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
@@ -28413,7 +28413,7 @@ mod tests {
     /// A final mint whose onchain amount does not convert to USDC must come back
     /// as a typed undecodable result carrying the raw values and the error, not
     /// as absent amounts, and must still carry the mint hash.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn recover_cctp_mint_reports_undecodable_amounts_with_the_error() {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
@@ -28555,7 +28555,7 @@ mod tests {
     /// WITHOUT a log scan or a second burn. The scan lower bound is set ABOVE the
     /// burn block, so the scan alone could not have found it -- proving the
     /// receipt-based adopt path, not the scan, did the adoption.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn resume_bridging_submitting_ethereum_adopts_pending_burn_when_mined() {
         let chains = deploy_dual_chain_cctp().await;
@@ -28928,7 +28928,7 @@ mod tests {
     /// transient or terminal error. The recorded tx is a REVERT-opcode tx (mines
     /// with status 0); the scan finds no prior burn, so a fresh burn is submitted
     /// and the aggregate advances to `Bridging` carrying the NEW burn tx.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn resume_bridging_submitting_ethereum_reverted_burn_reburns() {
         let chains = deploy_dual_chain_cctp().await;
@@ -29061,7 +29061,7 @@ mod tests {
     /// so it completes despite the cancellation; the redrive then ADOPTS the
     /// recorded tx (no second burn). Mining is disabled so the confirm wait hangs
     /// (forcing the timeout) and the burn stays pending until the redrive mines it.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn timeout_during_confirm_records_burn_then_redrive_adopts_no_double_burn() {
         let chains = deploy_dual_chain_cctp().await;
@@ -29303,7 +29303,7 @@ mod tests {
     /// it via `confirm_burn` and advances to `Bridging` WITHOUT a second burn. The
     /// scan lower bound sits ABOVE the burn block, so the scan alone could not have
     /// found it -- proving the receipt-based adopt path, not the scan, did the work.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn resume_bridging_submitting_base_adopts_pending_burn_when_mined() {
         let chains = deploy_dual_chain_cctp().await;
@@ -29480,7 +29480,7 @@ mod tests {
     /// reverted burn moved no funds, so reburning is SAFE), advancing to `Bridging`
     /// carrying the NEW tx. The recorded tx is a REVERT-opcode tx (mines status 0);
     /// the scan finds no prior burn, so a fresh burn is submitted.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn resume_bridging_submitting_base_reverted_burn_reburns() {
         let chains = deploy_dual_chain_cctp().await;
@@ -29730,7 +29730,7 @@ mod tests {
     /// `RecordPendingBurn` write fails READONLY and the bounded retries exhaust.
     /// (A fully-closed pool would instead fail the pre-broadcast `ClearPendingBurn`
     /// load, so it cannot isolate the post-broadcast record-failure path.)
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn burn_recording_pending_record_failure_after_broadcast_fails_closed() {
         let chains = deploy_dual_chain_cctp().await;
@@ -29865,7 +29865,7 @@ mod tests {
     /// `resume_bridging_submitting_ethereum` with the same received amount (the
     /// value `resume_alpaca_to_base` derives from the persisted aggregate field).
     /// A nonce check proves no second burn was submitted.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn resume_alpaca_to_base_with_persisted_burn_amount_scans_received_amount_not_nominal() {
         let chains = deploy_dual_chain_cctp().await;
@@ -30037,7 +30037,7 @@ mod tests {
     /// already initiated (`BeginBridging`), so a broadcast may be in flight and an
     /// auto-reburn could double-burn. The genuine first burn is the forward
     /// `execute_cctp_burn_on_ethereum` path, never the resume path.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn resume_bridging_submitting_ethereum_fails_closed_when_no_recorded_burn() {
         let chains = deploy_dual_chain_cctp().await;
@@ -30249,7 +30249,7 @@ mod tests {
     /// (where `resume_alpaca_to_base` computes the scan key from `burn_amount` via
     /// `unwrap_or(nominal_u256)`) is covered separately by
     /// `resume_alpaca_to_base_with_persisted_burn_amount_scans_received_amount_not_nominal`.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[tokio::test]
     async fn resume_bridging_submitting_ethereum_adopts_existing_burn_for_nominal_scan_key() {
         let chains = deploy_dual_chain_cctp().await;

@@ -310,11 +310,11 @@ reqwest_alpaca = { version = "0.13", package = "reqwest", default-features = fal
 ] }
 serial_test.workspace = true
 sqlite-es.workspace = true
-st0x-bridge = { workspace = true, features = ["mock"] }
+st0x-bridge = { workspace = true, features = ["mock", "test-support"] }
+st0x-config = { workspace = true, features = ["test-support"] }
 st0x-event-sorcery = { workspace = true, features = ["test-support"] }
 st0x-evm = { workspace = true, features = ["mock", "test-support"] }
 st0x-execution = { workspace = true, features = ["mock", "test-support"] }
-st0x-hedge = { workspace = true, features = ["test-support", "mock"] }
 st0x-liquidity-client = { workspace = true, features = ["test-support"] }
 st0x-tokenization = { workspace = true, features = ["test-support", "mock"] }
 st0x-wrapper = { workspace = true, features = ["mock"] }
@@ -328,9 +328,13 @@ tracing-subscriber.workspace = true
 tracing-test.workspace = true
 url.workspace = true
 
+# The e2e suite drives the crate's mock and test-support surface. Listing the
+# crate as its own dev-dependency to switch those on would make every unit-test
+# build wait for the library build, so the suite requires them instead.
 [[test]]
 name = "e2e"
 path = "tests/e2e/main.rs"
+required-features = ["test-support", "mock"]
 
 [lints]
 workspace = true

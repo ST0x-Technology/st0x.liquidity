@@ -181,7 +181,7 @@ pub mod bot_gas {
 pub mod conductor {
     pub use crate::conductor::{bounded_rpc_client, configured_equity_symbols};
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub use crate::conductor::{
         TradeProcessingCqrs, execute_acknowledge_fill, process_queued_trade,
     };
@@ -198,7 +198,7 @@ pub mod equity_redemption {
         EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId,
     };
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub use crate::equity_redemption::{
         DetectionFailure, EquityRedemptionError, prepared_withdrawal_for_test,
         redemption_aggregate_id,
@@ -322,7 +322,7 @@ pub mod equity_transfer {
     }
 
     /// Exposes stale-state error mapping to application-boundary tests.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn stale_state_context_for_test<Failure: std::error::Error + Send + Sync + 'static>(
         kind: &str,
         id: &str,
@@ -643,14 +643,14 @@ pub mod inventory {
         OnchainForm, PortfolioAsset, PortfolioBalanceRow, PortfolioLocation,
     };
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub use st0x_config::ImbalanceThreshold;
 }
 
 pub mod mint_authorization {
     pub use crate::mint_authorization::{ConfiguredMintAuthorizer, VaultModeReader};
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub use crate::mint_authorization::StubVaultModeReader;
 }
 
@@ -665,7 +665,7 @@ pub mod offchain {
             OffchainOrderId, OrderPlacementResult, OrderPlacer,
         };
 
-        #[cfg(feature = "test-support")]
+        #[cfg(any(test, feature = "test-support"))]
         pub use crate::offchain::order::{
             CancellationReason, CounterTradeOrderKind, OffchainOrderEvent, PollOrderStatusJobQueue,
             noop_order_placer,
@@ -676,12 +676,12 @@ pub mod offchain {
 pub mod onchain {
     pub use crate::onchain::raindex_contracts;
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub mod trade {
         pub use crate::onchain::trade::RaindexTradeEvent;
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub mod mock {
         pub use crate::onchain::mock::MockRaindex;
     }
@@ -690,7 +690,7 @@ pub mod onchain {
 pub mod onchain_trade {
     pub use crate::onchain_trade::OnChainTrade;
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub use crate::onchain_trade::{InventoryVenue, OnChainTradeCommand, OnChainTradeSource};
 }
 
@@ -912,7 +912,7 @@ pub mod position {
         AnchorDisposition, EquityTransferReservationId, Position, PositionCommand,
     };
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub use crate::position::{PositionEvent, TradeId};
 
     /// The net exposure change a completed [`set_position`] recorded.
@@ -1393,7 +1393,7 @@ pub mod position {
     /// Exposes the aggregate-fail internals to the operator CLI's
     /// application-boundary tests, which drive concurrent-transition races the
     /// public entry point cannot stage deterministically.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub use self::detail::{
         ReloadOutcome, RepairOrderPlacer, classify_reloaded_state, fail_offchain_order_aggregate,
     };
@@ -9668,7 +9668,7 @@ pub mod tokenized_equity_mint {
     pub use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintCommand};
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub mod trading {
     pub mod offchain {
         pub mod close_flatten {
@@ -9699,14 +9699,14 @@ pub mod usdc_rebalance {
         UsdcRebalanceCommand, UsdcRebalanceId,
     };
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub use crate::usdc_rebalance::{ConversionAmounts, TransferRef, swap_quote_for_test};
 }
 
 pub mod vault_lookup {
     pub use crate::vault_lookup::{VaultLookup, VaultRegistryLookup};
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub use crate::vault_lookup::MockVaultLookup;
 }
 
@@ -9720,12 +9720,12 @@ pub mod view_rebuild {
     };
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub mod bindings {
     pub use crate::bindings::IRaindexV6;
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_utils {
     pub use crate::test_utils::{
         OnchainTradeBuilder, TEST_POLL_INTERVAL, get_test_order, mock_alpaca_broker_ctx,

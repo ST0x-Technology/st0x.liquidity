@@ -7958,7 +7958,6 @@ dependencies = [
  "st0x-finance",
  "st0x-float-macro",
  "st0x-float-serde",
- "st0x-hedge",
  "st0x-issuance-client",
  "st0x-issuance-dto",
  "st0x-liquidity-client",
