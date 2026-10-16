@@ -3078,7 +3078,7 @@ mod tests {
     };
     use crate::usdc_rebalance::{
         EthereumWalletCredit, HopEvidence, PreBurnFailEligibility, ReconcileReason,
-        open_ethereum_credits,
+        any_rebalance_holds_guard, interrupted_usdc_rebalance_ids, open_ethereum_credits,
     };
 
     type TestWallet = Arc<dyn Wallet<Provider = RootProvider>>;
@@ -11128,6 +11128,79 @@ mod tests {
                 }
             ),
             "got {error:?}"
+        );
+    }
+
+    /// A replaced deposit is with Relay and a cancelled one holds the USDC at
+    /// the hub, so after either the transfer still holds its guard for the
+    /// startup scan and the live check, and the cancel hold is held credit.
+    #[tokio::test]
+    async fn superseded_hub_deposit_still_holds_the_guard_and_its_credit() {
+        let pool = setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let mut superseded = Vec::new();
+        for command in [
+            UsdcRebalanceCommand::ReplaceSwapDeposit {
+                deposit: SwapDeposit {
+                    tx: TxHash::repeat_byte(0xb2),
+                    order_id: TOWARD_CHAIN_ORDER_ID,
+                    amount: U256::from(AMOUNT_IN),
+                    block: 3,
+                },
+            },
+            UsdcRebalanceCommand::RecordSwapDepositCancelled {
+                cancel_tx: TxHash::repeat_byte(0xc2),
+            },
+        ] {
+            let id = UsdcRebalanceId(Uuid::new_v4());
+            record_quoted_toward_chain(
+                &store,
+                &id,
+                crate::usdc_rebalance::swap_quote_for_test(
+                    U256::from(AMOUNT_IN),
+                    TOWARD_CHAIN_ORDER_ID,
+                ),
+            )
+            .await;
+            store
+                .send(
+                    &id,
+                    UsdcRebalanceCommand::PrepareSwapDeposit {
+                        approve: None,
+                        deposit: PreparedTransaction::for_test(TxHash::repeat_byte(0xa2), 7),
+                    },
+                )
+                .await
+                .unwrap();
+            store.send(&id, command).await.unwrap();
+            superseded.push(id);
+        }
+        let [replaced, cancelled] = superseded.as_slice() else {
+            panic!("expected two transfers");
+        };
+
+        let interrupted = interrupted_usdc_rebalance_ids(&pool).await.unwrap();
+        for id in [replaced, cancelled] {
+            assert!(interrupted.ids.contains(id), "{id} is a guard candidate");
+        }
+        for except in [replaced, cancelled] {
+            assert!(
+                any_rebalance_holds_guard(
+                    &pool,
+                    &store,
+                    Some(except),
+                    Chain::Robinhood,
+                    RebalanceDirection::AlpacaToBase,
+                )
+                .await
+                .unwrap(),
+                "the other transfer holds the guard"
+            );
+        }
+        let credits = open_ethereum_credits(&pool, &store).await.unwrap();
+        assert_eq!(
+            credits.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+            vec![cancelled]
         );
     }
 }
