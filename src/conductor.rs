@@ -13124,11 +13124,22 @@ mod tests {
         .unwrap()
     }
 
+    /// A Base primary plus every chain in `secondaries` as a hedged chain.
+    fn ctx_hedging(secondaries: &[Chain]) -> Ctx {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        for chain in secondaries {
+            let mut secondary = ctx.chains.primary().clone();
+            secondary.chain = *chain;
+            ctx.chains.insert_secondary(secondary);
+        }
+        ctx
+    }
+
     async fn setup_apalis_queues_for_test(
         pool: &SqlitePool,
         apalis_pool: &apalis_sqlite::SqlitePool,
+        ctx: &Ctx,
     ) -> anyhow::Result<()> {
-        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
         let (event_sender, _) = broadcast::channel(16);
         let equity_prices = EquityPriceStore::new(ctx.chains.hedged().map(|hedged| &hedged.assets));
 
@@ -13160,7 +13171,7 @@ mod tests {
             insert_legacy_accounting_row(&apalis_pool, &ethereum, Status::Failed, 1).await;
         let done = insert_legacy_accounting_row(&apalis_pool, &ethereum, Status::Done, 1).await;
 
-        setup_apalis_queues_for_test(&pool, &apalis_pool)
+        setup_apalis_queues_for_test(&pool, &apalis_pool, &ctx_hedging(&[Chain::Ethereum]))
             .await
             .unwrap();
 
@@ -13193,9 +13204,10 @@ mod tests {
         let undecodable =
             insert_legacy_accounting_row(&apalis_pool, b"{}", Status::Pending, 0).await;
 
-        let error = setup_apalis_queues_for_test(&pool, &apalis_pool)
-            .await
-            .unwrap_err();
+        let error =
+            setup_apalis_queues_for_test(&pool, &apalis_pool, &ctx_hedging(&[Chain::Ethereum]))
+                .await
+                .unwrap_err();
 
         assert!(
             error.to_string().contains(&undecodable),
@@ -13207,6 +13219,28 @@ mod tests {
             legacy,
             "the relabel is all or nothing"
         );
+    }
+
+    /// A live row for a chain this config does not hedge has no worker to
+    /// drain it, and it may be the only record of the fill: startup must
+    /// refuse rather than move it onto a queue nobody reads.
+    #[tokio::test]
+    async fn setup_apalis_queues_refuses_a_live_accounting_row_on_an_unhedged_chain() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let legacy = std::any::type_name::<AccountForDexTrade>();
+        let ethereum = serde_json::to_vec(&accounting_payload(Chain::Ethereum)).unwrap();
+        let unhedged =
+            insert_legacy_accounting_row(&apalis_pool, &ethereum, Status::Pending, 0).await;
+
+        let error = setup_apalis_queues_for_test(&pool, &apalis_pool, &ctx_hedging(&[]))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains(&unhedged),
+            "the error must name the row: {error:#}"
+        );
+        assert_eq!(job_type_of(&apalis_pool, &unhedged).await, legacy);
     }
 
     async fn job_count(apalis_pool: &apalis_sqlite::SqlitePool) -> i64 {
