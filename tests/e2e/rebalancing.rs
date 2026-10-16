@@ -45,6 +45,7 @@ use st0x_hedge::e2e_support::seed_mint_at_tokens_wrapped;
 
 use self::assertions::*;
 use crate::assert::{StoredEvent, assert_single_clean_aggregate};
+use crate::poll::{done_job_ids, poll_for_done_job_referencing};
 
 fn issuer_request_id(label: &str) -> String {
     uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, label.as_bytes()).to_string()
@@ -3266,6 +3267,13 @@ async fn interrupted_usdc_base_to_alpaca_resumes_after_restart() -> anyhow::Resu
     let _ = bot1.await;
     tokio::time::sleep(Duration::from_secs(1)).await;
 
+    let jobs_done_before_restart = done_job_ids(
+        &infra.db_path,
+        "TransferUsdcToHedging",
+        &resumed_aggregate_id,
+    )
+    .await?;
+
     // Ethereum automines transactions but not empty blocks. The first bot may
     // already have minted before cancellation; resume then needs an authoritative
     // empty deposit scan at least two blocks past that mint before sending.
@@ -3321,43 +3329,25 @@ async fn interrupted_usdc_base_to_alpaca_resumes_after_restart() -> anyhow::Resu
          contract isn't holding.",
     );
 
-    // Apalis-driven resume produces a Done TransferUsdcToHedging row
-    // in the Jobs table whose serialized payload references the same
-    // aggregate id that BridgingInitiated was emitted under. Asserted via
-    // string match on job_type so the test can sit downstack of the PR
-    // that introduces the type and still fail to compile-time-reference
-    // it.
-    let raw_rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
-        "SELECT job_type, job FROM Jobs \
-         WHERE job_type LIKE '%TransferUsdcToHedging%' \
-         AND status = 'Done'",
-    )
-    .fetch_all(&pool)
-    .await?;
     pool.close().await;
 
-    let successful_job_rows: Vec<(String, String)> = raw_rows
-        .into_iter()
-        .map(|(job_type, job)| (job_type, String::from_utf8_lossy(&job).into_owned()))
-        .collect();
-
-    assert!(
-        !successful_job_rows.is_empty(),
-        "Expected at least one Done TransferUsdcToHedging row in \
-         the Jobs table after restart; the apalis-job-row durability \
-         contract is the only mechanism that produces such a row. None \
-         found, which means the resume happened via some other path \
-         (Rebalancer-mpsc + inventory poller) -- exactly the pre-712 \
-         behaviour this test must reject.",
-    );
-    assert!(
-        successful_job_rows
-            .iter()
-            .any(|(_, job)| job.contains(resumed_aggregate_id.as_str())),
-        "Expected the Done TransferUsdcToHedging row to reference \
-         the resumed_aggregate_id ({resumed_aggregate_id}). Job rows \
-         found: {successful_job_rows:?}",
-    );
+    // Apalis-driven resume leaves a Done TransferUsdcToHedging row whose
+    // payload references the aggregate BridgingInitiated was emitted under,
+    // and the restarted bot must be the one that finished it: the
+    // apalis-job-row durability contract is the only mechanism that produces
+    // such a row, so a resume through another path (Rebalancer-mpsc and the
+    // inventory poller) never satisfies this. Apalis marks the row Done only
+    // after the handler that emitted ConversionConfirmed returns, so a single
+    // read right after that event can miss it; poll instead.
+    poll_for_done_job_referencing(
+        &mut bot2,
+        &infra.db_path,
+        "TransferUsdcToHedging",
+        &resumed_aggregate_id,
+        &jobs_done_before_restart,
+        Duration::from_secs(60),
+    )
+    .await;
 
     assert_single_clean_aggregate(
         &events_after_restart,
