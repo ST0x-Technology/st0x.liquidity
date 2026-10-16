@@ -889,11 +889,12 @@ index) and the row id, and sets `trade_accounting_observe_only{chain}` to 1.
 
 Every `trade_accounting_redrive_interval_secs` the loop frees the stopped
 worker's prefetched rows (`requeue_orphaned`), resets the `Failed` row to
-`Pending` with `attempts = 0` (`requeue_failed`, keeping its `run_at`, so it is
-fetched first) and starts a new worker generation. Each generation has its own
-name, `order-fill-worker-{chain}-{generation}`: apalis refuses a worker name
-whose previous holder heartbeated within its 30s keep-alive. A re-drive that
-fails again halts the same row and logs, without a second page. The first job a
+`Pending` with `attempts = 0` (`requeue_failed_row`, guarded on `Failed`,
+keeping its `run_at`, so it is fetched first) and starts a new worker
+generation. Each generation has its own name,
+`order-fill-worker-{chain}-{generation}`: apalis refuses a worker name whose
+previous holder heartbeated within its 30s keep-alive. A re-drive that fails
+again halts the same row and logs, without a second page. The first job a
 generation completes lifts the halt: the loop logs
 `Trade accounting on {chain} resumed`, and the gauge returns to 0. A row an
 operator marks `Killed` (or deletes) lifts the halt at the next interval without
@@ -937,10 +938,11 @@ interval, so a fill hedged by hand while its row is still `Failed` (or reset to
 check hedges it: do not hedge it by hand. If not, hedge it by hand.
 
 A worker that exits without a job failure (a backend or heartbeat error) halts
-the chain on no row. It pages once, a later exit or a job failure behind a job
-halt does not replace that job halt, and the loop restarts the worker every
-interval. The halt lifts when a generation accounts a fill or runs a full
-interval without exiting.
+the chain on no row. It pages once: a repeat exit does not page again, and an
+exit while a job holds the chain leaves that job halt in place. A job failure
+replaces an exit halt and pages. The loop restarts the worker every interval.
+The halt lifts when a generation accounts a fill or runs a full interval without
+exiting.
 
 Implements `Job<AccountantCtx<Node, Exec>>`. The `perform()` method runs the
 hedging pipeline:

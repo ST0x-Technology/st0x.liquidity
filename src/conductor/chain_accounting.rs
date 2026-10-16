@@ -194,11 +194,14 @@ where
             return Ok(());
         };
 
+        // Reset first, guarded on `Failed`, so an operator's `Killed` that
+        // lands now is read below instead of being raced.
+        if self.queue.requeue_failed_row(&row).await? {
+            info!(target: "hedge", chain = %self.chain, %row, "Re-driving the trade accounting job that halted this chain");
+            return Ok(());
+        }
+
         match self.queue.status_of(&row).await? {
-            Some(Status::Failed) => {
-                let count = self.queue.requeue_failed().await?;
-                info!(target: "hedge", chain = %self.chain, %row, count, "Re-driving the trade accounting job that halted this chain");
-            }
             None => halt.resume("its job row no longer exists"),
             Some(Status::Killed) => halt.resume("its job row was marked Killed"),
             Some(Status::Done) => halt.resume("its job row is done"),

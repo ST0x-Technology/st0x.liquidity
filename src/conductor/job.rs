@@ -627,6 +627,25 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
         Ok(result.rows_affected())
     }
 
+    /// Resets the row `task_identity` to `Pending` with a fresh attempt budget
+    /// if it is still `Failed`; `false` when it is not.
+    pub(crate) async fn requeue_failed_row(
+        &self,
+        task_identity: &TaskIdentity,
+    ) -> Result<bool, SqlxError> {
+        let result = sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Pending', attempts = 0, last_result = NULL, \
+             lock_by = NULL, lock_at = NULL, done_at = NULL \
+             WHERE id = ? AND job_type = ? AND status = 'Failed'",
+        )
+        .bind(task_identity.as_str())
+        .bind(self.queue_key())
+        .execute(self.pool())
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
     /// The status of the row `task_identity` in this queue; `None` once the
     /// row is gone.
     pub(crate) async fn status_of(
