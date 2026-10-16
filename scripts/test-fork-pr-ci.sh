@@ -91,33 +91,17 @@ if jobs.key?("optimize_ci")
 end
 
 expected_wiring = {
-  "changes" => { "needs" => nil, "if" => nil },
-  "backend-build" => {
-    "needs" => "changes",
-    "if" => "${{ needs.changes.outputs.code == 'true' }}"
-  },
-  "backend-lint" => {
-    "needs" => "changes",
-    "if" => "${{ needs.changes.outputs.code == 'true' }}"
-  },
-  "backend-test" => {
-    "needs" => %w[changes backend-build],
-    "if" => "${{ needs.changes.outputs.code == 'true' }}"
-  },
+  "backend-build" => { "needs" => nil, "if" => nil },
+  "backend-lint" => { "needs" => nil, "if" => nil },
+  "backend-test" => { "needs" => "backend-build", "if" => nil },
   "backend" => {
-    "needs" => %w[changes backend-build backend-lint backend-test],
+    "needs" => %w[backend-build backend-lint backend-test],
     "if" => "${{ always() }}"
   },
-  "dashboard-build" => {
-    "needs" => "changes",
-    "if" => "${{ needs.changes.outputs.code == 'true' }}"
-  },
-  "dashboard-lint" => {
-    "needs" => "changes",
-    "if" => "${{ needs.changes.outputs.code == 'true' }}"
-  },
+  "dashboard-build" => { "needs" => nil, "if" => nil },
+  "dashboard-lint" => { "needs" => nil, "if" => nil },
   "dashboard" => {
-    "needs" => %w[changes dashboard-build dashboard-lint],
+    "needs" => %w[dashboard-build dashboard-lint],
     "if" => "${{ always() }}"
   },
   "hooks-run" => { "needs" => nil, "if" => nil },
@@ -145,27 +129,16 @@ end
   exit 1
 end
 
-filter_step = jobs.fetch("changes").fetch("steps").find { |step| step["id"] == "filter" }
-filter_config = filter_step.fetch("with")
-filters = YAML.safe_load(filter_config.fetch("filters")).fetch("code")
-expected_filters = %w[** !**/*.md !docs/** !AGENTS.md !README*]
-unless filter_config["predicate-quantifier"] == "every" && filters == expected_filters
-  warn "the code classifier must exclude only documentation paths"
-  exit 1
-end
-
-checkout_step = jobs.fetch("changes").fetch("steps").find do |step|
-  step.fetch("uses", "").start_with?("actions/checkout@")
-end
-unless checkout_step&.fetch("if", nil) == "${{ github.event_name != 'pull_request' }}"
-  warn "changes checkout must run for push detection and stay off pull_request API detection"
+# No job may skip validation on a change classification: GitHub reports a
+# skipped required job as successful, and every work job feeds a gate.
+if jobs.key?("changes")
+  warn "a change classifier must not gate the work jobs"
   exit 1
 end
 
 workflow_permissions = workflow.fetch("permissions")
-unless workflow_permissions["contents"] == "read" &&
-    workflow_permissions["pull-requests"] == "read"
-  warn "paths-filter permissions must remain explicitly read-only"
+unless workflow_permissions == { "contents" => "read" }
+  warn "CI must hold only read access to repository contents"
   exit 1
 end
 
@@ -220,27 +193,22 @@ check_gate.call(
   "backend",
   "Check backend validation",
   %w[
-    needs.changes.result
-    needs.changes.outputs.code
     needs.backend-build.result
     needs.backend-lint.result
     needs.backend-test.result
   ],
   [
-    [%w[success false skipped skipped skipped], true],
-    [%w[success true success success success], true],
-    [%w[success true failure success success], false],
-    [%w[success true skipped success success], false],
-    [%w[success true cancelled success success], false],
-    [%w[success true success failure success], false],
-    [%w[success true success skipped success], false],
-    [%w[success true success cancelled success], false],
-    [%w[success true success success failure], false],
-    [%w[success true success success skipped], false],
-    [%w[success true success success cancelled], false],
-    [%w[failure unknown skipped skipped skipped], false],
-    [%w[skipped unknown skipped skipped skipped], false],
-    [%w[cancelled unknown skipped skipped skipped], false]
+    [%w[success success success], true],
+    [%w[failure success success], false],
+    [%w[skipped success success], false],
+    [%w[cancelled success success], false],
+    [%w[success failure success], false],
+    [%w[success skipped success], false],
+    [%w[success cancelled success], false],
+    [%w[success success failure], false],
+    [%w[success success skipped], false],
+    [%w[success success cancelled], false],
+    [%w[skipped skipped skipped], false]
   ]
 )
 
@@ -248,23 +216,18 @@ check_gate.call(
   "dashboard",
   "Check dashboard validation",
   %w[
-    needs.changes.result
-    needs.changes.outputs.code
     needs.dashboard-build.result
     needs.dashboard-lint.result
   ],
   [
-    [%w[success false skipped skipped], true],
-    [%w[success true success success], true],
-    [%w[success true failure success], false],
-    [%w[success true skipped success], false],
-    [%w[success true cancelled success], false],
-    [%w[success true success failure], false],
-    [%w[success true success skipped], false],
-    [%w[success true success cancelled], false],
-    [%w[failure unknown skipped skipped], false],
-    [%w[skipped unknown skipped skipped], false],
-    [%w[cancelled unknown skipped skipped], false]
+    [%w[success success], true],
+    [%w[failure success], false],
+    [%w[skipped success], false],
+    [%w[cancelled success], false],
+    [%w[success failure], false],
+    [%w[success skipped], false],
+    [%w[success cancelled], false],
+    [%w[skipped skipped], false]
   ]
 )
 
@@ -371,8 +334,8 @@ if [ "$parsed_action_count" -ne "$action_line_count" ]; then
   exit 1
 fi
 
-assert_count 7 '      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6'
-assert_count 1 '      - uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590  # v3'
+assert_count 6 '      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6'
+assert_absent 'dorny/paths-filter@'
 assert_count 6 '      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035  # v34'
 assert_count 6 '      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71  # v17'
 assert_count 6 '      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569  # v7'
@@ -430,10 +393,6 @@ assert_count 2 '            ./scripts/sync-source-mtimes.sh record'
 assert_line '        run: ./scripts/test-sync-source-mtimes.sh'
 assert_count 2 '            ./scripts/clean-stale-rain-math-float.sh'
 assert_line '        run: ./scripts/test-clean-stale-rain-math-float.sh'
-
-# The pull request files API truncates after 3,000 files. The workflow must run
-# full CI at that boundary rather than accepting a docs-only false negative.
-assert_line "      code: \${{ github.event_name == 'pull_request' && github.event.pull_request.changed_files >= 3000 && 'true' || steps.filter.outputs.code }}"
 
 if grep -R -n -F 'external-pr/' \
   --exclude='test-fork-pr-ci.sh' \

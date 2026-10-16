@@ -21,7 +21,6 @@ concurrency:
 # read-only at the workflow level.
 permissions:
   contents: read
-  pull-requests: read
 
 env:
   # GitHub holds fork pull_request runs for maintainer approval, removes every
@@ -37,49 +36,13 @@ env:
 # old DeterminateSystems installer + magic-nix-cache + custom ABI-prefetch job,
 # which did not share the `rainlanguage` cache that raindex CI populates.
 
+# Every work job starts at once and runs on every change, docs-only ones
+# included. A change classifier in front of them cost ~15 s on every run, and
+# the gates wait for all work jobs anyway, so skipping work for docs-only
+# changes saved no wall time.
 jobs:
-  # Classifies the push: `code == 'true'` when at least one changed file is
-  # NOT a docs file. With `predicate-quantifier: every`, a file matches the
-  # `code` filter only if it matches `**` AND every negated docs glob -- i.e.
-  # it is a non-docs file. A push that mixes code and docs therefore flips
-  # `code` to true and runs full CI (fail-closed); only a confirmed
-  # all-docs push yields `code == 'false'`. If this job errors or is
-  # skipped, `code` is empty/unknown and the gates require the real checks.
-  #
-  # NOTE: paths-filter uses the Pull Requests API for pull_request runs and git
-  # change detection for push/workflow_dispatch, so the checkout is needed for
-  # the latter two events.
-  changes:
-    name: changes
-    runs-on: blacksmith-2vcpu-ubuntu-2404
-    timeout-minutes: 5
-    outputs:
-      # GitHub's pull request files API returns at most 3,000 files. At that
-      # limit the filter may have received a truncated list, so fail into full
-      # CI instead of accepting a possible docs-only false negative.
-      code: ${{ github.event_name == 'pull_request' && github.event.pull_request.changed_files >= 3000 && 'true' || steps.filter.outputs.code }}
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
-        if: ${{ github.event_name != 'pull_request' }}
-        with:
-          persist-credentials: false
-
-      - uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590  # v3
-        id: filter
-        with:
-          predicate-quantifier: 'every'
-          filters: |
-            code:
-              - '**'
-              - '!**/*.md'
-              - '!docs/**'
-              - '!AGENTS.md'
-              - '!README*'
-
   backend-build:
     name: backend build
-    needs: changes
-    if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 30
     env:
@@ -215,8 +178,6 @@ jobs:
   # instead of after it, off the test shards' critical path.
   backend-lint:
     name: backend lint
-    needs: changes
-    if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 30
     env:
@@ -348,8 +309,7 @@ jobs:
 
   backend-test:
     name: backend test ${{ matrix.partition }} of 8
-    needs: [changes, backend-build]
-    if: ${{ needs.changes.outputs.code == 'true' }}
+    needs: backend-build
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 30
     strategy:
@@ -417,7 +377,7 @@ jobs:
 
   backend:
     name: backend
-    needs: [changes, backend-build, backend-lint, backend-test]
+    needs: [backend-build, backend-lint, backend-test]
     # Inspect every dependency state, including failures, skips, and
     # cancellations, so this required check cannot pass without validation.
     if: ${{ always() }}
@@ -426,16 +386,6 @@ jobs:
     steps:
       - name: Check backend validation
         run: |
-          # Skip backend validation ONLY for a confirmed docs-only push: the
-          # changes job succeeded AND found no code files (code == 'false').
-          # Any other state -- changes failed/skipped, or code present -- falls
-          # through and requires the real jobs (which were skipped on a
-          # non-code path), so this gate fails closed rather than
-          # green-lighting untested code.
-          if [ "${{ needs.changes.result }}" = "success" ] && [ "${{ needs.changes.outputs.code }}" = "false" ]; then
-            echo "Docs-only change - backend validation not required."
-            exit 0
-          fi
           if [ "${{ needs.backend-build.result }}" != "success" ] || [ "${{ needs.backend-lint.result }}" != "success" ] || [ "${{ needs.backend-test.result }}" != "success" ]; then
             echo "backend validation failed (build=${{ needs.backend-build.result }}, lint=${{ needs.backend-lint.result }}, test=${{ needs.backend-test.result }})"
             exit 1
@@ -446,8 +396,6 @@ jobs:
   # obsolete build still consumes a runner.
   dashboard-build:
     name: dashboard build
-    needs: changes
-    if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 25
     steps:
@@ -497,8 +445,6 @@ jobs:
   # its own; in one job the two halves ran back to back.
   dashboard-lint:
     name: dashboard lint
-    needs: changes
-    if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 25
     steps:
@@ -563,28 +509,24 @@ jobs:
           nix develop "$GITHUB_WORKSPACE#ci-dashboard" -c bun run typecheck
           nix develop "$GITHUB_WORKSPACE#ci-dashboard" -c bun run format:check
 
-  # Required dashboard check. A confirmed docs-only change may skip the real
-  # build. Every other dependency state, including cancellation, fails closed.
+  # Required dashboard check. Every dependency state other than success,
+  # including skips and cancellation, fails closed.
   dashboard:
     name: dashboard
-    needs: [changes, dashboard-build, dashboard-lint]
+    needs: [dashboard-build, dashboard-lint]
     if: ${{ always() }}
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
       - name: Check dashboard validation
         run: |
-          if [ "${{ needs.changes.result }}" = "success" ] && [ "${{ needs.changes.outputs.code }}" = "false" ]; then
-            echo "Docs-only change - dashboard validation not required."
-            exit 0
-          fi
           if [ "${{ needs.dashboard-build.result }}" != "success" ] || [ "${{ needs.dashboard-lint.result }}" != "success" ]; then
             echo "dashboard validation failed (build=${{ needs.dashboard-build.result }}, lint=${{ needs.dashboard-lint.result }})"
             exit 1
           fi
 
-  # Cancellable hooks work. It runs on docs-only changes because pre-commit is
-  # the only check that validates docs files (deno fmt covers markdown).
+  # Cancellable hooks work. Pre-commit is the only check that validates docs
+  # files (deno fmt covers markdown).
   hooks-run:
     name: hooks validation
     runs-on: blacksmith-2vcpu-ubuntu-2404

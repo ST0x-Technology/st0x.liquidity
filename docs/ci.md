@@ -18,18 +18,18 @@ restart the full suite. Filtering `edited` at job level does not help, because a
 filtered run still cancels the real run in the shared concurrency group. GitHub
 also emits `edited` when a PR's base is retargeted, for example when the parent
 of a stacked PR merges. A retarget without a new push keeps the earlier run's
-result, and that result is not always valid for the new base: the `changes` job
-diffs against the base at run time, so if B is stacked on A, changes only docs
-relative to A, and is retargeted to `master` by hand before A merges, B keeps a
-docs-only pass while A's code would merge through it. GitHub also runs no
-`pull_request` workflow while a PR conflicts with its base; if a retarget
-removes the conflict, no run starts and the required checks stay missing. After
-a manual retarget, push or close and reopen the PR to validate it against the
-new base. The Graphite flow does this automatically: the restack and `gt submit`
-push a new head, which emits `synchronize`. Graphite merge queue draft PRs open
-against the previous `gtmq_spec_*` branch and are later retargeted to `master`;
-their `opened` run already tests the same tree, because each speculative branch
-builds on the one before it.
+result, and that result is not always valid for the new base: the earlier run
+tested B merged into its old base, so if B is stacked on A and is retargeted to
+`master` by hand before A merges, B keeps a pass earned on top of A's code, not
+on `master`. GitHub also runs no `pull_request` workflow while a PR conflicts
+with its base; if a retarget removes the conflict, no run starts and the
+required checks stay missing. After a manual retarget, push or close and reopen
+the PR to validate it against the new base. The Graphite flow does this
+automatically: the restack and `gt submit` push a new head, which emits
+`synchronize`. Graphite merge queue draft PRs open against the previous
+`gtmq_spec_*` branch and are later retargeted to `master`; their `opened` run
+already tests the same tree, because each speculative branch builds on the one
+before it.
 
 All subscribed events for a pull request share one concurrency group, so a later
 event cancels and replaces an older run. The replacement performs the same
@@ -39,18 +39,16 @@ successful.
 
 The required checks are never gated by the Graphite CI optimizer. In particular,
 middle-of-stack PRs run their own backend validation rather than relying on a
-different stack branch. Only a confirmed docs-only diff short-circuits the
-backend and dashboard toolchains; their required gate jobs still execute, and
-pre-commit hooks continue to validate the documentation.
+different stack branch. Every work job runs on every change, docs-only ones
+included: a change classifier in front of the work jobs cost about 15 seconds on
+every run, and the gates wait for all work jobs anyway, so skipping work for
+docs-only changes saved no wall time.
 
 The backend build, lint, and test matrix, dashboard build and lint, and
 pre-commit hooks run in cancellable work jobs. Separate `backend`, `dashboard`,
 and `hooks` gate jobs use `always()` to inspect their results and fail on
 skipped, failed, or cancelled work. This keeps replacement runs responsive
 without allowing an obsolete run to publish a successful required check.
-
-Pull requests with at least 3,000 changed files always run full CI because
-GitHub's pull request files API truncates responses at that boundary.
 
 ## Fork pull requests
 
