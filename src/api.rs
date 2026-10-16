@@ -12849,6 +12849,58 @@ mod tests {
     /// are 422 carrying the typed reason, the transient provider failure is
     /// 502 so the operator knows to retry, and internal failures stay a
     /// generic 500.
+    /// A superseding tx the bot could not read is retried later; one it read
+    /// and refused names why, for the operator to fix or wait out.
+    #[test]
+    fn superseding_tx_refusals_split_an_unread_chain_from_a_refusal() {
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        let superseding = TxHash::repeat_byte(0x5e);
+        let not_superseded = |source| UsdcRecheckError::DepositNotSuperseded {
+            id: id.clone(),
+            superseding,
+            source: Box::new(source),
+        };
+
+        let (status, message) = usdc_recheck_error_response(&not_superseded(
+            RelayBridgeError::Rpc(alloy::transports::TransportErrorKind::backend_gone()),
+        ));
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(message, "Chain RPC unavailable; retry later");
+
+        let (status, message) = usdc_recheck_error_response(&not_superseded(
+            RelayBridgeError::SupersedingTxAtAnotherNonce {
+                superseding,
+                superseding_nonce: 4,
+                nonce: 5,
+            },
+        ));
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            message.ends_with(&format!(
+                "superseding tx {superseding} is at nonce 4, not the deposit's nonce 5"
+            )),
+            "{message}"
+        );
+
+        for refusal in [
+            UsdcRecheckError::SupersedingTxNotApplicable {
+                id: id.clone(),
+                tx: superseding,
+                state: "SwapDeposited",
+            },
+            UsdcRecheckError::ReplacementAmountMismatch {
+                id: id.clone(),
+                replacement: superseding,
+                deposited: U256::from(1u8),
+                expected: U256::from(2u8),
+            },
+        ] {
+            let (status, message) = usdc_recheck_error_response(&refusal);
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(message, refusal.to_string());
+        }
+    }
+
     #[test]
     fn usdc_recheck_error_response_distinguishes_recoverability() {
         let id = UsdcRebalanceId(uuid::Uuid::new_v4());
