@@ -87,6 +87,15 @@ struct AvailablePrice {
     expires_at: DateTime<Utc>,
 }
 
+/// A symbol's newest quote, live or not: the wrapped token's mid price,
+/// the underlying share's where the frame carried it, and when it was quoted.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LastPrice {
+    pub(crate) wrapped_usd: Float,
+    pub(crate) underlying_usd: Option<Float>,
+    pub(crate) observed_at: DateTime<Utc>,
+}
+
 /// Told when a symbol gains a usable mark, so a check that declined for want
 /// of a price runs again. Nothing else wakes it while balances are unchanged.
 #[async_trait::async_trait]
@@ -105,6 +114,10 @@ pub(crate) struct EquityPriceStore {
     /// portfolio snapshot runs at ET midnight and at weekends, when no quote
     /// may be live, and applies its own age rule instead.
     last_marks: Arc<RwLock<HashMap<Symbol, PriceObservation>>>,
+    /// The newest prices each symbol has received this session, live or
+    /// not, so a holding keeps a value after its quote expires: the board
+    /// shows them with their age.
+    last_prices: Arc<RwLock<HashMap<Symbol, LastPrice>>>,
     mark_listener: Arc<std::sync::OnceLock<Arc<dyn MarkListener>>>,
 }
 
@@ -131,6 +144,7 @@ impl EquityPriceStore {
         Self {
             prices: Arc::new(RwLock::new(prices)),
             mark_listener: Arc::default(),
+            last_prices: Arc::default(),
             last_marks: Arc::default(),
         }
     }
@@ -190,13 +204,18 @@ impl EquityPriceStore {
         snapshot
     }
 
-    /// Every symbol's wrapped-token price that has not expired at `now`, in
-    /// symbol order.
-    pub(crate) async fn live_prices(&self, now: DateTime<Utc>) -> Vec<(Symbol, Float)> {
-        let mut live: Vec<(Symbol, Float)> = self
-            .prices
-            .read()
-            .await
+    /// Every symbol's wrapped-token price that has not expired at `now`, and
+    /// every symbol's newest quote this session, live or not, both in symbol
+    /// order. Expiry and disconnects do not clear the newest quotes; the
+    /// observed time says how old each is. Both lists come from the same
+    /// quotes: [`Self::update`] writes them under the `prices` lock, which
+    /// this read holds across both.
+    pub(crate) async fn live_and_last_prices(
+        &self,
+        now: DateTime<Utc>,
+    ) -> (Vec<(Symbol, Float)>, Vec<(Symbol, LastPrice)>) {
+        let prices = self.prices.read().await;
+        let mut live: Vec<(Symbol, Float)> = prices
             .iter()
             .filter_map(|(symbol, price)| {
                 price
@@ -205,8 +224,18 @@ impl EquityPriceStore {
                     .map(|price| (symbol.clone(), price.price_usd))
             })
             .collect();
+        let mut last: Vec<(Symbol, LastPrice)> = self
+            .last_prices
+            .read()
+            .await
+            .iter()
+            .map(|(symbol, price)| (symbol.clone(), *price))
+            .collect();
+        drop(prices);
+
         live.sort_by(|(left, _), (right, _)| left.cmp(right));
-        live
+        last.sort_by(|(left, _), (right, _)| left.cmp(right));
+        (live, last)
     }
 
     /// A store holding one live mark for `symbol`, observed now, with a
@@ -228,6 +257,7 @@ impl EquityPriceStore {
         Self {
             prices: Arc::new(RwLock::new(HashMap::from([(symbol.clone(), Some(price))]))),
             mark_listener: Arc::default(),
+            last_prices: Arc::default(),
             last_marks: Arc::new(RwLock::new(HashMap::from([(symbol, last_mark)]))),
         }
     }
@@ -239,6 +269,7 @@ impl EquityPriceStore {
         Self {
             prices: Arc::new(RwLock::new(HashMap::from([(symbol.clone(), None)]))),
             mark_listener: Arc::default(),
+            last_prices: Arc::default(),
             last_marks: Arc::new(RwLock::new(HashMap::from([(
                 symbol,
                 PriceObservation { price, observed_at },
@@ -273,6 +304,7 @@ impl EquityPriceStore {
         Self {
             prices: Arc::new(RwLock::new(seeded)),
             mark_listener: Arc::default(),
+            last_prices: Arc::default(),
             last_marks: Arc::default(),
         }
     }
@@ -335,7 +367,23 @@ impl EquityPriceStore {
                 price: underlying,
                 observed_at: price.observed_at,
             });
+        let last = LastPrice {
+            wrapped_usd: price.price_usd,
+            underlying_usd: price.underlying_price_usd,
+            observed_at: price.observed_at,
+        };
         *value = Some(price);
+
+        // Still under the `prices` lock, so a reader of both lists never sees
+        // this quote in one and not the other.
+        let mut last_prices = self.last_prices.write().await;
+        if last_prices
+            .get(symbol)
+            .is_none_or(|held| held.observed_at < last.observed_at)
+        {
+            last_prices.insert(symbol.clone(), last);
+        }
+        drop(last_prices);
         drop(prices);
 
         if let Some(mark) = mark {
@@ -960,6 +1008,58 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn last_prices_keep_each_symbols_newest_quote_after_it_expires() {
+        let now = Utc::now();
+        let aapl = Symbol::new("AAPL").unwrap();
+        let store = EquityPriceStore {
+            prices: Arc::new(RwLock::new(HashMap::from([(aapl.clone(), None)]))),
+            mark_listener: Arc::default(),
+            last_prices: Arc::default(),
+            last_marks: Arc::default(),
+        };
+        let quote = |wrapped, underlying, ago| AvailablePrice {
+            price_usd: wrapped,
+            underlying_price_usd: underlying,
+            observed_at: now - TimeDelta::seconds(ago),
+            expires_at: now - TimeDelta::seconds(ago) + TimeDelta::seconds(30),
+        };
+
+        store
+            .update(&aapl, quote(float!(150), Some(float!(100)), 120))
+            .await;
+        store.update(&aapl, quote(float!(151), None, 60)).await;
+        // An older quote arriving late does not replace it.
+        store
+            .update(&aapl, quote(float!(140), Some(float!(90)), 90))
+            .await;
+
+        let (live, last) = store.live_and_last_prices(now).await;
+        assert!(live.is_empty());
+        let last: Vec<(String, String, Option<String>, DateTime<Utc>)> = last
+            .into_iter()
+            .map(|(symbol, price)| {
+                (
+                    symbol.to_string(),
+                    price.wrapped_usd.format().unwrap(),
+                    price
+                        .underlying_usd
+                        .map(|underlying| underlying.format().unwrap()),
+                    price.observed_at,
+                )
+            })
+            .collect();
+        assert_eq!(
+            last,
+            vec![(
+                "AAPL".to_string(),
+                "151".to_string(),
+                None,
+                now - TimeDelta::seconds(60)
+            )]
+        );
+    }
+
+    #[tokio::test]
     async fn live_prices_lists_unexpired_prices_in_symbol_order() {
         let now = Utc::now();
         let available = |price_usd, expires_at| {
@@ -984,12 +1084,14 @@ mod tests {
                 (Symbol::new("SPYM").unwrap(), None),
             ]))),
             mark_listener: Arc::default(),
+            last_prices: Arc::default(),
             last_marks: Arc::default(),
         };
 
         let live: Vec<(String, String)> = store
-            .live_prices(now)
+            .live_and_last_prices(now)
             .await
+            .0
             .into_iter()
             .map(|(symbol, price)| (symbol.to_string(), price.format().unwrap()))
             .collect();
@@ -1100,6 +1202,7 @@ mod tests {
         let store = EquityPriceStore {
             prices: Arc::new(RwLock::new(HashMap::from([(symbol.clone(), None)]))),
             mark_listener: Arc::default(),
+            last_prices: Arc::default(),
             last_marks: Arc::default(),
         };
         assert!(store.update(&symbol, price).await);
@@ -1139,6 +1242,7 @@ mod tests {
         let store = EquityPriceStore {
             prices: Arc::new(RwLock::new(HashMap::from([(symbol.clone(), None)]))),
             mark_listener: Arc::default(),
+            last_prices: Arc::default(),
             last_marks: Arc::default(),
         };
         let listener = Arc::new(RecordingMarkListener::default());
@@ -1183,6 +1287,7 @@ mod tests {
                 }),
             )]))),
             mark_listener: Arc::default(),
+            last_prices: Arc::default(),
             last_marks: Arc::default(),
         };
         let listener = Arc::new(RecordingMarkListener::default());
@@ -1206,6 +1311,7 @@ mod tests {
         let store = EquityPriceStore {
             prices: Arc::new(RwLock::new(HashMap::from([(symbol.clone(), None)]))),
             mark_listener: Arc::default(),
+            last_prices: Arc::default(),
             last_marks: Arc::default(),
         };
         (symbol, store)
@@ -1335,6 +1441,7 @@ mod tests {
                 ),
             ]))),
             mark_listener: Arc::default(),
+            last_prices: Arc::default(),
             last_marks: Arc::default(),
         };
         let listener = Arc::new(RecordingMarkListener::default());
@@ -1355,6 +1462,7 @@ mod tests {
         let store = EquityPriceStore {
             prices: Arc::new(RwLock::new(HashMap::from([(symbol.clone(), None)]))),
             mark_listener: Arc::default(),
+            last_prices: Arc::default(),
             last_marks: Arc::default(),
         };
         assert!(store.update(&symbol, price).await);
@@ -1381,6 +1489,7 @@ mod tests {
         let store = EquityPriceStore {
             prices: Arc::new(RwLock::new(HashMap::from([(symbol.clone(), None)]))),
             mark_listener: Arc::default(),
+            last_prices: Arc::default(),
             last_marks: Arc::default(),
         };
         assert!(store.update(&symbol, price).await);
@@ -1664,6 +1773,7 @@ mod tests {
                 }),
             )]))),
             mark_listener: Arc::default(),
+            last_prices: Arc::default(),
             last_marks: Arc::default(),
         };
 
@@ -1704,6 +1814,7 @@ mod tests {
         let store = EquityPriceStore {
             prices: Arc::new(RwLock::new(HashMap::from([(symbol.clone(), None)]))),
             mark_listener: Arc::default(),
+            last_prices: Arc::default(),
             last_marks: Arc::default(),
         };
         let now = Utc::now();
@@ -1735,6 +1846,7 @@ mod tests {
         let store = EquityPriceStore {
             prices: Arc::new(RwLock::new(HashMap::from([(symbol.clone(), None)]))),
             mark_listener: Arc::default(),
+            last_prices: Arc::default(),
             last_marks: Arc::default(),
         };
         let now = Utc::now();

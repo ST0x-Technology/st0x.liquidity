@@ -1861,6 +1861,15 @@ start, captured before the config loads; `/health` uptime counts from the same
 instant), `liq_settings_*` and `liq_asset_*` for every symbol the primary chain
 lists. An optional setting that is not configured has no series.
 `liq_asset_extended_hours` is absent while counter trading is disabled.
+`liq_asset_chain_trading{chain,symbol}` (0 off, 1 regular hours, 2 extended
+hours too) and `liq_asset_chain_rebalancing{chain,symbol}` (1 enabled, 0.5
+paused, 0 disabled) give each hedged chain's own flags for the symbol, as that
+chain's listing configures them.
+`liq_settings_equity_chain_target{chain,symbol}` is the chain's target share of
+the symbol, the listing's own else the chain's, as the rebalancer reads it,
+wherever the chain rebalances the symbol (enabled or paused); the band
+half-width is `liq_settings_equity_deviation` for every chain. These come from
+the config, so they are there whether or not the planner can size the symbol.
 `liq_settings_info{trading_mode}` is always empty, as it was in the exporter.
 `liq_usdc_corridor_target{chain}` and `liq_usdc_corridor_deviation{chain}` give
 the band of every configured USDC corridor, whatever the USDC mode.
@@ -1886,7 +1895,14 @@ and `liq_equity_exposure_usd{symbol}` (net position times that price) for each
 symbol with a position. The price is the live, unexpired wrapped-token price
 from the pricing feed; positions and prices join on the `symbol` label. A symbol
 with a price but no position, or a position without a live price, has no series.
-If the positions fail to load, the last published prices stay.
+For each symbol with a position the task also publishes the newest quote the bot
+received this session, live or not, so a holding keeps a value after its quote
+expires: `liq_equity_last_price_usd{symbol}` (wrapped token),
+`liq_equity_underlying_price_usd{symbol}` (the underlying share, when the frame
+carried the underlying rates), `liq_equity_price_observed_ts_seconds{symbol}`
+(when it was quoted), and `liq_equity_last_exposure_usd{symbol}` (net position
+times the last wrapped price). A restart clears them until the first quote. If
+the positions fail to load, the last published prices stay.
 
 - `liq_equity_*{symbol}` and the unlabelled `liq_usdc_*` series keep the
   exporter's meaning: the onchain values are the primary chain's vault only,
@@ -1896,57 +1912,74 @@ If the positions fail to load, the last published prices stay.
   0. The reserve is the configured cash reserve, else the gross broker cash
   minus the available broker cash once the gross is read, else 0. It is absent
   until withdrawable cash is read.
-- `liq_equity_chain_{available,inflight}{symbol,chain}` and
+- `liq_equity_chain_{available,inflight,unwrapped,wrapped}{symbol,chain}` and
   `liq_usdc_chain_{available,inflight,ratio}{chain}` list each hedged chain's
-  vault separately. The hedged chains come from the config, not from the view. A
-  chain whose vault no snapshot has read yet is left out: a slot that only a
-  fill, transfer or inflight created holds a delta from 0, not a balance. A
-  chain the config no longer hedges is left out too. `liq_equity_chain_inflight`
-  is the equity in flight from that chain's vault, for example a redemption the
-  broker has not credited yet. Adding it to `liq_equity_chain_available` for the
-  same chain and symbol keeps that redemption from reading as a drop. Its unit
-  changes during a redemption: wrapped vault shares from the vault withdraw
-  until the bot unwraps, then underlying shares. A short unwrap moves the
-  difference into `liq_equity_chain_available`. So the per-chain sum is exact
-  only where the wrapper's ratio is 1. A redemption that is active across a
-  restart leaves both per-chain equity series absent for its chain and symbol
-  until it ends: boot recovery creates the slot from the in-flight quantity, and
-  the vault reads that would mark it read are refused while that redemption is
-  in flight. `liq_equity_chain_available` is in that chain's wrapped vault
-  shares. Each chain's wrapper has its own underlying-per-wrapped ratio, so the
-  series must not be summed across chains or added to broker shares.
-  `liq_usdc_chain_ratio` is that vault's available USDC over itself plus the
-  gross broker cash. It is absent until the gross broker cash is read and while
-  both are 0: it is a bot-only series, so the Values rule applies and no
-  exporter sentinel stands in. It is not the corridor's trigger ratio, which
-  uses the vault total, in flight included.
+  vault separately. `liq_equity_chain_unwrapped` and `liq_equity_chain_wrapped`
+  are the tokens in the bot's wallet on that chain, outside the vault, listed
+  with the chain's vault row (0 before a wallet read). The hedged chains come
+  from the config, not from the view. A chain whose vault no snapshot has read
+  yet is left out: a slot that only a fill, transfer or inflight created holds a
+  delta from 0, not a balance. A chain the config no longer hedges is left out
+  too. `liq_equity_chain_inflight` is the equity in flight from that chain's
+  vault, for example a redemption the broker has not credited yet. Adding it to
+  `liq_equity_chain_available` for the same chain and symbol keeps that
+  redemption from reading as a drop. Its unit changes during a redemption:
+  wrapped vault shares from the vault withdraw until the bot unwraps, then
+  underlying shares. A short unwrap moves the difference into
+  `liq_equity_chain_available`. So the per-chain sum is exact only where the
+  wrapper's ratio is 1. A redemption that is active across a restart leaves the
+  per-chain equity series absent for its chain and symbol until it ends: boot
+  recovery creates the slot from the in-flight quantity, and the vault reads
+  that would mark it read are refused while that redemption is in flight.
+  `liq_equity_chain_available` is in that chain's wrapped vault shares. Each
+  chain's wrapper has its own underlying-per-wrapped ratio, so the series must
+  not be summed across chains or added to broker shares. `liq_usdc_chain_ratio`
+  is that vault's available USDC over itself plus the broker cash: the gross
+  broker cash once read, else, with no cash reserve configured, the broker's
+  available cash (with no reserve the two are the same). It is absent while the
+  broker cash is unknown (not read yet, or a reserve configured and the gross
+  not read) and while both are 0: it is a bot-only series, so the Values rule
+  applies and no exporter sentinel stands in. It is not the corridor's trigger
+  ratio, which uses the vault total, in flight included.
 
 Each time the rebalancing trigger plans a symbol, it publishes that symbol's
 `liq_equity_chain_share{chain,symbol}` and
 `liq_equity_chain_verdict{chain,symbol}` from the allocation planner's own
 input: each chain's share of the symbol's total in underlying shares (vaults
 through their wrapper ratio, plus the broker, transfers in flight included), and
--1, 0 or 1 for below, within or above that chain's own target and band. A chain
-without a target, or whose listing is paused, still counts in the total but has
-no series, because the planner never picks it. The family keeps the latest bands
-of every symbol, so a symbol stays published while others are planned. A symbol
-leaves the family when the planner cannot size it (the broker or a listing chain
-not polled, a stale chain, a total of 0, or a plan input such as a wrapper ratio
-that cannot be read), and while its balance is divergent or restart tainted.
-When a symbol's transfer is in progress the trigger refreshes its bands without
-planning. Shares in flight count at the venue they leave, and venue snapshots
-are not applied while anything is in flight, so the verdict that started a
-transfer stays until the transfer completes; the refresh only picks up fills and
-provider polls of the amount in flight. A frozen asset keeps its last values
-until the next check. The `equity_bands` collector time moves whenever any
-symbol is published, so it does not say how old one symbol's values are. The
-verdict says where the chain sits, not whether the planner acts: it does not act
-while a transfer is in flight. Shares in flight are counted as underlying
-shares, the unit a provider poll and a stranded redemption use. The bot's own
-redemption is in flight in wrapped shares until a provider poll lists it, so
-while the ratio is not 1 the share is off by (ratio - 1) times that amount until
-then. A failed readiness probe of the chain the planner chose keeps the bands it
-recorded.
+-1, 0 or 1 for below, within or above that chain's own target and band.
+`liq_equity_chain_target{chain,symbol}` and
+`liq_equity_chain_deviation{chain,symbol}` are that target and band half-width,
+as shares of the symbol's total, and `liq_equity_underlying_total{symbol}` is
+the total itself, in underlying shares. The inventory family also values every
+asset with a chain vault read in underlying shares, from the snapshots, whether
+or not the planner can size it: `liq_equity_chain_held{chain,symbol}` is the
+vault's available wrapped shares through
+`liq_equity_chain_wrapper_ratio{chain,symbol}` (the underlying shares per
+wrapped share the trigger last read, 1 until it reads one) plus its shares in
+flight; `liq_equity_held_total{symbol}` adds the broker's available and in
+flight; `liq_equity_chain_held_share{chain,symbol}` and
+`liq_equity_offchain_held_share{symbol}` are each venue's share of that total,
+absent while it is 0. A chain without a target, or whose listing is paused,
+still counts in the total but has no series, because the planner never picks it.
+The family keeps the latest bands of every symbol, so a symbol stays published
+while others are planned. A symbol leaves the family when the planner cannot
+size it (the broker or a listing chain not polled, a stale chain, a total of 0,
+or a plan input such as a wrapper ratio that cannot be read), and while its
+balance is divergent or restart tainted. When a symbol's transfer is in progress
+the trigger refreshes its bands without planning. Shares in flight count at the
+venue they leave, and venue snapshots are not applied while anything is in
+flight, so the verdict that started a transfer stays until the transfer
+completes; the refresh only picks up fills and provider polls of the amount in
+flight. A frozen asset keeps its last values until the next check. The
+`equity_bands` collector time moves whenever any symbol is published, so it does
+not say how old one symbol's values are. The verdict says where the chain sits,
+not whether the planner acts: it does not act while a transfer is in flight.
+Shares in flight are counted as underlying shares, the unit a provider poll and
+a stranded redemption use. The bot's own redemption is in flight in wrapped
+shares until a provider poll lists it, so while the ratio is not 1 the share is
+off by (ratio - 1) times that amount until then. A failed readiness probe of the
+chain the planner chose keeps the bands it recorded.
 
 Every 60 seconds a second task publishes the log counts and the performance
 families over the last 24 hours. The performance families come from the same
@@ -9527,14 +9560,15 @@ multiple broker-specific contexts.
    not mutate a Position or the event store. The same store also supplies the
    rebalancer's minimum-operation-size price for a never-filled symbol, the
    daily portfolio snapshot's newer-than-fill mark (see "USD marks"), and the
-   `liq_*` prices family (`liq_position_last_price_usd` and
-   `liq_equity_exposure_usd`, see "Prometheus metrics (`liq_*` contract)").
-   Pricing transport failures are retried. They never affect hedging; they can
-   delay a never-filled symbol's rebalancing, a snapshot taken before any mark
-   arrives falls back to the last fill, and a symbol with no live price is
-   omitted from the replacement prices family at the next refresh that loads
-   positions (a refresh whose position load fails keeps the last family), so its
-   previous sample is dropped until a later refresh has a live price.
+   `liq_*` prices family (`liq_position_last_price_usd`,
+   `liq_equity_exposure_usd`, and the last observed prices, see "Prometheus
+   metrics (`liq_*` contract)"). Pricing transport failures are retried. They
+   never affect hedging; they can delay a never-filled symbol's rebalancing, a
+   snapshot taken before any mark arrives falls back to the last fill, and a
+   symbol with no live price is omitted from the replacement prices family at
+   the next refresh that loads positions (a refresh whose position load fails
+   keeps the last family), so its previous sample is dropped until a later
+   refresh has a live price.
 
 3. **Spreads**: Last realized spreads per asset (buy/sell prices and spread bps)
    and per-symbol price charts over time.

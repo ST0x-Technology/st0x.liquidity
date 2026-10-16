@@ -50,7 +50,7 @@ use st0x_finance::{HasZero, Usd, Usdc};
 #[cfg(test)]
 use st0x_float_macro::float;
 use st0x_tokenization::{ClientRequestId, IssuerRequestId, TokenizationRequestId};
-use st0x_wrapper::{Wrapper, WrapperError};
+use st0x_wrapper::{RATIO_ONE, UnderlyingPerWrapped, Wrapper, WrapperError};
 
 use self::allocation::{
     ChainSlot, DeclineReason, EquityPlan, EquityPlanInput, ManualSizingRefusal, Participation,
@@ -1866,6 +1866,30 @@ impl RebalancingService {
             None
         });
         publisher.record(symbol, bands.flatten());
+    }
+
+    /// Records the wrapper ratio just read for `symbol` on `chain`, so the
+    /// board can value that chain's wrapped shares whether or not the planner
+    /// can size the symbol.
+    fn record_wrapper_ratio(&self, symbol: &Symbol, chain: Chain, ratio: UnderlyingPerWrapped) {
+        let Some(publisher) = self.equity_bands.get() else {
+            return;
+        };
+
+        // The underlying units one whole wrapped share holds, as shares.
+        let per_wrapped = match ratio.to_underlying(RATIO_ONE) {
+            Ok(units) => FractionalShares::from_u256_18_decimals(units),
+            Err(error) => {
+                warn!(target: "rebalance", %symbol, %chain, ?error, "Could not value a wrapper ratio");
+                return;
+            }
+        };
+        match per_wrapped {
+            Ok(per_wrapped) => publisher.record_wrapper_ratio(symbol, chain, per_wrapped),
+            Err(error) => {
+                warn!(target: "rebalance", %symbol, %chain, ?error, "Could not value a wrapper ratio");
+            }
+        }
     }
 
     async fn equity_chain_gas_is_ready(&self, chain: Chain) -> bool {
@@ -5608,6 +5632,7 @@ impl RebalancingService {
                 .get(&chain)
                 .ok_or(equity::EquityTriggerError::UnwiredWrapper { chain })?;
             let ratio = wrapper.get_ratio_for_symbol(symbol).await?;
+            self.record_wrapper_ratio(symbol, chain, ratio);
             let target = listing
                 .target_share
                 .or_else(|| self.config.allocation.targets.get(&chain).copied());
@@ -11146,8 +11171,8 @@ mod tests {
     use st0x_bridge::SwapDeposit;
     use st0x_bridge::corridor::HopKind;
     use st0x_config::{
-        ChainCashAsset, ChainEquities, ChainEquityAsset, ExecutionThreshold, ImbalanceThreshold,
-        OperationMode, RebalancingMode, RelayHopCtx,
+        ChainCashAsset, ChainEquities, ChainEquityAsset, DeviationBand, ExecutionThreshold,
+        ImbalanceThreshold, OperationMode, RebalancingMode, RelayHopCtx, TargetShare,
     };
     use st0x_dto::Statement;
     use st0x_event_sorcery::{
@@ -16315,11 +16340,16 @@ mod tests {
         let publisher = EquityBandPublisher::new(families);
         publisher.record(
             symbol,
-            Some(vec![allocation::ChainBand {
-                chain: Chain::Base,
-                share: float!(0.1),
-                verdict: allocation::BandVerdict::Below,
-            }]),
+            Some(allocation::SymbolBands {
+                total: FractionalShares::new(float!(10)),
+                chains: vec![allocation::ChainBand {
+                    chain: Chain::Base,
+                    share: float!(0.1),
+                    target: TargetShare::new(float!(0.5)).unwrap(),
+                    band: DeviationBand::new(float!(0.05)).unwrap(),
+                    verdict: allocation::BandVerdict::Below,
+                }],
+            }),
         );
         trigger.publish_equity_bands(publisher);
         families
@@ -16339,7 +16369,9 @@ mod tests {
     }
 
     /// Each planned symbol publishes its chains' band verdicts, the same the
-    /// planner acts on: 50 of 100 sits within the default band.
+    /// planner acts on: 50 of 100 sits within the default band. The wrapper
+    /// ratio the plan read goes to the shared store, here 1 underlying per
+    /// wrapped.
     #[tokio::test]
     async fn planning_a_symbol_publishes_its_band_verdicts() {
         let symbol = Symbol::new("AAPL").unwrap();
@@ -16371,6 +16403,17 @@ mod tests {
                 ))
                 .copied(),
             Some(0.5)
+        );
+        let ratios: Vec<(String, Chain, String)> = families
+            .wrapper_ratios()
+            .into_iter()
+            .map(|((symbol, chain), per_wrapped)| {
+                (symbol, chain, per_wrapped.inner().format().unwrap())
+            })
+            .collect();
+        assert_eq!(
+            ratios,
+            vec![("AAPL".to_string(), Chain::Base, "1".to_string())]
         );
     }
 

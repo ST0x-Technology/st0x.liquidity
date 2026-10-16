@@ -8,14 +8,16 @@
 //! and the store ignores an older one, so a publisher that pauses after its
 //! read cannot put older balances back.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use rain_math_float::{Float, FloatError};
+use tracing::warn;
 
 use st0x_config::Ctx;
 use st0x_evm::Chain;
+use st0x_execution::FractionalShares;
 use st0x_finance::Usdc;
 
 use super::settings::cash_reserved;
@@ -33,16 +35,24 @@ pub(crate) struct InventoryInput {
     symbols: Vec<SymbolBalances>,
     usdc: UsdcBalances,
     by_chain: OnchainByChain,
+    /// The wrapper ratios the trigger last read (see
+    /// [`super::LiqFamilies::wrapper_ratios`]).
+    wrapper_ratios: BTreeMap<(String, Chain), FractionalShares>,
 }
 
 impl InventoryInput {
     /// `hedged` is the chains the config hedges: only their vaults get
-    /// per-chain series.
-    pub(crate) fn from_view(view: &InventoryView, hedged: &BTreeSet<Chain>) -> Self {
+    /// per-chain series. `wrapper_ratios` values each chain's wrapped shares.
+    pub(crate) fn from_view(
+        view: &InventoryView,
+        hedged: &BTreeSet<Chain>,
+        wrapper_ratios: BTreeMap<(String, Chain), FractionalShares>,
+    ) -> Self {
         Self {
             symbols: view.symbol_balances(),
             usdc: view.usdc_balances(),
             by_chain: view.onchain_by_chain(hedged),
+            wrapper_ratios,
         }
     }
 }
@@ -108,7 +118,11 @@ impl InventoryPublisher {
     pub(crate) fn read_changed(&self, view: &InventoryView) -> InventoryRead {
         InventoryRead {
             generation: self.families.next_generation(),
-            input: InventoryInput::from_view(view, &self.hedged_chains),
+            input: InventoryInput::from_view(
+                view,
+                &self.hedged_chains,
+                self.families.wrapper_ratios(),
+            ),
         }
     }
 
@@ -119,7 +133,11 @@ impl InventoryPublisher {
     pub(crate) fn read_current(&self, view: &InventoryView) -> Option<InventoryRead> {
         self.started().then(|| InventoryRead {
             generation: self.families.current_generation(),
-            input: InventoryInput::from_view(view, &self.hedged_chains),
+            input: InventoryInput::from_view(
+                view,
+                &self.hedged_chains,
+                self.families.wrapper_ratios(),
+            ),
         })
     }
 
@@ -155,20 +173,139 @@ pub(crate) fn inventory_samples(
     }
 
     usdc_samples(&mut samples, &input.usdc, cash_reserved);
-    let broker_gross = input.usdc.offchain_gross.map(Usdc::inner);
-    chain_samples(&mut samples, &input.by_chain, broker_gross);
+    let broker_cash = ratio_broker_cash(&input.usdc, cash_reserved);
+    chain_samples(&mut samples, &input.by_chain, broker_cash);
+    held_samples(&mut samples, input);
 
     samples
 }
 
-/// The per-chain series. Each vault's ratio divides by the gross broker
-/// cash, so it is absent until that cash is read, and absent while the vault
-/// and the broker are both 0: these series are the bot's own, with no
+/// Each asset's holdings in underlying shares, for an asset with a chain
+/// vault read: a chain's vault through its wrapper ratio (1 until the
+/// trigger reads it) plus its shares in flight, the broker's available and
+/// in flight, their total, and each venue's share of that total. The ratio
+/// read is published too.
+fn held_samples(samples: &mut Vec<LiqSample>, input: &InventoryInput) {
+    let mut chains: BTreeMap<&str, Vec<(Chain, Float)>> = BTreeMap::new();
+    for balance in &input.by_chain.equities {
+        let symbol = strip_prefix(balance.symbol.as_str());
+        let labels = vec![
+            ("chain", balance.chain.as_str().to_string()),
+            ("symbol", symbol.to_string()),
+        ];
+        let ratio = input
+            .wrapper_ratios
+            .get(&(symbol.to_string(), balance.chain));
+        if let Some(ratio) = ratio {
+            push_sample(
+                samples,
+                LiqMetric::EquityChainWrapperRatio,
+                labels.clone(),
+                float_value(ratio.inner()),
+            );
+        }
+        let held = ratio
+            .map_or_else(|| Float::parse("1".to_string()), |ratio| Ok(ratio.inner()))
+            .and_then(|per_wrapped| balance.available.inner() * per_wrapped)
+            .and_then(|vault| vault + balance.inflight.inner());
+        match held {
+            Ok(held) => {
+                push_sample(
+                    samples,
+                    LiqMetric::EquityChainHeld,
+                    labels,
+                    float_value(held),
+                );
+                chains
+                    .entry(symbol)
+                    .or_default()
+                    .push((balance.chain, held));
+            }
+            Err(error) => push_sample(
+                samples,
+                LiqMetric::EquityChainHeld,
+                labels,
+                Err(error.into()),
+            ),
+        }
+    }
+
+    for balances in &input.symbols {
+        let symbol = strip_prefix(balances.symbol.as_str());
+        let Some(held) = chains.get(symbol) else {
+            continue;
+        };
+        let labels = vec![("symbol", symbol.to_string())];
+        let held_total = (balances.offchain_available.inner() + balances.offchain_inflight.inner())
+            .and_then(|broker| {
+                let total = held
+                    .iter()
+                    .try_fold(broker, |sum, (_, chain_held)| sum + *chain_held)?;
+                Ok((broker, total))
+            });
+        let (broker, total) = match held_total {
+            Ok(held_total) => held_total,
+            Err(error) => {
+                push_sample(
+                    samples,
+                    LiqMetric::EquityHeldTotal,
+                    labels,
+                    Err(error.into()),
+                );
+                continue;
+            }
+        };
+        push_sample(
+            samples,
+            LiqMetric::EquityHeldTotal,
+            labels.clone(),
+            float_value(total),
+        );
+        if let Some(share) = defined_share_or_log(broker, total) {
+            push_sample(
+                samples,
+                LiqMetric::EquityOffchainHeldShare,
+                labels,
+                float_value(share),
+            );
+        }
+        for (chain, chain_held) in held {
+            if let Some(share) = defined_share_or_log(*chain_held, total) {
+                push_sample(
+                    samples,
+                    LiqMetric::EquityChainHeldShare,
+                    vec![
+                        ("chain", chain.as_str().to_string()),
+                        ("symbol", symbol.to_string()),
+                    ],
+                    float_value(share),
+                );
+            }
+        }
+    }
+}
+
+/// The broker cash a chain's ratio divides by, as the USDC rebalancer reads
+/// it: the gross balance, which the poller records only while a cash reserve
+/// is configured, else the offchain balance once read with no reserve. With
+/// a reserve and no gross balance there is none: the offchain balance is
+/// then net of the reserve, and the rebalancer skips the check too.
+fn ratio_broker_cash(usdc: &UsdcBalances, cash_reserved: Option<Float>) -> Option<Float> {
+    match (usdc.offchain_gross, cash_reserved) {
+        (Some(gross), _) => Some(gross.inner()),
+        (None, None) if usdc.offchain_read => Some(usdc.offchain_available.inner()),
+        (None, _) => None,
+    }
+}
+
+/// The per-chain series. Each vault's ratio divides by the broker cash from
+/// `ratio_broker_cash`, so it is absent while that is, and absent while the
+/// vault and the broker are both 0: these series are the bot's own, with no
 /// exporter value to keep.
 fn chain_samples(
     samples: &mut Vec<LiqSample>,
     by_chain: &OnchainByChain,
-    broker_gross: Option<Float>,
+    broker_cash: Option<Float>,
 ) {
     for balance in &by_chain.equities {
         let labels = vec![
@@ -178,6 +315,14 @@ fn chain_samples(
         let values = [
             (LiqMetric::EquityChainAvailable, balance.available.inner()),
             (LiqMetric::EquityChainInflight, balance.inflight.inner()),
+            (
+                LiqMetric::EquityChainUnwrapped,
+                balance.wallet_unwrapped.inner(),
+            ),
+            (
+                LiqMetric::EquityChainWrapped,
+                balance.wallet_wrapped.inner(),
+            ),
         ];
         for (metric, value) in values {
             push_sample(samples, metric, labels.clone(), float_value(value));
@@ -195,8 +340,8 @@ fn chain_samples(
             push_sample(samples, metric, labels.clone(), exact(value));
         }
 
-        let ratio = broker_gross.and_then(|broker_gross| {
-            (available + broker_gross)
+        let ratio = broker_cash.and_then(|broker_cash| {
+            (available + broker_cash)
                 .and_then(|whole| defined_share_of(available, whole))
                 .transpose()
         });
@@ -220,6 +365,7 @@ fn symbol_samples(samples: &mut Vec<LiqSample>, balances: &SymbolBalances) {
             LiqMetric::EquityInflightTotal,
             onchain_inflight + offchain_inflight,
         ),
+        (LiqMetric::EquityOffchainInflight, Ok(offchain_inflight)),
         (
             LiqMetric::EquityTotal,
             sum([onchain, offchain, onchain_inflight, offchain_inflight]),
@@ -347,6 +493,15 @@ fn defined_share_of(part: Float, whole: Float) -> Result<Option<Float>, FloatErr
     (part / whole).map(Some)
 }
 
+/// `part / total`, or `None` when `total` is 0, and when the division
+/// fails, which is logged.
+fn defined_share_or_log(part: Float, total: Float) -> Option<Float> {
+    defined_share_of(part, total)
+        .inspect_err(|error| warn!(?error, "Could not compute a held share"))
+        .ok()
+        .flatten()
+}
+
 fn exact(value: Result<Float, FloatError>) -> Result<f64, LiqValueError> {
     float_value(value?)
 }
@@ -391,6 +546,7 @@ pub(crate) mod tests {
             onchain_inflight: Usdc::new(float!(0)),
             offchain_available: Usdc::new(offchain),
             offchain_inflight: Usdc::new(float!(0)),
+            offchain_read: true,
             offchain_gross: None,
             withdrawable_cash: None,
             alpaca_usdc: None,
@@ -404,6 +560,7 @@ pub(crate) mod tests {
             symbols,
             usdc,
             by_chain: OnchainByChain::default(),
+            wrapper_ratios: BTreeMap::new(),
         }
     }
 
@@ -458,6 +615,7 @@ pub(crate) mod tests {
                 onchain_inflight: usdc.onchain_inflight,
                 offchain_available: usdc.offchain_available,
                 offchain_inflight: usdc.offchain_inflight,
+                offchain_read: true,
                 offchain_gross: usdc.offchain_gross,
                 withdrawable_cash: usdc.withdrawable_cash,
                 alpaca_usdc: usdc.alpaca_usdc,
@@ -465,6 +623,7 @@ pub(crate) mod tests {
                 base_wallet: usdc.inflight_cash.base_wallet,
             },
             by_chain: OnchainByChain::default(),
+            wrapper_ratios: BTreeMap::new(),
         }
     }
 
@@ -756,6 +915,21 @@ pub(crate) mod tests {
         assert_eq!(usdc_series(&rendered, "liq_usdc_ratio"), Some(0.0));
     }
 
+    /// The broker's shares in flight are their own series as well as part
+    /// of the symbol's total in flight.
+    #[test]
+    fn the_brokers_shares_in_flight_are_published_apart() {
+        let mut moving = symbol("TSLA", float!(10), float!(20));
+        moving.onchain_inflight = shares(float!(1));
+        moving.offchain_inflight = shares(float!(3));
+
+        let rendered = render(&input(vec![moving], usdc(float!(0), float!(0))), None);
+
+        let value = |name: &str| rendered.get(&series(name, &[("symbol", "TSLA")])).copied();
+        assert_eq!(value("liq_equity_offchain_inflight"), Some(3.0));
+        assert_eq!(value("liq_equity_inflight_total"), Some(4.0));
+    }
+
     #[test]
     fn a_missing_gross_reading_totals_the_available_broker_cash() {
         let mut cash = usdc(float!(300), float!(100));
@@ -872,6 +1046,7 @@ pub(crate) mod tests {
         let input = InventoryInput {
             symbols: Vec::new(),
             usdc: cash,
+            wrapper_ratios: BTreeMap::new(),
             by_chain: OnchainByChain {
                 equities: vec![
                     ChainEquityBalance {
@@ -879,12 +1054,16 @@ pub(crate) mod tests {
                         chain: Chain::Base,
                         available: shares(float!(50)),
                         inflight: shares(float!(0)),
+                        wallet_unwrapped: shares(float!(1)),
+                        wallet_wrapped: shares(float!(2)),
                     },
                     ChainEquityBalance {
                         symbol: Symbol::new("tAAPL").unwrap(),
                         chain: Chain::Robinhood,
                         available: shares(float!(9)),
                         inflight: shares(float!(4)),
+                        wallet_unwrapped: shares(float!(0)),
+                        wallet_wrapped: shares(float!(3)),
                     },
                 ],
                 usdc: vec![
@@ -904,7 +1083,7 @@ pub(crate) mod tests {
 
         let per_chain: BTreeMap<SeriesKey, f64> = render(&input, None)
             .into_iter()
-            .filter(|((name, _), _)| name.contains("_chain_"))
+            .filter(|((name, _), _)| name.contains("_chain_") && !name.contains("_held"))
             .collect();
 
         assert_eq!(
@@ -939,6 +1118,34 @@ pub(crate) mod tests {
                     4.0
                 ),
                 (
+                    series(
+                        "liq_equity_chain_unwrapped",
+                        &[("chain", "base"), ("symbol", "AAPL")]
+                    ),
+                    1.0
+                ),
+                (
+                    series(
+                        "liq_equity_chain_unwrapped",
+                        &[("chain", "robinhood"), ("symbol", "AAPL")]
+                    ),
+                    0.0
+                ),
+                (
+                    series(
+                        "liq_equity_chain_wrapped",
+                        &[("chain", "base"), ("symbol", "AAPL")]
+                    ),
+                    2.0
+                ),
+                (
+                    series(
+                        "liq_equity_chain_wrapped",
+                        &[("chain", "robinhood"), ("symbol", "AAPL")]
+                    ),
+                    3.0
+                ),
+                (
                     series("liq_usdc_chain_available", &[("chain", "base")]),
                     2000.0
                 ),
@@ -966,10 +1173,74 @@ pub(crate) mod tests {
         );
     }
 
+    /// Each chain vault counts in underlying shares, through the wrapper
+    /// ratio the trigger last read (1 until then) plus its shares in
+    /// flight, beside the broker's: 20 at the broker, 50 on Base, and 9
+    /// wrapped at 2 plus 4 in flight on Robinhood make 92.
+    #[test]
+    fn holdings_add_each_chain_in_underlying_shares_with_the_broker() {
+        let aapl = SymbolBalances {
+            symbol: Symbol::new("tAAPL").unwrap(),
+            onchain_available: shares(float!(50)),
+            onchain_inflight: shares(float!(0)),
+            offchain_available: shares(float!(15)),
+            offchain_inflight: shares(float!(5)),
+            base_wallet_unwrapped: shares(float!(0)),
+            base_wallet_wrapped: shares(float!(0)),
+        };
+        let vault = |chain, available, inflight| ChainEquityBalance {
+            symbol: Symbol::new("tAAPL").unwrap(),
+            chain,
+            available: shares(available),
+            inflight: shares(inflight),
+            wallet_unwrapped: shares(float!(0)),
+            wallet_wrapped: shares(float!(0)),
+        };
+        let input = InventoryInput {
+            symbols: vec![aapl],
+            usdc: usdc(float!(0), float!(0)),
+            wrapper_ratios: BTreeMap::from([(
+                ("AAPL".to_string(), Chain::Robinhood),
+                shares(float!(2)),
+            )]),
+            by_chain: OnchainByChain {
+                equities: vec![
+                    vault(Chain::Base, float!(50), float!(0)),
+                    vault(Chain::Robinhood, float!(9), float!(4)),
+                ],
+                usdc: Vec::new(),
+            },
+        };
+
+        let held: BTreeMap<SeriesKey, f64> = render(&input, None)
+            .into_iter()
+            .filter(|((name, _), _)| name.contains("_held") || name.ends_with("_wrapper_ratio"))
+            .collect();
+
+        let chain = |name, chain| series(name, &[("chain", chain), ("symbol", "AAPL")]);
+        let asset = |name| series(name, &[("symbol", "AAPL")]);
+        assert_eq!(
+            held,
+            BTreeMap::from([
+                (chain("liq_equity_chain_held", "base"), 50.0),
+                (chain("liq_equity_chain_held", "robinhood"), 22.0),
+                (chain("liq_equity_chain_wrapper_ratio", "robinhood"), 2.0),
+                (asset("liq_equity_held_total"), 92.0),
+                (chain("liq_equity_chain_held_share", "base"), 50.0 / 92.0),
+                (
+                    chain("liq_equity_chain_held_share", "robinhood"),
+                    22.0 / 92.0
+                ),
+                (asset("liq_equity_offchain_held_share"), 20.0 / 92.0),
+            ])
+        );
+    }
+
     fn one_chain_vault(available: Float, cash: UsdcBalances) -> InventoryInput {
         InventoryInput {
             symbols: Vec::new(),
             usdc: cash,
+            wrapper_ratios: BTreeMap::new(),
             by_chain: OnchainByChain {
                 equities: Vec::new(),
                 usdc: vec![ChainUsdcBalance {
@@ -985,6 +1256,29 @@ pub(crate) mod tests {
         render(input, None)
             .get(&series("liq_usdc_chain_ratio", &[("chain", "hyperevm")]))
             .copied()
+    }
+
+    /// Production reads no gross broker cash and configures no reserve: the
+    /// rebalancer then divides by the offchain balance, and so does the ratio.
+    #[test]
+    fn without_gross_cash_or_a_reserve_the_ratio_uses_the_offchain_balance() {
+        let input = one_chain_vault(float!(3000), usdc(float!(0), float!(1000)));
+
+        assert_eq!(hyperevm_ratio(&input), Some(0.75));
+    }
+
+    /// With a reserve the offchain balance is net of it, so without the
+    /// gross balance there is no ratio, as the rebalancer skips the check.
+    #[test]
+    fn without_gross_cash_a_configured_reserve_leaves_the_ratio_absent() {
+        let input = one_chain_vault(float!(3000), usdc(float!(0), float!(1000)));
+
+        assert_eq!(
+            render(&input, Some(float!(100)))
+                .get(&series("liq_usdc_chain_ratio", &[("chain", "hyperevm")]))
+                .copied(),
+            None
+        );
     }
 
     /// The share is undefined, so the bot-only ratio is absent rather than
@@ -1007,12 +1301,14 @@ pub(crate) mod tests {
         );
     }
 
-    /// Before the gross broker cash is read, the available broker cash can
-    /// be 0 while the broker holds cash, which would publish a vault holding
-    /// part of the cash as 1. The ratio waits for the gross reading.
+    /// Before the broker balance is read, the available broker cash is 0
+    /// while the broker holds cash, which would publish a vault holding part
+    /// of the cash as 1. The ratio waits for the broker reading.
     #[test]
-    fn an_unread_gross_broker_cash_leaves_the_ratio_absent() {
-        let unread = one_chain_vault(float!(400), usdc(float!(0), float!(0)));
+    fn an_unread_broker_balance_leaves_the_ratio_absent() {
+        let mut cash = usdc(float!(0), float!(0));
+        cash.offchain_read = false;
+        let unread = one_chain_vault(float!(400), cash);
         assert_eq!(hyperevm_ratio(&unread), None);
 
         let mut cash = usdc(float!(0), float!(0));
@@ -1073,11 +1369,23 @@ pub(crate) mod tests {
                 shares(float!(12.5)),
                 shares(float!(37.5)),
             )
-            .with_usdc(Usdc::new(float!(2500.5)), Usdc::new(float!(1000.25)))
-            .with_offchain_gross_usd_cents(150_050)
+            .with_usdc(Usdc::new(float!(2500.5)), Usdc::new(float!(0)))
             .with_withdrawable_cash_cents(80_000);
+        // The dashboard shows broker cash only once read.
+        let now = chrono::Utc::now();
+        let view = view
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OffchainUsd {
+                    usd_balance_cents: 100_025,
+                    gross_usd_cents: Some(150_050),
+                    fetched_at: now,
+                },
+                now,
+            )
+            .unwrap();
 
-        let from_view = InventoryInput::from_view(&view, &BTreeSet::from([Chain::Base]));
+        let from_view =
+            InventoryInput::from_view(&view, &BTreeSet::from([Chain::Base]), BTreeMap::new());
         let from_dashboard = input_from_dto(&view.to_dto(&RebalancingBands::default()));
 
         assert_eq!(from_view.symbols, from_dashboard.symbols);

@@ -25,6 +25,8 @@ use rain_math_float::{Float, FloatError};
 use serde::Serialize;
 use tracing::{debug, error, warn};
 
+use st0x_evm::Chain;
+use st0x_execution::{FractionalShares, Symbol};
 use st0x_float_serde::format_float;
 
 use self::pnl::PnlWindowKey;
@@ -63,20 +65,33 @@ pub(crate) enum LiqMetric {
     AssetCounterTrading,
     AssetExtendedHours,
     AssetRebalancing,
+    AssetChainTrading,
+    AssetChainRebalancing,
     UsdcCorridorTarget,
     UsdcCorridorDeviation,
     UsdcCorridorActive,
     EquityOnchainAvailable,
     EquityOffchainAvailable,
     EquityInflightTotal,
+    EquityOffchainInflight,
     EquityTotal,
     EquityUnwrapped,
     EquityWrapped,
     EquityRatio,
     EquityChainAvailable,
     EquityChainInflight,
+    EquityChainUnwrapped,
+    EquityChainWrapped,
     EquityChainShare,
     EquityChainVerdict,
+    EquityChainTarget,
+    EquityChainDeviation,
+    EquityChainWrapperRatio,
+    EquityChainHeld,
+    EquityHeldTotal,
+    EquityChainHeldShare,
+    EquityOffchainHeldShare,
+    EquityUnderlyingTotal,
     UsdcOnchainAvailable,
     UsdcOnchainInflight,
     UsdcOffchainAvailable,
@@ -94,6 +109,11 @@ pub(crate) enum LiqMetric {
     UsdcChainInflight,
     UsdcChainRatio,
     PositionLastPriceUsd,
+    EquityUnderlyingPriceUsd,
+    EquityLastPriceUsd,
+    EquityPriceObservedTsSeconds,
+    EquityLastExposureUsd,
+    SettingsEquityChainTarget,
     EquityExposureUsd,
     HedgeLatencyMs,
     HedgeLatencyMsSamples,
@@ -151,7 +171,7 @@ impl LiqMetric {
     /// Every variant, for the catalog tests. A new variant needs an entry
     /// here and its name in the catalog test.
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 97] = [
+    pub(crate) const ALL: [Self; 115] = [
         Self::BotInfo,
         Self::BotStartTimestampSeconds,
         Self::SettingsInfo,
@@ -167,20 +187,33 @@ impl LiqMetric {
         Self::AssetCounterTrading,
         Self::AssetExtendedHours,
         Self::AssetRebalancing,
+        Self::AssetChainTrading,
+        Self::AssetChainRebalancing,
         Self::UsdcCorridorTarget,
         Self::UsdcCorridorDeviation,
         Self::UsdcCorridorActive,
         Self::EquityOnchainAvailable,
         Self::EquityOffchainAvailable,
         Self::EquityInflightTotal,
+        Self::EquityOffchainInflight,
         Self::EquityTotal,
         Self::EquityUnwrapped,
         Self::EquityWrapped,
         Self::EquityRatio,
         Self::EquityChainAvailable,
         Self::EquityChainInflight,
+        Self::EquityChainUnwrapped,
+        Self::EquityChainWrapped,
         Self::EquityChainShare,
         Self::EquityChainVerdict,
+        Self::EquityChainTarget,
+        Self::EquityChainDeviation,
+        Self::EquityChainWrapperRatio,
+        Self::EquityChainHeld,
+        Self::EquityHeldTotal,
+        Self::EquityChainHeldShare,
+        Self::EquityOffchainHeldShare,
+        Self::EquityUnderlyingTotal,
         Self::UsdcOnchainAvailable,
         Self::UsdcOnchainInflight,
         Self::UsdcOffchainAvailable,
@@ -198,6 +231,11 @@ impl LiqMetric {
         Self::UsdcChainInflight,
         Self::UsdcChainRatio,
         Self::PositionLastPriceUsd,
+        Self::EquityUnderlyingPriceUsd,
+        Self::EquityLastPriceUsd,
+        Self::EquityPriceObservedTsSeconds,
+        Self::EquityLastExposureUsd,
+        Self::SettingsEquityChainTarget,
         Self::EquityExposureUsd,
         Self::HedgeLatencyMs,
         Self::HedgeLatencyMsSamples,
@@ -268,20 +306,33 @@ impl LiqMetric {
             Self::AssetCounterTrading => "liq_asset_counter_trading",
             Self::AssetExtendedHours => "liq_asset_extended_hours",
             Self::AssetRebalancing => "liq_asset_rebalancing",
+            Self::AssetChainTrading => "liq_asset_chain_trading",
+            Self::AssetChainRebalancing => "liq_asset_chain_rebalancing",
             Self::UsdcCorridorTarget => "liq_usdc_corridor_target",
             Self::UsdcCorridorDeviation => "liq_usdc_corridor_deviation",
             Self::UsdcCorridorActive => "liq_usdc_corridor_active",
             Self::EquityOnchainAvailable => "liq_equity_onchain_available",
             Self::EquityOffchainAvailable => "liq_equity_offchain_available",
             Self::EquityInflightTotal => "liq_equity_inflight_total",
+            Self::EquityOffchainInflight => "liq_equity_offchain_inflight",
             Self::EquityTotal => "liq_equity_total",
             Self::EquityUnwrapped => "liq_equity_unwrapped",
             Self::EquityWrapped => "liq_equity_wrapped",
             Self::EquityRatio => "liq_equity_ratio",
             Self::EquityChainAvailable => "liq_equity_chain_available",
             Self::EquityChainInflight => "liq_equity_chain_inflight",
+            Self::EquityChainUnwrapped => "liq_equity_chain_unwrapped",
+            Self::EquityChainWrapped => "liq_equity_chain_wrapped",
             Self::EquityChainShare => "liq_equity_chain_share",
             Self::EquityChainVerdict => "liq_equity_chain_verdict",
+            Self::EquityChainTarget => "liq_equity_chain_target",
+            Self::EquityChainDeviation => "liq_equity_chain_deviation",
+            Self::EquityChainWrapperRatio => "liq_equity_chain_wrapper_ratio",
+            Self::EquityChainHeld => "liq_equity_chain_held",
+            Self::EquityHeldTotal => "liq_equity_held_total",
+            Self::EquityChainHeldShare => "liq_equity_chain_held_share",
+            Self::EquityOffchainHeldShare => "liq_equity_offchain_held_share",
+            Self::EquityUnderlyingTotal => "liq_equity_underlying_total",
             Self::UsdcOnchainAvailable => "liq_usdc_onchain_available",
             Self::UsdcOnchainInflight => "liq_usdc_onchain_inflight",
             Self::UsdcOffchainAvailable => "liq_usdc_offchain_available",
@@ -299,6 +350,11 @@ impl LiqMetric {
             Self::UsdcChainInflight => "liq_usdc_chain_inflight",
             Self::UsdcChainRatio => "liq_usdc_chain_ratio",
             Self::PositionLastPriceUsd => "liq_position_last_price_usd",
+            Self::EquityUnderlyingPriceUsd => "liq_equity_underlying_price_usd",
+            Self::EquityLastPriceUsd => "liq_equity_last_price_usd",
+            Self::EquityPriceObservedTsSeconds => "liq_equity_price_observed_ts_seconds",
+            Self::EquityLastExposureUsd => "liq_equity_last_exposure_usd",
+            Self::SettingsEquityChainTarget => "liq_settings_equity_chain_target",
             Self::EquityExposureUsd => "liq_equity_exposure_usd",
             Self::HedgeLatencyMs => "liq_hedge_latency_ms",
             Self::HedgeLatencyMsSamples => "liq_hedge_latency_ms_samples",
@@ -384,6 +440,12 @@ impl LiqMetric {
                  trading is disabled"
             }
             Self::AssetRebalancing => "1 when the symbol starts new rebalancing operations, else 0",
+            Self::AssetChainTrading => {
+                "Counter trading on the chain: 0 off, 1 regular hours, 2 extended hours too"
+            }
+            Self::AssetChainRebalancing => {
+                "Rebalancing on the chain: 1 enabled, 0.5 paused, 0 disabled"
+            }
             Self::UsdcCorridorTarget => {
                 "Target onchain share of each configured USDC corridor's chain vault"
             }
@@ -394,6 +456,7 @@ impl LiqMetric {
             Self::EquityOnchainAvailable => "Primary chain vault shares available",
             Self::EquityOffchainAvailable => "Broker shares available",
             Self::EquityInflightTotal => "Primary chain vault plus broker shares in flight",
+            Self::EquityOffchainInflight => "Broker shares in flight",
             Self::EquityTotal => {
                 "Primary chain vault plus broker shares, available and in flight; excludes \
                  wallet tokens and other chains"
@@ -403,12 +466,6 @@ impl LiqMetric {
             Self::EquityRatio => {
                 "Primary chain vault share of available shares; 0 when nothing is available"
             }
-            Self::EquityChainAvailable => {
-                "Wrapped vault shares on each hedged chain a snapshot read; never sum chains"
-            }
-            Self::EquityChainInflight => "In flight from each hedged chain vault; units in SPEC",
-            Self::EquityChainShare => "Chain's share of the symbol in underlying shares",
-            Self::EquityChainVerdict => "-1 below the chain's band, 0 within, 1 above",
             Self::UsdcOnchainAvailable => "Primary chain vault settlement stable available",
             Self::UsdcOnchainInflight => "Primary chain vault settlement stable in flight",
             Self::UsdcOffchainAvailable => "Broker cash available after the reserve",
@@ -437,12 +494,32 @@ impl LiqMetric {
                 "Settlement stable in flight in each hedged chain vault a snapshot has read"
             }
             Self::UsdcChainRatio => {
-                "Vault share of itself plus gross broker cash; absent until gross is read or both 0"
+                "Vault share of itself plus broker cash: gross once read, else available with no \
+                 reserve; absent while that cash is unknown or both are 0"
             }
-            Self::PositionLastPriceUsd => {
-                "Live wrapped-token mid price in USD of each symbol with a position"
+            Self::SettingsEquityChainTarget => {
+                "Target share of the symbol on each chain that rebalances it, from the config"
             }
-            Self::EquityExposureUsd => "Net position times its live price, in USD",
+            Self::EquityChainAvailable
+            | Self::EquityChainInflight
+            | Self::EquityChainUnwrapped
+            | Self::EquityChainWrapped
+            | Self::EquityChainShare
+            | Self::EquityChainVerdict
+            | Self::EquityChainTarget
+            | Self::EquityChainDeviation
+            | Self::EquityChainWrapperRatio
+            | Self::EquityChainHeld
+            | Self::EquityHeldTotal
+            | Self::EquityChainHeldShare
+            | Self::EquityOffchainHeldShare
+            | Self::EquityUnderlyingTotal => self.chain_equity_help(),
+            Self::PositionLastPriceUsd
+            | Self::EquityUnderlyingPriceUsd
+            | Self::EquityLastPriceUsd
+            | Self::EquityPriceObservedTsSeconds
+            | Self::EquityLastExposureUsd
+            | Self::EquityExposureUsd => self.prices_help(),
             Self::HedgeLatencyMs
             | Self::HedgeLatencyMsSamples
             | Self::OpenExposureFillCount
@@ -521,6 +598,68 @@ impl LiqMetric {
             Self::CollectorLastSuccessTsSeconds => {
                 "Unix time each liq_ collector last published its family"
             }
+        }
+    }
+
+    /// HELP text of the per-chain equity holdings and bands, which `help`
+    /// routes here.
+    const fn chain_equity_help(self) -> &'static str {
+        match self {
+            Self::EquityChainAvailable => {
+                "Wrapped vault shares on each hedged chain a snapshot read; never sum chains"
+            }
+            Self::EquityChainInflight => "In flight from each hedged chain vault; units in SPEC",
+            Self::EquityChainUnwrapped => {
+                "Unwrapped tokens in the wallet on each hedged chain a snapshot read"
+            }
+            Self::EquityChainWrapped => {
+                "Wrapped tokens in the wallet on each hedged chain a snapshot read"
+            }
+            Self::EquityChainShare => "Chain's share of the symbol in underlying shares",
+            Self::EquityChainVerdict => "-1 below the chain's band, 0 within, 1 above",
+            Self::EquityChainTarget => {
+                "Chain's target share of the symbol, as the planner judges it"
+            }
+            Self::EquityChainDeviation => "Chain's band half-width around its target share",
+            Self::EquityChainWrapperRatio => {
+                "Underlying shares per wrapped share of each chain's wrapper, as last read"
+            }
+            Self::EquityChainHeld => {
+                "Each chain vault in underlying shares: wrapped through its ratio, plus in flight"
+            }
+            Self::EquityHeldTotal => "Broker and every listed chain vault, in underlying shares",
+            Self::EquityChainHeldShare => "Each chain vault's share of liq_equity_held_total",
+            Self::EquityOffchainHeldShare => "The broker's share of liq_equity_held_total",
+            Self::EquityUnderlyingTotal => {
+                "Broker and each slotted rebalancing chain vault, in underlying shares, available \
+                 and in flight"
+            }
+            // `help` routes only the names above here; the catalog test
+            // fails on the empty text if one is routed without its own arm.
+            _ => "",
+        }
+    }
+
+    /// HELP text of the `Prices` family's names, which `help` routes here.
+    const fn prices_help(self) -> &'static str {
+        match self {
+            Self::PositionLastPriceUsd => {
+                "Live wrapped-token mid price in USD of each symbol with a position"
+            }
+            Self::EquityUnderlyingPriceUsd => {
+                "Underlying-share mid price in USD of each symbol with a position, as last observed"
+            }
+            Self::EquityLastPriceUsd => {
+                "Wrapped-token mid price in USD of each symbol with a position, as last observed"
+            }
+            Self::EquityPriceObservedTsSeconds => {
+                "Unix time the last observed price of each symbol with a position was quoted"
+            }
+            Self::EquityLastExposureUsd => "Net position times its last observed price, in USD",
+            Self::EquityExposureUsd => "Net position times its live price, in USD",
+            // `help` routes only the names above here; the catalog test
+            // fails on the empty text if one is routed without its own arm.
+            _ => "",
         }
     }
 
@@ -607,18 +746,36 @@ impl LiqMetric {
             | Self::EquityOnchainAvailable
             | Self::EquityOffchainAvailable
             | Self::EquityInflightTotal
+            | Self::EquityOffchainInflight
+            | Self::EquityHeldTotal
+            | Self::EquityOffchainHeldShare
             | Self::EquityTotal
             | Self::EquityUnwrapped
             | Self::EquityWrapped
             | Self::EquityRatio
             | Self::PositionLastPriceUsd
+            | Self::EquityUnderlyingPriceUsd
+            | Self::EquityLastPriceUsd
+            | Self::EquityPriceObservedTsSeconds
+            | Self::EquityLastExposureUsd
             | Self::EquityExposureUsd
             | Self::OpenExposureFillCount
-            | Self::OpenExposureOldestTsSeconds => &["symbol"],
+            | Self::OpenExposureOldestTsSeconds
+            | Self::EquityUnderlyingTotal => &["symbol"],
             Self::EquityChainAvailable
+            | Self::EquityChainHeld
+            | Self::EquityChainHeldShare
             | Self::EquityChainInflight
+            | Self::EquityChainUnwrapped
+            | Self::EquityChainWrapped
             | Self::EquityChainShare
-            | Self::EquityChainVerdict => &["chain", "symbol"],
+            | Self::EquityChainVerdict
+            | Self::EquityChainTarget
+            | Self::EquityChainDeviation
+            | Self::EquityChainWrapperRatio
+            | Self::AssetChainTrading
+            | Self::AssetChainRebalancing
+            | Self::SettingsEquityChainTarget => &["chain", "symbol"],
             Self::UsdcCorridorTarget
             | Self::UsdcCorridorDeviation
             | Self::UsdcCorridorActive
@@ -713,18 +870,29 @@ impl LiqMetric {
             | Self::AssetCounterTrading
             | Self::AssetExtendedHours
             | Self::AssetRebalancing
+            | Self::AssetChainTrading
+            | Self::AssetChainRebalancing
+            | Self::SettingsEquityChainTarget
             | Self::UsdcCorridorTarget
             | Self::UsdcCorridorDeviation
             | Self::UsdcCorridorActive => Some(LiqFamily::Settings),
             Self::EquityOnchainAvailable
             | Self::EquityOffchainAvailable
             | Self::EquityInflightTotal
+            | Self::EquityOffchainInflight
             | Self::EquityTotal
             | Self::EquityUnwrapped
             | Self::EquityWrapped
             | Self::EquityRatio
             | Self::EquityChainAvailable
             | Self::EquityChainInflight
+            | Self::EquityChainWrapperRatio
+            | Self::EquityChainHeld
+            | Self::EquityHeldTotal
+            | Self::EquityChainHeldShare
+            | Self::EquityOffchainHeldShare
+            | Self::EquityChainUnwrapped
+            | Self::EquityChainWrapped
             | Self::UsdcOnchainAvailable
             | Self::UsdcOnchainInflight
             | Self::UsdcOffchainAvailable
@@ -741,8 +909,17 @@ impl LiqMetric {
             | Self::UsdcChainAvailable
             | Self::UsdcChainInflight
             | Self::UsdcChainRatio => Some(LiqFamily::Inventory),
-            Self::PositionLastPriceUsd | Self::EquityExposureUsd => Some(LiqFamily::Prices),
-            Self::EquityChainShare | Self::EquityChainVerdict => Some(LiqFamily::EquityBands),
+            Self::PositionLastPriceUsd
+            | Self::EquityUnderlyingPriceUsd
+            | Self::EquityLastPriceUsd
+            | Self::EquityPriceObservedTsSeconds
+            | Self::EquityLastExposureUsd
+            | Self::EquityExposureUsd => Some(LiqFamily::Prices),
+            Self::EquityChainShare
+            | Self::EquityChainVerdict
+            | Self::EquityChainTarget
+            | Self::EquityChainDeviation
+            | Self::EquityUnderlyingTotal => Some(LiqFamily::EquityBands),
             Self::HedgeLatencyMs
             | Self::HedgeLatencyMsSamples
             | Self::OpenExposureFillCount
@@ -933,6 +1110,11 @@ impl LabelSet {
 pub(crate) struct LiqFamilies {
     families: Mutex<BTreeMap<LiqFamily, FamilyEntry>>,
     generations: AtomicU64,
+    /// The wrapper ratio the rebalancing trigger last read for each symbol
+    /// (without its `t` prefix) on each chain, in underlying shares per
+    /// wrapped share. The inventory publisher values each chain's wrapped
+    /// shares with it.
+    wrapper_ratios: Mutex<BTreeMap<(String, Chain), FractionalShares>>,
 }
 
 /// Samples are shared, so a render copies the `Arc`s under the lock and
@@ -946,6 +1128,32 @@ struct FamilyEntry {
 }
 
 impl LiqFamilies {
+    /// Records the wrapper ratio the trigger last read for `symbol` on
+    /// `chain`.
+    pub(crate) fn record_wrapper_ratio(
+        &self,
+        symbol: &Symbol,
+        chain: Chain,
+        per_wrapped: FractionalShares,
+    ) {
+        self.wrapper_ratios
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                (strip_prefix(symbol.as_str()).to_string(), chain),
+                per_wrapped,
+            );
+    }
+
+    /// Each wrapper ratio last read, by symbol (without its `t` prefix) and
+    /// chain.
+    pub(crate) fn wrapper_ratios(&self) -> BTreeMap<(String, Chain), FractionalShares> {
+        self.wrapper_ratios
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     /// Replaces every sample of `family` and records `at` as its last
     /// success. Samples the family may not publish are dropped and logged
     /// (see [`owned_unique_samples`]).
@@ -1442,20 +1650,33 @@ pub(crate) mod tests {
                 "liq_asset_counter_trading",
                 "liq_asset_extended_hours",
                 "liq_asset_rebalancing",
+                "liq_asset_chain_trading",
+                "liq_asset_chain_rebalancing",
                 "liq_usdc_corridor_target",
                 "liq_usdc_corridor_deviation",
                 "liq_usdc_corridor_active",
                 "liq_equity_onchain_available",
                 "liq_equity_offchain_available",
                 "liq_equity_inflight_total",
+                "liq_equity_offchain_inflight",
                 "liq_equity_total",
                 "liq_equity_unwrapped",
                 "liq_equity_wrapped",
                 "liq_equity_ratio",
                 "liq_equity_chain_available",
                 "liq_equity_chain_inflight",
+                "liq_equity_chain_unwrapped",
+                "liq_equity_chain_wrapped",
                 "liq_equity_chain_share",
                 "liq_equity_chain_verdict",
+                "liq_equity_chain_target",
+                "liq_equity_chain_deviation",
+                "liq_equity_chain_wrapper_ratio",
+                "liq_equity_chain_held",
+                "liq_equity_held_total",
+                "liq_equity_chain_held_share",
+                "liq_equity_offchain_held_share",
+                "liq_equity_underlying_total",
                 "liq_usdc_onchain_available",
                 "liq_usdc_onchain_inflight",
                 "liq_usdc_offchain_available",
@@ -1473,6 +1694,11 @@ pub(crate) mod tests {
                 "liq_usdc_chain_inflight",
                 "liq_usdc_chain_ratio",
                 "liq_position_last_price_usd",
+                "liq_equity_underlying_price_usd",
+                "liq_equity_last_price_usd",
+                "liq_equity_price_observed_ts_seconds",
+                "liq_equity_last_exposure_usd",
+                "liq_settings_equity_chain_target",
                 "liq_equity_exposure_usd",
                 "liq_hedge_latency_ms",
                 "liq_hedge_latency_ms_samples",
