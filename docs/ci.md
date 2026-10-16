@@ -86,6 +86,26 @@ Use a pull request event for merge-blocking validation. Reserve
 `workflow_dispatch` for manual runs whose result does not need to become a pull
 request status check.
 
+## Parallel rustc frontend
+
+`backend build` sets `RUSTC_WORKSPACE_WRAPPER` to
+`scripts/rustc-parallel-frontend.sh`, which adds `-Zthreads=$(nproc)` to rustc
+for workspace crates only, with `RUSTC_BOOTSTRAP=1` scoped to those invocations
+so the unstable flag works on the stable toolchain. The `st0x-hedge` library and
+its unit-test harness dominate the build, and their type checking otherwise runs
+on one core: a cold workspace build took 140 s instead of 221 s locally.
+Dependencies build unchanged. The wrapper leaves incremental compilations alone:
+with `-C incremental` the parallel frontend crashed rustc's dependency graph on
+1.94 (CI run 38863026755), so `backend build` builds with `CARGO_INCREMENTAL=0`.
+Cargo also sends its target-info probe through the wrapper, and with
+`RUSTC_BOOTSTRAP` that probe reports unstable cfgs, which cargo then gives to
+every package. So the wrapper passes `--print` calls and version queries to
+rustc unchanged. Cargo fingerprints the wrapper's path, not its content, so
+`sync-source-mtimes.sh` treats the wrapper as a build-wide input. To roll back,
+drop the variable; the next run rebuilds the workspace crates once, since the
+wrapper is part of cargo's fingerprint. `backend lint` does not use it, because
+`cargo clippy` sets its own workspace wrapper.
+
 ## Test shards
 
 The eight `backend test` shards do not `need` `backend build`. They start with
@@ -109,10 +129,12 @@ takes little more than its slowest test.
 ## Persistent target directories
 
 `backend build` and `backend lint` keep their cargo target directories
-(`target/test`, `target/lint`) on Blacksmith sticky disks and build with
-`CARGO_INCREMENTAL=1`. A large share of the compile is the `st0x-hedge` test
-harness, which no dependency cache or sccache can reuse; rustc's incremental
-state can.
+(`target/test`, `target/lint`) on Blacksmith sticky disks, so crates whose
+sources did not change stay built. `backend lint` builds with
+`CARGO_INCREMENTAL=1`, so clippy also reuses rustc's incremental state for the
+crates that did change. `backend build` builds with `CARGO_INCREMENTAL=0` and
+the parallel frontend instead (see above): the two crashed rustc together, and a
+changed crate recompiles faster in full on all cores.
 
 - Each trusted run mounts the last saved snapshot. Only master pushes save one,
   so pull request runs never replace it. A manual `workflow_dispatch` run mounts
@@ -132,10 +154,10 @@ state can.
   `sync-source-mtimes.sh prepare` gives every tracked file an old fixed mtime
   and the current time to each file whose content hash differs from the recorded
   tree, including files that master changed after this branch forked. Cargo then
-  reruns rustc only for crates with a changed source, and rustc's incremental
-  cache reuses whatever still matches. With no recorded tree, every file counts
-  as changed. Registry and git dependencies fingerprint by version and stay
-  built.
+  reruns rustc only for crates with a changed source (in `backend lint`, rustc's
+  incremental cache then reuses whatever still matches). With no recorded tree,
+  every file counts as changed. Registry and git dependencies fingerprint by
+  version and stay built.
 - Some inputs are not in cargo's dep-info for the crate they affect. A
   `Cargo.lock`, `Cargo.toml`, toolchain, `.cargo/`, `build.rs`, or `ci.yaml`
   change can select an older artifact variant still on the disk, since `ci.yaml`

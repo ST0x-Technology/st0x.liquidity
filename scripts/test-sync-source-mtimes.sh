@@ -166,10 +166,12 @@ expect_all_new_after write_file migrations/2_b.sql
 expect_all_new_after delete_file migrations/1_a.sql
 expect_all_new_after write_file .sqlx/query-1.json
 expect_all_new_after write_file .github/workflows/ci.yaml
+expect_all_new_after write_file scripts/rustc-parallel-frontend.sh
 expect_all_new_after write_file src/build.rs
 expect_all_new_after delete_file src/build.rs
 expect_partial_after write_file src/Cargo.toml.rs
 expect_partial_after write_file docs/migrations/notes.md
+expect_partial_after write_file scripts/other.sh
 
 if (cd / && CARGO_TARGET_DIR=target/test "$fixture/scripts/sync-source-mtimes.sh" bogus > /dev/null 2>&1); then
   echo "an unknown mode must fail" >&2
