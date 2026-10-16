@@ -23,6 +23,7 @@ board_port = 8012
 database_url = "sqlite:///mnt/data/s01-issuer.db"
 log_level = "info"
 apalis_finished_job_cleanup_interval_secs = 3600
+trade_accounting_redrive_interval_secs = 60
 inventory_divergence_threshold = 10
 hedge_order_gate_reconciliation_timeout_secs = 10
 

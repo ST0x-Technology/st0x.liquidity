@@ -266,6 +266,7 @@ struct Config {
     #[serde(default = "default_hedge_order_gate_reconciliation_timeout_secs")]
     hedge_order_gate_reconciliation_timeout_secs: NonZeroU64,
     apalis_finished_job_cleanup_interval_secs: u64,
+    trade_accounting_redrive_interval_secs: u64,
     telemetry: Option<TelemetryConfig>,
     alerts: Option<AlertsConfig>,
     pricing: Option<PricingConfig>,
@@ -834,6 +835,9 @@ pub struct Ctx {
     /// starting from `counter_trade_slippage_bps` at the window's start.
     pub close_flatten_cross_max_bps: u16,
     pub apalis_finished_job_cleanup_interval_secs: u64,
+    /// Seconds between re-drives of the fill that halted a chain's trade
+    /// accounting. Required (no silent default) and non-zero.
+    pub trade_accounting_redrive_interval_secs: u64,
     pub broker: BrokerCtx,
     pub telemetry: Option<TelemetryCtx>,
     /// Gas-balance alerting and transfer-readiness context, required by
@@ -1458,6 +1462,10 @@ impl std::fmt::Debug for Ctx {
                 "apalis_finished_job_cleanup_interval_secs",
                 &self.apalis_finished_job_cleanup_interval_secs,
             )
+            .field(
+                "trade_accounting_redrive_interval_secs",
+                &self.trade_accounting_redrive_interval_secs,
+            )
             .field("broker", &self.broker)
             .field("telemetry", &self.telemetry)
             .field("alerts", &self.alerts)
@@ -1588,6 +1596,7 @@ struct ValidatedParts {
     extended_hours_close_flatten_window_secs: u64,
     close_flatten_cross_max_bps: u16,
     apalis_finished_job_cleanup_interval_secs: u64,
+    trade_accounting_redrive_interval_secs: u64,
     broker: BrokerCtx,
     telemetry: Option<TelemetryCtx>,
     alerts: Option<AlertsCtx>,
@@ -1795,6 +1804,7 @@ struct PollingIntervalsSecs {
     position_check: u64,
     inventory_poll: u64,
     apalis_finished_job_cleanup: u64,
+    trade_accounting_redrive: u64,
 }
 
 fn validated_polling_intervals(config: &Config) -> Result<PollingIntervalsSecs, CtxError> {
@@ -1803,6 +1813,7 @@ fn validated_polling_intervals(config: &Config) -> Result<PollingIntervalsSecs, 
         position_check: config.position_check_interval_secs.unwrap_or(60),
         inventory_poll: config.inventory_poll_interval_secs.unwrap_or(60),
         apalis_finished_job_cleanup: config.apalis_finished_job_cleanup_interval_secs,
+        trade_accounting_redrive: config.trade_accounting_redrive_interval_secs,
     };
 
     for (value, field) in [
@@ -1812,6 +1823,10 @@ fn validated_polling_intervals(config: &Config) -> Result<PollingIntervalsSecs, 
         (
             intervals.apalis_finished_job_cleanup,
             "apalis_finished_job_cleanup_interval_secs",
+        ),
+        (
+            intervals.trade_accounting_redrive,
+            "trade_accounting_redrive_interval_secs",
         ),
     ] {
         if value == 0 {
@@ -2550,6 +2565,7 @@ fn parse_and_validate_with(
         extended_hours_close_flatten_window_secs,
         close_flatten_cross_max_bps,
         apalis_finished_job_cleanup_interval_secs: polling_intervals.apalis_finished_job_cleanup,
+        trade_accounting_redrive_interval_secs: polling_intervals.trade_accounting_redrive,
         broker,
         telemetry,
         alerts,
@@ -2805,6 +2821,7 @@ impl Ctx {
             close_flatten_cross_max_bps: parts.close_flatten_cross_max_bps,
             apalis_finished_job_cleanup_interval_secs: parts
                 .apalis_finished_job_cleanup_interval_secs,
+            trade_accounting_redrive_interval_secs: parts.trade_accounting_redrive_interval_secs,
             broker: parts.broker,
             telemetry: parts.telemetry,
             alerts: parts.alerts,
@@ -3083,6 +3100,7 @@ impl Ctx {
         #[builder(default = const { NonZeroU64::new(10).unwrap() })]
         hedge_order_gate_reconciliation_timeout_secs: NonZeroU64,
         #[builder(default = 3600)] apalis_finished_job_cleanup_interval_secs: u64,
+        #[builder(default = 1)] trade_accounting_redrive_interval_secs: u64,
         #[builder(default = 0)] server_port: u16,
         #[builder(default = 0)] board_port: u16,
         execution_threshold_override: Option<ExecutionThreshold>,
@@ -3167,6 +3185,7 @@ impl Ctx {
             extended_hours_close_flatten_window_secs: 900,
             close_flatten_cross_max_bps: 400,
             apalis_finished_job_cleanup_interval_secs,
+            trade_accounting_redrive_interval_secs,
             broker,
             telemetry: None,
             alerts,
@@ -3804,6 +3823,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         extended_hours_close_flatten_window_secs: 900,
         close_flatten_cross_max_bps: 400,
         apalis_finished_job_cleanup_interval_secs: 3600,
+        trade_accounting_redrive_interval_secs: 1,
         broker: test_alpaca_broker_ctx(),
         telemetry: None,
         alerts: None,
@@ -4001,6 +4021,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -4246,6 +4267,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
 
             [chains.base]
@@ -4312,6 +4334,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -4386,6 +4409,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -4481,6 +4505,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -4594,6 +4619,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -4779,6 +4805,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -4847,6 +4874,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -4915,6 +4943,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -4975,6 +5004,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -5057,6 +5087,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -5605,6 +5636,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trade_accounting_redrive_interval_is_required() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            log_level = "debug"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
+
+            [chains.base.trading.assets.equities]
+
+            [chains.base]
+            lifecycle = "active"
+            required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
+            ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
+
+            [chains.ethereum]
+            lifecycle = "active"
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
+        "#,
+        );
+        let secrets = alpaca_secrets_toml();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::ConfigToml { .. }),
+            "expected config parse failure for missing redrive interval, got: {error:#}"
+        );
+
+        let source = std::error::Error::source(&error).unwrap();
+        let source_display = source.to_string();
+        assert!(
+            source_display.contains("trade_accounting_redrive_interval_secs"),
+            "expected parse error to mention redrive interval field, got: {source_display}"
+        );
+    }
+
+    #[tokio::test]
     async fn inventory_divergence_threshold_is_required() {
         let config = toml_file(
             r#"
@@ -5613,6 +5712,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
@@ -5679,6 +5779,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
 
             [chains]
@@ -5701,6 +5802,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 0
 
@@ -5755,6 +5857,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 0
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -5821,6 +5924,7 @@ mod tests {
             log_level = "debug"
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -5888,6 +5992,7 @@ mod tests {
             log_level = "debug"
             server_port = 8080
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -5960,6 +6065,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -6032,6 +6138,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 0
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -6093,6 +6200,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trade_accounting_redrive_interval_must_be_non_zero() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            log_level = "debug"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 0
+            inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
+
+            [chains.base.trading.assets.equities]
+
+            [chains.base]
+            lifecycle = "active"
+            required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
+            ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
+
+            [chains.ethereum]
+            lifecycle = "active"
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
+            [wallet]
+            kind = "private-key"
+            address = "0x0000000000000000000000000000000000000001"
+        "#,
+        );
+        let secrets = alpaca_secrets_toml();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::ZeroPollingInterval {
+                    field: "trade_accounting_redrive_interval_secs"
+                }
+            ),
+            "expected ZeroPollingInterval for redrive interval, got: {error:#}"
+        );
+    }
+
+    #[tokio::test]
     async fn order_fill_poll_interval_must_be_non_zero() {
         let config = toml_file(
             &String::from_utf8_lossy(minimal_config_toml_bytes()).replace(
@@ -6128,6 +6305,7 @@ mod tests {
             server_port = 8080
             board_port = 8080
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -6344,6 +6522,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -6455,6 +6634,7 @@ mod tests {
             database_url = ":memory:"
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
             log_level = "warn"
@@ -6674,6 +6854,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -6847,6 +7028,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -7412,6 +7594,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -7545,6 +7728,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -7682,6 +7866,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -7826,6 +8011,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -8130,6 +8316,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -8234,6 +8421,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -8330,6 +8518,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -8423,6 +8612,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -8625,6 +8815,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -8889,6 +9080,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -8978,6 +9170,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -9071,6 +9264,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -9167,6 +9361,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -9266,6 +9461,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -10008,6 +10204,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -11551,6 +11748,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
             bogus_field = "should fail"
@@ -11611,6 +11809,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -11675,6 +11874,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -11748,6 +11948,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -11907,6 +12108,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
             bogus_field = "should fail"
@@ -12490,6 +12692,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -12679,6 +12882,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -12914,6 +13118,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -12988,6 +13193,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -13148,6 +13354,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -13233,6 +13440,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -13323,6 +13531,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -13445,6 +13654,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
@@ -13519,6 +13729,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            trade_accounting_redrive_interval_secs = 60
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
             position_check_interval_secs = 0

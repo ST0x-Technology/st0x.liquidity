@@ -32,6 +32,7 @@ file_log_level = "info"
 database_url = "sqlite:///mnt/data/st0x-hedge.db"
 # How often (seconds) Apalis purges finished background jobs.
 apalis_finished_job_cleanup_interval_secs = 3600
+trade_accounting_redrive_interval_secs = 60
 # Consecutive offchain polls that must diverge from the inventory view's
 # Hedging balance for a symbol before the poller escalates a forced snapshot
 # reconciliation.
