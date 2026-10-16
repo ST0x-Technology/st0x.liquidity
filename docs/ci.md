@@ -43,9 +43,9 @@ different stack branch. Only a confirmed docs-only diff short-circuits the
 backend and dashboard toolchains; their required gate jobs still execute, and
 pre-commit hooks continue to validate the documentation.
 
-The backend build and test matrix, dashboard build, and pre-commit hooks run in
-cancellable work jobs. Separate `backend`, `dashboard`, and `hooks` gate jobs
-use `always()` to inspect their results and fail on skipped, failed, or
+The backend build, lint, and test matrix, dashboard build, and pre-commit hooks
+run in cancellable work jobs. Separate `backend`, `dashboard`, and `hooks` gate
+jobs use `always()` to inspect their results and fail on skipped, failed, or
 cancelled work. This keeps replacement runs responsive without allowing an
 obsolete run to publish a successful required check.
 
@@ -88,7 +88,7 @@ request status check.
 
 ## Board and parity checks
 
-The `backend build` job also runs two Python checks in the `ci-backend` shell,
+The `backend lint` job also runs two Python checks in the `ci-backend` shell,
 and `nix run .#ci` runs them too:
 
 - `python3 observability/gen-t0-liquidity.py --check` fails when the committed
