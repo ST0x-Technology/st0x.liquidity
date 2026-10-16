@@ -122,10 +122,12 @@ code, a regular shell is fine.
 The application uses TOML configuration files split into plaintext config and
 encrypted secrets. See `example.config.toml` and `example.secrets.toml` for all
 available options. Operational intervals such as
-`apalis_finished_job_cleanup_interval_secs` must be explicitly configured and
-nonzero, as must `inventory_divergence_threshold` (the number of consecutive
-offchain polls that must diverge from the inventory view before the poller
-escalates a forced snapshot reconciliation).
+`apalis_finished_job_cleanup_interval_secs` and
+`trade_accounting_redrive_interval_secs` (how often a chain halted by a failed
+trade accounting job re-drives it) must be explicitly configured and nonzero, as
+must `inventory_divergence_threshold` (the number of consecutive offchain polls
+that must diverge from the inventory view before the poller escalates a forced
+snapshot reconciliation).
 
 Each hedged chain requires its own `order_fill_poll_interval_secs`. Fill polling
 and catch-up use fixed inclusive `eth_getLogs` limits: 1000 blocks on Base,
