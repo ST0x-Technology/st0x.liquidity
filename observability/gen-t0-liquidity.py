@@ -911,23 +911,23 @@ WINDOW_VAR = {
     ],
 }
 
-# Which job's liq_* series the boards read. The exporter sidecar is the
-# default until Stage 4 of the migration flips it to the bot; the bot's job is
-# t0-liquidity in production and t0-liquidity-staging in staging, and `env`
-# already picks the project, so one regex covers both.
+# Which job's liq_* series the boards read. The bot is the default (Stage 4
+# of the migration); the exporter stays selectable until a later stage removes
+# it. The bot's job is t0-liquidity in production and t0-liquidity-staging in
+# staging, and `env` already picks the project, so one regex covers both.
 SOURCE_VAR = {
     "name": "source", "type": "custom", "label": "Source",
-    "description": "Which process serves the liq_* metrics: the exporter "
-                   "sidecar (the default for now) or the bot's own "
-                   "/metrics. Pick bot to compare the two.",
+    "description": "Which process serves the liq_* metrics and log rows: "
+                   "the bot's own /metrics and log (the default) or the "
+                   "exporter sidecar. Pick exporter to compare the two.",
     "query": f"exporter : {EXPORTER_JOB}, "
              "bot : t0-liquidity|t0-liquidity-staging",
     "includeAll": False, "multi": False, "hide": 0,
-    "current": {"selected": True, "text": "exporter",
-                "value": EXPORTER_JOB},
-    "options": [{"selected": True, "text": "exporter",
+    "current": {"selected": True, "text": "bot",
+                "value": "t0-liquidity|t0-liquidity-staging"},
+    "options": [{"selected": False, "text": "exporter",
                  "value": EXPORTER_JOB},
-                {"selected": False, "text": "bot",
+                {"selected": True, "text": "bot",
                  "value": "t0-liquidity|t0-liquidity-staging"}],
 }
 

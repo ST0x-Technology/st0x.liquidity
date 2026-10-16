@@ -36,8 +36,8 @@ adds both sources together. The log panels (Trades, Rebalances, the detail
 dialog, Logs) follow `Source` too: the exporter's log names, or the bot's own
 log, `liquidity-bot`, which holds rows once the bot logs JSON. Each such panel
 queries both logs and keeps the picked source's frame, and the generator fails
-on one that does not. Stage 4 of the migration makes `bot` the default
-(`SOURCE_VAR` in the generator). See `docs/observability.md`, "Board source".
+on one that does not. `bot` is the default (`SOURCE_VAR` in the generator). See
+`docs/observability.md`, "Board source".
 
 The header row is a Business Text panel (`marcusolsson-dynamictext-panel`): its
 JavaScript and CSS live in `liquidity-panels/`, and the generator inlines them

@@ -49,24 +49,24 @@
         "name": "source",
         "type": "custom",
         "label": "Source",
-        "description": "Which process serves the liq_* metrics: the exporter sidecar (the default for now) or the bot's own /metrics. Pick bot to compare the two.",
+        "description": "Which process serves the liq_* metrics and log rows: the bot's own /metrics and log (the default) or the exporter sidecar. Pick exporter to compare the two.",
         "query": "exporter : t0-liquidity-exporter, bot : t0-liquidity|t0-liquidity-staging",
         "includeAll": false,
         "multi": false,
         "hide": 0,
         "current": {
           "selected": true,
-          "text": "exporter",
-          "value": "t0-liquidity-exporter"
+          "text": "bot",
+          "value": "t0-liquidity|t0-liquidity-staging"
         },
         "options": [
           {
-            "selected": true,
+            "selected": false,
             "text": "exporter",
             "value": "t0-liquidity-exporter"
           },
           {
-            "selected": false,
+            "selected": true,
             "text": "bot",
             "value": "t0-liquidity|t0-liquidity-staging"
           }

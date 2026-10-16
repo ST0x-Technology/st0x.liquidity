@@ -1675,13 +1675,17 @@ migration files in `migrations/`.
 
 - System uptime and connectivity status using structured logging
 - Configure stdout and rotated-file minimum log levels independently. Production
-  keeps TRACE on stdout for remote log shipping and INFO in local rotated files,
-  reducing diagnostic log volume on the SQLite data disk without guaranteeing a
-  hard byte bound.
+  keeps DEBUG on stdout for remote log shipping (TRACE is not shipped, because
+  of its volume and cost) and INFO in local rotated files, reducing diagnostic
+  log volume on the SQLite data disk without guaranteeing a hard byte bound.
 - Console JSON (`log_format = "json"`) is one flattened object per line: the
   message and every event field are top-level keys beside `timestamp`, `level`
   and `target`, so a parsing log shipper exposes them as structured fields. The
-  rotated files keep the nested `fields` shape that the log readers parse.
+  rotated files keep the nested `fields` shape that the log readers parse. Each
+  console JSON line is at most 16000 bytes, so Docker's 16 KiB split never cuts
+  it: the longest string values are cut first, with a marker. `timestamp`,
+  `level` and `target` stay whole, and `message` is cut only when nothing else
+  is left to cut.
 - Require both log levels when rotated-file logging is enabled. A missing level
   must fail config validation instead of inheriting another sink's level.
 - API rate limiting and error tracking with metrics collection
