@@ -762,6 +762,19 @@ where
         }
     }
 
+    /// Records what `superseding_tx`, mined at the nonce of an
+    /// Alpaca-to-chain pair's deposit, did: a replacement of the deposit or a
+    /// cancel. Nothing is recorded unless it proves on Ethereum.
+    #[cfg(test)]
+    pub(crate) async fn supersede_swap_deposit(
+        &self,
+        id: &UsdcRebalanceId,
+        superseding_tx: TxHash,
+    ) -> Result<RecheckOutcome, UsdcRecheckError> {
+        let _ = (id, superseding_tx);
+        todo!()
+    }
+
     /// Drives an Alpaca-to-chain transfer on a Relay corridor from its
     /// recorded state. A state the Relay hop never reaches from the hub is
     /// refused.
@@ -5767,6 +5780,76 @@ mod tests {
             deposit.transaction_hash
         }
 
+        /// Signs the pair of `quote` on the hub wallet and persists it, as a
+        /// process that crashed before the broadcast did.
+        async fn persist_unsent_hub_pair(
+            &self,
+            store: &Store<UsdcRebalance>,
+            id: &UsdcRebalanceId,
+            quote: &SwapQuote,
+        ) -> (PreparedTransaction, PreparedTransaction) {
+            let approve = self
+                .hub_wallet
+                .prepare_pending(
+                    self.hub_contracts.stable,
+                    quote.approve.clone().unwrap().data,
+                    "approve",
+                )
+                .await
+                .unwrap();
+            let deposit = self
+                .hub_wallet
+                .prepare_pending_with_gas_limit(
+                    self.hub_contracts.depository,
+                    quote.deposit.data.clone(),
+                    200_000,
+                    "deposit",
+                )
+                .await
+                .unwrap();
+            store
+                .send(
+                    id,
+                    UsdcRebalanceCommand::PrepareSwapDeposit {
+                        approve: Some(approve.clone()),
+                        deposit: deposit.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            (approve, deposit)
+        }
+
+        /// What an operator's wallet sends from the bot's hub key at `nonce`,
+        /// outside the bot's wallet, mined past the hub's confirmations.
+        async fn send_from_hub_key_at(&self, nonce: u64, to: Address, input: Bytes) -> TxHash {
+            let operator = ProviderBuilder::new()
+                .wallet(EthereumWallet::from(
+                    PrivateKeySigner::from_slice(&self.hub_anvil.keys()[0].to_bytes()).unwrap(),
+                ))
+                .connect_http(self.hub_anvil.endpoint_url());
+            let request = TransactionRequest::default()
+                .with_to(to)
+                .with_input(input)
+                .with_nonce(nonce)
+                .with_gas_limit(200_000);
+            let tx = operator
+                .send_transaction(request)
+                .await
+                .unwrap()
+                .get_receipt()
+                .await
+                .unwrap()
+                .transaction_hash;
+            self.hub_wallet
+                .provider()
+                .anvil_mine(Some(2), None)
+                .await
+                .unwrap();
+            tx
+        }
+
         async fn hub_usdc(&self) -> U256 {
             erc20_balance(
                 &self.hub_wallet,
@@ -10632,5 +10715,73 @@ mod tests {
         };
         assert_eq!(*deposit_tx, deposit.tx_hash());
         assert_eq!(*signed_order_ids, vec![B256::repeat_byte(0x0d)]);
+    }
+
+    /// An operator replaced the pending deposit of a pair signed at the hub
+    /// with a fee-bumped copy at its nonce. A resume only sends the persisted
+    /// bytes, which can no longer mine; a recheck naming the replacement
+    /// adopts it as the swap's deposit, and the transfer reads Relay's status.
+    #[tokio::test]
+    async fn hub_deposit_replaced_at_its_nonce_is_adopted_on_recheck() {
+        let rig = RelayRig::deploy().await;
+        rig.withdraw_to_hub(U256::from(AMOUNT_IN)).await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_status(&relay_api, json!({"status": "pending"}));
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let quote =
+            exact_quote_from_hub(&rig.hub_wallet, rig.hub_contracts, TOWARD_CHAIN_ORDER_ID).await;
+        record_quoted_toward_chain(&store, &id, quote.clone()).await;
+        let (approve, deposit) = rig.persist_unsent_hub_pair(&store, &id, &quote).await;
+        rig.hub_wallet
+            .broadcast_prepared(&approve, "approve")
+            .await
+            .unwrap();
+        let replacement = rig
+            .send_from_hub_key_at(
+                deposit.nonce(),
+                rig.hub_contracts.depository,
+                quote.deposit.data.clone(),
+            )
+            .await;
+
+        let stuck = tokio::time::timeout(
+            Duration::from_secs(30),
+            transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends");
+        assert!(
+            matches!(stuck, Err(UsdcTransferError::RelayBridge(_))),
+            "got {stuck:?}"
+        );
+
+        let outcome = transfer
+            .supersede_swap_deposit(&id, replacement)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RecheckOutcome::Recovered);
+        let state = store.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::SwapDeposited { deposit_tx, .. } = &state else {
+            panic!("expected SwapDeposited, got {state:?}");
+        };
+        assert_eq!(*deposit_tx, replacement);
+        let resumed = tokio::time::timeout(
+            Duration::from_secs(30),
+            transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends");
+        assert_fill_pending(&resumed);
+        assert_eq!(
+            rig.hub_usdc().await,
+            U256::ZERO,
+            "the replacement deposited it"
+        );
     }
 }
