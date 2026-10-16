@@ -795,11 +795,11 @@ graph LR
     backfill --> start_runtime
 ```
 
-The trade accounting worker starts only after the initial backfill completes,
-guaranteeing historical events are processed in order. Because ingestion is a
-checkpoint-driven `eth_getLogs` poll rather than a live subscription, no events
-can be missed across downtime: the order fill monitor always resumes from the
-persisted checkpoint and re-scans any gap.
+Each chain's trade accounting worker starts only after the initial backfill
+completes, guaranteeing historical events are processed in order. Because
+ingestion is a checkpoint-driven `eth_getLogs` poll rather than a live
+subscription, no events can be missed across downtime: the order fill monitor
+always resumes from the persisted checkpoint and re-scans any gap.
 
 Before any worker or rebalancer runs, but after startup has reserved the nonces
 of signed sends persisted before the restart (Alpaca deposit sends, vault
@@ -8979,10 +8979,10 @@ sequenceDiagram
 ```
 
 On startup, backfill pushes historical events after the persisted backfill
-checkpoint as `AccountForDexTrade` jobs into the chain's accounting queue. The
-worker starts after backfill completes, so historical jobs are enqueued before
-live events are processed. Successful backfill advances the checkpoint to the
-cutoff block.
+checkpoint as `AccountForDexTrade` jobs into the chain's accounting queue. Each
+chain's worker starts after backfill completes, so historical jobs are enqueued
+before live events are processed. Successful backfill advances the checkpoint to
+the cutoff block.
 
 The diagram above shows `ClearV3`/`TakeOrderV3`, the direct-orderbook fill
 source. In `managed` inventory mode, `OperatorDeposit`/`OperatorWithdraw`

@@ -93,7 +93,9 @@ impl DexTradeAccountingQueues {
         apalis_pool: &apalis_sqlite::SqlitePool,
     ) -> Result<u64, RelabelLegacyAccountingRowsError> {
         let legacy = std::any::type_name::<AccountForDexTrade>();
-        let mut transaction = apalis_pool.begin().await?;
+        // IMMEDIATE: a deferred read-then-write upgrade fails at once with
+        // SQLITE_BUSY if another connection writes in between.
+        let mut transaction = apalis_pool.begin_with("BEGIN IMMEDIATE").await?;
 
         let rows: Vec<(String, Vec<u8>)> = sqlx_apalis::query_as(
             "SELECT id, job FROM Jobs \
@@ -148,10 +150,11 @@ pub(crate) enum RelabelLegacyAccountingRowsError {
     },
     #[error(
         "live trade accounting job {id} is for {chain}, which this config does not hedge; \
-         hedge {chain} again or resolve the row before starting"
+         hedge {chain} again, or hedge the fill by hand and mark the row Killed, before \
+         starting"
     )]
     UnhedgedChain { id: String, chain: Chain },
-    #[error("failed to relabel legacy trade accounting jobs: {0}")]
+    #[error("failed to relabel legacy trade accounting jobs")]
     Database(#[from] apalis_sqlite::SqlxError),
 }
 
@@ -3379,13 +3382,8 @@ mod tests {
         assert_eq!(decoded.amount, withdraw.amount);
     }
 
-    /// Every fixture here hedges Base, so its rows sit on Base's queue.
-    fn account_for_dex_trade_job_type() -> String {
-        format!(
-            "{}@{}",
-            std::any::type_name::<AccountForDexTrade>(),
-            Chain::Base
-        )
+    fn account_for_dex_trade_job_type(chain: Chain) -> String {
+        format!("{}@{chain}", std::any::type_name::<AccountForDexTrade>())
     }
 
     /// Each hedged chain's accounting rows live under its own queue key, so
@@ -3408,7 +3406,7 @@ mod tests {
             .fetch_all(&apalis_pool)
             .await
             .unwrap();
-        assert_eq!(job_types, vec![account_for_dex_trade_job_type()]);
+        assert_eq!(job_types, vec![account_for_dex_trade_job_type(Chain::Base)]);
         assert!(base_queue.has_in_flight().await.unwrap());
         assert!(
             !ethereum_queue.has_in_flight().await.unwrap(),
@@ -3433,7 +3431,7 @@ mod tests {
         .await
         .unwrap();
 
-        let expected_type = format!("{}@{chain}", std::any::type_name::<AccountForDexTrade>());
+        let expected_type = account_for_dex_trade_job_type(chain);
         assert_eq!(
             rows.iter()
                 .map(|(job_type, _)| job_type.as_str())
@@ -3541,7 +3539,7 @@ mod tests {
 
         let job_count: i64 =
             sqlx_apalis::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
-                .bind(account_for_dex_trade_job_type())
+                .bind(account_for_dex_trade_job_type(Chain::Base))
                 .fetch_one(&apalis_pool)
                 .await
                 .unwrap();

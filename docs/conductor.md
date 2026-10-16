@@ -862,13 +862,15 @@ reads. At startup, after the apalis tables exist and before any worker spawns,
 `DexTradeAccountingQueues::relabel_legacy_rows` moves every live legacy row onto
 the queue of the chain its payload names (the same serde rule the worker uses,
 so a chainless payload is Base). A live row whose payload does not decode, or
-names a chain this config does not hedge, fails startup and nothing is
-relabeled. Terminal rows keep the old label until the retention sweep deletes
-them.
+names a chain this config does not hedge, fails startup and nothing is relabeled
+(for the latter, hedge that chain again or hedge the fill by hand and mark the
+row `Killed`). Terminal rows keep the old label until the retention sweep
+deletes them.
 
 Rolling back to a single-queue binary strands every live `@chain` row, because
-its one worker reads only the bare label. Before starting the old binary, move
-them back:
+its one worker reads only the bare label. The relabel commits early in startup,
+so this holds for an automatic deploy-rs rollback after a later startup failure
+too. After any rollback past this change, move them back:
 `UPDATE Jobs SET job_type = '<type_name>' WHERE job_type LIKE '<type_name>@%' AND (status IN ('Pending', 'Queued', 'Running') OR (status = 'Failed' AND attempts < max_attempts))`.
 
 Implements `Job<AccountantCtx<Node, Exec>>`. The `perform()` method runs the
