@@ -1648,18 +1648,22 @@ before the startup token approvals.
     that took the send's nonce. Reconcile reads it on the bot's Ethereum node
     and refuses (the API with `409`) unless it is mined from the bot wallet, at
     the send's nonce, is not `<tx>` itself, has Ethereum's required
-    confirmations, and paid the Alpaca deposit address no USDC (a fee-bumped
-    copy of the send did, so the deposit went through) unless another transfer
-    signed, attached or recorded it as its own deposit send (the deposit address
-    is shared, so another transfer's send can take the nonce); each refusal
-    names the failed check. No receipt for `<tx>` is not proof: a lagging node
-    shows none for a send that did mine. "could not read superseding tx" (the
-    API: `502`) and "could not check whether another transfer recorded
-    superseding tx" (the API: `500`) are transient; retry. The send must also be
-    signed by the bot's configured Ethereum wallet, since nonces are per sender:
-    a send signed by a key rotated out since is refused with "deposit send <tx>
-    was signed by <signer>, not the bot's Ethereum wallet"; cancel it from that
-    key and run the CLI reconcile configured with that key.
+    confirmations, and paid the Alpaca deposit address less than the send pays
+    (a fee-bumped copy of the send pays its full amount, so the deposit may have
+    gone through) unless another transfer signed, attached or recorded it as its
+    own deposit send (the deposit address is shared, so another transfer's send
+    can take the nonce); each refusal names the failed check. A smaller payment
+    is not a copy of the send, but its amount does not show who signed it or
+    that Alpaca did not credit it: before you reconcile, find its signer and
+    check the Alpaca account for the credit, then pick `--reason` for where the
+    USDC is now. No receipt for `<tx>` is not proof: a lagging node shows none
+    for a send that did mine. "could not read superseding tx" (the API: `502`)
+    and "could not check whether another transfer recorded superseding tx" (the
+    API: `500`) are transient; retry. The send must also be signed by the bot's
+    configured Ethereum wallet, since nonces are per sender: a send signed by a
+    key rotated out since is refused with "deposit send <tx> was signed by
+    <signer>, not the bot's Ethereum wallet"; cancel it from that key and run
+    the CLI reconcile configured with that key.
 - **"Could not list signed Alpaca deposit sends at startup"** or **"Could not
   load a transfer with a signed Alpaca deposit send at startup"**
   (`operational_alert`): the bot started without reserving that send's nonce, so

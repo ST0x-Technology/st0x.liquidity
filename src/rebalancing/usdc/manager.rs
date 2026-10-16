@@ -7378,14 +7378,15 @@ pub enum DepositSendNotSuperseded {
     },
     #[error(
         "superseding tx {superseding} paid {paid} USDC units to the Alpaca deposit address \
-         {deposit_address}, like the deposit send it would replace, and no other transfer \
-         recorded it: the deposit went through, so do not reconcile. Cancel a send only \
-         with a 0-value self-transfer"
+         {deposit_address}, at least the {send_amount} the deposit send it would replace \
+         pays, and no other transfer recorded it: the deposit may have gone through, so \
+         do not reconcile. Cancel a send only with a 0-value self-transfer"
     )]
     SupersedingTxPaidTheDepositAddress {
         superseding: TxHash,
         deposit_address: Address,
         paid: U256,
+        send_amount: U256,
     },
     /// The persisted send's bytes are not a signed USDC transfer, so its
     /// signer or the deposit address it pays cannot be read.
@@ -7430,11 +7431,17 @@ pub enum DepositSendNotSuperseded {
 /// `prepared` must be signed by `bot_wallet`, since nonces are per sender.
 /// The operator-named `superseding_tx` must be a different tx from
 /// `bot_wallet` at the send's nonce with `required_confirmations`. It must
-/// pay the send's deposit address nothing, so a fee-bumped copy of the send
-/// is refused, unless another transfer in `event_store` signed, attached or
-/// recorded it as its own deposit send: the deposit address is shared, so
-/// that send is not a copy of this one. Only a tx the node shows as mined
-/// counts, so a node that lags refuses rather than proves.
+/// pay the send's deposit address less than the send pays, so a fee-bumped
+/// copy of the send is refused, unless another transfer in `event_store`
+/// signed, attached or recorded it as its own deposit send: the deposit
+/// address is shared, so that send is not a copy of this one. A smaller
+/// payment is not a copy of the send, since a copy pays its full amount, so
+/// the send's nonce is used up. It can still be this transfer's USDC sent by
+/// hand, and a credit at the shared deposit address does not show whose it
+/// is: the operator establishes its signer and owner first, then checks the
+/// Alpaca credit, and settles a credited payment of this transfer's USDC as
+/// a completed deposit. Only a tx the node shows as mined counts, so a node
+/// that lags refuses rather than proves.
 pub async fn verify_deposit_send_superseded<Helper: UsdcBridgeHelper + ?Sized>(
     bridge: &Helper,
     event_store: Option<&SqlitePool>,
@@ -7504,7 +7511,10 @@ pub async fn verify_deposit_send_superseded<Helper: UsdcBridgeHelper + ?Sized>(
         });
     }
 
-    let deposit_address = deposit_send_recipient(prepared)
+    let IERC20::transferCall {
+        to: deposit_address,
+        amount: send_amount,
+    } = deposit_send_transfer(prepared)
         .ok_or(DepositSendNotSuperseded::UnreadableDepositSend { tx })?;
     let paid = bridge
         .ethereum_usdc_credit(superseding, deposit_address)
@@ -7524,11 +7534,26 @@ pub async fn verify_deposit_send_superseded<Helper: UsdcBridgeHelper + ?Sized>(
         None => None,
     };
     let Some(recorded_by) = recorded_by else {
+        if paid < send_amount {
+            warn!(
+                target: "rebalance",
+                %id,
+                %superseding,
+                %paid,
+                %send_amount,
+                "Superseding tx paid the deposit address less than the send: it is not a \
+                 copy of the send, but establish whose payment it is and check the Alpaca \
+                 credit before relying on this reconcile"
+            );
+            return Ok(());
+        }
+
         return Err(
             DepositSendNotSuperseded::SupersedingTxPaidTheDepositAddress {
                 superseding,
                 deposit_address,
                 paid,
+                send_amount,
             },
         );
     };
@@ -7537,12 +7562,11 @@ pub async fn verify_deposit_send_superseded<Helper: UsdcBridgeHelper + ?Sized>(
     Ok(())
 }
 
-/// The address a signed deposit send pays: the `to` of its USDC `transfer`.
-fn deposit_send_recipient(prepared: &PreparedTransaction) -> Option<Address> {
+/// The USDC `transfer` a signed deposit send makes: its deposit address and
+/// amount.
+fn deposit_send_transfer(prepared: &PreparedTransaction) -> Option<IERC20::transferCall> {
     let envelope = TxEnvelope::decode_2718_exact(prepared.raw().as_ref()).ok()?;
-    IERC20::transferCall::abi_decode(envelope.input())
-        .ok()
-        .map(|call| call.to)
+    IERC20::transferCall::abi_decode(envelope.input()).ok()
 }
 
 /// The configured chains have no Ethereum entry, so there is no depth for
@@ -18369,6 +18393,90 @@ mod tests {
         );
     }
 
+    /// Another signer on the bot wallet can forward unrelated USDC to the
+    /// shared deposit address at the send's nonce. A payment smaller than
+    /// the send cannot be a copy of the send, so it supersedes the send. A
+    /// payment of at least the send's amount may hold the deposit, so it is
+    /// still refused.
+    #[tokio::test]
+    async fn deposit_send_is_superseded_only_by_a_payment_smaller_than_the_send() {
+        let chain = deploy_ethereum_usdc_chain().await;
+        let server = MockServer::start();
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let manager = build_deposit_manager(
+            &chain,
+            &server,
+            Arc::new(create_short_poll_wallet_service(&server)),
+            Arc::new(test_store(pool.clone(), ())),
+        )
+        .await
+        .with_credit_ledger(pool);
+        let wallet = create_test_wallet(&chain.endpoint, &chain.bot_key);
+        let amount = usdc_to_u256(usdc("99.99")).unwrap();
+        let bot_provider = bot_provider(&chain).await;
+
+        let smaller = usdc_to_u256(usdc("99.98")).unwrap();
+        let larger = usdc_to_u256(usdc("100")).unwrap();
+        let mut outcomes = Vec::new();
+        for paid in [smaller, larger] {
+            let prepared = sign_usdc_to_alpaca(&wallet, amount).await;
+            let forward = bot_provider
+                .send_transaction(
+                    TransactionRequest::default()
+                        .to(USDC_ADDRESS)
+                        .input(
+                            Bytes::from(
+                                IERC20::transferCall {
+                                    to: ALPACA_DEPOSIT_ADDRESS,
+                                    amount: paid,
+                                }
+                                .abi_encode(),
+                            )
+                            .into(),
+                        )
+                        .nonce(prepared.nonce()),
+                )
+                .await
+                .unwrap()
+                .get_receipt()
+                .await
+                .unwrap()
+                .transaction_hash;
+            bot_provider.anvil_mine(Some(2), None).await.unwrap();
+
+            outcomes.push(
+                manager
+                    .verify_deposit_send_superseded(
+                        &UsdcRebalanceId(Uuid::new_v4()),
+                        &prepared,
+                        Some(forward),
+                    )
+                    .await,
+            );
+        }
+
+        let [smaller_outcome, larger_outcome] = &outcomes[..] else {
+            panic!("one outcome per payment, got: {outcomes:?}");
+        };
+        assert!(
+            matches!(smaller_outcome, Ok(())),
+            "got: {smaller_outcome:?}"
+        );
+        assert!(
+            matches!(
+                larger_outcome,
+                Err(DepositSendNotSuperseded::SupersedingTxPaidTheDepositAddress {
+                    deposit_address: ALPACA_DEPOSIT_ADDRESS,
+                    paid,
+                    send_amount,
+                    ..
+                }) if *paid == larger && *send_amount == amount
+            ),
+            "got: {larger_outcome:?}"
+        );
+    }
+
     /// The deposit address is shared, so another transfer's own recorded
     /// deposit send can take the send's nonce: it paid the deposit address,
     /// but it is not a copy of this send, so it supersedes it.
@@ -18391,7 +18499,9 @@ mod tests {
         let prepared = sign_usdc_to_alpaca(&wallet, usdc_to_u256(usdc("99.99")).unwrap()).await;
         let bot_provider = bot_provider(&chain).await;
 
-        let other_amount = usdc_to_u256(usdc("50")).unwrap();
+        // At least the send's amount, so only the other transfer's record
+        // lets it supersede the send.
+        let other_amount = usdc_to_u256(usdc("150")).unwrap();
         let other_send = bot_provider
             .send_transaction(
                 TransactionRequest::default()
@@ -18416,7 +18526,7 @@ mod tests {
             .transaction_hash;
         bot_provider.anvil_mine(Some(2), None).await.unwrap();
         let other = UsdcRebalanceId(Uuid::new_v4());
-        stage_bridged_with_mint_tx(&cqrs, &other, usdc("50.01"), usdc("50"), chain.mint_tx).await;
+        stage_bridged_with_mint_tx(&cqrs, &other, usdc("150.01"), usdc("150"), chain.mint_tx).await;
         record_signed_deposit_send(
             &cqrs,
             &other,
