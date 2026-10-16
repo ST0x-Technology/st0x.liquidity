@@ -97,8 +97,10 @@ harness, which no dependency cache or sccache can reuse; rustc's incremental
 state can.
 
 - Each trusted run mounts the last saved snapshot. Only master pushes save one,
-  so normal pull request runs and manual `workflow_dispatch` runs never replace
-  it.
+  so pull request runs never replace it. A manual `workflow_dispatch` run mounts
+  and saves its own `-dispatch` disk instead, which no pull request or master
+  run reads, so a branch can measure a warm build without writing the master
+  disk.
 - The `commit` input alone is not a trust boundary: a pull request can edit the
   workflow, and the stickydisk action has no branch scoping. So the disk key
   embeds a masked hash of `CACHIX_AUTH_TOKEN`. Fork and Dependabot runs get no
@@ -106,14 +108,18 @@ state can.
   Same-repository runs can derive the key, but they can already push to Cachix
   with that token, so the disk adds no new trust. Rotating the token starts a
   fresh, empty disk.
-- After the mount, the job touches every tracked source, so each one is newer
-  than anything on the disk, even when a master run saved the snapshot after
-  this job's checkout. Cargo then always reruns rustc for workspace crates and
-  never trusts a stale fingerprint. rustc's incremental cache reuses only the
-  work whose source hashes still match. Registry and git dependencies
-  fingerprint by version and stay built.
+- Cargo decides whether a path crate is fresh from source mtimes, which a fresh
+  checkout resets. Each successful build records the git content hashes of the
+  tree it compiled (`scripts/sync-source-mtimes.sh record`). After the mount,
+  `sync-source-mtimes.sh prepare` gives every tracked file an old fixed mtime
+  and the current time to each file whose content hash differs from the recorded
+  tree, including files that master changed after this branch forked. Cargo then
+  reruns rustc only for crates with a changed source, and rustc's incremental
+  cache reuses whatever still matches. With no recorded tree, every file counts
+  as changed. Registry and git dependencies fingerprint by version and stay
+  built.
 - `rain-math-float` is a path dependency linked into the Nix store, where every
-  file has mtime 1, so touching cannot refresh it.
+  file has mtime 1, so mtimes cannot refresh it.
   `scripts/clean-stale-rain-math-float.sh` runs `cargo clean -p rain-math-float`
   whenever the linked store path differs from the one recorded on the disk.
 - `CARGO_HOME` (registry and git sources) lives on the same disk. These jobs do

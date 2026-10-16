@@ -154,38 +154,39 @@ jobs:
 
       # The target directory lives on a Blacksmith sticky disk: each run
       # mounts the last snapshot. Only master pushes (reviewed, merged code)
-      # save a new one, so pull request runs and manual dispatches never
-      # replace it. The next step makes every tracked source newer than the
-      # snapshot, so cargo reruns rustc for each workspace crate, and rustc's
-      # incremental cache reuses only results whose source hashes still match.
-      # Registry and git dependencies fingerprint by version and stay built.
+      # save the disk that pull request and master runs use, so pull request
+      # runs never replace it. Manual dispatches use and save their own
+      # `-dispatch` disk, which no other run reads, so a branch can measure
+      # cache changes without touching the master disk. The next step makes
+      # only changed sources newer than the snapshot's build. Registry and git
+      # dependencies fingerprint by version and stay built.
       - name: Mount persistent target directory
         if: ${{ env.UNTRUSTED_PR != 'true' }}
         uses: useblacksmith/stickydisk@3f6be1451e3cad893b778bc93495c80452a5da26  # v1.7.2
         with:
-          key: ${{ steps.target-disk.outputs.key }}-target-test-v1
+          key: ${{ steps.target-disk.outputs.key }}-target-test-v1${{ github.event_name == 'workflow_dispatch' && '-dispatch' || '' }}
           path: ${{ github.workspace }}/target/test
-          commit: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          commit: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/master') }}
 
       # A fresh disk mounts root-owned. A saving run clears the disk once it
       # holds more than 40 GiB (one full build is about 7), since stale
       # artifacts from older toolchains and dependency versions are never
       # collected. The fresh ext4 volume also holds a root-owned lost+found
       # (mode 700) that the runner user cannot remove, so the wipe runs with
-      # sudo and keeps it. The snapshot keeps its file mtimes, and a master
-      # run may have saved it after this job's checkout, so touching every
-      # tracked source after the mount stops cargo from treating a changed
-      # crate as fresh.
+      # sudo and keeps it. The snapshot records the git content hashes of the
+      # tree it compiled; sync-source-mtimes.sh then makes only the sources
+      # whose content differs newer than that build, so cargo reruns rustc
+      # just for the crates they belong to.
       - name: Prepare persistent target directory
         if: ${{ env.UNTRUSTED_PR != 'true' }}
         run: |
-          git ls-files -z | xargs -0 touch -h
           sudo chown "$(id -u):$(id -g)" "$CARGO_TARGET_DIR"
           used=$(df --output=used -BG "$CARGO_TARGET_DIR" | tail -1 | tr -dc '0-9')
           echo "target disk holds ${used} GiB"
           if [ "${{ github.event_name }}" = push ] && [ "$used" -gt 40 ]; then
             sudo find "$CARGO_TARGET_DIR" -mindepth 1 -maxdepth 1 ! -name lost+found -exec rm -rf {} +
           fi
+          ./scripts/sync-source-mtimes.sh prepare
 
       # Build the test binaries once into a nextest archive shared by all four
       # partitions. Clippy and rustdoc run in backend-lint, so the test shards
@@ -197,6 +198,7 @@ jobs:
             ./scripts/clean-stale-rain-math-float.sh
             cargo nextest archive --workspace --all-features --profile ci \
               --archive-file \"\$RUNNER_TEMP/nextest-archive.tar.zst\"
+            ./scripts/sync-source-mtimes.sh record
           "
 
       # Blacksmith transparently redirects the native Actions cache to
@@ -287,38 +289,39 @@ jobs:
 
       # The target directory lives on a Blacksmith sticky disk: each run
       # mounts the last snapshot. Only master pushes (reviewed, merged code)
-      # save a new one, so pull request runs and manual dispatches never
-      # replace it. The next step makes every tracked source newer than the
-      # snapshot, so cargo reruns rustc for each workspace crate, and rustc's
-      # incremental cache reuses only results whose source hashes still match.
-      # Registry and git dependencies fingerprint by version and stay built.
+      # save the disk that pull request and master runs use, so pull request
+      # runs never replace it. Manual dispatches use and save their own
+      # `-dispatch` disk, which no other run reads, so a branch can measure
+      # cache changes without touching the master disk. The next step makes
+      # only changed sources newer than the snapshot's build. Registry and git
+      # dependencies fingerprint by version and stay built.
       - name: Mount persistent target directory
         if: ${{ env.UNTRUSTED_PR != 'true' }}
         uses: useblacksmith/stickydisk@3f6be1451e3cad893b778bc93495c80452a5da26  # v1.7.2
         with:
-          key: ${{ steps.target-disk.outputs.key }}-target-lint-v1
+          key: ${{ steps.target-disk.outputs.key }}-target-lint-v1${{ github.event_name == 'workflow_dispatch' && '-dispatch' || '' }}
           path: ${{ github.workspace }}/target/lint
-          commit: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          commit: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/master') }}
 
       # A fresh disk mounts root-owned. A saving run clears the disk once it
       # holds more than 40 GiB (one full build is about 7), since stale
       # artifacts from older toolchains and dependency versions are never
       # collected. The fresh ext4 volume also holds a root-owned lost+found
       # (mode 700) that the runner user cannot remove, so the wipe runs with
-      # sudo and keeps it. The snapshot keeps its file mtimes, and a master
-      # run may have saved it after this job's checkout, so touching every
-      # tracked source after the mount stops cargo from treating a changed
-      # crate as fresh.
+      # sudo and keeps it. The snapshot records the git content hashes of the
+      # tree it compiled; sync-source-mtimes.sh then makes only the sources
+      # whose content differs newer than that build, so cargo reruns rustc
+      # just for the crates they belong to.
       - name: Prepare persistent target directory
         if: ${{ env.UNTRUSTED_PR != 'true' }}
         run: |
-          git ls-files -z | xargs -0 touch -h
           sudo chown "$(id -u):$(id -g)" "$CARGO_TARGET_DIR"
           used=$(df --output=used -BG "$CARGO_TARGET_DIR" | tail -1 | tr -dc '0-9')
           echo "target disk holds ${used} GiB"
           if [ "${{ github.event_name }}" = push ] && [ "$used" -gt 40 ]; then
             sudo find "$CARGO_TARGET_DIR" -mindepth 1 -maxdepth 1 ! -name lost+found -exec rm -rf {} +
           fi
+          ./scripts/sync-source-mtimes.sh prepare
 
       # The board JSON must match its generator, with every liq_ selector
       # pinned to the exporter job; compare.py is the staging parity tool.
@@ -340,6 +343,7 @@ jobs:
             # so it is a workspace member we do not own; exclude it rather than
             # gate CI on its rustdoc warnings.
             cargo doc --workspace --no-deps --all-features --exclude rain-math-float
+            ./scripts/sync-source-mtimes.sh record
           "
 
   backend-test:
@@ -581,6 +585,9 @@ jobs:
 
       - name: rain-math-float stale-artifact cleanup invariants
         run: ./scripts/test-clean-stale-rain-math-float.sh
+
+      - name: source mtime sync invariants
+        run: ./scripts/test-sync-source-mtimes.sh
 
       - name: tailscale certificate renewal invariants
         run: nix develop .#ci-hooks -c nu scripts/validate-tailscale-cert-renewal.nu
