@@ -323,18 +323,20 @@ impl<Signer: Wallet + Clone + 'static> RebalancerServices<Signer> {
         &self,
         base_wallet: Signer,
     ) -> Result<CctpBridge<Signer, Signer>, SpawnRebalancerError> {
-        CctpBridge::try_from_ctx(CctpCtx {
-            corridor: self.cctp_corridor,
-            ethereum_wallet: self.ethereum_wallet.clone(),
+        let cctp = CctpCtx::new(
+            self.cctp_corridor,
+            self.ethereum_wallet.clone(),
             base_wallet,
-            #[cfg(feature = "test-support")]
-            circle_api_base: self.settlement.circle_api_base.clone(),
-            #[cfg(feature = "test-support")]
-            token_messenger: self.settlement.token_messenger,
-            #[cfg(feature = "test-support")]
-            message_transmitter: self.settlement.message_transmitter,
-        })
-        .map_err(|error| SpawnRebalancerError::Cctp(Box::new(error)))
+        );
+
+        #[cfg(any(test, feature = "test-support"))]
+        let cctp = cctp.with_endpoints(
+            self.settlement.circle_api_base.clone(),
+            self.settlement.token_messenger,
+            self.settlement.message_transmitter,
+        );
+
+        CctpBridge::try_from_ctx(cctp).map_err(|error| SpawnRebalancerError::Cctp(Box::new(error)))
     }
 
     /// The Relay hop between `chain` and the hub, on the shared Ethereum
@@ -536,11 +538,11 @@ mod tests {
             settlement_retry_deadline: rebalancing_ctx.settlement_retry_deadline,
             ethereum_required_confirmations: Some(1),
             reserved_cash: None,
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
         }
     }

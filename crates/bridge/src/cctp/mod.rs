@@ -356,6 +356,49 @@ pub struct CctpCtx<EthWallet, BaseWallet> {
     pub message_transmitter: Address,
 }
 
+impl<EthWallet, BaseWallet> CctpCtx<EthWallet, BaseWallet> {
+    /// A context on the production CCTP contracts and Circle API.
+    ///
+    /// Dependent crates build one with this rather than a struct literal: the
+    /// test-only override fields exist whenever this crate's `test-support`
+    /// is on, which a dependent's own feature gates cannot see.
+    pub fn new(
+        corridor: CctpCorridor,
+        ethereum_wallet: EthWallet,
+        base_wallet: BaseWallet,
+    ) -> Self {
+        Self {
+            corridor,
+            ethereum_wallet,
+            base_wallet,
+            #[cfg(any(test, feature = "test-support"))]
+            circle_api_base: CIRCLE_API_BASE.to_string(),
+            #[cfg(any(test, feature = "test-support"))]
+            token_messenger: TOKEN_MESSENGER_V2,
+            #[cfg(any(test, feature = "test-support"))]
+            message_transmitter: MESSAGE_TRANSMITTER_V2,
+        }
+    }
+
+    /// Points the bridge at locally deployed CCTP contracts and a Circle API
+    /// stand-in.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn with_endpoints(
+        self,
+        circle_api_base: String,
+        token_messenger: Address,
+        message_transmitter: Address,
+    ) -> Self {
+        Self {
+            circle_api_base,
+            token_messenger,
+            message_transmitter,
+            ..self
+        }
+    }
+}
+
 /// The corridor's USDC on both ends, resolved from each chain's pinned stable.
 ///
 /// CCTP burns and mints Circle's USDC alone, so the bridge takes its tokens
@@ -1839,6 +1882,39 @@ mod tests {
     use super::*;
     use crate::corridor::HopKind;
     use crate::{Attestation, Bridge};
+
+    #[test]
+    fn a_new_context_targets_the_production_contracts_and_circle_api() {
+        let ctx = CctpCtx::new(CctpCorridor::ethereum_base().unwrap(), (), ());
+
+        assert_eq!(ctx.circle_api_base, "https://iris-api.circle.com");
+        assert_eq!(
+            ctx.token_messenger,
+            address!("0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d")
+        );
+        assert_eq!(
+            ctx.message_transmitter,
+            address!("0x81D40F21F12A8F0E3252Bccb954D722d4c464B64")
+        );
+    }
+
+    #[test]
+    fn endpoint_overrides_replace_only_the_endpoints() {
+        let corridor = CctpCorridor::with_tokens(Address::repeat_byte(1), Address::repeat_byte(2));
+
+        let ctx = CctpCtx::new(corridor, "ethereum", "base").with_endpoints(
+            "http://localhost:4000".to_string(),
+            Address::repeat_byte(3),
+            Address::repeat_byte(4),
+        );
+
+        assert_eq!(ctx.corridor, corridor);
+        assert_eq!(ctx.ethereum_wallet, "ethereum");
+        assert_eq!(ctx.base_wallet, "base");
+        assert_eq!(ctx.circle_api_base, "http://localhost:4000");
+        assert_eq!(ctx.token_messenger, Address::repeat_byte(3));
+        assert_eq!(ctx.message_transmitter, Address::repeat_byte(4));
+    }
 
     #[test]
     fn the_ethereum_base_corridor_resolves_circles_usdc_on_both_ends() {

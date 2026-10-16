@@ -92,17 +92,11 @@ pub(super) async fn cctp_bridge_command<Registry: IntoErrorRegistry, Writer: Wri
     writeln!(stdout, "   Source wallet: {source_wallet}")?;
     writeln!(stdout, "   Recipient wallet: {recipient_wallet}")?;
 
-    let cctp_bridge = CctpBridge::try_from_ctx(CctpCtx {
+    let cctp_bridge = CctpBridge::try_from_ctx(CctpCtx::new(
         corridor,
-        ethereum_wallet: wallet_ctx.ethereum_wallet().clone(),
-        base_wallet: wallet_ctx.base_wallet().clone(),
-        #[cfg(any(test, feature = "test-support"))]
-        circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
-        #[cfg(any(test, feature = "test-support"))]
-        token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
-        #[cfg(any(test, feature = "test-support"))]
-        message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
-    })?;
+        wallet_ctx.ethereum_wallet().clone(),
+        wallet_ctx.base_wallet().clone(),
+    ))?;
 
     let direction = from.to_bridge_direction();
 
@@ -151,17 +145,11 @@ pub(super) async fn cctp_recover_command<Writer: Write>(
     writeln!(stdout, "   Destination chain: {dest_chain:?}")?;
     writeln!(stdout, "   Polling V2 attestation API...")?;
 
-    let cctp_bridge = CctpBridge::try_from_ctx(CctpCtx {
-        corridor: ctx.rebalancing.cctp_corridor,
-        ethereum_wallet: wallet_ctx.ethereum_wallet().clone(),
-        base_wallet: wallet_ctx.base_wallet().clone(),
-        #[cfg(any(test, feature = "test-support"))]
-        circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
-        #[cfg(any(test, feature = "test-support"))]
-        token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
-        #[cfg(any(test, feature = "test-support"))]
-        message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
-    })?;
+    let cctp_bridge = CctpBridge::try_from_ctx(CctpCtx::new(
+        ctx.rebalancing.cctp_corridor,
+        wallet_ctx.ethereum_wallet().clone(),
+        wallet_ctx.base_wallet().clone(),
+    ))?;
 
     // Use the V2 API which returns both message and attestation from tx hash
     let response = cctp_bridge.poll_attestation(direction, burn_tx).await?;

@@ -258,7 +258,8 @@ binary).
   crates)
 - `cargo nextest run --lib` - Run library tests only
 - `cargo nextest run -p st0x-execution` - Run execution crate tests only
-- `cargo nextest run -p st0x-hedge` - Run main crate tests only
+- `cargo nextest run -p st0x-hedge` - Run main crate tests only (the e2e suite
+  needs `--all-features`)
 - `cargo nextest run <test_name>` - Run specific test
 
 ### Database Management

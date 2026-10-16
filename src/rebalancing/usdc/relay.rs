@@ -2896,7 +2896,7 @@ where
 }
 
 #[cfg(test)]
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 mod tests {
     use alloy::network::{EthereumWallet, TransactionBuilder};
     use alloy::node_bindings::Anvil;
