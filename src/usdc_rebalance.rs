@@ -3173,6 +3173,8 @@ pub(crate) async fn interrupted_usdc_rebalance_ids(
                'UsdcRebalanceEvent::SwapOverdeposited', \
                'UsdcRebalanceEvent::SwapRequoted', \
                'UsdcRebalanceEvent::SwapDepositReverted', \
+               'UsdcRebalanceEvent::SwapDepositReplaced', \
+               'UsdcRebalanceEvent::SwapDepositCancelled', \
                'UsdcRebalanceEvent::RelayFillVerified', \
                'UsdcRebalanceEvent::SwapRefunded', \
                'UsdcRebalanceEvent::SwapEscrowUnresolved', \
@@ -3669,6 +3671,7 @@ async fn ethereum_credit_candidate_ids(pool: &SqlitePool) -> Result<Vec<String>,
                'UsdcRebalanceEvent::SwapDepositPrepared', \
                'UsdcRebalanceEvent::SwapRequoted', \
                'UsdcRebalanceEvent::SwapDepositReverted', \
+               'UsdcRebalanceEvent::SwapDepositCancelled', \
                'UsdcRebalanceEvent::SwapOverdeposited', \
                'UsdcRebalanceEvent::SwapRefunded', \
                'UsdcRebalanceEvent::RelayFillVerified', \
@@ -3851,6 +3854,9 @@ impl EventSourced for UsdcRebalance {
     // v19: the `SwapOverdeposited` state and event, the recorded hold on found
     // deposits of reverted Relay orders that one attempt cannot account for.
     // A new state variant, so stale snapshots are rebuilt from events.
+    // v20: `deposit_cancelled_by` on `SwapQuoted`, and the
+    // `SwapDepositReplaced` and `SwapDepositCancelled` events of a signed
+    // Relay deposit whose nonce another tx took.
     const SCHEMA_VERSION: u64 = 20;
 
     fn originate(event: &Self::Event) -> Option<Self> {
