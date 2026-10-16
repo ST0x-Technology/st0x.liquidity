@@ -549,6 +549,7 @@ board_port = {board_port}
 log_level = "debug"
 database_url = "{database_url}"
 apalis_finished_job_cleanup_interval_secs = 3600
+trade_accounting_redrive_interval_secs = 60
 [telemetry]
 service_name = "st0x-simulate-failures"
 environment = "e2e"

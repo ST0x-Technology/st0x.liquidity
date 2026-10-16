@@ -6,10 +6,11 @@
 //! it and calls [`Job::perform`] with the shared context.
 
 use apalis::layers::retry::backoff::Backoff;
-use apalis::prelude::{Attempt, Data, TaskBuilder, TaskId, TaskSink};
+use apalis::prelude::{Attempt, Data, Status, TaskBuilder, TaskId, TaskSink};
 use apalis_core::backend::TaskSinkError;
 use apalis_core::backend::poll_strategy::{BackoffConfig, IntervalStrategy, StrategyBuilder};
 use apalis_core::error::BoxDynError;
+use apalis_core::task::status::StatusError;
 use apalis_core::worker::context::WorkerContext;
 use apalis_core::worker::event::Event;
 use apalis_sqlite::{Config, SqliteContext, SqlitePool, SqliteStorage, SqlxError};
@@ -608,6 +609,59 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
         Ok(result.rows_affected())
     }
 
+    /// Resets every `Failed` row of this queue, retry-exhausted ones included,
+    /// to `Pending` with a fresh attempt budget, keeping its place in the
+    /// queue. For a queue whose failed row must be re-driven on every start
+    /// instead of becoming a dead letter. `Killed` rows stay terminal.
+    pub(crate) async fn requeue_failed(&self) -> Result<u64, SqlxError> {
+        let job_type = self.queue_key();
+        let result = sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Pending', attempts = 0, last_result = NULL, \
+             lock_by = NULL, lock_at = NULL, done_at = NULL \
+             WHERE job_type = ? AND status = 'Failed'",
+        )
+        .bind(job_type)
+        .execute(self.pool())
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
+    /// Resets the row `task_identity` to `Pending` with a fresh attempt budget
+    /// if it is still `Failed`; `false` when it is not.
+    pub(crate) async fn requeue_failed_row(
+        &self,
+        task_identity: &TaskIdentity,
+    ) -> Result<bool, SqlxError> {
+        let result = sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Pending', attempts = 0, last_result = NULL, \
+             lock_by = NULL, lock_at = NULL, done_at = NULL \
+             WHERE id = ? AND job_type = ? AND status = 'Failed'",
+        )
+        .bind(task_identity.as_str())
+        .bind(self.queue_key())
+        .execute(self.pool())
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// The status of the row `task_identity` in this queue; `None` once the
+    /// row is gone.
+    pub(crate) async fn status_of(
+        &self,
+        task_identity: &TaskIdentity,
+    ) -> Result<Option<Status>, StatusLookupError> {
+        let status: Option<String> =
+            sqlx_apalis::query_scalar("SELECT status FROM Jobs WHERE id = ? AND job_type = ?")
+                .bind(task_identity.as_str())
+                .bind(self.queue_key())
+                .fetch_optional(self.pool())
+                .await?;
+
+        Ok(status.map(|status| status.parse()).transpose()?)
+    }
+
     /// Returns whether any job of this queue's task type is still in flight --
     /// i.e. present in the queue and not in a terminal state. Apalis terminal
     /// states are `Done`, `Failed`, and `Killed` (mirroring the finished-job
@@ -629,6 +683,15 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
 
         Ok(in_flight > 0)
     }
+}
+
+/// Error of [`JobQueue::status_of`].
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum StatusLookupError {
+    #[error("failed to read a job row's status")]
+    Query(#[from] SqlxError),
+    #[error("a job row has an unknown status")]
+    Unknown(#[from] StatusError),
 }
 
 /// Default upper bound on a single [`Job::perform`] invocation.
@@ -780,7 +843,7 @@ pub(crate) use build_worker_inner;
 /// [`AlertKind`] phrase. The terminal failure page takes its kind from that
 /// text (see [`terminal_failure_kind`]), so a message without one would page
 /// as the generic job failure while the `operational_alerts` extractor reads
-/// no kind at all. Both worker macros run it, so every production worker is
+/// no kind at all. Every worker macro runs it, so every production worker is
 /// checked however the const is written.
 macro_rules! assert_terminal_failure_msg_names_a_kind {
     (::<$ctx_type:ty, $job:ty>) => {
@@ -964,15 +1027,16 @@ pub enum JobError {
     },
 
     #[cfg(any(test, feature = "test-support"))]
-    #[error("injected terminal job failure")]
+    #[error("{label}: injected terminal job failure")]
     Injected {
         task_identity: TaskIdentity,
         durably_terminal: bool,
+        label: Label,
     },
 }
 
 impl JobError {
-    fn task_identity(&self) -> &TaskIdentity {
+    pub(crate) fn task_identity(&self) -> &TaskIdentity {
         match self {
             Self::Failed { task_identity, .. } => task_identity,
             #[cfg(any(test, feature = "test-support"))]
@@ -1137,6 +1201,12 @@ impl FailureInjector {
         *self.lock_state(kind) = InjectionState::Armed;
     }
 
+    /// Stops injecting for `kind`, so a targeted job succeeds on its next
+    /// attempt: a failure that clears.
+    pub fn disarm(&self, kind: JobKind) {
+        *self.lock_state(kind) = InjectionState::Idle;
+    }
+
     #[cfg(test)]
     fn is_armed(&self, kind: JobKind) -> bool {
         let state = &mut *self.lock_state(kind);
@@ -1211,6 +1281,7 @@ impl FailureInjector {
             return Err(JobError::Injected {
                 task_identity,
                 durably_terminal,
+                label,
             });
         }
 
@@ -1556,25 +1627,34 @@ pub(crate) fn on_best_effort_terminal_failure(
 
         let message =
             format!("st0x-hedge: {worker}: {error_msg}: {err}; worker and conductor will continue");
-        let kind = terminal_failure_kind(&message);
-        let notifier = Arc::clone(&notifier);
-        tokio::spawn(async move {
-            match tokio::time::timeout(
-                super::TERMINAL_FAILURE_ALERT_TIMEOUT,
-                notifier.notify(kind, &message),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(notify_error)) => {
-                    warn!(?notify_error, worker = %worker, "Failed to deliver terminal job failure alert");
-                }
-                Err(_) => {
-                    warn!(worker = %worker, "Timed out delivering terminal job failure alert");
-                }
-            }
-        });
+        spawn_terminal_failure_alert(Arc::clone(&notifier), worker, message);
     }
+}
+
+/// Sends a terminal job failure page off the worker's event path, bounded so
+/// a slow notifier never piles up behind a worker that keeps running.
+pub(crate) fn spawn_terminal_failure_alert(
+    notifier: Arc<dyn Notifier>,
+    worker: String,
+    message: String,
+) {
+    let kind = terminal_failure_kind(&message);
+    tokio::spawn(async move {
+        match tokio::time::timeout(
+            super::TERMINAL_FAILURE_ALERT_TIMEOUT,
+            notifier.notify(kind, &message),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(notify_error)) => {
+                warn!(?notify_error, worker = %worker, "Failed to deliver terminal job failure alert");
+            }
+            Err(_) => {
+                warn!(worker = %worker, "Timed out delivering terminal job failure alert");
+            }
+        }
+    });
 }
 
 /// The kind of a terminal job failure alert: the most specific extracted
@@ -1587,7 +1667,9 @@ pub(crate) fn terminal_failure_kind(alert: &str) -> AlertKind {
     AlertKind::most_specific_in(alert).unwrap_or(AlertKind::JobFailedAfterRetries)
 }
 
-fn find_job_error<'a>(mut error: &'a (dyn std::error::Error + 'static)) -> Option<&'a JobError> {
+pub(crate) fn find_job_error<'a>(
+    mut error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a JobError> {
     loop {
         if let Some(job_error) = error.downcast_ref::<JobError>() {
             return Some(job_error);
@@ -1618,6 +1700,7 @@ mod tests {
         let error: BoxDynError = Box::new(WrappedJobError(JobError::Injected {
             task_identity: TaskIdentity(task_identity.to_owned()),
             durably_terminal: true,
+            label: Label::new("test-job"),
         }));
 
         Event::Error(Arc::new(error))
@@ -1731,6 +1814,7 @@ mod tests {
         let error: BoxDynError = Box::new(UnderFundedJobError(JobError::Injected {
             task_identity: TaskIdentity("under-funded-task".to_owned()),
             durably_terminal: true,
+            label: Label::new("test-job"),
         }));
 
         handler(&ctx, &Event::Error(Arc::new(error)));
@@ -3339,6 +3423,74 @@ mod tests {
         .execute(apalis_pool)
         .await
         .unwrap();
+    }
+
+    /// The halted-chain re-drive resets one `Failed` row of its own queue and
+    /// leaves an operator's `Killed`, a `Done` row and other queues alone.
+    #[tokio::test]
+    async fn requeue_failed_row_resets_only_this_queues_failed_row() {
+        let apalis_pool = setup_test_apalis_pool().await;
+        let job_type = std::any::type_name::<TestJob>();
+        insert_worker(&apalis_pool, "dead-worker").await;
+        insert_locked_job(
+            &apalis_pool,
+            "failed",
+            job_type,
+            "Failed",
+            Some("dead-worker"),
+        )
+        .await;
+        sqlx_apalis::query("UPDATE Jobs SET attempts = 25 WHERE id = 'failed'")
+            .execute(&apalis_pool)
+            .await
+            .unwrap();
+        insert_locked_job(&apalis_pool, "killed", job_type, "Killed", None).await;
+        insert_locked_job(&apalis_pool, "done", job_type, "Done", None).await;
+        insert_locked_job(&apalis_pool, "other", "other::Job", "Failed", None).await;
+        let queue = JobQueue::<TestJob>::new(&apalis_pool);
+
+        for (id, reset) in [
+            ("failed", true),
+            ("killed", false),
+            ("done", false),
+            ("other", false),
+        ] {
+            assert_eq!(
+                queue
+                    .requeue_failed_row(&TaskIdentity::for_test(id))
+                    .await
+                    .unwrap(),
+                reset,
+                "{id}"
+            );
+        }
+
+        assert_eq!(status_of(&apalis_pool, "failed").await, "Pending");
+        assert_eq!(lock_by_of(&apalis_pool, "failed").await, None);
+        let attempts: i64 =
+            sqlx_apalis::query_scalar("SELECT attempts FROM Jobs WHERE id = 'failed'")
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            attempts, 0,
+            "a fresh budget, so the fetch takes the row again"
+        );
+        assert_eq!(status_of(&apalis_pool, "killed").await, "Killed");
+        assert_eq!(status_of(&apalis_pool, "other").await, "Failed");
+
+        for (id, expected) in [
+            ("killed", Some(Status::Killed)),
+            ("done", Some(Status::Done)),
+            ("other", None),
+            ("missing", None),
+        ] {
+            assert_eq!(
+                queue.status_of(&TaskIdentity::for_test(id)).await.unwrap(),
+                expected,
+                "{id}"
+            );
+        }
     }
 
     #[tokio::test]

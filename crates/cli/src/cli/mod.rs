@@ -2334,6 +2334,7 @@ mod tests {
             extended_hours_close_flatten_window_secs: 900,
             close_flatten_cross_max_bps: 400,
             apalis_finished_job_cleanup_interval_secs: 3600,
+            trade_accounting_redrive_interval_secs: 60,
             broker: st0x_config::test_alpaca_broker_ctx(),
             telemetry: None,
             alerts: None,
@@ -4735,6 +4736,7 @@ mod tests {
                 server_port = 8080
                 board_port = 8081
                 apalis_finished_job_cleanup_interval_secs = 3600
+                trade_accounting_redrive_interval_secs = 60
                 inventory_divergence_threshold = 3
                 hedge_order_gate_reconciliation_timeout_secs = 10
 

@@ -15,7 +15,7 @@ use tracing::warn;
 use st0x_event_sorcery::{Projection, Store};
 use st0x_execution::SupportedExecutor;
 
-use super::{requeue_recovery_orphans, requeue_trading_orphans};
+use super::{redrive_halted_trade_accounting, requeue_recovery_orphans, requeue_trading_orphans};
 use crate::equity_redemption::EquityRedemption;
 use crate::inventory::BroadcastingInventory;
 use crate::offchain::order::{
@@ -63,6 +63,19 @@ pub(super) struct TradingJobQueues {
     pub(super) portfolio_snapshot_queue: PortfolioSnapshotJobQueue,
 }
 
+/// Resets every hedged chain's orphaned accounting rows and re-drives the row
+/// that halted it, before the workers spawn.
+pub(super) async fn requeue_trade_accounting(
+    accounting_queues: &DexTradeAccountingQueues,
+) -> anyhow::Result<()> {
+    for (chain, accounting_queue) in accounting_queues.iter() {
+        requeue_trading_orphans(accounting_queue, &format!("{chain} trade accounting")).await?;
+        redrive_halted_trade_accounting(*chain, accounting_queue).await?;
+    }
+
+    Ok(())
+}
+
 /// Creates all trading-side and equity-recovery job queues, resets any orphaned
 /// `Running` rows left by a previous crash, recovers in-flight submitted orders,
 /// and bootstraps the recurring position-check and portfolio-snapshot queues.
@@ -97,9 +110,7 @@ pub(super) async fn setup_trading_job_queues(
     // transfer/backfill/recovery queues above. Trade accounting is the
     // one that cannot be recovered any other way: once the backfill
     // checkpoint advances, its job row is the only record of the fill.
-    for (chain, accounting_queue) in accounting_queues.iter() {
-        requeue_trading_orphans(accounting_queue, &format!("{chain} trade accounting")).await?;
-    }
+    requeue_trade_accounting(accounting_queues).await?;
     requeue_trading_orphans(&hedge_queue, "hedge placement").await?;
     requeue_trading_orphans(&poll_status_queue, "order status polling").await?;
     requeue_trading_orphans(&reconcile_queue, "order fill reconciliation").await?;
