@@ -1191,6 +1191,12 @@ impl FailureInjector {
         *self.lock_state(kind) = InjectionState::Armed;
     }
 
+    /// Stops injecting for `kind`, so a targeted job succeeds on its next
+    /// attempt: a failure that clears.
+    pub fn disarm(&self, kind: JobKind) {
+        *self.lock_state(kind) = InjectionState::Idle;
+    }
+
     #[cfg(test)]
     fn is_armed(&self, kind: JobKind) -> bool {
         let state = &mut *self.lock_state(kind);

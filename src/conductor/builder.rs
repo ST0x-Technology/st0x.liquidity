@@ -3232,16 +3232,19 @@ mod tests {
             })
         }
 
-        /// Pushes a HyperEVM fill that fails every attempt and waits until it
-        /// has halted HyperEVM's worker.
-        async fn halt_hyperevm(&self) -> tokio::task::JoinHandle<()> {
+        /// Pushes a HyperEVM fill that fails every attempt while
+        /// `failure_injector` is armed, and waits until it has halted
+        /// HyperEVM's worker.
+        async fn halt_hyperevm(
+            &self,
+            failure_injector: &FailureInjector,
+        ) -> tokio::task::JoinHandle<()> {
             let (poison_fill, _) = hedgeable_fill(Chain::HyperEvm, USDC_HYPEREVM, HYPEREVM_EQUITY);
             let mut hyperevm_queue = self.queue(Chain::HyperEvm);
             hyperevm_queue.push(poison_fill).await.unwrap();
 
-            let failure_injector = FailureInjector::new();
             failure_injector.arm(JobKind::OrderFill);
-            let monitor_handle = self.spawn_workers(&failure_injector);
+            let monitor_handle = self.spawn_workers(failure_injector);
             wait_for_failed_row(&self.apalis_pool, hyperevm_queue.queue_key()).await;
             tokio::time::timeout(Duration::from_secs(3), async {
                 while self.notifier.messages().is_empty() {
@@ -3262,7 +3265,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_accounting_failure_on_one_chain_leaves_other_chains_hedging() {
         let accounting = two_chain_accounting().await;
-        let monitor_handle = accounting.halt_hyperevm().await;
+        let monitor_handle = accounting.halt_hyperevm(&FailureInjector::new()).await;
 
         let (mut later_hyperevm_fill, _) =
             hedgeable_fill(Chain::HyperEvm, USDC_HYPEREVM, HYPEREVM_EQUITY);
@@ -3321,13 +3324,56 @@ mod tests {
         monitor_handle.abort();
     }
 
+    /// A halted chain re-drives its failed fill by itself, so once the cause
+    /// clears it accounts that fill and then the fills queued behind it,
+    /// without a restart.
+    #[tokio::test]
+    async fn halted_chain_resumes_by_itself_once_the_failure_clears() {
+        let accounting = two_chain_accounting().await;
+        let failure_injector = FailureInjector::new();
+        let monitor_handle = accounting.halt_hyperevm(&failure_injector).await;
+        let (mut later_hyperevm_fill, _) =
+            hedgeable_fill(Chain::HyperEvm, USDC_HYPEREVM, HYPEREVM_EQUITY);
+        later_hyperevm_fill.trade.log_index += 1;
+        accounting
+            .queue(Chain::HyperEvm)
+            .push(later_hyperevm_fill)
+            .await
+            .unwrap();
+
+        failure_injector.disarm(JobKind::OrderFill);
+
+        wait_for_placed_hedges(&accounting.pool, 1).await;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let statuses: Vec<String> = sqlx_apalis::query_scalar(
+                    "SELECT status FROM Jobs WHERE job_type = ? ORDER BY rowid",
+                )
+                .bind(accounting.queue(Chain::HyperEvm).queue_key())
+                .fetch_all(&accounting.apalis_pool)
+                .await
+                .unwrap();
+                if statuses == ["Done", "Done"] {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the halted fill and the one queued behind it must both be accounted");
+        monitor_handle.abort();
+    }
+
     /// The halting row must survive as more than a dead letter: the next start
     /// re-drives it, even past its durable retry budget, and once its cause
     /// is gone the chain hedges again.
     #[tokio::test]
     async fn restart_redrives_the_fill_that_halted_its_chain() {
         let accounting = two_chain_accounting().await;
-        accounting.halt_hyperevm().await.abort();
+        accounting
+            .halt_hyperevm(&FailureInjector::new())
+            .await
+            .abort();
         let hyperevm_queue = accounting.queue(Chain::HyperEvm);
         sqlx_apalis::query("UPDATE Jobs SET attempts = max_attempts WHERE job_type = ?")
             .bind(hyperevm_queue.queue_key())
