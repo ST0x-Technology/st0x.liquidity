@@ -88,7 +88,7 @@ request status check.
 
 ## Parallel rustc frontend
 
-`backend build` sets `RUSTC_WORKSPACE_WRAPPER` to
+`backend build` and `backend build e2e` set `RUSTC_WORKSPACE_WRAPPER` to
 `scripts/rustc-parallel-frontend.sh`, which adds `-Zthreads=$(nproc)` to rustc
 for workspace crates only, with `RUSTC_BOOTSTRAP=1` scoped to those invocations
 so the unstable flag works on the stable toolchain. The `st0x-hedge` library and
@@ -96,15 +96,15 @@ its unit-test harness dominate the build, and their type checking otherwise runs
 on one core: a cold workspace build took 140 s instead of 221 s locally.
 Dependencies build unchanged. The wrapper leaves incremental compilations alone:
 with `-C incremental` the parallel frontend crashed rustc's dependency graph on
-1.94 (CI run 38863026755), so `backend build` builds with `CARGO_INCREMENTAL=0`.
-Cargo also sends its target-info probe through the wrapper, and with
-`RUSTC_BOOTSTRAP` that probe reports unstable cfgs, which cargo then gives to
-every package. So the wrapper passes `--print` calls and version queries to
-rustc unchanged. Cargo fingerprints the wrapper's path, not its content, so
-`sync-source-mtimes.sh` treats the wrapper as a build-wide input. To roll back,
-drop the variable; the next run rebuilds the workspace crates once, since the
-wrapper is part of cargo's fingerprint. `backend lint` does not use it, because
-`cargo clippy` sets its own workspace wrapper.
+1.94 (CI run 38863026755), so `backend build` and `backend build e2e` build with
+`CARGO_INCREMENTAL=0`. Cargo also sends its target-info probe through the
+wrapper, and with `RUSTC_BOOTSTRAP` that probe reports unstable cfgs, which
+cargo then gives to every package. So the wrapper passes `--print` calls and
+version queries to rustc unchanged. Cargo fingerprints the wrapper's path, not
+its content, so `sync-source-mtimes.sh` treats the wrapper as a build-wide
+input. To roll back, drop the variable; the next run rebuilds the workspace
+crates once, since the wrapper is part of cargo's fingerprint. `backend lint`
+does not use it, because `cargo clippy` sets its own workspace wrapper.
 
 ## Cold-cache critical path
 
@@ -112,43 +112,54 @@ wrapper is part of cargo's fingerprint. `backend lint` does not use it, because
   `backend lint` it added 1m17 to that path on a cold disk; beside clippy in the
   same job, with a second target directory, it compiled every dependency again
   on the same cores and took 4m39.
-- `backend build` sets `CARGO_PROFILE_DEV_DEBUG` and `CARGO_PROFILE_TEST_DEBUG`
+- Both build jobs set `CARGO_PROFILE_DEV_DEBUG` and `CARGO_PROFILE_TEST_DEBUG`
   to `false`: a cold build took 132 s instead of 141 s locally, and the shards'
   archive halved (717 to 366 MB). Panic messages still carry file and line; only
   backtraces lose line numbers.
 - The shards poll every 3 s, which costs nothing extra: unchanged polls answer
   `304 Not Modified`.
 
+- Both build jobs run on 16 vCPUs. A cold build compiles all 614 crates, and the
+  dependency graph and the parallel frontend use the cores: the compile took
+  2m17 against 2m54 on 8. Clippy did not get faster, so `backend lint` stays
+  on 8.
+- The e2e suite (about 80 s a shard) needs only the `st0x-hedge` library, not
+  its larger unit-test harness. `backend build e2e` builds just the e2e binary,
+  on its own runner and disk, and the eight e2e shards start on its archive
+  while `backend build` still compiles the rest for the four unit shards. In one
+  job the two compiles ran back to back (1m35, then 1m10, from an empty cache).
+
 ## Test shards
 
-The eight `backend test` shards do not `need` `backend build`. They start with
-the run, install Nix, and realize the `ci-backend` dev shell while the archive
-compiles. Then `scripts/wait-for-job.sh` polls `backend build` through the
-Actions API (`actions: read`) until it completes, and fails unless it succeeded.
-The `GITHUB_TOKEN` gets 1,000 API requests per hour per repository, shared by
-every run, so the polls are conditional requests: a `304 Not Modified` does not
-count against that limit. Each step that starts or ends in `backend build`
-changes the job, so a shard spends about one request per step change. A near
-rate-limit reset is waited out, a far one fails the shard with a clear message,
-and other API errors only delay the next poll. A shard also fails if the run
-shows no `backend build` job for 5 minutes. The shard timeout (45 minutes)
-covers the wait for the build. The trade-off: each run holds eight runners from
-its start, so they sit idle while the build compiles, about one minute on a warm
-run and up to 30 minutes on a cold fork run, to save about 35 s of setup. A
-re-run of only the failed shards restores the archive from the attempt whose
-build succeeded. The slowest e2e tests (about 80 s) start first, so a shard
-takes little more than its slowest test.
+The twelve `backend test` shards (eight e2e, four unit) do not `need`
+`backend build`. They start with the run, install Nix, and realize the
+`ci-backend` dev shell while the archive compiles. Then
+`scripts/wait-for-job.sh` polls `backend build` through the Actions API
+(`actions: read`) until it completes, and fails unless it succeeded. The
+`GITHUB_TOKEN` gets 1,000 API requests per hour per repository, shared by every
+run, so the polls are conditional requests: a `304 Not Modified` does not count
+against that limit. Each step that starts or ends in `backend build` changes the
+job, so a shard spends about one request per step change. A near rate-limit
+reset is waited out, a far one fails the shard with a clear message, and other
+API errors only delay the next poll. A shard also fails if the run shows no
+`backend build` job for 5 minutes. The shard timeout (45 minutes) covers the
+wait for the build. The trade-off: each run holds eight runners from its start,
+so they sit idle while the build compiles, about one minute on a warm run and up
+to 30 minutes on a cold fork run, to save about 35 s of setup. A re-run of only
+the failed shards restores the archive from the attempt whose build succeeded.
+The slowest e2e tests (about 80 s) start first, so a shard takes little more
+than its slowest test.
 
 ## Persistent target directories
 
-`backend build`, `backend lint`, and `backend docs` keep their cargo target
-directories (`target/test`, `target/lint`, `target/docs`) on Blacksmith sticky
-disks, so crates whose sources did not change stay built. `backend lint` and
-`backend docs` build with `CARGO_INCREMENTAL=1`, so they also reuse rustc's
-incremental state for the crates that did change. `backend build` builds with
-`CARGO_INCREMENTAL=0` and the parallel frontend instead (see above): the two
-crashed rustc together, and a changed crate recompiles faster in full on all
-cores.
+`backend build`, `backend build e2e`, `backend lint`, and `backend docs` keep
+their cargo target directories (`target/test`, `target/e2e`, `target/lint`,
+`target/docs`) on Blacksmith sticky disks, so crates whose sources did not
+change stay built. `backend lint` and `backend docs` build with
+`CARGO_INCREMENTAL=1`, so they also reuse rustc's incremental state for the
+crates that did change. `backend build` builds with `CARGO_INCREMENTAL=0` and
+the parallel frontend instead (see above): the two crashed rustc together, and a
+changed crate recompiles faster in full on all cores.
 
 - Each trusted run mounts the last saved snapshot. Only master pushes save one,
   so pull request runs never replace it. A manual `workflow_dispatch` run mounts
@@ -191,8 +202,9 @@ cores.
 - A saving run (a master push or a manual dispatch) wipes the disk once it holds
   more than 40 GiB, because cargo never collects artifacts from older toolchains
   or dependency versions.
-- To start from empty disks, bump the `-v1` suffix of all three disk keys
-  (`-target-test-v1`, `-target-lint-v1`, and `-target-docs-v1`).
+- To start from empty disks, bump the `-v1` suffix of all four disk keys
+  (`-target-test-v1`, `-target-e2e-v1`, `-target-lint-v1`, and
+  `-target-docs-v1`).
 - A build that does not run `sync-source-mtimes.sh` (a re-run of a run from
   before it, or a run after a revert) leaves fingerprints newer than the record,
   so the next `prepare` treats every file as changed. To roll the script back
