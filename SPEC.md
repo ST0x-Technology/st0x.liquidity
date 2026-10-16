@@ -630,12 +630,25 @@ excellent async ecosystem for handling concurrent trading flows.
   `(chain, orderbook)`, scan queue, and trade-accounting queue and worker -- one
   chain's backlog or outage never blocks another chain's ingestion, and one
   chain's fill backlog (for example a long catch-up) never delays another
-  chain's hedges. Every poll interval the monitor enqueues a backfill range
-  covering the blocks since the persisted checkpoint, capped at the configured
-  ingestion cutoff block (must be explicitly configured; recommended value:
-  `safe`, i.e. `eth_getBlockByNumber("safe")`); the backfill worker fetches the
-  `Clear` and `TakeOrder` logs for the arbitrageur's owner address and advances
-  the checkpoint only on success. `required_confirmations` governs
+  chain's hedges. A fill whose accounting fails terminally (retries exhausted)
+  halts only its own chain's accounting worker: that chain drops to observe-only
+  for hedging (its later fills stay queued, unaccounted and unhedged) while
+  every other chain keeps hedging and the process keeps running, also when the
+  halted chain is the only one. The operator is paged once per halt with the
+  chain, the fill (event kind, chain, block, log index) and its job row, and the
+  `trade_accounting_observe_only` gauge reads 1 for the chain. The failed job
+  row is the record of the halt: it stays `Failed` in the chain's queue, the
+  retention sweep keeps it, and every start re-drives it with a fresh retry
+  budget, so the chain hedges again once the cause is fixed and halts again,
+  paging, while it is not. To retire a fill that can never be accounted, hedge
+  it by hand, mark its row `Killed`, and restart. The halt covers hedging only:
+  rebalancing, transfers and vault balance polling on that chain continue. Every
+  poll interval the monitor enqueues a backfill range covering the blocks since
+  the persisted checkpoint, capped at the configured ingestion cutoff block
+  (must be explicitly configured; recommended value: `safe`, i.e.
+  `eth_getBlockByNumber("safe")`); the backfill worker fetches the `Clear` and
+  `TakeOrder` logs for the arbitrageur's owner address and advances the
+  checkpoint only on success. `required_confirmations` governs
   transaction-submission paths only and does not affect fill ingestion. Every
   backfill path, including durable retries, uses the hedged chain's explicit
   policy: HyperEVM 50 blocks, Base, Ethereum and Robinhood 1000 blocks per

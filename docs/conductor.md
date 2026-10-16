@@ -760,7 +760,10 @@ WorkerBuilder::new(name)
   exhausts), `Event::Success`, `Event::Start`, `Event::Stop`. Supervised workers
   record failure info and call `ctx.stop()`. Best-effort workers inspect the
   carried SQLite attempt metadata, alert only when the row is durably terminal,
-  and never stop the worker or conductor.
+  and never stop the worker or conductor. Chain-scoped workers
+  (`build_chain_scoped_worker!`, trade accounting) stop only themselves and page
+  from `on_event`, without the conductor-wide signal; see
+  [AccountForDexTrade](#accountfordextrade).
 
 ### Error propagation: handler failure -> bot shutdown
 
@@ -845,7 +848,8 @@ Monitor::new()
 ```
 
 `should_restart(false)` — terminal job failure is fail-stop. The worker must not
-restart and process the next job with stale state.
+restart and process the next job with stale state. For a chain-scoped worker the
+stop is the chain's alone; the monitor and every other worker keep running.
 
 ### AccountForDexTrade
 
@@ -872,6 +876,21 @@ its one worker reads only the bare label. The relabel commits early in startup,
 so this holds for an automatic deploy-rs rollback after a later startup failure
 too. After any rollback past this change, move them back:
 `UPDATE Jobs SET job_type = '<type_name>' WHERE job_type LIKE '<type_name>@%' AND (status IN ('Pending', 'Queued', 'Running') OR (status = 'Failed' AND attempts < max_attempts))`.
+
+A terminal failure (retries exhausted) halts only that chain's worker
+(`on_chain_terminal_failure`): no conductor-wide signal, no process exit. The
+chain's later fills wait in its queue, so none of them reaches `Position` or a
+broker order, while other chains keep hedging. The handler pages once with the
+chain, the job label (event kind, chain, block, log index) and the row id, and
+sets `trade_accounting_observe_only{chain}` to 1. The page is a detached
+`tokio::spawn`, as for best-effort workers: the process does not exit, so it
+cannot race teardown. The `Failed` row stays: the retention sweep keeps
+`{type_name}@{chain}` rows in `Failed`, and `redrive_halted_trade_accounting`
+resets them to `Pending` with `attempts = 0` at every start, before workers
+spawn. A fixed cause therefore clears the halt on the next restart, and a poison
+fill halts the chain again and pages again. To retire a fill that can never be
+accounted, hedge it by hand, set its row to `Killed`, and restart; never reset a
+fill hedged by hand to `Pending`, since that hedges it twice.
 
 Implements `Job<AccountantCtx<Node, Exec>>`. The `perform()` method runs the
 hedging pipeline:
