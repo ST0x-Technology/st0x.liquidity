@@ -395,6 +395,10 @@ assert_count 2 "          if [ \"\${{ github.event_name }}\" != pull_request ] &
 assert_count 2 '          ./scripts/sync-source-mtimes.sh prepare'
 assert_count 2 '            ./scripts/sync-source-mtimes.sh record'
 assert_line '        run: ./scripts/test-sync-source-mtimes.sh'
+# The test archive builds workspace crates with rustc's parallel frontend; the
+# wrapper's own test runs in the hooks job.
+assert_count 1 "      RUSTC_WORKSPACE_WRAPPER: \${{ github.workspace }}/scripts/rustc-parallel-frontend.sh"
+assert_line '        run: ./scripts/test-rustc-parallel-frontend.sh'
 assert_count 2 '            ./scripts/clean-stale-rain-math-float.sh'
 # The test shards start with the run and wait for backend-build themselves.
 # wait-for-job.sh fails unless the build succeeded (test-wait-for-job.sh checks

@@ -45,10 +45,17 @@ jobs:
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 30
     env:
-      # The target directory persists on a sticky disk (below), so rustc's
-      # incremental state carries over between runs.
-      CARGO_INCREMENTAL: "1"
+      # Non-incremental: the parallel frontend below crashed rustc's
+      # incremental dependency graph, and with it a changed crate recompiles
+      # faster in full than single-threaded from incremental state. The target
+      # directory still persists on a sticky disk, so unchanged crates stay
+      # built.
+      CARGO_INCREMENTAL: "0"
       CARGO_TARGET_DIR: target/test
+      # Parallel rustc frontend for workspace crates (see the script). Cargo
+      # fingerprints only the wrapper's path, so sync-source-mtimes.sh treats
+      # the script as a build-wide input.
+      RUSTC_WORKSPACE_WRAPPER: ${{ github.workspace }}/scripts/rustc-parallel-frontend.sh
       # Registry and git sources live on the same sticky disk. Swatinem's
       # rust-cache is not used here: its save step prunes workspace-crate and
       # incremental artifacts from the target directory before the disk
@@ -601,6 +608,9 @@ jobs:
 
       - name: source mtime sync invariants
         run: ./scripts/test-sync-source-mtimes.sh
+
+      - name: rustc parallel frontend wrapper invariants
+        run: ./scripts/test-rustc-parallel-frontend.sh
 
       - name: CI job wait invariants
         run: ./scripts/test-wait-for-job.sh
