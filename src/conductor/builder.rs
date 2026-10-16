@@ -3416,13 +3416,18 @@ mod tests {
             .await
             .unwrap();
 
-        sqlx_apalis::query(
+        let killed = sqlx_apalis::query(
             "UPDATE Jobs SET status = 'Killed' WHERE job_type = ? AND status = 'Failed'",
         )
         .bind(accounting.queue(Chain::HyperEvm).queue_key())
         .execute(&accounting.apalis_pool)
         .await
         .unwrap();
+        assert_eq!(
+            killed.rows_affected(),
+            1,
+            "the halted row must still be Failed when it is killed"
+        );
 
         wait_for_placed_hedges(&accounting.pool, 1).await;
         assert!(logs_contain("its job row was marked Killed"));

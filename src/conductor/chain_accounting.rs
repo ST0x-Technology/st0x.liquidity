@@ -5,8 +5,9 @@
 //! fills queued behind the failed one wait. Every `redrive_interval` the chain
 //! re-drives the failed row with a fresh budget and starts a new worker, which
 //! takes that row first. The chain resumes when the row is accounted, or at
-//! once when an operator has marked it `Killed`. The monitor cannot do this
-//! itself: it restarts a stopped worker at once or never.
+//! the next interval once an operator has marked it `Killed`. The monitor
+//! cannot do this itself: it restarts a stopped worker at once or never. Each
+//! generation leaves its row in `Workers`, one per interval while halted.
 
 use alloy::providers::Provider;
 use apalis::prelude::Status;
@@ -97,6 +98,10 @@ where
         // A new name per generation: apalis refuses to register a worker
         // name whose previous holder heartbeated within its keep-alive.
         for generation in 0_u64.. {
+            if self.shutdown.is_cancelled() {
+                return;
+            }
+
             let attempt = Arc::new(WorkerAttempt::default());
             assert_terminal_failure_msg_names_a_kind!(::<AccountantCtx<Prov, Exec>, AccountForDexTrade>);
             let worker = build_worker_inner!(
@@ -111,7 +116,10 @@ where
 
             let run = worker.run();
             tokio::pin!(run);
+            // `run` first: its first poll emits `Event::Start`, which hands
+            // over the context the shutdown branch stops.
             let result = tokio::select! {
+                biased;
                 result = &mut run => result,
                 () = self.shutdown.cancelled() => {
                     attempt.stop_worker();
@@ -126,7 +134,11 @@ where
                 (Some(failure), _) => halt.begin(failure),
                 (None, Err(error)) => halt.begin(WorkerFailure {
                     halt: Halt::WorkerExit,
-                    worker: format!("{}-{generation}", self.chain),
+                    worker: format!(
+                        "{}-{}-{generation}",
+                        <AccountForDexTrade as Job<AccountantCtx<Prov, Exec>>>::WORKER_NAME,
+                        self.chain,
+                    ),
                     error: error.to_string(),
                 }),
                 (None, Ok(())) => {
@@ -169,8 +181,9 @@ where
         // worker takes the rows in order.
         self.queue.requeue_orphaned().await?;
 
+        // A worker exit has no row to re-drive; the next worker that polls
+        // cleanly lifts it.
         let Some(row) = halt.halted_row() else {
-            halt.resume("its worker restarted");
             return Ok(());
         };
 
@@ -295,6 +308,18 @@ impl ChainHalt {
         }
     }
 
+    /// Lifts a halt on a worker exit once a new worker polls its queue
+    /// cleanly; a halt on a job waits for that job.
+    fn resume_after_worker_exit(&self) {
+        let worker_exited = matches!(
+            *self.halted.lock().unwrap_or_else(PoisonError::into_inner),
+            Some(Halt::WorkerExit)
+        );
+        if worker_exited {
+            self.resume("its restarted worker polls cleanly");
+        }
+    }
+
     fn resume(&self, reason: &str) {
         let Some(halt) = self
             .halted
@@ -322,6 +347,7 @@ fn on_event(
             *attempt.ctx.lock().unwrap_or_else(PoisonError::into_inner) = Some(ctx.clone());
         }
         Event::Success => halt.resume("its halted job was accounted"),
+        Event::Idle => halt.resume_after_worker_exit(),
         Event::Error(error) => {
             let worker = ctx.name().clone();
             error!(%error, %worker, chain = %halt.chain, "Trade accounting job failed after retries; the chain is now observe-only");
@@ -342,7 +368,7 @@ fn on_event(
                 });
             }
         }
-        Event::Idle | Event::HeartBeat | Event::Custom(_) | Event::Stop => {}
+        Event::HeartBeat | Event::Custom(_) | Event::Stop => {}
     }
 }
 
