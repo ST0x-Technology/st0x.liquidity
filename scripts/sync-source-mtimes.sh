@@ -64,8 +64,11 @@ case "${1:-}" in
       git ls-files -z | xargs -0 -r touch -h --
       exit 0
     fi
-    # Unit fingerprints live in <target>/[<triple>/]<profile>/.fingerprint.
-    newer_build=$(find "$target_dir" -maxdepth 3 -type d -name .fingerprint \
+    # Unit fingerprints live in <target>/[<triple>/]<profile>/.fingerprint. A
+    # fresh ext4 disk holds a root-owned lost+found that the runner user cannot
+    # read, so the search skips it. Any other find error still fails prepare.
+    newer_build=$(find "$target_dir" -maxdepth 3 -name lost+found -prune -o \
+      -type d -name .fingerprint \
       -exec find {} -maxdepth 2 -newer "$manifest" -print -quit \;)
     sort -z "$manifest" > "$recorded"
     rm -f "$manifest"
