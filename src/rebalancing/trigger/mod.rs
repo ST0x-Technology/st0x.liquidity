@@ -7,10 +7,10 @@ mod usdc;
 mod usdc_guard;
 
 #[cfg(test)]
-pub(crate) use equity::{EquityTriggerError, InProgressGuard, StubLastPrice};
+pub(crate) use equity::{EquityTriggerError, StubLastPrice};
 pub(crate) use equity::{
     FillPriceOrMark, GUARD_GENERATION, GuardGeneration, GuardState, HedgeCapacity, HeldRecovery,
-    LastPriceReader, PendingMintResume, PendingMintResumes, RecoveryGuard,
+    InProgressGuard, LastPriceReader, PendingMintResume, PendingMintResumes, RecoveryGuard,
     claim_guard_for_recovery_or_orphan, remove_active_transfer,
 };
 pub(crate) use usdc_guard::UsdcCashGuards;
@@ -89,8 +89,8 @@ use crate::position::{
 #[cfg(test)]
 use crate::rebalancing::equity::EquityTransferServices;
 use crate::rebalancing::equity::{
-    TransferEquityToHedging, TransferEquityToHedgingJobQueue, TransferEquityToMarketMaking,
-    TransferEquityToMarketMakingJobQueue,
+    ResumeTokenizationAggregate, TransferEquityToHedging, TransferEquityToHedgingJobQueue,
+    TransferEquityToMarketMaking, TransferEquityToMarketMakingJobQueue,
 };
 use crate::rebalancing::usdc::{
     TransferUsdcToHedging, TransferUsdcToHedgingJobQueue, TransferUsdcToMarketMaking,
@@ -282,6 +282,28 @@ pub(crate) enum UsdcResumeError {
     ApalisDatabase(#[from] sqlx_apalis::Error),
     #[error("failed to enqueue the USDC transfer job: {0}")]
     Queue(#[from] QueuePushError),
+}
+
+/// What already drives a mint an operator asked to resume
+/// ([`RebalancingService::mint_driver`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MintDriver {
+    /// The bot's own transfer job for the mint.
+    TransferJob,
+    /// The resume job startup enqueues for a mint without a transfer job.
+    ResumeJob,
+    /// A wrapped or unwrapped equity recovery holding the mint's symbol.
+    Recovery,
+}
+
+impl std::fmt::Display for MintDriver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::TransferJob => "the bot's transfer job for it",
+            Self::ResumeJob => "the bot's resume job for it",
+            Self::Recovery => "a wrapped or unwrapped equity recovery of its symbol",
+        })
+    }
 }
 
 /// Why a manual equity transfer start (`capital transfer-equity`) could not
@@ -5369,7 +5391,12 @@ impl RebalancingService {
         }
     }
 
-    fn try_claim_equity_guard_for_transfer(
+    /// Claims `symbol`'s equity transfer guard, or `None` while a transfer or
+    /// a recovery holds it. The capital wrap, unwrap and redeem routes hold
+    /// it too, so the bot starts no transfer of the symbol while an operator
+    /// moves its shares in the wallet, and the operator cannot move them
+    /// under a transfer the bot is running.
+    pub(crate) fn try_claim_equity_guard_for_transfer(
         &self,
         symbol: &Symbol,
     ) -> Option<equity::InProgressGuard> {
@@ -8041,6 +8068,58 @@ impl RebalancingService {
             "Enqueued manual equity transfer for the transfer worker"
         );
         Ok(reservation_id)
+    }
+
+    /// What already drives the mint `id` of `symbol`, if anything does, so an
+    /// operator resume does not run beside it, where both could submit the
+    /// same wrap or deposit: a wrapped or unwrapped equity recovery that holds
+    /// the symbol (it owns the mint's tokens, which is why startup resumes no
+    /// mint it holds), or a live row of the mint's own transfer job or of the
+    /// resume job startup enqueues for a mint without one. A row is live as in
+    /// [`Self::in_flight_equity_transfer`]; a `Failed` row that spent its
+    /// attempts drives nothing.
+    pub(crate) async fn mint_driver(
+        &self,
+        id: &IssuerRequestId,
+        symbol: &Symbol,
+    ) -> Result<Option<MintDriver>, sqlx_apalis::Error> {
+        let held_for_recovery = matches!(
+            self.equity_in_progress
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(symbol),
+            Some(
+                equity::GuardState::HeldForRecovery { .. } | equity::GuardState::Recovering { .. }
+            )
+        );
+        if held_for_recovery {
+            return Ok(Some(MintDriver::Recovery));
+        }
+
+        let transfer_job = std::any::type_name::<TransferEquityToMarketMaking>();
+        let id = id.to_string();
+        let live_job: Option<String> = sqlx_apalis::query_scalar(
+            "SELECT job_type FROM Jobs \
+             WHERE ((job_type = ? AND json_extract(job, '$.issuer_request_id') = ?) \
+                    OR (job_type = ? AND json_extract(job, '$.target.Mint') = ?)) \
+             AND (status IN ('Pending', 'Queued', 'Running') \
+                  OR (status = 'Failed' AND attempts < max_attempts)) \
+             LIMIT 1",
+        )
+        .bind(transfer_job)
+        .bind(&id)
+        .bind(std::any::type_name::<ResumeTokenizationAggregate>())
+        .bind(&id)
+        .fetch_optional(self.transfer_equity_to_market_making_queue.pool())
+        .await?;
+
+        Ok(live_job.map(|job_type| {
+            if job_type == transfer_job {
+                MintDriver::TransferJob
+            } else {
+                MintDriver::ResumeJob
+            }
+        }))
     }
 
     /// Returns the oldest non-terminal equity transfer job for this symbol in
@@ -31562,6 +31641,77 @@ mod tests {
         assert!(
             enqueued,
             "a retry-exhausted Failed equity job must NOT suppress a new equity redemption"
+        );
+    }
+
+    /// An operator resume must not run beside another driver of the same
+    /// mint: a live row of its transfer job or of its startup resume job
+    /// drives it, and so does a wrapped or unwrapped equity recovery holding
+    /// its symbol. A row for another mint, or a dead letter row, does not.
+    #[tokio::test]
+    async fn mint_driver_names_what_already_drives_a_mint() {
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let transferred = IssuerRequestId::generate();
+        let resumed = IssuerRequestId::generate();
+        let dead = IssuerRequestId::generate();
+        let idle = IssuerRequestId::generate();
+
+        service
+            .transfer_equity_to_market_making_queue
+            .clone()
+            .push(TransferEquityToMarketMaking {
+                chain: Chain::Base,
+                issuer_request_id: transferred.clone(),
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(float!(1)),
+                generation: equity::GuardGeneration::default(),
+                backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
+            })
+            .await
+            .unwrap();
+        let mut resume_queue = crate::rebalancing::equity::ResumeTokenizationJobQueue::new(
+            service.transfer_equity_to_market_making_queue.pool(),
+        );
+        for id in [&resumed, &dead] {
+            resume_queue
+                .push(ResumeTokenizationAggregate {
+                    target: crate::rebalancing::equity::ResumeTokenizationTarget::Mint(id.clone()),
+                    symbol: Some(symbol.clone()),
+                    backpressure_streak: BackpressureStreak::default(),
+                    position_reservation_retry_attempts: 0,
+                })
+                .await
+                .unwrap();
+        }
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Failed', attempts = max_attempts \
+             WHERE json_extract(job, '$.target.Mint') = ?",
+        )
+        .bind(dead.to_string())
+        .execute(service.transfer_equity_to_market_making_queue.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(
+            service.mint_driver(&transferred, &symbol).await.unwrap(),
+            Some(MintDriver::TransferJob)
+        );
+        assert_eq!(
+            service.mint_driver(&resumed, &symbol).await.unwrap(),
+            Some(MintDriver::ResumeJob)
+        );
+        assert_eq!(service.mint_driver(&dead, &symbol).await.unwrap(), None);
+        assert_eq!(service.mint_driver(&idle, &symbol).await.unwrap(), None);
+
+        service.equity_in_progress.write().unwrap().insert(
+            symbol.clone(),
+            equity::GuardState::HeldForRecovery { chain: Chain::Base },
+        );
+        assert_eq!(
+            service.mint_driver(&idle, &symbol).await.unwrap(),
+            Some(MintDriver::Recovery)
         );
     }
 

@@ -66,6 +66,15 @@ sol!(
     TestERC20, env!("ST0X_TEST_ERC20_ABI")
 );
 
+// OpenZeppelin ERC-4626 vault over the underlying its constructor takes, the
+// wrapper shape the bot wraps into; the e2e tests deploy the same artifact.
+#[cfg(test)]
+sol!(
+    #![sol(all_derives = true, rpc)]
+    TestVault,
+    "tests/e2e/TestVault.json"
+);
+
 #[cfg(any(test, feature = "test-support"))]
 sol!(
     #![sol(all_derives = true, rpc)]

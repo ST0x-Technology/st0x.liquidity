@@ -198,6 +198,20 @@ pub(crate) struct TransferEquityRequest {
     /// Decimal number of shares; fractional shares are allowed.
     pub(crate) quantity: DecimalAmount,
     pub(crate) chain: &'static str,
+    /// Resumes this mint instead of starting one; omitted for a new transfer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) issuer_request_id: Option<Uuid>,
+}
+
+/// Body of `POST /liquidity-capital/wrap-equity`,
+/// `POST /liquidity-capital/unwrap-equity` and `POST /liquidity-capital/redeem`:
+/// underlying shares for a wrap or a redeem, wrapped shares for an unwrap.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EquityWalletRequest {
+    pub(crate) symbol: String,
+    pub(crate) quantity: DecimalAmount,
+    pub(crate) chain: &'static str,
 }
 
 /// The venue a USDC or equity transfer moves funds to, kebab cased on the
@@ -223,6 +237,17 @@ pub(crate) struct VaultTransferRequest {
     pub(crate) token: EvmAddress,
     pub(crate) vault_id: VaultId,
     pub(crate) amount: DecimalAmount,
+}
+
+/// Body of `POST /liquidity-capital/drain-equity`: wrapped shares to take out
+/// of the vault.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DrainEquityRequest {
+    pub(crate) symbol: String,
+    pub(crate) quantity: DecimalAmount,
+    pub(crate) chain: &'static str,
+    pub(crate) vault_id: VaultId,
 }
 
 /// Body of `POST /liquidity-capital/vault-withdraw-usdc`.

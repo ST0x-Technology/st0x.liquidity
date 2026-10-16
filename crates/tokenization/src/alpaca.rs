@@ -97,6 +97,34 @@ impl<W: Wallet> AlpacaTokenizationService<W> {
         Ok(receipt.transaction_hash)
     }
 
+    /// Broadcasts the transfer of `amount` of `token` to the issuer's
+    /// redemption wallet and returns its hash without awaiting its receipt:
+    /// the broadcast half of `send_for_redemption`, for a caller that must
+    /// answer before the transfer's confirmations, such as the bot's
+    /// `capital redeem` route. Confirm it with
+    /// [`Tokenizer::confirm_redemption_send`]. Like `send_for_redemption` it
+    /// carries no idempotency key, so the caller must never retry it.
+    pub async fn submit_redemption_send(
+        &self,
+        token: UnwrappedToken,
+        amount: U256,
+    ) -> Result<TxHash, TokenizerError> {
+        let redemption_wallet = self
+            .redemption_wallet
+            .ok_or(TokenizerError::MissingRedemptionWallet)?;
+        Ok(self
+            .wallet
+            .submit_pending(
+                token.address(),
+                IERC20::transferCall {
+                    to: redemption_wallet,
+                    amount,
+                },
+                "ERC20 transfer for redemption",
+            )
+            .await?)
+    }
+
     pub async fn list_requests(&self) -> Result<Vec<TokenizationRequest>, AlpacaTokenizationError> {
         self.client.list_requests().await
     }

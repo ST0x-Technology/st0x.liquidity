@@ -231,7 +231,7 @@ pub fn command_cases() -> Vec<CommandCase> {
     cases
 }
 
-fn capital_command_cases() -> [CommandCase; 8] {
+fn capital_command_cases() -> [CommandCase; 12] {
     const TOKEN: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
     const VAULT: &str = "0x00000000000000000000000000000000000000000000000000000000000000a1";
     const OPERATION: &str = "6f1c2a1e-6c39-4a77-9a8e-1f0b7d6e8c11";
@@ -259,6 +259,45 @@ fn capital_command_cases() -> [CommandCase; 8] {
                 "AAPL",
                 "--quantity",
                 "1",
+            ],
+        ),
+        case(
+            CommandRole::Capital,
+            &[
+                "capital",
+                "wrap-equity",
+                "--symbol",
+                "AAPL",
+                "--quantity",
+                "1",
+            ],
+        ),
+        case(
+            CommandRole::Capital,
+            &[
+                "capital",
+                "unwrap-equity",
+                "--symbol",
+                "AAPL",
+                "--quantity",
+                "1",
+            ],
+        ),
+        case(
+            CommandRole::Capital,
+            &["capital", "redeem", "--symbol", "AAPL", "--quantity", "1"],
+        ),
+        case(
+            CommandRole::Capital,
+            &[
+                "capital",
+                "drain-equity",
+                "--symbol",
+                "AAPL",
+                "--quantity",
+                "1",
+                "--vault-id",
+                VAULT,
             ],
         ),
         case(

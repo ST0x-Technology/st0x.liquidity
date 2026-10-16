@@ -157,6 +157,7 @@ alert_kinds! {
         CapitalCctpBridgeUnavailable => "Could not build the CCTP bridge to restore pending capital CCTP burns",
         CapitalCctpBurnSendUnproven => "A recorded CCTP burn could not be sent",
         CapitalCctpBurnRecordUnknown => "Cannot tell whether a signed CCTP burn was recorded",
+        CapitalEquityTxUnproven => "An operator equity wallet tx is still unproven",
         RecoveryActiveTransferOnOtherChain => "the symbol's active transfer is on another chain",
         RecoveryChainServicesMissing => "its chain has no equity services",
         WrappedRecoveryValidationFailed => "active aggregate validation failed",

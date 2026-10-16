@@ -905,6 +905,7 @@ mod tests {
             ))),
             vault_deposit_lock: Arc::new(tokio::sync::Mutex::new(())),
             vault_withdraw_lock: Arc::new(tokio::sync::Mutex::new(())),
+            equity_wallet_locks: Arc::default(),
             projection_maintenance: Arc::new(
                 crate::conductor::projection_pause::ProjectionMaintenance::for_test(),
             ),
