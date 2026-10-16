@@ -3849,6 +3849,47 @@ mod tests {
         assert!(rendered.contains("symbol=\"AAPL\""));
     }
 
+    #[tokio::test]
+    async fn buy_hedge_short_of_the_fractional_minimum_in_cash_keeps_the_stall_clock_running() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
+        let executor = MockExecutor::new()
+            .with_market_session(MarketSession::Regular)
+            .with_preflight_price(float!(100))
+            .with_inventory(Inventory {
+                positions: Vec::new(),
+                usd_balance_cents: 50,
+                cash_buying_power_cents: Some(50),
+                alpaca_usdc: None,
+                cash_withdrawable_cents: None,
+            });
+        let (ctx, position) = build_ctx_with_executor(
+            pool,
+            apalis_pool.clone(),
+            cfg,
+            Duration::from_secs(60),
+            executor,
+        )
+        .await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &symbol,
+            FractionalShares::new(float!(10.0)),
+            Direction::Sell,
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        assert_eq!(count_jobs(&apalis_pool, &hedge_job_type()).await, 0);
+        assert_eq!(
+            ctx.heartbeat.latest().map(|scan| scan.held),
+            Some(HashSet::new()),
+            "cash that cannot fund a $1 order is a funding shortfall, not a hold"
+        );
+    }
+
     /// Regression test for the preflight/placement price mismatch: the
     /// close-flatten placement path (`select_order_kind_for_current_session`)
     /// prices a buy off the current ask, not the latest trade price. Before

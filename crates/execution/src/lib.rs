@@ -855,32 +855,21 @@ pub(crate) fn resolve_buy_preflight(
             )?))?;
             let cost = estimate_buffered_cost_cents(shares, reference_price, slippage_bps)?;
             let notional = (shares.inner().inner() * reference_price)?;
-            let (_, is_whole) = shares.inner().inner().to_fixed_decimal_lossy(0)?;
+            let (whole_units, is_whole) = shares.inner().inner().to_fixed_decimal_lossy(0)?;
             let meets_fractional_minimum = is_whole || notional.gte(float!(1))?;
 
-            if !meets_fractional_minimum {
-                let (whole_units, _) = shares.inner().inner().to_fixed_decimal_lossy(0)?;
-                if whole_units == U256::ZERO {
-                    return Ok(CounterTradePreflight::Skipped(
-                        CounterTradeSkipReason::BelowMinimumNotional,
-                    ));
-                }
-
+            if meets_fractional_minimum {
+                Some((shares, cost))
+            } else if whole_units == U256::ZERO {
+                None
+            } else {
                 let whole_shares = Positive::new(FractionalShares::new(
                     Float::from_fixed_decimal(whole_units, 0)?,
                 ))?;
                 let whole_cost =
                     estimate_buffered_cost_cents(whole_shares, reference_price, slippage_bps)?;
-                return Ok(CounterTradePreflight::Allowed {
-                    reservation: Some(CounterTradeReservation::BuyingPower {
-                        required: whole_shares,
-                        estimated_cost_cents: whole_cost,
-                        available_buying_power_cents,
-                    }),
-                });
+                Some((whole_shares, whole_cost))
             }
-
-            Some((shares, cost))
         }
     };
 
@@ -1171,7 +1160,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_buy_preflight_skips_zero_cash_and_fractional_dust() {
+    fn resolve_buy_preflight_separates_cash_shortfall_from_dust() {
         let zero =
             resolve_buy_preflight(&buy_order("2"), positive_usd(float!(100)), 100, 0, 9).unwrap();
         assert!(matches!(
@@ -1179,12 +1168,22 @@ mod tests {
             CounterTradePreflight::Skipped(CounterTradeSkipReason::InsufficientBuyingPower { .. })
         ));
 
-        let dust =
+        let unfunded_whole_share =
             resolve_buy_preflight(&buy_order("1"), positive_usd(float!(0.5)), 0, 25, 9).unwrap();
-        assert!(matches!(
+        assert_eq!(
+            unfunded_whole_share,
+            CounterTradePreflight::Skipped(CounterTradeSkipReason::InsufficientBuyingPower {
+                estimated_cost_cents: 50,
+                available_buying_power_cents: 25,
+            })
+        );
+
+        let dust = resolve_buy_preflight(&buy_order("0.5"), positive_usd(float!(1)), 0, 100_000, 9)
+            .unwrap();
+        assert_eq!(
             dust,
             CounterTradePreflight::Skipped(CounterTradeSkipReason::BelowMinimumNotional)
-        ));
+        );
 
         let fully_funded_whole_share =
             resolve_buy_preflight(&buy_order("1"), positive_usd(float!(0.5)), 0, 100, 9).unwrap();
@@ -1192,6 +1191,20 @@ mod tests {
             fully_funded_whole_share,
             CounterTradePreflight::Allowed { .. }
         ));
+    }
+
+    #[test]
+    fn resolve_buy_preflight_reports_cash_below_the_fractional_minimum_as_insufficient() {
+        let result =
+            resolve_buy_preflight(&buy_order("10"), positive_usd(float!(100)), 0, 50, 9).unwrap();
+
+        assert_eq!(
+            result,
+            CounterTradePreflight::Skipped(CounterTradeSkipReason::InsufficientBuyingPower {
+                estimated_cost_cents: 100_000,
+                available_buying_power_cents: 50,
+            })
+        );
     }
 
     #[test]
