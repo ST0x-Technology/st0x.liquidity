@@ -6,7 +6,6 @@
 use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use serde::Serialize;
-use ts_rs::TS;
 
 use st0x_finance::{FractionalShares, HasZero, Symbol, Usdc};
 use st0x_float_serde::float_string_serde;
@@ -14,18 +13,13 @@ use st0x_float_serde::float_string_serde;
 use crate::ChainName;
 
 /// Per-symbol equity balances split by venue and availability.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SymbolInventory {
-    #[ts(type = "string")]
     pub symbol: Symbol,
-    #[ts(type = "string")]
     pub onchain_available: FractionalShares,
-    #[ts(type = "string")]
     pub onchain_inflight: FractionalShares,
-    #[ts(type = "string")]
     pub offchain_available: FractionalShares,
-    #[ts(type = "string")]
     pub offchain_inflight: FractionalShares,
     /// Equity tokens observed in the Base wallet between venues.
     pub inflight_equity: InFlightEquity,
@@ -36,13 +30,11 @@ pub struct SymbolInventory {
 /// One hedged chain's vault balance of a symbol, in that chain's wrapped
 /// vault shares. Each chain's wrapper has its own ratio, so these never sum
 /// across chains or with broker shares.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChainEquityInventory {
     pub chain: ChainName,
-    #[ts(type = "string")]
     pub available: FractionalShares,
-    #[ts(type = "string")]
     pub inflight: FractionalShares,
     /// `None` when the chain does not rebalance the symbol.
     pub band: Option<RebalancingBand>,
@@ -55,55 +47,44 @@ pub struct ChainEquityInventory {
 /// which needs each chain's wrapper ratio. The payload carries no ratio, so an
 /// equity band cannot be checked against `available`. For cash, the total is
 /// the chain's vault plus the broker's gross cash.
-#[derive(Debug, Clone, Copy, Serialize, TS)]
+#[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RebalancingBand {
     #[serde(with = "float_string_serde")]
-    #[ts(type = "string")]
     pub target: Float,
     #[serde(with = "float_string_serde")]
-    #[ts(type = "string")]
     pub deviation: Float,
 }
 
 /// Equity tokens sitting in wallets between venues, observed by polling.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InFlightEquity {
     /// Unwrapped tokenized equity (`tSTOCK`) parked on the Base wallet.
-    #[ts(type = "string")]
     pub base_wallet_unwrapped: FractionalShares,
     /// Wrapped equity vault shares (`wtSTOCK`) parked on the Base wallet.
-    #[ts(type = "string")]
     pub base_wallet_wrapped: FractionalShares,
 }
 
 /// Onchain and offchain USDC balances split by availability.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsdcInventory {
     /// The settlement stable the onchain balances are held in; the dashboard
     /// labels the cash row with it.
     pub symbol: String,
-    #[ts(type = "string")]
     pub onchain_available: Usdc,
-    #[ts(type = "string")]
     pub onchain_inflight: Usdc,
-    #[ts(type = "string")]
     pub offchain_available: Usdc,
-    #[ts(type = "string")]
     pub offchain_inflight: Usdc,
     /// Gross offchain USD balance before cash reserve subtraction.
-    #[ts(type = "string | null")]
     pub offchain_gross: Option<Usdc>,
     /// Settled cash that can be withdrawn/transferred out of the offchain
     /// broker (Alpaca's `cash_withdrawable` field -- excludes T+1 unsettled
     /// equity-sale proceeds). This is what can actually be rebalanced to
     /// Raindex.
-    #[ts(type = "string | null")]
     pub withdrawable_cash: Option<Usdc>,
     /// USDC held as a token asset in the Alpaca account.
-    #[ts(type = "string | null")]
     pub alpaca_usdc: Option<Usdc>,
     /// USDC observed at intermediate wallet locations between venues.
     pub inflight_cash: InFlightCash,
@@ -112,15 +93,13 @@ pub struct UsdcInventory {
 }
 
 /// One hedged chain's settlement-stable vault balance.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChainUsdcInventory {
     pub chain: ChainName,
     /// The chain's settlement stable (USDC, or USDG on Robinhood).
     pub symbol: String,
-    #[ts(type = "string")]
     pub available: Usdc,
-    #[ts(type = "string")]
     pub inflight: Usdc,
     /// The band of the chain's cash corridor; `None` without one.
     pub band: Option<RebalancingBand>,
@@ -131,14 +110,12 @@ pub struct ChainUsdcInventory {
 /// `None` means the wallet has not been observed yet; `Some(ZERO)` means
 /// it was observed empty. The values are tracked separately from venue
 /// inventory and never feed into imbalance math.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InFlightCash {
     /// USDC parked on the Ethereum wallet between Alpaca and CCTP.
-    #[ts(type = "string | null")]
     pub ethereum_wallet: Option<Usdc>,
     /// USDC parked on the Base wallet between CCTP and the Raindex vaults.
-    #[ts(type = "string | null")]
     pub base_wallet: Option<Usdc>,
 }
 
@@ -153,7 +130,7 @@ impl InFlightCash {
 }
 
 /// Full inventory snapshot across all symbols and USDC.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Inventory {
     pub per_symbol: Vec<SymbolInventory>,
@@ -183,7 +160,7 @@ impl Inventory {
 }
 
 /// Point-in-time snapshot of the current inventory state broadcast to clients.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InventorySnapshot {
     pub inventory: Inventory,

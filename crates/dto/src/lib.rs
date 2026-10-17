@@ -1,13 +1,8 @@
-//! Dashboard DTO types for TypeScript codegen.
-//!
-//! This crate contains all types that derive `TS` for TypeScript type generation.
-//! Keeping these in a separate crate allows the dashboard to build without waiting
-//! for the full workspace. Domain types from `st0x-finance` are used for type
-//! safety, with `#[ts(type = "string")]` overrides for TypeScript compatibility.
+//! Data transfer objects for the bot's read API: the REST handlers, the
+//! websocket stream and its `current_state` seed, and the liq_* metrics read
+//! them. Domain types from `st0x-finance` keep the wire values typed.
 
 use serde::Serialize;
-use std::path::Path;
-use ts_rs::TS;
 
 mod equity_price;
 mod inventory;
@@ -27,8 +22,8 @@ pub use statement::*;
 pub use trade::*;
 pub use transfer::*;
 
-/// Dashboard snapshot sent to the frontend on connection.
-#[derive(Debug, Clone, Serialize, TS)]
+/// The state snapshot `/api/ws` sends first on connection (the exporter reads it as a seed).
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CurrentState {
     pub trades: Vec<Trade>,
@@ -41,101 +36,11 @@ pub struct CurrentState {
     pub warnings: Vec<TransferWarning>,
 }
 
-/// Export all TypeScript bindings into `out_dir`.
-///
-/// Each type is written to `out_dir/TypeName.ts`. The caller controls
-/// the output location explicitly -- no `TS_RS_EXPORT_DIR` magic.
-///
-/// # Errors
-///
-/// Returns [`ts_rs::ExportError`] if any type's binding file fails to
-/// write (e.g., `out_dir` does not exist or is not writable).
-pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
-    Statement::export_all_to(out_dir)?;
-    CurrentState::export_all_to(out_dir)?;
-    Settings::export_all_to(out_dir)?;
-    AssetSettings::export_all_to(out_dir)?;
-    CounterTrading::export_all_to(out_dir)?;
-    WalletSettings::export_all_to(out_dir)?;
-    Trade::export_all_to(out_dir)?;
-    LegacyTrade::export_all_to(out_dir)?;
-    TradeOutcome::export_all_to(out_dir)?;
-    Position::export_all_to(out_dir)?;
-    EquityPrice::export_all_to(out_dir)?;
-    EquityPriceStatus::export_all_to(out_dir)?;
-    SymbolInventory::export_all_to(out_dir)?;
-    InFlightEquity::export_all_to(out_dir)?;
-    ChainEquityInventory::export_all_to(out_dir)?;
-    RebalancingBand::export_all_to(out_dir)?;
-    Inventory::export_all_to(out_dir)?;
-    InventorySnapshot::export_all_to(out_dir)?;
-    UsdcInventory::export_all_to(out_dir)?;
-    InFlightCash::export_all_to(out_dir)?;
-    ChainUsdcInventory::export_all_to(out_dir)?;
-    TransferOperation::export_all_to(out_dir)?;
-    EquityMintOperation::export_all_to(out_dir)?;
-    EquityMintStatus::export_all_to(out_dir)?;
-    EquityRedemptionOperation::export_all_to(out_dir)?;
-    EquityRedemptionStatus::export_all_to(out_dir)?;
-    UsdcBridgeDirection::export_all_to(out_dir)?;
-    UsdcBridgeOperation::export_all_to(out_dir)?;
-    UsdcBridgeStatus::export_all_to(out_dir)?;
-    TransferWarning::export_all_to(out_dir)?;
-    HedgeLatencies::export_all_to(out_dir)?;
-    LatencySummary::export_all_to(out_dir)?;
-    StageLatencies::export_all_to(out_dir)?;
-    LatencyStats::export_all_to(out_dir)?;
-    LatencyBucket::export_all_to(out_dir)?;
-    HedgeCycleReport::export_all_to(out_dir)?;
-    HedgeCycleStatus::export_all_to(out_dir)?;
-    OpenExposureReport::export_all_to(out_dir)?;
-    RebalanceTimings::export_all_to(out_dir)?;
-    RebalanceOperationTiming::export_all_to(out_dir)?;
-    RebalanceTimingStatus::export_all_to(out_dir)?;
-    RebalanceStageTiming::export_all_to(out_dir)?;
-    StageOutcome::export_all_to(out_dir)?;
-    RebalanceStageName::export_all_to(out_dir)?;
-    RebalanceStageStats::export_all_to(out_dir)?;
-    AttestationSample::export_all_to(out_dir)?;
-    EquityTimings::export_all_to(out_dir)?;
-    EquityOperationKind::export_all_to(out_dir)?;
-    EquityOperationTiming::export_all_to(out_dir)?;
-    EquityStageTiming::export_all_to(out_dir)?;
-    EquityStageName::export_all_to(out_dir)?;
-    EquityStageStats::export_all_to(out_dir)?;
-    ReliabilityReport::export_all_to(out_dir)?;
-    LogVolumeBucket::export_all_to(out_dir)?;
-    CountedLogLevel::export_all_to(out_dir)?;
-    LogTargetCount::export_all_to(out_dir)?;
-    FailureEventType::export_all_to(out_dir)?;
-    FailureEventCount::export_all_to(out_dir)?;
-    JobQueueHealth::export_all_to(out_dir)?;
-    InfraReport::export_all_to(out_dir)?;
-    MonitorTelemetry::export_all_to(out_dir)?;
-    ChainName::export_all_to(out_dir)?;
-    ChainBlockLag::export_all_to(out_dir)?;
-    BlockLagPoint::export_all_to(out_dir)?;
-    ChainPollHealth::export_all_to(out_dir)?;
-    DependencyName::export_all_to(out_dir)?;
-    DependencyStats::export_all_to(out_dir)?;
-    DependencyBucket::export_all_to(out_dir)?;
-    std::fs::write(out_dir.join("StatementGuard.ts"), Statement::guard_ts())
-        .map_err(ts_rs::ExportError::Io)?;
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use std::path::PathBuf;
-    use ts_rs::TS;
 
     use super::*;
-
-    fn default_bindings_dir() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dashboard/src/lib/api")
-    }
 
     #[test]
     fn current_state_serializes_all_fields() {
@@ -177,51 +82,5 @@ mod tests {
         assert_eq!(json["settings"]["usdcTarget"], json!(null));
         assert_eq!(json["settings"]["executionThreshold"], json!("$2"));
         assert!(json["inventory"].is_object());
-    }
-
-    #[derive(TS)]
-    struct TestOnlyBinding {
-        _canary: bool,
-    }
-
-    #[test]
-    fn export_bindings_generates_files_in_dashboard_directory() {
-        let out_dir = default_bindings_dir();
-
-        export_bindings(&out_dir).unwrap();
-
-        assert!(
-            out_dir.join("Statement.ts").exists(),
-            "Statement.ts should exist in {}/",
-            out_dir.display()
-        );
-        assert!(
-            out_dir.join("CurrentState.ts").exists(),
-            "CurrentState.ts should exist in {}/",
-            out_dir.display()
-        );
-        assert!(
-            out_dir.join("StatementGuard.ts").exists(),
-            "StatementGuard.ts should exist in {}/",
-            out_dir.display()
-        );
-
-        TestOnlyBinding::export_all_to(&out_dir).unwrap();
-        let test_file = out_dir.join("TestOnlyBinding.ts");
-        let contents = std::fs::read_to_string(&test_file).unwrap_or_else(|error| {
-            panic!(
-                "test-only binding should be readable at {}: {error}",
-                test_file.display()
-            )
-        });
-        assert!(
-            contents.contains("TestOnlyBinding"),
-            "generated file should contain the type name, got: {contents}"
-        );
-        assert!(
-            contents.contains("_canary"),
-            "generated file should contain the field name, got: {contents}"
-        );
-        std::fs::remove_file(&test_file).unwrap();
     }
 }

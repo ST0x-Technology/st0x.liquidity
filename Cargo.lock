@@ -7787,7 +7787,6 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "chrono",
- "clap",
  "rain-math-float",
  "serde",
  "serde_json",
@@ -7796,7 +7795,6 @@ dependencies = [
  "st0x-float-serde",
  "strum 0.28.0",
  "thiserror 2.0.18",
- "ts-rs",
  "uuid",
 ]
 
@@ -7981,7 +7979,6 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber 0.3.23",
  "tracing-test",
- "ts-rs",
  "url",
  "urlencoding",
  "uuid",
@@ -8952,7 +8949,6 @@ version = "11.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4994acea2522cd2b3b85c1d9529a55991e3ad5e25cdcd3de9d505972c4379424"
 dependencies = [
- "chrono",
  "thiserror 2.0.18",
  "ts-rs-macros",
 ]

@@ -3,21 +3,19 @@
 use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
-use ts_rs::TS;
 
 use st0x_finance::Symbol;
 use st0x_float_serde::float_string_serde;
 
 /// Latest pricing-service state for one configured equity.
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EquityPrice {
-    #[ts(type = "string")]
     pub symbol: Symbol,
     pub status: EquityPriceStatus,
 }
 
 /// A price is either currently usable or explicitly unavailable.
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(
     tag = "status",
     rename_all = "snake_case",
@@ -26,7 +24,6 @@ pub struct EquityPrice {
 pub enum EquityPriceStatus {
     Available {
         #[serde(with = "float_string_serde")]
-        #[ts(type = "string")]
         price_usd: Float,
         observed_at: DateTime<Utc>,
         expires_at: DateTime<Utc>,

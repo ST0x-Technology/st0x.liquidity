@@ -5,7 +5,6 @@ use serde::Serialize;
 use std::str::FromStr;
 use strum::VariantArray;
 use thiserror::Error;
-use ts_rs::TS;
 use uuid::Uuid;
 
 use st0x_finance::{FractionalShares, Symbol, Usdc};
@@ -13,7 +12,7 @@ use st0x_finance::{FractionalShares, Symbol, Usdc};
 use crate::UsdcBridgeDirection;
 
 /// Response of `GET /performance/latencies`.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HedgeLatencies {
     pub summary: LatencySummary,
@@ -22,24 +21,22 @@ pub struct HedgeLatencies {
     /// Most recent hedge cycles (waterfall rows), newest first.
     pub cycles: Vec<HedgeCycleReport>,
     /// Total cycles in range before the `cycles` cap was applied.
-    #[ts(type = "number")]
     pub total_cycles: usize,
     /// Symbols currently carrying fills not yet covered by a hedge.
     pub open_exposures: Vec<OpenExposureReport>,
 }
 
 /// Whole-range latency aggregates.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LatencySummary {
-    #[ts(type = "number")]
     pub fill_count: usize,
     pub stages: StageLatencies,
 }
 
 /// Percentiles for each stage of the hedge pipeline. A stage is `null` when
 /// no sample in the window reached it.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StageLatencies {
     pub detection: Option<LatencyStats>,
@@ -50,25 +47,19 @@ pub struct StageLatencies {
 }
 
 /// Nearest-rank percentiles over a set of latency samples, in milliseconds.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LatencyStats {
-    #[ts(type = "number")]
     pub p50_ms: i64,
-    #[ts(type = "number")]
     pub p90_ms: i64,
-    #[ts(type = "number")]
     pub p95_ms: i64,
-    #[ts(type = "number")]
     pub p99_ms: i64,
-    #[ts(type = "number")]
     pub max_ms: i64,
-    #[ts(type = "number")]
     pub sample_count: usize,
 }
 
 /// Per-stage percentiles within one time bucket.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LatencyBucket {
     pub start: DateTime<Utc>,
@@ -76,33 +67,26 @@ pub struct LatencyBucket {
 }
 
 /// One hedge order's trip through the pipeline: a waterfall row.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HedgeCycleReport {
-    #[ts(type = "string")]
     pub symbol: Symbol,
-    #[ts(type = "string")]
     pub offchain_order_id: Uuid,
     pub placed_at: DateTime<Utc>,
-    #[ts(type = "number")]
     pub covered_fill_count: usize,
     pub earliest_fill_block_timestamp: Option<DateTime<Utc>>,
     pub submitted_at: Option<DateTime<Utc>>,
     pub status: HedgeCycleStatus,
     /// Broker fill or failure time, depending on `status`.
     pub completed_at: Option<DateTime<Utc>>,
-    #[ts(type = "number | null")]
     pub decision_ms: Option<i64>,
-    #[ts(type = "number | null")]
     pub submission_ms: Option<i64>,
-    #[ts(type = "number | null")]
     pub execution_ms: Option<i64>,
-    #[ts(type = "number | null")]
     pub exposure_window_ms: Option<i64>,
 }
 
 /// Terminal state of a hedge cycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HedgeCycleStatus {
     Pending,
@@ -112,29 +96,25 @@ pub enum HedgeCycleStatus {
 
 /// Fills observed after a symbol's most recent hedge placement: exposure the
 /// system carries unhedged right now.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenExposureReport {
-    #[ts(type = "string")]
     pub symbol: Symbol,
-    #[ts(type = "number")]
     pub fill_count: usize,
     pub oldest_fill_block_timestamp: DateTime<Utc>,
 }
 
 /// Response of `GET /performance/rebalances`.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RebalanceTimings {
     /// Most recent operations (stage breakdown rows), newest first.
     pub operations: Vec<RebalanceOperationTiming>,
     /// Total operations in range before the `operations` cap was applied.
-    #[ts(type = "number")]
     pub total_operations: usize,
     /// Operations dropped because their stored timing JSON failed to
     /// deserialize. They are excluded from every field above; this count
     /// surfaces the gap so a malformed read-model row is not silently invisible.
-    #[ts(type = "number")]
     pub skipped_operations: u32,
     /// Percentiles per stage across all operations in range.
     ///
@@ -147,13 +127,11 @@ pub struct RebalanceTimings {
 }
 
 /// One USDC rebalance operation's per-stage timing breakdown.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RebalanceOperationTiming {
-    #[ts(type = "string")]
     pub operation_id: Uuid,
     pub direction: Option<UsdcBridgeDirection>,
-    #[ts(type = "string | null")]
     pub amount: Option<Usdc>,
     /// Genuine operation start (the first-phase conversion or withdrawal event).
     /// `null` when the read model first observed the operation mid-stream
@@ -168,12 +146,11 @@ pub struct RebalanceOperationTiming {
     /// (mid-stream first observation), or when completion was an out-of-band
     /// `OperatorReconciled` (whose manual-response window must not pollute
     /// round-trip latency metrics).
-    #[ts(type = "number | null")]
     pub total_ms: Option<i64>,
 }
 
 /// Where a rebalance operation currently stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RebalanceTimingStatus {
     InProgress,
@@ -182,13 +159,12 @@ pub enum RebalanceTimingStatus {
 }
 
 /// Timing of one stage within a rebalance operation.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RebalanceStageTiming {
     pub stage: RebalanceStageName,
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
-    #[ts(type = "number | null")]
     pub duration_ms: Option<i64>,
     pub outcome: StageOutcome,
 }
@@ -202,7 +178,7 @@ pub struct RebalanceStageTiming {
 /// intent, or a mint discovered after the fact by recovery); they carry a
 /// `null` `duration_ms` and never enter percentiles. An in-progress stage that
 /// has not yet ended also reports `Unmeasured` until it closes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StageOutcome {
     Succeeded,
@@ -211,7 +187,7 @@ pub enum StageOutcome {
 }
 
 /// Stages of the USDC rebalance pipeline, in flow order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RebalanceStageName {
     Conversion,
@@ -223,7 +199,7 @@ pub enum RebalanceStageName {
 }
 
 /// Percentiles for one rebalance stage.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RebalanceStageStats {
     pub stage: RebalanceStageName,
@@ -231,18 +207,16 @@ pub struct RebalanceStageStats {
 }
 
 /// Response of `GET /performance/equity-rebalances`.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EquityTimings {
     /// Most recent operations (stage breakdown rows), newest first.
     pub operations: Vec<EquityOperationTiming>,
     /// Total operations in range before the `operations` cap was applied.
-    #[ts(type = "number")]
     pub total_operations: usize,
     /// Operations dropped because their stored timing JSON failed to
     /// deserialize. They are excluded from every field above; this count
     /// surfaces the gap so a malformed read-model row is not silently invisible.
-    #[ts(type = "number")]
     pub skipped_operations: u32,
     /// Percentiles per stage across all operations in range.
     ///
@@ -254,7 +228,7 @@ pub struct EquityTimings {
 
 /// Whether an equity rebalance operation is minting tokenized equity from
 /// real shares or redeeming tokenized equity back to real shares.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EquityOperationKind {
     Mint,
@@ -262,19 +236,16 @@ pub enum EquityOperationKind {
 }
 
 /// One equity mint or redemption operation's per-stage timing breakdown.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EquityOperationTiming {
-    #[ts(type = "string")]
     pub operation_id: Uuid,
     pub kind: EquityOperationKind,
     /// `null` only when the read model first observed the operation
     /// mid-stream (its genesis event, which alone carries the symbol, was
     /// never seen) -- mirrors `RebalanceOperationTiming::direction`'s
     /// optionality for the same reason.
-    #[ts(type = "string | null")]
     pub symbol: Option<Symbol>,
-    #[ts(type = "string | null")]
     pub quantity: Option<FractionalShares>,
     /// Genuine operation start (the first observed event). `null` when the
     /// read model first observed the operation mid-stream (e.g. after a
@@ -289,18 +260,16 @@ pub struct EquityOperationTiming {
     /// unknown (mid-stream first observation), or when completion was an
     /// out-of-band `OperatorReconciled` (whose manual-response window must
     /// not pollute round-trip latency metrics).
-    #[ts(type = "number | null")]
     pub total_ms: Option<i64>,
 }
 
 /// Timing of one stage within an equity mint or redemption operation.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EquityStageTiming {
     pub stage: EquityStageName,
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
-    #[ts(type = "number | null")]
     pub duration_ms: Option<i64>,
     pub outcome: StageOutcome,
 }
@@ -312,7 +281,7 @@ pub struct EquityStageTiming {
 /// redemption stages are semantically distinct pipelines combined into one
 /// chart -- the prefix keeps the legend unambiguous about which row kind a
 /// stage applies to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EquityStageName {
     MintAcceptance,
@@ -327,7 +296,7 @@ pub enum EquityStageName {
 }
 
 /// Percentiles for one equity stage.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EquityStageStats {
     pub stage: EquityStageName,
@@ -335,16 +304,15 @@ pub struct EquityStageStats {
 }
 
 /// One completed CCTP attestation: burn time and how long Circle took.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AttestationSample {
     pub burned_at: DateTime<Utc>,
-    #[ts(type = "number")]
     pub duration_ms: i64,
 }
 
 /// Response of `GET /performance/reliability`.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReliabilityReport {
     /// Error/warning log volume over time, oldest bucket first.
@@ -367,19 +335,17 @@ pub struct ReliabilityReport {
 }
 
 /// Error and warning counts within one time bucket.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LogVolumeBucket {
     pub start: DateTime<Utc>,
-    #[ts(type = "number")]
     pub errors: usize,
-    #[ts(type = "number")]
     pub warnings: usize,
 }
 
 /// Log level counted by the reliability report. Only errors and warnings are
 /// aggregated; other levels never reach the report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum CountedLogLevel {
     Error,
@@ -387,15 +353,13 @@ pub enum CountedLogLevel {
 }
 
 /// How often one log target emitted at one level.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LogTargetCount {
     pub target: String,
     pub level: CountedLogLevel,
-    #[ts(type = "number")]
     pub count: usize,
     /// Per-bucket counts aligned with the report's `log_buckets`.
-    #[ts(type = "number[]")]
     pub sparkline: Vec<usize>,
 }
 
@@ -405,7 +369,7 @@ pub struct LogTargetCount {
 /// Serialized exactly as the event store's `event_type` discriminator
 /// (`AggregateEvent::Variant`), so the wire format matches what operators
 /// see in the database and logs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, TS, VariantArray)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, VariantArray)]
 pub enum FailureEventType {
     #[serde(rename = "OffchainOrderEvent::Failed")]
     OffchainOrderFailed,
@@ -484,17 +448,16 @@ impl FromStr for FailureEventType {
 }
 
 /// Occurrences of one lifecycle failure event type.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FailureEventCount {
     pub event_type: FailureEventType,
-    #[ts(type = "number")]
     pub count: usize,
     pub last_at: DateTime<Utc>,
 }
 
 /// Response of `GET /performance/infra`.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InfraReport {
     pub monitor: MonitorTelemetry,
@@ -504,7 +467,7 @@ pub struct InfraReport {
 }
 
 /// External dependency a call sample was recorded against.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DependencyName {
     Rpc,
@@ -512,14 +475,12 @@ pub enum DependencyName {
 }
 
 /// Latency and error aggregates for one operation against one dependency.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DependencyStats {
     pub dependency: DependencyName,
     pub operation: String,
-    #[ts(type = "number")]
     pub calls: usize,
-    #[ts(type = "number")]
     pub errors: usize,
     /// Whole-range latency percentiles.
     pub latency: Option<LatencyStats>,
@@ -528,20 +489,17 @@ pub struct DependencyStats {
 }
 
 /// One time bucket of dependency calls.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DependencyBucket {
     pub start: DateTime<Utc>,
-    #[ts(type = "number")]
     pub calls: usize,
-    #[ts(type = "number")]
     pub errors: usize,
-    #[ts(type = "number | null")]
     pub p50_ms: Option<i64>,
 }
 
 /// Ingestion-health telemetry sampled by the order-fill monitors.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MonitorTelemetry {
     /// Every enabled chain, including observe-only chains without a fill watcher.
@@ -553,7 +511,7 @@ pub struct MonitorTelemetry {
 }
 
 /// A hedged chain, by the wire name `st0x_evm::Chain` pins.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChainName {
     Base,
@@ -564,13 +522,12 @@ pub enum ChainName {
 }
 
 /// Block lag of one hedged chain's fill watcher.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChainBlockLag {
     pub chain: ChainName,
     /// Latest sampled block lag, regardless of the report range. `None`
     /// until a sample with a backfill checkpoint exists.
-    #[ts(type = "number | null")]
     pub current_lag_blocks: Option<i64>,
     /// When the current lag was sampled, so the dashboard can flag a stale
     /// monitor (no recent samples) distinctly from a healthy zero lag.
@@ -580,59 +537,48 @@ pub struct ChainBlockLag {
 }
 
 /// Worst block lag within one time bucket.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BlockLagPoint {
     pub start: DateTime<Utc>,
-    #[ts(type = "number")]
     pub max_lag_blocks: i64,
 }
 
 /// Poll-cycle health of one hedged chain's order-fill monitor within the
 /// report range.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChainPollHealth {
     pub chain: ChainName,
-    #[ts(type = "number")]
     pub cycles: usize,
-    #[ts(type = "number")]
     pub errors: usize,
     /// Poll ticks silently dropped because the previous cycle overran.
-    #[ts(type = "number")]
     pub skipped_ticks: usize,
     /// Poll duration percentiles; `null` with no cycles in range.
     pub duration: Option<LatencyStats>,
 }
 
 /// Snapshot of one apalis job queue's health.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JobQueueHealth {
     pub job_type: String,
-    #[ts(type = "number")]
     pub pending: usize,
-    #[ts(type = "number")]
     pub running: usize,
-    #[ts(type = "number")]
     pub done: usize,
     /// Terminal failures from retry exhaustion. apalis writes status `Killed`
     /// (not `Failed`) once a job exhausts `max_attempts`, carrying
     /// `attempts >= max_attempts`, so this counts `Killed AND attempts >=
     /// max_attempts`. Disjoint from `awaiting_retry` and `killed`.
-    #[ts(type = "number")]
     pub failed: usize,
     /// Failed jobs apalis will retry (status `Failed`, attempts <
     /// max_attempts): live backlog, also included in `oldest_pending_run_at`.
-    #[ts(type = "number")]
     pub awaiting_retry: usize,
     /// Jobs killed before exhausting retries (status `Killed`, attempts <
     /// max_attempts), e.g. an explicit non-retryable abort. Disjoint from the
     /// exhaustion-driven `failed` count.
-    #[ts(type = "number")]
     pub killed: usize,
     /// Jobs that needed more than one attempt.
-    #[ts(type = "number")]
     pub retried: usize,
     pub oldest_pending_run_at: Option<DateTime<Utc>>,
 }

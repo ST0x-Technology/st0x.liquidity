@@ -132,11 +132,6 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 # match the default module-path-based EnvFilter in tests. This feature makes
 # the test subscriber capture all targets regardless of RUST_LOG.
 tracing-test = { version = "0.2.5", features = ["no-env-filter"] }
-ts-rs = { version = "11.1.0", features = [
-  "chrono",
-  "chrono-impl",
-  "serde-compat",
-] }
 url = { version = "2.5.4", features = ["serde"] }
 urlencoding = "2.1"
 uuid = { version = "1.11", features = ["serde", "v4", "v5"] }
@@ -253,7 +248,6 @@ toml.workspace = true
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber = { workspace = true, features = ["json"] }
-ts-rs.workspace = true
 url.workspace = true
 urlencoding.workspace = true
 uuid.workspace = true

@@ -589,8 +589,7 @@ Workspace crates:
 - **`st0x-config`** (`crates/config/`) - TOML/secrets loading and runtime
   context assembly; restricted to the `st0x-hedge` and `st0x-cli` application
   crates
-- **`st0x-dto`** (`crates/dto/`) - Shared API DTOs and TypeScript binding
-  generation
+- **`st0x-dto`** (`crates/dto/`) - Shared API DTOs
 - **`st0x-execution`** (`crates/execution/`) - `Executor` trait and
   Liquidity-specific hedge policy over the released `st0x-alpaca` broker and
   wallet clients

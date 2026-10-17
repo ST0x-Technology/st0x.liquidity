@@ -9310,7 +9310,7 @@ src/                              - Main st0x-hedge library crate
 crates/
   cli/                            - st0x-cli operator binary and subcommands
   bridge/                         - Circle CCTP bridge abstraction
-  dto/                            - Shared API DTOs and TypeScript bindings
+  dto/                            - Shared API DTOs
   event-sorcery/                  - CQRS/ES framework (EventSourced, Store, Reactor, Projection)
   execution/                      - Trade execution library (Executor trait, Alpaca, mock)
 ```
