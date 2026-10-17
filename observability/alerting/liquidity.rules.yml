@@ -4631,5 +4631,185 @@ groups:
           summary: >-
             Production liquidity bot log has had no entry for 15 minutes, so its operational alerts cannot fire.
           description: >-
-            Cloud Logging has no entry in log liquidity-bot in t0-liquidity for 15 minutes. Both bots log at least once a minute, so either the bot stopped or the Ops Agent stopped shipping its stdout. While this fires, every per-kind liquidity alert is blind. Check production-service-down first: if the bot is down, fix that. If the bot is up, check the agent over IAP SSH: systemctl is-active google-cloud-ops-agent-opentelemetry-collector google-cloud-ops-agent-fluent-bit (one unit at a time), then docker logs on the bot container. A planned VM replace or stop also fires this. It resolves once the log has entries again.
+            Cloud Logging has no entry in log liquidity-bot in t0-liquidity for 15 minutes. Both bots log at least once a minute, so either the bot stopped or the Ops Agent stopped shipping its stdout. While this fires, every per-kind liquidity alert is blind. If liquidity-target-down-production fires for job t0-liquidity too, the bot alone is down: fix that. Otherwise, over IAP SSH, run systemctl is-active t0-liquidity-stack.service. Inactive or failed means the whole stack is down, and a planned stop, VM replace or failed roll fires this too. Active means the unit started: run sudo docker ps. If the bot container shows Restarting or Exited, the bot cannot start: read sudo docker logs --tail 50 t0-liquidity-bot-1 and fix the config or the image. If it shows Up for minutes, its log is not arriving: check the agent with systemctl is-active google-cloud-ops-agent-opentelemetry-collector google-cloud-ops-agent-fluent-bit (one unit at a time), then docker logs on the bot container. It resolves once the log has entries again.
+        labels: {service: liquidity, severity: critical}
+
+      # ---- the bot's scrape -------------------------------------------------
+      # The Ops Agent on the VM scrapes two targets, the bot (job
+      # t0-liquidity) and the exporter (job t0-liquidity-exporter), and
+      # Managed Prometheus records each outcome as `up` (1 answered, 0 did
+      # not). This rule fires for a target whose five-minute mean is below
+      # one half while the best target in the project is at or above it: the
+      # bot in a restart loop while the exporter answers, as on 2026-09-04 (a
+      # runtime-config field its pinned image rejected) and on 2026-10-03
+      # (Robinhood RPC quota). ALIGN_MEAN, not MAX: a process that starts,
+      # listens, then dies still averages below one half while it is down
+      # for most of each restart cycle. A loop that keeps /metrics up for
+      # most of each cycle does not fire it.
+      #
+      # Every target down at once fires it only while the bot still logs (L,
+      # its log lines in the last 5 minutes). Both targets run in the one
+      # systemd stack unit, and a stopped stack (by an operator, a roll or a
+      # failed unit) takes the log quiet too, so it pages nothing here.
+      # liquidity-bot-log-quiet-production above pages a stack that stays
+      # down, 17 minutes after the bot's last line. A crash loop that takes
+      # both containers down, from memory or a full disk, logs on every boot
+      # and fires. After a stop, the bot's last lines and the count's ingestion
+      # delay of up to 3 minutes keep L above 0 for at most about 8 minutes,
+      # under the 10-minute pending period. production-service-down in
+      # T0Trade/t0.grafana leaves t0-liquidity to this rule.
+      #
+      # Q reads 3 days for the reason the log-quiet rule gives: a quiet
+      # window returns no series, and one empty query makes the whole rule
+      # NoData. R cuts the last 5 minutes and L reads an empty bucket as 0.
+      #
+      # Without the exporter, T equals B and only the L leg can fire, so a
+      # bot that dies before it logs would page nothing. Review this rule
+      # before the exporter sidecar is removed.
+      #
+      # bot_enabled: false in t0.devops images.yaml scales the bot to 0 and
+      # leaves the exporter running, so a planned pause fires this rule:
+      # silence it for the pause.
+      #
+      # S has no group-by, so T is one series and the math applies it to the
+      # B of each target. The Cloud Monitoring datasource names grouped labels
+      # resource.label.<name>, so the annotations reach them through index.
+      # If the agent's metrics collector alone stops, A and S return no
+      # series and the rule reads OK while the log still arrives, so nothing
+      # pages: an accepted gap. for: 10m absorbs a plain restart.
+      - uid: t0liqtgtdownprd
+        title: liquidity-target-down-production
+        condition: C
+        data:
+          - refId: A
+            queryType: timeSeriesList
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: cloudmon
+            model:
+              datasource: {type: stackdriver, uid: cloudmon}
+              queryType: timeSeriesList
+              refId: A
+              instant: true
+              intervalMs: 60000
+              timeSeriesList:
+                projectName: t0-liquidity
+                filters:
+                  - "metric.type"
+                  - "="
+                  - "prometheus.googleapis.com/up/gauge"
+                alignmentPeriod: +300s
+                perSeriesAligner: ALIGN_MEAN
+                crossSeriesReducer: REDUCE_MIN
+                preprocessor: none
+                groupBys:
+                  - resource.label.job
+                view: FULL
+          - refId: S
+            queryType: timeSeriesList
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: cloudmon
+            model:
+              datasource: {type: stackdriver, uid: cloudmon}
+              queryType: timeSeriesList
+              refId: S
+              instant: true
+              intervalMs: 60000
+              timeSeriesList:
+                projectName: t0-liquidity
+                filters:
+                  - "metric.type"
+                  - "="
+                  - "prometheus.googleapis.com/up/gauge"
+                alignmentPeriod: +300s
+                perSeriesAligner: ALIGN_MEAN
+                crossSeriesReducer: REDUCE_MAX
+                preprocessor: none
+                groupBys: []
+                view: FULL
+          - refId: B
+            queryType: expression
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              datasource: {name: Expression, type: __expr__, uid: __expr__}
+              type: reduce
+              reducer: last
+              expression: A
+              refId: B
+          - refId: T
+            queryType: expression
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              datasource: {name: Expression, type: __expr__, uid: __expr__}
+              type: reduce
+              reducer: last
+              expression: S
+              refId: T
+          - refId: Q
+            queryType: timeSeriesList
+            relativeTimeRange: {from: 259200, to: 0}
+            datasourceUid: cloudmon
+            model:
+              datasource: {type: stackdriver, uid: cloudmon}
+              queryType: timeSeriesList
+              refId: Q
+              instant: true
+              intervalMs: 60000
+              timeSeriesList:
+                projectName: t0-liquidity
+                filters:
+                  - "metric.type"
+                  - "="
+                  - "logging.googleapis.com/log_entry_count"
+                  - AND
+                  - "metric.labels.log"
+                  - "="
+                  - "liquidity-bot"
+                alignmentPeriod: +60s
+                perSeriesAligner: ALIGN_DELTA
+                crossSeriesReducer: REDUCE_SUM
+                preprocessor: none
+                groupBys: []
+                view: FULL
+          - refId: R
+            queryType: expression
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: __expr__
+            model:
+              datasource: {name: Expression, type: __expr__, uid: __expr__}
+              type: resample
+              expression: Q
+              window: 5m
+              downsampler: sum
+              upsampler: fillna
+              refId: R
+          - refId: L
+            queryType: expression
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              datasource: {name: Expression, type: __expr__, uid: __expr__}
+              type: reduce
+              reducer: last
+              settings: {mode: replaceNN, replaceWithValue: 0}
+              expression: R
+              refId: L
+          - refId: C
+            queryType: expression
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              datasource: {name: Expression, type: __expr__, uid: __expr__}
+              type: math
+              expression: "$B < 0.5 && ($T >= 0.5 || $L > 0)"
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 10m
+        annotations:
+          summary: >-
+            Production {{ index $labels "resource.label.job" }} is down while the liquidity stack still runs: its /metrics has averaged below 0.5 for 10 minutes.
+          description: >-
+            The scrape of {{ index $labels "resource.label.job" }} in t0-liquidity has averaged below 0.5 for ten minutes while the other target answers or the bot keeps logging, so the process is not listening: most often a restart loop after a config or image roll, or both containers restarting from memory or a full disk. Over IAP SSH: sudo docker ps (look for "Restarting"), then sudo docker logs --tail 50 on t0-liquidity-bot-1 for job t0-liquidity or t0-liquidity-exporter-1 for job t0-liquidity-exporter. A bot config parse error names the field, and the fix is the runtime config (config/prod/st0x-hedge.toml) or the image, released together. While the bot is down it places no orders and no hedges. While the exporter is down, trading and the default boards continue, and only the boards' exporter source goes blank. bot_enabled: false in images.yaml also fires this for the bot: silence it for a planned pause. A stop of the whole stack does not fire this rule; liquidity-bot-log-quiet-production pages that.
         labels: {service: liquidity, severity: critical}

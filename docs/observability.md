@@ -654,7 +654,9 @@ bot source holds rows only once the bot logs JSON (`log_format = "json"`) and
 its stdout reaches Cloud Logging as `liquidity-bot`; until then it shows empty
 log panels. Stage 4 made `bot` the default for them and the metrics in one
 `SOURCE_VAR` change, once staging and production both showed rows on the bot
-source; a later stage removes the exporter's queries.
+source; a later stage removes the exporter's queries. Removing the exporter
+sidecar itself needs a review of `liquidity-target-down-production` first:
+without a second target, that rule fires only while the bot still logs.
 
 `observability/gen-t0-liquidity.py` adds the matcher and fails if any `liq_`
 selector is left without exactly `job=~"$source"`.
