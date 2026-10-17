@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Generator for dashboards/liquidity/t0-liquidity.json, the Liquidity bot
-board, a 1:1 Grafana rendering of the bot's own SvelteKit dashboard.
+board: the bot's inventory, trades, rebalances, orders, PnL, performance
+and logs in Grafana.
 
 Regenerate after edits:
 
@@ -18,11 +19,11 @@ Data comes from the bot itself:
             sidecar's liquidity-orders log for Orders, which the bot does
             not log
 
-Layout mirrors the SPA's tabs as rows, in tab order: header strip,
-Dashboard (inventory tables | trades over rebalances, a 13/11 split like
-the SPA's 11fr/9fr; checked with no sideways scroll on a 1934px-wide
-viewport), Orders, PnL, Performance, Logs — then the pre-exporter
-native-metric rows (t0-liquidity-native-rows.json), collapsed.
+Layout, in tab order: header strip,
+Dashboard (inventory tables | trades over rebalances, a 13/11 split;
+checked with no sideways scroll on a 1934px-wide viewport), Orders, PnL,
+Performance, Logs, then the pre-exporter native-metric rows
+(t0-liquidity-native-rows.json), collapsed.
 
 Two Grafana-side patterns worth knowing before editing:
 
@@ -445,13 +446,13 @@ def matrix_table(title, desc, expr, row_label, w=12, h=10, x=0, y=0,
 def day_barchart(title, desc, metric, series_label, w=12, h=7, x=0, y=0,
                  stack=True, unit="currencyUSD", decimals=2, overrides=None,
                  legend_mode="list", legend_placement="bottom"):
-    """The SPA's PnL bar charts: one bar per calendar day, split by symbol or
+    """The PnL bar charts: one bar per calendar day, split by symbol or
     by PnL stream.
 
     x is the `day` LABEL, kept a string on purpose. The bot's day buckets are
-    sparse (staging jumps Jul 8 -> Jul 22), and the SPA draws them as adjacent
-    categories with no gap; converting `day` to a time field would reopen
-    those two weeks as dead axis the SPA never shows. So: barchart with a
+    sparse (staging jumps Jul 8 -> Jul 22), and the chart draws them as
+    adjacent categories with no gap; converting `day` to a time field would
+    reopen those two weeks as dead axis. So: barchart with a
     categorical x, pivoted the same way the per-symbol tables are.
     """
     matrix_key = f"day\\{series_label}"
@@ -474,8 +475,8 @@ def day_barchart(title, desc, metric, series_label, w=12, h=7, x=0, y=0,
             {"id": "groupingToMatrix",
              "options": {"columnField": series_label, "rowField": "day",
                          "valueField": "Value (lastNotNull)",
-                         # A symbol with no fill that day is a zero bar in the
-                         # SPA, not a hole.
+                         # A symbol with no fill that day is a zero bar, not
+                         # a hole.
                          "emptyValue": "zero"}},
             {"id": "organize",
              "options": {"excludeByName": {}, "indexByName": {},
@@ -501,13 +502,13 @@ def day_barchart(title, desc, metric, series_label, w=12, h=7, x=0, y=0,
         "options": {
             "xField": "Day", "orientation": "auto",
             "stacking": "normal" if stack else "none",
-            # The SPA sizes a bar `min(34px, slot * 0.68)`. Grafana's
+            # The target bar size is `min(34px, slot * 0.68)`. Grafana's
             # barchart takes only a slot FRACTION, no pixel cap (checked in
             # the 13.1.0 panel editor: Bar width and Bar radius, nothing
             # else), so no single number reproduces that at every bucket
             # count. 0.35 lands on ~34px at this panel width for a normal
             # range; a range with only two buckets still draws two wide
-            # bars where the SPA would draw two narrow ones. Cosmetic, and
+            # bars where the target is two narrow ones. Cosmetic, and
             # the alternative is thread-thin bars on every normal range.
             "showValue": "never", "barWidth": 0.35, "groupWidth": 0.7,
             "xTickLabelRotation": -45, "xTickLabelSpacing": 0,
@@ -530,15 +531,15 @@ def cloudlog_table(title, desc, query, columns, w=12, h=9, x=0, y=0,
 
     number_columns: {display_name: decimals} — the payload ships decimal
       STRINGS; convertFieldType turns them numeric so decimals apply
-      (the SPA shows 0.049, not 0.0493843...).
-    time_columns: display names formatted in the SPA's "Jul 31, 13:31:50"
+      (shown as 0.049, not 0.0493843...).
+    time_columns: display names formatted in the "Jul 31, 13:31:50"
       style (override with time_unit, e.g. TIME_FMT for the "... [UTC]"
       variant); string RFC3339 columns (e.g. Started) are also
       convertFieldType'd to real time fields.
     hide_time: drop the Cloud Logging entry's own ingestion timestamp
       (the field normally renamed to time_name) from the rendered table,
       for panels where a business timestamp already in time_columns is
-      the only one the SPA shows (e.g. Orders' "Created" vs. the
+      the only one shown (Orders' "Created" versus the
       exporter's poll-time entry timestamp). Sort then follows the first
       time_columns entry instead of time_name.
     """
@@ -614,7 +615,7 @@ def cloudlog_table(title, desc, query, columns, w=12, h=9, x=0, y=0,
             # Current-state tables (Orders) ship one row per poll, so a
             # multi-poll window stacks repeats of the same entity. Collapse
             # to the newest row per key, then strip the " (first)" suffix
-            # groupBy appends so the headers read like the SPA's. The plugin
+            # groupBy appends so the headers read cleanly. The plugin
             # returns entries newest first, so `first` is the newest row
             # (`lastNotNull` kept the oldest one in the window).
             *([
@@ -667,9 +668,8 @@ SIDE_MAPPINGS = [
 
 
 # ==========================================================================
-# Value mappings shared by the row tables — the SPA capitalizes and
-# color-codes these, we mirror it exactly (venue palette from
-# trade-history-panel.svelte).
+# Value mappings shared by the row tables: they capitalize and color-code
+# the venue and status values.
 # ==========================================================================
 VENUE_MAPPINGS = [
     {"type": "value", "options": {
@@ -703,13 +703,12 @@ TYPE_MAPPINGS = [
     {"type": "value", "options": {
         "equity_mint": {"text": "Mint", "color": "text", "index": 0},
         "equity_redemption": {"text": "Redeem", "color": "text", "index": 1},
-        # A USDC bridge row reads its direction, like the SPA's
-        # transferTypeLabel (dashboard/src/lib/transfer.ts).
+        # A USDC bridge row reads its direction.
         "alpaca_to_base": {"text": "Alpaca → Raindex", "color": "text", "index": 3},
         "base_to_alpaca": {"text": "Raindex → Alpaca", "color": "text", "index": 4},
     }},
 ]
-# D13: transfer status carries the SPA's leading dot ("● Completed"); trade
+# D13: transfer status carries a leading dot ("● Completed"); trade
 # status (STATUS_CAP_MAPPINGS above) does NOT, so this is a separate mapping
 # rather than a shared-constant edit.
 STATUS_DOT_MAPPINGS = [
@@ -731,14 +730,14 @@ STATUS_DOT_MAPPINGS = [
 LATEST_ONLY_HIDDEN = {"timeFrom": "5m", "hideTimeOverride": True}
 
 
-# The SPA's timestamp style: "Jul 31, 13:31:50 UTC" (D7).
+# The timestamp style: "Jul 31, 13:31:50 UTC" (D7).
 TIME_FMT = [{"id": "unit", "value": "time:MMM D, HH:mm:ss [UTC]"}]
 
 # ==========================================================================
-# The tab suite: five dashboards, one per SPA tab, cross-linked with a
-# button row that mimics the SPA's tab bar. Every link carries
-# theme=light so the suite renders in the SPA's light look regardless of
-# the viewer's Grafana theme preference.
+# The tab suite: five dashboards, one per tab, cross-linked with a button
+# row that works as the tab bar. Every link carries theme=light so the
+# suite renders in the light look regardless of the viewer's Grafana theme
+# preference.
 # ==========================================================================
 # Each tab carries its own symbol in its label. Grafana's link buttons take
 # only seven built-in icons (external link, dashboard, question, info, bolt,
@@ -777,7 +776,8 @@ def tab_links(active):
 
 def panel_module(name):
     """A liquidity-panels script to prepend to an afterRender. Its export
-    line is for the SPA test; afterRender is not a module."""
+    line is for the tests in observability/tests/; afterRender is not a
+    module."""
     with open(os.path.join(HERE, "liquidity-panels", name)) as f:
         lines = f.readlines()
     # Only a one-line export is dropped whole; the rest of a longer one
@@ -792,19 +792,20 @@ def panel_module(name):
 def pills(y, w=24, fit_window=False, locked_sort=(), fit_columns=None,
           header_tips=None, tree_sorts=None, table_totals=None,
           scale_tables=(), row_tips=None, full_entries=None, unit_tags=None):
-    """The SPA's HeaderBar and SettingsBar as one Business Text row,
-    repeated on every tab like the SPA repeats its header: the settings
+    """The header and settings bar as one Business Text row, repeated on
+    every tab: the settings
     pills (broker, Equity and USDC targets with their bands, Trigger,
     Reserve) and a Config button on the left; the CLI recovery guide
     button, a UTC clock, the commit, uptime, and the connection badge on
-    the right. Config and the recovery guide open the SPA's dialogs.
+    the right. Config and the recovery guide open dialogs.
 
     Every series carries a `k` label naming it; liquidity-panels/header.js
     reads the rows by `k` (liquidity-panels/header-rows.js). The commit and
     info series are their sample timestamps, so the script can keep the
     newest label set when a deploy or restart leaves the previous one in the
-    lookback window. The recovery guide is static data exported
-    from the SPA (liquidity-panels/recovery-guide.json) and prepended to
+    lookback window. The recovery guide is static data in
+    liquidity-panels/recovery-guide.json, the source of truth for the
+    recovery commands, and prepended to
     the script with client-env.js, which retargets its commands at the
     board's environment.
 
@@ -888,7 +889,7 @@ def pills(y, w=24, fit_window=False, locked_sort=(), fit_columns=None,
         styles = f.read()
     return [{
         "id": nid(), "type": "marcusolsson-dynamictext-panel", "title": "",
-        "description": "The SPA header: settings pills, Config, the CLI "
+        "description": "The header: settings pills, Config, the CLI "
                        "recovery guide, the deployed commit, uptime, and "
                        "whether the bot is up: its scrape's up.",
         "datasource": CM,
@@ -913,16 +914,15 @@ def pills(y, w=24, fit_window=False, locked_sort=(), fit_columns=None,
     }]
 
 
-# The SPA's PnL range buttons (1W / 1M / YTD / 1Y / All). PnL is a windowed
+# The PnL range buttons (1W / 1M / YTD / 1Y / All). PnL is a windowed
 # server-side computation, so the exporter runs one /pnl query per window
 # and tags every series with window=<key>; this variable picks which set the
-# board shows. Default 1w, because that is what the SPA's PnL tab opens on —
-# with any other default the tiles disagree with the SPA at a glance.
+# board shows. Default 1w.
 # Windows are anchored on the last date WITH DATA, not today (see the
 # exporter's collect_pnl docstring).
 WINDOW_VAR = {
     "name": "window", "type": "custom", "label": "PnL range",
-    "description": "Matches the SPA's PnL range buttons. Windows are "
+    "description": "The PnL range: 1D, 1W, 1M, YTD, 1Y or All. Windows are "
                    "relative to the last date with fills, not to today.",
     "query": "1D : 1d, 1W : 1w, 1M : 1m, YTD : ytd, 1Y : 1y, All : all",
     "includeAll": False, "multi": False, "hide": 0,
@@ -1186,12 +1186,12 @@ UNIT_TAGS = {TRADES_TITLE: {
     ]}}
 # Trades and Rebalances load their newest LOG_FIRST_ENTRIES log entries,
 # enough rows for a tall screen once grouped by id, then their newest
-# LOG_FULL_ENTRIES, well over the SPA's 100 rows (board-progressive.js).
+# LOG_FULL_ENTRIES (board-progressive.js).
 LOG_FIRST_ENTRIES = 100
 LOG_FULL_ENTRIES = 500
 
 # ==========================================================================
-# Tab 1: Dashboard: the SPA's Inventory card as Grafana tables (USD at
+# Tab 1: Dashboard: the inventory as Grafana tables (USD at
 # Alpaca, USD on each chain, equities) on the left, Trades / Rebalances
 # stacked right.
 # ==========================================================================
@@ -2013,7 +2013,7 @@ def native_inventory(w, x, y, heights):
                  {"id": "unit", "value": "currencyUSD"},
                  {"id": "decimals", "value": 0}, NO_PRICE, NOT_FILTERABLE]),
              ("exposure", "Exposure", EXPOSURE_CELL),
-             # Left-aligned like the SPA's table, except the wallet
+             # Left-aligned, except the wallet
              # columns: the tokens in the bot's Base wallet, the asset's
              # unwrapped tStock (tAAPL) and wrapped wtStock (wtAAPL). Their
              # headers explain them on hover (HEADER_TIPS).
@@ -2094,7 +2094,7 @@ DETAIL_VAR = {"type": "textbox", "name": "detail", "hide": 2, "query": "",
 
 
 def detail_panel(x, y, trades_id, transfers_id):
-    """The SPA's trade and transfer detail dialogs, opened from a row of the
+    """The trade and transfer detail dialogs, opened from a row of the
     Trades or Rebalances table (see DETAIL_URL).
 
     The panel itself draws nothing; it takes the header row's last column so
@@ -2167,8 +2167,7 @@ def latest_status_table(title, desc, logs, fields, shown, w, h, x, y,
                         number_columns=None, time_columns=(), overrides=(),
                         sort_by=None):
     """A Cloud Logging table with one row per entity at its latest status,
-    like the SPA's Trade History and Cross-venue Transfers cards (here
-    Trades and Rebalances).
+    (here Trades and Rebalances).
 
     The bot writes a line per transfer status change and per terminal
     trade status (again on a venue correction), so the raw feed holds
@@ -2377,7 +2376,7 @@ panels.append(latest_status_table(
             "amount": "Amount", "usd": "USD", "status": "Status"},
     shown=["Last updated", "Type", "Asset", "Amount", "USD", "Status"],
     # Type reads the direction for a USDC bridge and the kind for an equity
-    # transfer, like the SPA's transferTypeLabel. A bridge's kind is
+    # transfer. A bridge's kind is
     # usdc_bridge and an equity transfer's direction is "", so each row can
     # match only one alternative, whatever the key order.
     body_regex='"(?:direction|kind)":"(?<Type>' + TRANSFER_TYPES + ')"',
@@ -2389,7 +2388,7 @@ panels.append(latest_status_table(
     number_columns={"Amount": 3, "USD": 2},
     overrides=[
         column("Last updated", 150), column("Type", 135, TYPE_MAPPINGS),
-        # A USDC bridge carries no symbol; the SPA's Asset column reads
+        # A USDC bridge carries no symbol; the Asset column reads
         # "USDC" for it.
         column("Asset", 65, [{"type": "special", "options": {
             "match": "empty", "result": {"text": "USDC", "index": 0}}}]),
@@ -2405,35 +2404,33 @@ panels.append(detail_panel(
 
 dashboards.append(make_dashboard(
     "t0-liquidity", "Liquidity bot",
-    "1:1 Grafana rendering of the liquidity bot's own dashboard, fed by "
-    "the bot's metrics and log. Five linked boards mimic the SPA's "
-    "tabs — use the Dashboard/Orders/PnL/Performance/Logs links above "
-    "(they carry theme=light so the suite matches the SPA's look). "
+    "The liquidity bot's inventory, trades, rebalances, orders, PnL, "
+    "performance and logs, fed by the bot's metrics and log. Five linked "
+    "boards act as tabs: use the Dashboard/Orders/PnL/Performance/Logs "
+    "links above (they carry theme=light so the suite renders in the light "
+    "look). "
     "Refresh is 1m polling, not WebSocket-live. On a relative range (the "
     "default now-24h) the header and the inventory show the live state, "
     "the last 5 minutes, and trades and transfers show the last 30 days. "
     "An absolute range shows that range's data in every panel. The board "
-    "fills the window height like the SPA, and scrolls on a short window "
-    "or a phone. Full history and drilldowns: the IAP "
-    "dashboard at https://liquidity.t0trade.com (production), or gcloud "
-    "compute start-iap-tunnel <vm> 8080 "
-    "--local-host-port=localhost:8080 --zone europe-west3-b "
-    "--project $env (VM name = project id)",
+    "fills the window height, and scrolls on a short window "
+    "or a phone. Full history and drilldowns: the operations client, "
+    "`st0x-liquidity-client --env <production|staging> read resource <name>`.",
     panels, tab_links("Dashboard"), [ENV_VAR, DETAIL_VAR]))
 
 # ==========================================================================
-# Tab 2: Orders — the SPA's Raindex Orders table (+ ops extras).
+# Tab 2: Orders: the Raindex Orders table (+ ops extras).
 # ==========================================================================
 panels = []
 panels += pills(0)
 panels.append(cloudlog_table(
     "Raindex Orders",
-    "The SPA's Orders tab, columns in SPA order (Output | Input | Vault "
+    "The bot's Raindex orders, one row per order (Output | Input | Vault "
     "Balance | IO Ratio | Order Hash | Created). Shipped by the exporter's "
     "collect_orders() as one Cloud Logging row per order per poll cycle "
     "(logName liquidity-orders); insertId buckets by poll-hour so a "
     "still-active order dedupes to ~1 stored row/hour rather than one per "
-    "60s poll — with a 2h window that means a couple of rows per order is "
+    "60s poll. With a 2h window, a couple of rows per order is "
     "expected, not a bug. Created is the order's own on-chain creation "
     "time (jsonPayload.created_at), not the row's ingestion time. The "
     "datasource returns at most about the panel's pixel width in entries.",
@@ -2472,17 +2469,18 @@ panels.append(stat(
     w=4, h=4, x=20, y=12))
 dashboards.append(make_dashboard(
     "t0-liquidity-orders", "Liquidity bot: Orders",
-    "The SPA's Orders tab.",
+    "The bot's Raindex orders and the pending-order and upstream-API "
+    "status tiles.",
     panels, tab_links("Orders"), [ENV_VAR]))
 
 # ==========================================================================
-# Tab 3: PnL — tiles, per-asset table, the four charts in SPA order.
+# Tab 3: PnL: tiles, per-asset table, the four charts.
 # ==========================================================================
 # P2: "currency:financial:$" is Grafana's non-abbreviating currency format
 # (Intl.NumberFormat under the hood, grouped thousands, forced decimals,
 # literal "$" prefix — added in grafana/grafana#106604, present since
 # Grafana 13.x). Unlike "currencyUSD" it never switches to K/M/B, so it
-# reproduces the SPA's tile style exactly: "$-25.77", "$130,861.46". The
+# gives tiles like "$-25.77" and "$130,861.46". The
 # audit's fallback ("keep currencyUSD on tiles, full locale in tables") was
 # only needed because no unit did both — this one does, so it's used on
 # both the tiles below and the Per Asset PnL table's dollar columns
@@ -2512,8 +2510,8 @@ pnl_tiles = [
 for index, (label, stream, desc) in enumerate(pnl_tiles):
     signed = stream not in ("tracked_costs",)
     panels.append(stat(
-        "", f"{desc} (SPA PnL tile, computed by the bot's replay — 5-min "
-        "refresh cadence.)",
+        "", f"{desc} (Computed by the bot's replay, refreshed every 5 "
+        "minutes.)",
         f'max(liq_pnl_summary_usd{{stream="{stream}",window="$window"}})',
         display=label.upper(), unit=PNL_TILE_USD, decimals=2,
         steps=([{"color": "red", "value": None},
@@ -2523,7 +2521,7 @@ for index, (label, stream, desc) in enumerate(pnl_tiles):
         w=4, h=3, x=(index % 5) * 4, y=2 + (index // 5) * 3,
         value_size=22))
 panels.append(stat(
-    "", "Open replay inventory in shares (the SPA's muted tile).",
+    "", "Open replay inventory, in shares.",
     'max(liq_pnl_summary_shares{kind="inventory_drift",window="$window"})',
     display="OPEN INVENTORY (SH)", decimals=3, color_mode="none",
     w=4, h=3, x=20, y=2))
@@ -2532,13 +2530,12 @@ panels.append(stat(
     'max(liq_pnl_sample_total_fills{window="$window"})', display="TOTAL FILLS", decimals=0,
     color_mode="none", w=4, h=3, x=20, y=5))
 panels.append(stat(
-    "", "Average deployed capital from daily snapshots — computed by the "
-    "bot, never rendered by the SPA.",
+    "", "Average deployed capital from daily snapshots, computed by the "
+    "bot.",
     'max(liq_pnl_capital_avg_deployed_usd{window="$window"})', display="AVG DEPLOYED CAPITAL",
     unit="currencyUSD", decimals=0, color_mode="none", w=8, h=3, x=0, y=8))
 panels.append(stat(
-    "", "Annualized return on that capital — computed by the bot, never "
-    "rendered by the SPA.",
+    "", "Annualized return on that capital, computed by the bot.",
     'max(liq_pnl_capital_annualized_return_pct{window="$window"})', display="ANNUALIZED RETURN",
     unit="percent", decimals=2,
     steps=[{"color": "red", "value": None}, {"color": "text", "value": 0},
@@ -2557,19 +2554,18 @@ pnl_cols = [
     ("Baseline Drift", "directional_inventory_baseline"),
     ("Total", "total"),
 ]
-# P5: the SPA's Volume column, in shares rather than USD, so it gets its own
-# override rather than joining unit_overrides' PNL_TABLE_USD_SIGNED sweep below. The
-# SPA places it right after Net; decimals=4 matches its "20.0723 sh"
-# precision. It counts a matched lot on both legs, so the exporter serves
+# P5: the Volume column, in shares rather than USD, so it gets its own
+# override rather than joining unit_overrides' PNL_TABLE_USD_SIGNED sweep below. It
+# sits right after Net; decimals=4 shows share counts like "20.0723". It counts a matched lot on both legs, so the exporter serves
 # 2 x matchedShares (verified against the entries page: their shares sum
-# to matchedShares exactly). Its USD sub-line is not reproduced; that one
+# to matchedShares exactly). A USD value for the volume is not shown: it
 # needs per-entry open/close prices from the full entries page.
 VOLUME_SHARES = [{"id": "unit", "value": "locale"}, {"id": "decimals", "value": 4}]
 panels.append(matrix_table(
     "Per Asset PnL",
-    "The SPA's Per Asset PnL table (closed-lot replay per symbol; Lots = "
-    "matched lot count; Volume = both legs of the matched shares, without "
-    "the SPA's USD sub-line).",
+    "PnL per asset from the closed-lot replay per symbol. Lots is the "
+    "matched lot count. Volume is both legs of the matched shares, in "
+    "shares.",
     or_chain([(f'liq_pnl_symbol_usd{{col="{stream}",window="$window"}}', name)
               for name, stream in pnl_cols]
              + [('liq_pnl_symbol_lots{window="$window"}', "Lots"),
@@ -2583,16 +2579,12 @@ panels.append(matrix_table(
     sort_by={"displayName": "Total", "desc": True},
     filterable=True,
 ))
-# P4: fixed per-stream colors, matched to the live SPA's own color map —
-# read directly out of its shipped JS bundle (node2.js): counterTradePnlUsd
-# -> var(--chart-sky), onchainNettingPnlUsd -> var(--chart-green),
-# directionalInventoryBaselinePnlUsd -> var(--chart-amber),
-# directionalImbalanceExcessPnlUsd -> var(--chart-rose); hex values read
-# from the SPA's computed --chart-* CSS custom properties. That map has
-# exactly these four entries because the SPA's per-stream chart plots only
-# these four components — "directional_exposure" (baseline_drift +
+# P4: fixed per-stream colors: counter_trade sky, onchain_netting green,
+# directional_inventory_baseline amber, directional_imbalance_excess rose.
+# The map has exactly these four entries because the per-stream charts plot
+# only these four components. "directional_exposure" (baseline_drift +
 # directional_excess) and "total" (every stream summed) are tile-only
-# aggregates there, never their own chart line. The exporter's day series
+# aggregates, never their own chart line. The exporter's day series
 # are already scoped to those four (CHART_STREAMS), so nothing here has to
 # filter them back out.
 PNL_STREAM_COLORS = {
@@ -2606,44 +2598,43 @@ PNL_STREAM_OVERRIDES = [
      "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": color}}]}
     for stream, color in PNL_STREAM_COLORS.items()
 ]
-# SPA chart order: the daily bar pair first, the cumulative pair below it,
-# with the SPA's exact titles. All four read the bot's own day buckets
-# (/pnl `windows[]`), the same array the SPA charts, so they carry the
+# Chart order: the daily bar pair first, the cumulative pair below it. All
+# four read the bot's own day buckets (/pnl `windows[]`), so they carry the
 # bot's full history for the selected range from the first scrape, and they
-# move with the range pill exactly as the SPA's charts move with its date
-# inputs.
+# move with the range pill.
 panels.append(day_barchart(
     "PnL by Asset per Time Unit",
     "One bar per calendar day, split by asset and stacked, straight from "
     "the bot's daily PnL buckets. A day with no closed lot for an asset is "
-    "a zero, as in the SPA.",
+    "a zero, not a gap.",
     "liq_pnl_day_usd", "symbol", w=12, h=7, x=0, y=19))
 panels.append(day_barchart(
     "PnL by PnL-Stream per Time Unit",
-    "The same days split by PnL stream, the SPA's four component streams "
+    "The same days split by PnL stream, the four component streams "
     "only, since directional_exposure and total are tile-only aggregates "
-    "there and stacking them beside their own components double-counts.",
+    "and stacking them beside their own components double-counts.",
     "liq_pnl_day_stream_usd", "stream", w=12, h=7, x=12, y=19,
     overrides=PNL_STREAM_OVERRIDES))
 panels.append(day_barchart(
     "Cumulative PnL by Asset",
-    "Running total per asset through the selected range. Unstacked: the "
-    "SPA draws one independent line per asset here, not a stack. The last "
+    "Running total per asset through the selected range. Unstacked: "
+    "each asset is its own independent series, not a stack. The last "
     "day's bars sum to the Total PnL tile above.",
     "liq_pnl_day_cum_usd", "symbol", w=12, h=7, x=0, y=26, stack=False,
     legend_mode="table", legend_placement="right"))
 panels.append(day_barchart(
     "Cumulative PnL by PnL-Stream",
-    "Running total per stream, unstacked like the SPA's lines. Grafana has "
-    "no categorical-axis line chart, so these are bars over the same day "
-    "buckets: the numbers are the SPA's, the shape is not.",
+    "Running total per stream, unstacked. Grafana has no "
+    "categorical-axis line chart, so these are bars over the same day "
+    "buckets.",
     "liq_pnl_day_cum_stream_usd", "stream", w=12, h=7, x=12, y=26,
     stack=False, overrides=PNL_STREAM_OVERRIDES,
     legend_mode="table", legend_placement="right"))
 dashboards.append(make_dashboard(
     "t0-liquidity-pnl", "Liquidity bot: PnL",
-    "The SPA's PnL tab, tiles, table and charts all driven by the range "
-    "pill; closed-lot and cost-ledger drilldowns live in the SPA.",
+    "PnL tiles, table and charts, all driven by the range pill. For "
+    "closed lots and the cost ledger, run "
+    "`st0x-liquidity-client --env <production|staging> read resource pnl` (the /pnl report).",
     panels, tab_links("PnL"), [ENV_VAR, WINDOW_VAR]))
 
 # ==========================================================================
@@ -2681,7 +2672,7 @@ panels.append(stat(
 panels.append(stat(
     "Oldest unhedged fill",
     "Age of the oldest on-chain fill not yet hedged. good ≤5m, warn ≤30m; "
-    "'—' = nothing unhedged (the SPA shows 'none').",
+    "'—' = nothing unhedged.",
     "time() - min(liq_open_exposure_oldest_ts_seconds)",
     unit="s", decimals=0,
     steps=[{"color": "green", "value": None}, {"color": "yellow", "value": 300},
@@ -2702,7 +2693,7 @@ panels.append(stat(
 LAG_PAUSED = -2
 LAG_NEVER_SAMPLED = -1
 
-# F1: the SPA's secondary context line per SLO card (e.g. "p50 118ms · 42
+# F1: the secondary context line per SLO card (for example "p50 118ms · 42
 # fills") as a thin strip of small stats directly under the card row —
 # chosen over hover descriptions because the pill row above already
 # establishes "small transparent value_and_name stats in a compact strip"
@@ -2712,72 +2703,72 @@ LAG_NEVER_SAMPLED = -1
 # eleven sub-stats use the same title="" + displayName + value_and_name
 # shape — no panel breaks the pattern).
 panels.append(stat(
-    "", "SPA secondary line: p50 detection latency.",
+    "", "p50 detection latency.",
     'max(liq_hedge_latency_ms{stage="detection",quantile="p50"})',
     display="p50", unit="ms", decimals=0, color_mode="none",
     w=2, h=1, x=0, y=6, value_size=10))
 panels.append(stat(
-    "", "SPA secondary line: fill sample count backing the detection "
+    "", "Fill sample count backing the detection "
     "latency percentiles.",
     'max(liq_hedge_latency_ms_samples{stage="detection"}) or vector(0)',
     display="fills (24h)", decimals=0, color_mode="none",
     w=3, h=1, x=2, y=6, value_size=10))
 panels.append(stat(
-    "", "SPA secondary line: p50 exposure-window latency.",
+    "", "p50 exposure-window latency.",
     'max(liq_hedge_latency_ms{stage="exposure_window",quantile="p50"})',
     display="p50", unit="ms", decimals=0, color_mode="none",
     w=2, h=1, x=5, y=6, value_size=10))
 panels.append(stat(
-    "", "SPA secondary line: hedge sample count backing the exposure-"
+    "", "Hedge sample count backing the exposure-"
     "window percentiles.",
     'max(liq_hedge_latency_ms_samples{stage="exposure_window"}) or vector(0)',
     display="hedges (24h)", decimals=0, color_mode="none",
     w=3, h=1, x=7, y=6, value_size=10))
 panels.append(stat(
-    "", "SPA secondary line: WARN-level log lines in 24h.",
+    "", "WARN-level log lines in 24h.",
     'max(liq_reliability_log_count_24h{level="warning"}) or vector(0)',
     display="warnings (24h)", decimals=0, color_mode="none",
     w=2, h=1, x=10, y=6, value_size=10))
 panels.append(stat(
-    "", "SPA secondary line: money-at-risk lifecycle failure events in "
+    "", "Money-at-risk lifecycle failure events in "
     "24h (the 'Errors & warnings by module' table breaks these out by "
     "event type).",
     'sum(liq_failure_event_count_24h) or vector(0)',
     display="lifecycle fails", decimals=0, color_mode="none",
     w=2, h=1, x=12, y=6, value_size=10))
 panels.append(stat(
-    "", "SPA secondary line: apalis job queues with a failed or killed "
-    "job right now (instantaneous, not windowed) — the SPA folds killed "
-    "into the same 'queue(s) failed' phrase.",
+    "", "Apalis job queues with a failed or killed "
+    "job right now (instantaneous, not windowed). Killed counts as "
+    "failed.",
     'count(sum by (job_type) (liq_job_queue{state=~"failed|killed"}) > 0) '
     'or vector(0)',
     display="bad queues", decimals=0, color_mode="none",
     steps=[{"color": "text", "value": None}, {"color": "red", "value": 1}],
     w=1, h=1, x=14, y=6, value_size=10))
 panels.append(stat(
-    "", "SPA secondary line: on-chain fills still uncovered by a hedge, "
+    "", "On-chain fills still uncovered by a hedge, "
     "summed across symbols.",
     'sum(liq_open_exposure_fill_count) or vector(0)',
     display="uncovered fills", decimals=0, color_mode="none",
     w=2, h=1, x=15, y=6, value_size=10))
 panels.append(stat(
-    "", "SPA secondary line: symbols with an open (unhedged) exposure — "
-    "0 is the SPA's 'all fills hedged'.",
+    "", "Symbols with an open (unhedged) exposure. 0 means all fills are "
+    "hedged.",
     'count(liq_open_exposure_fill_count > 0) or vector(0)',
     display="symbols exposed", decimals=0, color_mode="none",
     mappings=[{"type": "value", "options": {
         "0": {"text": "all hedged", "color": "green", "index": 0}}}],
     w=3, h=1, x=17, y=6, value_size=10))
 panels.append(stat(
-    "", "SPA secondary line: age of the oldest hedged chain's block-lag "
+    "", "Age of the oldest hedged chain's block-lag "
     "sample, so one stale chain shows behind a fresh one. A chain whose "
     "latest sample has a time but no lag has no cutoff block, and the "
-    "stat reads \"ingestion paused\" (the SPA's warning). A chain with "
+    "stat reads \"ingestion paused\". A chain with "
     "neither series has no checkpointed sample yet and reads \"no "
-    "checkpoint yet\" (the SPA's 'no checkpointed samples yet'). Paused "
+    "checkpoint yet\". Paused "
     "wins over an age, and an age wins over no checkpoint, so a stale "
     "chain still shows next to a new one. An age over 300 s is orange "
-    "(the SPA's stale monitor).",
+    "(a stale monitor).",
     "min(0 * (liq_block_lag_sampled_ts_seconds "
     f"unless on(chain) liq_block_lag_blocks) - {-LAG_PAUSED}) "
     "or max(clamp_min(time() - (liq_block_lag_sampled_ts_seconds "
@@ -2794,7 +2785,7 @@ panels.append(stat(
                                  "color": "text", "index": 1}}}],
     w=2, h=1, x=20, y=6, value_size=10))
 panels.append(stat(
-    "", "SPA secondary line: order-fill monitor poll ticks skipped "
+    "", "Order-fill monitor poll ticks skipped "
     "(overrun) in 24h.",
     'max(liq_poll_skipped_ticks_24h) or vector(0)',
     display="skipped ticks", decimals=0, color_mode="none",
@@ -2802,8 +2793,9 @@ panels.append(stat(
 
 panels.append(bargauge(
     "Hedge cycle stages (p95, 24h)",
-    "The SPA waterfall's aggregate form: p95 per stage. Per-cycle "
-    "waterfalls live in the SPA.",
+    "Aggregate hedge cycle waterfall: p95 per stage. For per-cycle "
+    "hedge waterfalls, run `st0x-liquidity-client --env <production|staging> read resource "
+    "latencies`.",
     'max by (stage) (liq_hedge_latency_ms{quantile="p95"})', "${__field.labels.stage}",
     w=8, h=8, x=0, y=7,
     steps=[{"color": "green", "value": None}, {"color": "yellow", "value": 30000},
@@ -2820,9 +2812,9 @@ panels.append(timeseries(
                            colors={"A": "green", "B": "yellow", "C": "red"})))
 errors_by_module = matrix_table(
     "Errors & warnings by module (24h)",
-    "The SPA's per-target error/warning counts. The Logs tab has the "
+    "Error and warning counts per module. The Logs tab has the "
     "lines themselves. Click a module to jump to the Logs board "
-    "pre-filtered on it (the SPA's 'logs →' button); sparkline cells are "
+    "pre-filtered on it; sparkline cells are "
     "skipped as low-value/fiddly here.",
     'label_replace(liq_log_target_count_24h, "col", "$1", "level", "(.*)")',
     "target", w=8, h=8, x=16, y=7,
@@ -2859,12 +2851,15 @@ panels.append(errors_by_module)
 panels.append(bargauge(
     "USDC rebalance stages (p95, 30d)",
     "Stage timings for USDC rebalances. From the server's stageSummary; "
-    "per-operation waterfalls live in the SPA.",
+    "for per-operation rebalance waterfalls, run `st0x-liquidity-client --env <production|staging> "
+    "read resource rebalances`.",
     'max by (stage) (liq_rebalance_stage_ms{kind="usdc",quantile="p95"})', "${__field.labels.stage}",
     w=8, h=7, x=0, y=15))
 panels.append(bargauge(
     "Equity rebalance stages (p95, 30d)",
-    "Stage timings for equity mints/redemptions.",
+    "Stage timings for equity mints/redemptions. For per-operation "
+    "rebalance waterfalls, run `st0x-liquidity-client --env <production|staging> read resource "
+    "equity-rebalances`.",
     'max by (stage) (liq_rebalance_stage_ms{kind="equity",quantile="p95"})', "${__field.labels.stage}",
     w=8, h=7, x=8, y=15))
 panels.append(matrix_table(
@@ -2892,7 +2887,7 @@ panels.append(matrix_table(
     sort_by={"displayName": "calls", "desc": True},
     decimals=0))
 
-# F5: the SPA's CCTP attestation-time chart under the USDC rebalance
+# F5: the CCTP attestation-time chart under the USDC rebalance
 # section. liq_attestation_last_ms is a gauge of the single most-recent
 # attestation duration per kind (the exporter only gets the last entry of
 # the bot's attestationTrend each poll) — there is no bucketed history to
@@ -2901,10 +2896,10 @@ panels.append(matrix_table(
 panels.append(timeseries(
     "CCTP attestation time",
     "Duration of the most recent CCTP attestation per rebalance kind, "
-    "sampled once per scrape. The SPA can chart the full attestationTrend "
-    "history for the selected range; this gauge only has 'last value at "
+    "sampled once per scrape. The bot keeps the full attestationTrend "
+    "history; this gauge only has 'last value at "
     "scrape time', so the line only accrues from whenever this panel "
-    "started being scraped forward — a short/flat history here does not "
+    "started being scraped forward. A short/flat history here does not "
     "mean attestations were fast, it means the metric is young.",
     [promql('max(liq_attestation_last_ms{kind="usdc"})', ref="A"),
      promql('max(liq_attestation_last_ms{kind="equity"})', ref="B")],
@@ -2940,8 +2935,7 @@ panels.append(bargauge(
 panels.append(matrix_table(
     "Job queues",
     "The bot's apalis job queues (instantaneous whole-table counts, not "
-    "windowed). killed or failed above zero is the SPA's critical Errors "
-    "state.",
+    "windowed). Killed or failed above zero is critical.",
     'label_replace(liq_job_queue, "col", "$1", "state", "(.*)")',
     "job_type", w=12, h=8, x=0, y=34,
     first_col="Job",
@@ -2991,8 +2985,8 @@ STAGE_VAR = {
 }
 dashboards.append(make_dashboard(
     "t0-liquidity-performance", "Liquidity bot: Performance",
-    "The SPA's Performance tab, plus the pre-exporter native bot metrics "
-    "as collapsed rows at the bottom.",
+    "SLO cards, stage timings and health tables, plus the pre-exporter "
+    "native bot metrics as collapsed rows at the bottom.",
     panels, tab_links("Performance"), [ENV_VAR, STAGE_VAR]))
 
 # ==========================================================================
@@ -3005,8 +2999,9 @@ panels.append(cloudlog_table(
     "The bot's structured log lines. "
     "Filter with the level/category/target/search variables above. ⚠️ "
     "Only the newest matching entries, about the panel's pixel width of "
-    "them. Narrow the filters, or use the SPA for deep digs. DEBUG/TRACE "
-    "are not shown.",
+    "them. Narrow the filters, or for deep digs run "
+    "`st0x-liquidity-client --env <production|staging> read resource logs` or use the Grafana Logs "
+    "export. DEBUG/TRACE are not shown.",
     # The level filter also keeps out the bot's DEBUG and TRACE lines.
     f'{BOT_LOG} jsonPayload.level=~"^(${{level:pipe}})$" '
     'jsonPayload.target=~"${target}" '
@@ -3026,7 +3021,7 @@ panels.append(cloudlog_table(
             "INFO": {"text": "INFO", "color": "blue", "index": 2}}},
     ]},
 ))
-# L2: ms-precision timestamps, matching the SPA's "Aug 18, 13:27:21.965
+# L2: ms-precision timestamps, like "Aug 18, 13:27:21.965
 # UTC". cloudlog_table's time_columns path (shared helper, other tabs own
 # it) only offers second precision and there's no ms-precision knob, so
 # time_columns is left off this call (it would add nothing but a
@@ -3046,7 +3041,7 @@ panels[-1]["fieldConfig"]["overrides"].append({
 # no single field to bind a "Fields" column to. Hard-coding today's known
 # keys as fixed columns would silently miss future ones and would be
 # mostly-empty per row (matches the audit's own "may be noisy" warning) —
-# worse than the SPA's dynamic key=value suffix, not a match for it.
+# worse than a dynamic key=value suffix.
 LEVEL_VAR = {
     "name": "level", "type": "custom", "label": "Log level",
     "query": "ERROR, WARN, INFO", "includeAll": True, "multi": True,
@@ -3060,16 +3055,16 @@ LEVEL_VAR = {
     ],
     "allValue": "ERROR|WARN|INFO",
 }
-# L1(a): the SPA's Category multi-select. The bot's own backend matches
+# L1(a): the Category multi-select. The bot's own backend matches
 # these as an EXACT target-field value (`"target":"<cat>"` literal
 # substring on the raw log line — see st0x.liquidity src/api.rs), not a
 # crate/module prefix, so this is anchored (^...$) rather than a bare
 # substring — an unanchored pipe would also swallow crate-path targets
 # like "st0x_hedge::portfolio_snapshot::write" (which contains "hedge")
-# and diverge from the SPA's own filter semantics.
+# and diverge from the bot's own filter semantics.
 CATEGORY_VAR = {
     "name": "category", "type": "custom", "label": "Category",
-    "description": "The SPA's log Category filter — exact-match domain "
+    "description": "The log Category filter: exact-match domain "
                    "tags the bot's tracing spans set (bridge/broker/cqrs/"
                    ".../wallet), distinct from crate/module paths.",
     "query": "bridge, broker, cqrs, dashboard, hedge, inventory, "
@@ -3093,8 +3088,8 @@ CATEGORY_VAR = {
     # "All" must stay a true passthrough (".*"), not a pipe of the 11
     # known values — target strings the taxonomy doesn't cover (e.g. the
     # crate-path "st0x_hedge::portfolio_snapshot::write") would otherwise
-    # vanish from the default view even though the SPA's own default
-    # (categories ∪ crates) still surfaces them. Verified: pipe-of-11 as
+    # vanish from the default view even though the bot's own unfiltered
+    # view (categories ∪ crates) still surfaces them. Verified: pipe-of-11 as
     # allValue collapsed level=ERROR from 100 rows to 0 in live staging
     # data, exactly the "over-constrained -> silent zero rows" trap this
     # item warns about.
@@ -3106,10 +3101,10 @@ TARGET_VAR = {
     "current": {"selected": True, "text": ".*", "value": ".*"},
     "options": [{"selected": True, "text": ".*", "value": ".*"}],
 }
-# L1(b): the SPA's free-text search box, matched against jsonPayload.message.
+# L1(b): the free-text search box, matched against jsonPayload.message.
 SEARCH_VAR = {
     "name": "search", "type": "textbox", "label": "Message search",
-    "description": "The SPA's free-text search box — regex against "
+    "description": "The free-text search box: regex against "
                    "jsonPayload.message.",
     "query": ".*", "hide": 0,
     "current": {"selected": True, "text": ".*", "value": ".*"},
@@ -3117,7 +3112,7 @@ SEARCH_VAR = {
 }
 dashboards.append(make_dashboard(
     "t0-liquidity-logs", "Liquidity bot: Logs",
-    "The SPA's Logs tab: level/category/target/search-filterable "
+    "Level/category/target/search-filterable "
     "structured log lines.",
     panels, tab_links("Logs"),
     [ENV_VAR, LEVEL_VAR, CATEGORY_VAR, TARGET_VAR, SEARCH_VAR]))

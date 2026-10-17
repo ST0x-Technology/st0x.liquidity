@@ -872,6 +872,9 @@ frameworks, vault registry, executor, database pool, and job queue. Wrapped in
 
 Defined in `src/dashboard/event.rs`. The dashboard CQRS reactor enqueues this
 job for each terminal trade outcome instead of publishing the update inline. The
+live delivery feeds the `/api/ws` stream. No UI uses that stream now: only the
+t0.devops liquidity exporter connects, and it reads just the initial
+`current_state` seed. RAI-3002 removes this job together with the stream. The
 serialized `Trade` payload is the replay record. A separate
 `dashboard_trade_delivery` ledger, keyed by trade ID, records whether the live
 update completed. The reactor registers the ledger row before its idempotent
@@ -896,7 +899,7 @@ notifies the conductor monitor and is logged as an undelivered terminal update.
 The Tokio broadcast channel reports an error when it has no receivers. That is
 not a delivery failure here: a later WebSocket connection loads terminal trades
 from the authoritative snapshot, so zero connected clients completes the job.
-Replaying a publish is safe because the dashboard replaces an existing trade
+Replaying a publish is safe because a stream consumer replaces an existing trade
 with the same trade ID; a completed ledger row prevents unnecessary replays.
 
 ### CheckPositions

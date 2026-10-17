@@ -1,7 +1,6 @@
-// Business Text "afterRender" code for the Liquidity bot header: the SPA's
-// HeaderBar and SettingsBar (header-bar.svelte, settings-bar.svelte,
-// recovery-guide.svelte in ST0x-Technology/st0x.liquidity) in one row, with
-// the same Config and CLI recovery guide dialogs.
+// Business Text "afterRender" code for the Liquidity bot header: the bot's
+// status and settings in one row, with the Config and CLI recovery guide
+// dialogs.
 //
 // Input: context.data, rows with a `k` column naming the value (up, uptime,
 // commit, info, equity_target, ...) plus the string labels some of them
@@ -84,7 +83,7 @@ root.style.setProperty('--hdr-text', theme.colors.text.primary);
 const escapeHtml = (text) =>
   String(text ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
 
-// The SPA's fmtPct and band strings: "50%" and "45%–55%".
+// A percent and a band: "50%" and "45%–55%".
 const pct = (fraction) => `${(fraction * 100).toFixed(0)}%`;
 const band = (target, deviation) =>
   target === null || target === undefined
@@ -93,7 +92,7 @@ const band = (target, deviation) =>
       ? ''
       : ` <span class="hdr-muted">(${pct(target - deviation)}–${pct(target + deviation)})</span>`;
 
-// The SPA's formatUptime.
+// The bot's uptime: "up 3d 4h", "up 4h 12m" or "up 12m".
 const uptime = (seconds) => {
   if (seconds === null || seconds === undefined) return '';
   const days = Math.floor(seconds / 86400);
@@ -250,7 +249,7 @@ root.querySelectorAll('dialog').forEach((dialog) => {
     dialog.close();
   };
   dialog.querySelector('[data-close]').addEventListener('click', dismiss);
-  // A click on the backdrop closes it, like the SPA.
+  // A click on the backdrop closes it.
   dialog.addEventListener('click', (event) => {
     if (event.target === dialog) dismiss();
   });
@@ -275,7 +274,7 @@ if (reopenDialog && !document.querySelector('dialog[open]')) {
   dialogMemory.open = null;
 }
 
-// The SPA's ticking UTC clock. One interval per element, replaced on every
+// A ticking UTC clock. One interval per element, replaced on every
 // render so a refresh never stacks them. Grafana can also mount a new
 // element (tab switch, view mode), so an interval whose element left the
 // page stops itself.

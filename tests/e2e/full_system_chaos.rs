@@ -151,7 +151,7 @@ pub(crate) async fn run_concurrent_chaos_simulation() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    info!("Chaos scenario converged - bot staying up for dashboard observation (Ctrl-C to stop)");
+    info!("Chaos scenario converged - bot staying up for inspection (Ctrl-C to stop)");
     idle_for_dashboard(&mut session.bot).await
 }
 
@@ -457,7 +457,7 @@ async fn wait_for_chaos_convergence<P: Provider + Clone>(
 
 async fn idle_for_dashboard(bot: &mut JoinHandle<anyhow::Result<()>>) -> anyhow::Result<()> {
     loop {
-        sleep_or_crash(bot, "dashboard idle").await;
+        sleep_or_crash(bot, "idle").await;
         tokio::time::sleep(Duration::from_secs(30)).await;
     }
 }

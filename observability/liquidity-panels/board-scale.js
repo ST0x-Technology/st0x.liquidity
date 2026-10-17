@@ -1,6 +1,6 @@
 // Scales the inventory tables down on a narrow window. The generator
 // prepends this file to header.js, which calls it on every render;
-// dashboard/src/lib/board-scale.test.ts imports it as a module through the
+// observability/tests/board-scale.test.ts imports it as a module through the
 // export line, which the generator drops.
 //
 // Each table's columns have fixed widths that add up to `fixedPx`, then the

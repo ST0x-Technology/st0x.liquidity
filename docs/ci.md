@@ -5,7 +5,10 @@
 The required `backend`, `dashboard`, and `hooks` jobs run on the `pull_request`
 event for every target branch, including Graphite PRs whose base is another
 feature branch. GitHub associates those runs with the pull request, so their
-results satisfy the required status checks when the PR reaches `master`.
+results satisfy the required status checks when the PR reaches `master`. The
+required `dashboard` check is the gate over the `dashboard tests` job. That job
+runs the Grafana board script tests in `observability/tests` (vitest, tsc,
+prettier) and the Turnkey message utility tests, both with bun.
 
 CI runs on `push` only for `master`. Running the same required job names on a
 feature-branch push and its pull request would create two check sets for one
@@ -44,7 +47,7 @@ included, and none waits for a change classifier. The classifier added about 15
 seconds to every run that changed code. Only docs-only changes gained from it,
 and they now pay a full run.
 
-The backend build, lint, and test matrix, dashboard build and lint, and
+The backend build, lint, and test matrix, the `dashboard tests` job, and
 pre-commit hooks run in cancellable work jobs. Separate `backend`, `dashboard`,
 and `hooks` gate jobs use `always()` to inspect their results and fail on
 skipped, failed, or cancelled work. This keeps replacement runs responsive

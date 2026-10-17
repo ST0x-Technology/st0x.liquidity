@@ -2,7 +2,6 @@
   pkgs,
   craneLib,
   abiEnv,
-  rainMathFloatAbiEnv,
   rainMathFloat,
   gitCommit,
 }:
@@ -175,10 +174,6 @@ let
   # exercising any tests the matrix doesn't already cover.
   commonArgs = depsArgs // abiEnv // { doCheck = false; };
 
-  # DTO only needs rain-math-float's ABI env through its Float dependency; keep
-  # dashboard builds from realizing backend contract ABIs.
-  dtoArgs = depsArgs // rainMathFloatAbiEnv // { doCheck = false; };
-
   # Build only dependencies (cached separately from source changes). The
   # custom dummy source retains rain-math-float's implementation because git
   # dependencies consume its API while this derivation is being built.
@@ -186,29 +181,8 @@ let
     builtins.removeAttrs depsArgs [ "src" ] // { dummySrc = depsDummySrc; }
   );
 
-  # The DTO crate's own dependencies. Reusing the workspace cargoArtifacts
-  # made every dashboard CI run unpack every backend dependency to compile
-  # this one small crate.
-  dtoCargoArtifacts = craneLib.buildDepsOnly (
-    builtins.removeAttrs depsArgs [ "src" ]
-    // {
-      pname = "st0x-dto";
-      dummySrc = depsDummySrc;
-      cargoExtraArgs = "-p st0x-dto";
-    }
-  );
-
 in
 {
-  # DTO crate for TypeScript codegen. Build config lives next to the crate
-  # source at crates/dto/default.nix; rust.nix only supplies shared crane
-  # infra.
-  st0x-dto = import ./crates/dto {
-    inherit craneLib;
-    cargoArtifacts = dtoCargoArtifacts;
-    commonArgs = dtoArgs;
-  };
-
   # Server binary for deployment
   st0x-liquidity = craneLib.buildPackage (
     commonArgs

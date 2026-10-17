@@ -7,7 +7,6 @@ homepage.workspace = true
 
 [dependencies]
 chrono = { workspace = true, features = ["serde"] }
-clap = { workspace = true, features = ["derive"] }
 rain-math-float.workspace = true
 serde = { workspace = true, features = ["derive"] }
 st0x-finance.workspace = true
@@ -15,7 +14,6 @@ st0x-float-macro.workspace = true
 st0x-float-serde.workspace = true
 strum = { version = "0.28.0", features = ["derive"] }
 thiserror.workspace = true
-ts-rs.workspace = true
 uuid = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]

@@ -4247,8 +4247,8 @@ mod tests {
         }
     }
 
-    /// Every offline stox command the SPA shows, written by
-    /// `dashboard/src/lib/transfer-board.test.ts`.
+    /// Every offline stox command the board shows as text, written by
+    /// `observability/tests/recovery.test.ts`.
     const SHOWN_STOX_COMMANDS: &str = include_str!("../../testdata/shown-stox-commands.txt");
 
     /// Each way to fill a shown command's `<a|b>` placeholders, split into
@@ -4279,7 +4279,7 @@ mod tests {
             })
     }
 
-    /// The SPA shows offline stox commands for the steps that run with the
+    /// The board shows offline stox commands for the steps that run with the
     /// bot stopped. Each must parse and classify, so a USDC reconcile's id is
     /// a UUID and its reason one the command accepts.
     #[test]

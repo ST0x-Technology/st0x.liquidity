@@ -8,8 +8,6 @@
 #                    unit: nothing runs continuously, the files are just installed.
 # kind = "plain"   -- has a systemd unit, no secrets/config. Marker file gates
 #                    ConditionPathExists; deploy step just touches it and restarts.
-# kind = "static"  -- no systemd unit (e.g. nginx-served static assets). Deploy step
-#                    runs a custom activation command.
 
 let
   profileBase = "/nix/var/nix/profiles/per-service";
@@ -66,14 +64,6 @@ let
       kind = "cli";
       package = "st0x-liquidity";
       encryptedSecretOverlays = [ "st0x-hedge-pricing.toml.age" ];
-    };
-
-    dashboard = {
-      enabled = true;
-      order = 10;
-      kind = "static";
-      package = "st0x-dashboard";
-      activation = "systemctl reload nginx";
     };
 
     datasette = {

@@ -1,3 +1,6 @@
-# Every offline stox command the SPA shows; crates/cli parses each with st0x-cli.
-# Written by dashboard/src/lib/transfer-board.test.ts; do not edit by hand.
+# Every offline stox command the board text gives; crates/cli parses each with st0x-cli.
+# Written by observability/tests/recovery.test.ts; do not edit by hand.
+stox alpaca-convert -d to-usd -a 1
+stox alpaca-deposit -a 1
+stox cctp complete-mint --burn-tx 0x0000000000000000000000000000000000000000000000000000000000000000 --source-chain base
 stox transfer reconcile --kind usdc --id 00000000-0000-4000-8000-000000000001 --reason <funds-moved-manually|deposit-credited-offline>

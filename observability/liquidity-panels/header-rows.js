@@ -1,6 +1,6 @@
 // The header's input rows by their `k` column. The generator prepends this
-// file to header.js; dashboard/src/lib/board-header.test.ts imports it as a
-// module through the export line, which the generator drops.
+// file to header.js; observability/tests/board-header.test.ts imports it as
+// a module through the export line, which the generator drops.
 //
 // The stackdriver datasource runs a range query even for an instant target,
 // so each `k` can arrive at several times. A plain value keeps its newest

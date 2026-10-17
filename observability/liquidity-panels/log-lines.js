@@ -1,7 +1,7 @@
 // The detail dialog's reading of Cloud Logging frames: a row's entries, and
 // the bot's event timeline. The generator prepends this file to detail.js;
-// dashboard/src/lib/transfer-board.test.ts imports it as a module through
-// the export line, which the generator drops.
+// observability/tests/recovery.test.ts imports it as a module through the
+// export line, which the generator drops.
 
 // A JSON object, or null for anything else (no value, bad JSON, a string).
 const parseObject = (value) => {

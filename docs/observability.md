@@ -91,9 +91,8 @@ empty format string, so after that bump only the `<name>: <error>` fallback for
 export errors is still needed.
 
 The rolling file layer is not flattened. It keeps the message under `fields`:
-the dashboard's log panel (`dashboard/src/lib/components/log-panel.svelte`) and
 the t0.devops liquidity exporter (`ship_botlogs`, which feeds the
-`liquidity-botlogs` log) read `fields` and `fields.message` from `/logs`, which
+`liquidity-botlogs` log) reads `fields` and `fields.message` from `/logs`, which
 serves these files.
 
 Switch an environment to `json` only where the log shipper parses JSON, and only
@@ -579,14 +578,14 @@ step) plus the publishes before it in the refresh order (`1w`, `1d`, `all`,
    and, for a new source, a `LiqFamily` variant with its `collector` string.
    Extend the catalog test and this table.
 3. Write the builder in its own submodule. It takes a metrics-owned input type,
-   not a dashboard DTO, computes in exact types, and converts once with
-   `float_value` or `integer_value`. A value that does not convert is skipped
-   and logged. The exception is a family that copies an endpoint: it takes that
-   endpoint's DTO from the same loader, so the two cannot drift. The performance
-   families take the DTO of their `/performance/*` endpoint, the pending orders
-   take `PendingOrderResponse` and the P&L windows take the `/pnl` response.
-   Their label values are the DTO's serde names, so a serde rename changes a
-   published label value: a contract change, as in step 1.
+   not an API DTO, computes in exact types, and converts once with `float_value`
+   or `integer_value`. A value that does not convert is skipped and logged. The
+   exception is a family that copies an endpoint: it takes that endpoint's DTO
+   from the same loader, so the two cannot drift. The performance families take
+   the DTO of their `/performance/*` endpoint, the pending orders take
+   `PendingOrderResponse` and the P&L windows take the `/pnl` response. Their
+   label values are the DTO's serde names, so a serde rename changes a published
+   label value: a contract change, as in step 1.
 4. Publish with `LIQ_FAMILIES.replace(family, samples, now)`. Each call replaces
    the whole family.
 5. Add a golden case: a fixture JSON under `src/metrics/liquidity/testdata/`, a

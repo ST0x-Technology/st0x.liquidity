@@ -1,6 +1,6 @@
 /* Business Text "styles" for the Liquidity bot's trade and transfer detail
    dialog. Theme colours come in as --det-* variables set by detail.js;
-   status, venue and side colours are the SPA's (Tailwind 500). */
+   status, venue and side colours are Tailwind's 500 shades. */
 
 .det-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .det-muted { color: var(--det-muted); }

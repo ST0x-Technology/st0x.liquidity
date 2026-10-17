@@ -4,7 +4,7 @@
 // Cloud Logging for that row's lines alone, over its own span: a query
 // filtered on one id is quick over minutes, where the board's 30 days take
 // about 13s. The generator prepends this file to detail.js;
-// dashboard/src/lib/row-events.test.ts imports it as a module through the
+// observability/tests/row-events.test.ts imports it as a module through the
 // export line, which the generator drops. lineEntries is prepended from
 // log-lines.js.
 

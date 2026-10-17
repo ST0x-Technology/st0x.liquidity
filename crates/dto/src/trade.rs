@@ -4,12 +4,11 @@ use chrono::{DateTime, Utc};
 use serde::de::Error as _;
 use serde::ser::{Error as _, SerializeStruct};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use ts_rs::TS;
 
 use st0x_finance::{FractionalShares, NonNegative, Positive, Symbol, Usd};
 
 /// Where a trade was executed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TradingVenue {
     Raindex,
@@ -98,13 +97,14 @@ pub struct InvalidTradingVenue {
 /// both broker execution and dashboard DTOs -- there is no separate
 /// "TradeDirection" that needs converting back and forth.
 ///
-/// Serializes as snake_case (`"buy"`/`"sell"`) to match the dashboard wire
-/// format. Deserialization accepts both snake_case and the legacy PascalCase
+/// Serializes as snake_case (`"buy"`/`"sell"`) to match the API wire format.
+/// Deserialization accepts both snake_case and the legacy PascalCase
 /// (`"Buy"`/`"Sell"`) variant names so old OffchainOrder event payloads
 /// continue to load after this type was promoted from `st0x_execution`.
-/// The `Deserialize` impl is hand-rolled because per-variant `#[serde(alias)]`
-/// confuses `ts-rs` (it warns on unrecognized attributes).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+/// `Deserialize` goes through `FromStr`, so payloads in any casing load
+/// (`buy`, `Buy`, `BUY`); per-variant `#[serde(alias)]` would drop the
+/// upper-case form `Display` writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Direction {
     Buy,
@@ -161,7 +161,7 @@ pub struct InvalidDirectionError {
 }
 
 /// Terminal outcome of a dashboard trade entry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(
     tag = "status",
     rename_all = "snake_case",
@@ -171,26 +171,18 @@ pub enum TradeOutcome {
     Filled,
     Failed {
         error: String,
-        #[ts(type = "string | null")]
         accepted_shares: Option<Positive<FractionalShares>>,
-        #[ts(type = "string | null")]
         filled_shares: Option<NonNegative<FractionalShares>>,
-        #[ts(type = "string | null")]
         remaining_shares: Option<NonNegative<FractionalShares>>,
         /// Shares filled beyond the broker-accepted order quantity. This is
         /// separate from remaining shares so anomalous broker state is never
         /// clamped away.
-        #[ts(type = "string | null")]
         excess_shares: Option<NonNegative<FractionalShares>>,
     },
     Cancelled {
-        #[ts(type = "string | null")]
         accepted_shares: Option<Positive<FractionalShares>>,
-        #[ts(type = "string | null")]
         filled_shares: Option<NonNegative<FractionalShares>>,
-        #[ts(type = "string | null")]
         remaining_shares: Option<NonNegative<FractionalShares>>,
-        #[ts(type = "string | null")]
         excess_shares: Option<NonNegative<FractionalShares>>,
     },
 }
@@ -238,10 +230,8 @@ enum TradeOutcomeWire {
 /// Rejects a terminal outcome whose derived quantities contradict its
 /// accepted and filled quantities.
 ///
-/// The dashboard parser enforces this contract on the same payload, so
-/// without it the two ends of the wire disagree on what a valid outcome is:
-/// `Trade` also deserializes from durable job payloads, and a corrupt row
-/// would pass here only to fail later in the browser.
+/// `Trade` also deserializes from durable job payloads, so this check is
+/// what keeps a corrupt row from loading as a valid outcome.
 fn validate_derived_quantities<E: serde::de::Error>(
     accepted_shares: Option<Positive<FractionalShares>>,
     filled_shares: Option<NonNegative<FractionalShares>>,
@@ -397,24 +387,21 @@ impl<'de> Deserialize<'de> for TradeOutcome {
 }
 
 /// A completed onchain fill or terminal offchain counter-trade.
-#[derive(Debug, Clone, Deserialize, TS)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Trade {
     /// Unique identifier for deduplication on reconnect.
     /// Onchain: `"tx_hash:log_index"`. Offchain: offchain order aggregate ID.
     pub id: String,
-    #[ts(rename = "occurredAt")]
     pub occurred_at: DateTime<Utc>,
     pub venue: TradingVenue,
     pub direction: Direction,
-    #[ts(type = "string")]
     pub symbol: Symbol,
     /// Executed quantity for fills, or requested quantity for a failed or
     /// cancelled counter-trade. Terminal non-fill outcomes carry
     /// broker-accepted and fill provenance separately when those facts are
     /// known. Onchain trades count wrapped shares, as Raindex settles them;
     /// counter-trades count underlying shares.
-    #[ts(type = "string")]
     pub shares: Positive<FractionalShares>,
     /// Fill price in USD per share of `shares`: per wrapped share for an
     /// onchain trade, per underlying share for a counter-trade. Absent when
@@ -422,7 +409,6 @@ pub struct Trade {
     /// broker fill whose reported price is not positive, or any trade whose
     /// price is not known. Only `terminal_outcomes_v3` carries it on the
     /// wire.
-    #[ts(type = "string | null")]
     pub price: Option<Usd>,
     pub outcome: TradeOutcome,
 }
@@ -598,16 +584,14 @@ impl Serialize for TerminalOutcomesV1Trade<'_> {
 
 /// Filled-trade wire shape consumed by dashboard versions before terminal
 /// outcomes were added to [`Trade`].
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LegacyTrade {
     pub id: String,
     pub filled_at: DateTime<Utc>,
     pub venue: TradingVenue,
     pub direction: Direction,
-    #[ts(type = "string")]
     pub symbol: Symbol,
-    #[ts(type = "string")]
     pub shares: Positive<FractionalShares>,
 }
 

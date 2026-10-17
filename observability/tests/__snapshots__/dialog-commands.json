@@ -1,0 +1,337 @@
+{
+  "trade": [
+    {
+      "command": "st0x-liquidity-client --env production debug position release-hedge MSTR --order-id <order-id> --reason \"<reason>\"",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug position set MSTR --target-net <N> [--price-usdc <USDC_PER_SHARE>] --reason \"<reason>\"",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug view rebuild position --id MSTR",
+      "mode": "requires-bot"
+    }
+  ],
+  "equity_mint minting": [
+    {
+      "command": "st0x-liquidity-client --env production debug recheck mint X1",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug resume",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug fail-equity-transfer mint X1 --reason \"<reason>\"",
+      "mode": "requires-bot"
+    }
+  ],
+  "equity_mint wrapping": [
+    {
+      "command": "st0x-liquidity-client --env production debug recheck mint X1",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug resume",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug fail-equity-transfer mint X1 --reason \"<reason>\"",
+      "mode": "requires-bot"
+    }
+  ],
+  "equity_mint depositing": [
+    {
+      "command": "st0x-liquidity-client --env production debug recheck mint X1",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug resume",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug fail-equity-transfer mint X1 --reason \"<reason>\"",
+      "mode": "requires-bot"
+    }
+  ],
+  "equity_mint sending": [
+    {
+      "command": "st0x-liquidity-client --env production debug recheck mint X1",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug resume",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug fail-equity-transfer mint X1 --reason \"<reason>\"",
+      "mode": "requires-bot"
+    }
+  ],
+  "equity_mint withdrawing": [
+    {
+      "command": "st0x-liquidity-client --env production debug recheck mint X1",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug resume",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug fail-equity-transfer mint X1 --reason \"<reason>\"",
+      "mode": "requires-bot"
+    }
+  ],
+  "equity_mint unwrapping": [
+    {
+      "command": "st0x-liquidity-client --env production debug recheck mint X1",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug resume",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug fail-equity-transfer mint X1 --reason \"<reason>\"",
+      "mode": "requires-bot"
+    }
+  ],
+  "equity_mint pending_confirmation": [
+    {
+      "command": "st0x-liquidity-client --env production debug recheck mint X1",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug resume",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug fail-equity-transfer mint X1 --reason \"<reason>\"",
+      "mode": "requires-bot"
+    }
+  ],
+  "equity_mint failed": [
+    {
+      "command": "st0x-liquidity-client --env production debug recheck mint X1",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug reconcile-equity mint X1 --reason \"<reason>\"",
+      "mode": "requires-bot"
+    }
+  ],
+  "equity_mint completed": [],
+  "equity_mint reconciled": [],
+  "equity_redemption minting": [
+    {
+      "command": "st0x-liquidity-client --env production debug recheck redemption X1",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug resume",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug fail-equity-transfer redemption X1 --reason \"<reason>\"",
+      "mode": "requires-bot"
+    }
+  ],
+  "equity_redemption wrapping": [
+    {
+      "command": "st0x-liquidity-client --env production debug recheck redemption X1",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug resume",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug fail-equity-transfer redemption X1 --reason \"<reason>\"",
+      "mode": "requires-bot"
+    }
+  ],
+  "equity_redemption depositing": [
+    {
+      "command": "st0x-liquidity-client --env production debug recheck redemption X1",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug resume",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug fail-equity-transfer redemption X1 --reason \"<reason>\"",
+      "mode": "requires-bot"
+    }
+  ],
+  "equity_redemption sending": [
+    {
+      "command": "st0x-liquidity-client --env production debug recheck redemption X1",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug resume",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug fail-equity-transfer redemption X1 --reason \"<reason>\"",
+      "mode": "requires-bot"
+    }
+  ],
+  "equity_redemption withdrawing": [
+    {
+      "command": "st0x-liquidity-client --env production debug recheck redemption X1",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug resume",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug fail-equity-transfer redemption X1 --reason \"<reason>\"",
+      "mode": "requires-bot"
+    }
+  ],
+  "equity_redemption unwrapping": [
+    {
+      "command": "st0x-liquidity-client --env production debug recheck redemption X1",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug resume",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug fail-equity-transfer redemption X1 --reason \"<reason>\"",
+      "mode": "requires-bot"
+    }
+  ],
+  "equity_redemption pending_confirmation": [
+    {
+      "command": "st0x-liquidity-client --env production debug recheck redemption X1",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug resume",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug fail-equity-transfer redemption X1 --reason \"<reason>\"",
+      "mode": "requires-bot"
+    }
+  ],
+  "equity_redemption failed": [
+    {
+      "command": "st0x-liquidity-client --env production debug recheck redemption X1",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug reconcile-equity redemption X1 --reason \"<reason>\"",
+      "mode": "requires-bot"
+    }
+  ],
+  "equity_redemption completed": [],
+  "equity_redemption reconciled": [],
+  "usdc_bridge converting alpaca_to_base": [
+    {
+      "command": "st0x-liquidity-client --env production debug resume-usdc alpaca-to-base B1",
+      "mode": "requires-bot"
+    }
+  ],
+  "usdc_bridge withdrawing alpaca_to_base": [
+    {
+      "command": "st0x-liquidity-client --env production debug resume-usdc alpaca-to-base B1",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug fail-usdc-transfer B1 --reason \"<reason>\"",
+      "mode": "requires-bot"
+    }
+  ],
+  "usdc_bridge bridging alpaca_to_base": [
+    {
+      "command": "st0x-liquidity-client --env production debug resume-usdc alpaca-to-base B1",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug fail-usdc-transfer B1 --reason \"<reason>\"",
+      "mode": "requires-bot"
+    }
+  ],
+  "usdc_bridge depositing alpaca_to_base": [
+    {
+      "command": "st0x-liquidity-client --env production debug resume-usdc alpaca-to-base B1",
+      "mode": "requires-bot"
+    }
+  ],
+  "usdc_bridge failed alpaca_to_base": [],
+  "usdc_bridge completed alpaca_to_base": [],
+  "usdc_bridge reconciled alpaca_to_base": [],
+  "usdc_bridge converting base_to_alpaca": [
+    {
+      "command": "st0x-liquidity-client --env production debug resume-usdc base-to-alpaca B1",
+      "mode": "requires-bot"
+    }
+  ],
+  "usdc_bridge withdrawing base_to_alpaca": [
+    {
+      "command": "st0x-liquidity-client --env production debug resume-usdc base-to-alpaca B1",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug fail-usdc-transfer B1 --reason \"<reason>\"",
+      "mode": "requires-bot"
+    }
+  ],
+  "usdc_bridge bridging base_to_alpaca": [
+    {
+      "command": "st0x-liquidity-client --env production debug resume-usdc base-to-alpaca B1",
+      "mode": "requires-bot"
+    }
+  ],
+  "usdc_bridge depositing base_to_alpaca": [
+    {
+      "command": "st0x-liquidity-client --env production debug resume-usdc base-to-alpaca B1",
+      "mode": "requires-bot"
+    }
+  ],
+  "usdc_bridge failed base_to_alpaca": [],
+  "usdc_bridge completed base_to_alpaca": [],
+  "usdc_bridge reconciled base_to_alpaca": [],
+  "usdc_bridge converting no-direction": [
+    {
+      "command": "st0x-liquidity-client --env production debug resume-usdc <alpaca-to-base|base-to-alpaca> B1",
+      "mode": "requires-bot"
+    }
+  ],
+  "usdc_bridge withdrawing no-direction": [
+    {
+      "command": "st0x-liquidity-client --env production debug resume-usdc <alpaca-to-base|base-to-alpaca> B1",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug fail-usdc-transfer B1 --reason \"<reason>\"",
+      "mode": "requires-bot"
+    }
+  ],
+  "usdc_bridge bridging no-direction": [
+    {
+      "command": "st0x-liquidity-client --env production debug resume-usdc <alpaca-to-base|base-to-alpaca> B1",
+      "mode": "requires-bot"
+    },
+    {
+      "command": "st0x-liquidity-client --env production debug fail-usdc-transfer B1 --reason \"<reason>\"",
+      "mode": "requires-bot"
+    }
+  ],
+  "usdc_bridge depositing no-direction": [
+    {
+      "command": "st0x-liquidity-client --env production debug resume-usdc <alpaca-to-base|base-to-alpaca> B1",
+      "mode": "requires-bot"
+    }
+  ],
+  "usdc_bridge failed no-direction": [],
+  "usdc_bridge completed no-direction": [],
+  "usdc_bridge reconciled no-direction": []
+}

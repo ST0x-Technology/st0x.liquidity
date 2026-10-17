@@ -15,7 +15,8 @@
 //!   takes them to simulate users buying and selling tokenized equities.
 //!   The bot counter-trades, mints/redeems, and bridges USDC to maintain
 //!   liquidity — if it works correctly, the vaults never drain permanently.
-//!   Run via `nix run .#simulate-market` (mprocs with dashboard). Ctrl-C to stop.
+//!   Run via `nix run .#simulate-market` (mprocs with the mock REST API and
+//!   datasette). Ctrl-C to stop.
 //!
 //! - [`simulate_failures`]: Same live simulation, but first creates stuck
 //!   mint and redemption rebalances where the local aggregate failed while
@@ -1044,8 +1045,8 @@ async fn full_system_concurrent() -> anyhow::Result<()> {
 /// supply, and bridges USDC to keep cash balanced. The Rain vaults stay
 /// funded because the bot continuously cycles liquidity back into them.
 ///
-/// Run via `nix run .#simulate-market` which pairs this with the dashboard dev
-/// server in mprocs so you can observe the system in real time.
+/// Run via `nix run .#simulate-market` which pairs this with the mock REST API
+/// and datasette in mprocs so you can observe the system in real time.
 #[tokio::test]
 #[ignore = "infinite simulation -- run via nix run .#simulate-market"]
 #[allow(clippy::too_many_lines)]
@@ -1076,10 +1077,10 @@ async fn simulate() -> anyhow::Result<()> {
     )
     .await?;
 
-    // Every counter-trade fills by default, so the dashboard's trade history
+    // Every counter-trade fills by default, so the trade history
     // only ever shows one outcome. This knob rotates each hedge through
     // filled, rejected, and partially-filled-then-cancelled instead, so the
-    // Outcome column can be inspected (and screenshotted) in one run.
+    // outcome field can be inspected in one run.
     if std::env::var_os("SIMULATE_BROKER_OUTCOME_ROTATION").is_some() {
         infra
             .broker_service
@@ -1209,7 +1210,7 @@ async fn simulate() -> anyhow::Result<()> {
             info!(
                 days,
                 "Seeded simulated hedge-latency, mint, USDC-rebalance, and equity-redemption \
-                 history for dashboard inspection"
+                 history for inspection"
             );
         }
         Err(std::env::VarError::NotPresent) => {}
@@ -1286,8 +1287,8 @@ async fn simulate() -> anyhow::Result<()> {
 
 /// Failure-injection simulation: starts the full system, performs normal trades
 /// to create recoverable AAPL mint and TSLA redemption failures, then advances
-/// the mock issuer/provider to Completed. The dashboard should show the failed
-/// transfers until `transfer recheck` recovers them.
+/// the mock issuer/provider to Completed. The failed transfers stay visible in the
+/// bot's transfer reads until `transfer recheck` recovers them.
 ///
 /// Run via `nix run .#simulate-failures`. Set
 /// `SIMULATE_EXIT_AFTER_SELF_HEAL=1` when running under automated verification
@@ -1592,7 +1593,7 @@ async fn simulate_failures() -> anyhow::Result<()> {
     }
 
     info!(
-        "Stuck mint and redemption left visible for dashboard/CLI testing. Starting continuous trade simulation."
+        "Stuck mint and redemption left visible for CLI testing. Starting continuous trade simulation."
     );
 
     let orders = [

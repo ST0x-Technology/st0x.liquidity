@@ -130,34 +130,13 @@ in
         forceSSL = true;
         sslCertificate = "${certDir}/${tailscaleMagicDnsName}.crt";
         sslCertificateKey = "${certDir}/${tailscaleMagicDnsName}.key";
-        root = "/nix/var/nix/profiles/per-service/dashboard";
-
-        locations =
-          let
-            port = "8001";
-            backend = "http://127.0.0.1:${port}";
-            apiProxy = path: { proxyPass = "${backend}${path}"; };
-            wsProxy = {
-              proxyPass = "${backend}/api/ws";
-              proxyWebsockets = true;
-              extraConfig = ''
-                proxy_connect_timeout 60;
-                proxy_send_timeout 60;
-                proxy_read_timeout 86400;
-              '';
-            };
-          in
-          {
-            "/".tryFiles = "$uri $uri/ /index.html";
-            "/api/ws" = wsProxy;
-            "/health" = apiProxy "/health";
-            "/logs" = apiProxy "/logs";
-            "/orders/" = apiProxy "/orders/";
-            "/pnl" = apiProxy "/pnl";
-            "/trades" = apiProxy "/trades";
-            "/transfers" = apiProxy "/transfers";
-            "/performance" = apiProxy "/performance";
-          };
+        # The SvelteKit dashboard this host served is gone; the Grafana
+        # board replaced it, so the vhost only points there.
+        locations."= /".extraConfig = ''
+          default_type text/html;
+          add_header Cache-Control "no-store" always;
+          return 200 '<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=https://grafana.t0trade.com/d/t0-liquidity/liquidity-bot"><title>Liquidity bot</title><p>The liquidity dashboard moved to Grafana: <a href="https://grafana.t0trade.com/d/t0-liquidity/liquidity-bot">Liquidity bot</a>.</p>';
+        '';
       };
     };
 
@@ -186,7 +165,7 @@ in
   networking.firewall = {
     enable = true;
     # All inbound access is gated by the DO Cloud Firewall (infra/modules/stack)
-    # which only permits Tailscale WireGuard. SSH and the dashboard are reached
+    # which only permits Tailscale WireGuard. SSH and the nginx vhost are reached
     # exclusively over tailscale0, which is configured as a trusted interface
     # in tailscale.nix and bypasses the NixOS firewall entirely.
     allowedTCPPorts = [ ];

@@ -18,7 +18,7 @@
         "id": 15,
         "type": "timeseries",
         "title": "Hedge fill latency percentiles",
-        "description": "Wall-clock seconds from hedge order placement to confirmed fill. The app builds these as a metrics-rs summary (no explicit buckets), so the quantiles come straight off the {quantile=...} label rather than from histogram_quantile. This is the metrics-side view of the SPA's 'Latency percentiles over time' chart \u2014 that chart's per-stage waterfall (detection / decision / submission / execution) comes from the telemetry tables in SQLite and has no metric behind it.",
+        "description": "Wall-clock seconds from hedge order placement to confirmed fill. The app builds these as a metrics-rs summary (no explicit buckets), so the quantiles come straight off the {quantile=...} label rather than from histogram_quantile. The per-stage waterfall (detection, decision, submission, execution) comes from the telemetry tables in SQLite and has no metric behind it: read it with st0x-liquidity-client --env <production|staging> read resource latencies.",
         "datasource": {
           "type": "stackdriver",
           "uid": "cloudmon"
@@ -1123,7 +1123,7 @@
         "id": 29,
         "type": "stat",
         "title": "Unusable snapshot marks (24h)",
-        "description": "Nonzero equity balances captured with a missing or stale USD mark. These make the portfolio snapshot \u2014 and therefore the PnL replay in the SPA \u2014 incomplete for that interval.",
+        "description": "Nonzero equity balances captured with a missing or stale USD mark. These make the portfolio snapshot, and so the PnL replay, incomplete for that interval.",
         "datasource": {
           "type": "stackdriver",
           "uid": "cloudmon"

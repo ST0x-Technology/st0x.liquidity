@@ -1,6 +1,6 @@
 // Lays out the Dashboard tab's two columns to fit the window. The generator
 // prepends this file to header.js, which calls it on every render;
-// dashboard/src/lib/board-layout.test.ts imports it as a module through the
+// observability/tests/board-layout.test.ts imports it as a module through the
 // export line, which the generator drops.
 //
 // This ends both columns at the window's bottom, again on every resize: on
