@@ -105,8 +105,8 @@ use crate::unwrapped_equity_recovery::{
 };
 use crate::usdc_rebalance::{
     CooldownFailure, InterruptedUsdcRebalances, PreBurnFailEligibility, RebalanceDirection,
-    RefundSide, UsdcRebalance, UsdcRebalanceEvent, UsdcRebalanceId, any_rebalance_holds_guard,
-    interrupted_usdc_rebalance_ids,
+    RefundSide, UsdcRebalance, UsdcRebalanceEvent, UsdcRebalanceId, any_rebalance_holds_any_guard,
+    any_rebalance_holds_guard, interrupted_usdc_rebalance_ids,
 };
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 use crate::wrapped_equity_recovery::aggregate::WrappedEquityRecoveryId;
@@ -7009,6 +7009,23 @@ impl RebalancingService {
     ) -> Result<Option<(String, i64)>, sqlx_apalis::Error> {
         let outbound_job_type = std::any::type_name::<TransferUsdcToMarketMaking>();
         let counts_outbound_elsewhere = direction == RebalanceDirection::AlpacaToBase;
+        Self::first_live_usdc_job(pool, usdc_store, |corridor, job_type| {
+            corridor.chain() == chain
+                || (counts_outbound_elsewhere && job_type == outbound_job_type)
+        })
+        .await
+    }
+
+    /// The oldest USDC transfer job row that `counts` (given the row's
+    /// corridor and job type) and that still drives a live transfer, with its
+    /// age in seconds, as [`Self::in_flight_usdc_transfer`] decides it: a row
+    /// whose payload cannot be parsed counts whatever `counts` says, and a
+    /// retryable `Failed` row counts only while its transfer is live.
+    async fn first_live_usdc_job(
+        pool: &apalis_sqlite::SqlitePool,
+        usdc_store: Option<&Store<UsdcRebalance>>,
+        counts: impl Fn(UsdcCorridor, &str) -> bool,
+    ) -> Result<Option<(String, i64)>, sqlx_apalis::Error> {
         for LiveUsdcJobRow {
             row_id,
             age_secs,
@@ -7018,12 +7035,7 @@ impl RebalancingService {
         } in Self::live_usdc_job_rows(pool).await?
         {
             let aggregate_id = match serde_json::from_slice::<UsdcJobKey>(&job_payload) {
-                Ok(UsdcJobKey { id, corridor, .. })
-                    if corridor.chain() == chain
-                        || (counts_outbound_elsewhere && job_type == outbound_job_type) =>
-                {
-                    id
-                }
+                Ok(UsdcJobKey { id, corridor, .. }) if counts(corridor, &job_type) => id,
                 Ok(_) => continue,
                 Err(error) => {
                     warn!(
@@ -7046,7 +7058,7 @@ impl RebalancingService {
             }
 
             // The zombie was killed here or terminalized concurrently; a
-            // later row on this corridor may still block the enqueue.
+            // later row may still count.
         }
 
         Ok(None)
@@ -7837,6 +7849,53 @@ impl RebalancingService {
             // The dropped `claim` releases the guard this call claimed.
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// Refuses while any USDC transfer is in flight or holds a corridor
+    /// guard, on every corridor and in either direction: the single flight
+    /// gates of [`Self::start_manual_usdc_transfer`] (the every corridor
+    /// latch, the in memory guards, the live job rows, the durable guard
+    /// holders), widened from one corridor to all of them. For an operator
+    /// send that spends the Ethereum hub wallet's USDC (`capital
+    /// alpaca-deposit`): every corridor passes through that wallet, so any
+    /// transfer may need what the send would take. The caller holds the
+    /// resume lock and the USDC driver pause, so no transfer starts or
+    /// advances between this check and its send.
+    pub(crate) async fn ensure_no_usdc_transfer_in_flight(
+        &self,
+        pool: &SqlitePool,
+    ) -> Result<(), UsdcResumeError> {
+        let store = self.usdc_store.read().await.as_ref().map(Arc::clone);
+        let Some(store) = store else {
+            warn!(
+                target: "rebalance",
+                "Operator USDC send refused: stores not wired yet"
+            );
+            return Err(UsdcResumeError::NotReady);
+        };
+
+        if let Some(refusal) = self.usdc_guards.any_claim() {
+            warn!(target: "rebalance", %refusal, "Operator USDC send refused");
+            return Err(match refusal {
+                ClaimRefusal::Unclassified => UsdcResumeError::EveryCorridorLatched,
+                ClaimRefusal::CorridorHeld
+                | ClaimRefusal::AlpacaOutboundElsewhere
+                | ClaimRefusal::CorridorUnread => UsdcResumeError::GuardHeldElsewhere,
+            });
+        }
+
+        let queue_pool = self.transfer_usdc_to_market_making_queue.pool();
+        if let Some((row_id, age_secs)) =
+            Self::first_live_usdc_job(queue_pool, Some(&store), |_, _| true).await?
+        {
+            return Err(UsdcResumeError::AlreadyInFlight { row_id, age_secs });
+        }
+
+        if any_rebalance_holds_any_guard(pool, &store).await? {
+            return Err(UsdcResumeError::GuardHeldElsewhere);
+        }
+
+        Ok(())
     }
 
     /// Starts a manual equity transfer of `quantity` shares of `symbol` on

@@ -529,6 +529,37 @@ async fn dispatch_capital<A: TokenSource + Sync>(
                 )
                 .await
         }
+        Capital::AlpacaDeposit {
+            amount,
+            operation_id,
+        } => {
+            let operation_id = operation_id.unwrap_or_else(uuid::Uuid::new_v4);
+            // Printed before the request, so it survives a timeout or an
+            // interrupted run: the id is what makes the rerun safe.
+            eprintln!(
+                "operation id {operation_id}: after a failure or a timeout, rerun with \
+                 --operation-id {operation_id} to report this deposit instead of sending again \
+                 (only against a bot that records operation ids, see below)"
+            );
+            let answer = client
+                .post_capital_json(
+                    "/alpaca-deposit",
+                    &wire::AlpacaDepositRequest {
+                        operation_id,
+                        amount,
+                    },
+                )
+                .await?;
+            if !records_operation(&answer, operation_id) {
+                eprintln!(
+                    "WARNING: the bot did not answer with operation id {operation_id} and a \
+                     status, so it predates operation ids and did not record this deposit. A \
+                     rerun, even with --operation-id, sends the USDC again: do not rerun, check \
+                     the bot's Ethereum wallet onchain"
+                );
+            }
+            Ok(answer)
+        }
         Capital::DrainEquity {
             symbol,
             quantity,
@@ -630,10 +661,10 @@ async fn dispatch_capital<A: TokenSource + Sync>(
     }
 }
 
-/// Whether a `cctp-bridge` answer comes from a bot that records operation
-/// ids: it echoes this run's id and a status. An older bot ignores the id and
-/// burns on every call, so a rerun with the same id is only safe when this
-/// holds.
+/// Whether a `cctp-bridge` or `alpaca-deposit` answer comes from a bot that
+/// records operation ids: it echoes this run's id and a status. An older bot
+/// ignores the id and sends on every call, so a rerun with the same id is
+/// only safe when this holds.
 fn records_operation(answer: &serde_json::Value, operation_id: uuid::Uuid) -> bool {
     let echoed = answer
         .get("operationId")
@@ -1461,6 +1492,43 @@ mod tests {
         assert_eq!(
             request_body(&request),
             serde_json::json!({ "chain": "base", "amount": "100" })
+        );
+        Ok(())
+    }
+
+    /// `alpaca-deposit` posts the operation id and the amount only: the bot
+    /// picks the chain and the deposit address itself. A run without
+    /// `--operation-id` sends a fresh id; one with it sends that id.
+    #[tokio::test]
+    async fn alpaca_deposit_posts_the_operation_id_and_the_amount()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fresh = request_for(Command::Capital(Capital::AlpacaDeposit {
+            amount: "500".parse()?,
+            operation_id: None,
+        }))
+        .await?;
+        assert_eq!(
+            request_line(&fresh),
+            "POST /liquidity-capital/alpaca-deposit HTTP/1.1"
+        );
+        let mut body = request_body(&fresh);
+        let generated = body
+            .as_object_mut()
+            .and_then(|body| body.remove("operationId"))
+            .and_then(|id| id.as_str().map(str::parse::<uuid::Uuid>))
+            .transpose()?;
+        assert!(generated.is_some_and(|id| id.get_version_num() == 4));
+        assert_eq!(body, serde_json::json!({ "amount": "500" }));
+
+        let id: uuid::Uuid = "6f1c2a1e-6c39-4a77-9a8e-1f0b7d6e8c11".parse()?;
+        let rerun = request_for(Command::Capital(Capital::AlpacaDeposit {
+            amount: "500".parse()?,
+            operation_id: Some(id),
+        }))
+        .await?;
+        assert_eq!(
+            request_body(&rerun),
+            serde_json::json!({ "operationId": id.to_string(), "amount": "500" })
         );
         Ok(())
     }

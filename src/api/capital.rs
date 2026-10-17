@@ -21,8 +21,9 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use alloy::primitives::{Address, B256, TxHash, U256};
-use alloy::providers::RootProvider;
+use alloy::primitives::{Address, B256, Bytes, TxHash, U256};
+use alloy::providers::{Provider as _, RootProvider};
+use alloy::sol_types::SolCall as _;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -30,14 +31,16 @@ use futures_util::FutureExt as _;
 use futures_util::future::BoxFuture;
 use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::{error, info, warn};
 
 use st0x_bridge::Bridge;
 use st0x_bridge::corridor::UsdcCorridor;
-use st0x_config::{BrokerCtx, HedgedChain, OnchainWalletCtx};
+use st0x_config::{BrokerCtx, Ctx, HedgedChain, OnchainWalletCtx};
 use st0x_event_sorcery::Store;
 use st0x_evm::{Chain, Evm, IERC20, MinedTx, OpenChainErrorRegistry, PreparedTransaction, Wallet};
+use st0x_execution::{AlpacaWalletService, TransferStatus};
 use st0x_finance::{FractionalShares, HasZero, Positive, Symbol, Usdc};
 use st0x_float_serde::format_float_with_fallback;
 use st0x_raindex::{Raindex, RaindexError, RaindexService, RaindexVaultId, RevokeOutcome};
@@ -48,12 +51,18 @@ use st0x_tokenization::{
 use st0x_wrapper::{Wrapper, WrapperError, WrapperService};
 
 use super::{
-    ErrorResponse, OpsError, UsdcDriverPauseRequest, answer_from_detached,
+    ErrorResponse, OpsError, ResumeLock, UsdcDriverPauseRequest, answer_from_detached,
     cctp_source_chain_wire_name, manual_equity_transfer_error_response, ops_command_error,
     ops_precondition_error, quiesce_usdc_driver, spawn_detached, usdc_resume_error_response,
 };
 use crate::AppState;
 use crate::alerts::AlertKind;
+use crate::alpaca_deposit::{
+    AlpacaDepositOperation, AlpacaDepositOperationCommand, AlpacaDepositOperationId,
+    AlpacaDepositOutcome, AlpacaDepositStatus, DEPOSIT_TRANSFER_NOTE, DepositTransfer,
+    DepositWallet, RestoredAlpacaDeposits, deposit_status, restore_pending_alpaca_deposits,
+    settle_pending_deposit,
+};
 use crate::cctp_burn::{
     BotCctpBridge, BurnNotSuperseded, BurnReceiptFate, CctpBurnOperation, CctpBurnOperationCommand,
     CctpBurnOperationId, CctpBurnStatus, CctpSourceChain, NonceTakenBy, RequestedBurn,
@@ -65,6 +74,9 @@ use crate::operations_audit::{Audited, AuditedRequest};
 use crate::rebalancing::trigger::InProgressGuard;
 use crate::rebalancing::trigger::allocation::{
     ALPACA_QUANTITY_MAX_DECIMAL_PLACES, PlannedDirection,
+};
+use crate::rebalancing::usdc::{
+    UsdcDriverPause, alpaca_usdc_deposit_address, deposit_send_required_confirmations,
 };
 use crate::rebalancing::{RebalancingService, UsdcResumeError, to_wrapped_equities};
 use crate::tokenized_equity_mint::{TOKENIZED_EQUITY_DECIMALS, TokenizedEquityMint};
@@ -454,6 +466,59 @@ pub(super) struct RedeemResponse {
     /// The underlying the chain's wrapper attested as its `asset()`.
     token: Address,
     transfer_tx: TxHash,
+}
+
+/// Wire contract for the Alpaca deposit route: the client's operation id and
+/// the amount. It names no chain and no destination: the send is always
+/// Ethereum USDC from the bot's Ethereum wallet to the deposit address Alpaca
+/// gives for the bot's own account. A request whose operation id already
+/// holds a transfer reports that transfer instead of sending again.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct AlpacaDepositRequest {
+    operation_id: AlpacaDepositOperationId,
+    /// Decimal USDC with at most 6 decimals, as for `st0x-cli
+    /// alpaca-deposit --amount`.
+    amount: String,
+}
+
+impl AuditedRequest for AlpacaDepositRequest {
+    fn audit_targets(&self) -> Vec<String> {
+        vec![self.operation_id.to_string(), Chain::Ethereum.to_string()]
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct AlpacaDepositResponse {
+    operation_id: AlpacaDepositOperationId,
+    chain: Chain,
+    /// Alpaca's USDC deposit address on Ethereum for the bot's account, the
+    /// one the recorded transfer pays.
+    deposit_address: Address,
+    amount: String,
+    /// The amount in USDC base units (6 decimals).
+    amount_raw: String,
+    transfer_tx: TxHash,
+    status: AlpacaDepositStatus,
+}
+
+impl AlpacaDepositResponse {
+    fn of(
+        request: &DepositRequest,
+        transfer: &DepositTransfer,
+        status: AlpacaDepositStatus,
+    ) -> Self {
+        Self {
+            operation_id: request.operation_id,
+            chain: Chain::Ethereum,
+            deposit_address: transfer.deposit_address,
+            amount: request.amount.clone(),
+            amount_raw: transfer.amount.to_string(),
+            transfer_tx: transfer.transfer_tx(),
+            status,
+        }
+    }
 }
 
 /// Starts a USDC transfer between Alpaca and Raindex on the bot's own
@@ -1797,7 +1862,7 @@ async fn run_wrapper_operation(
     let rebalancing = Arc::clone(&handle.rebalancing_service);
     let locks = Arc::clone(&state.equity_wallet_locks);
     // Checked under the claim, with the balance read.
-    let gas = equity_gas_readiness(state, chain, &wallet);
+    let gas = signer_gas_readiness(state, chain, &wallet);
     let required_confirmations = trading.required_confirmations;
     let owner = wallet.address();
     let wrapper = WrapperService::new(
@@ -1811,7 +1876,7 @@ async fn run_wrapper_operation(
 
     answer_from_detached(&state.detached_tasks, route, symbol.clone(), async move {
         let claim = claim_equity_wallet(&locks, &rebalancing, &symbol, chain, route)?;
-        ensure_equity_gas(&*gas?, route, chain).await?;
+        ensure_signer_gas(&*gas?, route, chain).await?;
 
         let submitted = match operation {
             WrapperOperation::Wrap => wrapper.submit_wrap(wrapped_token, amount, owner).await,
@@ -1873,7 +1938,7 @@ enum WrapperFate {
 /// Awaits a wrap or unwrap tx's confirmation through `Wrapper::confirm_wrap`
 /// or `Wrapper::confirm_unwrap`, waits again while its fate is unknown, and
 /// logs what the wallet received. The caller holds the symbol's claim, so a
-/// fate that stays unknown alerts once ([`UnprovenEquityTx`]).
+/// fate that stays unknown alerts once ([`UnprovenCapitalTx`]).
 async fn confirm_wrapper_tx(
     wrapper: &impl Wrapper,
     operation: WrapperOperation,
@@ -1889,7 +1954,7 @@ async fn confirm_wrapper_tx(
         required_confirmations,
     } = pending;
     let route = operation.route();
-    let mut unproven = UnprovenEquityTx::new(tokio::time::Instant::now());
+    let mut unproven = UnprovenCapitalTx::new(tokio::time::Instant::now());
     loop {
         let confirmed = match operation {
             WrapperOperation::Wrap => wrapper
@@ -2008,7 +2073,7 @@ pub(super) async fn redeem(
     let rebalancing = Arc::clone(&handle.rebalancing_service);
     let locks = Arc::clone(&state.equity_wallet_locks);
     // Checked under the claim, with the balance read.
-    let gas = equity_gas_readiness(&state, chain, &wallet);
+    let gas = signer_gas_readiness(&state, chain, &wallet);
     let required_confirmations = trading.required_confirmations;
     let wrapper = WrapperService::new(
         Arc::clone(&wallet),
@@ -2024,7 +2089,7 @@ pub(super) async fn redeem(
         async move {
             let symbol = task_symbol;
             let claim = claim_equity_wallet(&locks, &rebalancing, &symbol, chain, "redeem")?;
-            ensure_equity_gas(&*gas?, "redeem", chain).await?;
+            ensure_signer_gas(&*gas?, "redeem", chain).await?;
 
             let token = wrapper
                 .attest_underlying(&symbol)
@@ -2120,7 +2185,7 @@ pub(super) async fn drain_equity(
     let locks = Arc::clone(&state.equity_wallet_locks);
     let withdraw_lock = Arc::clone(&state.vault_withdraw_lock);
     // Checked under the claim, with the balance read.
-    let gas = equity_gas_readiness(&state, chain, &wallet);
+    let gas = signer_gas_readiness(&state, chain, &wallet);
     let required_confirmations = trading.required_confirmations;
     let owner = wallet.address();
     let wrapper = WrapperService::new(
@@ -2149,7 +2214,7 @@ pub(super) async fn drain_equity(
                     .to_string(),
             )
         })?;
-        ensure_equity_gas(&*gas?, ROUTE, chain).await?;
+        ensure_signer_gas(&*gas?, ROUTE, chain).await?;
         let token = wrapper
             .attest_underlying(&symbol)
             .await
@@ -2358,7 +2423,7 @@ async fn confirm_redemption_transfer(
     transfer_tx: TxHash,
     required_confirmations: u64,
 ) -> bool {
-    let mut unproven = UnprovenEquityTx::new(tokio::time::Instant::now());
+    let mut unproven = UnprovenCapitalTx::new(tokio::time::Instant::now());
     loop {
         let error = match tokenizer.confirm_redemption_send(transfer_tx).await {
             Ok(RedemptionSendReceipt::Succeeded) => {
@@ -2465,6 +2530,858 @@ async fn follow_alpaca_redemption(
         TokenizationRequestStatus::Pending => warn!(
             %chain, %symbol, %transfer_tx, request_id = %finished.id,
             "Alpaca's redemption of the transfer sent via API is still pending after its poll"
+        ),
+    }
+}
+
+/// The route name `capital alpaca-deposit` answers and logs under.
+const ALPACA_DEPOSIT_ROUTE: &str = "alpaca-deposit";
+
+/// How long `alpaca-deposit` waits for Alpaca's deposit address before it
+/// refuses with 502. The wallet client sets only a connect timeout, so this
+/// bounds the lookup, well under the operator client's 30 second request
+/// timeout.
+#[cfg(not(test))]
+const DEPOSIT_ADDRESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[cfg(test)]
+const DEPOSIT_ADDRESS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Sends `amount` USDC from the bot's Ethereum wallet to the deposit address
+/// Alpaca gives for the bot's own account, which Alpaca credits to the
+/// account. Mirrors `st0x-cli alpaca-deposit`, signed by the bot's own
+/// wallet; the bot's deposit leg sends the same transfer.
+///
+/// The request names no chain and no destination: the send is always the
+/// corridor's Ethereum USDC, the token the deposit leg sends, to the address
+/// [`alpaca_usdc_deposit_address`] returns, the lookup the deposit leg makes.
+/// A destination chosen by the caller would let anyone in the capital group
+/// send the bot's USDC out of our accounts.
+///
+/// The request carries the client's operation id, and each id holds at most
+/// one transfer (`AlpacaDepositOperation`, the design of ADR 0023). The route
+/// signs the transfer, records the signed bytes under the id, then broadcasts
+/// them, so a rerun with the same id, even after a dropped request or a
+/// restart, reports the recorded transfer or sends the same bytes again, and
+/// never signs a second one. A known id whose transfer is settled, or pending
+/// and already held by a node, is answered at once, since it sends nothing; a
+/// pending transfer no node holds is sent again under the lock and the pause,
+/// like a new one.
+///
+/// Input validation and the startup gate come first, as on every capital
+/// route, then Alpaca's deposit address (502), asked before anything is held
+/// and bounded by [`DEPOSIT_ADDRESS_TIMEOUT`], so a hung Alpaca blocks no USDC
+/// transfer and no verb that takes the resume lock. Everything after runs
+/// detached, in order: the resume lock (409), the USDC driver pause (503), no
+/// USDC transfer in flight or holding a corridor guard on any corridor (409,
+/// [`RebalancingService::ensure_no_usdc_transfer_in_flight`]), since every
+/// transfer may need the Ethereum wallet's USDC, the Ethereum wallet's gas
+/// (503), the wallet's USDC balance (409), then the signed transfer, its
+/// record and its broadcast. The lock and the pause are held like
+/// `cctp-bridge` holds them, from before the balance read until the
+/// transfer's fate is proven, so no transfer spends the balance in between
+/// and the bot's own deposit sends never race this one for a nonce.
+///
+/// The route answers at the broadcast. A broadcast that fails answers 502
+/// while the chain does not prove the transfer's fate, but keeps the lock and
+/// the pause and follows the recorded hash all the same: a node may have
+/// accepted the bytes before the answer was lost. The detached task then
+/// confirms the transfer ([`confirm_recorded_deposit`]): it sends the same
+/// bytes again while the fate is unknown, records `confirmed` or `reverted`
+/// from the transfer's own receipt, or `superseded` once the wallet's
+/// confirmed nonce passed the transfer's with no receipt for it, and alerts
+/// once while it stays unproven ([`UnprovenCapitalTx`]). Only then are the
+/// lock and the pause freed, and a transfer that moved the USDC is followed
+/// with `poll_deposit_by_tx_hash` until Alpaca reports its deposit final; the
+/// transfer id and the final status are logged, and a deposit Alpaca does not
+/// complete alerts. A restart restores a pending transfer and holds both
+/// again until it is proven ([`restore_capital_alpaca_deposits`]).
+pub(super) async fn alpaca_deposit(
+    State(state): State<AppState>,
+    Audited(request): Audited<AlpacaDepositRequest>,
+) -> Result<Json<AlpacaDepositResponse>, OpsError> {
+    let chain = Chain::Ethereum;
+    let (amount, amount_raw) = positive_usdc(&request.amount)?;
+    require_startup_complete(&state, ALPACA_DEPOSIT_ROUTE)?;
+    let handle = state.recovery.get().ok_or_else(recovery_not_ready)?;
+    let wallet = Arc::clone(bot_wallets(&state)?.ethereum_wallet());
+    let usdc = state.ctx.rebalancing.cctp_corridor.usdc_ethereum();
+    let required_confirmations =
+        deposit_send_required_confirmations(&state.ctx.chains).map_err(|error| {
+            error!(%error, "Alpaca deposit refused: Ethereum has no confirmation depth");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: error.to_string(),
+                }),
+            )
+        })?;
+    let store = Arc::clone(&handle.alpaca_deposit_store);
+    let request = DepositRequest {
+        operation_id: request.operation_id,
+        amount: amount.inner().to_string(),
+        amount_raw,
+        required_confirmations,
+    };
+
+    // A settled deposit, or a pending one a node already holds, sends nothing
+    // new, so it is answered at once, without Alpaca, the lock and the pause.
+    // A pending one no node holds must be sent again, which spends the
+    // wallet's USDC, so it takes the locked path below.
+    if let Some(recorded) = load_deposit_operation(&store, &request.operation_id).await? {
+        ensure_same_deposit(&request, &recorded)?;
+        if recorded.outcome != AlpacaDepositOutcome::Pending
+            || deposit_known_to_node(&wallet, &recorded.transfer).await
+        {
+            return Ok(Json(
+                report_recorded_deposit(&store, &wallet, &request, &recorded).await,
+            ));
+        }
+    }
+
+    let alpaca_wallet = Arc::new(alpaca_wallet_service(&state.ctx)?);
+    let _early = Arc::clone(&state.resume_lock.0).try_lock_owned();
+    let deposit_address = lookup_deposit_address(&alpaca_wallet, &request).await?;
+    // Checked under the lock and the pause, with the balance read.
+    let gas = signer_gas_readiness(&state, chain, &wallet);
+    let rebalancing = Arc::clone(&handle.rebalancing_service);
+    let resume_lock = Arc::clone(&state.resume_lock.0);
+    let driver_pause = Arc::clone(&handle.usdc_driver_pause);
+    let pool = state.pool.clone();
+
+    answer_from_detached(
+        &state.detached_tasks,
+        ALPACA_DEPOSIT_ROUTE,
+        request.operation_id,
+        async move {
+            // The lock and the pause stay held until the transfer's fate is
+            // proven; the confirmation future owns them.
+            let held = (
+                resume_lock.try_lock_owned().map_err(|_| {
+                    conflict("A resume or recheck operation is already in progress".to_string())
+                })?,
+                quiesce_usdc_driver(&driver_pause, UsdcDriverPauseRequest::AlpacaDeposit).await?,
+            );
+
+            // A request with the same id may have recorded its transfer since
+            // the lookup above; the lock serializes deposits, so this read is
+            // final.
+            if let Some(recorded) = load_deposit_operation(&store, &request.operation_id).await? {
+                return answer_recorded_deposit_under_lock(
+                    store,
+                    wallet,
+                    alpaca_wallet,
+                    request,
+                    &recorded,
+                    held,
+                )
+                .await;
+            }
+
+            rebalancing
+                .ensure_no_usdc_transfer_in_flight(&pool)
+                .await
+                .map_err(|error| {
+                    warn!(?error, amount = %request.amount, "Alpaca deposit refused: a USDC transfer may need the Ethereum wallet's USDC");
+                    let (status, message) = usdc_resume_error_response(&error);
+                    (status, Json(ErrorResponse { error: message }))
+                })?;
+            ensure_signer_gas(&*gas?, ALPACA_DEPOSIT_ROUTE, chain).await?;
+
+            let sender = wallet.address();
+            let balance = wallet
+                .call::<OpenChainErrorRegistry, _>(usdc, IERC20::balanceOfCall { account: sender })
+                .await
+                .map_err(|error| onchain_failure(ALPACA_DEPOSIT_ROUTE, chain, &error))?;
+            if balance < amount_raw {
+                warn!(%sender, %balance, %amount_raw, "Alpaca deposit refused: insufficient USDC balance");
+                return Err(conflict(format!(
+                    "Insufficient USDC balance in the bot's Ethereum wallet {sender}: it holds \
+                     {balance} and the deposit needs {amount_raw} (USDC base units, 6 decimals); \
+                     nothing was sent"
+                )));
+            }
+
+            // Signing broadcasts nothing; it reserves the transfer's nonce.
+            let prepared = wallet
+                .prepare_pending(
+                    usdc,
+                    Bytes::from(
+                        IERC20::transferCall {
+                            to: deposit_address,
+                            amount: amount_raw,
+                        }
+                        .abi_encode(),
+                    ),
+                    DEPOSIT_TRANSFER_NOTE,
+                )
+                .await
+                .map_err(|error| onchain_failure(ALPACA_DEPOSIT_ROUTE, chain, &error))?;
+            let transfer = DepositTransfer {
+                amount: amount_raw,
+                deposit_address,
+                prepared,
+            };
+            let persisted = store
+                .send(
+                    &request.operation_id,
+                    AlpacaDepositOperationCommand::Prepare {
+                        transfer: transfer.clone(),
+                    },
+                )
+                .await;
+            if let Err(error) = persisted {
+                error!(operation_id = %request.operation_id, transfer_tx = %transfer.transfer_tx(), ?error, "Failed to record the signed Alpaca deposit transfer; not broadcasting it");
+                let recorded =
+                    release_unpersisted_deposit(&wallet, &store, &request, &transfer).await?;
+                if recorded.transfer.transfer_tx() != transfer.transfer_tx() {
+                    return answer_recorded_deposit_under_lock(
+                        store,
+                        wallet,
+                        alpaca_wallet,
+                        request,
+                        &recorded,
+                        held,
+                    )
+                    .await;
+                }
+            }
+
+            broadcast_deposit_and_answer(store, wallet, alpaca_wallet, request, transfer, held)
+                .await
+        },
+    )
+    .await?
+    .map(Json)
+}
+
+/// What one `alpaca-deposit` request asked for, as the record, report and
+/// confirm paths need it.
+#[derive(Clone)]
+struct DepositRequest {
+    operation_id: AlpacaDepositOperationId,
+    /// The amount as a decimal USDC string, as the answer reports it.
+    amount: String,
+    /// The amount in USDC base units (6 decimals).
+    amount_raw: U256,
+    required_confirmations: u64,
+}
+
+/// What `alpaca-deposit` answers once its transfer is signed: the answer
+/// itself, a 502 for a failed broadcast whose transfer is still followed,
+/// and the future that follows the transfer until its fate is proven.
+type DepositAnswer = (
+    Result<AlpacaDepositResponse, OpsError>,
+    BoxFuture<'static, ()>,
+);
+
+async fn load_deposit_operation(
+    store: &Store<AlpacaDepositOperation>,
+    id: &AlpacaDepositOperationId,
+) -> Result<Option<AlpacaDepositOperation>, OpsError> {
+    store.load(id).await.map_err(|error| {
+        error!(operation_id = %id, ?error, "Could not load the Alpaca deposit operation");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!(
+                    "Could not read operation {id}; nothing was sent by this request, retry \
+                     with the same operation id"
+                ),
+            }),
+        )
+    })
+}
+
+/// Refuses a request whose amount differs from the transfer its operation id
+/// holds: the id names one deposit.
+fn ensure_same_deposit(
+    request: &DepositRequest,
+    recorded: &AlpacaDepositOperation,
+) -> Result<(), OpsError> {
+    if recorded.transfer.amount == request.amount_raw {
+        return Ok(());
+    }
+    let operation_id = request.operation_id;
+    let transfer_tx = recorded.transfer.transfer_tx();
+    warn!(
+        %operation_id, %transfer_tx, recorded_amount_raw = %recorded.transfer.amount,
+        amount_raw = %request.amount_raw,
+        "Alpaca deposit refused: the operation id already holds a different deposit"
+    );
+    Err(conflict(format!(
+        "Operation id {operation_id} already holds deposit {transfer_tx} of {} USDC base units; \
+         use a new operation id for a different deposit",
+        recorded.transfer.amount
+    )))
+}
+
+/// Answers with the transfer an operation id holds, sending nothing: a
+/// settled one reports its outcome, and a pending one reports what the chain
+/// now proves.
+async fn report_recorded_deposit(
+    store: &Store<AlpacaDepositOperation>,
+    wallet: &DepositWallet,
+    request: &DepositRequest,
+    recorded: &AlpacaDepositOperation,
+) -> AlpacaDepositResponse {
+    let status = deposit_status(
+        store,
+        wallet,
+        &request.operation_id,
+        recorded,
+        request.required_confirmations,
+    )
+    .await;
+    info!(operation_id = %request.operation_id, transfer_tx = %recorded.transfer.transfer_tx(), ?status, "Alpaca deposit reported via API: the operation id already holds this transfer");
+    AlpacaDepositResponse::of(request, &recorded.transfer, status)
+}
+
+/// Whether a node already holds the pending transfer, mined or in its
+/// mempool, so a rerun has nothing to send. A failed read counts as unknown:
+/// the rerun then sends the same bytes under the lock and the pause.
+async fn deposit_known_to_node(wallet: &DepositWallet, transfer: &DepositTransfer) -> bool {
+    matches!(
+        wallet
+            .provider()
+            .get_transaction_by_hash(transfer.transfer_tx())
+            .await,
+        Ok(Some(_))
+    )
+}
+
+/// Asks Alpaca for the account's USDC deposit address on Ethereum, bounded
+/// by [`DEPOSIT_ADDRESS_TIMEOUT`]. Asked before the resume lock and the USDC
+/// driver pause are taken, so a slow or hung Alpaca answers 502 without ever
+/// holding either.
+async fn lookup_deposit_address(
+    alpaca_wallet: &AlpacaWalletService,
+    request: &DepositRequest,
+) -> Result<Address, OpsError> {
+    let refused = |reason: String| {
+        warn!(operation_id = %request.operation_id, amount = %request.amount, %reason, "Alpaca deposit refused: Alpaca gave no USDC deposit address");
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse {
+                error: format!(
+                    "Alpaca did not give the account's USDC deposit address on Ethereum: \
+                     {reason}; nothing was sent"
+                ),
+            }),
+        )
+    };
+    match tokio::time::timeout(
+        DEPOSIT_ADDRESS_TIMEOUT,
+        alpaca_usdc_deposit_address(alpaca_wallet),
+    )
+    .await
+    {
+        Ok(Ok(address)) => Ok(address),
+        Ok(Err(error)) => Err(refused(error.to_string())),
+        Err(_elapsed) => Err(refused(format!(
+            "no answer within {} seconds",
+            DEPOSIT_ADDRESS_TIMEOUT.as_secs_f64()
+        ))),
+    }
+}
+
+/// Answers, under the resume lock and the driver pause, a request whose
+/// operation id already holds a transfer: a settled one is reported, and a
+/// pending one is sent again from its recorded bytes, like a new deposit,
+/// since sending spends the wallet's USDC.
+async fn answer_recorded_deposit_under_lock<Held: Send + 'static>(
+    store: Arc<Store<AlpacaDepositOperation>>,
+    wallet: DepositWallet,
+    alpaca_wallet: Arc<AlpacaWalletService>,
+    request: DepositRequest,
+    recorded: &AlpacaDepositOperation,
+    held: Held,
+) -> Result<DepositAnswer, OpsError> {
+    ensure_same_deposit(&request, recorded)?;
+    if recorded.outcome != AlpacaDepositOutcome::Pending {
+        let response = report_recorded_deposit(&store, &wallet, &request, recorded).await;
+        return Ok((Ok(response), std::future::ready(()).boxed()));
+    }
+    broadcast_deposit_and_answer(
+        store,
+        wallet,
+        alpaca_wallet,
+        request,
+        recorded.transfer.clone(),
+        held,
+    )
+    .await
+}
+
+/// Broadcasts a recorded transfer's signed bytes while the caller holds the
+/// resume lock and the driver pause in `held`, and answers with the transfer
+/// as pending; the returned future confirms it and holds `held` until its
+/// fate is proven. A failed broadcast proves nothing: the node may have
+/// accepted the bytes before its answer was lost. So the transfer is
+/// followed and `held` kept all the same, and the request answers what the
+/// chain already proves, or `502` while it proves nothing. A transfer signed
+/// by another address than the wallet (a rotated key) is never broadcast
+/// through this wallet, whose nonce bookkeeping is per address; it spends
+/// another wallet's USDC, so nothing is held for it.
+async fn broadcast_deposit_and_answer<Held: Send + 'static>(
+    store: Arc<Store<AlpacaDepositOperation>>,
+    wallet: DepositWallet,
+    alpaca_wallet: Arc<AlpacaWalletService>,
+    request: DepositRequest,
+    transfer: DepositTransfer,
+    held: Held,
+) -> Result<DepositAnswer, OpsError> {
+    let operation_id = request.operation_id;
+    let transfer_tx = transfer.transfer_tx();
+    if !transfer.prepared.signed_by(wallet.address()) {
+        warn!(%operation_id, %transfer_tx, signer = ?transfer.prepared.signer(), wallet = %wallet.address(), "Alpaca deposit not sent: the recorded transfer was signed by another wallet");
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse {
+                error: format!(
+                    "Deposit {transfer_tx} is recorded under operation id {operation_id}, but it \
+                     was signed by {:?}, not this bot's wallet {} (was the key rotated?), so \
+                     this bot never broadcasts it; check it onchain",
+                    transfer.prepared.signer(),
+                    wallet.address()
+                ),
+            }),
+        ));
+    }
+
+    let answer = match wallet
+        .broadcast_prepared(&transfer.prepared, DEPOSIT_TRANSFER_NOTE)
+        .await
+    {
+        Ok(_) => {
+            info!(
+                %operation_id, sender = %wallet.address(), deposit_address = %transfer.deposit_address,
+                amount = %request.amount, amount_raw = %transfer.amount, %transfer_tx,
+                "Alpaca deposit transfer broadcast via API"
+            );
+            Ok(AlpacaDepositResponse::of(
+                &request,
+                &transfer,
+                AlpacaDepositStatus::Pending,
+            ))
+        }
+        Err(error) => {
+            // The error's text can carry the RPC URL, whose path or query
+            // holds the provider key, so it is logged scrubbed and never put
+            // in the answer.
+            error!(
+                %operation_id, %transfer_tx, error = %scrubbed(&error),
+                "Broadcasting the recorded Alpaca deposit transfer failed; following it until \
+                 its fate is proven"
+            );
+            let status = settle_pending_deposit(
+                &store,
+                &wallet,
+                &operation_id,
+                &transfer,
+                request.required_confirmations,
+            )
+            .await;
+            if status != AlpacaDepositStatus::Pending {
+                let response = AlpacaDepositResponse::of(&request, &transfer, status);
+                let after = after_proven_deposit(alpaca_wallet, transfer, status);
+                return Ok((Ok(response), after.boxed()));
+            }
+            Err((
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse {
+                    error: format!(
+                        "Deposit {transfer_tx} is recorded under operation id {operation_id}, \
+                         but its broadcast failed (see the bot logs). A node may still hold \
+                         it, so the bot keeps the resume lock and the USDC driver pause, sends \
+                         the same bytes again until its fate is proven, then frees both; rerun \
+                         with the same operation id to see its status"
+                    ),
+                }),
+            ))
+        }
+    };
+
+    let follow = async move {
+        let status = hold_until_deposits_proven(
+            held,
+            &[transfer_tx],
+            confirm_recorded_deposit(
+                &store,
+                &wallet,
+                &operation_id,
+                &transfer,
+                request.required_confirmations,
+            ),
+        )
+        .await;
+        after_proven_deposit(alpaca_wallet, transfer, status).await;
+    };
+    Ok((answer, follow.boxed()))
+}
+
+/// What follows a deposit whose fate is proven: one that moved the USDC is
+/// followed on Alpaca until its deposit is final.
+async fn after_proven_deposit(
+    alpaca_wallet: Arc<AlpacaWalletService>,
+    transfer: DepositTransfer,
+    status: AlpacaDepositStatus,
+) {
+    if status == AlpacaDepositStatus::Confirmed {
+        follow_alpaca_deposit(
+            &alpaca_wallet,
+            transfer.deposit_address,
+            transfer.transfer_tx(),
+        )
+        .await;
+    }
+}
+
+/// Runs `wait`, which returns once the fate of every transfer in
+/// `transfer_txs` is proven, and frees `held` (the resume lock and the USDC
+/// driver pause) after it. A panic would unwind through `held` and free both
+/// while a fate is unknown, so it is caught here, `held` is kept until a
+/// restart (which restores the transfers and holds both again), and the
+/// panic resumes for its task's join failure log.
+async fn hold_until_deposits_proven<Held, Proven>(
+    held: Held,
+    transfer_txs: &[TxHash],
+    wait: impl Future<Output = Proven>,
+) -> Proven {
+    match std::panic::AssertUnwindSafe(wait).catch_unwind().await {
+        Ok(proven) => {
+            drop(held);
+            proven
+        }
+        Err(panic) => {
+            error!(
+                ?transfer_txs,
+                "Alpaca deposit confirmation panicked; keeping the resume lock and the USDC \
+                 driver pause until a restart, which restores the transfer and follows it again"
+            );
+            std::mem::forget(held);
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+/// After a failed `Prepare` write, reloads the operation. These bytes
+/// recorded (the write committed): returns them, and the route broadcasts.
+/// Another transfer recorded under the id: releases this signature's nonce
+/// and returns the recorded transfer to adopt. Nothing recorded: releases the
+/// nonce, since nothing will broadcast it. A failed reload cannot tell, so
+/// the nonce stays reserved until a restart: a rerun before then could sign
+/// behind it. Mirrors `release_unpersisted_burn`.
+async fn release_unpersisted_deposit(
+    wallet: &DepositWallet,
+    store: &Store<AlpacaDepositOperation>,
+    request: &DepositRequest,
+    transfer: &DepositTransfer,
+) -> Result<AlpacaDepositOperation, OpsError> {
+    let operation_id = request.operation_id;
+    let transfer_tx = transfer.transfer_tx();
+    let nonce = transfer.prepared.nonce();
+    match store.load(&operation_id).await {
+        Ok(Some(recorded)) if recorded.transfer.transfer_tx() == transfer_tx => {
+            warn!(%operation_id, %transfer_tx, "The failed Alpaca deposit write committed; broadcasting it");
+            Ok(recorded)
+        }
+        Ok(Some(recorded)) => {
+            warn!(%operation_id, %transfer_tx, nonce, recorded = %recorded.transfer.transfer_tx(), "Releasing the nonce of a signed Alpaca deposit transfer: the operation id already holds another transfer");
+            wallet.discard_prepared(transfer_tx).await;
+            Ok(recorded)
+        }
+        Ok(None) => {
+            warn!(%operation_id, %transfer_tx, nonce, "Releasing the nonce of a signed Alpaca deposit transfer that was not recorded");
+            wallet.discard_prepared(transfer_tx).await;
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!(
+                        "Could not record the signed deposit under operation id \
+                         {operation_id}; nothing was broadcast, so a rerun with the same \
+                         operation id deposits once"
+                    ),
+                }),
+            ))
+        }
+        Err(error) => {
+            error!(target: "operational_alert", alert = true, kind = AlertKind::CapitalAlpacaDepositRecordUnknown.as_str(), %operation_id, %transfer_tx, nonce, ?error, "Cannot tell whether a signed capital Alpaca deposit was recorded; its nonce stays reserved and every later send from the Ethereum wallet waits behind it until a restart");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!(
+                        "Could not tell whether deposit {transfer_tx} was recorded under \
+                         operation id {operation_id}; nothing was broadcast, and its nonce \
+                         stays reserved until the bot restarts. Rerun with the same operation \
+                         id only after a restart: it then broadcasts the deposit if it was \
+                         recorded, or deposits once if not"
+                    ),
+                }),
+            ))
+        }
+    }
+}
+
+/// The Alpaca wallet client a deposit looks its address up and polls
+/// through, built from the bot's broker ctx as the conductor builds its own.
+/// It keeps the default backpressure policy: a throttled deposit poll is
+/// waited out inside the poll on the detached task, where the transfer job's
+/// client hands it back to reschedule its worker.
+fn alpaca_wallet_service(ctx: &Ctx) -> Result<AlpacaWalletService, OpsError> {
+    let BrokerCtx::AlpacaBrokerApi(alpaca) = &ctx.broker;
+    AlpacaWalletService::new(
+        alpaca.base_url().to_string(),
+        alpaca.account_id,
+        alpaca.auth.clone(),
+    )
+    .map_err(|error| {
+        error!(
+            ?error,
+            "Capital route refused: the Alpaca wallet client failed to build"
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "The bot could not build its Alpaca wallet client".to_string(),
+            }),
+        )
+    })
+}
+
+/// Follows a recorded deposit transfer until the chain proves its fate, and
+/// returns it, never `Pending`. The wallet's receipt wait only paces the
+/// loop: it keeps the first receipt it saw while it counts blocks, so the
+/// outcome is recorded from a fresh read ([`settle_pending_deposit`]): the
+/// transfer's own receipt at the required confirmations, or its signer's
+/// confirmed nonce past the transfer's with no receipt for it, which settles
+/// it `superseded` and releases its nonce. While nothing is proven the
+/// transfer may still land, and freeing the lock and the pause would let a
+/// USDC transfer spend the balance it may still take, so the loop sends the
+/// same bytes again (a node may have dropped them from its mempool) and waits
+/// again. A fate that stays unknown alerts once ([`UnprovenCapitalTx`]).
+async fn confirm_recorded_deposit(
+    store: &Store<AlpacaDepositOperation>,
+    wallet: &DepositWallet,
+    operation_id: &AlpacaDepositOperationId,
+    transfer: &DepositTransfer,
+    required_confirmations: u64,
+) -> AlpacaDepositStatus {
+    let transfer_tx = transfer.transfer_tx();
+    let deposit_address = transfer.deposit_address;
+    let amount_raw = transfer.amount;
+    let mut unproven = UnprovenCapitalTx::new(tokio::time::Instant::now());
+    loop {
+        let waited = wallet
+            .confirm::<OpenChainErrorRegistry>(transfer_tx)
+            .await
+            .err()
+            .map(|error| scrubbed(&error));
+        match settle_pending_deposit(
+            store,
+            wallet,
+            operation_id,
+            transfer,
+            required_confirmations,
+        )
+        .await
+        {
+            AlpacaDepositStatus::Pending => {}
+            AlpacaDepositStatus::Confirmed => {
+                info!(%operation_id, %deposit_address, %amount_raw, %transfer_tx, ?waited, "Alpaca deposit transfer confirmed via API");
+                return AlpacaDepositStatus::Confirmed;
+            }
+            AlpacaDepositStatus::Reverted => {
+                error!(%operation_id, %deposit_address, %amount_raw, %transfer_tx, ?waited, "Alpaca deposit transfer sent via API reverted; no USDC moved, and a new operation id deposits again");
+                return AlpacaDepositStatus::Reverted;
+            }
+            AlpacaDepositStatus::Superseded => {
+                warn!(%operation_id, %deposit_address, %amount_raw, %transfer_tx, "Alpaca deposit transfer sent via API can never mine: another tx took its nonce; freeing the resume lock and the USDC driver pause");
+                return AlpacaDepositStatus::Superseded;
+            }
+        }
+        warn!(
+            %operation_id, %deposit_address, %amount_raw, %transfer_tx, ?waited,
+            "Alpaca deposit transfer sent via API is not confirmed yet; keeping the resume lock \
+             and the USDC driver pause, sending the same bytes again and waiting again"
+        );
+        unproven.observe_alpaca_deposit(tokio::time::Instant::now(), deposit_address, transfer_tx);
+        if let Err(error) = wallet
+            .broadcast_prepared(&transfer.prepared, DEPOSIT_TRANSFER_NOTE)
+            .await
+        {
+            warn!(%operation_id, %transfer_tx, error = %scrubbed(&error), "Sending the Alpaca deposit transfer's bytes again failed; retrying on the next round");
+        }
+        tokio::time::sleep(CONFIRM_RETRY_DELAY).await;
+    }
+}
+
+/// What the startup restore of capital Alpaca deposits leaves to the
+/// conductor.
+pub(crate) struct RestoredCapitalAlpacaDeposits {
+    /// Startup skips the Ethereum approvals and revokes: a restored transfer
+    /// is not mined, or the pending ones could not all be read.
+    pub(crate) gates_ethereum: bool,
+    /// The task that holds the resume lock and the USDC driver pause until
+    /// every restored transfer is proven, for the conductor to spawn.
+    pub(crate) follow: Option<BoxFuture<'static, ()>>,
+}
+
+/// At startup, restores every pending `alpaca-deposit` transfer
+/// ([`restore_pending_alpaca_deposits`]: its nonce reserved again and its
+/// bytes rebroadcast) and, while any is unproven, holds again what the live
+/// route held for it: the resume lock and the USDC driver pause, taken in the
+/// route's order before any USDC worker runs. So no USDC transfer sizes
+/// against USDC the transfer may still take, and no verb that takes the lock
+/// sends from the wallet meanwhile, exactly as before the restart. The
+/// returned task confirms each transfer like the route does
+/// ([`confirm_recorded_deposit`]), frees both once all are proven, then
+/// follows on Alpaca each that moved the USDC. Pending transfers that could
+/// not be listed or loaded may still take USDC, so then both stay held until
+/// a restart.
+pub(crate) async fn restore_capital_alpaca_deposits(
+    ctx: &Ctx,
+    pool: &SqlitePool,
+    store: &Arc<Store<AlpacaDepositOperation>>,
+    resume_lock: &ResumeLock,
+    driver_pause: &UsdcDriverPause,
+) -> RestoredCapitalAlpacaDeposits {
+    let wallet = match ctx.wallet() {
+        Ok(wallets) => Arc::clone(wallets.ethereum_wallet()),
+        Err(error) => {
+            warn!(%error, "No signing wallet, so no capital Alpaca deposit can be pending; skipping their restore");
+            return RestoredCapitalAlpacaDeposits {
+                gates_ethereum: false,
+                follow: None,
+            };
+        }
+    };
+    let required_confirmations = deposit_send_required_confirmations(&ctx.chains).ok();
+    let RestoredAlpacaDeposits {
+        restored,
+        settled,
+        pending,
+        unreadable,
+        unmined,
+    } = restore_pending_alpaca_deposits(pool, store, &wallet, required_confirmations).await;
+    info!(
+        restored,
+        settled,
+        pending = pending.len(),
+        unreadable,
+        "Reserved the nonces of the pending capital Alpaca deposits at startup"
+    );
+    let gates_ethereum = unmined || unreadable;
+    if pending.is_empty() && !unreadable {
+        return RestoredCapitalAlpacaDeposits {
+            gates_ethereum,
+            follow: None,
+        };
+    }
+
+    let lock = Arc::clone(&resume_lock.0).lock_owned().await;
+    let pause = driver_pause.pause().await.inspect_err(|error| {
+        error!(%error, "The USDC driver did not quiesce for a restored capital Alpaca deposit; USDC transfers may run before its fate is proven");
+    });
+    let held = (lock, pause);
+    let required_confirmations = match required_confirmations {
+        Some(required) if !unreadable => required,
+        _ => {
+            error!(
+                unreadable,
+                "Pending capital Alpaca deposits cannot all be read, or proven without Ethereum's \
+                 required_confirmations; keeping the resume lock and the USDC driver pause until \
+                 a restart"
+            );
+            std::mem::forget(held);
+            return RestoredCapitalAlpacaDeposits {
+                gates_ethereum: true,
+                follow: None,
+            };
+        }
+    };
+    let alpaca_wallet = alpaca_wallet_service(ctx).ok().map(Arc::new);
+    let store = Arc::clone(store);
+    let follow = async move {
+        let transfer_txs: Vec<TxHash> = pending
+            .iter()
+            .map(|(_, transfer)| transfer.transfer_tx())
+            .collect();
+        let wait = async {
+            let mut proven = Vec::with_capacity(pending.len());
+            for (operation_id, transfer) in pending {
+                let status = confirm_recorded_deposit(
+                    &store,
+                    &wallet,
+                    &operation_id,
+                    &transfer,
+                    required_confirmations,
+                )
+                .await;
+                proven.push((status, transfer));
+            }
+            proven
+        };
+        let proven = hold_until_deposits_proven(held, &transfer_txs, wait).await;
+        let Some(alpaca_wallet) = alpaca_wallet else {
+            return;
+        };
+        for (status, transfer) in proven {
+            after_proven_deposit(Arc::clone(&alpaca_wallet), transfer, status).await;
+        }
+    };
+    RestoredCapitalAlpacaDeposits {
+        gates_ethereum,
+        follow: Some(follow.boxed()),
+    }
+}
+
+/// Polls Alpaca with `poll_deposit_by_tx_hash` until it reports the
+/// confirmed transfer's deposit final, and logs the transfer id and the
+/// final status, as `st0x-cli alpaca-deposit` printed them. A deposit Alpaca
+/// does not report, fails, or leaves in another status alerts: the USDC left
+/// the wallet, and the account may not hold it.
+async fn follow_alpaca_deposit(
+    alpaca_wallet: &AlpacaWalletService,
+    deposit_address: Address,
+    transfer_tx: TxHash,
+) {
+    let transfer = match alpaca_wallet.poll_deposit_by_tx_hash(&transfer_tx).await {
+        Ok(transfer) => transfer,
+        Err(error) => {
+            error!(
+                target: "operational_alert",
+                alert = true,
+                kind = AlertKind::CapitalAlpacaDepositNotCredited.as_str(),
+                %deposit_address, %transfer_tx, ?error,
+                "Alpaca did not credit an operator deposit transfer: it did not report the \
+                 transfer sent via API as a final deposit; check the account's transfers before \
+                 sending again"
+            );
+            return;
+        }
+    };
+
+    match transfer.status {
+        TransferStatus::Complete => info!(
+            %deposit_address, %transfer_tx, transfer_id = %transfer.id, amount = %transfer.amount,
+            "Alpaca completed the deposit sent via API"
+        ),
+        TransferStatus::Failed => error!(
+            target: "operational_alert",
+            alert = true,
+            kind = AlertKind::CapitalAlpacaDepositNotCredited.as_str(),
+            %deposit_address, %transfer_tx, transfer_id = %transfer.id,
+            "Alpaca did not credit an operator deposit transfer: Alpaca reports the deposit sent \
+             via API as failed; check the transfer with Alpaca"
+        ),
+        status @ (TransferStatus::Pending | TransferStatus::Processing) => error!(
+            target: "operational_alert",
+            alert = true,
+            kind = AlertKind::CapitalAlpacaDepositNotCredited.as_str(),
+            %deposit_address, %transfer_tx, transfer_id = %transfer.id, ?status,
+            "Alpaca did not credit an operator deposit transfer: the deposit sent via API ended \
+             its poll in an unexpected status; check the transfer with Alpaca"
         ),
     }
 }
@@ -2758,9 +3675,11 @@ fn claim_equity_wallet(
 /// as the conductor builds the check a manual equity transfer passes, and as
 /// `st0x-cli transfer-equity` built it. Built here rather than read from the
 /// trigger, which wires one only for the chains that rebalance equity, so a
-/// paused chain being drained has none. A missing threshold is a gap in the
+/// paused chain being drained has none, and only for the corridors that
+/// rebalance USDC, whose check also covers the corridor chain's wallet,
+/// which `alpaca-deposit` does not use. A missing threshold is a gap in the
 /// bot's config, so it is a 500.
-fn equity_gas_readiness(
+fn signer_gas_readiness(
     state: &AppState,
     chain: Chain,
     wallet: &Arc<dyn Wallet<Provider = RootProvider>>,
@@ -2795,7 +3714,7 @@ fn equity_gas_readiness(
 
 /// Refuses with 503, as `transfer-equity` does, while the signer the check
 /// covers cannot pay gas or its balance cannot be read.
-async fn ensure_equity_gas(
+async fn ensure_signer_gas(
     readiness: &GasReadiness,
     route: &'static str,
     chain: Chain,
@@ -2804,7 +3723,7 @@ async fn ensure_equity_gas(
         .ensure_ready(TransferGasRoute::Equity)
         .await
         .map_err(|error| {
-            warn!(route, %chain, %error, "Equity wallet operation refused: the signer is not gas ready");
+            warn!(route, %chain, %error, "Capital route refused: the signer is not gas ready");
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse {
@@ -2886,23 +3805,26 @@ const CONFIRM_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(
 #[cfg(test)]
 const CONFIRM_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// How long an operator equity wallet tx (a wrap, an unwrap, a redeem, or a
-/// drain's vault withdrawal) may stay unproven before the bot
-/// alerts. Its claim holds the bot's equity transfer guard for the symbol,
-/// so meanwhile rebalancing of that symbol is blocked on every chain.
-const EQUITY_TX_UNPROVEN_ALERT_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// How long an operator tx that holds what blocks rebalancing (a wrap, an
+/// unwrap, a redeem, a drain's vault withdrawal, or an Alpaca deposit) may
+/// stay unproven before the bot alerts. An equity wallet tx holds the bot's
+/// equity transfer guard for the symbol, so meanwhile rebalancing of that
+/// symbol is blocked on every chain; an Alpaca deposit holds the resume lock
+/// and the USDC driver pause, so every USDC transfer waits.
+const CAPITAL_TX_UNPROVEN_ALERT_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60);
 
-/// Watches an operator equity wallet tx whose fate the confirmation loop
-/// cannot prove yet, and raises one operational alert once it has stayed
-/// unproven past [`EQUITY_TX_UNPROVEN_ALERT_AFTER`]. A tx that never gets a
-/// readable receipt (dropped from the mempool, lost by the node) would
-/// otherwise block the symbol's rebalancing silently until a restart.
-struct UnprovenEquityTx {
+/// Watches an operator tx whose fate the confirmation loop cannot prove yet,
+/// and raises one operational alert once it has stayed unproven past
+/// [`CAPITAL_TX_UNPROVEN_ALERT_AFTER`]. A tx that never gets a readable
+/// receipt (dropped from the mempool, lost by the node) would otherwise block
+/// rebalancing silently until a restart.
+struct UnprovenCapitalTx {
     since: tokio::time::Instant,
     alerted: bool,
 }
 
-impl UnprovenEquityTx {
+impl UnprovenCapitalTx {
     const fn new(since: tokio::time::Instant) -> Self {
         Self {
             since,
@@ -2910,8 +3832,21 @@ impl UnprovenEquityTx {
         }
     }
 
-    /// Records one more unproven round at `now`; alerts the first time the
-    /// wait passes the bound and returns whether it alerted.
+    /// Records one more unproven round at `now` and returns how long the tx
+    /// has waited the first time that passes the bound, when the caller
+    /// alerts; `None` before the bound and after the first alert.
+    fn due(&mut self, now: tokio::time::Instant) -> Option<std::time::Duration> {
+        let waited = now.saturating_duration_since(self.since);
+        if self.alerted || waited < CAPITAL_TX_UNPROVEN_ALERT_AFTER {
+            return None;
+        }
+        self.alerted = true;
+        Some(waited)
+    }
+
+    /// Records one more unproven round of an equity wallet tx at `now`;
+    /// alerts the first time the wait passes the bound and returns whether
+    /// it alerted.
     fn observe(
         &mut self,
         now: tokio::time::Instant,
@@ -2920,11 +3855,9 @@ impl UnprovenEquityTx {
         symbol: &Symbol,
         tx: TxHash,
     ) -> bool {
-        let waited = now.saturating_duration_since(self.since);
-        if self.alerted || waited < EQUITY_TX_UNPROVEN_ALERT_AFTER {
+        let Some(waited) = self.due(now) else {
             return false;
-        }
-        self.alerted = true;
+        };
         error!(
             target: "operational_alert",
             alert = true,
@@ -2935,6 +3868,29 @@ impl UnprovenEquityTx {
              onchain"
         );
         true
+    }
+
+    /// Records one more unproven round of an Alpaca deposit transfer at
+    /// `now`; alerts the first time the wait passes the bound.
+    fn observe_alpaca_deposit(
+        &mut self,
+        now: tokio::time::Instant,
+        deposit_address: Address,
+        tx: TxHash,
+    ) {
+        let Some(waited) = self.due(now) else {
+            return;
+        };
+        error!(
+            target: "operational_alert",
+            alert = true,
+            kind = AlertKind::CapitalAlpacaDepositUnproven.as_str(),
+            route = ALPACA_DEPOSIT_ROUTE, %deposit_address, %tx, waited_secs = waited.as_secs(),
+            "An operator Alpaca deposit transfer is still unproven; every USDC transfer waits \
+             until its fate is known, across restarts. Check the tx onchain: the bot keeps \
+             sending its same bytes, and frees the wait once it mines or another tx takes its \
+             nonce"
+        );
     }
 }
 
@@ -3192,7 +4148,7 @@ struct VaultTx {
 /// waits again while the fate is unknown: the tx can still land, and giving up
 /// would free a lock a rerun needs to stay held. When the wait holds `held`'s
 /// equity transfer guard, a fate that stays unknown alerts once
-/// ([`UnprovenEquityTx`]).
+/// ([`UnprovenCapitalTx`]).
 async fn confirm_vault_tx(
     raindex: &impl Raindex,
     vault_tx: VaultTx,
@@ -3207,7 +4163,7 @@ async fn confirm_vault_tx(
         tx,
         required_confirmations,
     } = vault_tx;
-    let mut unproven = UnprovenEquityTx::new(tokio::time::Instant::now());
+    let mut unproven = UnprovenCapitalTx::new(tokio::time::Instant::now());
     loop {
         let error = match raindex.confirm_tx(tx).await {
             Ok(()) => {
@@ -3304,24 +4260,24 @@ mod tests {
     #[test]
     fn an_unproven_equity_wallet_tx_alerts_once_past_the_bound() {
         let since = tokio::time::Instant::now();
-        let mut unproven = UnprovenEquityTx::new(since);
+        let mut unproven = UnprovenCapitalTx::new(since);
         let symbol = Symbol::new("AAPL").unwrap();
         let tx = TxHash::repeat_byte(0x42);
-        let observe = |unproven: &mut UnprovenEquityTx, after: std::time::Duration| {
+        let observe = |unproven: &mut UnprovenCapitalTx, after: std::time::Duration| {
             unproven.observe(since + after, "unwrap-equity", Chain::Base, &symbol, tx)
         };
 
         assert!(!observe(&mut unproven, CONFIRM_RETRY_DELAY));
         assert!(!observe(
             &mut unproven,
-            EQUITY_TX_UNPROVEN_ALERT_AFTER.saturating_sub(std::time::Duration::from_secs(1))
+            CAPITAL_TX_UNPROVEN_ALERT_AFTER.saturating_sub(std::time::Duration::from_secs(1))
         ));
         assert!(!logs_contain("still unproven"));
 
-        assert!(observe(&mut unproven, EQUITY_TX_UNPROVEN_ALERT_AFTER));
+        assert!(observe(&mut unproven, CAPITAL_TX_UNPROVEN_ALERT_AFTER));
         assert!(!observe(
             &mut unproven,
-            EQUITY_TX_UNPROVEN_ALERT_AFTER + CONFIRM_RETRY_DELAY
+            CAPITAL_TX_UNPROVEN_ALERT_AFTER + CONFIRM_RETRY_DELAY
         ));
         logs_assert(|lines: &[&str]| {
             let alerts: Vec<_> = lines

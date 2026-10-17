@@ -23,6 +23,7 @@ use st0x_config::DeploymentSymbolPolicy;
 use st0x_event_sorcery::{EventSourced, SchemaRegistry, load_all_ids, load_entity};
 use st0x_execution::Symbol;
 
+use crate::alpaca_deposit::AlpacaDepositOperation;
 use crate::bot_gas::BotGasReceiptCost;
 use crate::cctp_burn::CctpBurnOperation;
 use crate::equity_redemption::EquityRedemption;
@@ -434,6 +435,7 @@ async fn run_replay_checks_with_references(
     check!(UnwrappedEquityRecovery);
     check!(BotGasReceiptCost);
     check!(CctpBurnOperation);
+    check!(AlpacaDepositOperation);
     check!(SchemaRegistry);
 
     reports.extend(uncovered_aggregate_reports(persisted_types, &reports));
@@ -644,6 +646,10 @@ impl DurableSymbolReferences for BotGasReceiptCost {
 }
 
 impl DurableSymbolReferences for CctpBurnOperation {
+    fn add_durable_symbol_references(&self, _references: &mut SymbolReferences) {}
+}
+
+impl DurableSymbolReferences for AlpacaDepositOperation {
     fn add_durable_symbol_references(&self, _references: &mut SymbolReferences) {}
 }
 
@@ -1097,7 +1103,7 @@ mod tests {
 
         assert!(report.has_failures(), "{report}");
         assert_eq!(bytes_before, std::fs::read(&source_path).unwrap());
-        assert_eq!(report.replay_reports.len(), 15);
+        assert_eq!(report.replay_reports.len(), 16);
         assert_eq!(
             report
                 .replay_reports
@@ -1164,7 +1170,7 @@ mod tests {
 
         let reports = run_replay_checks(&pool).await;
 
-        assert_eq!(reports.len(), 14);
+        assert_eq!(reports.len(), 15);
         assert_eq!(
             reports
                 .iter()
@@ -1319,7 +1325,7 @@ mod tests {
 
         let reports = run_replay_checks(&pool).await;
 
-        assert_eq!(reports.len(), 14);
+        assert_eq!(reports.len(), 15);
         for report in &reports {
             assert_eq!(report.total, 0, "{}", report.aggregate_type);
             assert!(report.failures.is_empty(), "{}", report.aggregate_type);
@@ -1402,7 +1408,7 @@ mod tests {
         assert_eq!(bytes_before, bytes_after, "source database was mutated");
 
         assert!(!report.has_failures());
-        assert_eq!(report.replay_reports.len(), 14);
+        assert_eq!(report.replay_reports.len(), 15);
         assert_eq!(find_report(&report.replay_reports, "Position").total, 1);
     }
 

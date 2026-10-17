@@ -469,6 +469,18 @@ pub(crate) async fn pending_cctp_burn_ids(
 ) -> Result<(Vec<CctpBurnOperationId>, Vec<String>), sqlx::Error> {
     // Bound to the constants the aggregate writes, so a rename can never
     // silently empty the startup restore.
+    ids_whose_latest_event_is(pool, CctpBurnOperation::AGGREGATE_TYPE, PREPARED_EVENT_TYPE).await
+}
+
+/// The ids of the `aggregate_type` aggregates whose latest event is
+/// `event_type`, the shape of a capital operation that recorded its signed
+/// send and no outcome yet. Ids that do not parse as `Id` are returned apart,
+/// for the caller to page.
+pub(crate) async fn ids_whose_latest_event_is<Id: FromStr>(
+    pool: &SqlitePool,
+    aggregate_type: &str,
+    event_type: &str,
+) -> Result<(Vec<Id>, Vec<String>), sqlx::Error> {
     let rows: Vec<String> = sqlx::query_scalar(
         "WITH latest AS ( \
              SELECT aggregate_id, MAX(sequence) AS max_seq \
@@ -485,13 +497,13 @@ pub(crate) async fn pending_cctp_burn_ids(
            AND last_ev.event_type = ?2 \
          ORDER BY latest.aggregate_id",
     )
-    .bind(CctpBurnOperation::AGGREGATE_TYPE)
-    .bind(PREPARED_EVENT_TYPE)
+    .bind(aggregate_type)
+    .bind(event_type)
     .fetch_all(pool)
     .await?;
 
     Ok(rows.into_iter().partition_map(|raw| {
-        raw.parse::<CctpBurnOperationId>()
+        raw.parse::<Id>()
             .map_or_else(|_| Either::Right(raw), Either::Left)
     }))
 }

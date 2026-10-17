@@ -3089,14 +3089,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
         &self,
         id: &UsdcRebalanceId,
     ) -> Result<Address, UsdcTransferError> {
-        let usdc = TokenSymbol::new("USDC");
-        let ethereum = Network::new("ethereum");
-
-        match self
-            .alpaca_wallet
-            .get_wallet_address(&usdc, &ethereum)
-            .await
-        {
+        match alpaca_usdc_deposit_address(&self.alpaca_wallet).await {
             Ok(address) => Ok(address),
             Err(error) => {
                 warn!(target: "rebalance", %id, "Fetching Alpaca deposit address failed: {error}");
@@ -7559,6 +7552,16 @@ pub fn deposit_send_required_confirmations(
     chains
         .required_confirmations(Chain::Ethereum)
         .ok_or(EthereumChainMissing)
+}
+
+/// Alpaca's deposit address for USDC on Ethereum for the bot's own account:
+/// where the deposit leg sends, and where `capital alpaca-deposit` sends.
+pub(crate) async fn alpaca_usdc_deposit_address(
+    alpaca_wallet: &AlpacaWalletService,
+) -> Result<Address, AlpacaWalletError> {
+    alpaca_wallet
+        .get_wallet_address(&TokenSymbol::new("USDC"), &Network::new("ethereum"))
+        .await
 }
 
 /// Trait-erased entry point for the operator `transfer recheck` of a failed

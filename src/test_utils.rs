@@ -1152,6 +1152,10 @@ mod held_receipt {
     pub(crate) struct HeldReceiptWallet {
         inner: Arc<dyn Wallet<Provider = RootProvider>>,
         gate: watch::Receiver<ReceiptGate>,
+        /// Every broadcast of a prepared transaction reaches the node, then
+        /// fails as an RPC error: a node that accepted the raw tx and whose
+        /// answer was lost.
+        lose_broadcast_answers: bool,
     }
 
     impl HeldReceiptWallet {
@@ -1163,11 +1167,33 @@ mod held_receipt {
             Arc<dyn Wallet<Provider = RootProvider>>,
             watch::Sender<ReceiptGate>,
         ) {
+            Self::wrap_with(inner, false)
+        }
+
+        /// Like [`Self::wrap`], and every broadcast of a prepared transaction
+        /// reaches `inner`'s node and then answers with an RPC error.
+        pub(crate) fn wrap_losing_broadcast_answers(
+            inner: Arc<dyn Wallet<Provider = RootProvider>>,
+        ) -> (
+            Arc<dyn Wallet<Provider = RootProvider>>,
+            watch::Sender<ReceiptGate>,
+        ) {
+            Self::wrap_with(inner, true)
+        }
+
+        fn wrap_with(
+            inner: Arc<dyn Wallet<Provider = RootProvider>>,
+            lose_broadcast_answers: bool,
+        ) -> (
+            Arc<dyn Wallet<Provider = RootProvider>>,
+            watch::Sender<ReceiptGate>,
+        ) {
             let (gate, receiver) = watch::channel(ReceiptGate::Held);
             (
                 Arc::new(Self {
                     inner,
                     gate: receiver,
+                    lose_broadcast_answers,
                 }),
                 gate,
             )
@@ -1225,7 +1251,17 @@ mod held_receipt {
             prepared: &PreparedTransaction,
             note: &str,
         ) -> Result<TxHash, EvmError> {
-            self.inner.broadcast_prepared(prepared, note).await
+            let sent = self.inner.broadcast_prepared(prepared, note).await?;
+            if self.lose_broadcast_answers {
+                return Err(EvmError::Transport(alloy::transports::RpcError::ErrorResp(
+                    alloy::rpc::json_rpc::ErrorPayload {
+                        code: -32603,
+                        message: "the answer to an accepted raw tx was lost".into(),
+                        data: None,
+                    },
+                )));
+            }
+            Ok(sent)
         }
 
         async fn discard_prepared(&self, tx_hash: TxHash) {

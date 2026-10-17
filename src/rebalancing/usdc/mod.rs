@@ -25,7 +25,7 @@ pub(crate) use manager::RecoveredCctpMint;
 pub(crate) use manager::{
     CctpMintRecoveryError, RecheckUsdcDeposit, RecoverCctpMint, RecoveredMintAmounts,
     RestorePreparedDepositSends, RestoredDepositSends, UsdcBridgeHelper, UsdcRecheckError,
-    u256_to_usdc,
+    alpaca_usdc_deposit_address, u256_to_usdc,
 };
 pub use manager::{
     CrossVenueCashTransfer, DepositSendNotSuperseded, EthereumChainMissing,

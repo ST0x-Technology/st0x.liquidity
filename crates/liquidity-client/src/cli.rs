@@ -513,6 +513,26 @@ pub(crate) enum Capital {
         #[arg(long, value_enum, default_value_t = HedgedChain::Base)]
         network: HedgedChain,
     },
+    /// Send USDC from the bot's Ethereum wallet to the deposit address Alpaca
+    /// gives for the bot's own account, crediting it there. Returns the
+    /// transfer tx and its status as soon as it is broadcast; the bot
+    /// confirms it, polls Alpaca's detection afterwards and logs them. Every
+    /// run sends an operation id, printed to stderr before the request:
+    /// rerunning with `--operation-id <id>` after a failure or a timeout
+    /// reports that same transfer and its status instead of sending again.
+    /// Refused while a USDC transfer is in flight. The bot always sends on
+    /// Ethereum to the address Alpaca returns; no command can name a chain or
+    /// another destination.
+    AlpacaDeposit {
+        /// Amount of USDC to deposit, as a decimal.
+        #[arg(short = 'a', long, allow_negative_numbers = true)]
+        amount: DecimalAmount,
+        /// The operation id an earlier run printed, to report its transfer
+        /// instead of sending again. Omit for a new deposit: a fresh id is
+        /// generated. A rerun must repeat the same amount.
+        #[arg(long)]
+        operation_id: Option<Uuid>,
+    },
     /// Drain wrapped shares of an equity from a paused chain into Alpaca in
     /// one run: withdraws them from the vault, unwraps them, and sends the
     /// underlying to the redemption wallet the bot has configured for the
@@ -1218,6 +1238,46 @@ mod tests {
         assert_eq!(withdrawn, amount("100"));
         assert_eq!(network.wire_name(), "hyperevm");
 
+        for argv in [
+            &["alpaca-deposit", "--amount", "500"][..],
+            &["alpaca-deposit", "-a", "500"][..],
+        ] {
+            let Capital::AlpacaDeposit {
+                amount: deposited,
+                operation_id: None,
+            } = capital(argv).unwrap()
+            else {
+                panic!("expected alpaca-deposit without an operation id from {argv:?}");
+            };
+            assert_eq!(deposited, amount("500"), "{argv:?}");
+        }
+        let id = "6f1c2a1e-6c39-4a77-9a8e-1f0b7d6e8c11";
+        let Capital::AlpacaDeposit {
+            operation_id: Some(operation_id),
+            ..
+        } = capital(&["alpaca-deposit", "-a", "500", "--operation-id", id]).unwrap()
+        else {
+            panic!("expected alpaca-deposit with the operation id");
+        };
+        assert_eq!(operation_id.to_string(), id);
+        // The bot deposits only on Ethereum, to the address Alpaca returns for
+        // its own account, so the client has no way to name a chain or another
+        // destination.
+        for (flag, value) in [
+            ("--network", "base"),
+            ("--chain", "base"),
+            ("--deposit-address", TOKEN),
+        ] {
+            let Err(error) = capital(&["alpaca-deposit", "-a", "1", flag, value]) else {
+                panic!("alpaca-deposit must not accept {flag}");
+            };
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{flag}"
+            );
+        }
+
         let Capital::ResetAllowance { network } =
             capital(&["reset-allowance", "--network", "ethereum"]).unwrap()
         else {
@@ -1241,6 +1301,7 @@ mod tests {
             &["vault-deposit", "-a", "1", "-t", TOKEN][..],
             &["vault-withdraw", "-a", "1", "-v", VAULT][..],
             &["vault-withdraw-usdc", "--network", "base"][..],
+            &["alpaca-deposit"][..],
             &["cctp-bridge", "--amount", "1"][..],
         ] {
             let Err(error) = capital(argv) else {
@@ -1384,6 +1445,7 @@ mod tests {
                 | Capital::DrainEquity { network, .. }
                 | Capital::ResetAllowance { network } => network,
                 Capital::TransferUsdc { .. }
+                | Capital::AlpacaDeposit { .. }
                 | Capital::CctpBridge { .. }
                 | Capital::CctpBurnSupersede { .. } => {
                     panic!("{argv:?} takes no --network")
@@ -1530,6 +1592,7 @@ mod tests {
                 VAULT,
             ]);
             argvs.push(vec!["vault-withdraw-usdc", "-a", bad_amount]);
+            argvs.push(vec!["alpaca-deposit", "-a", bad_amount]);
             argvs.push(vec![
                 "cctp-bridge",
                 "--from",
