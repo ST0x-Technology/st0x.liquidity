@@ -27,7 +27,7 @@ use crate::position_check::{CheckPositionsJobQueue, bootstrap_check_positions};
 use crate::rebalancing::RebalancingService;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::trading::offchain::hedge::HedgeJobQueue;
-use crate::trading::onchain::trade_accountant::DexTradeAccountingJobQueue;
+use crate::trading::onchain::trade_accountant::DexTradeAccountingQueues;
 use crate::unwrapped_equity_recovery::{
     UnwrappedEquityRecovery, UnwrappedEquityRecoveryCtx, UnwrappedEquityRecoveryJobQueue,
 };
@@ -71,7 +71,7 @@ pub(super) struct TradingJobQueues {
 pub(super) async fn setup_trading_job_queues(
     cqrs_pool: &sqlx::SqlitePool,
     apalis_pool: &apalis_sqlite::SqlitePool,
-    job_queue: &DexTradeAccountingJobQueue,
+    accounting_queues: &DexTradeAccountingQueues,
     equity_recovery: EquityRecoveryInputs,
     offchain_order_projection: &Arc<Projection<OffchainOrder>>,
     executor_type: SupportedExecutor,
@@ -97,7 +97,9 @@ pub(super) async fn setup_trading_job_queues(
     // transfer/backfill/recovery queues above. Trade accounting is the
     // one that cannot be recovered any other way: once the backfill
     // checkpoint advances, its job row is the only record of the fill.
-    requeue_trading_orphans(job_queue, "trade accounting").await?;
+    for (chain, accounting_queue) in accounting_queues.iter() {
+        requeue_trading_orphans(accounting_queue, &format!("{chain} trade accounting")).await?;
+    }
     requeue_trading_orphans(&hedge_queue, "hedge placement").await?;
     requeue_trading_orphans(&poll_status_queue, "order status polling").await?;
     requeue_trading_orphans(&reconcile_queue, "order fill reconciliation").await?;

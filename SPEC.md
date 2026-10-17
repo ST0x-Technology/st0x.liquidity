@@ -627,17 +627,19 @@ excellent async ecosystem for handling concurrent trading flows.
   per-chain poll interval (`order_fill_poll_interval_secs`, required on every
   hedged chain's trading table; no global default), a chain-selected constant
   limiting each inclusive `eth_getLogs` request, checkpoint keyed
-  `(chain, orderbook)`, and scan queue -- one chain's backlog or outage never
-  blocks another chain's ingestion. Every poll interval the monitor enqueues a
-  backfill range covering the blocks since the persisted checkpoint, capped at
-  the configured ingestion cutoff block (must be explicitly configured;
-  recommended value: `safe`, i.e. `eth_getBlockByNumber("safe")`); the backfill
-  worker fetches the `Clear` and `TakeOrder` logs for the arbitrageur's owner
-  address and advances the checkpoint only on success. `required_confirmations`
-  governs transaction-submission paths only and does not affect fill ingestion.
-  Every backfill path, including durable retries, uses the hedged chain's
-  explicit policy: HyperEVM 50 blocks, Base, Ethereum and Robinhood 1000 blocks
-  per request, counted inclusively. Adding a chain requires an explicit policy
+  `(chain, orderbook)`, scan queue, and trade-accounting queue and worker -- one
+  chain's backlog or outage never blocks another chain's ingestion, and one
+  chain's fill backlog (for example a long catch-up) never delays another
+  chain's hedges. Every poll interval the monitor enqueues a backfill range
+  covering the blocks since the persisted checkpoint, capped at the configured
+  ingestion cutoff block (must be explicitly configured; recommended value:
+  `safe`, i.e. `eth_getBlockByNumber("safe")`); the backfill worker fetches the
+  `Clear` and `TakeOrder` logs for the arbitrageur's owner address and advances
+  the checkpoint only on success. `required_confirmations` governs
+  transaction-submission paths only and does not affect fill ingestion. Every
+  backfill path, including durable retries, uses the hedged chain's explicit
+  policy: HyperEVM 50 blocks, Base, Ethereum and Robinhood 1000 blocks per
+  request, counted inclusively. Adding a chain requires an explicit policy
   before the code compiles. Poll intervals remain required deployment
   configuration; block limits are constants and need no new configuration field.
   The cutoff tag is configured via `ingestion_cutoff` (required field):
@@ -8979,14 +8981,15 @@ sequenceDiagram
 ```
 
 On startup, backfill pushes historical events after the persisted backfill
-checkpoint as `AccountForDexTrade` jobs into the same queue. The worker starts
-after backfill completes, so historical jobs are enqueued before live events are
-processed. Successful backfill advances the checkpoint to the cutoff block.
+checkpoint as `AccountForDexTrade` jobs into the chain's accounting queue. The
+worker starts after backfill completes, so historical jobs are enqueued before
+live events are processed. Successful backfill advances the checkpoint to the
+cutoff block.
 
 The diagram above shows `ClearV3`/`TakeOrderV3`, the direct-orderbook fill
 source. In `managed` inventory mode, `OperatorDeposit`/`OperatorWithdraw`
 settlement pairs on the shared `RaindexInventory` are a third fill source pushed
-into the same `AccountForDexTrade` queue as an `InventoryTrade`; see
+into the chain's `AccountForDexTrade` queue as an `InventoryTrade`; see
 "InventoryTrade: a third fill source" above for the pairing rules.
 
 **Target Flow** (lifecycle workflows, future):

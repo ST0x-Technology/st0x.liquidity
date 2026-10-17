@@ -427,10 +427,10 @@ For detailed implementation requirements, see @crates/execution/AGENTS.md
 
 The `OrderFillMonitor` (`src/conductor/monitor/order_fills.rs`) polls
 `ClearV3`/`TakeOrderV3` fills via HTTP `eth_getLogs` and enqueues each fill as
-an `AccountForDexTrade` job into the apalis `DexTradeAccountingJobQueue`. The
-job worker resolves the symbol, discovers vaults, records the `OnChainTrade`,
-updates the `Position` aggregate, and places an offsetting broker order.
-Idempotency via `(tx_hash, log_index)` keys.
+an `AccountForDexTrade` job into its chain's apalis
+`DexTradeAccountingJobQueue`. The job worker resolves the symbol, discovers
+vaults, records the `OnChainTrade`, updates the `Position` aggregate, and places
+an offsetting broker order. Idempotency via `(tx_hash, log_index)` keys.
 
 ### Configuration
 

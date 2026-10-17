@@ -172,7 +172,7 @@ use crate::trading::onchain::skipped_fill::{
     SkipReason, record_skipped_fill, recorded_skip_detail,
 };
 use crate::trading::onchain::trade_accountant::{
-    DexTradeAccountingJobQueue, NormalizedFillEconomicsError, TradeAccountingError,
+    DexTradeAccountingQueues, NormalizedFillEconomicsError, TradeAccountingError,
 };
 use crate::unwrapped_equity_recovery::{
     UnwrappedEquityRecovery, UnwrappedEquityRecoveryId, UnwrappedEquityRecoveryServices,
@@ -259,7 +259,7 @@ async fn setup_apalis_queues(
     chains: &st0x_config::ChainRegistry,
     equity_prices: EquityPriceStore,
 ) -> anyhow::Result<(
-    DexTradeAccountingJobQueue,
+    DexTradeAccountingQueues,
     BackfillQueues,
     DashboardTradeDelivery,
     RebalancingSchedulers,
@@ -277,8 +277,17 @@ async fn setup_apalis_queues(
         );
     }
 
+    let accounting_queues = DexTradeAccountingQueues::new(apalis_pool, chains);
+    let relabeled = accounting_queues.relabel_legacy_rows(apalis_pool).await?;
+    if relabeled > 0 {
+        info!(
+            relabeled,
+            "Moved legacy trade accounting jobs onto their chain's queue"
+        );
+    }
+
     Ok((
-        DexTradeAccountingJobQueue::new(apalis_pool),
+        accounting_queues,
         BackfillQueues::new(apalis_pool, chains),
         DashboardTradeDelivery::new(apalis_pool, pool, event_sender, equity_prices),
         RebalancingSchedulers::new(apalis_pool),
@@ -1099,14 +1108,15 @@ impl Conductor {
         // serializes its broker submission against live hedging (ADR 0014).
         let counter_trade_submission_lock = Arc::new(Mutex::new(()));
 
-        let (job_queue, backfill_queues, dashboard_delivery, schedulers) = setup_apalis_queues(
-            &pool,
-            &apalis_pool,
-            event_sender,
-            &ctx.chains,
-            equity_prices.clone(),
-        )
-        .await?;
+        let (accounting_queues, backfill_queues, dashboard_delivery, schedulers) =
+            setup_apalis_queues(
+                &pool,
+                &apalis_pool,
+                event_sender,
+                &ctx.chains,
+                equity_prices.clone(),
+            )
+            .await?;
 
         let onchain_trade =
             setup_onchain_trade_store(&pool, dashboard_delivery.broadcaster.clone()).await?;
@@ -1267,7 +1277,7 @@ impl Conductor {
         } = setup_trading_job_queues(
             &pool,
             &apalis_pool,
-            &job_queue,
+            &accounting_queues,
             EquityRecoveryInputs {
                 wrapped_store: wrapped_equity_recovery_store,
                 unwrapped_store: unwrapped_equity_recovery_store,
@@ -1338,7 +1348,7 @@ impl Conductor {
         let conductor = builder::spawn()
             .context(conductor_ctx)
             .counter_trade_submission_lock(counter_trade_submission_lock.clone())
-            .job_queue(job_queue)
+            .accounting_queues(accounting_queues)
             .backfill_queues(backfill_queues)
             .dashboard_trade_delivery_queue(dashboard_delivery.queue)
             .dashboard_trade_delivery_ctx(dashboard_delivery.ctx)
@@ -8040,7 +8050,9 @@ mod tests {
     };
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
     use crate::trading::onchain::inclusion::EmittedOnChain;
-    use crate::trading::onchain::trade_accountant::AccountForDexTrade;
+    use crate::trading::onchain::trade_accountant::{
+        AccountForDexTrade, DexTradeAccountingJobQueue,
+    };
     use crate::unwrapped_equity_recovery::aggregate::UnwrappedEquityRecoveryId;
     use crate::unwrapped_equity_recovery::{
         UnwrappedEquityRecoveryJob, UnwrappedEquityRecoveryJobQueue,
@@ -13029,14 +13041,15 @@ mod tests {
     #[tokio::test]
     async fn requeue_trading_orphans_resets_running_accounting_rows() {
         let (_pool, apalis_pool) = setup_test_pools().await;
-        let queue = DexTradeAccountingJobQueue::new(&apalis_pool);
-        let job_type = std::any::type_name::<AccountForDexTrade>();
+        let queue = DexTradeAccountingJobQueue::new_namespaced(&apalis_pool, Chain::Base.as_str());
+        let job_type = format!("{}@base", std::any::type_name::<AccountForDexTrade>());
+        let job_type = job_type.as_str();
 
         // The lock owner must exist: Jobs.lock_by is a foreign key into Workers.
         sqlx_apalis::query(
             "INSERT INTO Workers (id, worker_type, storage_name) VALUES (?, 'test', 'test')",
         )
-        .bind("order-fill-worker-0")
+        .bind("order-fill-worker-base-0")
         .execute(&apalis_pool)
         .await
         .unwrap();
@@ -13053,7 +13066,7 @@ mod tests {
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(job_type)
         .bind(Status::Running.to_string())
-        .bind("order-fill-worker-0")
+        .bind("order-fill-worker-base-0")
         .bind(0_i64)
         .execute(&apalis_pool)
         .await
@@ -13072,6 +13085,163 @@ mod tests {
         assert_eq!(status, Status::Pending.to_string());
         assert_eq!(lock_by, None);
         assert_eq!(attempts, 1, "requeue must preserve the attempt count");
+    }
+
+    async fn insert_legacy_accounting_row(
+        apalis_pool: &apalis_sqlite::SqlitePool,
+        payload: &[u8],
+        status: Status,
+        attempts: i64,
+    ) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        sqlx_apalis::query(
+            "INSERT INTO Jobs (job, id, job_type, status, attempts, max_attempts, run_at, priority) \
+             VALUES (?, ?, ?, ?, ?, 25, 0, 0)",
+        )
+        .bind(payload)
+        .bind(&id)
+        .bind(std::any::type_name::<AccountForDexTrade>())
+        .bind(status.to_string())
+        .bind(attempts)
+        .execute(apalis_pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn job_type_of(apalis_pool: &apalis_sqlite::SqlitePool, id: &str) -> String {
+        sqlx_apalis::query_scalar("SELECT job_type FROM Jobs WHERE id = ?")
+            .bind(id)
+            .fetch_one(apalis_pool)
+            .await
+            .unwrap()
+    }
+
+    fn accounting_payload(chain: Chain) -> serde_json::Value {
+        serde_json::to_value(AccountForDexTrade {
+            trade: create_emitted_clear_event_on(chain, get_test_order(), get_test_order()),
+            backpressure_streak: BackpressureStreak::default(),
+        })
+        .unwrap()
+    }
+
+    /// A Base primary plus every chain in `secondaries` as a hedged chain.
+    fn ctx_hedging(secondaries: &[Chain]) -> Ctx {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        for chain in secondaries {
+            let mut secondary = ctx.chains.primary().clone();
+            secondary.chain = *chain;
+            ctx.chains.insert_secondary(secondary);
+        }
+        ctx
+    }
+
+    async fn setup_apalis_queues_for_test(
+        pool: &SqlitePool,
+        apalis_pool: &apalis_sqlite::SqlitePool,
+        ctx: &Ctx,
+    ) -> anyhow::Result<()> {
+        let (event_sender, _) = broadcast::channel(16);
+        let equity_prices = EquityPriceStore::new(ctx.chains.hedged().map(|hedged| &hedged.assets));
+
+        setup_apalis_queues(pool, apalis_pool, event_sender, &ctx.chains, equity_prices)
+            .await
+            .map(|_| ())
+    }
+
+    /// Rows queued by a single-queue binary carry the bare type name, which
+    /// no per-chain worker reads. Startup must move every live row onto its
+    /// own chain's queue, reading the chain from the payload exactly as the
+    /// worker would (a chainless payload is Base), and leave terminal history
+    /// where it is.
+    #[tokio::test]
+    async fn setup_apalis_queues_moves_live_accounting_rows_onto_their_chain_queue() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let legacy = std::any::type_name::<AccountForDexTrade>();
+
+        let ethereum = serde_json::to_vec(&accounting_payload(Chain::Ethereum)).unwrap();
+        let mut chainless = accounting_payload(Chain::Base);
+        chainless["trade"].as_object_mut().unwrap().remove("chain");
+        let chainless = serde_json::to_vec(&chainless).unwrap();
+
+        let pending =
+            insert_legacy_accounting_row(&apalis_pool, &ethereum, Status::Pending, 0).await;
+        let running =
+            insert_legacy_accounting_row(&apalis_pool, &chainless, Status::Running, 1).await;
+        let retryable =
+            insert_legacy_accounting_row(&apalis_pool, &ethereum, Status::Failed, 1).await;
+        let done = insert_legacy_accounting_row(&apalis_pool, &ethereum, Status::Done, 1).await;
+
+        setup_apalis_queues_for_test(&pool, &apalis_pool, &ctx_hedging(&[Chain::Ethereum]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            job_type_of(&apalis_pool, &pending).await,
+            format!("{legacy}@ethereum")
+        );
+        assert_eq!(
+            job_type_of(&apalis_pool, &running).await,
+            format!("{legacy}@base"),
+            "a chainless payload replays as base, so it belongs to base's queue"
+        );
+        assert_eq!(
+            job_type_of(&apalis_pool, &retryable).await,
+            format!("{legacy}@ethereum"),
+            "a Failed row with attempts left is still live"
+        );
+        assert_eq!(job_type_of(&apalis_pool, &done).await, legacy);
+    }
+
+    /// A live row whose chain cannot be read would otherwise be stranded or
+    /// hedged on a guessed chain: startup must refuse and leave it untouched.
+    #[tokio::test]
+    async fn setup_apalis_queues_refuses_an_undecodable_live_accounting_row() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let legacy = std::any::type_name::<AccountForDexTrade>();
+        let ethereum = serde_json::to_vec(&accounting_payload(Chain::Ethereum)).unwrap();
+        let decodable =
+            insert_legacy_accounting_row(&apalis_pool, &ethereum, Status::Pending, 0).await;
+        let undecodable =
+            insert_legacy_accounting_row(&apalis_pool, b"{}", Status::Pending, 0).await;
+
+        let error =
+            setup_apalis_queues_for_test(&pool, &apalis_pool, &ctx_hedging(&[Chain::Ethereum]))
+                .await
+                .unwrap_err();
+
+        assert!(
+            error.to_string().contains(&undecodable),
+            "the error must name the row: {error:#}"
+        );
+        assert_eq!(job_type_of(&apalis_pool, &undecodable).await, legacy);
+        assert_eq!(
+            job_type_of(&apalis_pool, &decodable).await,
+            legacy,
+            "the relabel is all or nothing"
+        );
+    }
+
+    /// A live row for a chain this config does not hedge has no worker to
+    /// drain it, and it may be the only record of the fill: startup must
+    /// refuse rather than move it onto a queue nobody reads.
+    #[tokio::test]
+    async fn setup_apalis_queues_refuses_a_live_accounting_row_on_an_unhedged_chain() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let legacy = std::any::type_name::<AccountForDexTrade>();
+        let ethereum = serde_json::to_vec(&accounting_payload(Chain::Ethereum)).unwrap();
+        let unhedged =
+            insert_legacy_accounting_row(&apalis_pool, &ethereum, Status::Pending, 0).await;
+
+        let error = setup_apalis_queues_for_test(&pool, &apalis_pool, &ctx_hedging(&[]))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains(&unhedged),
+            "the error must name the row: {error:#}"
+        );
+        assert_eq!(job_type_of(&apalis_pool, &unhedged).await, legacy);
     }
 
     async fn job_count(apalis_pool: &apalis_sqlite::SqlitePool) -> i64 {

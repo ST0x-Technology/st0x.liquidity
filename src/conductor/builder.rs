@@ -92,7 +92,7 @@ use crate::trading::offchain::close_flatten::{
 };
 use crate::trading::offchain::hedge::{HedgeCtx, HedgeJobQueue, PlaceHedge};
 use crate::trading::onchain::trade_accountant::{
-    AccountForDexTrade, AccountantCtx, DeadLetterReason, DexTradeAccountingJobQueue,
+    AccountForDexTrade, AccountantCtx, DeadLetterReason, DexTradeAccountingQueues,
     TradeAccountingError,
 };
 use crate::unwrapped_equity_recovery::{
@@ -342,7 +342,7 @@ where
 pub(crate) fn spawn<Prov, Exec>(
     context: ConductorCtx<Prov, Exec>,
     counter_trade_submission_lock: Arc<tokio::sync::Mutex<()>>,
-    job_queue: DexTradeAccountingJobQueue,
+    accounting_queues: DexTradeAccountingQueues,
     backfill_queues: BackfillQueues,
     dashboard_trade_delivery_queue: DashboardTradeDeliveryJobQueue,
     dashboard_trade_delivery_ctx: Arc<DashboardTradeDeliveryCtx>,
@@ -675,12 +675,19 @@ where
                 },
             )?
         };
+        let job_queue = accounting_queues.for_chain(hedged.chain).cloned().ok_or(
+            ConductorSpawnError::MissingWatchWiring {
+                chain: hedged.chain,
+                what: "trade accounting queue",
+            },
+        )?;
         chain_accounting.insert(
             hedged.chain,
             crate::trading::onchain::trade_accountant::ChainAccounting {
                 trading: hedged.clone(),
                 contracts: crate::onchain::raindex_contracts(hedged),
                 evm: ReadOnlyEvm::new(provider),
+                job_queue,
             },
         );
     }
@@ -694,7 +701,6 @@ where
         vault_registry: context.frameworks.vault_registry,
         executor: context.executor.clone(),
         pool: context.pool.clone(),
-        job_queue: job_queue.clone(),
     });
 
     let apalis_shutdown_token = CancellationToken::new();
@@ -854,7 +860,7 @@ where
         portfolio_snapshot_ctx,
         rebalancing_check_ctx: rebalancing_service,
         seed_vault_registry_ctx,
-        job_queue,
+        accounting_queues,
         hedge_queue,
         backfill_queues,
         dashboard_trade_delivery_queue,
@@ -925,7 +931,7 @@ where
     portfolio_snapshot_ctx: Arc<PortfolioSnapshotCtx>,
     rebalancing_check_ctx: Arc<RebalancingService>,
     seed_vault_registry_ctx: Arc<SeedVaultRegistryCtx>,
-    job_queue: DexTradeAccountingJobQueue,
+    accounting_queues: DexTradeAccountingQueues,
     hedge_queue: HedgeJobQueue,
     backfill_queues: BackfillQueues,
     dashboard_trade_delivery_queue: DashboardTradeDeliveryJobQueue,
@@ -982,7 +988,7 @@ where
             portfolio_snapshot_ctx,
             rebalancing_check_ctx,
             seed_vault_registry_ctx,
-            job_queue,
+            accounting_queues,
             hedge_queue,
             backfill_queues,
             dashboard_trade_delivery_queue,
@@ -1101,20 +1107,31 @@ where
                 });
             }
 
-            let monitor = monitor
-                .should_restart(|_ctx, _error, _attempt| false)
-                .register(move |index| {
-                    // Supervised: losing trade accounting compromises hedging state.
+            // Supervised: losing trade accounting compromises hedging state.
+            // One worker per hedged chain, so a slow chain's fill backlog
+            // never delays another chain's hedges.
+            for (worker_chain, chain_queue) in accounting_queues.iter() {
+                let chain_queue = chain_queue.clone();
+                let worker_chain = *worker_chain;
+                let accountant_ctx = accountant_ctx.clone();
+                let failure_notify = failure_notify.clone();
+                #[cfg(any(test, feature = "test-support"))]
+                let failure_injector = failure_injector.clone();
+                monitor = monitor.register(move |index| {
                     build_supervised_worker!(
                         ::<AccountantCtx<Prov, Exec>, AccountForDexTrade>,
-                        index,
-                        job_queue.clone(),
+                        format_args!("{worker_chain}-{index}"),
+                        chain_queue.clone(),
                         accountant_ctx.clone(),
                         failure_notify.clone(),
                         #[cfg(any(test, feature = "test-support"))]
                         failure_injector.clone(),
                     )
-                })
+                });
+            }
+
+            let monitor = monitor
+                .should_restart(|_ctx, _error, _attempt| false)
                 .register(move |index| {
                     // Supervised: the durable dashboard trade handoff must not diverge.
                     build_supervised_worker!(

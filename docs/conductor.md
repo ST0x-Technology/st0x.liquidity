@@ -59,13 +59,13 @@ nothing enqueued). The `backfill-worker` fetches the logs and pushes an
 success. The cutoff tag is unrelated to `required_confirmations`, which governs
 only transaction-submission paths.
 
-Each hedged chain has its own required `order_fill_poll_interval_secs` and
-independent backfill queue. All fill scans, including startup catch-up and
-durable retries, split inclusive block ranges using explicit chain constants:
-Base, Ethereum and Robinhood use 1000 blocks per request; HyperEVM uses 50. This
-applies to both OrderBook filters and the combined inventory settlement filter.
-The partition iterator is lazy and handles the full unsigned block-number range
-without arithmetic overflow.
+Each hedged chain has its own required `order_fill_poll_interval_secs`,
+independent backfill queue, and trade-accounting queue and worker. All fill
+scans, including startup catch-up and durable retries, split inclusive block
+ranges using explicit chain constants: Base, Ethereum and Robinhood use 1000
+blocks per request; HyperEVM uses 50. This applies to both OrderBook filters and
+the combined inventory settlement filter. The partition iterator is lazy and
+handles the full unsigned block-number range without arithmetic overflow.
 
 The 50-block HyperEVM cap follows the
 [official JSON-RPC contract](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/hyperevm/json-rpc).
@@ -850,8 +850,28 @@ restart and process the next job with stale state.
 ### AccountForDexTrade
 
 Defined in `src/trading/onchain/trade_accountant.rs`. Serializable wrapper
-around `EmittedOnChain<RaindexTradeEvent>`, pushed into
-`DexTradeAccountingJobQueue` by `OrderFillMonitor`.
+around `EmittedOnChain<RaindexTradeEvent>`, pushed by the backfill worker into
+the fill's chain's queue. Each hedged chain has its own namespaced queue
+(`Jobs.job_type` = `{type_name}@{chain}`, see `DexTradeAccountingQueues`) and
+its own single-concurrency worker (`order-fill-worker-{chain}-{index}`), so a
+slow chain's backlog never delays another chain's hedges. A rate-limit successor
+goes back onto the same chain's queue.
+
+Rows queued before per-chain queues carry the bare type name, which no worker
+reads. At startup, after the apalis tables exist and before any worker spawns,
+`DexTradeAccountingQueues::relabel_legacy_rows` moves every live legacy row onto
+the queue of the chain its payload names (the same serde rule the worker uses,
+so a chainless payload is Base). A live row whose payload does not decode, or
+names a chain this config does not hedge, fails startup and nothing is relabeled
+(for the latter, hedge that chain again or hedge the fill by hand and mark the
+row `Killed`). Terminal rows keep the old label until the retention sweep
+deletes them.
+
+Rolling back to a single-queue binary strands every live `@chain` row, because
+its one worker reads only the bare label. The relabel commits early in startup,
+so this holds for an automatic deploy-rs rollback after a later startup failure
+too. After any rollback past this change, move them back:
+`UPDATE Jobs SET job_type = '<type_name>' WHERE job_type LIKE '<type_name>@%' AND (status IN ('Pending', 'Queued', 'Running') OR (status = 'Failed' AND attempts < max_attempts))`.
 
 Implements `Job<AccountantCtx<Node, Exec>>`. The `perform()` method runs the
 hedging pipeline:

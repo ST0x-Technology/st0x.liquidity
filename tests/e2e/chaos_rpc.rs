@@ -9,6 +9,7 @@
 
 use std::time::Duration;
 
+use st0x_evm::Chain;
 use st0x_float_macro::float;
 
 use crate::chaos::ChaosProxy;
@@ -297,7 +298,11 @@ async fn replayed_get_logs_across_checkpoint_advances_do_not_double_process() ->
     // accounting job -- two takes plus at least one replayed duplicate.
     let pool = connect_db(&infra.db_path).await?;
     let (accounting_jobs,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
-        .bind(std::any::type_name::<st0x_hedge::AccountForDexTrade>())
+        .bind(format!(
+            "{}@{}",
+            std::any::type_name::<st0x_hedge::AccountForDexTrade>(),
+            Chain::Base
+        ))
         .fetch_one(&pool)
         .await?;
     assert!(

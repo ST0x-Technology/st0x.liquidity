@@ -305,7 +305,7 @@ where
             from_block,
             self.to_block,
             get_backfill_retry_strat(),
-            ctx.job_queue.clone(),
+            chain_ctx.job_queue.clone(),
         )
         .await
     }

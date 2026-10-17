@@ -32,7 +32,7 @@ use st0x_dto::Statement;
 
 use crate::conductor::{ConductorStartupTokens, DatabasePools, SupervisorStartupTokens};
 use crate::trading::offchain::hedge::HedgeJobQueue;
-use crate::trading::onchain::trade_accountant::DexTradeAccountingJobQueue;
+use crate::trading::onchain::trade_accountant::DexTradeAccountingQueues;
 
 /// Outer timeout for the entire graceful shutdown sequence. Must exceed
 /// the rebalancer drain timeout (60s) plus margin for supervisor shutdown
@@ -719,6 +719,7 @@ fn spawn_server_supervisor(
     // Read before `state` moves into the router below.
     let ops_api = state.ctx.ops_api.clone();
     let detached_tasks = state.detached_tasks.clone();
+    let accounting_queues = DexTradeAccountingQueues::new(&pools.apalis, &state.ctx.chains);
 
     let main_router = api::routes(ops_api.as_ref(), &detached_tasks).with_state(state);
 
@@ -726,10 +727,12 @@ fn spawn_server_supervisor(
     // (`/apalis-board-web-*`) and the wasm calls `/api/v1/*` directly,
     // so it must own its origin. Run it on its own port instead of
     // nesting under the main router.
-    let dex_storage = DexTradeAccountingJobQueue::new(&pools.apalis).into_storage();
     let hedge_storage = HedgeJobQueue::new(&pools.apalis).into_storage();
-    let board_api = ApiBuilder::new(Router::new())
-        .register(dex_storage)
+    let board_api = accounting_queues
+        .iter()
+        .fold(ApiBuilder::new(Router::new()), |board, (_, queue)| {
+            board.register(queue.clone().into_storage())
+        })
         .register(hedge_storage)
         .build();
     let board_router = Router::new()

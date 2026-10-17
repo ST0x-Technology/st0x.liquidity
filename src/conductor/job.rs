@@ -442,7 +442,7 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
     /// The durable queue key this storage reads and writes (`Jobs.job_type`).
     /// Every raw-SQL helper must key on THIS, not the bare type name, or a
     /// namespaced queue's helpers silently match zero rows.
-    fn queue_key(&self) -> &str {
+    pub(crate) fn queue_key(&self) -> &str {
         self.0.config().queue().as_ref()
     }
 
