@@ -44,7 +44,8 @@ use st0x_raindex::{Raindex, RaindexError, RaindexService, RaindexVaultId, Withdr
 
 use super::driver_pause::UsdcDriverGate;
 use super::{
-    DepositSendPending, UnresolvedDepositSend, UsdcTransferError, refuse_unserved_corridor,
+    DepositSendPending, DepositSendRefusal, UnresolvedDepositSend, UsdcTransferError,
+    refuse_unserved_corridor,
 };
 use crate::alerts::AlertKind;
 use crate::bot_gas::{BotGasOperationCategory, BotGasReceiptCostEnqueuer, RecordBotGasReceiptCost};
@@ -203,6 +204,10 @@ pub trait UsdcBridgeHelper: Send + Sync + 'static {
         tx_hash: TxHash,
     ) -> Result<Option<u64>, Self::HubError>;
 
+    /// Returns the bot wallet's next free nonce on Ethereum at the latest
+    /// block.
+    async fn ethereum_wallet_nonce(&self) -> Result<u64, Self::HubError>;
+
     /// Returns the block in which `tx_hash` was mined on Ethereum.
     async fn ethereum_tx_block(&self, tx_hash: TxHash) -> Result<u64, Self::HubError>;
 
@@ -278,6 +283,10 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> UsdcBridgeHelper for CctpBridge<EthW
 
     async fn ethereum_tx_confirmations(&self, tx_hash: TxHash) -> Result<Option<u64>, CctpError> {
         self.ethereum_tx_confirmations(tx_hash).await
+    }
+
+    async fn ethereum_wallet_nonce(&self) -> Result<u64, CctpError> {
+        self.ethereum_wallet_nonce().await
     }
 
     async fn ethereum_tx_block(&self, tx_hash: TxHash) -> Result<u64, CctpError> {
@@ -367,6 +376,10 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> UsdcBridgeHelper
         tx_hash: TxHash,
     ) -> Result<Option<u64>, StableEndpointError> {
         self.ethereum_stable().tx_confirmations(tx_hash).await
+    }
+
+    async fn ethereum_wallet_nonce(&self) -> Result<u64, StableEndpointError> {
+        self.ethereum_stable().wallet_nonce().await
     }
 
     async fn ethereum_tx_block(&self, tx_hash: TxHash) -> Result<u64, StableEndpointError> {
@@ -2703,7 +2716,9 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
         if let Err(error) = self.hop.broadcast_usdc_on_ethereum(prepared).await {
             match send {
                 RestoredSend::AlpacaDepositSend => {
-                    error!(target: "operational_alert", alert = true, kind = AlertKind::AlpacaDepositSendRebroadcastFailed.as_str(), %id, %tx, nonce, ?error, "Could not rebroadcast a signed Alpaca deposit send at startup; its nonce stays reserved, so startup skips Ethereum token approvals and allowance revokes, and the transfer's resume broadcasts it again");
+                    let error: CctpError = error.into();
+                    let refusal = self.classify_deposit_send_refusal(prepared, &error).await;
+                    error!(target: "operational_alert", alert = true, kind = AlertKind::AlpacaDepositSendRebroadcastFailed.as_str(), %id, %tx, nonce, %refusal, ?error, "Could not rebroadcast a signed Alpaca deposit send at startup; its nonce stays reserved, so startup skips Ethereum token approvals and allowance revokes, and the transfer's resume broadcasts it again. Refused because {refusal}. {}", refusal.operator_step());
                 }
                 RestoredSend::RelayEnvelope => {
                     error!(target: "operational_alert", alert = true, kind = AlertKind::RelayEnvelopeRebroadcastFailed.as_str(), %id, %tx, nonce, ?error, "Could not rebroadcast a signed Relay envelope at startup; its nonce stays reserved, so startup skips Ethereum token approvals and allowance revokes, and the transfer's resume broadcasts it again");
@@ -3309,10 +3324,14 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
             cause,
         };
 
-        self.hop
-            .broadcast_usdc_on_ethereum(prepared)
-            .await
-            .map_err(|error| pending(DepositSendPending::Broadcast(Box::new(error.into()))))?;
+        if let Err(error) = self.hop.broadcast_usdc_on_ethereum(prepared).await {
+            let source = error.into();
+            let refusal = self.classify_deposit_send_refusal(prepared, &source).await;
+            return Err(pending(DepositSendPending::Broadcast {
+                refusal,
+                source: Box::new(source),
+            }));
+        }
 
         let status = self
             .hop
@@ -3346,6 +3365,80 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
             }
             // The same bytes are broadcast again on the redrive.
             UsdcTransferStatus::Dropped => Err(pending(DepositSendPending::Dropped)),
+        }
+    }
+
+    /// Why the node refused to broadcast `prepared`, the signed deposit send.
+    /// Gas and nonces belong to the signer, so a send a key rotated out of the
+    /// bot wallet signed never names the bot wallet as the one to fund.
+    /// A refused nonce counts as taken only when the bot wallet signed the
+    /// send, the send has no receipt, and the wallet's nonce on chain is past
+    /// the send's: nonces are per sender, so the wallet's nonce says nothing
+    /// about a send a rotated-out key signed, and a load-balanced node may
+    /// refuse the nonce of a send that mined while its hash lookup misses it.
+    /// A failed read leaves the nonce in use, which pages no sooner than
+    /// before.
+    async fn classify_deposit_send_refusal(
+        &self,
+        prepared: &PreparedTransaction,
+        error: &CctpError,
+    ) -> DepositSendRefusal {
+        let tx = prepared.tx_hash();
+        let CctpError::Evm(evm_error) = error else {
+            debug!(target: "rebalance", %tx, ?error, "Deposit send broadcast failed outside the wallet");
+            return DepositSendRefusal::Rpc;
+        };
+        let signed_by_bot_wallet = prepared.signed_by(self.market_maker_wallet);
+        if evm_error.is_insufficient_funds() {
+            if signed_by_bot_wallet {
+                return DepositSendRefusal::NoEthForGas;
+            }
+            let Some(signer) = prepared.signer() else {
+                warn!(target: "rebalance", %tx, ?error, "The node refused for gas a deposit send whose signer cannot be recovered");
+                return DepositSendRefusal::Rpc;
+            };
+            return DepositSendRefusal::SignerHasNoEthForGas { signer };
+        }
+        if evm_error.is_fee_below_floor() {
+            return DepositSendRefusal::FeeBelowFloor;
+        }
+        let EvmError::PreparedTransactionReconciliationPending { .. } = evm_error.underlying()
+        else {
+            debug!(target: "rebalance", %tx, ?error, "Deposit send broadcast refusal is not a recognized cause");
+            return DepositSendRefusal::Rpc;
+        };
+
+        // The nonce is read before the receipt, so a send that mines between
+        // the two reads shows its receipt instead of a taken nonce.
+        let nonce = prepared.nonce();
+        let in_use = DepositSendRefusal::NonceInUse { nonce };
+        if !signed_by_bot_wallet {
+            warn!(target: "rebalance", %tx, nonce, signer = ?prepared.signer(), wallet = %self.market_maker_wallet, "The node refused the nonce of a deposit send the bot wallet did not sign");
+            return in_use;
+        }
+
+        let wallet_nonce = match self.hop.ethereum_wallet_nonce().await {
+            Ok(wallet_nonce) if wallet_nonce > nonce => wallet_nonce,
+            Ok(_) => return in_use,
+            Err(error) => {
+                warn!(target: "rebalance", %tx, nonce, ?error, "Could not read the Ethereum wallet's nonce for a deposit send whose nonce the node refused");
+                return in_use;
+            }
+        };
+
+        match self.hop.ethereum_tx_confirmations(tx).await {
+            Ok(None) => DepositSendRefusal::NonceTaken {
+                nonce,
+                wallet_nonce,
+            },
+            Ok(Some(confirmations)) => {
+                warn!(target: "rebalance", %tx, nonce, confirmations, "The node refused the nonce of a deposit send that has a receipt");
+                in_use
+            }
+            Err(error) => {
+                warn!(target: "rebalance", %tx, nonce, ?error, "Could not read the receipt of a deposit send whose nonce the node refused");
+                in_use
+            }
         }
     }
 
@@ -8038,6 +8131,8 @@ mod tests {
         usdc_broadcasts: Mutex<Vec<TxHash>>,
         usdc_broadcast_delay: Duration,
         usdc_broadcast_error: Option<fn() -> CctpError>,
+        wallet_nonce: Option<fn() -> Result<u64, CctpError>>,
+        usdc_receipt_error: Option<fn() -> CctpError>,
         usdc_discarded: Mutex<Vec<TxHash>>,
         usdc_restored: Mutex<Vec<TxHash>>,
         mined_usdc_sends: Mutex<Vec<TxHash>>,
@@ -8089,6 +8184,8 @@ mod tests {
                 usdc_broadcasts: Mutex::new(Vec::new()),
                 usdc_broadcast_delay: Duration::ZERO,
                 usdc_broadcast_error: None,
+                wallet_nonce: None,
+                usdc_receipt_error: None,
                 usdc_discarded: Mutex::new(Vec::new()),
                 usdc_restored: Mutex::new(Vec::new()),
                 mined_usdc_sends: Mutex::new(Vec::new()),
@@ -8204,6 +8301,17 @@ mod tests {
 
         fn with_failing_usdc_broadcast(mut self, error: fn() -> CctpError) -> Self {
             self.usdc_broadcast_error = Some(error);
+            self
+        }
+
+        fn with_wallet_nonce(mut self, wallet_nonce: fn() -> Result<u64, CctpError>) -> Self {
+            self.wallet_nonce = Some(wallet_nonce);
+            self
+        }
+
+        /// Fails every `ethereum_tx_confirmations` read with `error`.
+        fn with_failing_usdc_receipt_read(mut self, error: fn() -> CctpError) -> Self {
+            self.usdc_receipt_error = Some(error);
             self
         }
 
@@ -8465,12 +8573,24 @@ mod tests {
             &self,
             tx_hash: TxHash,
         ) -> Result<Option<u64>, CctpError> {
+            if let Some(error) = self.usdc_receipt_error {
+                return Err(error());
+            }
+
             Ok(self
                 .mined_usdc_sends
                 .lock()
                 .unwrap()
                 .contains(&tx_hash)
                 .then_some(1))
+        }
+
+        async fn ethereum_wallet_nonce(&self) -> Result<u64, CctpError> {
+            let Some(wallet_nonce) = self.wallet_nonce else {
+                unimplemented!("MockBridge: ethereum_wallet_nonce not used in this test")
+            };
+
+            wallet_nonce()
         }
 
         async fn ethereum_tx_block(&self, _tx_hash: TxHash) -> Result<u64, CctpError> {
@@ -8743,6 +8863,10 @@ mod tests {
             self.inner.ethereum_tx_confirmations(tx_hash).await
         }
 
+        async fn ethereum_wallet_nonce(&self) -> Result<u64, CctpError> {
+            self.inner.ethereum_wallet_nonce().await
+        }
+
         async fn ethereum_tx_block(&self, tx_hash: TxHash) -> Result<u64, CctpError> {
             self.inner.ethereum_tx_block(tx_hash).await
         }
@@ -8961,6 +9085,10 @@ mod tests {
             self.inner.ethereum_tx_confirmations(tx_hash).await
         }
 
+        async fn ethereum_wallet_nonce(&self) -> Result<u64, CctpError> {
+            self.inner.ethereum_wallet_nonce().await
+        }
+
         async fn ethereum_tx_block(&self, tx_hash: TxHash) -> Result<u64, CctpError> {
             self.inner.ethereum_tx_block(tx_hash).await
         }
@@ -9176,6 +9304,10 @@ mod tests {
             tx_hash: TxHash,
         ) -> Result<Option<u64>, CctpError> {
             self.inner.ethereum_tx_confirmations(tx_hash).await
+        }
+
+        async fn ethereum_wallet_nonce(&self) -> Result<u64, CctpError> {
+            self.inner.ethereum_wallet_nonce().await
         }
 
         async fn ethereum_tx_block(&self, tx_hash: TxHash) -> Result<u64, CctpError> {
@@ -19182,6 +19314,208 @@ mod tests {
         );
     }
 
+    fn deposit_send_rpc_refusal(message: &'static str) -> CctpError {
+        CctpError::Evm(EvmError::Transport(RpcError::ErrorResp(ErrorPayload {
+            code: -32000,
+            message: message.into(),
+            data: None,
+        })))
+    }
+
+    fn deposit_send_nonce_refused() -> CctpError {
+        CctpError::Evm(EvmError::PreparedTransactionReconciliationPending {
+            tx_hash: MOCK_DEPOSIT_SEND_TX,
+        })
+    }
+
+    /// Resumes a staged transfer whose deposit send `bridge` refuses, once,
+    /// and returns the refusal the pending error carries.
+    async fn deposit_send_refusal(bridge: MockBridge) -> DepositSendRefusal {
+        let bridge = Arc::new(
+            bridge
+                .with_send_usdc_tx(MOCK_DEPOSIT_SEND_TX)
+                .with_empty_usdc_scan(),
+        );
+        let cqrs = create_test_store_instance().await;
+        let (manager, _server, _anvil) = deposit_send_manager(cqrs.clone(), bridge).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        stage_bridged_with_mint_tx(&cqrs, &id, amount, usdc("99.99"), TxHash::ZERO).await;
+
+        let error = manager
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
+            .await
+            .unwrap_err();
+        let UsdcTransferError::DepositSendReconciliationPending {
+            cause: DepositSendPending::Broadcast { refusal, .. },
+            ..
+        } = error
+        else {
+            panic!("expected a refused broadcast, got: {error:?}");
+        };
+        refusal
+    }
+
+    #[tokio::test]
+    async fn a_refused_nonce_past_the_wallets_nonce_on_chain_is_taken() {
+        let refusal = deposit_send_refusal(
+            MockBridge::new()
+                .with_failing_usdc_broadcast(deposit_send_nonce_refused)
+                .with_wallet_nonce(|| Ok(1)),
+        )
+        .await;
+
+        assert_eq!(
+            refusal,
+            DepositSendRefusal::NonceTaken {
+                nonce: 0,
+                wallet_nonce: 1,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_nonce_the_wallet_has_not_used_on_chain_is_in_use() {
+        let refusal = deposit_send_refusal(
+            MockBridge::new()
+                .with_failing_usdc_broadcast(deposit_send_nonce_refused)
+                .with_wallet_nonce(|| Ok(0)),
+        )
+        .await;
+
+        assert_eq!(refusal, DepositSendRefusal::NonceInUse { nonce: 0 });
+    }
+
+    /// A load-balanced node can refuse the nonce of a send that mined; its
+    /// receipt keeps the refusal from paging as a taken nonce.
+    #[tokio::test]
+    async fn a_refused_nonce_of_a_mined_send_is_in_use_not_taken() {
+        let refusal = deposit_send_refusal(
+            MockBridge::new()
+                .with_failing_usdc_broadcast(deposit_send_nonce_refused)
+                .with_wallet_nonce(|| Ok(1))
+                .with_mined_usdc_send(MOCK_DEPOSIT_SEND_TX),
+        )
+        .await;
+
+        assert_eq!(refusal, DepositSendRefusal::NonceInUse { nonce: 0 });
+    }
+
+    /// Nonces are per sender: the bot wallet's nonce says nothing about a
+    /// send a rotated-out key signed.
+    #[tokio::test]
+    async fn a_refused_nonce_of_a_send_another_key_signed_is_in_use() {
+        let bridge = Arc::new(MockBridge::new().with_wallet_nonce(|| Ok(1)));
+        let (manager, _server, _anvil) =
+            deposit_send_manager(create_test_store_instance().await, bridge).await;
+        let rotated_key = PrivateKeySigner::random();
+        let prepared =
+            sign_usdc_to_alpaca_offline(&rotated_key, 0, usdc_to_u256(usdc("99.99")).unwrap());
+
+        let refusal = manager
+            .classify_deposit_send_refusal(&prepared, &deposit_send_nonce_refused())
+            .await;
+
+        assert_eq!(refusal, DepositSendRefusal::NonceInUse { nonce: 0 });
+    }
+
+    #[tokio::test]
+    async fn a_refused_nonce_whose_wallet_nonce_read_fails_is_in_use() {
+        let refusal = deposit_send_refusal(
+            MockBridge::new()
+                .with_failing_usdc_broadcast(deposit_send_nonce_refused)
+                .with_wallet_nonce(|| Err(deposit_send_broadcast_timed_out())),
+        )
+        .await;
+
+        assert_eq!(refusal, DepositSendRefusal::NonceInUse { nonce: 0 });
+    }
+
+    #[tokio::test]
+    async fn a_refused_nonce_whose_receipt_read_fails_is_in_use() {
+        let refusal = deposit_send_refusal(
+            MockBridge::new()
+                .with_failing_usdc_broadcast(deposit_send_nonce_refused)
+                .with_wallet_nonce(|| Ok(1))
+                .with_failing_usdc_receipt_read(deposit_send_broadcast_timed_out),
+        )
+        .await;
+
+        assert_eq!(refusal, DepositSendRefusal::NonceInUse { nonce: 0 });
+    }
+
+    #[tokio::test]
+    async fn a_send_the_wallet_cannot_pay_gas_for_has_no_eth_for_gas() {
+        let refusal = deposit_send_refusal(MockBridge::new().with_failing_usdc_broadcast(|| {
+            deposit_send_rpc_refusal("insufficient funds for gas * price + value")
+        }))
+        .await;
+
+        assert_eq!(refusal, DepositSendRefusal::NoEthForGas);
+    }
+
+    /// The signer pays the gas, so a send a rotated-out key signed names that
+    /// key, not the bot wallet, as the one to fund.
+    #[tokio::test]
+    async fn a_send_another_key_cannot_pay_gas_for_names_that_signer() {
+        let bridge = Arc::new(MockBridge::new());
+        let (manager, _server, _anvil) =
+            deposit_send_manager(create_test_store_instance().await, bridge).await;
+        let rotated_key = PrivateKeySigner::random();
+        let prepared =
+            sign_usdc_to_alpaca_offline(&rotated_key, 0, usdc_to_u256(usdc("99.99")).unwrap());
+
+        let refusal = manager
+            .classify_deposit_send_refusal(
+                &prepared,
+                &deposit_send_rpc_refusal("insufficient funds for gas * price + value"),
+            )
+            .await;
+
+        assert_eq!(
+            refusal,
+            DepositSendRefusal::SignerHasNoEthForGas {
+                signer: rotated_key.address(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn an_underpriced_send_has_a_fee_below_the_floor() {
+        let refusal =
+            deposit_send_refusal(MockBridge::new().with_failing_usdc_broadcast(|| {
+                deposit_send_rpc_refusal("transaction underpriced")
+            }))
+            .await;
+
+        assert_eq!(refusal, DepositSendRefusal::FeeBelowFloor);
+    }
+
+    /// The refusal and its step follow the kind phrase in the startup page,
+    /// so neither may hold an extracted phrase: the extractor reads the
+    /// rightmost one.
+    #[test]
+    fn no_refusal_text_holds_an_extracted_alert_phrase() {
+        for refusal in [
+            DepositSendRefusal::NonceTaken {
+                nonce: 7,
+                wallet_nonce: 9,
+            },
+            DepositSendRefusal::NonceInUse { nonce: 7 },
+            DepositSendRefusal::NoEthForGas,
+            DepositSendRefusal::SignerHasNoEthForGas {
+                signer: Address::repeat_byte(0x11),
+            },
+            DepositSendRefusal::FeeBelowFloor,
+            DepositSendRefusal::Rpc,
+        ] {
+            let text = format!("{refusal}. {}", refusal.operator_step());
+
+            assert_eq!(AlertKind::most_specific_in(&text), None, "{text}");
+        }
+    }
+
     fn deposit_send_broadcast_timed_out() -> CctpError {
         CctpError::Evm(EvmError::Transport(RpcError::local_usage_str(
             "request timed out",
@@ -19218,7 +19552,10 @@ mod tests {
                     error,
                     UsdcTransferError::DepositSendReconciliationPending {
                         tx: MOCK_DEPOSIT_SEND_TX,
-                        cause: DepositSendPending::Broadcast(_),
+                        cause: DepositSendPending::Broadcast {
+                            refusal: DepositSendRefusal::Rpc,
+                            ..
+                        },
                         ..
                     }
                 ),
@@ -19593,6 +19930,58 @@ mod tests {
             )
         });
         assert!(logs_contain(&format!("id={id}")));
+        assert!(logs_contain("refusal=the RPC failed"));
+    }
+
+    /// The startup page names a refusal that cannot clear by itself.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn startup_restore_names_a_taken_nonce_in_its_page() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let bridge = Arc::new(
+            MockBridge::new()
+                .with_failing_usdc_broadcast(deposit_send_nonce_refused)
+                .with_wallet_nonce(|| Ok(4)),
+        );
+        let (manager, _server, _anvil) =
+            deposit_send_manager(cqrs.clone(), Arc::clone(&bridge)).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        stage_bridged_with_mint_tx(&cqrs, &id, usdc("100"), usdc("99"), TxHash::ZERO).await;
+        let signed = PreparedTransaction::for_test(TxHash::repeat_byte(0xA1), 3);
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::PrepareDepositSend {
+                prepared: signed.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            manager.restore_prepared_deposit_sends(&pool).await,
+            RestoredDepositSends {
+                restored: 1,
+                unmined: 1,
+            }
+        );
+
+        let refusal = DepositSendRefusal::NonceTaken {
+            nonce: 3,
+            wallet_nonce: 4,
+        };
+        logs_assert(|lines| {
+            paged(
+                lines,
+                &format!("Refused because {refusal}. {}", refusal.operator_step()),
+            )
+        });
+        assert!(
+            bridge.usdc_discarded().is_empty(),
+            "the nonce stays reserved"
+        );
     }
 
     /// Passes when one captured log line is an `operational_alert` page

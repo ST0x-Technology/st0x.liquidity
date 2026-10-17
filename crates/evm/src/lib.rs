@@ -646,6 +646,51 @@ impl EvmError {
             _ => false,
         }
     }
+
+    /// Returns `true` if the node refused a transaction because the sender
+    /// cannot pay its maximum gas cost plus value: go-ethereum's
+    /// "insufficient funds for gas * price + value", or "overdraft" as some
+    /// clients phrase it.
+    ///
+    /// A best-effort parse of non-contractual error text, like the nonce hint
+    /// parsed from a "nonce too low" refusal: an unmatched phrasing returns
+    /// `false`.
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    pub fn is_insufficient_funds(&self) -> bool {
+        self.rpc_message_matches(|message| {
+            message.contains("insufficient funds") || message.contains("overdraft")
+        })
+    }
+
+    /// Returns `true` if the node refused a transaction for a fee below what
+    /// it accepts: go-ethereum's "transaction underpriced" (below the pool's
+    /// minimum tip), or a fee cap below the block base fee, which some
+    /// providers refuse at submission while go-ethereum's pool keeps it
+    /// pending. "replacement transaction underpriced" is a different refusal
+    /// (another transaction holds the nonce) and does not match.
+    ///
+    /// A best-effort parse of non-contractual error text, like the nonce hint
+    /// parsed from a "nonce too low" refusal: an unmatched phrasing returns
+    /// `false`.
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    pub fn is_fee_below_floor(&self) -> bool {
+        self.rpc_message_matches(|message| {
+            (message.contains("transaction underpriced")
+                && !message.contains("replacement transaction underpriced"))
+                || message.contains("less than block base fee")
+        })
+    }
+
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    fn rpc_message_matches(&self, matches: impl Fn(&str) -> bool) -> bool {
+        let Self::Transport(rpc_error) = self.underlying() else {
+            return false;
+        };
+
+        rpc_error
+            .as_error_resp()
+            .is_some_and(|payload| matches(&payload.message.to_ascii_lowercase()))
+    }
 }
 
 impl From<std::convert::Infallible> for EvmError {
@@ -2119,6 +2164,74 @@ mod tests {
             }
             .is_confirmation_pending()
         );
+    }
+
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    fn rpc_refusal(message: &'static str) -> EvmError {
+        EvmError::Transport(alloy::transports::RpcError::ErrorResp(
+            alloy::rpc::json_rpc::ErrorPayload {
+                code: -32000,
+                message: message.into(),
+                data: None,
+            },
+        ))
+    }
+
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    #[test]
+    fn insufficient_funds_matches_the_nodes_phrasings_in_any_case() {
+        for message in [
+            "insufficient funds for gas * price + value",
+            "Insufficient funds for gas * price + value: balance 1, tx cost 2",
+            "overdraft",
+        ] {
+            assert!(rpc_refusal(message).is_insufficient_funds(), "{message}");
+            assert!(!rpc_refusal(message).is_fee_below_floor(), "{message}");
+            assert!(
+                EvmError::RejectedBeforeBroadcast {
+                    source: Box::new(rpc_refusal(message)),
+                }
+                .is_insufficient_funds(),
+                "{message}"
+            );
+        }
+    }
+
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    #[test]
+    fn fee_below_floor_matches_underpriced_and_base_fee_refusals_only() {
+        for message in [
+            "transaction underpriced",
+            "Transaction Underpriced",
+            "max fee per gas less than block base fee: address 0x0, maxFeePerGas: 1, baseFee: 2",
+            "fee cap less than block base fee",
+        ] {
+            assert!(rpc_refusal(message).is_fee_below_floor(), "{message}");
+            assert!(!rpc_refusal(message).is_insufficient_funds(), "{message}");
+        }
+
+        for message in [
+            "replacement transaction underpriced",
+            "nonce too low",
+            "already known",
+        ] {
+            assert!(!rpc_refusal(message).is_fee_below_floor(), "{message}");
+            assert!(!rpc_refusal(message).is_insufficient_funds(), "{message}");
+        }
+    }
+
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    #[test]
+    fn refusal_classifiers_ignore_errors_without_an_rpc_payload() {
+        let pending = EvmError::PreparedTransactionReconciliationPending {
+            tx_hash: alloy::primitives::TxHash::ZERO,
+        };
+        let transport = EvmError::Transport(alloy::transports::TransportErrorKind::backend_gone());
+
+        assert!(!pending.is_insufficient_funds());
+        assert!(!pending.is_fee_below_floor());
+        assert!(!transport.is_insufficient_funds());
+        assert!(!transport.is_fee_below_floor());
     }
 
     #[test]

@@ -9629,27 +9629,34 @@ therefore performs an explicit fund-moving send:
      (`DepositSendReconciliationPending`). The aggregate stays `Bridged` and the
      job redrives after 30 s, broadcasting the same bytes again, with no retry
      budget. Once 4 hours have passed since the send was persisted, every
-     redrive pages the operator and the cadence slows to 30 minutes. A signed
-     send is never re-signed or fee-bumped. One whose nonce another tx took
-     never confirms. One that will not confirm at its current fee can still mine
-     when fees drop, so the operator first cancels it: a higher-fee 0-value
-     self-transfer from the bot wallet at the same nonce, mined. Only once a
-     different tx is mined at the send's nonce does the operator settle the
-     minted USDC and run `transfer reconcile --kind usdc`, which accepts a
-     BaseToAlpaca `Bridged` with a signed send, then restart the bot to release
-     the send's nonce. Reconcile takes that different tx's hash
-     (`--superseding-tx`) and refuses unless the chain shows it mined from the
-     bot wallet at the send's nonce, distinct from the send, with the required
-     confirmations, and paying the send's deposit address less than the send
-     pays, so a fee-bumped copy of the send is refused while a smaller payment
-     is accepted. The amount alone does not show who signed a smaller payment or
-     whether Alpaca credited it, so the operator checks both before reconciling
-     and picks the reason for where the USDC is now. The deposit address is
-     shared, so a tx that paid it at least the send's amount is accepted when
-     another transfer signed, attached or recorded it as its own deposit send.
-     Nonces are per sender, so a send whose recovered signer is not the
-     configured bot wallet (a key rotated out since) is refused. A superseding
-     tx on a transfer with no signed send is refused.
+     redrive pages the operator and the cadence slows to 30 minutes. A refused
+     broadcast names its cause: a taken nonce, a nonce in use, no ETH for gas, a
+     fee below what the node accepts, or an RPC fault. The bot counts the nonce
+     as taken only when the bot wallet signed the send, the send has no receipt,
+     and the wallet's nonce on chain is past the send's. A taken nonce or a
+     wallet with no ETH for gas cannot clear by itself, so it pages on the first
+     redrive and on every redrive after it, at the 30-minute cadence. No ETH for
+     gas names the wallet to fund: a send a key rotated out of the bot wallet
+     signed is paid for by that key's address. A signed send is never re-signed
+     or fee-bumped. One whose nonce another tx took never confirms. One that
+     will not confirm at its current fee can still mine when fees drop, so the
+     operator first cancels it: a higher-fee 0-value self-transfer from the bot
+     wallet at the same nonce, mined. Only once a different tx is mined at the
+     send's nonce does the operator settle the minted USDC and run
+     `transfer reconcile --kind usdc`, which accepts a BaseToAlpaca `Bridged`
+     with a signed send, then restart the bot to release the send's nonce.
+     Reconcile takes that different tx's hash (`--superseding-tx`) and refuses
+     unless the chain shows it mined from the bot wallet at the send's nonce,
+     distinct from the send, with the required confirmations, and paying the
+     send's deposit address less than the send pays, so a fee-bumped copy of the
+     send is refused while a smaller payment is accepted. The amount alone does
+     not show who signed a smaller payment or whether Alpaca credited it, so the
+     operator checks both before reconciling and picks the reason for where the
+     USDC is now. The deposit address is shared, so a tx that paid it at least
+     the send's amount is accepted when another transfer signed, attached or
+     recorded it as its own deposit send. Nonces are per sender, so a send whose
+     recovered signer is not the configured bot wallet (a key rotated out since)
+     is refused. A superseding tx on a transfer with no signed send is refused.
    - Mined reverted: it moved no USDC. The bot does not sign another send; it
      emits `FailDeposit` (the signed tx becomes the `deposit_ref`) and pages
      (`DepositSendUnresolved`). If the `FailDeposit` write fails, the job

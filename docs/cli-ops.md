@@ -1604,11 +1604,38 @@ bytes, so it never sends a second time for the same transfer. At startup it
 reserves the nonce of every signed send still on `Bridged` and rebroadcasts it,
 before the startup token approvals.
 
+- **"signed deposit send <tx> is not confirmed yet: its broadcast was refused
+  (<cause>) ...; later sends from the Ethereum wallet queue behind its nonce"**
+  (`DepositSendReconciliationPending`, paged at once and then every 30 minutes):
+  the node refused the send for a cause that cannot clear by itself. The page
+  names the cause and its step:
+  - "another tx took its nonce <n>; the wallet's next nonce on chain is <m>":
+    the bot wallet signed the send, it has no receipt, and the wallet's nonce on
+    chain is past the send's, so it can never mine and cannot be cancelled.
+    Before you move any USDC, check on a block explorer that `<tx>` has no
+    receipt and that a different tx is mined at its nonce with Ethereum's
+    required confirmations: a lagging node can hide the receipt of a send that
+    mined. If the send mined, do nothing. Otherwise settle it as below, with
+    that different tx.
+  - "the bot's Ethereum wallet has too little ETH to pay its gas": fund the
+    wallet. The next redrive, at most 30 minutes later, rebroadcasts the send; a
+    bot restart rebroadcasts it at once. `transfer resume` refuses while the
+    redrive is queued. The **"Low gas"** page can fire for the same wallet.
+  - "its signer <address>, not the bot's Ethereum wallet, has too little ETH to
+    pay its gas": a key rotated out of the bot wallet signed the send, so that
+    address pays its gas. Fund `<address>`, not the bot wallet; the redrive and
+    restart rebroadcast it as above.
 - **"signed deposit send <tx> is not confirmed yet ... It has stayed unconfirmed
   for ..."** (`DepositSendReconciliationPending`, paged every 30 minutes once 4
   hours have passed since the send was signed): the transfer stays `Bridged`,
   holds the guard, and the job keeps broadcasting the same bytes. The bot never
-  re-signs or fee-bumps it. Check `<tx>` on chain:
+  re-signs or fee-bumps it. A refused broadcast names its cause: "the node
+  refused its nonce <n>, but the chain does not show another tx took it"
+  (another pending tx may hold the nonce, or a node lags), "its fee is below
+  what the node accepts", or "the RPC failed". A fee too low to confirm usually
+  shows as "its confirmation is not known" or "it was dropped from the mempool",
+  since most nodes keep such a send pending instead of refusing it. Check `<tx>`
+  on chain:
   - Confirmed: do nothing. The next redrive continues the deposit.
   - No receipt, and the bot wallet's `latest` nonce is past the send's nonce: a
     different tx took the nonce, so the send can never mine. Settle it (below).
@@ -1696,9 +1723,12 @@ before the startup token approvals.
   (`operational_alert`, with `id`, `tx` and `nonce`): the bot keeps the send's
   nonce reserved and started without the Ethereum startup token approvals and
   stale-allowance revokes (the **"Startup token approvals deferred"** warning
-  below names the chain). The transfer's resume broadcasts the send again. Read
-  the `error`: an RPC fault clears by itself; for a send that will never
-  confirm, follow the not-confirmed page above.
+  below names the chain). The transfer's resume broadcasts the send again. The
+  page and its `refusal` field name the cause, and the page ends with its step,
+  as in the not-confirmed pages above. For an RPC fault the bot keeps
+  rebroadcasting; if the refusals continue, read the error in the log line and
+  check the Ethereum RPC provider. A taken nonce or a wallet with no ETH for gas
+  pages again as not confirmed on the transfer's first redrive.
 - **"Startup token approvals deferred on this chain"** (warning, not a page,
   target `orderbook`, with `chain`): a signed send restored at startup on that
   chain (an Alpaca deposit send, a vault withdrawal, or a Relay approve or

@@ -1345,6 +1345,12 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         Ok(self.ethereum.stable().tx_confirmations(tx_hash).await?)
     }
 
+    /// Returns the bot wallet's next free nonce on Ethereum at the latest
+    /// block.
+    pub async fn ethereum_wallet_nonce(&self) -> Result<u64, CctpError> {
+        Ok(self.ethereum.stable().wallet_nonce().await?)
+    }
+
     /// Returns `tx_hash` as mined on Ethereum, or `None` while the node shows
     /// no canonical receipt for it.
     pub async fn ethereum_mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, CctpError> {
@@ -7168,6 +7174,28 @@ mod tests {
             result, None,
             "ethereum_tx_confirmations must return None for an unmined tx"
         );
+    }
+
+    #[tokio::test]
+    async fn ethereum_wallet_nonce_counts_the_wallets_mined_transactions() {
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _) = setup_anvil();
+
+        let usdc_address = deploy_mock_usdc(&ethereum_endpoint, &private_key)
+            .await
+            .unwrap();
+
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            usdc_address,
+        )
+        .await
+        .unwrap();
+
+        // deploy_mock_usdc mines the deployment and a mint from this wallet.
+        assert_eq!(bridge.ethereum_wallet_nonce().await.unwrap(), 2);
     }
 
     /// Hypothesis: ethereum_tx_confirmations returns Some(N) where N >= 1 after

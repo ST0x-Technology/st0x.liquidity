@@ -775,16 +775,98 @@ pub enum UsdcTransferError {
 /// Why a signed Base->Alpaca deposit send is not confirmed yet.
 #[derive(Debug, Error)]
 pub enum DepositSendPending {
-    /// The RPC did not accept the broadcast. The node may not see the tx
-    /// yet, or another tx took its nonce.
-    #[error("its broadcast was not accepted: {0}")]
-    Broadcast(#[source] Box<CctpError>),
+    /// The RPC did not accept the broadcast, for `refusal`.
+    #[error("its broadcast was refused ({refusal}): {source}")]
+    Broadcast {
+        refusal: DepositSendRefusal,
+        #[source]
+        source: Box<CctpError>,
+    },
     /// Its receipt could not be read to the required confirmations.
     #[error("its confirmation is not known: {0}")]
     Confirmation(#[source] Box<CctpError>),
     /// Absent from the mempool, never mined.
     #[error("it was dropped from the mempool")]
     Dropped,
+}
+
+/// Why the node refused to broadcast a signed Base->Alpaca deposit send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum DepositSendRefusal {
+    /// The bot wallet signed the send, the send has no receipt, and the
+    /// wallet's nonce on chain is past the send's: another tx took its nonce,
+    /// so the send can never mine.
+    #[error(
+        "another tx took its nonce {nonce}; the wallet's next nonce on chain is {wallet_nonce}"
+    )]
+    NonceTaken { nonce: u64, wallet_nonce: u64 },
+    /// The node refused the send's nonce, but the chain does not show another
+    /// tx took it: another pending tx may hold it, a node may lag, a key
+    /// rotated out signed it, or the reads that would tell failed.
+    #[error("the node refused its nonce {nonce}, but the chain does not show another tx took it")]
+    NonceInUse { nonce: u64 },
+    #[error("the bot's Ethereum wallet has too little ETH to pay its gas")]
+    NoEthForGas,
+    /// A key rotated out of the bot's Ethereum wallet signed the send, and
+    /// that key's address pays its gas.
+    #[error(
+        "its signer {signer}, not the bot's Ethereum wallet, has too little ETH to pay its gas"
+    )]
+    SignerHasNoEthForGas { signer: Address },
+    #[error("its fee is below what the node accepts")]
+    FeeBelowFloor,
+    /// Any other failure, a transport fault or an unrecognized refusal.
+    #[error("the RPC failed")]
+    Rpc,
+}
+
+impl DepositSendRefusal {
+    /// Whether the refusal cannot clear by itself, so the bot pages on the
+    /// first redrive instead of after the send has stayed unconfirmed for
+    /// hours.
+    pub(crate) const fn pages_at_once(self) -> bool {
+        match self {
+            Self::NonceTaken { .. } | Self::NoEthForGas | Self::SignerHasNoEthForGas { .. } => true,
+            Self::NonceInUse { .. } | Self::FeeBelowFloor | Self::Rpc => false,
+        }
+    }
+
+    /// What the operator does about a send refused for this reason.
+    pub(crate) const fn operator_step(self) -> &'static str {
+        match self {
+            Self::NonceTaken { .. } => {
+                "The send can never mine and cannot be cancelled. On a block explorer, check that \
+                 it has no receipt and that a different tx is mined at its nonce with Ethereum's \
+                 required confirmations; if the send mined, do nothing. Then settle it as \
+                 docs/cli-ops.md says. If that tx paid the Alpaca deposit address, find its signer \
+                 and check the Alpaca account for the credit first. Move only the minted USDC that \
+                 has not reached Alpaca by hand, run `transfer reconcile --kind usdc --id <id> \
+                 --reason <where the USDC is now> --superseding-tx <that tx>`, and restart the bot \
+                 to release the nonce."
+            }
+            Self::NonceInUse { .. } => {
+                "The bot keeps rebroadcasting it. Check the send and the wallet's nonce on chain \
+                 (docs/cli-ops.md)."
+            }
+            Self::NoEthForGas => {
+                "Fund the bot's Ethereum wallet with ETH. The next redrive, at most 30 minutes \
+                 later, rebroadcasts the send; a bot restart rebroadcasts it at once."
+            }
+            Self::SignerHasNoEthForGas { .. } => {
+                "Fund the signer named above with ETH, not the bot's Ethereum wallet: it signed the \
+                 send, so it pays the gas. The next redrive, at most 30 minutes later, \
+                 rebroadcasts the send; a bot restart rebroadcasts it at once."
+            }
+            Self::FeeBelowFloor => {
+                "It can still mine once fees drop, and the bot keeps rebroadcasting it. Do not \
+                 reconcile it; cancel it only as docs/cli-ops.md says."
+            }
+            Self::Rpc => {
+                "The bot keeps rebroadcasting it. If the refusals continue, read the error in the \
+                 log line and check the Ethereum RPC provider."
+            }
+        }
+    }
 }
 
 /// Why a Base->Alpaca deposit send cannot be resolved automatically.
