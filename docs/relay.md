@@ -312,6 +312,10 @@ there is not confirmed yet. Orders stay fillable for about a week
 no shorter window is assumed. The hop adopts one found deposit, of both its
 order's and the current quote's amount, as the transfer's deposit, and records
 any other find as the `SwapOverdeposited` hold (see SPEC.md, "Relay recovery").
+`verify_deposit_superseded` proves what a tx at a signed deposit's nonce did: a
+cancel (reverted, or a plain 0-value self-transfer) or our deposit of the same
+order (the replacement, with its amount), from the deposit's signer at its
+nonce, confirmed in a canonical block; anything else is refused.
 
 ### Proofs
 

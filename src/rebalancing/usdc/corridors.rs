@@ -215,6 +215,24 @@ impl RecheckUsdcDeposit for UsdcCorridorTransfers {
             .verify_deposit_send_superseded(id, prepared, superseding_tx)
             .await
     }
+    async fn supersede_swap_deposit(
+        &self,
+        id: &UsdcRebalanceId,
+        superseding_tx: TxHash,
+    ) -> Result<RecheckOutcome, UsdcRecheckError> {
+        let recorded = self
+            .store
+            .load(id)
+            .await
+            .map_err(|error| Box::new(UsdcTransferError::from(error)))?
+            .ok_or_else(|| UsdcRecheckError::NotFound(id.clone()))?;
+
+        self.route(id, recorded.corridor())
+            .await
+            .map_err(Box::new)?
+            .supersede_swap_deposit(id, superseding_tx)
+            .await
+    }
 }
 
 #[async_trait]
@@ -301,6 +319,7 @@ mod tests {
     #[derive(Default)]
     struct StubTransfer {
         resumed: Mutex<Vec<UsdcRebalanceId>>,
+        superseded: Mutex<Vec<(UsdcRebalanceId, TxHash)>>,
         restores: Mutex<usize>,
         cctp_recoveries: Mutex<usize>,
     }
@@ -350,6 +369,18 @@ mod tests {
         ) -> Result<(), DepositSendNotSuperseded> {
             self.resumed.lock().unwrap().push(id.clone());
             Ok(())
+        }
+
+        async fn supersede_swap_deposit(
+            &self,
+            id: &UsdcRebalanceId,
+            superseding_tx: TxHash,
+        ) -> Result<RecheckOutcome, UsdcRecheckError> {
+            self.superseded
+                .lock()
+                .unwrap()
+                .push((id.clone(), superseding_tx));
+            Ok(RecheckOutcome::Recovered)
         }
     }
 
@@ -590,6 +621,32 @@ mod tests {
         assert!(
             matches!(error, UsdcRecheckError::NotFound(ref missing) if *missing == unknown),
             "got {error:?}"
+        );
+    }
+
+    /// A superseding tx reaches the service of the transfer's recorded
+    /// corridor, which signed the deposit it names.
+    #[tokio::test]
+    async fn superseding_tx_routes_to_the_recorded_corridors_service() {
+        let TwoCorridors {
+            transfers,
+            base,
+            robinhood,
+            store,
+            ..
+        } = two_corridors().await;
+        let id = record_on(&store, ROBINHOOD_CCTP).await;
+
+        transfers
+            .supersede_swap_deposit(&id, TxHash::repeat_byte(0x66))
+            .await
+            .unwrap();
+
+        assert!(base.superseded.lock().unwrap().is_empty());
+        assert!(robinhood.resumed.lock().unwrap().is_empty());
+        assert_eq!(
+            *robinhood.superseded.lock().unwrap(),
+            vec![(id, TxHash::repeat_byte(0x66))]
         );
     }
 

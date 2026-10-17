@@ -196,6 +196,7 @@ alert_kinds! {
         RevertedRelayOrderDepositsOnChain => "Deposits of several reverted Relay orders are on chain",
         RelayFoundDepositApprovesUnconfirmed => "Deposits of reverted Relay orders are on chain, but the lone approves do not confirm",
         RecheckAdoptedRelayRefund => "Recheck adopted a Relay refund paid at the other end",
+        RelayHubDepositCancelled => "Relay deposit from the hub was cancelled",
     }
 }
 

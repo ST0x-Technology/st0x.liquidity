@@ -205,9 +205,9 @@ vault <-> hop <-> Ethereum wallet <-> Alpaca.
   ever signed a deposit for. Entries are never removed, so a late fill or refund
   of any of them can still be matched.
 - **Reverted quotes** (`reverted_quotes`): the quotes of signed deposits that
-  mined and reverted. A reorg may still land one, so the **escrow scan** looks
-  for our deposits of their order ids in the origin chain's depository before a
-  new pair is signed or the stable is redeposited.
+  mined and reverted, or were cancelled. A reorg may still land one, so the
+  **escrow scan** looks for our deposits of their order ids in the origin
+  chain's depository before a new pair is signed or the stable is redeposited.
 - **Adopted deposit** (`AdoptSwapDeposit` -> `SwapDepositAdopted`): a deposit of
   a reverted order the escrow scan found on chain, of both its order's and the
   current quote's amount, taken from `SwapQuoted` as the swap's deposit into
@@ -218,6 +218,12 @@ vault <-> hop <-> Ethereum wallet <-> Alpaca.
   refunded at the hub than one attempt's amount. It lists each **found deposit**
   (`FoundSwapDeposit`: request id, order id, deposit tx, block, amount) and ends
   only with `transfer reconcile`.
+- **Superseding tx**: a tx an operator names to `transfer recheck` that took the
+  nonce of an Alpaca-to-chain prepared pair's deposit. A **replaced deposit**
+  (`ReplaceSwapDeposit` -> `SwapDepositReplaced`), our deposit of the same order
+  and input, becomes the swap's deposit in `SwapDeposited`; a **cancelled
+  deposit** (`RecordSwapDepositCancelled` -> `SwapDepositCancelled`) holds the
+  transfer at `SwapQuoted` (`deposit_cancelled_by`) until `transfer reconcile`.
 - **Late adoption** (`RecoverSwapCompletion` -> `SwapCompletionRecovered`): a
   fill or refund of the failed order of a `SwapFailed`, proven after the
   transfer stopped waiting for it, adopted into `Bridged` or `SwapRefunded`.

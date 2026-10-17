@@ -5480,11 +5480,32 @@ ledger an Ethereum-origin `SwapQuoted` is held credit, and so is the
 flight, and a refund paid in Ethereum USDC (`SwapRefunded` on the Ethereum side)
 is held credit, so a Base deposit send that would spend the USDC a Relay swap is
 about to deposit or was refunded pages a shortfall. The ledger only pages: it
-reserves nothing and does not block the send. A persisted pair has no operator
-exit in this build (`transfer reconcile` and `fail-usdc-transfer` refuse
-`SwapDepositPrepared`, and a resume only sends the same bytes again), so a
-pending Relay approve or deposit is never cancelled or replaced at its nonce by
-hand: the transfer would keep its guard with nothing to move it on.
+reserves nothing and does not block the send. A resume of a persisted pair only
+sends the same bytes again, and `transfer reconcile` and `fail-usdc-transfer`
+refuse `SwapDepositPrepared`. Once another tx took the nonce of an
+Alpaca-to-chain pair's deposit (signed on the shared Ethereum wallet), the
+operator names that tx with
+`transfer recheck --kind usdc --superseding-tx <tx>`, and the bot reads it on
+Ethereum before it records anything. It must be a different tx from the
+deposit's signer at the deposit's nonce, with Ethereum's required confirmations
+in a canonical block. A reverted one, or a plain cancel (a 0-value transfer to
+the signer with no calldata and no logs, not EIP-7702), cancelled the deposit
+(`RecordSwapDepositCancelled` -> `SwapDepositCancelled` -> `SwapQuoted`): the
+cancelled quote is kept for the escrow scan, no approve is left to send, and the
+recorded cancel holds the transfer at `SwapQuoted` with the USDC at the hub.
+`RequoteSwap` refuses that hold, so nothing is quoted or signed again; each
+resume pages it once the escrow scan found nothing, and the operator moves the
+USDC by hand and runs `transfer reconcile`. A successful one whose receipt holds
+our depository deposit of the quote's order id and of exactly its input replaced
+the deposit (`ReplaceSwapDeposit` -> `SwapDepositReplaced` -> `SwapDeposited` on
+that tx), and the transfer goes on through steps 6 to 8 once its job or
+`transfer resume` reads Relay's status. The recheck answers `recovered` for
+either; anything else is refused and changes nothing. Either outcome releases
+the wallet's reservations of every envelope of the pair and queues the gas of
+the replacement deposit and of each approve that mined. A chain-to-Alpaca pair,
+on the corridor chain's wallet, has no such exit in this build: its pending
+approve or deposit is never cancelled or replaced at its nonce by hand, or the
+transfer keeps its guard with nothing to move it on.
 `transfer recheck --kind usdc` reads a held escrow (`SwapEscrowUnresolved`,
 `SwapFailed`) again and adopts a late fill or refund (see "Relay recovery"); it
 refuses every other Relay state, and a Relay `DepositFailed` is settled with
@@ -5517,24 +5538,26 @@ signing a second deposit while an earlier one may still land:
   `SwapDepositPrepared` broadcasts exactly those bytes. A new pair is signed
   only from `SwapQuoted`, after the escrow scan below found no deposit of an
   earlier order. A nonce is released only for a pair that was never persisted
-  (`discard_prepared`). A reconciled transfer's envelopes keep their nonces
-  reserved until a restart, whose restore skips reconciled transfers: the
+  (`discard_prepared`), or for one whose deposit a `transfer recheck` proved
+  superseded (see "Relay hop"). A reconciled transfer's envelopes keep their
+  nonces reserved until a restart, whose restore skips reconciled transfers: the
   reconcile asks for that restart.
-- **Escrow scan.** A signed deposit that reverted (`reverted_quotes`) may still
-  land after a reorg. Before a `SwapQuoted` re-quotes, signs or redeposits, the
-  bot scans the origin chain's depository from the lowest `origin_from_block` of
-  those quotes for our deposits of their order ids, so no new pair is signed and
-  nothing is redeposited from `SwapQuoted` while one of them is on chain. A
-  deposit found is never left behind. One found deposit of both its order's and
-  the current quote's `amount_in` is adopted as the swap's deposit
-  (`AdoptSwapDeposit` -> `SwapDepositAdopted` -> `SwapDeposited` on that order's
-  quote, which leaves `reverted_quotes`) and read through the normal path (steps
-  6 to 8): its fill window starts at the adoption, and a failure Relay reports
-  for it past the window, listing the deposit, ends at `SwapFailed`, paged once.
-  Deposits of several reverted orders found together are never adopted: each
-  holds the transfer's amount, so adopting one payment would release the guard
-  with the other still at Relay. Nor is one whose order was quoted for another
-  amount (before an Alpaca-to-chain refund at the hub, whose re-quote is for the
+- **Escrow scan.** A signed deposit that reverted or was cancelled
+  (`reverted_quotes`) may still land after a reorg. Before a `SwapQuoted`
+  re-quotes, signs or redeposits, the bot scans the origin chain's depository
+  from the lowest `origin_from_block` of those quotes for our deposits of their
+  order ids, so no new pair is signed and nothing is redeposited from
+  `SwapQuoted` while one of them is on chain. A deposit found is never left
+  behind. One found deposit of both its order's and the current quote's
+  `amount_in` is adopted as the swap's deposit (`AdoptSwapDeposit` ->
+  `SwapDepositAdopted` -> `SwapDeposited` on that order's quote, which leaves
+  `reverted_quotes`) and read through the normal path (steps 6 to 8): its fill
+  window starts at the adoption, and a failure Relay reports for it past the
+  window, listing the deposit, ends at `SwapFailed`, paged once. Deposits of
+  several reverted orders found together are never adopted: each holds the
+  transfer's amount, so adopting one payment would release the guard with the
+  other still at Relay. Nor is one whose order was quoted for another amount
+  (before an Alpaca-to-chain refund at the hub, whose re-quote is for the
   refunded amount). Either is recorded, once its lone approves confirm (see
   below), as the hold `SwapOverdeposited` (`HoldOverdepositedSwap`), which lists
   every found deposit (request id, order id, deposit tx, block, amount), pages
@@ -8352,21 +8375,24 @@ named exemptions defined after the list:**
   `not_detected_yet` when Relay names a payment the chain does not show yet, and
   an error (`502` when transient or rate-limited) when the status read fails,
   and a `502` when the chain read for the payment fails; it refuses a
-  `--deposit-tx` and every other Relay state. It does not move an adopted
-  payment on: the escrow's job does at its next read, and after a `SwapFailed`
-  the operator's `transfer resume --kind usdc` does, as for any `Bridged` or
-  `SwapRefunded`. A transfer Alpaca still reports pending or failed refuses
-  without touching the aggregate. A send tx that is absent from Alpaca's
-  account-wide transfer list is a separate, INCONCLUSIVE result: the list may be
-  capped, so absence is not proof the deposit never settled. The recheck reports
-  `not_detected_yet`, changes nothing, and the operator retries later. Other
-  USDC states keep their existing paths (`resume` while non-terminal,
-  `reconcile` for funds handled out-of-band rather than settled by the
-  provider). Because the USDC recheck sends from the rebalancing wallet and
-  advances the aggregate on the request task, it first quiesces the USDC
-  rebalancing driver and holds it paused for the whole recheck, refusing with
-  `503` when the driver cannot quiesce (see "Both bot-routed USDC recovery
-  routes quiesce the rebalancing driver first" below).
+  `--deposit-tx`. Its `--superseding-tx` applies only to an Alpaca-to-chain
+  `SwapDepositPrepared`, whose deposit's nonce that tx took: the bot proves it a
+  cancel or a replacement of the deposit and records it (see "Relay hop"). It
+  refuses every other Relay state. It does not move an adopted payment on: the
+  escrow's job does at its next read, and after a `SwapFailed` the operator's
+  `transfer resume --kind usdc` does, as for any `Bridged` or `SwapRefunded`. A
+  transfer Alpaca still reports pending or failed refuses without touching the
+  aggregate. A send tx that is absent from Alpaca's account-wide transfer list
+  is a separate, INCONCLUSIVE result: the list may be capped, so absence is not
+  proof the deposit never settled. The recheck reports `not_detected_yet`,
+  changes nothing, and the operator retries later. Other USDC states keep their
+  existing paths (`resume` while non-terminal, `reconcile` for funds handled
+  out-of-band rather than settled by the provider). Because the USDC recheck
+  sends from the rebalancing wallet and advances the aggregate on the request
+  task, it first quiesces the USDC rebalancing driver and holds it paused for
+  the whole recheck, refusing with `503` when the driver cannot quiesce (see
+  "Both bot-routed USDC recovery routes quiesce the rebalancing driver first"
+  below).
 - `fail` -- force a stuck non-terminal operation to its clean `Failed` terminal
   so the system stops waiting on it; `--reason` required.
 - `reconcile` -- declare an already-terminal-failed operation resolved

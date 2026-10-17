@@ -1378,6 +1378,11 @@ fn relay_hold_step(state: &UsdcRebalance) -> &'static str {
         | UsdcRebalance::SwapRefunded {
             side: RefundSide::Destination,
             ..
+        }
+        // A resume of a cancelled deposit's hold only pages it again.
+        | UsdcRebalance::SwapQuoted {
+            deposit_cancelled_by: Some(_),
+            ..
         } => SETTLE,
         UsdcRebalance::SwapQuoted {
             direction: RebalanceDirection::AlpacaToBase,
@@ -50489,6 +50494,21 @@ mod tests {
             (
                 RebalanceDirection::AlpacaToBase,
                 [deposited(), vec![short_refund]].concat(),
+                vec![settle],
+                vec![to_raindex],
+            ),
+            (
+                RebalanceDirection::AlpacaToBase,
+                vec![
+                    quote(),
+                    UsdcRebalanceCommand::PrepareSwapDeposit {
+                        approve: None,
+                        deposit: PreparedTransaction::for_test(TxHash::repeat_byte(0xa2), 6),
+                    },
+                    UsdcRebalanceCommand::RecordSwapDepositCancelled {
+                        cancel_tx: TxHash::repeat_byte(0xc2),
+                    },
+                ],
                 vec![settle],
                 vec![to_raindex],
             ),
