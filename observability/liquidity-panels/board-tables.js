@@ -1,6 +1,6 @@
 // Behaviour the board's native tables cannot configure. The generator
 // prepends this file to header.js, which installs it once per page;
-// dashboard/src/lib/board-tables.test.ts imports it as a module through the
+// observability/tests/board-tables.test.ts imports it as a module through the
 // export line, which the generator drops.
 //
 // - Hover text: a table cell's <abbr title> or <img title> shows its title
@@ -32,7 +32,7 @@
 // - Plain hover: a cell with a tooltip field (the USD worth of a share
 //   amount) opens it from a grey corner triangle only. The triangle is
 //   stretched over the whole cell and made invisible, so the pointer
-//   anywhere on the cell opens it, like the SPA's hover.
+//   anywhere on the cell opens it.
 // - Aligned edges: the tables in `alignedPanels` always keep room for a
 //   scrollbar, so a table that scrolls ends its last column where one that
 //   does not ends it, and their ratio bars line up.

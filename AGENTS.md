@@ -218,7 +218,7 @@ This project uses a Cargo workspace with:
 - **`st0x-cli`** (`crates/cli/`): Operator command-line application
 - **`st0x-config`** (`crates/config/`): TOML/secrets loading; restricted to
   binary crates
-- **`st0x-dto`** (`crates/dto/`): Dashboard DTOs and TypeScript bindings
+- **`st0x-dto`** (`crates/dto/`): Shared API DTOs and TypeScript bindings
 - **`st0x-execution`** (`crates/execution/`): `Executor` trait, Alpaca Broker
   API, and mock implementations
 - **`st0x-tokenization`** (`crates/tokenization/`): `Tokenizer` trait and Alpaca
@@ -336,23 +336,21 @@ convention -- new generated paths should not extend that list.
 
 ### Configuration Files
 
-| File                    | Purpose                                                                           |
-| ----------------------- | --------------------------------------------------------------------------------- |
-| `Cargo.toml`            | Workspace definition, `[workspace.lints.clippy]` lint config, shared dependencies |
-| `clippy.toml`           | Clippy behavior settings (thresholds, disallowed methods, test permissions)       |
-| `flake.nix`             | Nix flake: dev shell, NixOS deployment, helper scripts                            |
-| `rust.nix`              | Rust toolchain and cargo/clippy nix config                                        |
-| `os.nix`                | NixOS server configuration for deployment                                         |
-| `services.nix`          | Systemd service definitions for the deployed server                               |
-| `deploy.nix`            | Deployment targets and settings                                                   |
-| `disko.nix`             | Disk partitioning for server                                                      |
-| `infra/default.nix`     | Infrastructure module aggregator                                                  |
-| `infra/secrets.nix`     | Agenix secret declarations (paths, not values)                                    |
-| `dashboard/default.nix` | Dashboard build derivation                                                        |
-| `dashboard/bun.nix`     | Bun runtime nix packaging for dashboard                                           |
-| `e2e/config.toml`       | End-to-end test configuration                                                     |
-| `.config/nextest.toml`  | Nextest runner configuration                                                      |
-| `crates/*/Cargo.toml`   | Per-crate dependencies and `[lints] workspace = true`                             |
+| File                   | Purpose                                                                           |
+| ---------------------- | --------------------------------------------------------------------------------- |
+| `Cargo.toml`           | Workspace definition, `[workspace.lints.clippy]` lint config, shared dependencies |
+| `clippy.toml`          | Clippy behavior settings (thresholds, disallowed methods, test permissions)       |
+| `flake.nix`            | Nix flake: dev shell, NixOS deployment, helper scripts                            |
+| `rust.nix`             | Rust toolchain and cargo/clippy nix config                                        |
+| `os.nix`               | NixOS server configuration for deployment                                         |
+| `services.nix`         | Systemd service definitions for the deployed server                               |
+| `deploy.nix`           | Deployment targets and settings                                                   |
+| `disko.nix`            | Disk partitioning for server                                                      |
+| `infra/default.nix`    | Infrastructure module aggregator                                                  |
+| `infra/secrets.nix`    | Agenix secret declarations (paths, not values)                                    |
+| `e2e/config.toml`      | End-to-end test configuration                                                     |
+| `.config/nextest.toml` | Nextest runner configuration                                                      |
+| `crates/*/Cargo.toml`  | Per-crate dependencies and `[lints] workspace = true`                             |
 
 ## Development Workflow Notes
 
@@ -629,8 +627,9 @@ reviewing code that uses configuration instead of reading secrets directly.
   `nix run .#ci` enters the right dev shells (`ci-backend`, `ci-dashboard`) and
   runs the full matrix end-to-end -- backend `cargo check` (with and without
   `--all-features`), `cargo nextest run`, `cargo clippy`, `cargo fmt --check`,
-  plus RustSec audit and regressions, dashboard `bun.nix` freshness, DTO
-  generation, lint, `svelte-check`. Mirrors CI.
+  plus RustSec audit and regressions, the Grafana board script tests in
+  `observability/tests` (vitest, tsc, prettier), and the Turnkey message utility
+  tests. Mirrors CI.
 
   For iteration (e.g. backend-only), run individual steps in the corresponding
   shell:

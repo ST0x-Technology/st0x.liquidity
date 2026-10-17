@@ -1,7 +1,6 @@
 // Business Text "afterRender" code for the Liquidity bot's detail panel: the
-// SPA's trade and transfer detail dialogs (trade-history-panel.svelte,
-// transfer-panel.svelte in ST0x-Technology/st0x.liquidity) for the row whose
-// ⓘ was clicked in the Trades or Rebalances table.
+// trade and transfer detail dialog for the row whose ⓘ was clicked in the
+// Trades or Rebalances table.
 //
 // The click sets the hidden `detail` variable to the row's id. The panel's
 // data is the Trades and Rebalances tables' own results through the
@@ -29,7 +28,7 @@ root.style.setProperty('--det-text', theme.colors.text.primary);
 root.classList.toggle('det-light', !theme.isDark);
 
 // Alternate rows in the board's Trades and Rebalances
-// tables, like the SPA's. Grafana's table has no striping option, but its
+// tables. Grafana's table has no striping option, but its
 // grid marks every row rdg-row-even or rdg-row-odd. This panel lives only on
 // the Dashboard tab, so the rule goes into the page while the panel is
 // mounted and comes out when the board is left. Grafana can mount the panel
@@ -72,7 +71,7 @@ const entriesOf = (refId) =>
     env
   );
 
-// The SPA's formatUtc: "Oct 6, 12:24:39 UTC".
+// A UTC time: "Oct 6, 12:24:39 UTC".
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 const utc = (value) => {
   const date = new Date(value);
@@ -81,7 +80,7 @@ const utc = (value) => {
   return `${MONTHS[date.getUTCMonth()]} ${date.getUTCDate()}, ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())} UTC`;
 };
 
-// The SPA's formatDecimal(value, 3): fixed decimals, comma groups, and the
+// An amount with 3 fixed decimals and comma groups, or the
 // raw value when it does not parse.
 const decimal = (value) => {
   const number = Number(value);
@@ -111,7 +110,7 @@ const typeOf = (transfer) => (transfer.kind === 'usdc_bridge' ? transfer.directi
 const typeLabel = (transfer) => TYPES[typeOf(transfer)] || transfer.kind || '—';
 const assetOf = (transfer) => (transfer.kind === 'usdc_bridge' || !transfer.symbol ? 'USDC' : transfer.symbol);
 
-// The SPA's statusStyle colours.
+// The colour of each status.
 const statusClass = (status) => {
   const lower = String(status || '').toLowerCase();
   if (lower.includes('completed') || lower.includes('filled') || lower.includes('deposited') || lower.includes('confirmed')) return 'det-green';
@@ -168,8 +167,7 @@ const txLink = (hash, chain) =>
     ? `<a href="${EXPLORERS[chain]}/tx/${escapeHtml(hash)}" target="_blank" rel="noopener noreferrer">${shortHash(hash)} ↗</a>`
     : `<span class="det-mono" title="${escapeHtml(hash)}">${shortHash(hash)}</span>`;
 
-// The bot's event timeline: each step with its time and fields, like the
-// SPA's dialog.
+// The bot's event timeline: each step with its time and fields.
 // The board loads no event lines (a slow read for a dialog most loads never
 // open): each row fetches its own when its dialog opens.
 const eventLines = [];
@@ -509,7 +507,7 @@ const dismiss = () => {
   dialog.close();
 };
 dialog.oncancel = recordDismissal;
-// A click on the backdrop closes it, like the SPA.
+// A click on the backdrop closes it.
 dialog.onclick = (event) => {
   if (event.target === dialog) dismiss();
 };

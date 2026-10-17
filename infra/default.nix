@@ -436,21 +436,6 @@ let
           echo "Database reset complete. Backup at: $backup_dir"
         '';
       };
-
-      "${env}Dashboard" = pkgs.writeShellApplication {
-        name = "${env}-dashboard";
-        runtimeInputs = sshBuildInputs ++ [
-          pkgs.openssh
-          pkgs.nushell
-          pkgs.bun
-        ];
-        text = ''
-          ${resolveHost}
-          trap _cleanup_identity EXIT
-          export identity host_ip
-          nu scripts/dashboard.nu "${env}" "$@"
-        '';
-      };
     };
 
   envResults = builtins.listToAttrs (

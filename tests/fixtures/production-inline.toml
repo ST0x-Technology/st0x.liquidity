@@ -17,7 +17,8 @@
 # together. The release validates this file inside the bot image it rolls
 # (the 2026-09-04 crash loop was a field only the newer image knew).
 #
-# HTTP API port for the dashboard and health checks.
+# HTTP API port (REST reads for st0x-liquidity-client and the exporter, and
+# health checks).
 server_port = 8001
 # HTTP port for the apalis-board job queue UI.
 board_port = 8002

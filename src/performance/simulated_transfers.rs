@@ -1,14 +1,14 @@
 //! Seeds simulated cross-venue transfer history (USDC rebalances, equity
-//! mints, and equity redemptions) for local dashboard simulation, mirroring
+//! mints, and equity redemptions) for local simulation, mirroring
 //! `super::seed_simulated_hedge_latency_history`'s approach: real CQRS
 //! commands through a temporary store instead of raw inserts.
 //!
 //! The aggregate stores maintain the materialized views consumed by the
-//! Transfers panel (`dashboard/transfer_loader.rs`) while these commands are
-//! persisted. The mint/redemption stores are also wired with `EquityTimingProjection`
-//! (mirroring how the USDC store is wired with `RebalanceTimingProjection`
-//! below) so the Performance tab's "Equity rebalance stage breakdown" chart
-//! also gets historical data, not just the Transfers panel.
+//! transfer history reads (`dashboard/transfer_loader.rs`) while these commands
+//! are persisted. The mint/redemption stores are also wired with
+//! `EquityTimingProjection` (mirroring how the USDC store is wired with
+//! `RebalanceTimingProjection` below) so the equity rebalance stage breakdown
+//! also gets historical data, not just the transfer history.
 //!
 //! Single-run-only, same caveat as the hedge-latency fixture: a second call
 //! against the same pool hits each aggregate's own already-initialized guard
@@ -279,7 +279,7 @@ fn usdc(value: f64) -> anyhow::Result<Usdc> {
     Ok(Usdc::new(Float::parse(format!("{value:.2}"))?))
 }
 
-/// Seeds deterministic equity-mint history for local dashboard simulation.
+/// Seeds deterministic equity-mint history for local simulation.
 ///
 /// Drives the `TokenizedEquityMint` aggregate's happy path
 /// (`RequestMintAt` -> `SubmitMintRequestAt` -> `PollAt` -> `WrapTokensAt` -> `DepositToVaultAt`)
@@ -384,16 +384,15 @@ pub async fn seed_simulated_mint_history(
 }
 
 /// Seeds deterministic USDC-rebalance (Alpaca<->Base) history for local
-/// dashboard simulation.
+/// simulation.
 ///
 /// Drives the `UsdcRebalance` aggregate (whose `Services = ()`, so no
 /// fixture service implementations are needed -- none of its commands call
 /// out to an external service) through the full per-direction command
 /// sequence, alternating direction by day. Wired with
 /// `RebalanceTimingProjection` (the equity-mint/redemption fixtures wire
-/// `EquityTimingProjection` for the same reason) so the Performance tab's
-/// "Rebalance stage breakdown" chart, not just the dashboard's Transfers
-/// panel, gets historical data too.
+/// `EquityTimingProjection` for the same reason) so the rebalance stage
+/// breakdown, not just the transfer history, gets historical data too.
 pub async fn seed_simulated_usdc_rebalance_history(
     pool: &SqlitePool,
     now: DateTime<Utc>,
@@ -1156,8 +1155,7 @@ impl Wrapper for FixtureWrapper {
     }
 }
 
-/// Seeds deterministic equity-redemption history for local dashboard
-/// simulation.
+/// Seeds deterministic equity-redemption history for local simulation.
 ///
 /// Drives the `EquityRedemption` aggregate's happy path (`RedeemAt` ->
 /// direct Raindex submission -> `RecordWithdrawSubmissionAt` ->

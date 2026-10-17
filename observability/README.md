@@ -42,24 +42,26 @@ into the board JSON. The plugin is installed on the box by `T0Trade/t0.devops`
 (`GF_INSTALL_PLUGINS`); the PR check's throwaway Grafana does not have it, so it
 loads these panels as "Panel plugin not found" and still passes. The header
 reads its query rows through `header-rows.js`, which
-`dashboard/src/lib/board-header.test.ts` tests.
-`dashboard/src/lib/board-header-render.test.ts` and `board-detail.test.ts` run
-the header's and the row dialog's scripts as deployed, from the generated board
-JSON, in happy-dom, so regenerate the boards before you run them.
+`observability/tests/board-header.test.ts` tests. `board-header-render.test.ts`
+and `board-detail.test.ts` in the same directory run the header's and the row
+dialog's scripts as deployed, from the generated board JSON, in happy-dom, so
+regenerate the boards before you run them.
+
+The tests live in `observability/tests` (vitest). Run them there with
+`bun install && bun run test`. CI's `dashboard tests` job and the flake's `ci`
+app run them too.
 
 The recovery commands in the header's guide (`recovery-guide.json`) and in the
-row dialog (`recovery-commands.js`) are copies of the SPA's
-(`dashboard/src/lib/transfer.ts`), in the operations client form for the
-environment the board shows (`client-env.js`).
-`dashboard/src/lib/transfer-board.test.ts` fails when a copy drifts, for every
-status the DTOs carry, so change the SPA and the copies together. The same test
-covers the dialog's `status-history.js` and `log-lines.js`, and writes every
-shown client command to `crates/liquidity-client/testdata/shown-commands.txt`,
-which the client's `every_shown_recovery_command_parses` test parses with the
-real CLI, and every shown offline `stox` command to
-`crates/cli/testdata/shown-stox-commands.txt`, which `crates/cli` parses and
-classifies. Run `bunx vitest run -u` in `dashboard/` after a command changes.
-The test runs in the dashboard build of CI.
+row dialog (`recovery-commands.js`) are the source of truth for the commands
+operators see, in the operations client form for the environment the board shows
+(`client-env.js`). `recovery.test.ts` checks them for every status the DTOs
+carry. The same test covers the dialog's `status-history.js` and `log-lines.js`,
+and writes every shown client command to
+`crates/liquidity-client/testdata/shown-commands.txt`, which the client's
+`every_shown_recovery_command_parses` test parses with the real CLI, and every
+shown offline `stox` command to `crates/cli/testdata/shown-stox-commands.txt`,
+which `crates/cli` parses and classifies. After a command changes, run
+`bunx vitest run -u` in `observability/tests` to regenerate both files.
 
 The Dashboard tab's inventory is three Grafana tables: USD at the brokers
 (Alpaca), USD on each chain, and Equities, each with its total in USD after its

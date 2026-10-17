@@ -1,6 +1,6 @@
 // Each inventory table's total in USD, after its title. The generator
 // prepends this file to header.js, which calls it on every render;
-// dashboard/src/lib/board-totals.test.ts imports it as a module through the
+// observability/tests/board-totals.test.ts imports it as a module through the
 // export line, which the generator drops.
 //
 // A panel title is fixed text in Grafana, so the total is a CSS ::after on

@@ -164,7 +164,7 @@ The stablecoin a chain's cash leg settles in, pinned in code per `Chain` as
 address, symbol and decimals (`Chain::settlement_stable`, type
 `SettlementStable`). Vault polling reads its vault, the fill parse scales the
 cash amount by its decimals, and the inventory view carries its symbol for the
-dashboard's cash row. An `InventoryTrade` fill must quote in its address; a
+board's cash row. An `InventoryTrade` fill must quote in its address; a
 `ClearV3`/`TakeOrderV3` fill is matched by its symbol, with the address gated by
 vault discovery. The portfolio snapshot still labels cash `USDC`. USDC on Base,
 Ethereum and HyperEVM; USDG on Robinhood. Circle's USDC is exposed separately
@@ -387,7 +387,7 @@ The type is `DeviationBand`.
 
 A target share together with the deviation band around it: the range one chain's
 vault is held to for an equity, or a cash corridor's target and deviation. The
-dashboard inventory carries at most one per chain entry. The DTO type is
+inventory DTO carries at most one per chain entry. The DTO type is
 `RebalancingBand`.
 
 ### Minimum Operation Size

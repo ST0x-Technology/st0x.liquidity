@@ -19,7 +19,7 @@ let
   # Each environment's deploy.nix decrypts with its own host key.
   # When staging needs different secrets, add staging-specific entries below.
   # `carriesConfig` (services.nix) selects the kinds with an encryptedSecret
-  # ("st0x"/"cli"); "plain" and "static" (datasette, dashboard) have none.
+  # ("st0x"/"cli"); "plain" (datasette) has none.
   secretServiceNames = builtins.filter (name: carriesConfig byName.${name}.kind) (
     builtins.attrNames byName
   );
