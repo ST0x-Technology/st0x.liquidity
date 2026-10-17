@@ -1666,7 +1666,7 @@ pub(super) async fn verify_deposit_send_superseded_on_chain(
         wallet_ctx.base_wallet().clone(),
     ))?;
 
-    Ok(verify_deposit_send_superseded(
+    verify_deposit_send_superseded(
         &bridge,
         Some(pool),
         id,
@@ -1675,7 +1675,9 @@ pub(super) async fn verify_deposit_send_superseded_on_chain(
         wallet_ctx.ethereum_wallet().address(),
         deposit_send_required_confirmations(&ctx.chains)?,
     )
-    .await?)
+    .await?;
+
+    Ok(())
 }
 
 /// The vault withdrawal or send to the issuer a redemption reconcile checks on chain

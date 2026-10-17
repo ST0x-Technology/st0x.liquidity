@@ -34,6 +34,7 @@ pub use manager::{
 };
 pub(crate) use relay::RelayHop;
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
@@ -778,7 +779,7 @@ pub enum DepositSendPending {
     /// The RPC did not accept the broadcast, for `refusal`.
     #[error("its broadcast was refused ({refusal}): {source}")]
     Broadcast {
-        refusal: DepositSendRefusal,
+        refusal: Box<DepositSendRefusal>,
         #[source]
         source: Box<CctpError>,
     },
@@ -799,7 +800,11 @@ pub enum DepositSendRefusal {
     #[error(
         "another tx took its nonce {nonce}; the wallet's next nonce on chain is {wallet_nonce}"
     )]
-    NonceTaken { nonce: u64, wallet_nonce: u64 },
+    NonceTaken {
+        nonce: u64,
+        wallet_nonce: u64,
+        superseding: SupersedingTx,
+    },
     /// The node refused the send's nonce, but the chain does not show another
     /// tx took it: another pending tx may hold it, a node may lag, a key
     /// rotated out signed it, or the reads that would tell failed.
@@ -832,9 +837,103 @@ impl DepositSendRefusal {
     }
 
     /// What the operator does about a send refused for this reason.
-    pub(crate) const fn operator_step(self) -> &'static str {
+    pub(crate) fn operator_step(self) -> Cow<'static, str> {
         match self {
-            Self::NonceTaken { .. } => {
+            Self::NonceTaken { superseding, .. } => superseding.operator_step(),
+            Self::NonceInUse { .. } => Cow::Borrowed(
+                "The bot keeps rebroadcasting it. Check the send and the wallet's nonce on chain \
+                 (docs/cli-ops.md).",
+            ),
+            Self::NoEthForGas => Cow::Borrowed(
+                "Fund the bot's Ethereum wallet with ETH. The next redrive, at most 30 minutes \
+                 later, rebroadcasts the send; a bot restart rebroadcasts it at once.",
+            ),
+            Self::SignerHasNoEthForGas { .. } => Cow::Borrowed(
+                "Fund the signer named above with ETH, not the bot's Ethereum wallet: it signed the \
+                 send, so it pays the gas. The next redrive, at most 30 minutes later, \
+                 rebroadcasts the send; a bot restart rebroadcasts it at once.",
+            ),
+            Self::FeeBelowFloor => Cow::Borrowed(
+                "It can still mine once fees drop, and the bot keeps rebroadcasting it. Do not \
+                 reconcile it; cancel it only as docs/cli-ops.md says.",
+            ),
+            Self::Rpc => Cow::Borrowed(
+                "The bot keeps rebroadcasting it. If the refusals continue, read the error in the \
+                 log line and check the Ethereum RPC provider.",
+            ),
+        }
+    }
+}
+
+/// The tx the bot found at a taken deposit send's nonce, checked as
+/// `transfer reconcile --superseding-tx` checks it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupersedingTx {
+    /// Reconcile accepts it: mined from the bot wallet at the send's nonce
+    /// with Ethereum's required confirmations, and it paid the Alpaca deposit
+    /// address nothing unless another transfer claims it as its own send.
+    Proven(TxHash),
+    /// Reconcile accepts it, but it paid the Alpaca deposit address `paid`,
+    /// less than the send's `send_amount`, and no other transfer claims it:
+    /// part of this transfer's USDC may already be at Alpaca.
+    PartialPayment {
+        tx: TxHash,
+        paid: U256,
+        send_amount: U256,
+    },
+    /// Not yet deep enough to prove the send can never mine.
+    Unconfirmed(TxHash),
+    /// It paid the Alpaca deposit address at least the send's amount and no
+    /// other transfer claims it as its send, so it may be a fee-bumped copy
+    /// of this send.
+    PaidTheDepositAddress(TxHash),
+    /// Found, but reconcile refuses it for another reason.
+    Unverified(TxHash),
+    /// The search found nothing, or a read failed.
+    NotFound,
+}
+
+impl SupersedingTx {
+    fn operator_step(self) -> Cow<'static, str> {
+        match self {
+            Self::Proven(tx) => Cow::Owned(format!(
+                "The send can never mine: tx {tx} took its nonce, passes the checks reconcile \
+                 makes and paid the Alpaca deposit address none of this transfer's USDC. Settle \
+                 it as docs/cli-ops.md says: move the minted USDC to Alpaca by hand, run \
+                 `transfer reconcile --kind usdc --id <id> --reason <where the USDC is now> \
+                 --superseding-tx {tx}`, and restart the bot to release the nonce."
+            )),
+            Self::PartialPayment {
+                tx,
+                paid,
+                send_amount,
+            } => Cow::Owned(format!(
+                "The send can never mine: tx {tx} took its nonce and passes the checks reconcile \
+                 makes, but it paid the Alpaca deposit address {} USDC of the send's {} USDC. \
+                 Before you move any USDC, find its signer and check the Alpaca account for that \
+                 credit (docs/cli-ops.md). Move only the minted USDC that has not reached Alpaca \
+                 by hand, run `transfer reconcile --kind usdc --id <id> --reason <where the USDC \
+                 is now> --superseding-tx {tx}`, and restart the bot to release the nonce.",
+                manager::display_usdc(paid),
+                manager::display_usdc(send_amount),
+            )),
+            Self::Unconfirmed(tx) => Cow::Owned(format!(
+                "Tx {tx} took its nonce but does not have Ethereum's required confirmations \
+                 yet. Do not settle it yet: a later page says whether reconcile accepts it."
+            )),
+            Self::PaidTheDepositAddress(tx) => Cow::Owned(format!(
+                "Tx {tx} took its nonce and paid the Alpaca deposit address, so it can be a \
+                 fee-bumped copy of the send and the deposit may have gone through. Do not \
+                 reconcile with it and do not move the minted USDC by hand: that can pay \
+                 Alpaca twice. No command settles this transfer: find its signer and check \
+                 whether Alpaca credited {tx}, then escalate with both answers \
+                 (docs/cli-ops.md)."
+            )),
+            Self::Unverified(tx) => Cow::Owned(format!(
+                "Tx {tx} was found at its nonce but fails a check reconcile makes; the bot \
+                 log names it. Settle only as docs/cli-ops.md says."
+            )),
+            Self::NotFound => Cow::Borrowed(
                 "The send can never mine and cannot be cancelled. On a block explorer, check that \
                  it has no receipt and that a different tx is mined at its nonce with Ethereum's \
                  required confirmations; if the send mined, do nothing. Then settle it as \
@@ -842,29 +941,8 @@ impl DepositSendRefusal {
                  and check the Alpaca account for the credit first. Move only the minted USDC that \
                  has not reached Alpaca by hand, run `transfer reconcile --kind usdc --id <id> \
                  --reason <where the USDC is now> --superseding-tx <that tx>`, and restart the bot \
-                 to release the nonce."
-            }
-            Self::NonceInUse { .. } => {
-                "The bot keeps rebroadcasting it. Check the send and the wallet's nonce on chain \
-                 (docs/cli-ops.md)."
-            }
-            Self::NoEthForGas => {
-                "Fund the bot's Ethereum wallet with ETH. The next redrive, at most 30 minutes \
-                 later, rebroadcasts the send; a bot restart rebroadcasts it at once."
-            }
-            Self::SignerHasNoEthForGas { .. } => {
-                "Fund the signer named above with ETH, not the bot's Ethereum wallet: it signed the \
-                 send, so it pays the gas. The next redrive, at most 30 minutes later, \
-                 rebroadcasts the send; a bot restart rebroadcasts it at once."
-            }
-            Self::FeeBelowFloor => {
-                "It can still mine once fees drop, and the bot keeps rebroadcasting it. Do not \
-                 reconcile it; cancel it only as docs/cli-ops.md says."
-            }
-            Self::Rpc => {
-                "The bot keeps rebroadcasting it. If the refusals continue, read the error in the \
-                 log line and check the Ethereum RPC provider."
-            }
+                 to release the nonce.",
+            ),
         }
     }
 }

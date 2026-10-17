@@ -2608,6 +2608,13 @@ impl<Signer: Wallet> UsdcBridgeHelper for RelayHop<Signer> {
         self.bridge.ethereum_wallet_nonce().await
     }
 
+    async fn ethereum_tx_at_nonce(
+        &self,
+        nonce: u64,
+    ) -> Result<Option<TxHash>, StableEndpointError> {
+        self.bridge.ethereum_tx_at_nonce(nonce).await
+    }
+
     async fn ethereum_tx_block(&self, tx_hash: TxHash) -> Result<u64, StableEndpointError> {
         self.bridge.ethereum_tx_block(tx_hash).await
     }
@@ -2868,6 +2875,7 @@ where
     ) -> Result<(), DepositSendNotSuperseded> {
         self.verify_hub_deposit_send_superseded(id, prepared, superseding_tx)
             .await
+            .map(|_| ())
     }
 }
 

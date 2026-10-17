@@ -1351,6 +1351,12 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         Ok(self.ethereum.stable().wallet_nonce().await?)
     }
 
+    /// Returns the bot wallet's tx mined at `nonce` on Ethereum, or `None`
+    /// while the node shows nothing mined there.
+    pub async fn ethereum_tx_at_nonce(&self, nonce: u64) -> Result<Option<TxHash>, CctpError> {
+        Ok(self.ethereum.stable().tx_at_nonce(nonce).await?)
+    }
+
     /// Returns `tx_hash` as mined on Ethereum, or `None` while the node shows
     /// no canonical receipt for it.
     pub async fn ethereum_mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, CctpError> {

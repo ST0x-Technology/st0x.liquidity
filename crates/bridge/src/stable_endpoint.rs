@@ -122,6 +122,11 @@ impl<'wallet, W: Wallet> StableEndpoint<'wallet, W> {
             .await?)
     }
 
+    /// Returns the wallet's tx mined at `nonce`; see [`st0x_evm::tx_at_nonce`].
+    pub async fn tx_at_nonce(&self, nonce: u64) -> Result<Option<TxHash>, StableEndpointError> {
+        Ok(st0x_evm::tx_at_nonce(self.wallet.provider(), self.wallet.address(), nonce).await?)
+    }
+
     /// Returns `tx_hash` as mined; see [`st0x_evm::mined_tx`].
     pub async fn mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, StableEndpointError> {
         Ok(st0x_evm::mined_tx(self.wallet.provider(), tx_hash).await?)

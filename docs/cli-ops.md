@@ -1616,7 +1616,38 @@ before the startup token approvals.
     receipt and that a different tx is mined at its nonce with Ethereum's
     required confirmations: a lagging node can hide the receipt of a send that
     mined. If the send mined, do nothing. Otherwise settle it as below, with
-    that different tx.
+    that different tx. The bot searches the chain for the tx at the nonce and
+    checks it as reconcile does, and the page's step names what it found:
+    - "tx <hash> took its nonce and passes the checks reconcile makes": it paid
+      the deposit address nothing, or it is another transfer's deposit send. The
+      step holds the reconcile command with that tx. Reconcile checks it again.
+    - "... passes the checks reconcile makes, but it paid the Alpaca deposit
+      address <paid> USDC of the send's <amount> USDC": it is not a copy of the
+      send, but it can be this transfer's USDC sent by hand. Find its signer and
+      check the Alpaca account for that credit before you move any USDC. Move
+      only the minted USDC that has not reached Alpaca, and pick the reconcile
+      reason for where the USDC is now. The step holds the reconcile command
+      with that tx.
+    - "... does not have Ethereum's required confirmations yet": wait for a
+      later page.
+    - "... paid the Alpaca deposit address": it paid at least the send's amount,
+      so it can be a fee-bumped copy of the send and the deposit may have gone
+      through. Do not reconcile with it, and do not move the minted USDC by
+      hand: that can pay Alpaca twice. No command settles this state
+      (`fail-usdc-transfer` refuses a transfer past its burn, and
+      `transfer recheck --deposit-tx` takes only a `DepositFailed` transfer).
+      Find its signer, check whether Alpaca credited that tx and whether the
+      minted USDC is still in the bot's Ethereum wallet, then escalate with the
+      answers. The transfer holds the guard and pages every 30 minutes until
+      then.
+    - "... fails a check reconcile makes": the warning "The tx at a taken
+      deposit send's nonce does not prove the send can never mine" names the
+      check.
+    - No tx named: the search found nothing or a read failed. It reads the
+      wallet's nonce at past blocks, so it needs a node that serves past state.
+      Find the tx on a block explorer. If it paid the Alpaca deposit address,
+      find its signer and check the Alpaca account for the credit first, then
+      move only the minted USDC that has not reached Alpaca.
   - "the bot's Ethereum wallet has too little ETH to pay its gas": fund the
     wallet. The next redrive, at most 30 minutes later, rebroadcasts the send; a
     bot restart rebroadcasts it at once. `transfer resume` refuses while the
