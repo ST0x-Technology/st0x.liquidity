@@ -258,11 +258,14 @@ pub(crate) struct VaultWithdrawUsdcRequest {
     pub(crate) amount: DecimalAmount,
 }
 
-/// Body of `POST /liquidity-capital/alpaca-deposit`: USDC to send from the
-/// bot's Ethereum wallet. No chain and no destination: the bot always sends
-/// on Ethereum to the deposit address Alpaca gives for its own account.
+/// Body of `POST /liquidity-capital/alpaca-deposit`: the run's operation id
+/// and the USDC to send from the bot's Ethereum wallet. No chain and no
+/// destination: the bot always sends on Ethereum to the deposit address
+/// Alpaca gives for its own account.
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct AlpacaDepositRequest {
+    pub(crate) operation_id: Uuid,
     pub(crate) amount: DecimalAmount,
 }
 

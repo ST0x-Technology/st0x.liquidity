@@ -40,6 +40,7 @@ use crate::trading::onchain::trade_accountant::DexTradeAccountingJobQueue;
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(90);
 
 mod alerts;
+mod alpaca_deposit;
 pub mod api;
 #[cfg(feature = "wallet-turnkey")]
 pub mod approval_policy;
@@ -398,7 +399,7 @@ async fn run_bot_session_inner(
         settings: dashboard::settings_from_ctx(&ctx),
         recovery: recovery_cell.clone(),
         process_tx: process_tx_cell.clone(),
-        resume_lock,
+        resume_lock: Arc::clone(&resume_lock),
         vault_deposit_lock: Arc::new(tokio::sync::Mutex::new(())),
         vault_withdraw_lock: Arc::new(tokio::sync::Mutex::new(())),
         equity_wallet_locks: Arc::default(),
@@ -446,6 +447,7 @@ async fn run_bot_session_inner(
             pnl_ledger,
             projection_maintenance,
             equity_prices,
+            resume_lock,
         },
         shutdown_token.clone(),
         conductor_startup_tokens(&ctx, &startup_barrier),
@@ -1891,6 +1893,7 @@ mod tests {
                     conductor::projection_pause::ProjectionMaintenance::for_test(),
                 ),
                 equity_prices: dashboard::equity_price::EquityPriceStore::new([]),
+                resume_lock: Arc::new(api::ResumeLock(Arc::new(tokio::sync::Mutex::new(())))),
             },
             tokio_util::sync::CancellationToken::new(),
             create_test_startup_tokens(),
@@ -1932,6 +1935,7 @@ mod tests {
                     conductor::projection_pause::ProjectionMaintenance::for_test(),
                 ),
                 equity_prices: dashboard::equity_price::EquityPriceStore::new([]),
+                resume_lock: Arc::new(api::ResumeLock(Arc::new(tokio::sync::Mutex::new(())))),
             },
             tokio_util::sync::CancellationToken::new(),
             create_test_startup_tokens(),

@@ -8654,48 +8654,92 @@ effect rather than a generic intent:
   BaseToAlpaca deposit leg makes: the token is the corridor's Ethereum USDC and
   the address is the one `get_wallet_address(USDC, ethereum)` returns, never one
   the request names, so the capital group cannot send the bot's USDC out of our
-  accounts. An amount that is not positive or is finer than USDC's six decimals
-  is refused with `400`, then it refuses with `503` until startup completes,
-  takes the recovery lock (`409`) and quiesces the USDC rebalancing driver
-  (`503`), then refuses with `409` while any USDC transfer, on any corridor and
-  in either direction, is in flight or holds its corridor guard (the single
+  accounts. Like `cctp-bridge`, every request carries the client's operation id
+  (a UUID, which `st0x-liquidity-client` generates per run and prints before
+  sending), and an id holds at most one transfer: the `AlpacaDepositOperation`
+  aggregate, which follows the design of ADR 0023. An amount that is not
+  positive or is finer than USDC's six decimals is refused with `400`, then it
+  refuses with `503` until startup completes. A request whose id already holds a
+  transfer never signs or sends a second one, and its amount must match the
+  recorded one, else `409`. A settled transfer, or a pending one a node already
+  holds (mined or in its mempool), is answered at once with the recorded
+  transfer and the status the chain proves, since nothing is sent; a pending one
+  no node holds (a crash before its broadcast, or a drop) is sent again from its
+  recorded bytes under the lock and the pause below, like a new deposit. Any
+  other request first asks Alpaca for the deposit address, before it takes
+  anything and bounded at 10 seconds, so a slow or hung Alpaca answers `502`
+  without blocking any USDC transfer or any verb that takes the recovery lock.
+  Then it takes the recovery lock (`409`) and quiesces the USDC rebalancing
+  driver (`503`), looks the id up again (so two concurrent requests with one id
+  send once), then refuses with `409` while any USDC transfer, on any corridor
+  and in either direction, is in flight or holds its corridor guard (the single
   flight gates of `transfer-usdc` widened to every corridor: an every corridor
   latch, a hold in memory, a live or retryable job row, or a durable guard
   holder such as a transfer that failed after its burn and awaits reconcile),
   since every corridor passes through that wallet and a transfer may need what
   the deposit would take. Then `503` while the Ethereum wallet cannot be shown
   to pay gas, checked against Ethereum's own `[alerts.low_balance_thresholds]`
-  entry, `502` when Alpaca does not give the deposit address, and `409` naming
-  the wallet's balance and the amount when the balance is short. The transfer is
-  sent once and never retried, since it carries no idempotency key; a failed
-  send answers `500` saying the transfer may still have gone out and the wallet
-  must be checked onchain before a rerun. It answers at the broadcast with
-  `chain`, `depositAddress`, `amount`, `amountRaw` and `transferTx`, and the
-  detached task holds the lock and the pause until the transfer has Ethereum's
-  required confirmations or is proven failed, waiting again while its fate is
-  unknown and raising one operational alert after 10 minutes, since meanwhile
-  every USDC transfer waits; a panic while confirming keeps both until a
-  restart. Once the transfer is proven to have moved the USDC, the task frees
-  both, polls Alpaca with `poll_deposit_by_tx_hash` until it reports the deposit
-  final, and logs the transfer id and the final status; a deposit Alpaca reports
-  failed, leaves in another status, or does not report before the poll times out
-  raises an operational alert. The vault verbs and `reset-allowance` take
-  neither the lock nor the pause, like the `st0x-cli` verbs: pausing the driver
-  would refuse every vault operation for the length of each USDC transfer.
-  `vault-deposit` does take its own lock (`409` while another `vault-deposit`
-  request runs): the deposit reads the allowance and approves exactly the amount
-  when it is short, so two concurrent requests for a token without the startup
-  MAX grant could overwrite each other's approval. The lock covers these
-  requests only: without the MAX grant, a request can still use up the exact
-  approval of a USDC transfer worker's deposit, which then reverts and needs a
-  redrive. `vault-withdraw` and `vault-withdraw-usdc` share a withdraw lock of
-  their own (`409` while either runs), held until the outcome of the tx it
-  answered with is known, for the rerun reason below; it does not cover the
-  bot's own transfer withdrawals. `wrap-equity` deposits `quantity` underlying
-  shares of `symbol` into the chain's ERC-4626 wrapper and `unwrap-equity`
-  redeems `quantity` wrapped shares from it, both for the bot's own wallet on
-  `chain`, and `redeem` sends `quantity` underlying shares from that wallet to
-  Alpaca's redemption wallet there, always the chain's own
+  entry, and `409` naming the wallet's balance and the amount when the balance
+  is short. It then signs the transfer without broadcasting it, records the
+  signed bytes under the id (`Prepared`), and only then broadcasts them, so the
+  transfer is on record before it can exist onchain. A failed record is handled
+  like a failed burn record: the signature's nonce is released when a reload
+  shows nothing recorded (`500`, nothing broadcast), the transfer another
+  request recorded is adopted, and the nonce stays reserved when the reload
+  fails too (`500`, rerun only after a restart). It answers at the broadcast
+  with `operationId`, `chain`, `depositAddress`, `amount`, `amountRaw`,
+  `transferTx` and a `status`: `pending`, `confirmed`, `reverted` or
+  `superseded`. A broadcast error proves nothing, since a node can accept the
+  bytes and its answer still be lost: the request answers the status the chain
+  already proves, or `502` naming the recorded transfer and its operation id
+  while it proves nothing, and either way the detached task follows the transfer
+  while it holds the lock and the pause. A transfer signed by another address
+  than the Ethereum wallet (a rotated key) is never broadcast or restored
+  through this wallet. The task holds both until the transfer's fate is proven
+  by a fresh read of the chain: its own receipt at Ethereum's required
+  confirmations records `Confirmed` or `Reverted` (which moved no USDC), and the
+  signer's nonce at the newest block with those confirmations past the
+  transfer's nonce, while the node has no receipt for the transfer, records
+  `Superseded`: another tx took its nonce, so it can never mine and moved no
+  USDC, and the wallet releases the nonce. Superseding raises an operational
+  alert, since only a copy of the deposit sent by hand at that nonce would have
+  paid Alpaca. While nothing is proven the task sends the same bytes again every
+  30 seconds, since a node may have dropped them from its mempool, and raises
+  one operational alert after 10 minutes, since meanwhile every USDC transfer
+  waits; a panic while confirming keeps both until a restart. A reverted
+  transfer is final: a rerun with its id reports `reverted` and sends nothing,
+  and depositing again takes a new id. At startup, next to the pending
+  `cctp-bridge` burns and before any startup approval or revoke, the bot records
+  the outcome of every pending transfer the chain now decides, reserves the
+  nonce of every other one signed by the Ethereum wallet and rebroadcasts its
+  exact bytes (one signed by another wallet is skipped and gates Ethereum), and,
+  while any of them is unproven, takes the recovery lock and the USDC driver
+  pause again before any USDC worker runs and follows each transfer as the route
+  does, so no USDC transfer sizes against USDC the transfer may still take and
+  no other send reuses its nonce. A restored transfer not mined yet gates
+  Ethereum's startup approvals and revokes. When the pending transfers cannot
+  all be listed or loaded, both stay held until a restart. Once a transfer is
+  proven to have moved the USDC, the task frees both, polls Alpaca with
+  `poll_deposit_by_tx_hash` until it reports the deposit final, and logs the
+  transfer id and the final status; a deposit Alpaca reports failed, leaves in
+  another status, or does not report before the poll times out raises an
+  operational alert. The vault verbs and `reset-allowance` take neither the lock
+  nor the pause, like the `st0x-cli` verbs: pausing the driver would refuse
+  every vault operation for the length of each USDC transfer. `vault-deposit`
+  does take its own lock (`409` while another `vault-deposit` request runs): the
+  deposit reads the allowance and approves exactly the amount when it is short,
+  so two concurrent requests for a token without the startup MAX grant could
+  overwrite each other's approval. The lock covers these requests only: without
+  the MAX grant, a request can still use up the exact approval of a USDC
+  transfer worker's deposit, which then reverts and needs a redrive.
+  `vault-withdraw` and `vault-withdraw-usdc` share a withdraw lock of their own
+  (`409` while either runs), held until the outcome of the tx it answered with
+  is known, for the rerun reason below; it does not cover the bot's own transfer
+  withdrawals. `wrap-equity` deposits `quantity` underlying shares of `symbol`
+  into the chain's ERC-4626 wrapper and `unwrap-equity` redeems `quantity`
+  wrapped shares from it, both for the bot's own wallet on `chain`, and `redeem`
+  sends `quantity` underlying shares from that wallet to Alpaca's redemption
+  wallet there, always the chain's own
   `[chains.<name>.trading].redemption_wallet` and never one the request names,
   so the capital group cannot send the bot's shares out of our accounts; Alpaca
   redeems them into the account. `redeem` is kept for draining a paused chain,

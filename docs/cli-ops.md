@@ -369,8 +369,10 @@ st0x-liquidity-client --env <env> capital unwrap-equity --symbol <symbol> --quan
 # prints the transfer tx, then the bot follows the redemption in its logs
 st0x-liquidity-client --env <env> capital redeem --symbol <symbol> --quantity <shares> [--network <chain>]
 # sends USDC from the bot's Ethereum wallet to Alpaca's deposit address for the
-# bot's account; prints the transfer tx, then the bot logs Alpaca's detection
-st0x-liquidity-client --env <env> capital alpaca-deposit --amount <amount>
+# bot's account; prints the transfer tx and its status, then the bot logs
+# Alpaca's detection; it prints its operation id to stderr first: rerun with
+# --operation-id <id> to report that same transfer
+st0x-liquidity-client --env <env> capital alpaca-deposit --amount <amount> [--operation-id <id>]
 # drains a paused listing in one run: vault withdraw, unwrap, then redeem;
 # prints the withdrawal tx, then the bot logs each later step
 st0x-liquidity-client --env <env> capital drain-equity --symbol <symbol> --quantity <wrapped-shares> --vault-id <vault-id> [--network <chain>]
@@ -481,16 +483,16 @@ confirmations. Until then every verb that takes the recovery lock answers `409`:
 `debug resume`, `debug recheck`, `debug resume-usdc`, `debug reconcile-usdc`,
 `debug fail-usdc-transfer`, `debug fail-equity-transfer`,
 `capital transfer-usdc`, `capital transfer-equity`, a `capital cctp-bridge` with
-a new operation id, `capital alpaca-deposit`, and `debug cctp complete-mint`.
-Most say `A resume or recheck operation is already in progress`; `debug resume`
-says `A resume operation is already in progress` and
-`debug fail-equity-transfer` says
-`A transfer recovery operation is already in progress`. `complete-mint` answers
-`502` instead while Circle has not attested the burn, since it fetches the
-attestation before it tries the lock; both mean retry. A rerun with the burn's
-own operation id is answered at once while its burn is settled or a node holds
-it; one that must send the burn again waits for the lock like any other. After
-the task finishes, the lock is free again. The outcome is
+a new operation id, a `capital alpaca-deposit` that must send, and
+`debug cctp complete-mint`. Most say
+`A resume or recheck operation is already in progress`; `debug resume` says
+`A resume operation is already in progress` and `debug fail-equity-transfer`
+says `A transfer recovery operation is already in progress`. `complete-mint`
+answers `502` instead while Circle has not attested the burn, since it fetches
+the attestation before it tries the lock; both mean retry. A rerun with the
+burn's own operation id is answered at once while its burn is settled or a node
+holds it; one that must send the burn again waits for the lock like any other.
+After the task finishes, the lock is free again. The outcome is
 `CCTP burn confirmed via API`, `CCTP burn broadcast via API reverted`, or
 `CCTP burn broadcast via API is not confirmed yet` when the receipt wait timed
 out or a drop report or RPC errors left the burn unproven; a rerun with its
@@ -627,49 +629,76 @@ account, which credits the broker account, as the bot's own deposit leg of a
 transfer to Alpaca does. It always sends on Ethereum (Sepolia in sandbox) the
 USDC the bot uses there, to the address Alpaca returns; no command can name a
 chain or another destination, so the verb cannot move USDC out of our accounts.
-It prints the chain, the `depositAddress`, the `amount`, the `amountRaw` in USDC
-base units and the `transferTx` as soon as the transfer is broadcast; the answer
-never waits for the confirmations or for Alpaca. It refuses an amount that is
-not a positive decimal or is finer than 6 decimals with `400`. It answers `503`
-until the bot finishes starting, while a USDC transfer is executing (the bot
-cannot pause its USDC driver), and while the Ethereum wallet cannot be shown to
-pay gas; `502` when Alpaca cannot give the deposit address; and `409` while
-another verb holds the recovery lock, while any USDC transfer on any corridor
-has a live or retryable job or holds its corridor guard (also a failed one
-awaiting reconcile, since the deposit spends Ethereum wallet USDC such a
-transfer may need), and when the wallet holds less USDC than the amount (the
-message names the balance and the amount). None of these refusals sends
-anything.
+Like `capital cctp-bridge`, every run sends an operation id, printed to stderr
+before the request, and the bot records the signed transfer under it before
+broadcasting it. It prints the `operationId`, the chain, the `depositAddress`,
+the `amount`, the `amountRaw` in USDC base units, the `transferTx` and a
+`status` as soon as the transfer is broadcast; the answer never waits for the
+confirmations or for Alpaca. It refuses an amount that is not a positive decimal
+or is finer than 6 decimals with `400`. It asks Alpaca for the deposit address
+before it takes the recovery lock or pauses the USDC driver, and answers `502`
+when Alpaca cannot give it within 10 seconds, so a slow Alpaca blocks nothing.
+It answers `503` until the bot finishes starting, while a USDC transfer is
+executing (the bot cannot pause its USDC driver), and while the Ethereum wallet
+cannot be shown to pay gas; and `409` while another verb holds the recovery
+lock, while any USDC transfer on any corridor has a live or retryable job or
+holds its corridor guard (also a failed one awaiting reconcile, since the
+deposit spends Ethereum wallet USDC such a transfer may need), and when the
+wallet holds less USDC than the amount (the message names the balance and the
+amount). None of these refusals sends anything.
+
+A rerun with the printed `--operation-id` never sends a second transfer: it must
+repeat the same `--amount` (another amount answers `409`), and it reports the
+recorded `transferTx` and its `status`. A transfer the node holds or whose fate
+is proven is reported at once; one no node holds (a crash before its broadcast,
+or a drop) is sent again from its recorded bytes under the lock and the pause.
+Without `--operation-id` the client generates a new id, which is a new deposit.
+The `status` is `pending` (not proven yet), `confirmed` (it moved the USDC),
+`reverted` (it moved nothing; deposit again with a new id), or `superseded`
+(another tx from the wallet took its nonce, so it can never mine and moved
+nothing). A bot release from before operation ids ignores the id and sends on
+every call; the client then warns that the deposit was not recorded and must not
+be rerun.
 
 After answering, the bot keeps the recovery lock and the USDC driver pause, like
 `capital cctp-bridge`, until the transfer is proven, so every USDC transfer and
 every verb that takes the lock waits meanwhile. It logs
 `Alpaca deposit transfer confirmed via API` once the transfer has Ethereum's
-required confirmations, or `did not confirm; no USDC moved` when it reverted,
-and frees both either way. While it is unproven it logs `is not confirmed yet`
-and waits again every 30 seconds; after 10 minutes it raises one operational
-alert, `An operator Alpaca deposit transfer is still unproven`, and holds both
-until the transfer is proven or the bot restarts: check the tx onchain. Once the
-transfer is confirmed, the bot polls Alpaca and logs
+required confirmations, `reverted; no USDC moved` when it reverted, or
+`can never mine` when the wallet's nonce at a block with those confirmations is
+past the transfer's nonce and no node has a receipt for it, and frees both in
+every case. While it is unproven it logs `is not confirmed yet`, sends the same
+bytes again, since a node may have dropped them, and waits again every 30
+seconds; after 10 minutes it raises one operational alert,
+`An operator Alpaca deposit transfer is still unproven`: check the tx onchain. A
+superseded transfer raises `An operator Alpaca deposit transfer can never mine`:
+check the tx that took its nonce, since only a copy of the deposit sent by hand
+would have paid Alpaca. If the broadcast itself answers an error, the node may
+still have accepted the transfer, so the bot answers `502` naming the recorded
+transfer and its operation id, keeps both held, and follows the transfer all the
+same; rerun with the operation id to see its status. At startup the bot reserves
+the nonce of every pending transfer, rebroadcasts it, and takes the recovery
+lock and the USDC driver pause again before any USDC transfer runs, holding them
+until each restored transfer is proven, so a restart never frees them early.
+Once the transfer is confirmed, the bot polls Alpaca and logs
 `Alpaca completed the deposit sent via API` with the Alpaca `transfer_id`. An
 operational alert starting `Alpaca did not credit an operator deposit transfer`
 means Alpaca failed it, its poll ended in an unexpected status, or Alpaca never
 reported it as final within 30 minutes: check the account's transfers with
-Alpaca before sending again. The send is never retried: a `500` says the tx may
-still have gone out, so check the bot's Ethereum wallet onchain and the deposit
-in Alpaca before rerunning.
+Alpaca before sending again.
 
 A request that times out on the client may still complete in the bot; check the
 bot logs and the chain for the transaction before retrying a vault or allowance
-verb. A `cctp-bridge` rerun with the printed operation id is safe, as described
-above, against a bot that records operation ids. If the logs show
-`Capital route failed onchain` for `cctp-bridge`, the burn was not signed or
-recorded: the balance read, the allowance approve or the Circle fee lookup
-failed, and a rerun with the same operation id burns once. A `500` that says the
-bot cannot tell whether the burn was recorded keeps its nonce reserved until a
-restart: rerun with the same operation id only after the restart. Every capital
-verb answers `503` until the bot finishes starting. The tokenization and issuer
-verbs `donate-equity` and `dividend-bump` have no client subcommand.
+verb. A `cctp-bridge` or `alpaca-deposit` rerun with the printed operation id is
+safe, as described above, against a bot that records operation ids. If the logs
+show `Capital route failed onchain` for `cctp-bridge` or `alpaca-deposit`, the
+send was not signed or recorded: the balance read, the signing, the allowance
+approve or the Circle fee lookup failed, and a rerun with the same operation id
+sends once. A `500` that says the bot cannot tell whether the burn or the
+deposit was recorded keeps its nonce reserved until a restart: rerun with the
+same operation id only after the restart. Every capital verb answers `503` until
+the bot finishes starting. The tokenization and issuer verbs `donate-equity` and
+`dividend-bump` have no client subcommand.
 
 ### Taking a Listing off Rebalancing
 

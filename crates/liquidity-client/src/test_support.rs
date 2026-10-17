@@ -289,7 +289,14 @@ fn capital_command_cases() -> [CommandCase; 13] {
         ),
         case(
             CommandRole::Capital,
-            &["capital", "alpaca-deposit", "--amount", "1"],
+            &[
+                "capital",
+                "alpaca-deposit",
+                "--amount",
+                "1",
+                "--operation-id",
+                OPERATION,
+            ],
         ),
         case(
             CommandRole::Capital,

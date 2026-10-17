@@ -40,6 +40,7 @@ use st0x_tokenization::IssuerRequestId;
 
 use crate::AppState;
 use crate::alerts::AlertKind;
+use crate::alpaca_deposit::AlpacaDepositOperation;
 use crate::cctp_burn::{CctpBurnOperation, CctpSourceChain};
 use crate::dashboard::event_lines::{event_step, variant_fields};
 use crate::dashboard::order_loader::{
@@ -109,6 +110,7 @@ use crate::view_rebuild::{
 mod capital;
 
 pub(crate) use capital::EquityWalletLocks;
+pub(crate) use capital::restore_capital_alpaca_deposits;
 
 /// Comma-separated filter for transfer kinds in query parameters.
 ///
@@ -1369,6 +1371,11 @@ pub(crate) struct RecoveryHandle {
     /// `cctp-bridge` route records each signed burn under its operation id
     /// before broadcasting it, and the startup restore reads the same store.
     pub(crate) cctp_burn_store: Arc<Store<CctpBurnOperation>>,
+    /// The conductor-built `AlpacaDepositOperation` store: the capital
+    /// `alpaca-deposit` route records each signed transfer under its
+    /// operation id before broadcasting it, and the startup restore reads the
+    /// same store.
+    pub(crate) alpaca_deposit_store: Arc<Store<AlpacaDepositOperation>>,
 }
 
 /// Shared handle backing the in-bot process-tx route: the broker order placer
@@ -10416,6 +10423,10 @@ mod tests {
                 usdc_driver_pause: Arc::new(pause),
                 usdc_store,
                 cctp_burn_store: Arc::new(st0x_event_sorcery::test_store(state.pool.clone(), ())),
+                alpaca_deposit_store: Arc::new(st0x_event_sorcery::test_store(
+                    state.pool.clone(),
+                    (),
+                )),
             })
             .ok()
             .expect("recovery cell must start empty");
@@ -11071,7 +11082,7 @@ mod tests {
         .await;
         let alpaca_deposit = capital::alpaca_deposit(
             State(state.clone()),
-            capital_request(serde_json::json!({"amount": "1"})),
+            capital_request(serde_json::json!({"operationId": TEST_OPERATION_ID, "amount": "1"})),
         )
         .await;
         let drain = capital::drain_equity(
@@ -11594,15 +11605,26 @@ mod tests {
         );
     }
 
-    /// Runs `capital alpaca-deposit` for `amount`, as its JSON answer or its
-    /// refusal.
+    /// Runs `capital alpaca-deposit` for `amount` under a fresh operation id,
+    /// as its JSON answer or its refusal.
     async fn run_alpaca_deposit(
         state: &AppState,
         amount: &str,
     ) -> Result<serde_json::Value, (StatusCode, String)> {
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        deposit_under(state, &operation_id, amount).await
+    }
+
+    /// Runs `capital alpaca-deposit` for `amount` under `operation_id`, as its
+    /// JSON answer or its refusal.
+    async fn deposit_under(
+        state: &AppState,
+        operation_id: &str,
+        amount: &str,
+    ) -> Result<serde_json::Value, (StatusCode, String)> {
         capital::alpaca_deposit(
             State(state.clone()),
-            capital_request(serde_json::json!({"amount": amount})),
+            capital_request(serde_json::json!({"operationId": operation_id, "amount": amount})),
         )
         .await
         .map(|Json(answer)| serde_json::to_value(answer).unwrap())
@@ -11639,6 +11661,18 @@ mod tests {
         ctx
     }
 
+    /// A deposit state over the stub wallet whose Alpaca serves the deposit
+    /// address, so a deposit passes the address lookup and reaches the gates
+    /// it checks after it. The server must outlive the state's requests.
+    async fn stub_deposit_state() -> (AppState, MockServer, apalis_sqlite::SqlitePool) {
+        let alpaca = MockServer::start();
+        let mut ctx = stub_wallet_ctx();
+        ctx.broker = crate::test_utils::mock_alpaca_broker_ctx(alpaca.base_url());
+        let (state, _gate, jobs) = alpaca_deposit_state(ctx).await;
+        serve_alpaca_deposit_address(&alpaca, &state);
+        (state, alpaca, jobs)
+    }
+
     /// A zero, negative, unparseable, or off grid amount is refused as input
     /// before the startup gate: startup has not completed, so a 503 here
     /// would mean the amount was not checked first. `1.0000001` is finer
@@ -11659,7 +11693,7 @@ mod tests {
     /// it refuses while another operator write holds the resume lock.
     #[tokio::test]
     async fn alpaca_deposit_returns_409_while_the_resume_lock_is_held() {
-        let (state, _gate, _jobs) = alpaca_deposit_state(stub_wallet_ctx()).await;
+        let (state, _alpaca, _jobs) = stub_deposit_state().await;
         let _held = state.resume_lock.0.try_lock().unwrap();
 
         let Err((status, error)) = run_alpaca_deposit(&state, "10").await else {
@@ -11680,7 +11714,7 @@ mod tests {
     /// cannot pass that check, so reaching it would answer 500.
     #[tokio::test]
     async fn alpaca_deposit_returns_409_while_a_usdc_transfer_is_in_flight_or_holds_its_guard() {
-        let (in_flight, _gate, jobs) = alpaca_deposit_state(stub_wallet_ctx()).await;
+        let (in_flight, _alpaca, jobs) = stub_deposit_state().await;
         crate::rebalancing::usdc::TransferUsdcToHedgingJobQueue::new(&jobs)
             .push(crate::rebalancing::usdc::TransferUsdcToHedging {
                 id: UsdcRebalanceId(uuid::Uuid::new_v4()),
@@ -11701,7 +11735,7 @@ mod tests {
             "{error}"
         );
 
-        let (holding, _gate, _jobs) = alpaca_deposit_state(stub_wallet_ctx()).await;
+        let (holding, _holding_alpaca, _jobs) = stub_deposit_state().await;
         seed_usdc_bridging_failed(&holding.pool, &UsdcRebalanceId(uuid::Uuid::new_v4())).await;
 
         let Err((status, error)) = run_alpaca_deposit(&holding, "10").await else {
@@ -11725,7 +11759,34 @@ mod tests {
         tokio::sync::watch::Sender<ReceiptGate>,
         UsdcDriverGate,
     ) {
-        let (mut ctx, receipt_gate) = capital_ctx_on(chain);
+        alpaca_deposit_state_with(
+            chain,
+            usdc,
+            alpaca,
+            ethereum_gas_threshold,
+            HeldReceiptWallet::wrap(Arc::clone(&chain.bot_wallet)),
+        )
+        .await
+    }
+
+    /// [`alpaca_deposit_state_on`] with every signer `wrapped` (see
+    /// [`capital_ctx_with`]).
+    #[cfg(feature = "test-support")]
+    async fn alpaca_deposit_state_with(
+        chain: &AnvilRaindexChain,
+        usdc: Address,
+        alpaca: &MockServer,
+        ethereum_gas_threshold: U256,
+        wrapped: (
+            Arc<dyn st0x_evm::Wallet<Provider = alloy::providers::RootProvider>>,
+            tokio::sync::watch::Sender<ReceiptGate>,
+        ),
+    ) -> (
+        AppState,
+        tokio::sync::watch::Sender<ReceiptGate>,
+        UsdcDriverGate,
+    ) {
+        let (mut ctx, receipt_gate) = capital_ctx_with(chain, wrapped);
         ctx.rebalancing.cctp_corridor = st0x_bridge::cctp::CctpCorridor::with_tokens(usdc, usdc);
         ctx.alerts = Some(st0x_config::AlertsCtx::for_test(
             std::collections::BTreeMap::from([
@@ -11742,13 +11803,11 @@ mod tests {
     }
 
     /// Alpaca's USDC deposit address on Ethereum in the deposit tests.
-    #[cfg(feature = "test-support")]
     const TEST_ALPACA_DEPOSIT_ADDRESS: Address =
         address!("0x00000000000000000000000000000000000000de");
 
     /// Serves `TEST_ALPACA_DEPOSIT_ADDRESS` as the account's USDC deposit
     /// address on Ethereum.
-    #[cfg(feature = "test-support")]
     fn serve_alpaca_deposit_address(alpaca: &MockServer, state: &AppState) {
         let BrokerCtx::AlpacaBrokerApi(broker) = &state.ctx.broker;
         let path = format!("/v1/accounts/{}/wallets", broker.account_id);
@@ -11768,7 +11827,7 @@ mod tests {
     }
 
     /// The deposit refuses with 503 while the Ethereum wallet is below its
-    /// gas threshold, before it asks Alpaca or moves anything.
+    /// gas threshold, before it moves anything.
     #[cfg(feature = "test-support")]
     #[tokio::test]
     async fn alpaca_deposit_returns_503_while_the_ethereum_wallet_is_not_gas_ready() {
@@ -11877,7 +11936,7 @@ mod tests {
             alpaca_deposit_state_on(&chain, usdc, &alpaca, U256::from(1_u64)).await;
         serve_alpaca_deposit_address(&alpaca, &state);
 
-        let answer = run_alpaca_deposit(&state, "250.5")
+        let answer = deposit_under(&state, TEST_OPERATION_ID, "250.5")
             .await
             .unwrap_or_else(|(status, error)| panic!("deposit refused with {status}: {error}"));
         assert!(
@@ -11897,36 +11956,18 @@ mod tests {
         assert_eq!(
             answer,
             serde_json::json!({
+                "operationId": TEST_OPERATION_ID,
                 "chain": "ethereum",
                 "depositAddress": TEST_ALPACA_DEPOSIT_ADDRESS,
                 "amount": "250.5",
                 "amountRaw": "250500000",
                 "transferTx": transfer_tx,
+                "status": "pending",
             })
         );
 
-        let BrokerCtx::AlpacaBrokerApi(broker) = &state.ctx.broker;
-        let transfers_path = format!("/v1/accounts/{}/wallets/transfers", broker.account_id);
-        let deposit = alpaca.mock(|when, then| {
-            when.method(GET).path(transfers_path.as_str());
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(serde_json::json!([{
-                    "id": "6a1c2e3f-0b4d-4e5f-8a9b-0c1d2e3f4a5b",
-                    "direction": "INCOMING",
-                    "amount": "250.5",
-                    "usd_value": "250.5",
-                    "chain": "ethereum",
-                    "asset": "USDC",
-                    "from_address": chain.bot,
-                    "to_address": TEST_ALPACA_DEPOSIT_ADDRESS,
-                    "status": "COMPLETE",
-                    "tx_hash": transfer_tx,
-                    "created_at": "2024-01-01T00:00:00Z",
-                    "network_fee": "0",
-                    "fees": "0"
-                }]));
-        });
+        let deposit =
+            serve_completed_deposits(&alpaca, &state, chain.bot, &[(transfer_tx, "250.5")]);
         confirm_after_the_answer(&state, &receipt_gate).await;
         assert!(
             deposit.calls() > 0,
@@ -11956,6 +11997,531 @@ mod tests {
         assert_eq!(
             erc20_balance(&chain.bot_wallet, usdc, chain.bot).await,
             supply - sent
+        );
+    }
+
+    /// Serves Alpaca's wallet transfers as the `COMPLETE` incoming deposits
+    /// of `deposits` (each transfer tx and its decimal amount) from `from`
+    /// to `TEST_ALPACA_DEPOSIT_ADDRESS`, with the Alpaca transfer ids
+    /// `6a1c2e3f-0b4d-4e5f-8a9b-0c1d2e3f4a5b` onward.
+    #[cfg(feature = "test-support")]
+    fn serve_completed_deposits<'server>(
+        alpaca: &'server MockServer,
+        state: &AppState,
+        from: Address,
+        deposits: &[(TxHash, &str)],
+    ) -> httpmock::Mock<'server> {
+        let BrokerCtx::AlpacaBrokerApi(broker) = &state.ctx.broker;
+        let transfers_path = format!("/v1/accounts/{}/wallets/transfers", broker.account_id);
+        let transfers: Vec<serde_json::Value> = deposits
+            .iter()
+            .enumerate()
+            .map(|(index, (transfer_tx, amount))| {
+                serde_json::json!({
+                    "id": format!("6a1c2e3f-0b4d-4e5f-8a9b-0c1d2e3f4a{:02x}", 0x5b + index),
+                    "direction": "INCOMING",
+                    "amount": amount,
+                    "usd_value": amount,
+                    "chain": "ethereum",
+                    "asset": "USDC",
+                    "from_address": from,
+                    "to_address": TEST_ALPACA_DEPOSIT_ADDRESS,
+                    "status": "COMPLETE",
+                    "tx_hash": transfer_tx,
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "network_fee": "0",
+                    "fees": "0"
+                })
+            })
+            .collect();
+        alpaca.mock(|when, then| {
+            when.method(GET).path(transfers_path.as_str());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::Value::Array(transfers));
+        })
+    }
+
+    /// The deposit recorded under `operation_id`.
+    #[cfg(feature = "test-support")]
+    async fn recorded_deposit(
+        state: &AppState,
+        operation_id: &str,
+    ) -> crate::alpaca_deposit::AlpacaDepositOperation {
+        state
+            .recovery
+            .get()
+            .unwrap()
+            .alpaca_deposit_store
+            .load(&operation_id.parse().unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Waits until every capital task has finished, then reopens the tracker
+    /// for the next route.
+    #[cfg(feature = "test-support")]
+    async fn capital_tasks_finished(state: &AppState) {
+        state.detached_tasks.close();
+        tokio::time::timeout(Duration::from_secs(30), state.detached_tasks.wait())
+            .await
+            .expect("the capital tasks must finish");
+        state.detached_tasks.reopen();
+    }
+
+    /// The bot's resume lock and USDC driver pause are both free: a deposit
+    /// whose fate is proven holds neither.
+    #[cfg(feature = "test-support")]
+    fn lock_and_pause_free(state: &AppState, driver_gate: &UsdcDriverGate) -> bool {
+        state.resume_lock.0.try_lock().is_ok() && !driver_gate.is_paused()
+    }
+
+    /// A node can accept the raw transfer and the bot still get an RPC error
+    /// back (the answer was lost). The transfer is recorded before its
+    /// broadcast, so the request answers 502 naming the recorded transfer and
+    /// its operation id, yet the resume lock and the USDC driver pause stay
+    /// held while the node holds the transfer, and the task follows its hash
+    /// to confirmation: no USDC transfer can size against USDC already in the
+    /// mempool, and nothing can reuse its nonce. Once it confirms, both are
+    /// freed and a rerun reports it confirmed without sending again.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn an_accepted_deposit_whose_broadcast_answer_is_lost_is_followed_under_the_lock_and_the_pause()
+     {
+        use alloy::providers::Provider as _;
+
+        let chain = AnvilRaindexChain::deploy().await;
+        let supply = U256::from(1_000_000_000_u64);
+        let usdc = chain.deploy_bot_token(6, supply).await;
+        let alpaca = MockServer::start();
+        let (state, receipt_gate, driver_gate) = alpaca_deposit_state_with(
+            &chain,
+            usdc,
+            &alpaca,
+            U256::from(1_u64),
+            HeldReceiptWallet::wrap_losing_broadcast_answers(Arc::clone(&chain.bot_wallet)),
+        )
+        .await;
+        serve_alpaca_deposit_address(&alpaca, &state);
+        chain.set_automine(false).await;
+
+        let Err((status, error)) = deposit_under(&state, TEST_OPERATION_ID, "250.5").await else {
+            panic!("a broadcast whose answer is lost must not be reported sent");
+        };
+        let transfer_tx = recorded_deposit(&state, TEST_OPERATION_ID)
+            .await
+            .transfer
+            .transfer_tx();
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{error}");
+        assert!(
+            error.contains(&format!(
+                "Deposit {transfer_tx} is recorded under operation id {TEST_OPERATION_ID}"
+            )),
+            "{error}"
+        );
+        assert!(
+            chain
+                .bot_wallet
+                .provider()
+                .get_transaction_by_hash(transfer_tx)
+                .await
+                .unwrap()
+                .is_some(),
+            "the node must hold the accepted transfer"
+        );
+        assert!(
+            state.resume_lock.0.try_lock().is_err(),
+            "a transfer the node may hold must keep the resume lock"
+        );
+        assert!(
+            driver_gate.is_paused(),
+            "a transfer the node may hold must keep the USDC driver paused"
+        );
+
+        chain.mine().await;
+        chain.set_automine(true).await;
+        serve_completed_deposits(&alpaca, &state, chain.bot, &[(transfer_tx, "250.5")]);
+        confirm_after_the_answer(&state, &receipt_gate).await;
+
+        assert!(lock_and_pause_free(&state, &driver_gate));
+        assert!(matches!(
+            recorded_deposit(&state, TEST_OPERATION_ID).await.outcome,
+            crate::alpaca_deposit::AlpacaDepositOutcome::Confirmed { .. }
+        ));
+        let rerun = deposit_under(&state, TEST_OPERATION_ID, "250.5")
+            .await
+            .unwrap_or_else(|(status, error)| panic!("rerun refused with {status}: {error}"));
+        assert_eq!(rerun["status"], "confirmed");
+        assert_eq!(rerun["transferTx"], serde_json::json!(transfer_tx));
+        let sent = U256::from(250_500_000_u64);
+        assert_eq!(
+            erc20_balance(&chain.bot_wallet, usdc, TEST_ALPACA_DEPOSIT_ADDRESS).await,
+            sent
+        );
+        assert_eq!(
+            erc20_balance(&chain.bot_wallet, usdc, chain.bot).await,
+            supply - sent
+        );
+    }
+
+    /// A request whose answer was lost, rerun with the same operation id
+    /// while the transfer still confirms and again after, gets the same
+    /// transfer each time and sends the USDC once; another amount under the
+    /// id is refused. A new operation id deposits again.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn a_rerun_with_the_same_operation_id_deposits_once_and_a_new_id_deposits_again() {
+        let chain = AnvilRaindexChain::deploy().await;
+        let supply = U256::from(1_000_000_000_u64);
+        let usdc = chain.deploy_bot_token(6, supply).await;
+        let alpaca = MockServer::start();
+        let (state, receipt_gate, _driver_gate) =
+            alpaca_deposit_state_on(&chain, usdc, &alpaca, U256::from(1_u64)).await;
+        serve_alpaca_deposit_address(&alpaca, &state);
+        let one_usdc = U256::from(1_000_000_u64);
+        chain.set_automine(false).await;
+
+        let first = deposit_under(&state, TEST_OPERATION_ID, "1")
+            .await
+            .unwrap_or_else(|(status, error)| panic!("deposit refused with {status}: {error}"));
+        let while_confirming = deposit_under(&state, TEST_OPERATION_ID, "1")
+            .await
+            .unwrap_or_else(|(status, error)| panic!("rerun refused with {status}: {error}"));
+        assert_eq!(while_confirming["transferTx"], first["transferTx"]);
+        assert_eq!(while_confirming["status"], "pending");
+        let Err((status, refusal)) = deposit_under(&state, TEST_OPERATION_ID, "2").await else {
+            panic!("another amount under a used operation id must be refused");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(refusal.contains("use a new operation id"), "{refusal}");
+
+        let transfer_tx: TxHash = serde_json::from_value(first["transferTx"].clone()).unwrap();
+        chain.mine().await;
+        chain.set_automine(true).await;
+        let mut completed =
+            serve_completed_deposits(&alpaca, &state, chain.bot, &[(transfer_tx, "1")]);
+        confirm_after_the_answer(&state, &receipt_gate).await;
+        let after = deposit_under(&state, TEST_OPERATION_ID, "1")
+            .await
+            .unwrap_or_else(|(status, error)| panic!("rerun refused with {status}: {error}"));
+        assert_eq!(after["transferTx"], first["transferTx"]);
+        assert_eq!(after["status"], "confirmed");
+        assert_eq!(
+            erc20_balance(&chain.bot_wallet, usdc, TEST_ALPACA_DEPOSIT_ADDRESS).await,
+            one_usdc,
+            "the reruns must not send again"
+        );
+
+        let fresh = deposit_under(&state, "0b6c6f47-3f52-4c2f-9f3c-6d1f2e0a9b44", "1")
+            .await
+            .unwrap_or_else(|(status, error)| panic!("deposit refused with {status}: {error}"));
+        assert_ne!(fresh["transferTx"], first["transferTx"]);
+        let fresh_tx: TxHash = serde_json::from_value(fresh["transferTx"].clone()).unwrap();
+        completed.delete();
+        let _completed = serve_completed_deposits(
+            &alpaca,
+            &state,
+            chain.bot,
+            &[(transfer_tx, "1"), (fresh_tx, "1")],
+        );
+        confirm_after_the_answer(&state, &receipt_gate).await;
+        assert_eq!(
+            erc20_balance(&chain.bot_wallet, usdc, TEST_ALPACA_DEPOSIT_ADDRESS).await,
+            one_usdc + one_usdc,
+            "a new operation id deposits again"
+        );
+    }
+
+    /// Alpaca's deposit address is asked before the resume lock and the USDC
+    /// driver pause are taken, and within a bound: while Alpaca hangs, both
+    /// stay free, and the request answers 502 once the bound passes, having
+    /// sent nothing.
+    #[tokio::test]
+    async fn a_hung_alpaca_address_lookup_answers_502_without_holding_the_lock_or_the_pause() {
+        let alpaca = MockServer::start();
+        let mut ctx = stub_wallet_ctx();
+        ctx.broker = crate::test_utils::mock_alpaca_broker_ctx(alpaca.base_url());
+        let (state, driver_gate, _jobs) = alpaca_deposit_state(ctx).await;
+        let BrokerCtx::AlpacaBrokerApi(broker) = &state.ctx.broker;
+        let path = format!("/v1/accounts/{}/wallets", broker.account_id);
+        alpaca.mock(|when, then| {
+            when.method(GET).path(path.as_str());
+            then.status(200).delay(Duration::from_secs(60));
+        });
+
+        let request = tokio::spawn({
+            let state = state.clone();
+            async move { run_alpaca_deposit(&state, "10").await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            state.resume_lock.0.try_lock().is_ok(),
+            "a hung Alpaca must not hold the resume lock"
+        );
+        assert!(
+            !driver_gate.is_paused(),
+            "a hung Alpaca must not hold the USDC driver paused"
+        );
+
+        let Err((status, error)) = tokio::time::timeout(Duration::from_secs(10), request)
+            .await
+            .expect("a hung Alpaca must not hang the request")
+            .unwrap()
+        else {
+            panic!("a hung Alpaca must refuse the deposit");
+        };
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{error}");
+        assert!(error.contains("no answer within"), "{error}");
+        assert!(state.resume_lock.0.try_lock().is_ok());
+        assert!(!driver_gate.is_paused());
+    }
+
+    /// A transfer the node dropped from its mempool never gets a receipt, so
+    /// the task sends its recorded bytes again while its fate is unknown; the
+    /// same transfer then mines, is recorded confirmed, and frees the lock
+    /// and the pause.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn a_dropped_deposit_is_sent_again_from_its_recorded_bytes() {
+        use alloy::providers::Provider as _;
+        use alloy::providers::ext::AnvilApi as _;
+
+        let chain = AnvilRaindexChain::deploy().await;
+        let supply = U256::from(1_000_000_000_u64);
+        let usdc = chain.deploy_bot_token(6, supply).await;
+        let alpaca = MockServer::start();
+        let (state, receipt_gate, driver_gate) =
+            alpaca_deposit_state_on(&chain, usdc, &alpaca, U256::from(1_u64)).await;
+        serve_alpaca_deposit_address(&alpaca, &state);
+        chain.set_automine(false).await;
+        let provider = chain.bot_wallet.provider();
+
+        let answer = deposit_under(&state, TEST_OPERATION_ID, "1")
+            .await
+            .unwrap_or_else(|(status, error)| panic!("deposit refused with {status}: {error}"));
+        let transfer_tx: TxHash = serde_json::from_value(answer["transferTx"].clone()).unwrap();
+        provider.anvil_drop_transaction(transfer_tx).await.unwrap();
+        assert!(
+            provider
+                .get_transaction_by_hash(transfer_tx)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        receipt_gate.send_replace(ReceiptGate::Dropped);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while provider
+                .get_transaction_by_hash(transfer_tx)
+                .await
+                .unwrap()
+                .is_none()
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the task must send the dropped transfer's bytes again");
+        assert!(!lock_and_pause_free(&state, &driver_gate));
+
+        chain.mine().await;
+        chain.set_automine(true).await;
+        let _completed =
+            serve_completed_deposits(&alpaca, &state, chain.bot, &[(transfer_tx, "1")]);
+        receipt_gate.send_replace(ReceiptGate::Released);
+        capital_tasks_finished(&state).await;
+
+        assert!(lock_and_pause_free(&state, &driver_gate));
+        assert!(matches!(
+            recorded_deposit(&state, TEST_OPERATION_ID).await.outcome,
+            crate::alpaca_deposit::AlpacaDepositOutcome::Confirmed { .. }
+        ));
+        assert_eq!(
+            erc20_balance(&chain.bot_wallet, usdc, TEST_ALPACA_DEPOSIT_ADDRESS).await,
+            U256::from(1_000_000_u64)
+        );
+    }
+
+    /// A transfer whose nonce another tx from the wallet took can never
+    /// mine. Once the wallet's nonce at a confirmed block is past it and the
+    /// node has no receipt for it, the task records it superseded, frees the
+    /// resume lock and the USDC driver pause, and a rerun reports it
+    /// superseded without sending: no USDC moved.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn a_deposit_whose_nonce_another_tx_took_is_superseded_and_frees_the_lock_and_the_pause()
+    {
+        use alloy::providers::Provider as _;
+        use alloy::providers::ext::AnvilApi as _;
+
+        let chain = AnvilRaindexChain::deploy().await;
+        let supply = U256::from(1_000_000_000_u64);
+        let usdc = chain.deploy_bot_token(6, supply).await;
+        let alpaca = MockServer::start();
+        let (state, receipt_gate, driver_gate) =
+            alpaca_deposit_state_on(&chain, usdc, &alpaca, U256::from(1_u64)).await;
+        serve_alpaca_deposit_address(&alpaca, &state);
+        chain.set_automine(false).await;
+        let provider = chain.bot_wallet.provider();
+
+        let answer = deposit_under(&state, TEST_OPERATION_ID, "1")
+            .await
+            .unwrap_or_else(|(status, error)| panic!("deposit refused with {status}: {error}"));
+        let transfer_tx: TxHash = serde_json::from_value(answer["transferTx"].clone()).unwrap();
+        let nonce = recorded_deposit(&state, TEST_OPERATION_ID)
+            .await
+            .transfer
+            .prepared
+            .nonce();
+        // The node loses the transfer, and a plain self transfer at its
+        // nonce, sent outside the bot, mines in its place.
+        provider.anvil_drop_transaction(transfer_tx).await.unwrap();
+        let cancel = *provider
+            .send_transaction(
+                alloy::rpc::types::TransactionRequest::default()
+                    .from(chain.bot)
+                    .to(chain.bot)
+                    .nonce(nonce)
+                    .value(U256::ZERO),
+            )
+            .await
+            .unwrap()
+            .tx_hash();
+        chain.mine().await;
+        chain.set_automine(true).await;
+        assert_eq!(
+            mined_receipt(&chain.bot_wallet, cancel).await.from,
+            chain.bot
+        );
+        assert!(!lock_and_pause_free(&state, &driver_gate));
+
+        receipt_gate.send_replace(ReceiptGate::Dropped);
+        capital_tasks_finished(&state).await;
+
+        assert!(lock_and_pause_free(&state, &driver_gate));
+        assert!(matches!(
+            recorded_deposit(&state, TEST_OPERATION_ID).await.outcome,
+            crate::alpaca_deposit::AlpacaDepositOutcome::Superseded { .. }
+        ));
+        let rerun = deposit_under(&state, TEST_OPERATION_ID, "1")
+            .await
+            .unwrap_or_else(|(status, error)| panic!("rerun refused with {status}: {error}"));
+        assert_eq!(rerun["status"], "superseded");
+        assert_eq!(
+            erc20_balance(&chain.bot_wallet, usdc, TEST_ALPACA_DEPOSIT_ADDRESS).await,
+            U256::ZERO
+        );
+        assert_eq!(
+            erc20_balance(&chain.bot_wallet, usdc, chain.bot).await,
+            supply
+        );
+    }
+
+    /// A transfer signed and recorded before a restart, never broadcast, is
+    /// restored at startup: its bytes are rebroadcast, and the resume lock
+    /// and the USDC driver pause are taken again, so no USDC worker runs and
+    /// no lock taking verb starts until its fate is proven. Once it confirms,
+    /// both are freed, and the transfer moved the USDC once.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn a_restart_restores_a_pending_deposit_and_keeps_the_usdc_driver_paused_until_it_is_proven()
+     {
+        use alloy::providers::Provider as _;
+
+        let chain = AnvilRaindexChain::deploy().await;
+        let supply = U256::from(1_000_000_000_u64);
+        let usdc = chain.deploy_bot_token(6, supply).await;
+        let alpaca = MockServer::start();
+        let (state, receipt_gate, driver_gate) =
+            alpaca_deposit_state_on(&chain, usdc, &alpaca, U256::from(1_u64)).await;
+        serve_alpaca_deposit_address(&alpaca, &state);
+        let handle = state.recovery.get().unwrap();
+        let amount = U256::from(1_000_000_u64);
+        let prepared = chain
+            .bot_wallet
+            .prepare_pending(
+                usdc,
+                alloy::primitives::Bytes::from(alloy::sol_types::SolCall::abi_encode(
+                    &st0x_evm::IERC20::transferCall {
+                        to: TEST_ALPACA_DEPOSIT_ADDRESS,
+                        amount,
+                    },
+                )),
+                crate::alpaca_deposit::DEPOSIT_TRANSFER_NOTE,
+            )
+            .await
+            .unwrap();
+        handle
+            .alpaca_deposit_store
+            .send(
+                &TEST_OPERATION_ID.parse().unwrap(),
+                crate::alpaca_deposit::AlpacaDepositOperationCommand::Prepare {
+                    transfer: crate::alpaca_deposit::DepositTransfer {
+                        amount,
+                        deposit_address: TEST_ALPACA_DEPOSIT_ADDRESS,
+                        prepared: prepared.clone(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        chain.set_automine(false).await;
+
+        let restored = restore_capital_alpaca_deposits(
+            &state.ctx,
+            &state.pool,
+            &handle.alpaca_deposit_store,
+            &state.resume_lock,
+            &handle.usdc_driver_pause,
+        )
+        .await;
+        assert!(
+            restored.gates_ethereum,
+            "an unmined transfer gates Ethereum"
+        );
+        let follow = tokio::spawn(restored.follow.expect("a pending deposit must be followed"));
+        assert!(
+            chain
+                .bot_wallet
+                .provider()
+                .get_transaction_by_hash(prepared.tx_hash())
+                .await
+                .unwrap()
+                .is_some(),
+            "startup must rebroadcast the recorded bytes"
+        );
+        assert!(
+            state.resume_lock.0.try_lock().is_err(),
+            "a restored deposit must hold the resume lock until it is proven"
+        );
+        assert!(
+            driver_gate.try_enter().is_none(),
+            "a restored deposit must keep every USDC worker out until it is proven"
+        );
+        let Err((status, _)) = run_alpaca_deposit(&state, "1").await else {
+            panic!("another deposit must not run while a restored one is unproven");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        chain.mine().await;
+        chain.set_automine(true).await;
+        let _completed =
+            serve_completed_deposits(&alpaca, &state, chain.bot, &[(prepared.tx_hash(), "1")]);
+        receipt_gate.send_replace(ReceiptGate::Released);
+        tokio::time::timeout(Duration::from_secs(30), follow)
+            .await
+            .expect("the restored deposit must be proven")
+            .unwrap();
+
+        assert!(lock_and_pause_free(&state, &driver_gate));
+        assert!(matches!(
+            recorded_deposit(&state, TEST_OPERATION_ID).await.outcome,
+            crate::alpaca_deposit::AlpacaDepositOutcome::Confirmed { .. }
+        ));
+        assert_eq!(
+            erc20_balance(&chain.bot_wallet, usdc, TEST_ALPACA_DEPOSIT_ADDRESS).await,
+            amount
         );
     }
 
@@ -12444,7 +13010,21 @@ mod tests {
     /// waits until the returned gate moves, so the tests can observe a route
     /// that answered at the broadcast while its confirmation is still pending.
     fn capital_ctx_on(chain: &AnvilRaindexChain) -> (Ctx, tokio::sync::watch::Sender<ReceiptGate>) {
-        let (wallet, gate) = HeldReceiptWallet::wrap(Arc::clone(&chain.bot_wallet));
+        capital_ctx_with(
+            chain,
+            HeldReceiptWallet::wrap(Arc::clone(&chain.bot_wallet)),
+        )
+    }
+
+    /// [`capital_ctx_on`] with every signer `wrapped`, a [`HeldReceiptWallet`]
+    /// over the bot's wallet on `chain` and the sender that moves its gate.
+    fn capital_ctx_with(
+        chain: &AnvilRaindexChain,
+        (wallet, gate): (
+            Arc<dyn st0x_evm::Wallet<Provider = alloy::providers::RootProvider>>,
+            tokio::sync::watch::Sender<ReceiptGate>,
+        ),
+    ) -> (Ctx, tokio::sync::watch::Sender<ReceiptGate>) {
         let mut ctx = create_test_ctx_with_order_owner(chain.bot);
         let primary = ctx.chains.primary_mut();
         primary.rpc_url = chain.endpoint.clone();

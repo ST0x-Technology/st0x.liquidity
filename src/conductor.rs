@@ -74,6 +74,7 @@ use st0x_tokenization::Tokenizer;
 use st0x_wrapper::{UnderlyingPerWrapped, Wrapper, WrapperError, WrapperService};
 
 use crate::alerts::{AlertKind, LogNotifier, Notifier};
+use crate::alpaca_deposit::AlpacaDepositOperation;
 use crate::bindings::IERC4626;
 use crate::bot_gas::{
     BotGasCostLedger, BotGasReceiptCost, BotGasReceiptCostEnqueuer, RecordBotGasReceiptCostCtx,
@@ -1020,8 +1021,9 @@ fn publish_process_tx_handle(
 /// Handles the conductor shares with the axum server's `AppState`: the
 /// dashboard event stream, the broadcasting inventory, the recovery cell the
 /// conductor populates for `/transfers/resume`, the process-tx cell the
-/// conductor populates for the in bot process-tx route, and the PnL ledger
-/// whose ingestion both sides drive.
+/// conductor populates for the in bot process-tx route, the PnL ledger
+/// whose ingestion both sides drive, and the resume lock a capital Alpaca
+/// deposit restored at startup holds until its fate is proven.
 pub(crate) struct ServerHandles {
     pub(crate) event_sender: broadcast::Sender<Statement>,
     pub(crate) inventory: Arc<BroadcastingInventory>,
@@ -1030,6 +1032,7 @@ pub(crate) struct ServerHandles {
     pub(crate) pnl_ledger: Arc<PnlLedger>,
     pub(crate) projection_maintenance: Arc<projection_pause::ProjectionMaintenance>,
     pub(crate) equity_prices: EquityPriceStore,
+    pub(crate) resume_lock: Arc<crate::api::ResumeLock>,
 }
 
 async fn setup_trading_schedule(
@@ -1073,6 +1076,7 @@ impl Conductor {
             pnl_ledger,
             projection_maintenance,
             equity_prices,
+            resume_lock,
         }: ServerHandles,
         shutdown_token: CancellationToken,
         startup_tokens: ConductorStartupTokens,
@@ -1162,6 +1166,7 @@ impl Conductor {
             usdc_driver_pause,
             usdc_store: recovery_usdc_store,
             cctp_burn_store,
+            alpaca_deposit_store,
             wrapped_equity_recovery_store,
             unwrapped_equity_recovery_store,
             mint_store,
@@ -1191,6 +1196,7 @@ impl Conductor {
                 notifier: notifier.clone(),
                 record_bot_gas_receipt_cost_queue: record_bot_gas_receipt_cost_queue.clone(),
                 equity_prices: equity_prices.clone(),
+                resume_lock,
             },
             &backfill_queues,
         ))
@@ -1395,6 +1401,7 @@ impl Conductor {
             usdc_driver_pause,
             usdc_store: recovery_usdc_store,
             cctp_burn_store,
+            alpaca_deposit_store,
         });
 
         publish_process_tx_handle(
@@ -2159,6 +2166,10 @@ struct RebalancingInfrastructure {
     /// The `CctpBurnOperation` store, published on the recovery handle for
     /// the capital `cctp-bridge` route after the startup burn restore.
     cctp_burn_store: Arc<Store<CctpBurnOperation>>,
+    /// The `AlpacaDepositOperation` store, published on the recovery handle
+    /// for the capital `alpaca-deposit` route after the startup deposit
+    /// restore.
+    alpaca_deposit_store: Arc<Store<AlpacaDepositOperation>>,
     wrapped_equity_recovery_store: Arc<Store<WrappedEquityRecovery>>,
     unwrapped_equity_recovery_store: Arc<Store<UnwrappedEquityRecovery>>,
     mint_store: Arc<Store<TokenizedEquityMint>>,
@@ -2192,6 +2203,9 @@ struct RebalancingDeps {
     notifier: Arc<dyn crate::alerts::Notifier>,
     record_bot_gas_receipt_cost_queue: RecordBotGasReceiptCostJobQueue,
     equity_prices: EquityPriceStore,
+    /// The API's resume lock, which a capital Alpaca deposit restored at
+    /// startup holds, as the live route does, until its fate is proven.
+    resume_lock: Arc<crate::api::ResumeLock>,
 }
 
 /// Position + rebalancing infrastructure produced during conductor startup.
@@ -2212,6 +2226,7 @@ struct PositionAndRebalancing {
     usdc_driver_pause: Arc<UsdcDriverPause>,
     usdc_store: Arc<Store<UsdcRebalance>>,
     cctp_burn_store: Arc<Store<CctpBurnOperation>>,
+    alpaca_deposit_store: Arc<Store<AlpacaDepositOperation>>,
     wrapped_equity_recovery_store: Arc<Store<WrappedEquityRecovery>>,
     unwrapped_equity_recovery_store: Arc<Store<UnwrappedEquityRecovery>>,
     mint_store: Arc<Store<TokenizedEquityMint>>,
@@ -2513,6 +2528,7 @@ impl PositionAndRebalancing {
             usdc_driver_pause: infra.usdc_driver_pause,
             usdc_store: infra.usdc_store,
             cctp_burn_store: infra.cctp_burn_store,
+            alpaca_deposit_store: infra.alpaca_deposit_store,
             wrapped_equity_recovery_store: infra.wrapped_equity_recovery_store,
             unwrapped_equity_recovery_store: infra.unwrapped_equity_recovery_store,
             mint_store: infra.mint_store,
@@ -4059,6 +4075,29 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         unmined_restore_chains
             .extend(restore_capital_cctp_burns(&deps.ctx, &deps.pool, &cctp_burn_store).await);
 
+        // Likewise for the signed transfers of the capital `alpaca-deposit`
+        // route: a pending one keeps its nonce on the Ethereum wallet and is
+        // rebroadcast, and it holds the resume lock and the USDC driver pause,
+        // as the live route does, until its fate is proven. Taken before any
+        // USDC worker starts, so no transfer sizes against its USDC.
+        let alpaca_deposit_store = StoreBuilder::<AlpacaDepositOperation>::new(deps.pool.clone())
+            .build(())
+            .await?;
+        let restored_deposits = crate::api::restore_capital_alpaca_deposits(
+            &deps.ctx,
+            &deps.pool,
+            &alpaca_deposit_store,
+            &deps.resume_lock,
+            &usdc_driver_pause,
+        )
+        .await;
+        if restored_deposits.gates_ethereum {
+            unmined_restore_chains.insert(Chain::Ethereum);
+        }
+        if let Some(follow) = restored_deposits.follow {
+            tokio::spawn(follow);
+        }
+
         // After the nonce restores and rebroadcasts above, so a revoke neither
         // takes the nonce of a signed send persisted before the restart nor
         // waits behind one that is not mined.
@@ -4132,6 +4171,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             usdc_driver_pause,
             usdc_store: recovery_usdc_store,
             cctp_burn_store,
+            alpaca_deposit_store,
             wrapped_equity_recovery_store,
             unwrapped_equity_recovery_store,
             mint_store: built.mint,
