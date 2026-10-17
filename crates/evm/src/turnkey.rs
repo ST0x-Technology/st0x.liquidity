@@ -3267,54 +3267,67 @@ mod tests {
     // via `anvil_setBalance`).
     //
     // Required env vars (set in `.env`, loaded by direnv):
-    //   TURNKEY_API_PRIVATE_KEY  -- hex-encoded P-256 API private key
     //   TURNKEY_ORG_ID           -- Turnkey organization ID
     //   TURNKEY_ADDRESS          -- Ethereum address managed by Turnkey
+    // plus exactly one credential, the same choice as production's
+    // `[wallet]` config:
+    //   TURNKEY_API_PRIVATE_KEY  -- hex-encoded P-256 API private key
+    //   TURNKEY_KMS_KEY_VERSION  -- KMS key version whose public half is the
+    //                               Turnkey API key; stamps with
+    //                               GOOGLE_OAUTH_ACCESS_TOKEN
     //
     // See `.env.example` for the template.
 
-    /// Returns `None` when `TURNKEY_*` env vars are absent, allowing
-    /// tests to skip gracefully in environments without credentials.
-    fn turnkey_env() -> Option<(String, String, Address)> {
-        let api_key = std::env::var("TURNKEY_API_PRIVATE_KEY").ok()?;
+    /// Returns `None` when `TURNKEY_ORG_ID` or `TURNKEY_ADDRESS` is absent,
+    /// allowing tests to skip gracefully in environments without
+    /// credentials. The credential is passed through as found:
+    /// [`TurnkeyWallet::new`] refuses both or neither, as in production.
+    fn turnkey_env() -> Option<(TurnkeySettings, TurnkeyCredentials)> {
         let org_id = std::env::var("TURNKEY_ORG_ID").ok()?;
         let address: Address = std::env::var("TURNKEY_ADDRESS")
             .ok()?
             .parse()
             .expect("TURNKEY_ADDRESS must be valid hex address");
 
-        Some((api_key, org_id, address))
+        let settings = TurnkeySettings {
+            address,
+            organization_id: TurnkeyOrganizationId::try_new(org_id)
+                .expect("Turnkey organization ID must be a UUID"),
+            kms_api_key: std::env::var("TURNKEY_KMS_KEY_VERSION")
+                .ok()
+                .map(TurnkeyKmsApiKey::new),
+        };
+        let credentials = TurnkeyCredentials {
+            api_private_key: std::env::var("TURNKEY_API_PRIVATE_KEY").ok().map(|key| {
+                TurnkeyApiPrivateKey::try_new(key)
+                    .expect("Turnkey API private key must be valid P-256 hex")
+            }),
+        };
+
+        Some((settings, credentials))
     }
 
     /// Spin up Anvil, fund the Turnkey address, and return a
     /// `TurnkeyWallet` connected to the local node.
     async fn integration_wallet(
-        api_key: String,
-        org_id: String,
-        address: Address,
+        settings: TurnkeySettings,
+        credentials: TurnkeyCredentials,
     ) -> (TurnkeyWallet<impl Provider + Clone>, AnvilInstance) {
         let anvil = Anvil::new().spawn();
         let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
 
         // Fund the Turnkey-managed address on the local Anvil node.
         provider
-            .anvil_set_balance(address, U256::from(10) * U256::from(10).pow(U256::from(18)))
+            .anvil_set_balance(
+                settings.address,
+                U256::from(10) * U256::from(10).pow(U256::from(18)),
+            )
             .await
             .expect("anvil_setBalance should succeed");
 
         let wallet = TurnkeyWallet::new(WalletCtx {
-            settings: TurnkeySettings {
-                address,
-                organization_id: TurnkeyOrganizationId::try_new(org_id)
-                    .expect("Turnkey organization ID must be a UUID"),
-                kms_api_key: None,
-            },
-            credentials: TurnkeyCredentials {
-                api_private_key: Some(
-                    TurnkeyApiPrivateKey::try_new(api_key)
-                        .expect("Turnkey API private key must be valid P-256 hex"),
-                ),
-            },
+            settings,
+            credentials,
             provider,
             required_confirmations: 1,
         })
@@ -3336,6 +3349,38 @@ mod tests {
             )
             .parse()
             .expect("ST0X_ORCHESTRATOR_ADDRESS must be a hex address")
+    }
+
+    /// Base, Ethereum, HyperEVM, BNB Smart Chain and Robinhood: the chains
+    /// the typed-signing policy admits, each through its own
+    /// (verifying_contract, chain_id) arm.
+    const MINT_AUTH_CHAIN_IDS: [u64; 5] = [8453, 1, 999, 56, 4663];
+
+    /// Panics unless `error` is Turnkey refusing the probe: a failed or
+    /// rejected activity, or a 4xx answer other than 401, 408 or 429. An
+    /// activity that waits for approval means another policy matched the
+    /// probe. Any other error (a KMS stamping failure such as a missing sign
+    /// permission, an expired token or a 429, a transport failure, a
+    /// malformed response) stops before Turnkey decides, so it proves
+    /// nothing about the policy.
+    fn assert_turnkey_refused(error: &TurnkeyRequestError, condition: &str) {
+        match error {
+            TurnkeyRequestError::Client(TurnkeyClientError::ActivityFailed(_)) => {}
+            TurnkeyRequestError::Client(TurnkeyClientError::UnexpectedActivityStatus(status))
+                if status == "ACTIVITY_STATUS_REJECTED" => {}
+            TurnkeyRequestError::Client(TurnkeyClientError::UnexpectedHttpStatus(code, _))
+                if (400..500).contains(code) && ![401, 408, 429].contains(code) => {}
+            TurnkeyRequestError::Client(TurnkeyClientError::ActivityRequiresApproval(
+                activity_id,
+            )) => panic!(
+                "the probe for {condition} waits for approval as activity {activity_id}: \
+                 another policy matched it, so reject that activity now and find that policy"
+            ),
+            other => panic!(
+                "the probe for {condition} failed before Turnkey refused it, so it proves no \
+                 refusal: {other:?}"
+            ),
+        }
     }
 
     /// Hand-composes a MintAuth-shaped typed payload and its EIP-712
@@ -3438,69 +3483,100 @@ mod tests {
     #[ignore = "requires TURNKEY_* env vars and ST0X_ORCHESTRATOR_ADDRESS -- run with `cargo test -- --ignored`"]
     #[tokio::test]
     async fn turnkey_typed_signing_integration() {
-        let (api_key, org_id, address) = turnkey_env()
-            .expect("TURNKEY_API_PRIVATE_KEY, TURNKEY_ORG_ID, and TURNKEY_ADDRESS must be set");
+        let (settings, credentials) =
+            turnkey_env().expect("TURNKEY_ORG_ID and TURNKEY_ADDRESS must be set");
+        let address = settings.address;
         let orchestrator = orchestrator_env();
 
-        let (wallet, _anvil) = integration_wallet(api_key, org_id, address).await;
+        let (wallet, _anvil) = integration_wallet(settings, credentials).await;
 
-        // Base -- the chain the orchestrator is deployed to and the
-        // policy's chain_id condition names.
-        let (payload, digest) = policy_probe("MintAuth", 8453, orchestrator, address);
+        // The orchestrator has the same address on Base, Ethereum, HyperEVM,
+        // BNB Smart Chain and Robinhood, and the policy allows it through one
+        // (verifying_contract, chain_id) arm per chain, so each chain is
+        // signed on its own.
+        for chain_id in MINT_AUTH_CHAIN_IDS {
+            let (payload, digest) = policy_probe("MintAuth", chain_id, orchestrator, address);
 
-        let signature = wallet.sign_typed_data(payload, digest).await.expect(
-            "Turnkey typed-data signing should succeed (the typed-scoped \
-                 policy must allow this domain and primary type)",
-        );
+            let signature = wallet
+                .sign_typed_data(payload, digest)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "Turnkey typed-data signing should succeed on chain {chain_id} (the \
+                         typed-scoped policy must allow this domain and primary type): \
+                         {error:?}"
+                    )
+                });
 
-        assert_eq!(
-            signature.recover_address_from_prehash(&digest).unwrap(),
-            address,
-            "signature must recover to the Turnkey-managed address over the \
-             locally composed EIP-712 digest"
-        );
+            assert_eq!(
+                signature.recover_address_from_prehash(&digest).unwrap(),
+                address,
+                "signature on chain {chain_id} must recover to the Turnkey-managed address \
+                 over the locally composed EIP-712 digest"
+            );
+        }
     }
 
     /// Proves the DENY half of the typed-signing policy against the REAL
     /// Turnkey API -- the half [`turnkey_typed_signing_integration`] cannot
     /// see: a blanket raw-payload grant passes the allow side, and only
-    /// refusals prove the `eth.eip_712` scoping. Four probes, each varying
-    /// exactly one scoped condition: a foreign primary type, a foreign
-    /// verifying contract, a foreign chain id, and a bare hex digest
+    /// refusals prove the `eth.eip_712` scoping. Four kinds of probe, each
+    /// varying exactly one scoped condition: a foreign primary type, a
+    /// foreign verifying contract, a foreign chain id, and a bare hex digest
     /// (which carries no `eth.eip_712` fields for the policy to match, so
     /// under default-deny it is refused unless a blanket raw-payload
-    /// allowance shadows the scoping).
+    /// allowance shadows the scoping). The foreign primary type and foreign
+    /// verifying contract probes run on each chain in
+    /// [`MINT_AUTH_CHAIN_IDS`], because each chain has its own policy arm.
+    /// The test first signs the allowed Base MintAuth, so a refusal below
+    /// cannot come from a credential that signs nothing at all.
     ///
     /// Every probe's expected digest matches its payload, so a wrongly
     /// allowed probe surfaces as a VALID signature -- an unambiguous `Ok`
     /// -- rather than a recovery mismatch. Only the refusal itself is
-    /// asserted: the denial's error shape (failed activity vs. HTTP
-    /// rejection) is Turnkey's to choose, not part of our contract.
+    /// asserted, and only a refusal from Turnkey counts (see
+    /// [`assert_turnkey_refused`]): the denial's error shape (failed
+    /// activity vs. HTTP rejection) is Turnkey's to choose, not part of our
+    /// contract.
     #[ignore = "requires TURNKEY_* env vars and ST0X_ORCHESTRATOR_ADDRESS -- run with `cargo test -- --ignored`"]
     #[tokio::test]
     async fn turnkey_typed_signing_policy_denials_integration() {
-        let (api_key, org_id, address) = turnkey_env()
-            .expect("TURNKEY_API_PRIVATE_KEY, TURNKEY_ORG_ID, and TURNKEY_ADDRESS must be set");
+        let (settings, credentials) =
+            turnkey_env().expect("TURNKEY_ORG_ID and TURNKEY_ADDRESS must be set");
+        let address = settings.address;
         let orchestrator = orchestrator_env();
 
-        let (wallet, _anvil) = integration_wallet(api_key.clone(), org_id.clone(), address).await;
+        let (wallet, _anvil) = integration_wallet(settings, credentials).await;
 
-        for (condition, probe) in [
-            (
-                "a foreign primary type",
-                policy_probe("MintAuthV2", 8453, orchestrator, address),
-            ),
-            (
-                "a foreign verifying contract",
-                policy_probe("MintAuth", 8453, Address::repeat_byte(0x66), address),
-            ),
-            (
-                "a foreign chain id",
-                policy_probe("MintAuth", 1, orchestrator, address),
-            ),
-        ] {
-            let (payload, digest) = probe;
-            wallet
+        // Positive control: without it, a user that lacks the policy's tag, or
+        // a KMS identity that cannot sign, would see every probe refused.
+        let (payload, digest) = policy_probe("MintAuth", 8453, orchestrator, address);
+        wallet.sign_typed_data(payload, digest).await.expect(
+            "the allowed Base MintAuth must sign before the denial probes can prove anything",
+        );
+
+        let per_chain_probes = MINT_AUTH_CHAIN_IDS.into_iter().flat_map(|chain_id| {
+            [
+                (
+                    format!("a foreign primary type on chain {chain_id}"),
+                    policy_probe("MintAuthV2", chain_id, orchestrator, address),
+                ),
+                (
+                    format!("a foreign verifying contract on chain {chain_id}"),
+                    policy_probe("MintAuth", chain_id, Address::repeat_byte(0x66), address),
+                ),
+            ]
+        });
+        // The policy admits every chain in MINT_AUTH_CHAIN_IDS, so a probe on
+        // one of those is correctly signed and fails here for no fault.
+        // Anvil's 31337 is outside the set.
+        let foreign_chain_probe = (
+            "a foreign chain id".to_owned(),
+            policy_probe("MintAuth", 31337, orchestrator, address),
+        );
+
+        for (condition, (payload, digest)) in per_chain_probes.chain([foreign_chain_probe]) {
+            let error = wallet
                 .sign_typed_data(payload, digest)
                 .await
                 .expect_err(&format!(
@@ -3508,21 +3584,33 @@ mod tests {
                  Turnkey signed the probe and the policy is broader than the \
                  eth.eip_712 scoping the runbook requires"
                 ));
+
+            let EvmError::Turnkey(TurnkeyError::Signer(TracingTurnkeySignerError::TurnkeyClient(
+                request_error,
+            ))) = &error
+            else {
+                panic!(
+                    "the probe for {condition} failed outside the Turnkey request, so it \
+                     proves no refusal: {error:?}"
+                );
+            };
+            assert_turnkey_refused(request_error, &condition);
         }
 
         // A bare digest submitted as PAYLOAD_ENCODING_HEXADECIMAL, using
         // the digest the policy WOULD sign through the EIP-712 encoding --
         // the exact bypass a leftover blanket raw-payload allowance would
-        // permit.
+        // permit. Sent through the wallet's own client, so it carries the
+        // same stamp credential (local or KMS) as the probes above.
         let (_, allowed_digest) = policy_probe("MintAuth", 8453, orchestrator, address);
-        let api_private_key = TurnkeyApiPrivateKey::try_new(api_key).expect("valid api key");
-        let client = TracingTurnkeyClient::for_stamper(
-            ApiStamper::local(&api_private_key).expect("stamper builds"),
-        )
-        .expect("client builds");
+        let TracingTurnkeySigner {
+            client,
+            organization_id,
+            ..
+        } = &wallet.typed_data_signer;
         let hex_submission = client
             .sign_raw_payload(
-                TurnkeyOrganizationId::try_new(org_id).expect("valid organization id"),
+                organization_id.clone(),
                 TracingTurnkeyClient::current_timestamp().expect("clock is after the epoch"),
                 SignRawPayloadIntentV2 {
                     sign_with: address.to_string(),
@@ -3535,7 +3623,7 @@ mod tests {
 
         // `SignRawPayloadResult` has no Debug impl, so no `expect_err`.
         match hex_submission {
-            Err(_refused) => {}
+            Err(error) => assert_turnkey_refused(&error, "a bare hex digest"),
             Ok(_) => panic!(
                 "Turnkey SIGNED a bare hex digest: the org carries a blanket \
                  raw-payload allowance that bypasses the eth.eip_712 scoping"
@@ -3546,10 +3634,11 @@ mod tests {
     #[ignore = "requires TURNKEY_* env vars -- run with `cargo test -- --ignored`"]
     #[tokio::test]
     async fn turnkey_integration() {
-        let (api_key, org_id, address) = turnkey_env()
-            .expect("TURNKEY_API_PRIVATE_KEY, TURNKEY_ORG_ID, and TURNKEY_ADDRESS must be set");
+        let (settings, credentials) =
+            turnkey_env().expect("TURNKEY_ORG_ID and TURNKEY_ADDRESS must be set");
+        let address = settings.address;
 
-        let (wallet, _anvil) = integration_wallet(api_key, org_id, address).await;
+        let (wallet, _anvil) = integration_wallet(settings, credentials).await;
         let self_address = wallet.address();
 
         // Wallet address matches configured address.
