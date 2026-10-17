@@ -1,5 +1,7 @@
 //! The `Prices` family: the live price of each symbol the bot holds a
-//! position in, and the position's dollar exposure at that price.
+//! position in and the position's dollar exposure at it, and the symbol's
+//! last observed prices, wrapped and underlying, with their time and the
+//! exposure at them, which stay after the live price expires.
 //!
 //! Refreshed every 60 seconds by `liq-state-refresh`, like the exporter. A
 //! symbol with a price but no position, or a position without a live price,
@@ -14,7 +16,8 @@ use tracing::warn;
 use st0x_event_sorcery::{LoadAllIdsError, SendError, load_all_ids, load_entity};
 use st0x_finance::Symbol;
 
-use super::{LiqMetric, LiqSample, float_value, push_sample, strip_prefix};
+use super::{LiqMetric, LiqSample, float_value, push_sample, strip_prefix, timestamp_value};
+use crate::dashboard::equity_price::LastPrice;
 use crate::position::Position;
 
 /// One position as the prices builder reads it, owned by the metrics so it
@@ -66,14 +69,22 @@ pub(crate) async fn load_positions(
     Ok(positions)
 }
 
-/// `liq_position_last_price_usd` and `liq_equity_exposure_usd` per position.
-/// Positions and prices join on the label symbol, as the exporter joined
-/// them, so `tAAPL` prices `AAPL`.
+/// `liq_position_last_price_usd` and `liq_equity_exposure_usd` per position
+/// with a live price, and `liq_equity_last_price_usd`,
+/// `liq_equity_underlying_price_usd`, `liq_equity_price_observed_ts_seconds`
+/// and `liq_equity_last_exposure_usd` per position with a last observed
+/// one. Positions and prices join on the label symbol, as the exporter
+/// joined them, so `tAAPL` prices `AAPL`.
 pub(crate) fn price_samples(
     positions: &[PositionInput],
     live_prices: &[(Symbol, Float)],
+    last_prices: &[(Symbol, LastPrice)],
 ) -> Vec<LiqSample> {
     let prices: HashMap<&str, Float> = live_prices
+        .iter()
+        .map(|(symbol, price)| (strip_prefix(symbol.as_str()), *price))
+        .collect();
+    let last: HashMap<&str, LastPrice> = last_prices
         .iter()
         .map(|(symbol, price)| (strip_prefix(symbol.as_str()), *price))
         .collect();
@@ -81,28 +92,66 @@ pub(crate) fn price_samples(
     let mut samples = Vec::new();
     for position in positions {
         let symbol = strip_prefix(position.symbol.as_str());
-        let Some(price) = prices.get(symbol).copied() else {
-            continue;
-        };
-
         let labels = vec![("symbol", symbol.to_string())];
-        push_sample(
-            &mut samples,
-            LiqMetric::PositionLastPriceUsd,
-            labels.clone(),
-            float_value(price),
-        );
-        push_sample(
-            &mut samples,
-            LiqMetric::EquityExposureUsd,
-            labels,
-            (position.net * price)
-                .map_err(Into::into)
-                .and_then(float_value),
-        );
+        if let Some(price) = prices.get(symbol).copied() {
+            push_sample(
+                &mut samples,
+                LiqMetric::PositionLastPriceUsd,
+                labels.clone(),
+                float_value(price),
+            );
+            push_sample(
+                &mut samples,
+                LiqMetric::EquityExposureUsd,
+                labels.clone(),
+                (position.net * price)
+                    .map_err(Into::into)
+                    .and_then(float_value),
+            );
+        }
+        if let Some(last) = last.get(symbol).copied() {
+            last_price_samples(&mut samples, &labels, position.net, last);
+        }
     }
 
     samples
+}
+
+/// A position's last observed prices, their time, and its exposure at them.
+fn last_price_samples(
+    samples: &mut Vec<LiqSample>,
+    labels: &[(&'static str, String)],
+    net: Float,
+    last: LastPrice,
+) {
+    push_sample(
+        samples,
+        LiqMetric::EquityLastPriceUsd,
+        labels.to_vec(),
+        float_value(last.wrapped_usd),
+    );
+    if let Some(underlying) = last.underlying_usd {
+        push_sample(
+            samples,
+            LiqMetric::EquityUnderlyingPriceUsd,
+            labels.to_vec(),
+            float_value(underlying),
+        );
+    }
+    push_sample(
+        samples,
+        LiqMetric::EquityPriceObservedTsSeconds,
+        labels.to_vec(),
+        timestamp_value(last.observed_at),
+    );
+    push_sample(
+        samples,
+        LiqMetric::EquityLastExposureUsd,
+        labels.to_vec(),
+        (net * last.wrapped_usd)
+            .map_err(Into::into)
+            .and_then(float_value),
+    );
 }
 
 #[cfg(test)]
@@ -161,12 +210,11 @@ pub(crate) mod tests {
                     net: position.net,
                 })
                 .collect();
-            let live = EquityPriceStore::with_prices(&fixture.equity_prices)
-                .live_prices(now)
-                .await;
+            let store = EquityPriceStore::with_prices(&fixture.equity_prices);
+            let (live, last) = store.live_and_last_prices(now).await;
 
             assert_eq!(
-                render_family(LiqFamily::Prices, price_samples(&positions, &live)),
+                render_family(LiqFamily::Prices, price_samples(&positions, &live, &last)),
                 golden_for(LiqFamily::Prices, golden)
             );
         }
@@ -177,6 +225,7 @@ pub(crate) mod tests {
         let samples = price_samples(
             &[position("tAAPL", float!(10)), position("TSLA", float!(-3))],
             &[price("AAPL", float!(2.5)), price("tSPYM", float!(7))],
+            &[],
         );
 
         assert_eq!(
@@ -189,6 +238,81 @@ pub(crate) mod tests {
                 (
                     series("liq_equity_exposure_usd", &[("symbol", "AAPL")]),
                     25.0
+                ),
+            ])
+        );
+    }
+
+    /// After its live price expires, a position keeps its last observed
+    /// prices, their time, and its exposure at the last wrapped price; a
+    /// wrapped token here is worth 2 underlying shares.
+    #[test]
+    fn a_position_keeps_its_last_observed_prices_after_the_live_one_expires() {
+        let observed_at: chrono::DateTime<chrono::Utc> = "2026-10-08T12:00:00Z".parse().unwrap();
+        let last = |symbol: &str, wrapped, underlying| {
+            (
+                Symbol::new(symbol).unwrap(),
+                LastPrice {
+                    wrapped_usd: wrapped,
+                    underlying_usd: underlying,
+                    observed_at,
+                },
+            )
+        };
+        let samples = price_samples(
+            &[position("tAAPL", float!(10)), position("TSLA", float!(1))],
+            &[price("TSLA", float!(30))],
+            &[
+                last("AAPL", float!(200), Some(float!(100))),
+                last("TSLA", float!(30), None),
+            ],
+        );
+
+        let at = timestamp_value(observed_at).unwrap();
+        assert_eq!(
+            render_family(LiqFamily::Prices, samples),
+            BTreeMap::from([
+                (
+                    series("liq_equity_last_price_usd", &[("symbol", "AAPL")]),
+                    200.0
+                ),
+                (
+                    series("liq_equity_underlying_price_usd", &[("symbol", "AAPL")]),
+                    100.0
+                ),
+                (
+                    series(
+                        "liq_equity_price_observed_ts_seconds",
+                        &[("symbol", "AAPL")]
+                    ),
+                    at
+                ),
+                (
+                    series("liq_equity_last_exposure_usd", &[("symbol", "AAPL")]),
+                    2000.0
+                ),
+                (
+                    series("liq_position_last_price_usd", &[("symbol", "TSLA")]),
+                    30.0
+                ),
+                (
+                    series("liq_equity_exposure_usd", &[("symbol", "TSLA")]),
+                    30.0
+                ),
+                (
+                    series("liq_equity_last_price_usd", &[("symbol", "TSLA")]),
+                    30.0
+                ),
+                (
+                    series(
+                        "liq_equity_price_observed_ts_seconds",
+                        &[("symbol", "TSLA")]
+                    ),
+                    at
+                ),
+                (
+                    series("liq_equity_last_exposure_usd", &[("symbol", "TSLA")]),
+                    30.0
                 ),
             ])
         );

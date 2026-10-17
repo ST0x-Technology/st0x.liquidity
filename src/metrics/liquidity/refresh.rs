@@ -80,10 +80,10 @@ impl LiqStateRefresh {
             }
         };
 
-        let live_prices = self.equity_prices.live_prices(Utc::now()).await;
+        let (live_prices, last_prices) = self.equity_prices.live_and_last_prices(Utc::now()).await;
         self.families.replace(
             LiqFamily::Prices,
-            price_samples(&positions, &live_prices),
+            price_samples(&positions, &live_prices, &last_prices),
             SystemTime::now(),
         );
     }

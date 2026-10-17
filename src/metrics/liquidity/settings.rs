@@ -11,7 +11,11 @@ use itertools::Itertools;
 use rain_math_float::Float;
 use tracing::warn;
 
-use st0x_config::{BrokerCtx, Ctx, ExecutionThreshold, OperationMode, UsdcCorridorCtx};
+use st0x_config::{
+    BrokerCtx, Ctx, ExecutionThreshold, OperationMode, RebalancingMode, TargetShare,
+    UsdcCorridorCtx,
+};
+use st0x_evm::Chain;
 use st0x_finance::{Positive, Symbol};
 
 use super::{
@@ -53,6 +57,8 @@ pub(crate) struct SettingsInput {
     /// `None` for a share-count threshold: the series is dollars only.
     execution_threshold_usd: Option<Float>,
     assets: Vec<AssetInput>,
+    /// One row per symbol each hedged chain lists.
+    chain_assets: Vec<ChainAssetInput>,
     wallet: Option<WalletInput>,
     log_level: String,
     server_port: u16,
@@ -78,6 +84,20 @@ struct AssetInput {
     symbol: Symbol,
     counter_trading: AssetCounterTrading,
     rebalancing: bool,
+}
+
+/// One symbol as one hedged chain lists it: whether that chain counter
+/// trades it (with the symbol's extended-hours policy, which is global) and
+/// its rebalancing mode there.
+#[derive(Debug)]
+struct ChainAssetInput {
+    symbol: Symbol,
+    chain: Chain,
+    trading: AssetCounterTrading,
+    rebalancing: RebalancingMode,
+    /// The listing's target share, else the chain's, as the rebalancer reads
+    /// them; `None` where the chain does not rebalance the symbol.
+    target: Option<Float>,
 }
 
 /// Extended hours exists only while counter trading is enabled.
@@ -149,6 +169,34 @@ impl SettingsInput {
             })
             .collect();
 
+        let chain_assets = ctx
+            .chains
+            .hedged()
+            .flat_map(|hedged| {
+                hedged
+                    .assets
+                    .equities
+                    .symbols
+                    .iter()
+                    .map(|(symbol, config)| ChainAssetInput {
+                        symbol: symbol.clone(),
+                        chain: hedged.chain,
+                        trading: match config.trading {
+                            OperationMode::Enabled => AssetCounterTrading::Enabled {
+                                extended_hours: ctx.assets.is_extended_hours_enabled(symbol),
+                            },
+                            OperationMode::Disabled => AssetCounterTrading::Disabled,
+                        },
+                        rebalancing: config.rebalancing,
+                        target: config
+                            .target_share
+                            .or_else(|| rebalancing.allocation.targets.get(&hedged.chain).copied())
+                            .filter(|_| config.rebalancing.keeps_services())
+                            .map(TargetShare::inner),
+                    })
+            })
+            .collect();
+
         let BrokerCtx::AlpacaBrokerApi(_) = &ctx.broker;
 
         Self {
@@ -175,6 +223,7 @@ impl SettingsInput {
                 .collect(),
             execution_threshold_usd,
             assets,
+            chain_assets,
             wallet: ctx.wallet_meta.as_ref().map(|meta| WalletInput {
                 kind: meta.kind.clone(),
                 address: meta.address,
@@ -294,7 +343,56 @@ pub(crate) fn settings_samples(input: &SettingsInput) -> Vec<LiqSample> {
         asset_samples(&mut samples, asset);
     }
 
+    for asset in &input.chain_assets {
+        chain_asset_samples(&mut samples, asset);
+    }
+
     samples
+}
+
+/// `liq_asset_chain_trading`: 0 off, 1 counter trading in regular hours, 2
+/// in extended hours too. `liq_asset_chain_rebalancing`: 1 enabled, 0.5
+/// paused, 0 disabled. `liq_settings_equity_chain_target`: the chain's
+/// target share of the symbol, where it rebalances the symbol.
+fn chain_asset_samples(samples: &mut Vec<LiqSample>, asset: &ChainAssetInput) {
+    let labels = vec![
+        ("chain", asset.chain.as_str().to_string()),
+        ("symbol", strip_prefix(asset.symbol.as_str()).to_string()),
+    ];
+    let trading = match asset.trading {
+        AssetCounterTrading::Disabled => 0.0,
+        AssetCounterTrading::Enabled {
+            extended_hours: false,
+        } => 1.0,
+        AssetCounterTrading::Enabled {
+            extended_hours: true,
+        } => 2.0,
+    };
+    let rebalancing = match asset.rebalancing {
+        RebalancingMode::Enabled => 1.0,
+        RebalancingMode::Paused => 0.5,
+        RebalancingMode::Disabled => 0.0,
+    };
+    push_sample(
+        samples,
+        LiqMetric::AssetChainTrading,
+        labels.clone(),
+        Ok(trading),
+    );
+    if let Some(target) = asset.target {
+        push_sample(
+            samples,
+            LiqMetric::SettingsEquityChainTarget,
+            labels.clone(),
+            float_value(target),
+        );
+    }
+    push_sample(
+        samples,
+        LiqMetric::AssetChainRebalancing,
+        labels,
+        Ok(rebalancing),
+    );
 }
 
 fn settings_info_labels(input: &SettingsInput) -> Vec<(&'static str, String)> {
@@ -362,7 +460,7 @@ fn asset_samples(samples: &mut Vec<LiqSample>, asset: &AssetInput) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::time::Duration;
 
     use alloy::primitives::address;
@@ -370,9 +468,9 @@ mod tests {
 
     use st0x_bridge::corridor::{HopKind, UsdcCorridor};
     use st0x_config::{
-        CashHedgePolicy, ChainAssets, ChainCashAsset, ChainEquityAsset, EquityHedgePolicy,
-        HedgedChain, ImbalanceThreshold, RebalancingMode, UsdcCorridors, WalletMeta,
-        create_test_ctx_with_order_owner,
+        CashHedgePolicy, ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset,
+        EquityHedgePolicy, HedgedChain, ImbalanceThreshold, RebalancingMode, TargetShare,
+        UsdcCorridors, WalletMeta, create_test_ctx_with_order_owner,
     };
     use st0x_evm::Chain;
     use st0x_finance::{Usd, Usdc};
@@ -396,6 +494,8 @@ mod tests {
             cash_reserved: settings.cash_reserved.map(Usd::inner),
             // The dashboard settings carry one band, not each corridor's.
             usdc_corridors: Vec::new(),
+            // The DTO lists the primary chain's assets only.
+            chain_assets: Vec::new(),
             execution_threshold_usd: Float::parse(
                 settings
                     .execution_threshold
@@ -780,13 +880,12 @@ mod tests {
         }
         assert!(ctx.rebalancing.allocation.targets.contains_key(&primary));
 
-        // The dashboard settings carry one USDC band, not each corridor's.
         let from_ctx: BTreeMap<SeriesKey, f64> = render(
             settings_samples(&SettingsInput::from_ctx(&ctx)),
             LiqFamily::Settings,
         )
         .into_iter()
-        .filter(|((name, _), _)| !name.starts_with("liq_usdc_corridor_"))
+        .filter(|((name, _), _)| dashboard_carries(name))
         .collect();
         let from_dashboard = render(
             settings_samples(&input_from_dto(&settings_from_ctx(&ctx))),
@@ -878,7 +977,7 @@ mod tests {
                 LiqFamily::Settings,
             )
             .into_iter()
-            .filter(|((name, _), _)| !name.starts_with("liq_usdc_corridor_"))
+            .filter(|((name, _), _)| dashboard_carries(name))
             .collect();
             let from_dashboard = render(
                 settings_samples(&input_from_dto(&settings_from_ctx(&ctx))),
@@ -886,6 +985,14 @@ mod tests {
             );
             assert_eq!(from_ctx, from_dashboard, "{name}");
         }
+    }
+
+    /// The dashboard settings carry one USDC band, not each corridor's, no
+    /// per-chain listing, and no per-chain equity target.
+    fn dashboard_carries(name: &str) -> bool {
+        !name.starts_with("liq_usdc_corridor_")
+            && !name.starts_with("liq_asset_chain_")
+            && name != "liq_settings_equity_chain_target"
     }
 
     fn corridor(chain: Chain, hop: HopKind, target: Float, deviation: Float) -> UsdcCorridorCtx {
@@ -932,6 +1039,141 @@ mod tests {
         .into_iter()
         .filter(|((name, _), _)| name.starts_with("liq_usdc_corridor_"))
         .collect()
+    }
+
+    /// Each hedged chain's own trading and rebalancing modes for a symbol,
+    /// with the symbol's global extended-hours policy on a trading chain.
+    #[test]
+    fn each_chain_publishes_its_own_asset_flags() {
+        let symbol = Symbol::new("tHOOD").unwrap();
+        let asset = |trading, rebalancing| ChainEquityAsset {
+            tokenized_equity: address!("0x1111111111111111111111111111111111111111"),
+            tokenized_equity_derivative: address!("0x2222222222222222222222222222222222222222"),
+            vault_ids: Vec::new(),
+            trading,
+            rebalancing,
+            wrapped_equity_recovery: OperationMode::Disabled,
+            operational_limit: None,
+            target_share: None,
+        };
+        let mut ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        ctx.chains.primary_mut().assets.equities.symbols.insert(
+            symbol.clone(),
+            asset(OperationMode::Enabled, RebalancingMode::Paused),
+        );
+        ctx.chains.insert_secondary(
+            HedgedChain::test()
+                .chain(Chain::HyperEvm)
+                .assets(ChainAssets {
+                    equities: ChainEquities {
+                        operational_limit: None,
+                        symbols: HashMap::from([(
+                            symbol.clone(),
+                            asset(OperationMode::Disabled, RebalancingMode::Enabled),
+                        )]),
+                    },
+                    cash: None,
+                })
+                .call(),
+        );
+        ctx.assets.equities.symbols.insert(
+            symbol,
+            EquityHedgePolicy {
+                extended_hours_counter_trading: OperationMode::Enabled,
+                hedge_floor_shares: None,
+            },
+        );
+
+        let flags: BTreeMap<SeriesKey, f64> = render(
+            settings_samples(&SettingsInput::from_ctx(&ctx)),
+            LiqFamily::Settings,
+        )
+        .into_iter()
+        .filter(|((name, _), _)| name.starts_with("liq_asset_chain_"))
+        .collect();
+
+        let flag = |name, chain| series(name, &[("chain", chain), ("symbol", "HOOD")]);
+        assert_eq!(
+            flags,
+            BTreeMap::from([
+                (flag("liq_asset_chain_trading", "base"), 2.0),
+                (flag("liq_asset_chain_rebalancing", "base"), 0.5),
+                (flag("liq_asset_chain_trading", "hyperevm"), 0.0),
+                (flag("liq_asset_chain_rebalancing", "hyperevm"), 1.0),
+            ])
+        );
+    }
+
+    /// Each chain that rebalances a symbol publishes its target share: the
+    /// listing's own, else the chain's default. A chain that does not
+    /// rebalance the symbol publishes none.
+    #[test]
+    fn each_rebalancing_chain_publishes_its_target_share() {
+        let hood = Symbol::new("tHOOD").unwrap();
+        let spym = Symbol::new("tSPYM").unwrap();
+        let asset = |rebalancing, target_share| ChainEquityAsset {
+            tokenized_equity: address!("0x1111111111111111111111111111111111111111"),
+            tokenized_equity_derivative: address!("0x2222222222222222222222222222222222222222"),
+            vault_ids: Vec::new(),
+            trading: OperationMode::Enabled,
+            rebalancing,
+            wrapped_equity_recovery: OperationMode::Disabled,
+            operational_limit: None,
+            target_share,
+        };
+        let mut ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        let primary = ctx.chains.primary().chain;
+        let default_target = ctx.rebalancing.allocation.targets[&primary].inner();
+        let symbols = &mut ctx.chains.primary_mut().assets.equities.symbols;
+        symbols.insert(hood.clone(), asset(RebalancingMode::Paused, None));
+        symbols.insert(spym, asset(RebalancingMode::Disabled, None));
+        ctx.chains.insert_secondary(
+            HedgedChain::test()
+                .chain(Chain::HyperEvm)
+                .assets(ChainAssets {
+                    equities: ChainEquities {
+                        operational_limit: None,
+                        symbols: HashMap::from([(
+                            hood,
+                            asset(
+                                RebalancingMode::Enabled,
+                                Some(TargetShare::new(float!(0.3)).unwrap()),
+                            ),
+                        )]),
+                    },
+                    cash: None,
+                })
+                .call(),
+        );
+
+        let targets: BTreeMap<SeriesKey, f64> = render(
+            settings_samples(&SettingsInput::from_ctx(&ctx)),
+            LiqFamily::Settings,
+        )
+        .into_iter()
+        .filter(|((name, _), _)| name == "liq_settings_equity_chain_target")
+        .collect();
+
+        let target = |chain, symbol| {
+            series(
+                "liq_settings_equity_chain_target",
+                &[("chain", chain), ("symbol", symbol)],
+            )
+        };
+        assert_eq!(
+            targets,
+            BTreeMap::from([
+                (
+                    target(primary.as_str(), "HOOD"),
+                    default_target.format().unwrap().parse::<f64>().unwrap()
+                ),
+                (target("hyperevm", "HOOD"), 0.3),
+            ])
+        );
     }
 
     /// Each corridor table gets its own band, labelled by chain, while the

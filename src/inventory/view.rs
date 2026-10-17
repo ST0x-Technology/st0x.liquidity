@@ -896,6 +896,10 @@ pub(crate) struct UsdcBalances {
     pub(crate) onchain_inflight: Usdc,
     pub(crate) offchain_available: Usdc,
     pub(crate) offchain_inflight: Usdc,
+    /// Whether a broker cash snapshot has applied since boot or the last
+    /// reset: before that the offchain fields are 0 whatever the broker
+    /// holds, or hold only the fills and transfers applied since.
+    pub(crate) offchain_read: bool,
     pub(crate) offchain_gross: Option<Usdc>,
     pub(crate) withdrawable_cash: Option<Usdc>,
     pub(crate) alpaca_usdc: Option<Usdc>,
@@ -911,13 +915,16 @@ pub(crate) struct OnchainByChain {
 }
 
 /// One chain vault's equity: shares available, and shares in flight from it
-/// (a redemption the broker has not credited yet).
+/// (a redemption the broker has not credited yet), with the tokens in the
+/// bot's wallet on that chain, outside the vault.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ChainEquityBalance {
     pub(crate) symbol: Symbol,
     pub(crate) chain: Chain,
     pub(crate) available: FractionalShares,
     pub(crate) inflight: FractionalShares,
+    pub(crate) wallet_unwrapped: FractionalShares,
+    pub(crate) wallet_wrapped: FractionalShares,
 }
 
 /// One chain's settlement-stable vault balance (USDC, or USDG on Robinhood).
@@ -1454,6 +1461,9 @@ impl InventoryView {
             onchain_inflight,
             offchain_available,
             offchain_inflight,
+            // A fill or a settled transfer creates the cash slot too, so the
+            // slot alone does not prove a broker read.
+            offchain_read: self.offchain_usd_snapshot_watermark.is_some(),
             offchain_gross: self.offchain_gross_usd_cents.and_then(Usdc::from_cents),
             withdrawable_cash: self.withdrawable_cash_cents.and_then(Usdc::from_cents),
             alpaca_usdc: self.alpaca_usdc,
@@ -1476,11 +1486,23 @@ impl InventoryView {
                 inventory
                     .polled_onchain()
                     .filter(|(chain, _)| hedged.contains(chain))
-                    .map(|(chain, balance)| ChainEquityBalance {
-                        symbol: symbol.clone(),
-                        chain: *chain,
-                        available: balance.available(),
-                        inflight: balance.inflight(),
+                    .map(|(chain, balance)| {
+                        let wallet = |location| {
+                            self.inflight_equity
+                                .get(&(symbol.clone(), location))
+                                .map_or(FractionalShares::ZERO, |entry| entry.amount)
+                        };
+
+                        ChainEquityBalance {
+                            symbol: symbol.clone(),
+                            chain: *chain,
+                            available: balance.available(),
+                            inflight: balance.inflight(),
+                            wallet_unwrapped: wallet(InFlightEquityLocation::WalletUnwrapped(
+                                *chain,
+                            )),
+                            wallet_wrapped: wallet(InFlightEquityLocation::WalletWrapped(*chain)),
+                        }
                     })
             })
             .collect();
@@ -7642,6 +7664,8 @@ mod tests {
                 chain: Chain::Base,
                 available: shares(50),
                 inflight: shares(3),
+                wallet_unwrapped: FractionalShares::ZERO,
+                wallet_wrapped: FractionalShares::ZERO,
             }]
         );
     }
@@ -8364,18 +8388,24 @@ mod tests {
                         chain: Chain::Base,
                         available: shares(50),
                         inflight: shares(5),
+                        wallet_unwrapped: FractionalShares::ZERO,
+                        wallet_wrapped: FractionalShares::ZERO,
                     },
                     ChainEquityBalance {
                         symbol: aapl,
                         chain: Chain::Robinhood,
                         available: shares(9),
                         inflight: shares(1),
+                        wallet_unwrapped: FractionalShares::ZERO,
+                        wallet_wrapped: FractionalShares::ZERO,
                     },
                     ChainEquityBalance {
                         symbol: tsla,
                         chain: Chain::Base,
                         available: shares(4),
                         inflight: shares(0),
+                        wallet_unwrapped: FractionalShares::ZERO,
+                        wallet_wrapped: FractionalShares::ZERO,
                     },
                 ],
                 usdc: vec![
@@ -8521,6 +8551,8 @@ mod tests {
                     chain: Chain::Robinhood,
                     available: shares(7),
                     inflight: shares(0),
+                    wallet_unwrapped: FractionalShares::ZERO,
+                    wallet_wrapped: FractionalShares::ZERO,
                 }],
                 usdc: vec![ChainUsdcBalance {
                     chain: Chain::Robinhood,
@@ -8565,6 +8597,67 @@ mod tests {
         );
     }
 
+    /// A chain's row carries the tokens in the bot's wallet on that chain,
+    /// apart from another chain's.
+    #[test]
+    fn onchain_by_chain_carries_each_chains_wallet_tokens() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let wallet = |chain, unwrapped, wrapped| {
+            [
+                InventorySnapshotEvent::ChainWalletUnwrappedEquity {
+                    chain,
+                    balances: BTreeMap::from([(aapl.clone(), shares(unwrapped))]),
+                    fetched_at: now,
+                },
+                InventorySnapshotEvent::ChainWalletWrappedEquity {
+                    chain,
+                    balances: BTreeMap::from([(aapl.clone(), shares(wrapped))]),
+                    fetched_at: now,
+                },
+            ]
+        };
+
+        let view = [Chain::Base, Chain::Robinhood].into_iter().fold(
+            InventoryView::for_primary_chain(Chain::Base),
+            |view, chain| {
+                view.update_equity_at(
+                    &aapl,
+                    chain,
+                    Inventory::on_snapshot(Venue::MarketMaking, shares(40), now),
+                    now,
+                )
+                .unwrap()
+            },
+        );
+        let view = wallet(Chain::Robinhood, 5, 6)
+            .iter()
+            .chain(&wallet(Chain::Base, 1, 2))
+            .fold(view, |view, event| {
+                view.apply_snapshot_event(event, now).unwrap()
+            });
+
+        let wallets: Vec<_> = view
+            .onchain_by_chain(&BTreeSet::from([Chain::Base, Chain::Robinhood]))
+            .equities
+            .into_iter()
+            .map(|balance| {
+                (
+                    balance.chain,
+                    balance.wallet_unwrapped,
+                    balance.wallet_wrapped,
+                )
+            })
+            .collect();
+        assert_eq!(
+            wallets,
+            vec![
+                (Chain::Base, shares(1), shares(2)),
+                (Chain::Robinhood, shares(5), shares(6)),
+            ]
+        );
+    }
+
     /// A fill on a chain whose vault was never read holds a delta from 0,
     /// not a reading. The chain is listed once a vault snapshot sets it.
     #[test]
@@ -8600,6 +8693,8 @@ mod tests {
                 chain: Chain::Robinhood,
                 available: shares(40),
                 inflight: shares(0),
+                wallet_unwrapped: FractionalShares::ZERO,
+                wallet_wrapped: FractionalShares::ZERO,
             }]
         );
     }
@@ -11645,6 +11740,45 @@ mod tests {
             .unwrap();
 
         assert_eq!(capacity, Usdc::new(float!(102.10)));
+    }
+
+    /// A cash fill can create the broker cash slot before any broker read,
+    /// and a reset clears the read with the cash.
+    #[test]
+    fn only_a_broker_cash_snapshot_marks_the_broker_cash_read() {
+        let now = Utc::now();
+        let filled = InventoryView::default()
+            .update_usdc(
+                Inventory::available(Venue::Hedging, Operator::Add, Usdc::new(float!(100))),
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            filled.usdc_available(Venue::Hedging),
+            Some(Usdc::new(float!(100)))
+        );
+        assert!(
+            !filled.usdc_balances().offchain_read,
+            "a fill is not a broker read"
+        );
+
+        let read = filled
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OffchainUsd {
+                    usd_balance_cents: 50_000,
+                    gross_usd_cents: None,
+                    fetched_at: now,
+                },
+                now,
+            )
+            .unwrap();
+        assert!(read.usdc_balances().offchain_read);
+
+        let reset = read.reset_preserving_offchain_order_state();
+        assert!(
+            !reset.usdc_balances().offchain_read,
+            "a reset clears the read"
+        );
     }
 
     fn gross_after(

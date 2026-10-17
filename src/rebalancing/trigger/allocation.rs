@@ -214,23 +214,31 @@ pub(crate) enum BandVerdict {
 }
 
 /// One chain's band position for a symbol: its share of the symbol's total
-/// in underlying shares, and the verdict against its own target and band.
+/// in underlying shares, its target and band, and the verdict against them.
 #[derive(Debug, Clone)]
 pub(crate) struct ChainBand {
     pub(crate) chain: Chain,
     pub(crate) share: Float,
+    pub(crate) target: TargetShare,
+    pub(crate) band: DeviationBand,
     pub(crate) verdict: BandVerdict,
 }
 
+/// A symbol's total as the planner sizes it, and each chain's band position.
+#[derive(Debug, Clone)]
+pub(crate) struct SymbolBands {
+    /// The broker's shares and every slot's, in underlying shares.
+    pub(crate) total: FractionalShares,
+    pub(crate) chains: Vec<ChainBand>,
+}
+
 /// The band position of every chain the planner can pick, from the same
-/// total and deviations the planner uses. A paused chain or a chain without
-/// a target still counts in the total but has no band. `None` when the planner could not size
-/// the symbol at all: the broker unpolled, no chain polled, a listing chain
-/// without a slot (a partial total), or a total of zero. Transfers in flight
-/// are counted, as in the planner's total.
-pub(crate) fn chain_bands(
-    input: &EquityPlanInput,
-) -> Result<Option<Vec<ChainBand>>, EquityPlanError> {
+/// total and deviations the planner uses, with that total. A paused chain or
+/// a chain without a target still counts in the total but has no band. `None`
+/// when the planner could not size the symbol at all: the broker unpolled, no
+/// chain polled, a listing chain without a slot (a partial total), or a total
+/// of zero. Transfers in flight are counted, as in the planner's total.
+pub(crate) fn chain_bands(input: &EquityPlanInput) -> Result<Option<SymbolBands>, EquityPlanError> {
     let Ok(offchain) = sizable_offchain(input) else {
         return Ok(None);
     };
@@ -251,11 +259,16 @@ pub(crate) fn chain_bands(
         bands.push(ChainBand {
             chain: *chain,
             share: (underlying[chain].inner() / total.inner())?,
+            target: slot.target,
+            band: slot.band,
             verdict,
         });
     }
 
-    Ok(Some(bands))
+    Ok(Some(SymbolBands {
+        total,
+        chains: bands,
+    }))
 }
 
 /// The broker balance, once every venue the symbol's total needs has a
@@ -762,6 +775,7 @@ mod tests {
     fn bands(input: &EquityPlanInput) -> Option<Vec<(Chain, String, BandVerdict)>> {
         chain_bands(input).unwrap().map(|bands| {
             bands
+                .chains
                 .into_iter()
                 .map(|band| (band.chain, band.share.format().unwrap(), band.verdict))
                 .collect()
@@ -804,6 +818,66 @@ mod tests {
                 BTreeMap::from([(Chain::Base, wrapped)]),
             )),
             Some(vec![(Chain::Base, "0.6".to_string(), BandVerdict::Within)])
+        );
+    }
+
+    /// The total is every chain in underlying shares plus the broker: 40
+    /// wrapped at 1.5 on Base is 60, Robinhood's 20 at 1 is 20, and the
+    /// broker's 20 makes 100.
+    #[test]
+    fn chain_bands_total_every_chain_in_underlying_shares() {
+        let ratio = UnderlyingPerWrapped::new(U256::from(1_500_000_000_000_000_000u64)).unwrap();
+        let base = ChainSlot {
+            ratio,
+            ..slot("40", "0.5")
+        };
+
+        let symbol_bands = chain_bands(&input(
+            Some(balance("20")),
+            BTreeMap::from([(Chain::Base, base), (Chain::Robinhood, slot("20", "0.2"))]),
+        ))
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(symbol_bands.total.inner().format().unwrap(), "100");
+    }
+
+    /// Each band carries its own chain's target and band, so a reader can
+    /// tell where the verdict changes.
+    #[test]
+    fn chain_bands_carry_each_chains_target_and_band() {
+        let robinhood = ChainSlot {
+            band: band("0.05"),
+            ..slot("20", "0.2")
+        };
+
+        let symbol_bands = chain_bands(&input(
+            Some(balance("40")),
+            BTreeMap::from([
+                (Chain::Base, slot("40", "0.5")),
+                (Chain::Robinhood, robinhood),
+            ]),
+        ))
+        .unwrap()
+        .unwrap();
+
+        let limits = symbol_bands
+            .chains
+            .iter()
+            .map(|chain_band| {
+                (
+                    chain_band.chain,
+                    chain_band.target.inner().format().unwrap(),
+                    chain_band.band.inner().format().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            limits,
+            vec![
+                (Chain::Base, "0.5".to_string(), "0.2".to_string()),
+                (Chain::Robinhood, "0.2".to_string(), "0.05".to_string()),
+            ]
         );
     }
 
