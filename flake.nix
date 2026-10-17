@@ -245,13 +245,11 @@
             };
           })
           abis
-          abiEnvs
           abiEnv
           ;
 
         rust = pkgs.callPackage ./rust.nix {
           inherit craneLib abiEnv;
-          rainMathFloatAbiEnv = abiEnvs.rainMathFloat;
           rainMathFloat = rain-math-float;
           # Commit the server compiles in and reports from /health
           # (src/api.rs). self.rev exists only for a clean checkout, as in
@@ -360,7 +358,6 @@
 
             others = rec {
               inherit (rust)
-                st0x-dto
                 st0x-liquidity
                 st0x-cli
                 ;

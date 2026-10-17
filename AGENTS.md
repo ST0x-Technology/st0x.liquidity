@@ -218,7 +218,7 @@ This project uses a Cargo workspace with:
 - **`st0x-cli`** (`crates/cli/`): Operator command-line application
 - **`st0x-config`** (`crates/config/`): TOML/secrets loading; restricted to
   binary crates
-- **`st0x-dto`** (`crates/dto/`): Shared API DTOs and TypeScript bindings
+- **`st0x-dto`** (`crates/dto/`): Shared API DTOs
 - **`st0x-execution`** (`crates/execution/`): `Executor` trait, Alpaca Broker
   API, and mock implementations
 - **`st0x-tokenization`** (`crates/tokenization/`): `Tokenizer` trait and Alpaca

@@ -5,7 +5,6 @@
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use ts_rs::TS;
 
 use st0x_finance::{FractionalShares, Id, Symbol, Usdc};
 
@@ -19,7 +18,7 @@ pub enum EquityRedemptionTag {}
 pub enum UsdcBridgeTag {}
 
 /// Transfer operation: a tagged union per operation type.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TransferOperation {
     EquityMint(EquityMintOperation),
@@ -28,14 +27,11 @@ pub enum TransferOperation {
 }
 
 /// Minting tokenized equity from real shares.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EquityMintOperation {
-    #[ts(type = "string")]
     pub id: Id<EquityMintTag>,
-    #[ts(type = "string")]
     pub symbol: Symbol,
-    #[ts(type = "string")]
     pub quantity: FractionalShares,
     pub status: EquityMintStatus,
     pub started_at: DateTime<Utc>,
@@ -43,7 +39,7 @@ pub struct EquityMintOperation {
 }
 
 /// Lifecycle stages for an equity mint.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(
     tag = "status",
     rename_all = "snake_case",
@@ -59,9 +55,6 @@ pub enum EquityMintStatus {
     Failed {
         failed_at: DateTime<Utc>,
     },
-    // Plain `//` comment, not `///` -- ts-rs propagates doc comments into the
-    // generated TS binding and a field-level doc trips the dashboard's
-    // type-aware eslint. Keep rationale here in Rust.
     Reconciled {
         reconciled_at: DateTime<Utc>,
         // The mint aggregate's Failed.reason is always a non-optional String, so
@@ -75,14 +68,11 @@ pub enum EquityMintStatus {
 }
 
 /// Redeeming tokenized equity back to real shares.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EquityRedemptionOperation {
-    #[ts(type = "string")]
     pub id: Id<EquityRedemptionTag>,
-    #[ts(type = "string")]
     pub symbol: Symbol,
-    #[ts(type = "string")]
     pub quantity: FractionalShares,
     pub status: EquityRedemptionStatus,
     pub started_at: DateTime<Utc>,
@@ -90,7 +80,7 @@ pub struct EquityRedemptionOperation {
 }
 
 /// Lifecycle stages for an equity redemption.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(
     tag = "status",
     rename_all = "snake_case",
@@ -107,9 +97,6 @@ pub enum EquityRedemptionStatus {
     Failed {
         failed_at: DateTime<Utc>,
     },
-    // Plain `//` comment, not `///` -- ts-rs propagates doc comments into the
-    // generated TS binding and a field-level doc trips the dashboard's
-    // type-aware eslint. Keep rationale here in Rust.
     Reconciled {
         reconciled_at: DateTime<Utc>,
         failure_reason: Option<String>,
@@ -118,7 +105,7 @@ pub enum EquityRedemptionStatus {
 }
 
 /// Direction for USDC bridge transfers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UsdcBridgeDirection {
     AlpacaToBase,
@@ -126,13 +113,11 @@ pub enum UsdcBridgeDirection {
 }
 
 /// Bridging USDC between venues (onchain <-> offchain).
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsdcBridgeOperation {
-    #[ts(type = "string")]
     pub id: Id<UsdcBridgeTag>,
     pub direction: UsdcBridgeDirection,
-    #[ts(type = "string")]
     pub amount: Usdc,
     pub status: UsdcBridgeStatus,
     pub started_at: DateTime<Utc>,
@@ -140,7 +125,7 @@ pub struct UsdcBridgeOperation {
 }
 
 /// Lifecycle stages for a USDC bridge transfer.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(
     tag = "status",
     rename_all = "snake_case",
@@ -163,17 +148,9 @@ pub enum UsdcBridgeStatus {
         // usdc` accepts. The name is historical: the semantic is
         // reconcile-eligibility, kept as `post_burn` on the wire for
         // older-payload compatibility. False for failures whose funds never
-        // left the source venue, which the CLI rejects, so the dashboard can
-        // offer reconcile per-object only when this is true. NOTE: a plain `//`
-        // comment, not `///` -- ts-rs emits doc comments into the generated TS
-        // binding, and a field-level doc lands awkwardly inside the object type
-        // literal (`{ failedAt: string, /** ... */ postBurn: boolean }`), which
-        // trips the dashboard's type-aware eslint. Keep the rationale here in Rust.
+        // left the source venue, which the CLI rejects.
         post_burn: bool,
     },
-    // Plain `//` comment, not `///` -- ts-rs propagates doc comments into the
-    // generated TS binding and a field-level doc trips the dashboard's
-    // type-aware eslint. Keep rationale here in Rust.
     Reconciled {
         reconciled_at: DateTime<Utc>,
         failure_reason: Option<String>,
@@ -234,12 +211,12 @@ impl TransferOperation {
     }
 }
 
-/// Warning emitted when dashboard initial state is partially loaded.
+/// Warning emitted when the transfer history loads only in part.
 ///
 /// Variant names encode the category -- no separate `TransferCategory`
 /// enum needed. Row-specific failures carry the dto `Id<Tag>` -- the internal
 /// aggregate ID types convert to these at the boundary via `to_string()`.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(
     tag = "kind",
     rename_all = "snake_case",
@@ -250,30 +227,12 @@ pub enum TransferWarning {
     RedemptionCategoryUnavailable,
     BridgeCategoryUnavailable,
     TradeHistoryUnavailable,
-    MintReplayFailed {
-        #[ts(type = "string")]
-        id: Id<EquityMintTag>,
-    },
-    RedemptionReplayFailed {
-        #[ts(type = "string")]
-        id: Id<EquityRedemptionTag>,
-    },
-    BridgeReplayFailed {
-        #[ts(type = "string")]
-        id: Id<UsdcBridgeTag>,
-    },
-    MintLifecycleFailed {
-        #[ts(type = "string")]
-        id: Id<EquityMintTag>,
-    },
-    RedemptionLifecycleFailed {
-        #[ts(type = "string")]
-        id: Id<EquityRedemptionTag>,
-    },
-    BridgeLifecycleFailed {
-        #[ts(type = "string")]
-        id: Id<UsdcBridgeTag>,
-    },
+    MintReplayFailed { id: Id<EquityMintTag> },
+    RedemptionReplayFailed { id: Id<EquityRedemptionTag> },
+    BridgeReplayFailed { id: Id<UsdcBridgeTag> },
+    MintLifecycleFailed { id: Id<EquityMintTag> },
+    RedemptionLifecycleFailed { id: Id<EquityRedemptionTag> },
+    BridgeLifecycleFailed { id: Id<UsdcBridgeTag> },
 }
 
 #[cfg(test)]
