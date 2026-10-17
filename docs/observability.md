@@ -598,68 +598,35 @@ step) plus the publishes before it in the refresh order (`1w`, `1d`, `all`,
 
 ### Board source
 
-Both the exporter sidecar and the bot serve `liq_*`, so a selector without a job
-would add the two together. The liquidity boards have a `Source` variable,
-`$source`, and every `liq_` selector on them reads `job=~"$source"`:
+The liquidity boards read the bot only (Stage 5 of the migration; the `Source`
+variable is gone). The exporter sidecar can still serve `liq_*` beside the bot,
+so every `liq_` selector on the boards reads `job="$env"`: the bot's scrape job
+is named after its project, `t0-liquidity` in production and
+`t0-liquidity-staging` in staging, which `$env` already picks. The header's Bot
+pill is the bot scrape's own `up`: `max(up{job="$env"})`.
 
-| Source          | Job matcher                          |
-| --------------- | ------------------------------------ |
-| `bot` (default) | `t0-liquidity\|t0-liquidity-staging` |
-| `exporter`      | `t0-liquidity-exporter`              |
+The log panels read the bot's own log, `liquidity-bot`, each as refId
+`bot-<name>`:
 
-The bot's job is `t0-liquidity` in production and `t0-liquidity-staging` in
-staging. `$env` already picks the project, so one regex covers both. PromQL
-anchors a regex matcher, so `bot` never matches the exporter job.
+| Panel                | Query on `liquidity-bot`                           |
+| -------------------- | -------------------------------------------------- |
+| Trades               | `jsonPayload.target="liq_trade"`                   |
+| Rebalances           | `jsonPayload.target="liq_transfer"`                |
+| Detail dialog events | `jsonPayload.target="liq_event"`                   |
+| Logs                 | the bot's lines, with the level and target filters |
 
-The bot never emits `liq_up`, so the header's Bot pill reads the exporter's
-`liq_up` on the exporter source and the bot scrape's own `up` on the bot source:
-`max(liq_up{job=~"$source"}) or max(up{job=~"$source",job!="t0-liquidity-exporter"})`.
-A stopped bot shows red on either source. A stopped exporter shows no data, not
-red, because the exporter's own `up` says nothing about the bot.
-
-`bot` is the default (Stage 4 of the migration, `SOURCE_VAR`). Pick `exporter`
-to compare the two side by side; a later stage removes the variable with the
-exporter.
-
-The log panels follow `Source` too. A Cloud Logging query cannot pick its log by
-a variable, so each one queries both logs, and its first transformation keeps
-the frame of the source picked (`filterByRefId` on `${source:text}-<name>`):
-
-| Panel                | `exporter`                          | `bot` (log `liquidity-bot`)                    |
-| -------------------- | ----------------------------------- | ---------------------------------------------- |
-| Trades               | `liquidity-trades`                  | `jsonPayload.target="liq_trade"`               |
-| Rebalances           | `liquidity-transfers`               | `jsonPayload.target="liq_transfer"`            |
-| Detail dialog events | none (status history)               | `jsonPayload.target="liq_event"`               |
-| Logs                 | `liquidity-botlogs`                 | the bot's own lines, same level/target filters |
-| Orders               | `liquidity-orders` on either source | the bot writes no order lines                  |
-
-The bot's lines use the exporter's field names, so the columns are the same. The
-bot source adds a USD column to Trades and Rebalances (the lines' `usd`) and the
-detail dialog's event timeline, and the dialog drops a line whose `event_id` it
-already has. Every row carries its project (`resource.labels.project_id`), so
-the dialog never shows another environment's row. The generator fails on a log
-panel without both queries and the transformation.
-
-On the bot source, Trades' "Last updated" is when the bot logged the terminal
-status. For an onchain fill the bot caught up on, that is later than the fill
-(the exporter stamps the fill time); the dialog's "Occurred At" is the fill
-time.
-
-The hidden source's queries still run. On the exporter source, each refresh also
-scans the bot's log for Trades, Rebalances and the dialog's events (about 10
-seconds each over 30 days while the log is empty), and the Logs tab for its log
-lines: one more Cloud Logging list call per panel against the project's read
-quota. The plugin shows a throttled call as missing rows, not as an error. The
-bot source holds rows only once the bot logs JSON (`log_format = "json"`) and
-its stdout reaches Cloud Logging as `liquidity-bot`; until then it shows empty
-log panels. Stage 4 made `bot` the default for them and the metrics in one
-`SOURCE_VAR` change, once staging and production both showed rows on the bot
-source; a later stage removes the exporter's queries.
+Orders reads the exporter's `liquidity-orders` log, because the bot writes no
+order lines. Every row carries its project (`resource.labels.project_id`), so
+the dialog never shows another environment's row, and it drops a line whose
+`event_id` it already has. Trades' "Last updated" is when the bot logged the
+terminal status. For an onchain fill the bot caught up on, that is later than
+the fill; the dialog's "Occurred At" is the fill time.
 
 `observability/gen-t0-liquidity.py` adds the matcher and fails if any `liq_`
-selector is left without exactly `job=~"$source"`.
-`python3 observability/gen-t0-liquidity.py --check` (run in CI) fails when the
-committed board JSON differs from the generator output.
+selector is left without exactly `job="$env"`, or a log query reads a log other
+than the bot's or Orders'. `python3 observability/gen-t0-liquidity.py --check`
+(run in CI) fails when the committed board JSON differs from the generator
+output.
 
 ### Checking parity on a live environment
 

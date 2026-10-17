@@ -31,8 +31,8 @@ const renderDetail = new Function('context', detailSource) as (context: unknown)
 
 type Entry = { time: number; payload: Record<string, string> }
 
-// The plugin's log-lines frame, newest first; an exporter entry's body is its
-// JSON payload.
+// The plugin's log-lines frame, newest first, each entry's payload as its
+// JSON body.
 const frame = (refId: string, entries: Entry[]) => {
   const newestFirst = [...entries].sort((left, right) => right.time - left.time)
   return {
@@ -105,6 +105,48 @@ const transfers = [
   }
 ]
 
+// The board's newest event lines; a test sets the ones it needs.
+let boardEvents: Entry[] = []
+
+// M1's mint events, as the bot logs them.
+const mintEvent = (sequence: number, step: string, time: number): Entry => ({
+  time,
+  payload: {
+    id: 'M1',
+    parent: 'transfer',
+    kind: 'equity_mint',
+    sequence: String(sequence),
+    step,
+    payload: '{}',
+    event_id: `EquityMint:M1:${String(sequence)}`
+  }
+})
+
+// Grafana's /api/ds/query answer for the row query: `entries` as one
+// log-lines frame, or an error.
+const rowQueryAnswer = (entries: Entry[], error?: string) => {
+  const lines = frame('row-events', entries)
+  return new Response(
+    JSON.stringify({
+      results: {
+        'row-events':
+          error !== undefined
+            ? { error }
+            : {
+                frames: [
+                  {
+                    schema: { fields: lines.fields.map(({ name }) => ({ name })) },
+                    data: { values: lines.fields.map(({ values }) => values) }
+                  }
+                ]
+              }
+      }
+    }),
+    { status: 200, headers: { 'Content-Type': 'application/json' } }
+  )
+}
+let fetchSpy: ReturnType<typeof vi.spyOn>
+
 const variables: Record<string, string> = {}
 const partial = vi.fn()
 let root: HTMLDivElement
@@ -115,7 +157,11 @@ const render = (detail: string) => {
     element: root,
     panelData: {
       state: 'Done',
-      series: [frame('exporter-trades', trades), frame('exporter-transfers', transfers)]
+      series: [
+        frame('bot-trades', trades),
+        frame('bot-transfers', transfers),
+        frame('bot-events', boardEvents)
+      ]
     },
     grafana: {
       theme: {
@@ -155,8 +201,10 @@ beforeEach(() => {
   Object.assign(variables, {
     env: 't0-liquidity',
     'env:text': 'production',
-    'source:text': 'exporter'
+    'source:text': 'bot'
   })
+  boardEvents = []
+  fetchSpy = vi.spyOn(window, 'fetch').mockResolvedValue(rowQueryAnswer([]))
   root = document.createElement('div')
   document.body.appendChild(root)
 })
@@ -166,6 +214,7 @@ afterEach(() => {
   vi.runOnlyPendingTimers()
   vi.useRealTimers()
   closeSpy.mockRestore()
+  fetchSpy.mockRestore()
   partial.mockClear()
 })
 
@@ -225,6 +274,401 @@ describe('board detail.js', () => {
     })
     vi.advanceTimersByTime(1500)
     expect(button?.textContent).toBe('Copy')
+  })
+
+  it("fetches a row's events over its own span when the board has none of them", async () => {
+    fetchSpy.mockResolvedValue(
+      rowQueryAnswer([
+        mintEvent(1, 'MintRequested', minutes(1)),
+        mintEvent(2, 'MintCompleted', minutes(5))
+      ])
+    )
+    const dialog = render('M1')
+    expect(dialog?.innerHTML).toContain('Loading this row')
+
+    const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit]
+    expect(url).toBe('/api/ds/query')
+    const body = JSON.parse(init.body as string) as {
+      queries: { queryText: string; projectId: string }[]
+      from: string
+      to: string
+    }
+    expect(body.queries[0]?.queryText).toContain('jsonPayload.id="M1"')
+    expect(body.queries[0]?.projectId).toBe('t0-liquidity')
+    // Its first and newest status lines, ten minutes either side.
+    expect(body.from).toBe(String(minutes(1) - 600_000))
+    expect(body.to).toBe(String(minutes(5) + 600_000))
+
+    await vi.waitFor(() => {
+      expect(dialog?.innerHTML).toContain('Event timeline')
+    })
+    const steps = [...(dialog?.querySelectorAll('.det-timeline .det-step') ?? [])].map((step) =>
+      step.textContent.replace(/\s+/g, ' ').trim()
+    )
+    expect(steps).toEqual([
+      'Mint Requested Oct 6, 12:01:00 UTC',
+      'Mint Completed Oct 6, 12:05:00 UTC'
+    ])
+    expect(dialog?.innerHTML).not.toContain('SPA')
+
+    // A refresh with the same row and status uses what it fetched.
+    render('M1')
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+  })
+
+  it("reads back once over the board's range when the row's first events are older", async () => {
+    fetchSpy
+      .mockResolvedValueOnce(rowQueryAnswer([mintEvent(2, 'MintCompleted', minutes(5))]))
+      .mockResolvedValueOnce(
+        rowQueryAnswer([
+          mintEvent(1, 'MintRequested', minutes(-600)),
+          mintEvent(2, 'MintCompleted', minutes(5))
+        ])
+      )
+    const dialog = render('M1')
+
+    await vi.waitFor(() => {
+      expect(dialog?.innerHTML).toContain('Event timeline')
+    })
+    const froms = fetchSpy.mock.calls.map(
+      (call: unknown[]) =>
+        (JSON.parse((call[1] as RequestInit).body as string) as { from: string }).from
+    )
+    expect(froms).toEqual([
+      String(minutes(1) - 600_000),
+      // The board's 30 days back from the newest status, less the margin.
+      String(minutes(5) - 30 * 24 * 60 * 60_000 - 600_000)
+    ])
+    const steps = [...(dialog?.querySelectorAll('.det-timeline .det-step') ?? [])].map((step) =>
+      step.textContent.replace(/\s+/g, ' ').trim()
+    )
+    expect(steps).toEqual([
+      'Mint Requested Oct 6, 02:00:00 UTC',
+      'Mint Completed Oct 6, 12:05:00 UTC'
+    ])
+  })
+
+  it('reads back over 30 days again when the row opens after that read failed', async () => {
+    const DAY = 24 * 60 * 60_000
+    const from = (call: unknown[]) =>
+      Number((JSON.parse((call[1] as RequestInit).body as string) as { from: string }).from)
+    fetchSpy
+      .mockResolvedValueOnce(rowQueryAnswer([mintEvent(2, 'MintCompleted', minutes(5))]))
+      .mockResolvedValueOnce(rowQueryAnswer([], 'quota exceeded'))
+    const dialog = render('M1')
+    await vi.waitFor(() => {
+      expect(dialog?.innerHTML).toContain("This row's event query failed (quota exceeded)")
+    })
+
+    dialog?.querySelector<HTMLButtonElement>('[data-close]')?.click()
+    render('')
+    fetchSpy.mockResolvedValue(rowQueryAnswer([mintEvent(2, 'MintCompleted', minutes(5))]))
+    render('M1')
+    await vi.waitFor(() => {
+      expect(fetchSpy).toHaveBeenCalledTimes(4)
+    })
+
+    const longReads = fetchSpy.mock.calls.filter((call: unknown[]) => from(call) < minutes(0) - DAY)
+    expect(longReads).toHaveLength(2)
+  })
+
+  it("keeps an in-flight row's old events across its minute reads, with one 30-day read", async () => {
+    const DAY = 24 * 60 * 60_000
+    // B1's bridge events: the first one a day old, before the board's rows.
+    const bridgeEvent = (sequence: number, step: string, time: number): Entry => ({
+      time,
+      payload: {
+        id: 'B1',
+        parent: 'transfer',
+        kind: 'usdc_bridge',
+        sequence: String(sequence),
+        step,
+        payload: '{}',
+        event_id: `UsdcBridge:B1:${String(sequence)}`
+      }
+    })
+    const from = (call: unknown[]) =>
+      Number((JSON.parse((call[1] as RequestInit).body as string) as { from: string }).from)
+    fetchSpy.mockImplementation((...call: unknown[]) =>
+      Promise.resolve(
+        rowQueryAnswer(
+          from(call) < minutes(0) - DAY
+            ? [
+                bridgeEvent(1, 'OldestEvent', minutes(-DAY / 60_000)),
+                bridgeEvent(2, 'Bridging', minutes(3))
+              ]
+            : [bridgeEvent(2, 'Bridging', minutes(3))]
+        )
+      )
+    )
+    vi.setSystemTime(minutes(60))
+    const dialog = render('B1')
+    await vi.waitFor(() => {
+      expect(dialog?.innerHTML).toContain('Oldest Event')
+    })
+    expect(fetchSpy).toHaveBeenCalledTimes(2)
+
+    vi.setSystemTime(minutes(61))
+    const next = render('B1')
+    // The kept events show while the minute's read loads.
+    expect(next?.innerHTML).toContain('Oldest Event')
+    await vi.waitFor(() => {
+      expect(fetchSpy).toHaveBeenCalledTimes(3)
+    })
+    await vi.waitFor(() => {
+      expect(render('B1')?.innerHTML).not.toContain('Loading this row')
+    })
+    const froms = fetchSpy.mock.calls.map((call: unknown[]) => from(call))
+    expect(froms.filter((at: number) => at < minutes(0) - DAY)).toHaveLength(1)
+  })
+
+  it('shows the events a slow 30-day read found once the next minute read lands', async () => {
+    const DAY = 24 * 60 * 60_000
+    const bridgeEvent = (sequence: number, step: string, time: number): Entry => ({
+      time,
+      payload: {
+        id: 'B1',
+        parent: 'transfer',
+        kind: 'usdc_bridge',
+        sequence: String(sequence),
+        step,
+        payload: '{}',
+        event_id: `UsdcBridge:B1:${String(sequence)}`
+      }
+    })
+    const from = (call: unknown[]) =>
+      Number((JSON.parse((call[1] as RequestInit).body as string) as { from: string }).from)
+    const pending: { long: boolean; answer: (response: Response) => void }[] = []
+    fetchSpy.mockImplementation(
+      (...call: unknown[]) =>
+        new Promise<Response>((answer) => {
+          pending.push({ long: from(call) < minutes(0) - DAY, answer })
+        })
+    )
+    const recent = [bridgeEvent(2, 'Bridging', minutes(3))]
+    vi.setSystemTime(minutes(60))
+    render('B1')
+    pending[0]?.answer(rowQueryAnswer(recent))
+    await vi.waitFor(() => {
+      expect(pending).toHaveLength(2)
+    })
+    expect(pending[1]?.long).toBe(true)
+
+    // The 30-day read is still out when the next minute's read starts.
+    vi.setSystemTime(minutes(61))
+    render('B1')
+    expect(pending).toHaveLength(3)
+    pending[1]?.answer(
+      rowQueryAnswer([bridgeEvent(1, 'OldestEvent', minutes(-DAY / 60_000)), ...recent])
+    )
+    await vi.advanceTimersByTimeAsync(0)
+    pending[2]?.answer(rowQueryAnswer(recent))
+
+    await vi.waitFor(() => {
+      expect(render('B1')?.innerHTML).not.toContain('Loading this row')
+    })
+    expect(render('B1')?.innerHTML).toContain('Oldest Event')
+  })
+
+  it('shows the events a slow 30-day read found when it lands after the next minute read', async () => {
+    const DAY = 24 * 60 * 60_000
+    const bridgeEvent = (sequence: number, step: string, time: number): Entry => ({
+      time,
+      payload: {
+        id: 'B1',
+        parent: 'transfer',
+        kind: 'usdc_bridge',
+        sequence: String(sequence),
+        step,
+        payload: '{}',
+        event_id: `UsdcBridge:B1:${String(sequence)}`
+      }
+    })
+    const from = (call: unknown[]) =>
+      Number((JSON.parse((call[1] as RequestInit).body as string) as { from: string }).from)
+    const pending: { long: boolean; answer: (response: Response) => void }[] = []
+    fetchSpy.mockImplementation(
+      (...call: unknown[]) =>
+        new Promise<Response>((answer) => {
+          pending.push({ long: from(call) < minutes(0) - DAY, answer })
+        })
+    )
+    const recent = [bridgeEvent(2, 'Bridging', minutes(3))]
+    vi.setSystemTime(minutes(60))
+    render('B1')
+    pending[0]?.answer(rowQueryAnswer(recent))
+    await vi.waitFor(() => {
+      expect(pending).toHaveLength(2)
+    })
+
+    // The next minute's read lands first, without the oldest event.
+    vi.setSystemTime(minutes(61))
+    render('B1')
+    pending[2]?.answer(rowQueryAnswer(recent))
+    await vi.waitFor(() => {
+      expect(render('B1')?.innerHTML).not.toContain('Loading this row')
+    })
+    expect(render('B1')?.innerHTML).not.toContain('Oldest Event')
+
+    pending[1]?.answer(
+      rowQueryAnswer([bridgeEvent(1, 'OldestEvent', minutes(-DAY / 60_000)), ...recent])
+    )
+    await vi.waitFor(() => {
+      expect(render('B1')?.innerHTML).toContain('Oldest Event')
+    })
+    expect(pending).toHaveLength(3)
+  })
+
+  it('reads a row again when it reopens after a close during its read', async () => {
+    let answer: (response: Response) => void = () => undefined
+    fetchSpy.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          answer = resolve
+        })
+    )
+    const dialog = render('M1')
+    dialog?.querySelector<HTMLButtonElement>('[data-close]')?.click()
+    render('')
+    answer(rowQueryAnswer([], 'quota exceeded'))
+    await vi.advanceTimersByTimeAsync(0)
+
+    render('M1')
+    expect(fetchSpy).toHaveBeenCalledTimes(2)
+  })
+
+  it('says a 30-day read failed, and reads back again, when a newer read finished first', async () => {
+    const DAY = 24 * 60 * 60_000
+    const from = (call: unknown[]) =>
+      Number((JSON.parse((call[1] as RequestInit).body as string) as { from: string }).from)
+    const pending: { long: boolean; answer: (response: Response) => void }[] = []
+    fetchSpy.mockImplementation(
+      (...call: unknown[]) =>
+        new Promise<Response>((answer) => {
+          pending.push({ long: from(call) < minutes(0) - DAY, answer })
+        })
+    )
+    const partial = () => rowQueryAnswer([mintEvent(2, 'MintCompleted', minutes(5))])
+    const dialog = render('M1')
+    pending[0]?.answer(partial())
+    await vi.waitFor(() => {
+      expect(pending).toHaveLength(2)
+    })
+    expect(pending[1]?.long).toBe(true)
+
+    // Closed during the 30-day read and opened again: the new read finishes
+    // first, without the first event.
+    dialog?.querySelector<HTMLButtonElement>('[data-close]')?.click()
+    render('')
+    render('M1')
+    expect(pending).toHaveLength(3)
+    pending[2]?.answer(partial())
+    await vi.waitFor(() => {
+      expect(render('M1')?.innerHTML).not.toContain('Loading this row')
+    })
+
+    pending[1]?.answer(rowQueryAnswer([], 'quota exceeded'))
+    await vi.waitFor(() => {
+      expect(render('M1')?.innerHTML).toContain("This row's event query failed (quota exceeded)")
+    })
+
+    render('M1')?.querySelector<HTMLButtonElement>('[data-close]')?.click()
+    render('')
+    render('M1')
+    pending[3]?.answer(partial())
+    await vi.waitFor(() => {
+      expect(pending.filter((read) => read.long)).toHaveLength(2)
+    })
+  })
+
+  it('reads back over 30 days once for a row whose first event no line holds', async () => {
+    const DAY = 24 * 60 * 60_000
+    // B1's second event only: its first was never logged.
+    const second: Entry = {
+      time: minutes(3),
+      payload: {
+        id: 'B1',
+        parent: 'transfer',
+        kind: 'usdc_bridge',
+        sequence: '2',
+        step: 'BridgeSent',
+        payload: '{}',
+        event_id: 'UsdcBridge:B1:2'
+      }
+    }
+    const from = (call: unknown[]) =>
+      Number((JSON.parse((call[1] as RequestInit).body as string) as { from: string }).from)
+    fetchSpy.mockImplementation(() => Promise.resolve(rowQueryAnswer([second])))
+    vi.setSystemTime(minutes(60))
+    render('B1')
+    await vi.waitFor(() => {
+      expect(fetchSpy).toHaveBeenCalledTimes(2)
+    })
+
+    // A minute later the row reads again, and that read settles.
+    vi.setSystemTime(minutes(61))
+    render('B1')
+    await vi.waitFor(() => {
+      expect(fetchSpy).toHaveBeenCalledTimes(3)
+    })
+    await vi.waitFor(() => {
+      expect(render('B1')?.innerHTML).not.toContain('Loading this row')
+    })
+
+    expect(fetchSpy).toHaveBeenCalledTimes(3)
+    const longReads = fetchSpy.mock.calls.filter((call: unknown[]) => from(call) < minutes(0) - DAY)
+    expect(longReads).toHaveLength(1)
+  })
+
+  it('reads a row still in flight up to now, and again a minute later', () => {
+    vi.setSystemTime(minutes(60))
+    const dialog = render('B1')
+    expect(dialog?.open).toBe(true)
+    const [, init] = fetchSpy.mock.calls[0] as [string, RequestInit]
+    const body = JSON.parse(init.body as string) as { to: string }
+    expect(body.to).toBe(String(minutes(60) + 600_000))
+
+    render('B1')
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+    vi.setSystemTime(minutes(61))
+    render('B1')
+    expect(fetchSpy).toHaveBeenCalledTimes(2)
+  })
+
+  // The board loads no event lines (a slow read at every load), so even
+  // a frame that holds the whole row's events is not read: the row fetches.
+  it("fetches a row's events when it opens, whatever event lines the board's data holds", async () => {
+    boardEvents = [
+      mintEvent(1, 'MintRequested', minutes(1)),
+      mintEvent(2, 'MintCompleted', minutes(5))
+    ]
+    fetchSpy.mockResolvedValue(
+      rowQueryAnswer([
+        mintEvent(1, 'MintRequested', minutes(1)),
+        mintEvent(2, 'MintCompleted', minutes(5))
+      ])
+    )
+    const dialog = render('M1')
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+    await vi.waitFor(() => {
+      expect(dialog?.innerHTML).toContain('Event timeline')
+    })
+  })
+
+  it('says when the row query failed, and retries when the row opens again', async () => {
+    fetchSpy.mockResolvedValue(rowQueryAnswer([], 'quota exceeded'))
+    const dialog = render('M1')
+    await vi.waitFor(() => {
+      expect(dialog?.innerHTML).toContain("This row's event query failed (quota exceeded)")
+    })
+    // Its status history still shows.
+    expect(dialog?.querySelectorAll('.det-timeline .det-step')).toHaveLength(2)
+
+    dialog?.querySelector<HTMLButtonElement>('[data-close]')?.click()
+    render('')
+    fetchSpy.mockResolvedValue(rowQueryAnswer([]))
+    render('M1')
+    expect(fetchSpy).toHaveBeenCalledTimes(2)
   })
 
   it('keeps a row the operator closed closed until the variable moves off it', () => {

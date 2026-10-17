@@ -3,22 +3,20 @@
 // transfer-panel.svelte in ST0x-Technology/st0x.liquidity) for the row whose
 // ⓘ was clicked in the Trades or Rebalances table.
 //
-// The click sets the hidden `detail` variable to the row's id. A and B are
-// the Trades and Rebalances tables' own results through the Dashboard
-// datasource: each table's two frames, the exporter's and the bot's (the
-// newest 500 status entries of each log), and the script reads the frames
-// of the `source` picked. On the bot source, bot-events is the bot's event
-// timeline (the newest 500 liq_event lines); the exporter has no event
-// log, so there the dialog shows the status history. Closing the dialog
-// clears the variable.
+// The click sets the hidden `detail` variable to the row's id. The panel's
+// data is the Trades and Rebalances tables' own results through the
+// Dashboard datasource: the bot's status entries for trades and for
+// transfers. The dialog fetches the row's event timeline when it opens
+// (rowEvents). Closing the dialog clears the variable.
 //
 // The panel is one empty column of the header row; only the dialog shows.
 //
-// MODE_LABELS, tradeCommands, transferCommands, latest, lineEntries,
-// eventTimeline, timelineIncomplete, queryState, commandLine and
+// MODE_LABELS, ROW_EVENTS, tradeCommands, transferCommands, latest,
+// lineEntries, eventTimeline, timelineIncomplete, queryState,
+// rowEventsRequest, fetchRowEvents, mergeEntries, commandLine and
 // wireCopyButtons are not defined here: the generator prepends them from
-// recovery-guide.json, recovery-commands.js, status-history.js, log-lines.js
-// and copy-command.js (see detail_panel()).
+// recovery-guide.json, recovery-commands.js, status-history.js, log-lines.js,
+// row-events.js and copy-command.js (see detail_panel()).
 
 const theme = context.grafana.theme;
 const root = context.element;
@@ -61,9 +59,9 @@ const escapeHtml = (text) =>
 // query's data, still shown while the new one loads.
 const wanted = context.grafana.replaceVariables('${detail}');
 
-// The board's environment is its project, and `source` names the frames.
+// The board's environment is its project. SOURCE prefixes the frames' refIds.
 const env = context.grafana.replaceVariables('${env}');
-const SOURCE = context.grafana.replaceVariables('${source:text}') === 'bot' ? 'bot' : 'exporter';
+const SOURCE = 'bot';
 
 // The wanted id's entries in one frame, from the board's project only (see
 // lineEntries).
@@ -171,14 +169,14 @@ const txLink = (hash, chain) =>
     : `<span class="det-mono" title="${escapeHtml(hash)}">${shortHash(hash)}</span>`;
 
 // The bot's event timeline: each step with its time and fields, like the
-// SPA's dialog. On the exporter source, the status history instead: one
-// step per status change.
-const eventLines = SOURCE === 'bot' ? entriesOf('bot-events') : [];
+// SPA's dialog.
+// The board loads no event lines (a slow read for a dialog most loads never
+// open): each row fetches its own when its dialog opens.
+const eventLines = [];
 // Only an error of a query this source reads fails the dialog (see
 // queryState). An Error state that lists no error fails it too, and one that
 // lists only other errors marks the row as possibly out of date.
 const queries = queryState(context.panelData, SOURCE);
-const eventsFailed = queries.eventsFailed;
 const listedError = (errors) => errors.map((error) => error.message).filter(Boolean).join('; ') || 'unknown error';
 // Grafana can drop a failed table query's error when another query also
 // failed, so a row shown after a failed refresh says it can be out of date.
@@ -205,14 +203,22 @@ const eventFields = (payload, rowChain) => {
     .join('');
 };
 
-// The events scan and the table scans run at different moments, so a row's
-// newest status can also be ahead of its events until the next refresh.
-const timeline = (events, history, chain, rowEventId) =>
-  events.length > 0
+// What the timeline says about the row's own event query (rowEvents).
+const rowEventsNote = (loaded, events, rowEventId) =>
+  loaded.status === 'loading'
+    ? `<p class="det-muted">Loading this row's events…</p>`
+    : loaded.status === 'failed'
+      ? `<p class="det-red">This row's event query failed (${escapeHtml(loaded.error)}). Close the row and open it again to retry.</p>`
+      : timelineIncomplete(events, rowEventId)
+        ? '<p class="det-muted">Some events of this row are missing: the bot did not log them, or the newest ones are not logged yet.</p>'
+        : '';
+
+const timeline = (loaded, history, chain, rowEventId) => {
+  const events = loaded.events;
+  return events.length > 0
     ? `
   <div class="det-section-title">Event timeline</div>
-  ${eventsFailed ? '<p class="det-red">The event query failed, so this timeline can be out of date.</p>' : ''}
-  ${timelineIncomplete(events, rowEventId) ? '<p class="det-muted">Some events of this row are not here: they are not loaded yet (refresh), outside the newest 500 event lines the board loads, or the bot missed a line. The full timeline is in the SPA at liquidity.t0trade.com.</p>' : ''}
+  ${rowEventsNote(loaded, events, rowEventId)}
   <div class="det-timeline">${events
     .map(
       (event) => `
@@ -237,7 +243,8 @@ const timeline = (events, history, chain, rowEventId) =>
     </div>`
     )
     .join('')}</div>
-  <p class="det-muted">${SOURCE === 'exporter' ? "From the exporter's status log." : eventsFailed ? "From the bot's status lines: the event query failed." : "From the bot's status lines; its event lines for this row are not in the newest 500."} The full event timeline is in the SPA at liquidity.t0trade.com.</p>`;
+  ${loaded.status === 'done' ? `<p class="det-muted">From the bot's status lines: it logged no events for this row.</p>` : rowEventsNote(loaded, events, rowEventId)}`;
+};
 
 // valueHtml is trusted HTML: a caller escapes any data it puts in it.
 const field = (name, valueHtml) => `<div class="det-field"><span class="det-muted">${escapeHtml(name)}</span><span class="det-break">${valueHtml}</span></div>`;
@@ -270,7 +277,7 @@ const tradeDialog = (trade) => {
       ${field('Occurred At', utc(trade.occurred_at || trade.first))}
       ${field('Status', `<span class="${statusClass(trade.status)}">${escapeHtml(statusLabel(trade.status))}</span>${trade.error ? `<div class="det-red">${escapeHtml(trade.error)}</div>` : ''}`)}
     </div>
-    ${timeline(eventTimeline(eventLines, 'trade'), trade.history, onchain ? chain : null, trade.event_id)}
+    ${timeline(rowEvents(trade, 'trade'), trade.history, onchain ? chain : null, trade.event_id)}
     ${commandBlock(tradeCommands(CLIENT, trade.symbol))}
   </div>`;
 };
@@ -294,7 +301,7 @@ const transferDialog = (transfer) => {
       ${field('Updated', utc(transfer.newest))}
       ${field('Status', `<span class="${statusClass(transfer.status)}">${escapeHtml(statusLabel(transfer.status))}</span>`)}
     </div>
-    ${timeline(eventTimeline(eventLines, 'transfer', transfer.kind), transfer.history, null, transfer.event_id)}
+    ${timeline(rowEvents(transfer, 'transfer', transfer.kind), transfer.history, null, transfer.event_id)}
     ${commandBlock(
       transferCommands(CLIENT, transfer),
       usdcFailed ? usdcFailedNote(transfer.direction) : ''
@@ -309,6 +316,107 @@ const transferDialog = (transfer) => {
 // Kept on the element across renders: the plugin re-runs this code on every
 // refresh and query, into the same element.
 const state = root.__det || (root.__det = { dismissed: null });
+
+// The row's own events (row-events.js): the row's lines fetched over its
+// span. A row still in flight can have events newer than its status
+// lines, which lag them, so its span runs to now and is fetched again at
+// most once a minute; a finished row's is fetched once per newest status.
+// The row's first status line is the oldest one the table still holds, not
+// the operation's start, so when the lines fetched still lack the row's
+// first events, the dialog reads back once over the board's whole range.
+// The lines a row's reads found are kept for that row, so the minute's
+// read of a row in flight shows them while it loads, and the row's long
+// read runs once, even when no line ever holds its first event (one older
+// than 30 days, or one the bot never logged).
+// The fetch redraws the dialog when it lands, and a read that lands after
+// a newer one adds its lines to that one. A failed one, the long read
+// included, is retried when the row opens again, and so is one the dialog
+// closed on before it landed.
+const rowEvents = (row, parent, kind) => {
+  const board = eventTimeline(eventLines, parent, kind);
+  if (board.length > 0 && !timelineIncomplete(board, row.event_id)) return { events: board, status: 'done' };
+  const inFlight = statusClass(row.status) === 'det-blue';
+  const now = Date.now();
+  const key = `${env}|${row.id}|${row.newest}|${inFlight ? Math.floor(now / 60_000) : ''}`;
+  const rowKey = `${env}|${row.id}`;
+  if (state.rowKept?.key !== rowKey) state.rowKept = { key: rowKey, entries: [] };
+  const kept = state.rowKept;
+  let fetched = state.rowEvents;
+  if (!fetched || fetched.key !== key) {
+    fetched = { key, status: 'loading', entries: kept.entries };
+    state.rowEvents = fetched;
+    const landed = fetched;
+    const newest = inFlight ? Math.max(row.newest, now) : row.newest;
+    const fetchFrom = (first, widened) => {
+      const request = rowEventsRequest({
+        datasource: ROW_EVENTS.datasource,
+        eventsFilter: context.grafana.replaceVariables(ROW_EVENTS.filter),
+        project: env,
+        id: row.id,
+        first,
+        newest,
+      });
+      fetchRowEvents(window.fetch.bind(window), request, String(row.id), env).then(
+        (entries) => {
+          // A newer read replaced this one: its lines still count for the row.
+          landed.entries = mergeEntries(landed.entries, entries);
+          if (state.rowKept === kept) {
+            kept.entries = mergeEntries(kept.entries, entries);
+            // And the row's other reads that landed while this one ran.
+            landed.entries = mergeEntries(landed.entries, kept.entries);
+          }
+          if (state.rowEvents !== landed) {
+            // The row's current read may already be done without these lines.
+            const current = state.rowEvents;
+            if (state.rowKept === kept && current?.key.startsWith(`${rowKey}|`)) {
+              current.entries = mergeEntries(current.entries, kept.entries);
+              if (current.status === 'done' && state.redraw) state.redraw(current.key);
+            }
+            return;
+          }
+          const events = eventTimeline(mergeEntries(eventLines, landed.entries), parent, kind);
+          const startMissing = events.length === 0 || Number(events[0].sequence) !== 1;
+          const lookback = newest - ROW_EVENTS_LOOKBACK_MS;
+          if (!widened && !kept.widened && lookback < first && startMissing && timelineIncomplete(events, row.event_id)) {
+            kept.widened = true;
+            fetchFrom(lookback, true);
+            return;
+          }
+          landed.status = 'done';
+          if (state.redraw) state.redraw(landed.key);
+        },
+        (error) => {
+          const message = error?.message || String(error);
+          landed.status = 'failed';
+          landed.error = message;
+          if (widened) {
+            kept.widened = false;
+            // A newer read of the row finished while this one ran, and could
+            // not tell its missing first events from ones never logged: it
+            // fails too, so a reopen reads back again.
+            const current = state.rowEvents;
+            if (current !== landed && current?.status === 'done' && current.key.startsWith(`${rowKey}|`)) {
+              current.status = 'failed';
+              current.error = message;
+              if (state.redraw) state.redraw(current.key);
+              return;
+            }
+          }
+          if (state.redraw) state.redraw(landed.key);
+        }
+      );
+    };
+    fetchFrom(row.first, false);
+  }
+  return {
+    events:
+      fetched.status === 'done' || fetched.entries.length > 0
+        ? eventTimeline(mergeEntries(eventLines, fetched.entries), parent, kind)
+        : board,
+    status: fetched.status,
+    error: fetched.error,
+  };
+};
 
 // The variable can lag the close by a render (a refresh that was already
 // running), so an id the operator just closed is not reopened until the
@@ -386,6 +494,9 @@ if (!dialog) {
 // same row opens the row again.
 const recordDismissal = () => {
   state.dismissed = dialog.detId || null;
+  // A read that failed, or that can still fail after the close, reads
+  // again when the row reopens.
+  if (state.rowEvents?.status !== 'done') state.rowEvents = null;
   dialog.detId = '';
   // An empty value, not null: removing the URL parameter leaves a textbox
   // variable at its old value, so the same row could not be reopened.
@@ -403,18 +514,13 @@ dialog.onclick = (event) => {
   if (event.target === dialog) dismiss();
 };
 
-if (html === null || state.dismissed === wanted) {
-  if (dialog.open) {
-    dialog.detId = '';
-    dialog.close();
-  }
-} else {
-  if (dialog.detHtml !== html) {
+const show = (content) => {
+  if (dialog.detHtml !== content) {
     // A refresh that brings a new status keeps the operator's scroll.
     const body = dialog.querySelector('.det-dialog-body');
     const scroll = dialog.detId === wanted && body ? body.scrollTop : 0;
-    dialog.innerHTML = html;
-    dialog.detHtml = html;
+    dialog.innerHTML = content;
+    dialog.detHtml = content;
     const next = dialog.querySelector('.det-dialog-body');
     if (next) next.scrollTop = scroll;
   }
@@ -422,4 +528,20 @@ if (html === null || state.dismissed === wanted) {
   dialog.querySelector('[data-close]').onclick = dismiss;
   wireCopyButtons(dialog);
   if (!dialog.open) dialog.showModal();
+};
+
+if (html === null || state.dismissed === wanted) {
+  if (dialog.open) {
+    dialog.detId = '';
+    dialog.close();
+  }
+} else {
+  show(html);
 }
+
+// The row query redraws the dialog it was fetched for, while it shows.
+state.redraw = (key) => {
+  if (!dialog.open || dialog.detId !== wanted || state.rowEvents?.key !== key) return;
+  if (trade) show(tradeDialog(trade));
+  else if (transfer) show(transferDialog(transfer));
+};

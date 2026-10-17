@@ -49,6 +49,7 @@ const PAST_REOPEN_WINDOW_MS = 3 * 60_000
 describe('board header.js', () => {
   let root: HTMLDivElement
   let closeSpy: ReturnType<typeof queueCloseEvents>
+  const partial = vi.fn()
 
   const render = (up: number) => {
     renderHeader({
@@ -67,7 +68,8 @@ describe('board header.js', () => {
             background: { primary: '#111', secondary: '#222' }
           }
         },
-        replaceVariables: () => 'production'
+        replaceVariables: () => 'production',
+        locationService: { partial }
       }
     })
   }
@@ -89,6 +91,7 @@ describe('board header.js', () => {
   }
 
   beforeEach(() => {
+    partial.mockReset()
     vi.useFakeTimers()
     closeSpy = queueCloseEvents()
     Reflect.deleteProperty(window, '__liqHeaderDialog')
@@ -243,8 +246,10 @@ describe('board header.js', () => {
       return styles.slice(start, styles.indexOf('}', start))
     }
     expect(rule('.hdr-pills')).toMatch(/flex: 0 1 auto;[\s\S]*min-width: 0;[\s\S]*overflow: hidden;/)
+    // The clock group gives way long before the pills (shrink 100 to 1), so a
+    // band pill is never cut to a wrong-looking number.
     expect(rule('.hdr-info')).toMatch(
-      /flex: 0 1 auto;[\s\S]*min-width: 0;[\s\S]*overflow: hidden;[\s\S]*text-overflow: ellipsis;/
+      /flex: 0 100 auto;[\s\S]*min-width: 0;[\s\S]*overflow: hidden;[\s\S]*text-overflow: ellipsis;/
     )
     expect(rule('.hdr-button,\n.hdr-guide,\n.hdr-badge')).toContain('flex: 0 0 auto;')
   })
@@ -281,5 +286,19 @@ describe('board header.js', () => {
     await vi.waitFor(() => {
       expect(button?.textContent).toBe('Copied')
     })
+  })
+
+  // The Dashboard tab fits the window itself (board-layout.js): Grafana's
+  // autofit would squeeze a short window's board, so the header takes the
+  // flag off a link that has it.
+  it('takes autofitpanels off a Dashboard URL that has it, and only then', () => {
+    window.history.replaceState(null, '', `${START_PATH}?autofitpanels=true`)
+    render(1)
+    expect(partial).toHaveBeenCalledWith({ autofitpanels: null }, true)
+
+    partial.mockReset()
+    window.history.replaceState(null, '', START_PATH)
+    render(1)
+    expect(partial).not.toHaveBeenCalled()
   })
 })

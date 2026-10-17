@@ -10,14 +10,13 @@ Check that the committed JSON matches the generator (CI runs this):
 
     python3 observability/gen-t0-liquidity.py --check
 
-Data comes from the exporter sidecar on the liquidity VM
-(terraform/liquidity-exporter/exporter.py in T0Trade/t0.devops) or, for the
-liq_* gauges, from the bot's own /metrics, as the `source` variable picks:
+Data comes from the bot itself:
 
-  cloudmon  liq_* gauges via Ops Agent scrape -> managed prometheus
-  cloudlog  the exporter's logNames liquidity-trades / liquidity-transfers /
-            liquidity-botlogs (Cloud Logging entries.write), or the bot's
-            own log, liquidity-bot (its JSON stdout)
+  cloudmon  its liq_* gauges on /metrics, via the Ops Agent scrape into
+            managed prometheus
+  cloudlog  its own log, liquidity-bot (its JSON stdout), and the exporter
+            sidecar's liquidity-orders log for Orders, which the bot does
+            not log
 
 Layout mirrors the SPA's tabs as rows, in tab order: header strip,
 Dashboard (inventory tables | trades over rebalances, a 13/11 split like
@@ -46,6 +45,7 @@ Two Grafana-side patterns worth knowing before editing:
     maxDataPoints itself (see latest_status_table).
 """
 
+import base64
 import filecmp
 import json
 import os
@@ -56,37 +56,28 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 NATIVE_ROWS = os.path.join(HERE, "t0-liquidity-native-rows.json")
 
-# The bot serves liq_* on its own /metrics too, so an unpinned liq_ selector
-# would sum the exporter and the bot together. Every liq_ selector on these
-# boards reads the one job the `source` variable picks (SOURCE_VAR). PromQL
-# anchors a regex matcher, so the bot's value never matches the exporter job.
-LIQ_JOB_MATCHER = 'job=~"$source"'
-# The exporter sidecar's scrape job, the `source` variable's exporter value.
-EXPORTER_JOB = "t0-liquidity-exporter"
-# The header's Bot light. The bot source has no liq_up and reads its scrape's
-# up. The exporter source never falls back to up: the exporter's own up says
-# nothing about the bot, so a stopped exporter shows no data, not red.
-# pin_liq leaves both selectors alone, since each already names its job.
-LIQ_UP = ('max(liq_up{job=~"$source"}) or '
-          f'max(up{{job=~"$source",job!="{EXPORTER_JOB}"}})')
+# The exporter sidecar can still serve liq_* beside the bot, so an unpinned
+# liq_ selector could sum the two. Every liq_ selector on these boards reads
+# the bot's scrape job, which is named after the project `env` picks
+# (t0-liquidity, t0-liquidity-staging).
+LIQ_JOB_MATCHER = 'job="$env"'
+# The header's Bot light: the bot's scrape up. pin_liq leaves it alone, since
+# it already names its job.
+LIQ_UP = 'max(up{job="$env"})'
 LIQ_NAME = re.compile(r"(?<![A-Za-z0-9_:])liq_[a-z0-9_]+")
 LIQ_PREFIX = re.compile(r"(?<![A-Za-z0-9_:])liq_")
 
 CM = {"type": "stackdriver", "uid": "cloudmon"}
 CL = {"type": "googlecloud-logging-datasource", "uid": "cloudlog"}
 
-# The log panels follow `source` too. A Cloud Logging query cannot pick its
-# log by a variable, so each panel queries both logs, as refIds
-# exporter-<name> and bot-<name>, and its first transformation keeps the
-# frame of the source picked (pick_source). check_log_sources fails on a
-# log panel that does not. The bot's log is its stdout, with every field of a
-# JSON line at jsonPayload.<field>; it holds lines only once the bot logs
-# JSON.
-SOURCES = ("exporter", "bot")
-BOT_LOG = 'logName="projects/$env/logs/liquidity-bot"'
-EXPORTER_LOGS = ("liquidity-trades", "liquidity-transfers", "liquidity-botlogs")
-# The bot writes no order lines, so Orders reads the exporter's log on
-# either source.
+# The log panels read the bot's log, its stdout, with every field of a JSON
+# line at jsonPayload.<field>. Each query is refId bot-<name>, which the
+# detail panel finds the Trades and Rebalances results by; check_log_sources
+# fails on a log query that is not.
+BOT_LOG_NAME = "liquidity-bot"
+BOT_LOG = f'logName="projects/$env/logs/{BOT_LOG_NAME}"'
+BOT_EVENTS_FILTER = f'{BOT_LOG} jsonPayload.target="liq_event"'
+# The bot writes no order lines, so Orders reads the exporter's log.
 EXPORTER_ONLY_LOG = "liquidity-orders"
 
 _id = [0]
@@ -275,19 +266,6 @@ def series_names(names, colors=None):
 def cloudlog(query, ref="A"):
     return {"refId": ref, "datasource": CL, "projectId": "$env",
             "queryText": query, "queryType": "logs"}
-
-
-def source_targets(name, exporter_query, bot_query):
-    """One log panel's two queries: the exporter's and the bot's."""
-    return [cloudlog(exporter_query, ref=f"exporter-{name}"),
-            cloudlog(bot_query, ref=f"bot-{name}")]
-
-
-def pick_source(name):
-    """Keeps only the frame of the source picked. Grafana interpolates
-    variables in transformation options, and refIds match exactly."""
-    return {"id": "filterByRefId",
-            "options": {"include": "${source:text}-" + name}}
 
 
 def stat(title, desc, expr, display=None, unit="short", decimals=None,
@@ -544,12 +522,11 @@ def cloudlog_table(title, desc, query, columns, w=12, h=9, x=0, y=0,
                    widths=None, mappings_by_field=None, time_from=None,
                    number_columns=None, time_columns=None, time_name="Time",
                    order_override=None, time_unit="time:MMM D, HH:mm:ss",
-                   hide_time=False, dedup_by=None, source=None):
+                   hide_time=False, dedup_by=None, name=None):
     """columns: list of (raw_field, display_name).
 
-    source: (name, bot_query) for a panel that follows `source`: `query`
-      is then the exporter's, and the panel keeps the picked source's frame
-      (pick_source). Without it the panel reads only `query`.
+    query: a Cloud Logging filter on the bot's log, read as refId
+      bot-<name>, or `name` None for a query on another log (refId A).
 
     number_columns: {display_name: decimals} — the payload ships decimal
       STRINGS; convertFieldType turns them numeric so decimals apply
@@ -613,12 +590,10 @@ def cloudlog_table(title, desc, query, columns, w=12, h=9, x=0, y=0,
     return {
         "id": nid(), "type": "table", "title": title, "description": desc,
         "datasource": CL,
-        "targets": (source_targets(source[0], query, source[1]) if source
-                    else [cloudlog(query)]),
+        "targets": [cloudlog(query, ref=f"bot-{name}" if name else "A")],
         **({"timeFrom": time_from} if time_from else {}),
         "gridPos": {"h": h, "w": w, "x": x, "y": y},
         "transformations": [
-            *([pick_source(source[0])] if source else []),
             # `labels` is a JSON object per row; extractFields lifts each
             # key into its own column, dotted names kept verbatim (it
             # only JSON-parses strings, an object goes straight to
@@ -749,10 +724,10 @@ STATUS_DOT_MAPPINGS = [
 # (27,092 points for the equity table) just to show the newest one. A 5m
 # panel window keeps the same answer and makes the query about 60x smaller.
 # It applies only while the board range is relative (the default now-24h):
-# Grafana ignores a panel's relative override on an absolute range.
-LATEST_ONLY = {"timeFrom": "5m", "hideTimeOverride": False}
-# The one-row header pills have no room for the "Last 5 minutes" badge, so
-# they hide it; the board description says the header shows live state.
+# Grafana ignores a panel's relative override on an absolute range. The
+# panels hide its "Last 5 minutes" badge: the header pills have no room for
+# it, and on the inventory tables it cut off the title's total on a laptop.
+# The board description says they show the live state.
 LATEST_ONLY_HIDDEN = {"timeFrom": "5m", "hideTimeOverride": True}
 
 
@@ -785,11 +760,8 @@ def tab_links(active):
             # A no-break space: Grafana trims a plain one after the symbol.
             "title": (f"▸ {symbol}\u00a0{name}" if name == active
                       else f"{symbol}\u00a0{name}"),
-            # autofitpanels stretches the board to the window height, like
-            # the SPA's full-height layout. Only the Dashboard tab: the
-            # other tabs hold too many panels to squeeze into one screen.
-            "url": f"/d/{uid}/?theme=light"
-                   + ("&autofitpanels" if uid == "t0-liquidity" else ""),
+            # The Dashboard tab fits the window itself (board-layout.js).
+            "url": f"/d/{uid}/?theme=light",
             "targetBlank": False,
             "keepTime": True, "includeVars": True,
             "asDropdown": False, "tags": [], "tooltip": "",
@@ -807,10 +779,19 @@ def panel_module(name):
     """A liquidity-panels script to prepend to an afterRender. Its export
     line is for the SPA test; afterRender is not a module."""
     with open(os.path.join(HERE, "liquidity-panels", name)) as f:
-        return "".join(line for line in f if not line.startswith("export "))
+        lines = f.readlines()
+    # Only a one-line export is dropped whole; the rest of a longer one
+    # would stay in the script and break it.
+    split = [line for line in lines
+             if line.startswith("export ") and not line.rstrip().endswith(";")]
+    if split:
+        raise SystemExit(f"{name}: keep its export on one line: {split[0]!r}")
+    return "".join(line for line in lines if not line.startswith("export "))
 
 
-def pills(y, w=24):
+def pills(y, w=24, fit_window=False, locked_sort=(), fit_columns=None,
+          header_tips=None, tree_sorts=None, table_totals=None,
+          scale_tables=(), row_tips=None, full_entries=None, unit_tags=None):
     """The SPA's HeaderBar and SettingsBar as one Business Text row,
     repeated on every tab like the SPA repeats its header: the settings
     pills (broker, Equity and USDC targets with their bands, Trigger,
@@ -828,7 +809,34 @@ def pills(y, w=24):
     board's environment.
 
     w: the Dashboard tab narrows it to 23 to fit the detail panel beside
-    it (see detail_panel()).
+    it (see detail_panel()). fit_window: the board fits the window itself
+    (board-layout.js), so the script takes Grafana's autofitpanels off a
+    link that has it: autofit would squeeze a short window's board.
+    locked_sort: titles of the tab's tables that must not sort, because a
+    sort breaks their tree rows (liquidity-panels/board-tables.js).
+    fit_columns: {"fit": [titles], "fill": title, "split": [titles]}: a
+    left column whose `fit` tables take the height their rows need and
+    `fill` the rest, and a right column the `split` panels share equally,
+    both ending level (liquidity-panels/board-layout.js). header_tips:
+    {panel title: {header: hover text}} for headers that need explaining
+    (liquidity-panels/board-tables.js). tree_sorts: {panel title:
+    {"rowField": the row key, "keys": {header: hidden key}}} for tree tables
+    whose headers sort by a key every row of a group shares
+    (liquidity-panels/board-tables.js). row_tips: {panel title: config}
+    for tables whose first column explains its row on hover (ROW_TIPS,
+    liquidity-panels/board-tables.js). table_totals: {panel title:
+    [column] or {"columns", "stamp", "staleAfterSeconds"}}, each panel's
+    total of those columns in USD after its title, and how old its prices
+    are once stale (liquidity-panels/board-totals.js). scale_tables: groups
+    of tables, [{"id", "panels", "fixedPx", "ratioMinPx", "stretch",
+    "stretchMinPx", "cellFontPx"}], whose fixed columns (fixedPx) shrink
+    together on a window too narrow for them and the stretching column's
+    ratioMinPx (liquidity-panels/board-scale.js). full_entries: {panel
+    title: entries}, log tables that first load a screen's entries and then
+    their whole history (liquidity-panels/board-progressive.js). unit_tags:
+    {panel title: {"match", "column", "tags": [{"values", "text", "tip"}]}},
+    a unit after a cell by its row's match column
+    (liquidity-panels/board-tables.js).
     """
     def named(expr, name):
         return f'label_replace({expr}, "k", "{name}", "", "")'
@@ -849,13 +857,32 @@ def pills(y, w=24):
         named("max(liq_settings_order_polling_seconds)", "order_polling"),
         named("max(liq_settings_inventory_poll_seconds)", "inventory_polling"),
         named("max(liq_settings_deployment_block)", "deployment_block"),
+        # For the trade sizes' hover (UNIT_TAGS): wt in t and t in wt.
+        named("max by (symbol, chain) (liq_equity_chain_wrapper_ratio)",
+              "wrapper_ratio"),
     ])
     with open(os.path.join(HERE, "liquidity-panels", "recovery-guide.json")) as f:
         guide = json.load(f)
-    after_render = (f"const RECOVERY_GUIDE = {json.dumps(guide)};\n\n"
+    after_render = (f"const FIT_WINDOW = {json.dumps(fit_window)};\n"
+                    f"const LOCKED_SORT_PANELS = {json.dumps(list(locked_sort))};\n"
+                    f"const FIT_COLUMNS = {json.dumps(fit_columns)};\n"
+                    f"const ROW_TINTS = {json.dumps(MARK_ROW_TINTS)};\n"
+                    f"const HEADER_TIPS = {json.dumps(header_tips or {})};\n"
+                    f"const TREE_SORTS = {json.dumps(tree_sorts or {})};\n"
+                    f"const ROW_TIPS = {json.dumps(row_tips or {})};\n"
+                    f"const UNIT_TAGS = {json.dumps(unit_tags or {})};\n"
+                    f"const TABLE_TOTALS = {json.dumps(table_totals or {})};\n"
+                    f"const SCALE_TABLES = {json.dumps(list(scale_tables))};\n"
+                    f"const FULL_ENTRIES = {json.dumps(full_entries or {})};\n"
+                    f"const RECOVERY_GUIDE = {json.dumps(guide)};\n\n"
                     + panel_module("client-env.js") + "\n"
                     + panel_module("header-rows.js") + "\n"
                     + panel_module("copy-command.js") + "\n"
+                    + panel_module("board-tables.js") + "\n"
+                    + panel_module("board-layout.js") + "\n"
+                    + panel_module("board-totals.js") + "\n"
+                    + panel_module("board-scale.js") + "\n"
+                    + panel_module("board-progressive.js") + "\n"
                     + panel_module("header.js"))
     with open(os.path.join(HERE, "liquidity-panels", "header.css")) as f:
         styles = f.read()
@@ -863,8 +890,7 @@ def pills(y, w=24):
         "id": nid(), "type": "marcusolsson-dynamictext-panel", "title": "",
         "description": "The SPA header: settings pills, Config, the CLI "
                        "recovery guide, the deployed commit, uptime, and "
-                       "whether the bot is up: the exporter's liq_up, or "
-                       "the bot scrape's up on the bot source.",
+                       "whether the bot is up: its scrape's up.",
         "datasource": CM,
         "targets": [promql(expr, instant=True)],
         "transparent": True,
@@ -911,26 +937,6 @@ WINDOW_VAR = {
     ],
 }
 
-# Which job's liq_* series the boards read. The bot is the default (Stage 4
-# of the migration); the exporter stays selectable until a later stage removes
-# it. The bot's job is t0-liquidity in production and t0-liquidity-staging in
-# staging, and `env` already picks the project, so one regex covers both.
-SOURCE_VAR = {
-    "name": "source", "type": "custom", "label": "Source",
-    "description": "Which process serves the liq_* metrics and log rows: "
-                   "the bot's own /metrics and log (the default) or the "
-                   "exporter sidecar. Pick exporter to compare the two.",
-    "query": f"exporter : {EXPORTER_JOB}, "
-             "bot : t0-liquidity|t0-liquidity-staging",
-    "includeAll": False, "multi": False, "hide": 0,
-    "current": {"selected": True, "text": "bot",
-                "value": "t0-liquidity|t0-liquidity-staging"},
-    "options": [{"selected": False, "text": "exporter",
-                 "value": EXPORTER_JOB},
-                {"selected": True, "text": "bot",
-                 "value": "t0-liquidity|t0-liquidity-staging"}],
-}
-
 ENV_VAR = {
     "name": "env", "type": "custom", "label": "Environment",
     "description": "GCP project id — both the Cloud Monitoring and Cloud "
@@ -951,6 +957,15 @@ ENV_VAR = {
 }
 
 
+# The Dashboard tab has no time series to mark, so Grafana's built-in
+# "Annotations & Alerts" query, which every board runs at load unless told
+# not to, is off there: one request fewer while the board loads.
+NO_ANNOTATIONS = {"list": [{
+    "builtIn": 1, "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+    "enable": False, "hide": True, "iconColor": "rgba(0, 211, 255, 1)",
+    "name": "Annotations & Alerts", "type": "dashboard"}]}
+
+
 def make_dashboard(uid, title, description, panels, links, variables):
     if uid != "t0-liquidity":
         # Tab boards live in the liquidity/tabs folder; say so, since a
@@ -967,27 +982,289 @@ def make_dashboard(uid, title, description, panels, links, variables):
         "templating": {"list": variables},
         "links": links,
         "panels": panels,
+        **({"annotations": NO_ANNOTATIONS} if uid == "t0-liquidity" else {}),
     }
 
 
 dashboards = []
+
+# The Equities table: an asset row with its chain rows under it, so the
+# header locks its sort (pills(locked_sort=...)).
+EQUITIES_TITLE = "Equities"
+# Equities sorts by a column without breaking its tree: each sortable column
+# has a hidden key that a chain row takes from its asset, so a sort on the key
+# and then the row keeps each asset's chain rows under it. board-tables.js
+# swaps the panel's sort transformations when a header is clicked; Asset
+# restores the default order, the largest exposure either way first
+# (EQUITY_DEFAULT_SORT_KEY). Exposure sorts by that size too, not by its
+# sign. {header: hidden key column}.
+EQUITY_DEFAULT_SORT_KEY = "sort_exposure_size"
+EQUITY_SORT_KEYS = {
+    "Total": "sort_total",
+    "Total USD": "sort_total_usd", "Exposure": EQUITY_DEFAULT_SORT_KEY,
+    "tStock": "sort_unwrapped", "wtStock": "sort_wrapped",
+    "Ratio": "sort_ratio",
+}
+# Every hidden key column, once.
+EQUITY_SORT_COLUMNS = list(dict.fromkeys(
+    [*EQUITY_SORT_KEYS.values(), EQUITY_DEFAULT_SORT_KEY]))
+EQUITY_ROW_FIELD = "row\\col"
+
+# What each Dashboard table header shows, on hover (board-tables.js).
+HEADER_TIPS = {
+    "USD · Brokers": {
+        "Cash": "Alpaca's cash, the reserve included",
+        "USDC": "USDC held at Alpaca",
+        "Reserve": "Cash the bot always keeps at Alpaca and never moves",
+        "Rebalanceable": "Withdrawable cash above the reserve: what can move "
+                         "onchain now",
+        "In flight": "Cash on its way to or from Alpaca",
+        "Share of total": "Alpaca's cash against Alpaca, Base's vault and all "
+                          "cash in flight. Green while every chain is inside "
+                          "its band; the ticks are where a chain leaves it",
+    },
+    "USD · Onchain": {
+        "Vault": "USDC in the chain's vault",
+        "In flight": "USDC in flight from or to the vault",
+        "Wallet": "USDC in the bot's wallet on the chain, outside the vault",
+        "Target": "The chain's target ratio",
+        "±": "How far the ratio may drift from the target before the bot "
+             "rebalances",
+        "Ratio": "vault / (vault + Alpaca cash). Green inside the band, red "
+                 "outside; the ticks are the band",
+    },
+    "Equities": {
+        "Asset": "The asset, and under it Alpaca and each chain it has a "
+                 "vault on. Hover a symbol or a chain for its flags. Click to "
+                 "restore the default order: the largest exposure first",
+        "Amount": "Shares held: wrapped shares in a chain's vault, or "
+                  "shares at Alpaca",
+        "Inflight": "Shares in flight in a mint or redemption. On an "
+                    "asset row, every chain's and Alpaca's",
+        "Total": "Shares at Alpaca and every chain, in underlying shares, with "
+                 "those in flight. Click to sort",
+        "Total USD": "Total at the last price. Click to sort",
+        "Exposure": "Unhedged net position at the live price, else at "
+                    "the last price. Red beyond ±$5. Click to sort",
+        "tStock": "Unwrapped tokens (tAAPL) in the bot's wallet on the "
+                  "chain, not in a vault. Click to sort",
+        "wtStock": "Wrapped tokens (wtAAPL) in the bot's wallet on the "
+                   "chain, not in a vault. Click to sort",
+        "Ratio": "A chain's or Alpaca's share of the asset; the ticks are "
+                 "its band (Alpaca's is what the chains' targets leave). "
+                 "Green inside, red outside. Click to sort the assets by "
+                 "their onchain share",
+    },
+    "Trades": {
+        "Last updated": "When the bot logged the trade's latest status",
+        "Venue": "Where it filled: an onchain venue, or Alpaca for a hedge",
+        "Side": "Buy or sell, from the bot's side",
+        "Size": "Shares filled",
+        "USD": "Shares × fill price",
+        "Status": "The trade's latest status",
+    },
+    "Rebalances": {
+        "Last updated": "When the bot logged the transfer's latest status",
+        "Type": "Mint, redeem, or the USDC bridge's direction",
+        "Amount": "Shares, or USDC for a bridge",
+        "USD": "An equity transfer at its mark, or a bridge's amount",
+        "Status": "The transfer's latest status; the dialog's timeline can be "
+                  "newer",
+    },
+}
+# Display names for the chains the bot knows (config keys). A chain not
+# listed here still gets its row and column, under its raw key.
+CHAIN_NAMES = {"base": "Base", "robinhood": "Robinhood", "hyperevm": "HyperEVM",
+               "ethereum": "Ethereum"}
+
+# The venues with a mark: Alpaca and the chains.
+MARK_NAMES = {"alpaca": "Alpaca", **CHAIN_NAMES}
+
+GREEN, RED, AMBER, GREY = "#22c55e", "#ef4444", "#f59e0b", "#6b7280"
+
+# A venue row's background, a wash of its mark's colour, keyed by the
+# mark's name (its alt, MARK_NAMES): board-tables.js tints every row holding
+# the mark. Bright marks (Robinhood's neon, Alpaca's yellow) get a thinner
+# wash, so every tint reads about as strong as Base's blue. The header row
+# that installs it comes before the marks, so the names are written out;
+# check_row_tints holds them to MARK_NAMES.
+MARK_ROW_TINTS = {
+    "Alpaca": "rgba(252,212,0,0.08)",
+    "Base": "rgba(0,82,255,0.20)",
+    "Robinhood": "rgba(204,255,0,0.06)",
+    "Ethereum": "rgba(98,126,234,0.20)",
+    "HyperEVM": "rgba(151,252,228,0.15)",
+}
+# A symbol's flags on hover (board-tables.js): the first column of an
+# Equities row is an <abbr title="row:<key>">, and the tip lists the flags
+# of that row's chains from the panel's hidden flags field
+# (CHAIN_FLAGS_EXPR): every chain row of an asset, or the one chain. Each
+# column reads one digit of the packed number, a state per digit value:
+# [text, colour, light].
+ROW_TIP_PREFIX = "row:"
+ROW_TIPS = {
+    EQUITIES_TITLE: {
+        "rowFields": [EQUITY_ROW_FIELD, "Asset"],
+        "flagFields": ["flags", "Flags"],
+        "chains": CHAIN_NAMES,
+        "empty": "No chain flags published",
+        "columns": [
+            {"name": "Counter trading",
+             "states": {"2": ["on", GREEN, "●"], "1": ["off", RED, "●"]}},
+            {"name": "Rebalancing",
+             "states": {"2": ["enabled", GREEN, "●"],
+                        "4": ["paused", AMBER, "●"],
+                        "1": ["disabled", RED, "●"]}},
+            {"name": "Extended hours",
+             "states": {"2": ["on", GREEN, "●"], "1": ["off", RED, "●"],
+                        "3": ["n/a, no counter trading", GREY, "○"]}},
+        ],
+    },
+}
+# The USD tables above it, sized to their rows, and the log tables beside
+# them, half the column each (pills(fit_columns=...)).
+USD_BROKERS_TITLE = "USD · Brokers"
+USD_ONCHAIN_TITLE = "USD · Onchain"
+TRADES_TITLE = "Trades"
+# The left column's three tables end in their ratio bar, which stretches to
+# the card's edge. Their other columns add up to RATIO_LEFT_PX, so the bars
+# line up one above the other (check_ratio_columns). On a window too narrow
+# for those columns and RATIO_MIN_PX of bar, board-scale.js shrinks the
+# columns and their text together; a 1080p window needs none.
+RATIO_LEFT_PX = 790
+RATIO_MIN_PX = 180
+# Trades and Rebalances scale too, each by its own factor: their fixed
+# columns (the ⓘ, Last updated, and the rest) add up to these, and Status
+# takes the rest, at least STATUS_MIN_PX (check_scale_groups).
+TRADES_FIXED_PX = 50 + 150 + 65 + 80 + 55 + 100 + 80
+REBALANCES_FIXED_PX = 50 + 150 + 135 + 65 + 88 + 80
+STATUS_MIN_PX = 110
+# The inventory tables' numbers, larger than Grafana's 14px so they fill
+# their 42px rows; scaled down with the columns on a narrow window.
+INVENTORY_CELL_FONT_PX = 16
+# Room the factor leaves for what the widths do not count: each cell's 1px
+# border and each scaled width rounded up.
+TABLE_SLACK_PX = 24
+# Each inventory table's total in USD after its title: the balances held,
+# in flight left out (a bridge's USDC can sit in a wallet while it is in
+# flight, so both would count it twice). {panel title: [column]}.
+TABLE_TOTALS = {
+    USD_BROKERS_TITLE: ["cash", "usdc"],
+    USD_ONCHAIN_TITLE: ["vault", "wallet"],
+    # The prices are the last observed, live or not: the title says how old
+    # the oldest is once it is older than PRICE_STALE_SECONDS.
+    # Then the onchain and broker parts of it: each row's shares and those
+    # in flight, a chain row's (symbol/chain) and Alpaca's (symbol/alpaca).
+    EQUITIES_TITLE: {"columns": ["total_usd"], "stamp": "price_ts",
+                     "staleAfterSeconds": 600, "rowField": EQUITY_ROW_FIELD,
+                     "parts": [
+                         {"label": "onchain",
+                          "columns": ["vault_usd", "inflight_usd"],
+                          "rows": "^[^/]+/(?!alpaca$)"},
+                         {"label": "brokers",
+                          "columns": ["vault_usd", "inflight_usd"],
+                          "rows": "/alpaca$"},
+                     ]},
+}
+REBALANCES_TITLE = "Rebalances"
+# An onchain trade's size is in wrapped shares (Raindex settles them), a
+# broker hedge's in underlying shares; at a wrapper ratio other than 1 the
+# two differ for the same exposure, so every size names its unit: wt
+# onchain, t at Alpaca (board-tables.js). Venue holds its mapped text.
+# On hover each size shows itself in the other unit, through the symbol's
+# wrapper ratio on each chain (the header reads them).
+UNIT_TAGS = {TRADES_TITLE: {
+    "match": "Venue", "column": "Size", "symbol": "Asset",
+    "chains": CHAIN_NAMES,
+    "tags": [
+        {"values": ["Raindex", "Bebop", "Uniswap v4", "Unknown Onchain"],
+         "text": "wt", "convert": {"unit": "t", "times": True},
+         "tip": "Wrapped shares; the broker hedge is in underlying shares."},
+        {"values": ["Alpaca"], "text": "t",
+         "convert": {"unit": "wt", "times": False},
+         "tip": "Underlying shares at Alpaca."},
+    ]}}
+# Trades and Rebalances load their newest LOG_FIRST_ENTRIES log entries,
+# enough rows for a tall screen once grouped by id, then their newest
+# LOG_FULL_ENTRIES, well over the SPA's 100 rows (board-progressive.js).
+LOG_FIRST_ENTRIES = 100
+LOG_FULL_ENTRIES = 500
 
 # ==========================================================================
 # Tab 1: Dashboard: the SPA's Inventory card as Grafana tables (USD at
 # Alpaca, USD on each chain, equities) on the left, Trades / Rebalances
 # stacked right.
 # ==========================================================================
+# The tables that shrink on a narrow window. The left column's share one
+# factor, so their ratio bars stay lined up (RATIO_LEFT_PX).
+# On a phone, or a window too narrow for every column (board-scale.js), each
+# table is compact: it hides its secondary columns and fits the rest:
+# compactFixedPx is the widest table's remaining fixed columns
+# (check_scale_groups), with a narrower stretching column. Trades and
+# Rebalances also drop the seconds and "UTC" from the time, so a 402px
+# iPhone fits them at about 12px text.
+COMPACT_TIME_COLUMNS = {
+    "Last updated": {"unit": "time:MMM D HH:mm", "custom.width": 100},
+}
+COMPACT_STATUS_MIN_PX = 90
+SCALE_GROUPS = [
+    {"id": "inventory",
+     "panels": [USD_BROKERS_TITLE, USD_ONCHAIN_TITLE, EQUITIES_TITLE],
+     "fixedPx": RATIO_LEFT_PX, "ratioMinPx": RATIO_MIN_PX,
+     "cellFontPx": INVENTORY_CELL_FONT_PX,
+     "compactHide": {
+         USD_BROKERS_TITLE: ["Reserve", "Rebalanceable", "In flight"],
+         USD_ONCHAIN_TITLE: ["In flight", "Target", "±"],
+         EQUITIES_TITLE: ["Inflight", "Total", "Total USD", "tStock",
+                          "wtStock"],
+     },
+     "compactFixedPx": 378, "compactRatioMinPx": 120},
+    {"id": "trades", "panels": [TRADES_TITLE],
+     "fixedPx": TRADES_FIXED_PX, "ratioMinPx": STATUS_MIN_PX + TABLE_SLACK_PX,
+     "stretch": "Status", "stretchMinPx": STATUS_MIN_PX,
+     "compactHide": {TRADES_TITLE: ["Venue", "Side", "Size"]},
+     "compactColumns": {**COMPACT_TIME_COLUMNS, "Asset": {"custom.width": 56},
+                      "USD": {"custom.width": 68}},
+     "compactFixedPx": 50 + 100 + 56 + 68,
+     "compactRatioMinPx": COMPACT_STATUS_MIN_PX + TABLE_SLACK_PX},
+    {"id": "rebalances", "panels": [REBALANCES_TITLE],
+     "fixedPx": REBALANCES_FIXED_PX,
+     "ratioMinPx": STATUS_MIN_PX + TABLE_SLACK_PX,
+     "stretch": "Status", "stretchMinPx": STATUS_MIN_PX,
+     "compactHide": {REBALANCES_TITLE: ["Asset", "Amount", "USD"]},
+     "compactColumns": COMPACT_TIME_COLUMNS,
+     "compactFixedPx": 50 + 100 + 135,
+     "compactRatioMinPx": COMPACT_STATUS_MIN_PX + TABLE_SLACK_PX},
+]
 panels = []
-panels += pills(0, w=23)
+panels += pills(0, w=23, fit_window=True, locked_sort=(EQUITIES_TITLE,),
+                fit_columns={"fit": [USD_BROKERS_TITLE, USD_ONCHAIN_TITLE],
+                             "fill": EQUITIES_TITLE,
+                             "split": [TRADES_TITLE, REBALANCES_TITLE]},
+                header_tips=HEADER_TIPS,
+                tree_sorts={EQUITIES_TITLE: {"rowField": EQUITY_ROW_FIELD,
+                                             "keys": EQUITY_SORT_KEYS}},
+                table_totals=TABLE_TOTALS,
+                row_tips=ROW_TIPS,
+                scale_tables=SCALE_GROUPS,
+                full_entries={TRADES_TITLE: LOG_FULL_ENTRIES,
+                              REBALANCES_TITLE: LOG_FULL_ENTRIES},
+                unit_tags=UNIT_TAGS)
 
 def native_table(title, desc, expr, row_label, columns, w, h, x, y,
                  first_col, sort_by=(), widths=None, bars=(),
-                 align="right", stretch=None, first_col_mappings=None):
+                 align="right", stretch=None, first_col_mappings=None,
+                 first_col_html=False, first_col_align="left",
+                 presort=(), drop=(), no_value=None):
     """A Grafana table from one or-chain query pivoted on (row_label, col),
     like matrix_table. columns: [(col, display name, [field override
     properties])]; bars: columns drawn as HTML bars (see bar_cell);
     sort_by: the default sort, a list of {displayName, desc}, first key
-    first."""
+    first. presort: the row order before display, [(col, desc)], first key
+    first, which can use a `drop` column: Grafana 13.1.0's table draws a
+    column it is told to hide, so a sort key the card does not show is
+    sorted on here and then dropped. no_value: the text of an empty cell.
+    """
     matrix_key = f"{row_label}\\col"
     names = {col: name for col, name, _ in columns}
     # Fixed widths, except one `stretch` column that takes the rest of the
@@ -1022,8 +1299,13 @@ def native_table(title, desc, expr, row_label, columns, w, h, x, y,
              "options": {"columnField": "col", "rowField": row_label,
                          "valueField": "Value (lastNotNull)",
                          "emptyValue": "null"}},
+            # sortBy sorts stably, so the last key applied leads.
+            *[{"id": "sortBy", "options": {"fields": {}, "sort": [
+                {"field": matrix_key if col == row_label else col,
+                 "desc": desc}]}}
+              for col, desc in reversed(presort)],
             {"id": "organize", "options": {
-                "excludeByName": {},
+                "excludeByName": {col: True for col in drop},
                 "indexByName": {name: index for index, name in enumerate(
                     [matrix_key] + [col for col, _, _ in columns])},
                 "renameByName": {matrix_key: first_col, **names}}},
@@ -1034,6 +1316,7 @@ def native_table(title, desc, expr, row_label, columns, w, h, x, y,
         ],
         "fieldConfig": {
             "defaults": {"unit": "locale", "decimals": 2,
+                         **({"noValue": no_value} if no_value else {}),
                          "custom": {"align": align, "filterable": True,
                                     "cellOptions": {"type": "auto"}},
                          "thresholds": {"mode": "absolute", "steps": [
@@ -1041,33 +1324,30 @@ def native_table(title, desc, expr, row_label, columns, w, h, x, y,
                          "mappings": []},
             "overrides": [
                 {"matcher": {"id": "byName", "options": first_col},
-                 "properties": [{"id": "custom.align", "value": "left"},
+                 "properties": [{"id": "custom.align", "value": first_col_align},
                                 {"id": "custom.width",
                                  "value": widths.get(row_label, 90)},
                                 *([{"id": "mappings",
                                     "value": first_col_mappings}]
-                                  if first_col_mappings else [])]},
+                                  if first_col_mappings else []),
+                                *([{"id": "custom.cellOptions",
+                                    "value": {"type": "markdown"}}]
+                                  if first_col_html else [])]},
                 *overrides,
                 *stretch_props,
             ],
         },
         "options": {"showHeader": True, "cellHeight": "md",
                     **({"sortBy": list(sort_by)} if sort_by else {})},
-        **LATEST_ONLY,
+        **LATEST_ONLY_HIDDEN,
     }
 
 
 
-# Added to a banded percent before its sign, so an out-of-band 0% is -0.0001
-# and not -0, which Grafana writes as "0" (in band). The bar cell's regex
-# keeps one decimal, so the offset never shows.
-BAND_SIGN_OFFSET = 0.0001
-
-
 # A ratio outside [0, 1], from a negative balance say, is no share a bar can
 # draw: every bar encoding sends it to OUT_OF_RANGE instead. That value
-# matches none of the bar cell's percent patterns, so the cell writes
-# "out of range" for it (see bar_cell).
+# matches none of the bar cell's patterns, so the cell writes "out of range"
+# for it (see bar_cell).
 OUT_OF_RANGE = 2000
 
 
@@ -1082,86 +1362,147 @@ def in_range(ratio, encoded):
             f"unless {bounded}))")
 
 
-def banded_pct(expr, inside):
-    """pct_bar's sign encoding: the percent rounded to 0.1, negative when
-    `inside` (a 0/1 PromQL bool) says it is outside the band."""
-    return in_range(expr, f"(round(100 * ({expr}), 0.1) + {BAND_SIGN_OFFSET}) "
-                          f"* (2 * {inside} - 1)")
+# A table cell can only style its own value, so a judged bar's value carries
+# everything the bar draws: the percent and its band's two edges, each in
+# tenths of a percent as four digits, behind a leading digit for the bar's
+# kind that also keeps their zeros (K PPPP LLLL HHHH), and the verdict as
+# the sign, negative outside the band. Every term is a whole number under
+# 2^53, so PromQL keeps each digit. An edge past 0% or 100% draws its tick
+# at the bar's end. A bar with no single band (an asset on several chains)
+# writes NO_EDGE for both edges and draws no ticks.
+BAND_BAR_BASE = 10 ** 12
+NO_EDGE = 9999
+# The bar's kind: a ratio of its own (a USD row, or an asset on one chain),
+# the sum of the chain rows under it (an asset on several chains), or one
+# chain's part of its asset (a chain row).
+BAR_WHOLE, BAR_SUM, BAR_PART = 1, 2, 3
 
 
-# Added to a percent the board cannot judge against a band, so the bar cell
-# draws it grey. A percent is at most 100, so a judged value never has four
-# integer digits and an unjudged one always does.
+def band_bar(ratio, low, high, inside, kind=BAR_WHOLE):
+    """`ratio` for a bar cell, with its band [low, high], or no ticks when
+    both are None, `inside`, a 0/1 PromQL bool, as the verdict, and the
+    bar's kind. All the expressions carry the same labels."""
+    tenths = lambda fraction: (NO_EDGE if fraction is None else
+                               f"round(1000 * clamp(({fraction}), 0, 1))")
+    return in_range(ratio, f"({kind * BAND_BAR_BASE} + {tenths(ratio)} * 1e8 + "
+                           f"{tenths(low)} * 1e4 + {tenths(high)}) "
+                           f"* (2 * ({inside}) - 1)")
+
+
+# Added to a percent the board has no band for, so the bar cell draws it
+# grey. A percent is at most 100, so the value always has four integer digits.
 UNJUDGED_OFFSET = 1000
 
 
 def unjudged_pct(expr):
-    """A percent with no band verdict: grey in a banded bar cell."""
-    return in_range(expr, f"round(100 * ({expr}), 0.1) + {UNJUDGED_OFFSET} "
-                          f"+ {BAND_SIGN_OFFSET}")
+    """A percent with no band: a grey bar."""
+    return in_range(expr, f"round(100 * ({expr}), 0.1) + {UNJUDGED_OFFSET}")
 
 
-def pct_bar(expr, band=None):
-    """A percent for an HTML bar cell (see BAR_CELL): the value as a percent
-    rounded to 0.1, negative when it is outside the rebalance band. A table
-    cell can only style its own value, so the band verdict travels in the
-    sign. band: (target metric, deviation metric), or None for a neutral
-    share."""
-    if not band:
-        return in_range(expr, f"round(100 * ({expr}), 0.1)")
-    target, deviation = band
-    inside = (f"(abs(({expr}) - scalar(max({target}))) "
-              f"<= bool scalar(max({deviation})))")
-    return banded_pct(expr, inside)
+# A bar's percent sits on a dark backing, so a band tick behind it never
+# runs through the digits on a narrow bar.
+PCT_OPEN = ('<span style="background:rgba(17,18,23,0.6);padding:0 3px;'
+            'border-radius:3px">')
 
 
-def bar_html(fill, text):
+def bar_html(fill, text, track="rgba(128,128,128,0.15)"):
     # One div: Grafana's sanitizer drops position, top, left and
     # line-height, so the fill is a hard-stop gradient behind the text.
-    return ('<div style="height:20px;border-radius:4px;font-weight:600;'
-            f'text-align:center;background:linear-gradient(90deg, {fill} '
-            f'{text}%, rgba(128,128,128,0.15) {text}%)">{text}%</div>')
+    return ('<div style="height:20px;border-radius:4px;font-size:10px;'
+            f'font-weight:600;text-align:center;background:linear-gradient('
+            f'90deg, {fill} '
+            f'{text}%, {track} {text}%)">{PCT_OPEN}{text}%</span></div>')
+
+
+def band_bar_html(fill, track, pct, low=None, high=None, kind=BAR_WHOLE):
+    """A judged bar: the fill as wide as the percent, the percent in the
+    middle, and a tick at each band edge. The edges are tenths of a percent
+    (band_bar), so a tick sits at a tenth of that in percent. The track is
+    tinted too, so a ratio near 0% still reads red or green. A sum writes
+    "Σ" before its percent; a part is a slimmer bar, its ticks where its
+    asset's are."""
+    tick = lambda at: (f"transparent calc({at}% / 10 - 1px), currentColor "
+                       f"calc({at}% / 10 - 1px), currentColor "
+                       f"calc({at}% / 10 + 1px), transparent "
+                       f"calc({at}% / 10 + 1px)")
+    ticks = ("" if low is None else
+             f"linear-gradient(90deg, {tick(low)}, {tick(high)}), ")
+    height = 13 if kind == BAR_PART else 20
+    sign = "Σ " if kind == BAR_SUM else ""
+    return (f'<div style="height:{height}px;border-radius:4px;font-size:10px;'
+            f'font-weight:600;text-align:center;background:{ticks}'
+            'linear-gradient(90deg, '
+            f'{fill} {pct}%, {track} {pct}%)">{PCT_OPEN}{sign}{pct}%</span></div>')
+
+
+# The fills are opaque, the colour the old 60% fill showed on the dark
+# panel, so a venue row's tint (MARK_ROW_TINTS) shows only through the
+# translucent track and never changes the verdict's red or green.
+RED_FILL, RED_TRACK = "rgb(153,52,53)", "rgba(239,68,68,0.22)"
+GREEN_FILL, GREEN_TRACK = "rgb(30,129,69)", "rgba(34,197,94,0.22)"
+
+
+def pct_field(whole):
+    """The pattern for band_bar's four-digit percent, in tenths of a
+    percent, and the percent it writes from groups 1 to 3: no leading
+    zeros, and no ".0" when `whole`. A percent over 100 matches neither."""
+    if whole:
+        return r"(?:00(\d)|0([1-9]\d)|(100))0", "$1$2$3"
+    return r"(?:00(\d)|0([1-9]\d))([1-9])", "$1$2.$3"
+
+
+def band_bar_mappings(start):
+    """One regex mapping per kind, verdict, percent written whole or with a
+    decimal (a mapping writes text, it cannot leave out a decimal), and bar
+    with or without ticks. Each edge is 0000 to 1000, its tenths of a
+    percent as groups 4 and 5, or NO_EDGE."""
+    edge = r"(0\d{3}|1000)"
+    mappings = []
+    for kind in (BAR_WHOLE, BAR_SUM, BAR_PART):
+        for sign, fill, track in (("-", RED_FILL, RED_TRACK),
+                                  ("", GREEN_FILL, GREEN_TRACK)):
+            for whole in (True, False):
+                pct_pattern, pct = pct_field(whole)
+                for edges, html in (
+                        (edge * 2,
+                         band_bar_html(fill, track, pct, "$4", "$5", kind)),
+                        (f"{NO_EDGE}" * 2,
+                         band_bar_html(fill, track, pct, kind=kind))):
+                    mappings.append({"type": "regex", "options": {
+                        "pattern": f"^{sign}{kind}{pct_pattern}{edges}$",
+                        "result": {"text": html,
+                                   "index": start + len(mappings)}}})
+    return mappings
 
 
 # A percent drawn as the custom card's bar: the fill as wide as the percent
 # and the percent written inside it. Grafana's gauge cell puts the number
 # beside its bar, so this is a Markdown + HTML cell: the value turns into a
-# string and a regex mapping writes the HTML, its capture group the percent.
-# Negative means outside the band (see pct_bar): red, else green. With
-# `unjudged`, a value from 1000 to 1100 is a percent plus UNJUDGED_OFFSET
-# (see unjudged_pct): grey, its percent read after the offset. The patterns
+# string and a regex mapping writes the HTML from its capture groups. A
+# band_bar value is red or green with its band's ticks; an unjudged_pct value
+# (1000 to 1100) is grey, its percent read after the offset. The patterns
 # take percents from 0 to 100 only, so OUT_OF_RANGE, or any value a broken
 # encoding makes, is written "out of range", never as a coloured bar.
-GREY_FILL = "rgba(148,163,184,0.45)"
-PCT_PATTERN = r"(100|[1-9]?\d(?:\.[1-9])?)(?:\.\d*|(?<=\.\d)\d*)?"
+GREY_FILL = "rgb(80,88,100)"
 UNJUDGED_PATTERN = r"^(?=1(?:0\d\d|100)(?!\d))10*(\d+(?:\.[1-9])?).*$"
 OUT_OF_RANGE_HTML = ('<div style="height:20px;border-radius:4px;'
                      f'text-align:center;background:{GREY_FILL}">'
                      'out of range</div>')
 
 
-def bar_cell(neutral=False, unjudged=False):
+def bar_cell():
     # No value (a chain without a vault) shows nothing.
     mappings = [{"type": "regex", "options": {"pattern": "^(null|NaN)?$",
                  "result": {"text": " ", "index": 0}}}]
     mappings.append({"type": "regex", "options": {
         "pattern": f"^{OUT_OF_RANGE}$",
         "result": {"text": OUT_OF_RANGE_HTML, "index": len(mappings)}}})
-    mappings += ([] if not unjudged else [
-        {"type": "regex", "options": {"pattern": UNJUDGED_PATTERN, "result": {
-            "text": bar_html(GREY_FILL, "$1"), "index": len(mappings)}}}])
-    # The percent keeps at most one decimal, which drops pct_bar's offset
-    # and any float noise from the rounding.
-    mappings += ([] if neutral else [
-        {"type": "regex", "options": {"pattern": f"^-{PCT_PATTERN}$", "result": {
-            "text": bar_html("rgba(239,68,68,0.6)", "$1"), "index": len(mappings)}}}])
     mappings.append({"type": "regex", "options": {
-        "pattern": f"^{PCT_PATTERN}$" if not neutral else "^(.*)$", "result": {
-        "text": bar_html(GREY_FILL if neutral else "rgba(34,197,94,0.6)", "$1"),
-        "index": len(mappings)}}})
-    mappings += ([] if neutral else [
-        {"type": "regex", "options": {"pattern": "^.*$", "result": {
-            "text": OUT_OF_RANGE_HTML, "index": len(mappings)}}}])
+        "pattern": UNJUDGED_PATTERN, "result": {
+            "text": bar_html(GREY_FILL, "$1"), "index": len(mappings)}}})
+    mappings += band_bar_mappings(len(mappings))
+    mappings.append({"type": "regex", "options": {"pattern": "^.*$", "result": {
+        "text": OUT_OF_RANGE_HTML, "index": len(mappings)}}})
     # The cell is an encoded string, so sorting or filtering it would order
     # the encodings, not the percents.
     return [{"id": "mappings", "value": mappings},
@@ -1169,83 +1510,188 @@ def bar_cell(neutral=False, unjudged=False):
             {"id": "custom.align", "value": "center"},
             {"id": "custom.filterable", "value": False}]
 
-# CT, Rebal and Ext as one column of three dots. Grafana renders no column
-# under 50px, so three one-dot columns took 150px. The query packs the flags
-# into one number, CT x 100 + Rebal x 10 + Ext, with each digit 1 off, 2 on
-# or 3 not set (never 0, so the number never loses a leading digit), and one
-# regex mapping per combination draws the dots as HTML.
-def flag_digit(metric):
-    return (f"(max by (symbol) ({metric}) + 1 "
-            "or (max by (symbol) (liq_equity_total) * 0 + 3))")
+
+# A chain row's counter trading, rebalancing and extended hours, packed into
+# one hidden number, CT x 100 + Rebal x 10 + Ext, each digit never 0 so the
+# number keeps its leading digits. The symbol's hover reads it (ROW_TIPS).
+# Trading and rebalancing are the chain's own config; extended hours is the
+# asset's, and applies only where the chain counter trades.
+CHAIN_TRADING = "max by (symbol, chain) (liq_asset_chain_trading)"
+CHAIN_REBALANCING = "max by (symbol, chain) (liq_asset_chain_rebalancing)"
+CHAIN_FLAGS_EXPR = (
+    # CT: 2 on, 1 off.
+    f"((({CHAIN_TRADING}) > bool 0) + 1) * 100 + "
+    # Rebal: 2 enabled, 4 paused, 1 disabled.
+    f"(2 * (({CHAIN_REBALANCING}) == bool 1) "
+    f"+ 4 * (({CHAIN_REBALANCING}) == bool 0.5) "
+    f"+ (({CHAIN_REBALANCING}) == bool 0)) * 10 + "
+    # Ext: 2 on, 1 off, 3 not counter trading.
+    f"(3 * (({CHAIN_TRADING}) == bool 0) + (({CHAIN_TRADING}) == bool 1) "
+    f"+ 2 * (({CHAIN_TRADING}) == bool 2))")
 
 
-FLAGS_EXPR = (f"{flag_digit('liq_asset_counter_trading')} * 100 + "
-              f"{flag_digit('liq_asset_rebalancing')} * 10 + "
-              f"{flag_digit('liq_asset_extended_hours')}")
-FLAG_DOT = {"2": '<span style="color:#22c55e">●</span>',
-            "1": '<span style="color:#ef4444">●</span>',
-            "3": '<span style="color:#6b7280">○</span>'}
-FLAGS_CELL = [
-    {"id": "mappings", "value": [
-        {"type": "regex", "options": {"pattern": f"^{a}{b}{c}$", "result": {
-            "text": "&nbsp;".join(FLAG_DOT[d] for d in (a, b, c)),
-            "index": index}}}
-        for index, (a, b, c) in enumerate(
-            (a, b, c) for a in "123" for b in "123" for c in "123")]},
-    {"id": "custom.cellOptions", "value": {"type": "markdown"}},
-    {"id": "custom.align", "value": "center"},
-    {"id": "custom.filterable", "value": False},
-]
+# An empty cell of a USD table: the bot tracks nothing there (no wallet read
+# on the chain, no target, no vault), which a 0 would misstate.
+NOT_TRACKED = "—"
 
-# Unpriced symbols arrive as NaN (see native_inventory) and read as a dash.
+# A field kept in the frame but not drawn as a column, so a cell tooltip or
+# a sort can read it. Overrides only apply option paths the table registers:
+# custom.hideFrom.viz, not the custom.hideFrom object.
+HIDDEN_FIELD = {"id": "custom.hideFrom.viz", "value": True}
+
+
+def usd_tooltip(field):
+    """Shows `field`, a USD amount, when the pointer is on the cell."""
+    return {"id": "custom.tooltip.field", "value": field}
+
+
+# Unpriced symbols arrive as NaN (see native_inventory) and read as a dash;
+# a chain row has no value (null) and stays empty.
 NO_PRICE = {"id": "mappings", "value": [{"type": "special", "options": {
-    "match": "null+nan", "result": {"text": "—", "color": "#6b7280",
-                                    "index": 0}}}]}
+    "match": "nan", "result": {"text": "—", "color": "#6b7280",
+                               "index": 0}}}]}
 
-# Display names for the chains the bot knows (config keys). A chain not
-# listed here still gets its row and column, under its raw key.
-CHAIN_NAMES = {"base": "Base", "robinhood": "Robinhood", "hyperevm": "HyperEVM",
-               "ethereum": "Ethereum"}
-# The Equities table's chain column headers: a short one where the full name
-# would widen the column past its numbers.
-EQUITY_CHAIN_HEADERS = {**CHAIN_NAMES, "robinhood": "RH"}
-# The Equities card's inner width on the reference 1934px viewport, about
-# 950px (913px of fixed columns, before Robinhood, left Ratio under its
-# 50px), less Ratio's minimum width. check_equity_widths holds the fixed
-# columns to it with the EQUITY_MAX_CHAIN_COLUMNS widest chain columns
-# showing. A third chain column (HyperEVM beside Base and RH) does not fit:
-# every chain column is at its 74px balance floor, so a shorter header saves
-# nothing, and the table scrolls sideways until other columns are narrowed.
-EQUITY_FIXED_PX_MAX = 950 - 60
-EQUITY_MAX_CHAIN_COLUMNS = 2
+# Each venue as a small mark in its brand colour, its name on hover (the
+# cell sanitizer keeps title on img; board-tables.js shows it at once). An
+# inline SVG data URI, so the board loads nothing from elsewhere. A venue
+# without a mark keeps its name.
+MARK_SVGS = {
+    # Alpaca's logo: a white alpaca, head left, on a yellow circle, its neck
+    # running off the circle's edge (clipped to it).
+    "alpaca": ('<defs><clipPath id="c"><circle cx="8" cy="8" r="8"/></clipPath>'
+               '</defs><circle cx="8" cy="8" r="8" fill="#FCD400"/>'
+               '<g clip-path="url(#c)"><path d="M6.31 16.2V7.66C5.9 7.7 5.4 7.6 '
+               '5 7.35 4.6 7.05 4.4 6.6 4.38 6.1L4.55 5.95C4.95 5.6 5.35 5.05 5.75 '
+               '4.55 6.1 4.15 6.6 3.95 7.15 3.85L7.05 2.8C7.4 2.8 7.75 3.1 8 3.6 '
+               '8.05 3.2 8.08 2.85 8.15 2.55 8.55 2.6 8.9 2.85 9.05 3.25L9.2 4.05'
+               'C9.95 4.45 10.45 5.25 10.56 6.2L10.8 15.6V16.2Z" fill="#fff"/>'
+               '<path d="M7.08 2.85C7.3 3 7.45 3.3 7.45 3.7 7.25 3.5 7.1 3.2 7.08 '
+               '2.85Z" fill="#d0d0d0"/><path d="M8.18 2.6C8.3 2.9 8.32 3.3 8.22 '
+               '3.7 8.1 3.35 8.1 2.95 8.18 2.6Z" fill="#d0d0d0"/><path d="M6.35 '
+               '5.55H6.95C6.85 5.7 6.65 5.78 6.4 5.78 6.3 5.78 6.3 5.62 6.35 5.55Z" '
+               'fill="#c8c8c8"/></g>'),
+    "base": ('<circle cx="8" cy="8" r="8" fill="#0052FF"/>'
+             '<rect x="0" y="6.8" width="9.4" height="2.4" fill="#fff"/>'),
+    # Robinhood's three-part feather, drawn on a 1932px square and scaled
+    # to the mark's 16.
+    "robinhood": ('<circle cx="8" cy="8" r="8" fill="#CCFF00"/>'
+                  '<g transform="scale(0.0082816)" fill="#000">'
+                  '<path d="M927 597H1174Q1208 597 1208 632V962Q1208 975 1216 965'
+                  'L1375 708Q1405 668 1407 580Q1409 470 1366 432Q1335 405 1240 403'
+                  'Q1120 403 1072 443Q1000 505 923 587Q917 597 927 597Z"/>'
+                  '<path d="M879 648H1103Q1112 650 1106 658C880 905 715 1170 606 1484'
+                  'Q602 1491 593 1491H568Q561 1491 564 1483Q600 1330 672 1154V950'
+                  'Q672 890 703 853L860 657Q868 648 879 648Z"/>'
+                  '<path d="M1147 705Q1156 698 1156 710V983Q1156 994 1150 1003'
+                  'L1052 1162Q1035 1188 1002 1198L772 1270Q762 1272 765 1262'
+                  'C880 1040 1000 870 1147 705Z"/></g>'),
+    "ethereum": ('<circle cx="8" cy="8" r="8" fill="#627EEA"/>'
+                 '<path d="M8 2.2 4.6 8.1 8 10.1l3.4-2z" fill="#fff"/>'
+                 '<path d="M8 10.8 4.6 8.8 8 13.8l3.4-5z" fill="#fff" '
+                 'fill-opacity=".75"/>'),
+    "hyperevm": ('<circle cx="8" cy="8" r="8" fill="#97FCE4"/>'
+                 '<path d="M4 8c1.3-2.6 2.7-2.6 4 0s2.7 2.6 4 0" '
+                 'stroke="#072723" stroke-width="1.6" fill="none" '
+                 'stroke-linecap="round"/>'),
+}
+
+
+# A mark's size in the USD tables, one venue a row, and beside an Equities
+# chain row's indent.
+USD_MARK_PX, EQUITY_MARK_PX = 24, 18
+
+
+def mark_icon(key, title, size=EQUITY_MARK_PX, tip=True):
+    svg = MARK_SVGS.get(key)
+    if svg is None:
+        return title
+    data = base64.b64encode(
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">{svg}</svg>'
+        .encode()).decode()
+    title_attr = f'title="{title}" ' if tip else ""
+    return (f'<img src="data:image/svg+xml;base64,{data}" width="{size}" '
+            f'height="{size}" {title_attr}alt="{title}" '
+            'style="vertical-align:middle">')
+
+def row_tip(key, html):
+    """`html` with its row's flags on hover: board-tables.js reads the
+    row:<key> title (ROW_TIPS). The sanitizer keeps title on abbr."""
+    return (f'<abbr title="{ROW_TIP_PREFIX}{key}" '
+            'style="cursor:help;text-decoration:none;border:0">'
+            f'{html}</abbr>')
+
+
+# RATIO_LEFT_PX leaves Ratio a few pixels over its 60px minimum on the
+# reference 1934px viewport, where the card is about 854px wide inside, so
+# the number columns have room for big amounts.
+RATIO_LEFT_PX_MAX = 854 - 60
 # A balance column filtered by its distinct values filters nothing useful,
 # and its filter icon costs the header about 20px.
 NOT_FILTERABLE = {"id": "custom.filterable", "value": False}
+# A column that is zero nearly always (shares or USDC in flight, wallet
+# tokens) shows its zeros as a middle dot, quieter than a dash, so the few
+# real amounts stand out. A range, so a float's -0 or dust left by a sum
+# reads as zero too.
+ZERO_DASH = {"id": "mappings", "value": [{"type": "range", "options": {
+    "from": -1e-9, "to": 1e-9, "result": {"text": "\u00b7", "index": 0}}}]}
 
 
-# The Equities Ratio is Base vault / (Base vault + Alpaca), both available,
-# against the default Base target. The planner instead sizes each chain's
-# share of the total over the chains whose listing rebalances, in underlying
-# shares, against that listing's own target. The board can see the other
-# chains only on the bot source, so it judges a symbol only there: rebalanced
-# on Base, with a balance, the default target set, its Base vault read, and no
-# vault row on any other chain, empty or not (a multi-chain listing such as
-# DNUT sets its own target_share). Every other symbol is grey, no verdict.
-# The verdict can still differ from the bot's for a Base-only listing with
-# its own target_share, while a wrapper ratio is not 1, or while a transfer is
-# in flight.
-EQUITY_JUDGED = (
-    '(liq_equity_total > 0) '
-    'and on (symbol) (max by (symbol) (liq_asset_rebalancing) == 1) '
-    'and on () count(liq_settings_equity_target) '
-    'and on (symbol) max by (symbol) '
-    '(liq_equity_chain_available{chain="base"}) '
-    'unless on (symbol) max by (symbol) '
-    '(liq_equity_chain_available{chain!="base"})')
-EQUITY_RATIO = (
-    f'({pct_bar("liq_equity_ratio", ("liq_settings_equity_target", "liq_settings_equity_deviation"))}'
-    f' and on (symbol) ({EQUITY_JUDGED})) '
-    f'or ({unjudged_pct("liq_equity_ratio")} unless on (symbol) ({EQUITY_JUDGED}))')
+# Exposure in whole cents (see native_inventory), drawn as dollars with its
+# sign in front, bold and larger, and red beyond EXPOSURE_ALERT_CENTS either
+# way. A value mapping can only read a string and write text, so a regex
+# mapping per magnitude splits the cents into dollars, thousands and cents,
+# and the magnitude decides the colour: 501 cents and up is red. An unpriced
+# symbol (NaN) reads as a dash; a chain row (null) stays empty. The dollar
+# sign is &#36;: before $1, a literal one would be the replace's $$ escape.
+EXPOSURE_ALERT_CENTS = 500
+EXPOSURE_RED = "#f2495c"
+
+
+def exposure_html(sign, amount, red):
+    mark = {"": "+", "-": "\u2212"}[sign]
+    colour = f"color:{EXPOSURE_RED};" if red else ""
+    # A flex box, so the sign never wraps away from its amount (the
+    # sanitizer drops white-space).
+    return (f'<span style="display:inline-flex;align-items:baseline;'
+            f'{colour}font-weight:600">'
+            f'<b style="font-size:14px">{mark}</b>&#36;{amount}</span>')
+
+
+def exposure_mappings():
+    # (pattern for the cents after the sign, amount text, red). Three digits
+    # are one dollar digit and two cent digits, where 501 starts the red.
+    magnitudes = [
+        (r"(\d)", "0.0$1", False),
+        (r"([1-9]\d)", "0.$1", False),
+        (r"([1-4])(\d\d)", "$1.$2", False),
+        (r"(5)(00)", "$1.$2", False),
+        (r"(5)(0[1-9]|[1-9]\d)", "$1.$2", True),
+        (r"([6-9])(\d\d)", "$1.$2", True),
+        (r"([1-9]\d{1,2})(\d\d)", "$1.$2", True),
+        (r"([1-9]\d{0,2})(\d{3})(\d\d)", "$1,$2.$3", True),
+        (r"([1-9]\d{0,2})(\d{3})(\d{3})(\d\d)", "$1,$2,$3.$4", True),
+    ]
+    mappings = [
+        {"type": "regex", "options": {"pattern": "^null$",
+                                      "result": {"text": " "}}},
+        {"type": "regex", "options": {"pattern": "^NaN$", "result": {
+            "text": '<span style="color:#6b7280">\u2014</span>'}}},
+        {"type": "regex", "options": {"pattern": "^-?0$",
+                                      "result": {"text": "&#36;0.00"}}},
+    ]
+    for sign in ("", "-"):
+        for pattern, amount, red in magnitudes:
+            mappings.append({"type": "regex", "options": {
+                "pattern": f"^{sign}{pattern}$",
+                "result": {"text": exposure_html(sign, amount, red)}}})
+    for index, mapping in enumerate(mappings):
+        mapping["options"]["result"]["index"] = index
+    return mappings
+
+
+EXPOSURE_CELL = [{"id": "mappings", "value": exposure_mappings()},
+                 {"id": "custom.cellOptions", "value": {"type": "markdown"}},
+                 {"id": "custom.align", "value": "right"}, NOT_FILTERABLE]
 
 
 def native_inventory(w, x, y, heights):
@@ -1254,24 +1700,9 @@ def native_inventory(w, x, y, heights):
     alpaca_h, chains_h, equity_h = heights
     usd = lambda metric, row: (f'label_replace({metric}, "venue", "{row}", '
                                '"", "")')
-    alpaca = or_chain([
-        (usd("liq_usdc_alpaca_total", "Alpaca"), "cash"),
-        (usd("liq_usdc_alpaca_usdc", "Alpaca"), "usdc"),
-        # The reserve setting, else gross minus available cash, else Alpaca
-        # total minus available (0 when the bot ships no gross figure), as
-        # the custom card computed it.
-        (usd("(liq_settings_cash_reserved or (liq_usdc_offchain_gross "
-             "- liq_usdc_offchain_available) or (liq_usdc_alpaca_total "
-             "- liq_usdc_offchain_available))", "Alpaca"), "reserve"),
-        (usd("liq_usdc_rebalanceable", "Alpaca"), "rebalanceable"),
-        (usd("liq_usdc_offchain_inflight", "Alpaca"), "inflight"),
-        (usd(pct_bar("liq_usdc_alpaca_total / liq_usdc_total"), "Alpaca"),
-         "share"),
-        (usd("liq_usdc_total", "Alpaca"), "total"),
-    ], row_label="venue")
-    # One row per chain from the bot's per-chain series, else (the exporter
-    # source, which has none) the single Base row from the unlabelled ones.
-    # The fallback is per source, not per row: while the bot publishes
+    # One row per chain from the bot's per-chain series, else (a bot build
+    # from before them) the single Base row from the unlabelled ones. The
+    # fallback is for the whole table, not per row: while the bot publishes
     # liq_usdc_chain_available, a chain without a labelled value shows none,
     # so a chain without a corridor has no target and no ratio, and a ratio
     # the bot leaves out is not filled from the unlabelled one. Each side is
@@ -1285,32 +1716,42 @@ def native_inventory(w, x, y, heights):
     target = per_chain("liq_usdc_corridor_target", "liq_settings_usdc_target")
     deviation = per_chain("liq_usdc_corridor_deviation",
                           "liq_settings_usdc_deviation")
+    low, high = f"(({target}) - ({deviation}))", f"(({target}) + ({deviation}))"
     inside = (f"(abs(({ratio}) - ({target})) <= bool ({deviation}))")
-    # A chain's band counts only while USDC rebalancing runs on its corridor.
-    # The bot publishes liq_usdc_corridor_active. A bot build from before that
-    # flag (only staging builds of this stack) publishes each corridor's table
-    # and the single USDC band. It sets that band only for one active corridor
-    # or the primary chain's, so the fallback below needs the band: with
-    # several active corridors and none on the primary chain it greys every
-    # row. The exporter has neither and cannot tell which chain its single
-    # band is for: it is judged as the Base row while that band is set. The
-    # bot sets that band only from corridors the USDC trigger can act on (the
-    # USDC mode and that chain's cash rebalancing enabled), so while it can
-    # act on none the row shows no ratio, target or band instead of grey. On
-    # the bot source a chain with no corridor table shows no ratio, and one
-    # whose corridor is off is grey, no verdict.
-    active = ('max by (venue) (label_replace(liq_usdc_corridor_active == 1, '
-              '"venue", "$1", "chain", "(.*)")) '
-              'or (max by (venue) (label_replace(liq_usdc_corridor_target * 0 '
-              '+ 1, "venue", "$1", "chain", "(.*)")) and on () '
-              'count(liq_settings_usdc_target) unless on () '
-              'count(liq_usdc_corridor_active)) '
-              'or (max by (venue) (label_replace(liq_settings_usdc_target * 0 '
-              '+ 1, "venue", "base", "", "")) unless on () '
-              'count(liq_usdc_corridor_target))')
-    judged_ratio = (f"(({banded_pct(ratio, inside)}) and on (venue) ({active})) "
-                    f"or ({unjudged_pct(ratio)} and on (venue) ({target}) "
-                    f"unless on (venue) ({active}))")
+    # Every chain with a band is judged against it, whether or not USDC
+    # rebalancing runs on its corridor: the band is the range the chain is
+    # meant to stay in. A chain without a corridor has no band and no ratio.
+    chain_ratio = band_bar(ratio, low, high, inside)
+    # Alpaca's share of the USD total has no band of its own: each chain's
+    # ratio is vault / (vault + Alpaca cash). It is green while every chain
+    # is inside its band. Its ticks are the shares at which Alpaca's cash,
+    # with the chain vaults where they are, would put a chain outside its
+    # band: a chain leaves through its top edge once Alpaca's cash falls to
+    # vault x (1 - high) / high, and through its bottom edge once it rises
+    # to vault x (1 - low) / low. The tightest chain sets each tick. With no
+    # band on any chain, the bar is grey.
+    vault = per_chain("liq_usdc_chain_available", "liq_usdc_onchain_available")
+    cash_floor = (f"max(({vault}) * (1 - ({high})) "
+                  f"/ clamp_min(({high}), 0.000001))")
+    cash_ceiling = (f"min(({vault}) * (1 - ({low})) "
+                    f"/ clamp_min(({low}), 0.000001))")
+    others = "(max(liq_usdc_total) - max(liq_usdc_alpaca_total))"
+    alpaca_share = "(max(liq_usdc_alpaca_total) / max(liq_usdc_total))"
+    alpaca_bar = (f"({band_bar(alpaca_share, f'({cash_floor}) / (({cash_floor}) + {others})', f'({cash_ceiling}) / (({cash_ceiling}) + {others})', f'min({inside})')}) "
+                  f"or ({unjudged_pct(alpaca_share)})")
+    alpaca = or_chain([
+        (usd("liq_usdc_alpaca_total", "Alpaca"), "cash"),
+        (usd("liq_usdc_alpaca_usdc", "Alpaca"), "usdc"),
+        # The reserve setting, else gross minus available cash, else Alpaca
+        # total minus available (0 when the bot ships no gross figure), as
+        # the custom card computed it.
+        (usd("(liq_settings_cash_reserved or (liq_usdc_offchain_gross "
+             "- liq_usdc_offchain_available) or (liq_usdc_alpaca_total "
+             "- liq_usdc_offchain_available))", "Alpaca"), "reserve"),
+        (usd("liq_usdc_rebalanceable", "Alpaca"), "rebalanceable"),
+        (usd("liq_usdc_offchain_inflight", "Alpaca"), "inflight"),
+        (usd(alpaca_bar, "Alpaca"), "share"),
+    ], row_label="venue")
     chains = or_chain([
         (per_chain("liq_usdc_chain_available", "liq_usdc_onchain_available"),
          "vault"),
@@ -1320,162 +1761,318 @@ def native_inventory(w, x, y, heights):
          '"venue", "base", "", "")) or max by (venue) (label_replace('
          'liq_usdc_inflight_ethereum_wallet, "venue", "ethereum", "", ""))',
          "wallet"),
-        # pct_bar's sign encoding, with each chain's own band, while the
-        # corridor runs.
-        (judged_ratio, "ratio"),
+        (chain_ratio, "ratio"),
         (target, "target"),
         (deviation, "deviation"),
     ], row_label="venue")
+    # One row per asset (row = the symbol) and, under it, a row for Alpaca
+    # and one per chain the asset has a vault on (row = symbol/alpaca,
+    # symbol/chain). Rows sort by that key, so a chain row follows its asset.
+    # Everything comes from the inventory snapshots, so the rows are there
+    # whether or not the rebalancer can size the asset. The bot values each
+    # chain's vault in underlying shares (its wrapped shares through the
+    # wrapper ratio, plus in flight), so the chains and Alpaca add up, and
+    # publishes each venue's share of the asset (liq_equity_*_held_*).
+    asset = lambda expr: (f'label_replace({expr}, "row", "$1", "symbol", '
+                          '"(.*)")')
+    chain = lambda expr: f'label_join({expr}, "row", "/", "symbol", "chain")'
+    # Alpaca's row under each asset, beside its chains: key symbol/alpaca.
+    broker = lambda expr: (f'label_replace({expr}, "row", "$1/alpaca", '
+                           '"symbol", "(.*)")')
+    chain_available = "max by (symbol, chain) (liq_equity_chain_available)"
+    chain_inflight = "max by (symbol, chain) (liq_equity_chain_inflight)"
+    wrapper_ratio = ("(max by (symbol, chain) (liq_equity_chain_wrapper_ratio) "
+                     f"or {chain_available} * 0 + 1)")
+    broker_shares = "max by (symbol) (liq_equity_offchain_available)"
+    # Alpaca's shares in flight, 0 until the bot lists them apart.
+    broker_inflight = ("(max by (symbol) (liq_equity_offchain_inflight) "
+                       f"or {broker_shares} * 0)")
+    # The asset's every chain and Alpaca, in underlying shares; the bot's own
+    # total until a vault is read.
+    asset_total = ("(max by (symbol) (liq_equity_held_total) "
+                   "or max by (symbol) (liq_equity_total))")
+    chain_share = "max by (symbol, chain) (liq_equity_chain_held_share)"
+    # Every chain and Alpaca row, whichever column made it (the sort keys).
+    chain_rows = ("group by (symbol, chain) (liq_equity_chain_available or "
+                  "liq_equity_chain_inflight or liq_equity_chain_unwrapped or "
+                  "liq_equity_chain_wrapped or liq_equity_chain_held_share)")
+    broker_rows = ("group by (symbol) (liq_equity_offchain_available or "
+                   "liq_equity_offchain_inflight or liq_equity_offchain_held_share)")
+    broker_share = "max by (symbol) (liq_equity_offchain_held_share)"
+    # Each chain's band from the config: its target share and the one
+    # deviation. A chain with no target there has no band, so its bar is
+    # grey. Alpaca holds what the chains' targets leave, so its band is the
+    # rest of them and the same deviation (for one chain, that chain's band
+    # mirrored), and its bar is judged by it like a chain's.
+    chain_target = "max by (symbol, chain) (liq_settings_equity_chain_target)"
+    deviation = "scalar(max(liq_settings_equity_deviation))"
+    chain_inside = f"(abs({chain_share} - {chain_target}) <= bool {deviation})"
+    chain_bar = (f"({band_bar(chain_share, f'{chain_target} - {deviation}', f'{chain_target} + {deviation}', chain_inside, BAR_PART)}) "
+                 f"or ({unjudged_pct(chain_share)})")
+    broker_target = f"(1 - sum by (symbol) ({chain_target}))"
+    broker_inside = f"(abs({broker_share} - {broker_target}) <= bool {deviation})"
+    broker_bar = (f"({band_bar(broker_share, f'{broker_target} - {deviation}', f'{broker_target} + {deviation}', broker_inside, BAR_PART)}) "
+                  f"or ({unjudged_pct(broker_share)})")
+    # Underlying shares at the underlying share's price, and a wrapped token
+    # at its chain's ratio of that. Both are the last prices observed, live
+    # or not; their age is in the title (TABLE_TOTALS). Before the bot
+    # published the last prices, the live wrapped price stands in.
+    wrapped_price = ("(max by (symbol) (liq_equity_last_price_usd) "
+                     "or max by (symbol) (liq_position_last_price_usd))")
+    underlying_price = ("(max by (symbol) (liq_equity_underlying_price_usd) "
+                        f"or {wrapped_price})")
+    # group_left () before a parenthesised price, which PromQL would read as
+    # group_left's label list.
+    priced = lambda expr: f"({expr}) * on (symbol) group_left () {underlying_price}"
+    priced_wrapped = lambda expr: f"({expr}) * on (symbol) group_left () {wrapped_price}"
+    priced_chain_wrapped = lambda expr: priced(f"({expr}) * on (symbol, chain) {wrapper_ratio}")
+    # An asset's shares in flight: every chain's and Alpaca's.
+    asset_inflight = f"(sum by (symbol) ({chain_inflight}) + on (symbol) {broker_inflight})"
+    exposure = ("(max by (symbol) (liq_equity_exposure_usd) "
+                "or max by (symbol) (liq_equity_last_exposure_usd))")
+    # The wallet tokens of an asset whose chains the bot does not list yet:
+    # the Base wallet on the asset row.
+    wallet_fallback = lambda form: (
+        f"max by (symbol) (liq_equity_{form}) unless on (symbol) "
+        f"count by (symbol) (liq_equity_chain_{form})")
+    # The asset-level values the sort keys hold, one per symbol.
+    sort_values = {
+        "sort_total": asset_total,
+        "sort_total_usd": f"({priced(asset_total)})",
+        EQUITY_DEFAULT_SORT_KEY: f"abs({exposure})",
+        "sort_unwrapped": "(sum by (symbol) (liq_equity_chain_unwrapped) or "
+                          "max by (symbol) (liq_equity_unwrapped))",
+        "sort_wrapped": "(sum by (symbol) (liq_equity_chain_wrapped) or "
+                          "max by (symbol) (liq_equity_wrapped))",
+        "sort_ratio": f"(1 - {broker_share})",
+    }
     equity = or_chain([
-        (FLAGS_EXPR, "flags"),
-        # A column per chain (col onchain_<chain>) from the per-chain metric,
-        # else (the exporter source) the onchain total as the Base column.
-        ('max by (symbol, col) (label_replace(liq_equity_chain_available, '
-         '"col", "onchain_$1", "chain", "(.*)")) or (max by (symbol, col) '
-         '(label_replace(liq_equity_onchain_available, "col", "onchain_base", '
-         '"", "")) unless on () count(liq_equity_chain_available))', None),
-        ("liq_equity_inflight_total", "inflight"),
-        ("liq_equity_offchain_available", "alpaca"),
-        ("liq_equity_total", "total"),
-        # Priced symbols only: the last price from the pricing feed. The NaN
-        # fallback keeps the column on the board for unpriced symbols (a
-        # dash, see NO_PRICE), where Grafana would drop a column that has no
-        # values at all.
-        ("(liq_equity_total * on (symbol) group_left "
-         "max by (symbol) (liq_position_last_price_usd)) "
-         "or (liq_equity_total * NaN)", "total_usd"),
-        (EQUITY_RATIO, "ratio"),
-        ("liq_equity_exposure_usd or (liq_equity_total * NaN)", "exposure"),
-        ("liq_equity_unwrapped", "unwrapped"),
-        ("liq_equity_wrapped", "wrapped"),
-        # The SPA lists counter-trading assets first: the hidden sort key, 1
-        # for counter trading, else 0, unset included.
-        ("max by (symbol) (liq_asset_counter_trading) "
-         "or (max by (symbol) (liq_equity_total) * 0)", "counter_trading"),
-    ])
+        # Hidden, for the symbol's hover (ROW_TIPS): only on the chain rows
+        # a vault makes, so a chain configured without a vault read adds no
+        # row with no sort keys.
+        (chain(f"({CHAIN_FLAGS_EXPR}) and on (symbol, chain) {chain_available}"),
+         "flags"),
+        # A chain's wrapped vault shares, or Alpaca's shares.
+        (f'{chain(chain_available)} or {broker(broker_shares)}', "vault"),
+        (f'{asset(asset_inflight)} or {chain(chain_inflight)} or '
+         f'{broker(broker_inflight)}',
+         "inflight"),
+        (asset(asset_total), "total"),
+        # Priced symbols only. The NaN fallback keeps the column on the
+        # board for unpriced symbols (a dash, see NO_PRICE), where Grafana
+        # would drop a column that has no values at all.
+        (asset(f"{priced(asset_total)} or {asset_total} * NaN"), "total_usd"),
+        # When the price was quoted, for the title's age (TABLE_TOTALS).
+        (asset("max by (symbol) (liq_equity_price_observed_ts_seconds)"),
+         "price_ts"),
+        # The NaN fallback by symbol only, like the exposure: with the
+        # total's other labels, `or` keeps both and their sum is NaN.
+        (asset(f"round(100 * {exposure}) or (max by (symbol) (liq_equity_total) * NaN)"),
+         "exposure"),
+        (f'{chain("max by (symbol, chain) (liq_equity_chain_unwrapped)")} or '
+         f'{asset(wallet_fallback("unwrapped"))}',
+         "unwrapped"),
+        (f'{chain("max by (symbol, chain) (liq_equity_chain_wrapped)")} or '
+         f'{asset(wallet_fallback("wrapped"))}',
+         "wrapped"),
+        # The USD each share amount is worth, shown as its cell's tooltip.
+        (f'{chain(priced_chain_wrapped(chain_available))} or '
+         f'{broker(priced(broker_shares))}',
+         "vault_usd"),
+        (f'{asset(priced(asset_inflight))} or {chain(priced(chain_inflight))} or '
+         f'{broker(priced(broker_inflight))}',
+         "inflight_usd"),
+        (f'{chain(priced("max by (symbol, chain) (liq_equity_chain_unwrapped)"))} or '
+         f'{asset(priced(wallet_fallback("unwrapped")))}',
+         "unwrapped_usd"),
+        (f'{chain(priced_chain_wrapped("max by (symbol, chain) (liq_equity_chain_wrapped)"))} or '
+         f'{asset(priced_wrapped(wallet_fallback("wrapped")))}',
+         "wrapped_usd"),
+        (f'{chain(chain_bar)} or {broker(broker_bar)}', "ratio"),
+        # Each sort key (EQUITY_SORT_KEYS and the default's): the asset's
+        # value, which its chain and Alpaca rows take too, so they stay
+        # under it. Every row takes it, whichever series made the row: a
+        # chain with tokens in flight or in the wallet and nothing in its
+        # vault is a row too, and one without the key sorts away from its
+        # asset.
+        *((f'{asset(sort_values[key])} or {chain(chain_rows + " * 0 + on (symbol) group_left () (" + sort_values[key] + ")")} or '
+           f'{broker(f"{broker_rows} * 0 + ({sort_values[key]})")}',
+           key) for key in EQUITY_SORT_COLUMNS),
+    ], row_label="row")
     pct = [{"id": "unit", "value": "percentunit"}, {"id": "decimals", "value": 0}]
     return [
         native_table(
-            "USD · Alpaca",
-            "Alpaca's cash: no rebalance target, so it shows its share of "
-            "the USD total. The USD total is Alpaca, the primary chain's "
-            "vault and the cash in flight; other chains' vaults are not in "
-            "it. Rebalanceable = max(0, withdrawable - reserve).",
+            USD_BROKERS_TITLE,
+            "**USD at the brokers** (Alpaca) and its share of the USD the bot "
+            "balances against Base. The title's total is the brokers' cash "
+            "and USDC; cash in flight is not in it.\n"
+            "\n"
+            "- **Share of total**: Alpaca's cash against Alpaca's, Base's "
+            "vault, and all cash in flight. Robinhood's vault is not in it.\n"
+            "- **Rebalanceable**: max(0, withdrawable − reserve).\n"
+            "- **Colour**: green while every chain's USD ratio is inside its "
+            "band, red when any is outside. Alpaca has no band of its own.\n"
+            "- **Ticks**: the shares at which Alpaca's cash would push a chain "
+            "out of its band, with the chain vaults where they are. Grey when "
+            "no chain has a band.",
             alpaca, "venue",
             [("cash", "Cash", None), ("usdc", "USDC", None),
              ("reserve", "Reserve", None),
              ("rebalanceable", "Rebalanceable", None),
-             ("inflight", "In flight", None),
-             ("share", "Share of total", bar_cell(neutral=True)),
-             ("total", "USD total", None)],
+             ("inflight", "In flight", [ZERO_DASH]),
+             ("share", "Share of total", bar_cell())],
             w, alpaca_h, x, y, first_col="Venue", bars=("share",),
-            stretch="share",
-            widths={"venue": 80, "cash": 110, "usdc": 140, "reserve": 95,
-                    "rebalanceable": 140, "inflight": 95, "share": 180,
-                    "total": 120}),
+            first_col_mappings=[{"type": "value", "options": {
+                "Alpaca": {"text": mark_icon("alpaca", "Alpaca", USD_MARK_PX),
+                           "index": 0}}}],
+            first_col_html=True, first_col_align="center", stretch="share",
+            no_value=NOT_TRACKED,
+            widths={"venue": 82, "cash": 150, "usdc": 118, "reserve": 110,
+                    "rebalanceable": 170, "inflight": 160}),
         native_table(
-            "USD · Onchain",
-            "Each chain's vault and the ratio the bot rebalances on, vault "
-            "/ (vault + Alpaca cash), against the chain's band. It is not a "
-            "share of all USD: other chains are not in it. On the bot source "
-            "the ratio is grey while USDC rebalancing is off on that corridor; "
-            "the exporter source judges its one band as Base's, and shows no "
-            "ratio, target or band while USDC rebalancing is off on every "
-            "corridor. "
-            "Ethereum is the hub wallet Alpaca deposits to and withdraws "
-            "from, with no band.", chains, "venue",
-            [("vault", "Vault", None), ("inflight", "In flight", None),
+            USD_ONCHAIN_TITLE,
+            "**Each chain's USDC vault** and the ratio the bot rebalances on. "
+            "The title's total is the vaults and wallets; USDC in flight is "
+            "not in it.\n"
+            "\n"
+            "- **Ratio**: vault / (vault + Alpaca cash). Not a share of all "
+            "USD: other chains are not in it.\n"
+            "- **Ticks**: the chain's band, target ± deviation. Green inside, "
+            "red outside, whether or not USDC rebalancing runs on that "
+            "corridor.\n"
+            "- **Ethereum**: the hub wallet Alpaca deposits to and withdraws "
+            "from, with no band.\n"
+            "- Hover a mark for the chain's name.", chains, "venue",
+            [("vault", "Vault", None), ("inflight", "In flight", [ZERO_DASH]),
              ("wallet", "Wallet", None),
-             ("ratio", "Ratio", bar_cell(unjudged=True)),
-             ("target", "Target", pct), ("deviation", "±", pct)],
+             ("target", "Target", pct), ("deviation", "±", pct),
+             ("ratio", "Ratio", bar_cell())],
             w, chains_h, x, y + alpaca_h, first_col="Chain",
             first_col_mappings=[{"type": "value", "options": {
-                key: {"text": name if key != "ethereum" else "Ethereum (hub)",
+                key: {"text": (mark_icon(key, name, USD_MARK_PX)
+                               if key != "ethereum" else
+                               mark_icon(key, "Ethereum (hub)", USD_MARK_PX)),
                       "index": index}
                 for index, (key, name) in enumerate(CHAIN_NAMES.items())}}],
-            bars=("ratio",), stretch="ratio",
-            widths={"venue": 125, "vault": 110, "inflight": 95, "wallet": 85,
-                    "target": 85, "deviation": 60},
+            first_col_html=True, first_col_align="center",
+            bars=("ratio",), stretch="ratio", no_value=NOT_TRACKED,
+            widths={"venue": 82, "vault": 156, "inflight": 146, "wallet": 140,
+                    "target": 136, "deviation": 130},
             ),
         native_table(
-            "Equities",
-            "Flags: counter trading, rebalancing and extended hours, green "
-            "when on, red when off, hollow grey when not set. "
-            "Share balances per venue, one column per chain (RH is "
-            "Robinhood). Counter-trading assets come first. Total and "
-            "Total USD count only the primary chain (Base) with Alpaca and "
-            "the shares in flight: a wrapped share on another chain is "
-            "worth that chain's underlying, so the chains are not added "
-            "together. Ratio = Base vault available / (Base vault available "
-            "+ Alpaca available), green inside the default Base band and "
-            "red outside it. It is grey, with no verdict, where that is not "
-            "the bot's own band: a symbol not rebalanced on Base, with no "
-            "balance, with a vault on another chain, or with no default "
-            "target, and "
-            "every symbol on the exporter source, which cannot see the "
-            "other chains. A click on Ratio sorts by its encoded text, not by "
-            "percent. Exposure = net x live price, empty without a "
-            "price.", equity, "symbol",
-            [("flags", "Flags", FLAGS_CELL),
-             *[(f"onchain_{key}", name, [NOT_FILTERABLE])
-               for key, name in EQUITY_CHAIN_HEADERS.items()
-               if key != "ethereum"],
-             ("inflight", "Inflight", [NOT_FILTERABLE]),
-             ("alpaca", "Alpaca", [NOT_FILTERABLE]),
-             ("total", "Total", [NOT_FILTERABLE]),
+            EQUITIES_TITLE,
+            "**One row per asset**, and under it a row for Alpaca and one per "
+            "chain the asset has a vault on (the slimmer bars). The largest "
+            "exposure, long or "
+            "short, comes first; click a header to sort by it. The title's "
+            "total is Total USD over every asset.\n"
+            "\n"
+            "**Columns**\n"
+            "\n"
+            "- **Asset**: hover a symbol for its chains' flags (counter "
+            "trading, rebalancing, and extended-hours counter trading), or a "
+            "chain's mark for that chain's.\n"
+            "- **Amount**: on a chain row, the wrapped shares in that chain's "
+            "vault, so chains are not added together; on Alpaca's, its "
+            "shares.\n"
+            "- **Total, Total USD**: Alpaca and every chain in underlying "
+            "shares, with the shares in flight. For an asset the rebalancer "
+            "does not size, Alpaca and Base only.\n"
+            "- **Exposure**: net × live price, or × the last price when none "
+            "is live (the title says how old it is). Red beyond ±$5. Empty "
+            "without any price.\n"
+            "- **tStock, wtStock**: on a chain row, the unwrapped and wrapped "
+            "tokens in the bot's wallet on that chain, outside the vault. "
+            "Hover the header.\n"
+            "- Hover a share amount for its USD value.\n"
+            "\n"
+            "**Ratio**\n"
+            "\n"
+            "Every bar comes from the inventory snapshots: what each venue "
+            "holds, a chain's wrapped shares through its wrapper ratio (as the "
+            "bot last read it, else 1) and its shares in flight, against the "
+            "asset's total in underlying shares.\n"
+            "\n"
+            "- **Chain row**: its share of the asset. The ticks are its band "
+            "from the config (its target ± the deviation): green inside, red "
+            "outside, grey without a target.\n"
+            "- **Alpaca row**: Alpaca's share. Its ticks are what the chains' "
+            "targets leave, ± the deviation: green inside, red outside, grey "
+            "when no chain has a target.\n"
+            "- **Asset row**: no bar; Ratio sorts the assets by their onchain "
+            "share.\n"
+            "- **Total USD, Exposure**: at the last observed prices; the title "
+            "says when they are older than 10 minutes.", equity, "row",
+            [("flags", "Flags", [HIDDEN_FIELD]),
+             ("price_ts", "Price time", [HIDDEN_FIELD]),
+             ("vault", "Amount", [NOT_FILTERABLE, usd_tooltip("Amount USD")]),
+             ("inflight", "Inflight", [NOT_FILTERABLE, ZERO_DASH,
+                                       usd_tooltip("Inflight USD")]),
+             ("total", "Total", [NOT_FILTERABLE, usd_tooltip("Total USD")]),
              ("total_usd", "Total USD", [
                  {"id": "unit", "value": "currencyUSD"},
                  {"id": "decimals", "value": 0}, NO_PRICE, NOT_FILTERABLE]),
-             ("ratio", "Ratio", bar_cell(unjudged=True)),
-             ("exposure", "Exposure", [
-                 {"id": "unit", "value": "currencyUSD"}, NO_PRICE,
-                 NOT_FILTERABLE,
-                 {"id": "thresholds", "value": {"mode": "absolute", "steps": [
-                     {"color": "red", "value": None},
-                     {"color": "text", "value": -0.005},
-                     {"color": "green", "value": 0.005}]}},
-                 {"id": "custom.cellOptions", "value": {"type": "color-text"}}]),
-             # Left-aligned like the SPA's table, except the wrap columns.
-             ("unwrapped", "Unwrapped", [{"id": "custom.align", "value": "right"},
-                                         NOT_FILTERABLE]),
-             ("wrapped", "Wrapped", [{"id": "custom.align", "value": "right"},
-                                     NOT_FILTERABLE]),
-             ("counter_trading", "Counter trading", [HIDDEN_COLUMN])],
+             ("exposure", "Exposure", EXPOSURE_CELL),
+             # Left-aligned like the SPA's table, except the wallet
+             # columns: the tokens in the bot's Base wallet, the asset's
+             # unwrapped tStock (tAAPL) and wrapped wtStock (wtAAPL). Their
+             # headers explain them on hover (HEADER_TIPS).
+             ("unwrapped", "tStock", [
+                 {"id": "custom.align", "value": "right"}, NOT_FILTERABLE,
+                 ZERO_DASH, usd_tooltip("tStock USD")]),
+             ("wrapped", "wtStock", [
+                 {"id": "custom.align", "value": "right"}, NOT_FILTERABLE,
+                 ZERO_DASH, usd_tooltip("wtStock USD")]),
+             # Last, like every ratio on the tab (see RATIO_LEFT_PX).
+             ("ratio", "Ratio", bar_cell()),
+             *[(f"{col}_usd", f"{name} USD", [{"id": "unit", "value": "currencyUSD"}, {"id": "decimals", "value": 2},
+               HIDDEN_FIELD])
+               for col, name in (("vault", "Amount"), ("inflight", "Inflight"),
+                                 ("unwrapped", "tStock"),
+                                 ("wrapped", "wtStock"))],
+             *((key, key, None) for key in
+               EQUITY_SORT_COLUMNS)],
             w, equity_h, x, y + alpaca_h + chains_h, first_col="Asset",
+            # A chain row's key is symbol/chain: shown indented under its
+            # asset as the chain's mark. The symbol and each chain's mark
+            # show their flags on hover (ROW_TIPS); Alpaca's mark its name.
+            first_col_mappings=[
+                *({"type": "regex", "options": {
+                    "pattern": f"^([^/]+)/{key}$",
+                    "result": {"text": "\u00a0\u00a0\u21b3 " + (
+                        mark_icon(key, name) if key not in CHAIN_NAMES
+                        else row_tip("$1/" + key, mark_icon(key, name, tip=False))),
+                               "index": index}}}
+                  for index, (key, name) in enumerate(MARK_NAMES.items())),
+                {"type": "regex", "options": {
+                    "pattern": "^([^/]+)$",
+                    "result": {"text": row_tip("$1", "$1"),
+                               "index": len(MARK_NAMES)}}}],
+            first_col_html=True,
             # Asset's width fits its header's text plus the filter icon
             # (measured). The balance columns have no filter icon, so each
             # fits its header's text (the measured width less the icon) or
             # a balance, Total's 74px, whichever is wider. A column under
             # Grafana's 50px minimum renders at the minimum and would leave
             # the stretching Ratio column too wide by the difference.
-            widths={"symbol": 96, "flags": 64,
-                    # One per chain; only chains with balances show up.
-                    **{f"onchain_{key}": 74 for key in CHAIN_NAMES},
-                    "inflight": 74, "alpaca": 74, "total": 74,
-                    "total_usd": 80, "ratio": 158, "exposure": 88,
-                    "unwrapped": 98, "wrapped": 82},
-            bars=("ratio", "flags"), align="left", stretch="ratio",
-            sort_by=[{"displayName": "Counter trading", "desc": True},
-                     {"displayName": "Asset", "desc": False}]),
+            widths={"row": 110, "vault": 116,
+                    "inflight": 76, "total": 116, "total_usd": 92,
+                    "ratio": 100, "exposure": 112, "unwrapped": 82,
+                    "wrapped": 86},
+            bars=("ratio", "exposure"), align="left", stretch="ratio",
+            presort=[(EQUITY_DEFAULT_SORT_KEY, True), ("row", False)],
+            drop=tuple(EQUITY_SORT_COLUMNS)),
     ]
 
 
-# A table column kept for sorting but not drawn. Grafana 13.1.0's table
-# hides a field only on custom.hideFrom.viz. It rewrites the older
-# custom.hidden to that only when it migrates a panel saved by another
-# version, and these tables save 13.1.0, so custom.hidden would draw the
-# column (check_no_custom_hidden). A sort still sees a hidden field.
-HIDDEN_COLUMN = {"id": "custom.hideFrom",
-                 "value": {"viz": True, "legend": False, "tooltip": False}}
-
-
-# The inventory tables (8 + 9 + 35 rows) beside Trades stacked on
-# Rebalances (25 + 26). Change these heights only after checking a new set on
-# a preview board (observability/README.md says why and how).
-TRADES_H, TRANSFERS_H = 25, 26
-# USD · Alpaca gets 8 so its one row shows under the column headers: at 6 the
-# fit left it a header and a scrollbar on windows under ~1600px tall.
-panels += native_inventory(w=13, x=0, y=1, heights=(8, 9, 35))
+# The inventory tables (5 + 7 + 13 rows) beside Trades stacked on
+# Rebalances (15 + 10). The header sizes the USD tables to their rows, gives
+# Equities the rest of the window, halves the right column and levels both
+# (board-layout.js); without the dashboard scene the board keeps these.
+# Change them only after checking a new set on a preview board
+# (observability/README.md says why).
+TRADES_H, TRANSFERS_H = 15, 10
+panels += native_inventory(w=13, x=0, y=1, heights=(5, 7, 13))
 
 # A row's detail dialog is the hidden `detail` variable: a table row's link
 # sets it to the row's id, the detail panel picks that id out of the Trades
@@ -1509,8 +2106,10 @@ def detail_panel(x, y, trades_id, transfers_id):
     of data the browser already has and the dialog opens at once. The
     Dashboard datasource keeps each table's refIds, so the script picks the
     picked source's frames by name (<source>-trades, <source>-transfers).
-    On the bot source it also reads the newest 500 liq_event lines, the
-    event timeline. The queries do not use
+    It loads no event lines: a 30-day Cloud Logging read took as long as
+    the slowest table's, every time the board loaded, for a dialog most
+    loads never open. A row fetches its own events when its dialog opens
+    (row-events.js). The queries do not use
     `$detail`, so a click does not re-run them; the script reads `${detail}`,
     which makes Grafana redraw the panel when the variable changes.
     liquidity-panels/detail.js builds the dialog. renderMode "data" hands
@@ -1526,9 +2125,13 @@ def detail_panel(x, y, trades_id, transfers_id):
         mode_labels = json.load(f)["modeLabels"]
     commands = "".join(panel_module(module) + "\n" for module in (
         "client-env.js", "recovery-commands.js", "status-history.js",
-        "log-lines.js", "copy-command.js"))
+        "log-lines.js", "row-events.js", "copy-command.js"))
+    # A row fetches its own events (row-events.js) with the board's event
+    # filter.
+    row_events = {"datasource": CL, "filter": BOT_EVENTS_FILTER}
     with open(os.path.join(HERE, "liquidity-panels", "detail.js")) as f:
-        after_render = (f"const MODE_LABELS = {json.dumps(mode_labels)};\n\n"
+        after_render = (f"const MODE_LABELS = {json.dumps(mode_labels)};\n"
+                        f"const ROW_EVENTS = {json.dumps(row_events)};\n\n"
                         + commands + "\n" + f.read())
     with open(os.path.join(HERE, "liquidity-panels", "detail.css")) as f:
         styles = f.read()
@@ -1543,10 +2146,6 @@ def detail_panel(x, y, trades_id, transfers_id):
             *({"refId": ref, "panelId": panel_id, "withTransforms": False,
                "datasource": {"type": "datasource", "uid": "-- Dashboard --"}}
               for ref, panel_id in (("A", trades_id), ("B", transfers_id))),
-            # Only the bot logs its events. On the exporter source the
-            # script ignores this frame.
-            cloudlog(f'{BOT_LOG} jsonPayload.target="liq_event"',
-                     ref="bot-events"),
         ],
         "transparent": True,
         "gridPos": {"h": 1, "w": 1, "x": x, "y": y},
@@ -1571,35 +2170,27 @@ def latest_status_table(title, desc, logs, fields, shown, w, h, x, y,
     like the SPA's Trade History and Cross-venue Transfers cards (here
     Trades and Rebalances).
 
-    The exporter writes one log entry per status change (insertId
-    `<id>:<status>`), so the raw feed holds several rows per trade or
-    transfer. The plugin returns entries newest first, so groupBy on
-    jsonPayload.id with `first` keeps each entity's entry with the highest
-    timestamp. That is usually the latest status, but a status's timestamp
-    can be earlier than the one before it: a USDC bridge stamps
-    WithdrawalComplete with confirmed_at and the BridgingSubmitting after it
-    with the older initiated_at, so such a row can show withdrawing. The
-    detail dialog orders a bridge's statuses by its lifecycle instead.
     The bot writes a line per transfer status change and per terminal
-    trade status (again on a venue correction), with the same field names,
-    so the same grouping applies; its line times follow commit order.
+    trade status (again on a venue correction), so the raw feed holds
+    several rows per trade or transfer. The plugin returns entries newest
+    first, and the line times follow commit order, so groupBy on
+    jsonPayload.id with `first` keeps each entity's latest status.
 
     The id stays as the first column, an ⓘ that opens the row's detail
     dialog (see DETAIL_URL).
 
-    logs: (name, exporter query, bot query); the panel follows `source`
-      (pick_source), and the detail panel finds its frames by refId.
+    logs: (name, query) on the bot's log, read as refId bot-<name>; the
+      detail panel finds its frames by that refId.
     fields: {payload leaf: column name}; the entry's own timestamp is
-      always kept, as fields["timestamp"]. A leaf only one source writes
-      (the bot's usd) is a column on that source only.
+      always kept, as fields["timestamp"].
     shown: column names in display order.
     body_regex: an extra extractFields over the entry's JSON body, with
       named groups as new columns. Grafana only treats the pattern as a
       regex when it is wrapped in slashes; without them it silently
-      returns the whole body as one "NewField" column. The exporter's body
-      is its JSON payload; a bot line's body is its message.
-    bot_label_regex: the same columns for the bot's frame, from its labels
-      as one JSON string.
+      returns the whole body as one "NewField" column. A bot line's body
+      is its message.
+    bot_label_regex: the same columns from the line's labels, as one JSON
+      string.
     number_columns: {column: decimals}; the payload ships decimal strings.
     time_columns: string RFC3339 columns to turn into real time fields.
     sort_by: newest-first column; defaults to the entry timestamp.
@@ -1624,13 +2215,13 @@ def latest_status_table(title, desc, logs, fields, shown, w, h, x, y,
         "timeFrom": "30d",
         # The plugin takes the row limit from maxDataPoints, which Grafana
         # sets to the panel's pixel width when the panel does not set it.
-        # 500 newest entries load in about 1.5s and still leave well over
-        # the SPA's 100 rows after grouping by id.
-        "maxDataPoints": 500,
-        "targets": source_targets(*logs),
+        # The board loads a screen's entries first, then the whole history
+        # (LOG_FULL_ENTRIES, board-progressive.js): 500 took 0.5s more to
+        # draw, and nobody sees the rows past the first screen at once.
+        "maxDataPoints": LOG_FIRST_ENTRIES,
+        "targets": [cloudlog(logs[1], ref=f"bot-{logs[0]}")],
         "gridPos": {"h": h, "w": w, "x": x, "y": y},
         "transformations": [
-            pick_source(logs[0]),
             # `labels` is a JSON object per row; extractFields lifts each
             # key into its own column, dotted names kept verbatim.
             {"id": "extractFields",
@@ -1713,8 +2304,10 @@ def latest_status_table(title, desc, logs, fields, shown, w, h, x, y,
 
 
 def column(name, px, mappings=None, color_text=False):
-    # px None: the column stretches over the rest of the card.
-    properties = [{"id": "custom.width", "value": px}] if px else []
+    # px None: the column stretches over the rest of the card, down to
+    # STATUS_MIN_PX, not Grafana's 150px default, so a scaled table fits.
+    properties = ([{"id": "custom.width", "value": px}] if px
+                  else [{"id": "custom.minWidth", "value": STATUS_MIN_PX}])
     if mappings:
         properties.append({"id": "mappings", "value": mappings})
     if color_text:
@@ -1736,18 +2329,18 @@ def usd_column(px):
 
 
 panels.append(latest_status_table(
-    "Trades",
-    "Direct Raindex fills, fills routed through supported adapters such as "
-    "Bebop, and the corresponding Alpaca hedge trades placed to offset "
-    "exposure. One row per trade at its latest status; its ⓘ "
-    "opens the details. Built from the newest 500 status entries, so a "
-    "busy period can push older rows out of the 30-day window. USD, "
-    "shares times the fill price, is on the bot source only. There, Last "
-    "updated is when the bot logged the terminal status, which is later "
-    "than the fill for a fill it caught up on; the dialog shows the fill "
-    "time.",
-    ("trades", 'logName="projects/$env/logs/liquidity-trades"',
-     f'{BOT_LOG} jsonPayload.target="liq_trade"'),
+    TRADES_TITLE,
+    "**Raindex fills** (direct, or routed through adapters such as "
+    "Bebop) and the **Alpaca hedges** that offset them. One row per "
+    "trade at its latest status. Click ⓘ for details.\n"
+    "\n"
+    "- **USD**: shares × fill price.\n"
+    "- **Last updated**: when the bot logged the final status. For a "
+    "fill it caught up on, that is later than the fill; the dialog "
+    "shows the fill time.\n"
+    "- Built from the newest 500 status lines, so a busy period can "
+    "push older trades out of the 30-day window.",
+    ("trades", f'{BOT_LOG} jsonPayload.target="liq_trade"'),
     # One timestamp, first: when the row last changed status.
     fields={"timestamp": "Last updated", "symbol": "Asset", "venue": "Venue",
             "direction": "Side", "shares": "Size", "usd": "USD",
@@ -1756,29 +2349,28 @@ panels.append(latest_status_table(
     w=11, h=TRADES_H, x=13, y=1,
     number_columns={"Size": 3, "USD": 2},
     overrides=[
-        column("Last updated", 185), column("Asset", 85),
-        column("Venue", 115, VENUE_MAPPINGS, color_text=True),
-        column("Side", 75, SIDE_MAPPINGS, color_text=True),
-        column("Size", 100), usd_column(110),
+        column("Last updated", 150), column("Asset", 65),
+        column("Venue", 80, VENUE_MAPPINGS, color_text=True),
+        column("Side", 55, SIDE_MAPPINGS, color_text=True),
+        column("Size", 100), usd_column(80),
         column("Status", None, STATUS_CAP_MAPPINGS, color_text=True),
     ],
 ))
 
 panels.append(latest_status_table(
-    "Rebalances",
-    "Asset movements between venues to rebalance inventory: equity mints "
-    "(Alpaca to onchain), redemptions (onchain to Alpaca), and USDC bridges "
-    "(Base/Ethereum via CCTP). One row per transfer at its latest status; "
-    "its ⓘ opens the details. "
-    "A USDC bridge can show the previous status for a while: the exporter "
-    "stamps each status with the transfer's updatedAt, which is not always "
-    "later than the one before (bridging starts from initiated_at). "
-    "Built from the newest 500 status entries, so a busy period can push "
-    "older rows out of the 30-day window. USD, an equity transfer at its "
-    "mark when the status changed or a bridge's amount, is on the bot "
-    "source only.",
-    ("transfers", 'logName="projects/$env/logs/liquidity-transfers"',
-     f'{BOT_LOG} jsonPayload.target="liq_transfer"'),
+    REBALANCES_TITLE,
+    "**Moves between venues** to rebalance inventory: equity mints "
+    "(Alpaca → onchain), redemptions (onchain → Alpaca), and USDC "
+    "bridges (CCTP). One row per transfer at its latest status. Click ⓘ"
+    " for the full event timeline and the recovery commands.\n"
+    "\n"
+    "- **USD**: an equity transfer at its mark when the status changed,"
+    " or a bridge's amount.\n"
+    "- **Status** comes from the bot's status lines, which can lag its "
+    "events: the dialog's timeline is the newest.\n"
+    "- Built from the newest 500 status lines, so a busy period can "
+    "push older transfers out of the 30-day window.",
+    ("transfers", f'{BOT_LOG} jsonPayload.target="liq_transfer"'),
     # One timestamp, first: when the row last changed status. The start
     # time is in the row's detail dialog.
     fields={"timestamp": "Last updated", "symbol": "Asset",
@@ -1796,12 +2388,12 @@ panels.append(latest_status_table(
     w=11, h=TRANSFERS_H, x=13, y=1 + TRADES_H,
     number_columns={"Amount": 3, "USD": 2},
     overrides=[
-        column("Last updated", 185), column("Type", 165, TYPE_MAPPINGS),
+        column("Last updated", 150), column("Type", 135, TYPE_MAPPINGS),
         # A USDC bridge carries no symbol; the SPA's Asset column reads
         # "USDC" for it.
-        column("Asset", 80, [{"type": "special", "options": {
+        column("Asset", 65, [{"type": "special", "options": {
             "match": "empty", "result": {"text": "USDC", "index": 0}}}]),
-        column("Amount", 115), usd_column(110),
+        column("Amount", 88), usd_column(80),
         column("Status", None, STATUS_DOT_MAPPINGS, color_text=True),
     ],
 ))
@@ -1814,20 +2406,20 @@ panels.append(detail_panel(
 dashboards.append(make_dashboard(
     "t0-liquidity", "Liquidity bot",
     "1:1 Grafana rendering of the liquidity bot's own dashboard, fed by "
-    "the exporter sidecar on the VM. Five linked boards mimic the SPA's "
+    "the bot's metrics and log. Five linked boards mimic the SPA's "
     "tabs — use the Dashboard/Orders/PnL/Performance/Logs links above "
     "(they carry theme=light so the suite matches the SPA's look). "
     "Refresh is 1m polling, not WebSocket-live. On a relative range (the "
     "default now-24h) the header and the inventory show the live state, "
     "the last 5 minutes, and trades and transfers show the last 30 days. "
-    "An absolute range shows that range's data in every panel. Open it with "
-    "&autofitpanels (the Dashboard tab link does) to fill the window "
-    "height like the SPA. Full history and drilldowns: the IAP "
+    "An absolute range shows that range's data in every panel. The board "
+    "fills the window height like the SPA, and scrolls on a short window "
+    "or a phone. Full history and drilldowns: the IAP "
     "dashboard at https://liquidity.t0trade.com (production), or gcloud "
     "compute start-iap-tunnel <vm> 8080 "
     "--local-host-port=localhost:8080 --zone europe-west3-b "
     "--project $env (VM name = project id)",
-    panels, tab_links("Dashboard"), [ENV_VAR, SOURCE_VAR, DETAIL_VAR]))
+    panels, tab_links("Dashboard"), [ENV_VAR, DETAIL_VAR]))
 
 # ==========================================================================
 # Tab 2: Orders — the SPA's Raindex Orders table (+ ops extras).
@@ -1881,7 +2473,7 @@ panels.append(stat(
 dashboards.append(make_dashboard(
     "t0-liquidity-orders", "Liquidity bot: Orders",
     "The SPA's Orders tab.",
-    panels, tab_links("Orders"), [ENV_VAR, SOURCE_VAR]))
+    panels, tab_links("Orders"), [ENV_VAR]))
 
 # ==========================================================================
 # Tab 3: PnL — tiles, per-asset table, the four charts in SPA order.
@@ -2052,7 +2644,7 @@ dashboards.append(make_dashboard(
     "t0-liquidity-pnl", "Liquidity bot: PnL",
     "The SPA's PnL tab, tiles, table and charts all driven by the range "
     "pill; closed-lot and cost-ledger drilldowns live in the SPA.",
-    panels, tab_links("PnL"), [ENV_VAR, SOURCE_VAR, WINDOW_VAR]))
+    panels, tab_links("PnL"), [ENV_VAR, WINDOW_VAR]))
 
 # ==========================================================================
 # Tab 4: Performance — SLO cards, stage charts, health tables + the
@@ -2258,7 +2850,6 @@ errors_by_module["fieldConfig"]["overrides"].append({
         "title": "View in Logs tab",
         "url": "/d/t0-liquidity-logs/?${__url_time_range}"
                "&var-env=${env:percentencode}"
-               "&var-source=${source:percentencode}"
                "&var-target=${__value.text}&theme=light",
         "targetBlank": False,
     }]}],
@@ -2402,7 +2993,7 @@ dashboards.append(make_dashboard(
     "t0-liquidity-performance", "Liquidity bot: Performance",
     "The SPA's Performance tab, plus the pre-exporter native bot metrics "
     "as collapsed rows at the bottom.",
-    panels, tab_links("Performance"), [ENV_VAR, SOURCE_VAR, STAGE_VAR]))
+    panels, tab_links("Performance"), [ENV_VAR, STAGE_VAR]))
 
 # ==========================================================================
 # Tab 5: Logs.
@@ -2411,28 +3002,21 @@ panels = []
 panels += pills(0)
 panels.append(cloudlog_table(
     "Log History",
-    "The bot's structured log lines: on the exporter source as the "
-    "exporter re-emits them, on the bot source the bot's own JSON lines. "
+    "The bot's structured log lines. "
     "Filter with the level/category/target/search variables above. ⚠️ "
     "Only the newest matching entries, about the panel's pixel width of "
     "them. Narrow the filters, or use the SPA for deep digs. DEBUG/TRACE "
     "are not shown.",
-    'logName="projects/$env/logs/liquidity-botlogs" '
-    'labels.level=~"^(${level:pipe})$" labels.target=~"${target}" '
-    'labels.target=~"^(${category:pipe})$" '
+    # The level filter also keeps out the bot's DEBUG and TRACE lines.
+    f'{BOT_LOG} jsonPayload.level=~"^(${{level:pipe}})$" '
+    'jsonPayload.target=~"${target}" '
+    'jsonPayload.target=~"^(${category:pipe})$" '
     'jsonPayload.message=~"${search}"',
     # The message is the log-lines frame's `body`; level/target are
-    # leaves in `labels` like every other payload field. The bot's lines
-    # have the same names, so one set of columns serves both sources.
+    # leaves in `labels` like every other payload field.
     columns=[("jsonPayload.level", "Level"), ("jsonPayload.target", "Target"),
              ("body", "Message")],
-    # The level filter also keeps out the bot's DEBUG and TRACE lines,
-    # which its stdout holds and the exporter never shipped.
-    source=("logs",
-            f'{BOT_LOG} jsonPayload.level=~"^(${{level:pipe}})$" '
-            'jsonPayload.target=~"${target}" '
-            'jsonPayload.target=~"^(${category:pipe})$" '
-            'jsonPayload.message=~"${search}"'),
+    name="logs",
     w=24, h=19, x=0, y=2,
     widths={"Time": 170, "Level": 70, "Target": 220},
     mappings_by_field={"Level": [
@@ -2536,7 +3120,7 @@ dashboards.append(make_dashboard(
     "The SPA's Logs tab: level/category/target/search-filterable "
     "structured log lines.",
     panels, tab_links("Logs"),
-    [ENV_VAR, SOURCE_VAR, LEVEL_VAR, CATEGORY_VAR, TARGET_VAR, SEARCH_VAR]))
+    [ENV_VAR, LEVEL_VAR, CATEGORY_VAR, TARGET_VAR, SEARCH_VAR]))
 
 # ==========================================================================
 # Emit.
@@ -2576,36 +3160,26 @@ def board_panels(node):
         yield from board_panels(panel)
 
 
+# Every log a Cloud Logging query names.
+LOG_NAME = re.compile(r'logName\s*[=:]\s*"projects/\$env/logs/([^"]+)"')
+
+
 def log_source_problems(panel):
-    """Why a panel's Cloud Logging queries do not follow `source`, if they
-    do not. Allowed: a pair exporter-<name> and bot-<name> under
-    pick_source(<name>); the detail script's bot-events, which it reads on
-    the bot source only; and the exporter-only Orders log."""
-    targets = [target for target in panel.get("targets", [])
-               if target.get("datasource", panel.get("datasource")) == CL]
-    names = {}
+    """Why a panel's Cloud Logging queries are not the bot's, if they are
+    not. Allowed: refId bot-<name> on the bot's log, and the exporter-only
+    Orders log."""
     problems = []
-    for target in targets:
-        source, _, name = target.get("refId", "").partition("-")
-        query = target.get("queryText", "")
-        if source not in SOURCES:
-            if f"logs/{EXPORTER_ONLY_LOG}" not in query:
-                problems.append(f"refId {target.get('refId')} is not "
-                                "exporter-<name> or bot-<name>")
+    for target in panel.get("targets", []):
+        if target.get("datasource", panel.get("datasource")) != CL:
             continue
-        names.setdefault(name, set()).add(source)
-        reads_bot = query.startswith(BOT_LOG)
-        reads_exporter = any(f"logs/{log}\"" in query
-                             for log in EXPORTER_LOGS)
-        if (source == "bot") != reads_bot or (source == "bot") == reads_exporter:
-            problems.append(f"{target['refId']} reads the wrong log: {query}")
-    for name, sources in names.items():
-        if sources == set(SOURCES):
-            if (panel.get("transformations") or [None])[0] != pick_source(name):
-                problems.append(f"{name} does not start with pick_source")
-        elif not (sources == {"bot"} and name == "events"
-                  and panel["type"] == "marcusolsson-dynamictext-panel"):
-            problems.append(f"{name} has only {sorted(sources)}")
+        query = target.get("queryText", "")
+        logs = set(LOG_NAME.findall(query))
+        if logs == {EXPORTER_ONLY_LOG}:
+            continue
+        if not target.get("refId", "").startswith("bot-"):
+            problems.append(f"refId {target.get('refId')} is not bot-<name>")
+        if logs != {BOT_LOG_NAME} or not query.startswith(BOT_LOG):
+            problems.append(f"{target.get('refId')} reads another log: {query}")
     return problems
 
 
@@ -2688,12 +3262,12 @@ def check_links_keep_env(boards):
                 for panel in board_panels(board)
                 for url in panel_link_urls(panel.get("fieldConfig", {}))
                 if url.startswith("/d/") and "__url.params" not in url
-                and not ("var-env=" in url and "var-source=" in url)]
+                and "var-env=" not in url]
     for uid, title, url in failures:
         print(f"{uid}: panel {title!r}: link drops env or source: {url}",
               file=sys.stderr)
     if failures:
-        raise SystemExit(f"{len(failures)} data links drop env or source")
+        raise SystemExit(f"{len(failures)} data links drop env")
 
 
 def table_columns(panel):
@@ -2728,45 +3302,115 @@ def check_table_sorts(boards):
         raise SystemExit(f"{len(failures)} tables sort by a missing column")
 
 
-def check_equity_widths(boards):
-    """Every Equities column but Ratio has a fixed width, and with the
-    EQUITY_MAX_CHAIN_COLUMNS widest chain columns showing the fixed columns
-    leave the stretching Ratio column room (EQUITY_FIXED_PX_MAX). The budget
-    covers at most that many chain columns, not every chain at once."""
-    equities = next(panel for board in boards for panel in board_panels(board)
-                    if panel.get("title") == "Equities")
-    chains = {name for key, name in EQUITY_CHAIN_HEADERS.items()
-              if key != "ethereum"}
-    others = {"Asset", "Flags", "Inflight", "Alpaca", "Total", "Total USD",
-              "Exposure", "Unwrapped", "Wrapped"}
-    widths = {override["matcher"]["options"]: prop["value"]
-              for override in equities["fieldConfig"]["overrides"]
-              for prop in override["properties"] if prop["id"] == "custom.width"}
-    missing = (chains | others) - widths.keys()
+def check_ratio_columns(boards):
+    """Each table in the Dashboard tab's left column ends in its ratio bar,
+    every other column has a fixed width, and they add up to RATIO_LEFT_PX,
+    so the bars line up. Each table's query also carries its own row label:
+    a query that lost it (one overwritten by another, say) draws nothing."""
+    titles = {USD_BROKERS_TITLE: "Share of total", USD_ONCHAIN_TITLE: "Ratio",
+              EQUITIES_TITLE: "Ratio"}
+    if RATIO_LEFT_PX > RATIO_LEFT_PX_MAX:
+        raise SystemExit(f"RATIO_LEFT_PX {RATIO_LEFT_PX} leaves the ratio no room")
+    problems = {}
+    panels = [panel for board in boards for panel in board_panels(board)
+              if panel.get("title") in titles]
+    missing = titles.keys() - {panel["title"] for panel in panels}
     if missing:
-        raise SystemExit(f"Equities columns have no width: {sorted(missing)}")
-    widest_chains = sorted((widths[name] for name in chains),
-                           reverse=True)[:EQUITY_MAX_CHAIN_COLUMNS]
-    fixed = sum(widths[name] for name in others) + sum(widest_chains)
-    if fixed > EQUITY_FIXED_PX_MAX:
-        raise SystemExit(f"Equities fixed columns take {fixed}px with "
-                         f"{EQUITY_MAX_CHAIN_COLUMNS} chain columns, over "
-                         f"{EQUITY_FIXED_PX_MAX}px")
+        problems["missing"] = sorted(missing)
+    for panel in panels:
+        title = panel["title"]
+        organize = next(t["options"] for t in panel["transformations"]
+                        if t["id"] == "organize")
+        matrix = next(t["options"] for t in panel["transformations"]
+                      if t["id"] == "groupingToMatrix")
+        hidden = {override["matcher"]["options"]
+                  for override in panel["fieldConfig"]["overrides"]
+                  for prop in override["properties"]
+                  if prop["id"] == "custom.hideFrom.viz"}
+        order = sorted(organize["indexByName"], key=organize["indexByName"].get)
+        shown = [organize["renameByName"].get(name, name) for name in order
+                 if name not in organize.get("excludeByName", {})]
+        shown = [name for name in shown if name not in hidden]
+        widths = {override["matcher"]["options"]: prop["value"]
+                  for override in panel["fieldConfig"]["overrides"]
+                  for prop in override["properties"]
+                  if prop["id"] == "custom.width"}
+        if shown[-1] != titles[title]:
+            problems[title] = f"ends in {shown[-1]}"
+        elif set(shown[:-1]) - widths.keys():
+            problems[title] = f"no width: {sorted(set(shown[:-1]) - widths.keys())}"
+        elif sum(widths[name] for name in shown[:-1]) != RATIO_LEFT_PX:
+            problems[title] = (f"{sum(widths[name] for name in shown[:-1])}px "
+                               f"before the ratio")
+        elif f'"{matrix["rowField"]}"' not in panel["targets"][0]["promQLQuery"]["expr"]:
+            problems[title] = f"query has no {matrix['rowField']} label"
+    if problems:
+        raise SystemExit(f"left column ratios do not line up: {problems}")
+
+
+def check_scale_groups(boards):
+    """Each scale group's fixedPx is the sum of the fixed column widths of
+    every table in it, so the scaling fits the columns it shrinks."""
+    by_title = {panel.get("title"): panel for board in boards
+                for panel in board_panels(board)}
+    problems = []
+    for group in SCALE_GROUPS:
+        for title in group["panels"]:
+            panel = by_title.get(title)
+            if panel is None:
+                problems.append(f"{group['id']}: no panel {title!r}")
+                continue
+            fixed = sum(prop["value"]
+                        for override in panel["fieldConfig"]["overrides"]
+                        for prop in override["properties"]
+                        if prop["id"] == "custom.width")
+            if fixed != group["fixedPx"]:
+                problems.append(f"{title}: fixed widths {fixed}, the "
+                                f"{group['id']} group says {group['fixedPx']}")
+            hide = group.get("compactHide", {}).get(title, [])
+            widths = {override["matcher"]["options"]: prop["value"]
+                      for override in panel["fieldConfig"]["overrides"]
+                      for prop in override["properties"]
+                      if prop["id"] == "custom.width"}
+            if set(hide) - widths.keys():
+                problems.append(f"{title}: hides unknown columns "
+                                f"{sorted(set(hide) - widths.keys())} on a phone")
+            phone_widths = {name: values.get("custom.width", widths.get(name))
+                            for name, values in group.get("compactColumns", {}).items()}
+            if set(phone_widths) - widths.keys():
+                problems.append(f"{title}: changes unknown columns "
+                                f"{sorted(set(phone_widths) - widths.keys())} on a phone")
+            phone = sum(phone_widths.get(name, px) for name, px in widths.items()
+                        if name not in hide)
+            if phone > group.get("compactFixedPx", group["fixedPx"]):
+                problems.append(f"{title}: {phone}px on a phone, over the "
+                                f"group's {group.get('compactFixedPx')}")
+    if problems:
+        raise SystemExit(f"scale groups do not match their tables: {problems}")
 
 
 def check_after_render_scripts(boards):
     """An afterRender script is not a module, so an export line left in it
-    (see panel_module) breaks the whole panel."""
-    failures = [(board["uid"], panel.get("title"))
-                for board in boards
-                for panel in board_panels(board)
-                if any(line.startswith("export ") for line in panel.get(
-                    "options", {}).get("afterRender", "").splitlines())]
-    for uid, title in failures:
-        print(f"{uid}: panel {title!r}: afterRender has an export line",
+    (see panel_module) breaks the whole panel. Its modules share one scope,
+    so a name two of them declare at the top level breaks it too."""
+    failures = []
+    for board in boards:
+        for panel in board_panels(board):
+            script = panel.get("options", {}).get("afterRender", "")
+            if any(line.startswith("export ") for line in script.splitlines()):
+                failures.append((board["uid"], panel.get("title"),
+                                 "has an export line"))
+            names = re.findall(r"^(?:const|let|var|function|class)\s+(\w+)",
+                               script, re.M)
+            twice = sorted({name for name in names if names.count(name) > 1})
+            if twice:
+                failures.append((board["uid"], panel.get("title"),
+                                 f"declares {', '.join(twice)} twice"))
+    for uid, title, problem in failures:
+        print(f"{uid}: panel {title!r}: afterRender {problem}",
               file=sys.stderr)
     if failures:
-        raise SystemExit(f"{len(failures)} afterRender scripts export")
+        raise SystemExit(f"{len(failures)} afterRender scripts are broken")
 
 
 def board_path(root, board):
@@ -2857,86 +3501,128 @@ def check_pin_liq():
 
 
 def bar_cell_shows(cell, value):
-    """(fill, percent) that a bar cell's first matching regex mapping draws
-    for `value` as Grafana passes it, the number's string form. A cell with
-    no percent gives its text in place of the percent."""
+    """What a bar cell's first matching regex mapping draws for `value` as
+    Grafana passes it, the number's string form: (fill, percent, low tick,
+    high tick), each tick in percent and None on a bar without ticks. A cell
+    with no percent gives its text in place of the percent. Grafana fills
+    the mapping's text with JavaScript's replace, where a group that did not
+    take part writes nothing."""
     mappings = next(o["value"] for o in cell if o["id"] == "mappings")
     for mapping in mappings:
         match = re.fullmatch(mapping["options"]["pattern"], value)
         if match:
-            html = match.expand(mapping["options"]["result"]["text"]
-                                .replace("$1", r"\1"))
-            fill = re.search(r"90deg, (rgba\([^)]*\))", html)
-            text = (re.search(r">([^<]*)%</div>", html)
+            html = re.sub(r"\$(\d)", lambda ref: match.group(int(ref.group(1))) or "",
+                          mapping["options"]["result"]["text"])
+            fill = re.search(r"90deg, (rgba?\([^)]*\))", html)
+            ticks = [f"{int(tenths) / 10:g}" for tenths in re.findall(
+                r"currentColor calc\((\d+)% / 10 - 1px\)", html)]
+            text = (re.search(r">([^<]*)%</span></div>", html)
                     or re.search(r">([^<]*)</div>", html))
+            judged = fill and fill.group(1) in (GREEN_FILL, RED_FILL)
+            height = re.search(r"height:(\d+)px", html)
             return (fill.group(1) if fill else None,
-                    text.group(1) if text else None)
+                    text.group(1) if text else None,
+                    *(ticks if ticks else (None, None)),
+                    *((int(height.group(1)),) if judged else ()))
     return None
 
 
 def check_bar_cells():
-    """The banded and unjudged encodings draw the colour and percent they
-    mean, for values with and without float noise, and anything outside
-    them reads "out of range". CI runs this on --check."""
-    green, red = "rgba(34,197,94,0.6)", "rgba(239,68,68,0.6)"
-    out_of_range = (None, "out of range")
-    cell = bar_cell(unjudged=True)
+    """band_bar and unjudged_pct values draw the colour, percent and ticks
+    they mean, and anything outside them reads "out of range". CI runs this
+    on --check."""
+    out_of_range = (None, "out of range", None, None)
+    grey = lambda pct: (GREY_FILL, pct, None, None)
+    green = lambda *texts, height=20: (GREEN_FILL, *texts, height)
+    red = lambda *texts, height=20: (RED_FILL, *texts, height)
+    cell = bar_cell()
+    no_edges = f"{NO_EDGE}" * 2
     cases = {
-        "45.5001": (green, "45.5"), "100.0001": (green, "100"),
-        "0.0001": (green, "0"), "45.5000999999999": (green, "45.5"),
-        "-45.5001": (red, "45.5"), "-0.0001": (red, "0"),
-        "-100.0001": (red, "100"),
-        "1045.5001": (GREY_FILL, "45.5"), "1000.0001": (GREY_FILL, "0"),
-        "1100.0001": (GREY_FILL, "100"), "1005.0001": (GREY_FILL, "5"),
-        "1010.0001": (GREY_FILL, "10"), "1000.5001": (GREY_FILL, "0.5"),
-        "1045.5000999999999": (GREY_FILL, "45.5"),
+        "1062805500650": green("62.8", "55", "65"),
+        "-1062805500650": red("62.8", "55", "65"),
+        "1050004500550": green("50", "45", "55"),
+        "-1000504751000": red("0.5", "47.5", "100"),
+        "1100000000000": green("100", "0", "0"),
+        "1000000000000": green("0", "0", "0"),
+        "-1000900100025": red("0.9", "1", "2.5"),
+        f"10747{no_edges}": green("74.7", None, None),
+        f"-10831{no_edges}": red("83.1", None, None),
+        # A sum writes Σ before its percent; a part is the slim bar.
+        f"20747{no_edges}": green("Σ 74.7", None, None),
+        f"-20831{no_edges}": red("Σ 83.1", None, None),
+        "3038103500450": green("38.1", "35", "45", height=13),
+        "-3028003500450": red("28", "35", "45", height=13),
+        "4062805500650": out_of_range,
+        "1045.5": grey("45.5"), "1000": grey("0"), "1100": grey("100"),
+        "1005": grey("5"), "1010": grey("10"), "1000.5": grey("0.5"),
+        "1045.5000000000002": grey("45.5"),
         # A negative or above-one ratio: the encodings send it to
-        # OUT_OF_RANGE, and what an encoding without that guard made of it
-        # (an unjudged -10% was 990.0001, a judged -10% inside the band
-        # -9.9999) never draws a percent bar the encoding did not mean.
-        str(OUT_OF_RANGE): out_of_range, "990.0001": out_of_range,
-        "-110.0001": out_of_range, "110.0001": out_of_range,
-        "1200.0001": out_of_range, "1990.0001": out_of_range,
-        "-990.0001": out_of_range,
-        # Trailing digits count only after a dot, so a whole number above
-        # 100 is not read as a percent ("1001" is the unjudged 1% here; a
-        # banded cell reads it as out of range, checked below).
-        "5001": out_of_range, "990": out_of_range, "-1001": out_of_range,
+        # OUT_OF_RANGE, and a value no encoding makes never draws a bar.
+        str(OUT_OF_RANGE): out_of_range, "990": out_of_range,
+        "1200": out_of_range, "1990.5": out_of_range,
+        "1100100000000": out_of_range, "1050010010000": out_of_range,
+        "1050099990550": out_of_range, "5062805500650": out_of_range,
+        "106280550065": out_of_range, "62.8": out_of_range,
+        "-62.8": out_of_range,
     }
     wrong = {value: (bar_cell_shows(cell, value), want)
              for value, want in cases.items()
              if bar_cell_shows(cell, value) != want}
-    # Cells without the unjudged mapping keep their two colours.
-    if bar_cell_shows(bar_cell(), "100.0001") != (green, "100"):
-        wrong["banded 100.0001"] = bar_cell_shows(bar_cell(), "100.0001")
-    if bar_cell_shows(bar_cell(), "1045.5001") != out_of_range:
-        wrong["banded 1045.5001"] = bar_cell_shows(bar_cell(), "1045.5001")
-    if bar_cell_shows(bar_cell(), "1001") != out_of_range:
-        wrong["banded 1001"] = bar_cell_shows(bar_cell(), "1001")
-    for neutral_value, want in {"45.5": (GREY_FILL, "45.5"),
-                                str(OUT_OF_RANGE): out_of_range}.items():
-        if bar_cell_shows(bar_cell(neutral=True), neutral_value) != want:
-            wrong[f"neutral {neutral_value}"] = bar_cell_shows(
-                bar_cell(neutral=True), neutral_value)
     # Every encoding guards its ratio with in_range, so a ratio outside
     # [0, 1] reaches the cell as OUT_OF_RANGE.
     bounded = "(((ratio) >= 0) <= 1)"
     guarded = (f") and {bounded}) or ((clamp((ratio), 0, 0) + "
                f"{OUT_OF_RANGE}) unless {bounded}))")
     for name, encoded in {
-            "banded_pct": banded_pct("ratio", "inside"),
-            "unjudged_pct": unjudged_pct("ratio"),
-            "pct_bar": pct_bar("ratio"),
-            "pct_bar banded": pct_bar("ratio", ("target", "deviation"))}.items():
+            "band_bar": band_bar("ratio", "low", "high", "inside"),
+            "band_bar without ticks": band_bar("ratio", None, None, "inside"),
+            "unjudged_pct": unjudged_pct("ratio")}.items():
         if not encoded.endswith(guarded):
             wrong[f"{name} out of range"] = encoded
     if wrong:
         raise SystemExit(f"bar cell mappings draw the wrong bar: {wrong}")
 
 
+def check_exposure_cell():
+    """Exposure cents draw as a signed dollar amount, red beyond
+    EXPOSURE_ALERT_CENTS either way. CI runs this on --check."""
+    def shows(value):
+        mappings = next(o["value"] for o in EXPOSURE_CELL if o["id"] == "mappings")
+        for mapping in mappings:
+            match = re.fullmatch(mapping["options"]["pattern"], value)
+            if match:
+                html = re.sub(r"\$(\d)", lambda ref: match.group(int(ref.group(1))) or "",
+                              mapping["options"]["result"]["text"])
+                text = re.sub(r"<[^>]*>", "", html).replace("&#36;", "$")
+                return text, EXPOSURE_RED in html
+        return None
+    cases = {
+        "0": ("$0.00", False), "-0": ("$0.00", False),
+        "5": ("+$0.05", False), "-42": ("\u2212$0.42", False),
+        "450": ("+$4.50", False), "-500": ("\u2212$5.00", False),
+        "500": ("+$5.00", False), "501": ("+$5.01", True),
+        "-501": ("\u2212$5.01", True), "-599": ("\u2212$5.99", True),
+        "600": ("+$6.00", True), "1000": ("+$10.00", True),
+        "-123456": ("\u2212$1,234.56", True),
+        "123456789": ("+$1,234,567.89", True),
+        "NaN": ("\u2014", False), "null": (" ", False),
+    }
+    wrong = {value: (shows(value), want) for value, want in cases.items()
+             if shows(value) != want}
+    if wrong:
+        raise SystemExit(f"exposure cell draws the wrong amount: {wrong}")
+
+
+def check_row_tints():
+    """Every venue with a mark has a row tint, under the mark's name."""
+    if set(MARK_ROW_TINTS) != set(MARK_NAMES.values()):
+        raise SystemExit(f"MARK_ROW_TINTS {sorted(MARK_ROW_TINTS)} do not name "
+                         f"the venues {sorted(MARK_NAMES.values())}")
+
+
 def check_no_custom_hidden(boards):
     """No table saved as 13.1.0 hides a column with custom.hidden, which
-    that version draws (see HIDDEN_COLUMN)."""
+    that version draws (see native_table's presort and drop)."""
     failures = [(board["uid"], panel.get("title"))
                 for board in boards
                 for panel in board_panels(board)
@@ -3001,14 +3687,17 @@ def check_lag_age_states(boards):
 
 check_pin_liq()
 check_bar_cells()
+check_exposure_cell()
+check_row_tints()
 check_lag_age_states(dashboards)
 check_liq_pinned(dashboards)
 check_log_sources(dashboards)
 check_series_names(dashboards)
 check_links_keep_env(dashboards)
 check_table_sorts(dashboards)
-check_equity_widths(dashboards)
+check_ratio_columns(dashboards)
 check_no_custom_hidden(dashboards)
+check_scale_groups(dashboards)
 check_after_render_scripts(dashboards)
 if sys.argv[1:] == ["--check"]:
     check_committed(dashboards)

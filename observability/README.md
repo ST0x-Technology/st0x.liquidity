@@ -27,17 +27,14 @@ The Liquidity bot board and its four tab boards are generated: edit
 Do not edit those files by hand or replace them with a Grafana export; the next
 run of the generator overwrites them.
 
-The liquidity boards read `liq_*` from one source at a time, picked by the
-`Source` variable: the exporter sidecar (`job="t0-liquidity-exporter"`, the
-default) or the bot's own `/metrics` (`t0-liquidity` in production,
-`t0-liquidity-staging` in staging). The generator writes `job=~"$source"` into
-every `liq_` selector and fails on one without it, because an unpinned selector
-adds both sources together. The log panels (Trades, Rebalances, the detail
-dialog, Logs) follow `Source` too: the exporter's log names, or the bot's own
-log, `liquidity-bot`, which holds rows once the bot logs JSON. Each such panel
-queries both logs and keeps the picked source's frame, and the generator fails
-on one that does not. `bot` is the default (`SOURCE_VAR` in the generator). See
-`docs/observability.md`, "Board source".
+The liquidity boards read the bot only: its `liq_*` gauges from its own
+`/metrics` (scrape job `t0-liquidity` in production, `t0-liquidity-staging` in
+staging, the same as the project `Environment` picks) and its own log,
+`liquidity-bot`. The generator writes `job="$env"` into every `liq_` selector
+and fails on one without it, because the exporter sidecar can still serve the
+same names. Every log panel reads the bot's log as refId `bot-<name>`, except
+Orders, which reads the exporter's `liquidity-orders` log because the bot writes
+no order lines; the generator fails on any other log query.
 
 The header row is a Business Text panel (`marcusolsson-dynamictext-panel`): its
 JavaScript and CSS live in `liquidity-panels/`, and the generator inlines them
@@ -64,42 +61,48 @@ real CLI, and every shown offline `stox` command to
 classifies. Run `bunx vitest run -u` in `dashboard/` after a command changes.
 The test runs in the dashboard build of CI.
 
-The Dashboard tab's inventory is three Grafana tables, for their column filters:
-USD at Alpaca, USD on each chain, and Equities. Per-chain rows (USD · Onchain)
-and columns (Equities) come from the bot's `chain`-labelled series
-(`liq_usdc_chain_*`, `liq_usdc_corridor_*`, `liq_equity_chain_available`; the
-board does not read `liq_equity_chain_inflight` yet). The exporter does not
-publish them, so with `Source` on `exporter` the tables show the single Base row
-and column from the unlabelled series. The fallback is per source: while the bot
-publishes per-chain series, a chain without a labelled value shows none. The
-Equities Ratio is coloured only where it is the bot's own band verdict (a symbol
-rebalanced on Base, with a balance, with no vault on another chain, while the
-default Base target is set), so it is grey on the `exporter` source, which
-cannot see the other chains. A ratio outside 0 to 100% reads "out of range".
-Counter-trading assets come first, like the SPA, through a hidden sort column.
-The Equities column widths fit the card on a 1934px-wide window with at most two
-chain columns showing (Base and RH). A third, such as HyperEVM, makes the table
-scroll sideways; the generator's `check_equity_widths` holds only that
-two-column budget.
+The Dashboard tab's inventory is three Grafana tables: USD at the brokers
+(Alpaca), USD on each chain, and Equities, each with its total in USD after its
+title (`board-totals.js`, the balances held, in flight left out). USD · Onchain
+has a row per chain from the bot's `chain`-labelled series (`liq_usdc_chain_*`,
+`liq_usdc_corridor_*`). Equities has a row per asset and, under it, a row for
+Alpaca and one per chain the asset has a vault on (`liq_equity_chain_*`), keyed
+`symbol/alpaca` and `symbol/chain` so the rows sort into a tree. Grafana's own
+sort would break the tree, so the header sorts Equities itself
+(`board-tables.js`): each sortable column has a hidden key that a chain row
+takes from its asset, and a click sorts by it and then by row. The default order
+is the largest exposure first, long or short.
+
+Each table ends in a ratio bar, green inside its band and red outside, with a
+tick at each band edge. A table cell can only style its own value, so the query
+packs the percent, both edges and the verdict into one number (`band_bar` in the
+generator) and regex value mappings draw it. The other columns of the three
+tables add up to `RATIO_LEFT_PX`, so the bars line up one above the other. Venue
+and chain names are small brand marks (`MARK_SVGS`), and each venue's rows take
+a tint of its colour.
 
 Trades and Rebalances are Grafana tables too. A row's ⓘ sets the hidden `detail`
 variable to the row's id; the `detail` panel, a second Business Text panel in
 the header row's last column, then opens that row's dialog. It reads the two
 tables' results through the Dashboard datasource, so a click runs no new query
-and the dialog opens at once. The dialog shows the row's status history
-(`status-history.js`), or on the bot source the row's event timeline from the
-bot's `liq_event` lines (`log-lines.js`). Closing the dialog clears the
-variable.
+and the dialog opens at once. The dialog shows the row's event timeline from the
+bot's `liq_event` lines (`log-lines.js`). The board loads none of those, a slow
+read at every load for a dialog most loads never open: each row fetches its own
+when its dialog opens (`row-events.js`), over its own span. Closing the dialog
+clears the variable.
 
-Keep the Dashboard tab's panel heights (`TRADES_H`, `TRANSFERS_H` and the
-`native_inventory` heights in the generator) unless you check a new set on a
-preview board: reload it at a few window heights and confirm both columns end
-level and every table shows its rows. The tab link opens the board with
-`autofitpanels`, which scales and rounds every height, keeps the result, and
-fits it again on the next render. Whenever one column rounds a row taller than
-the window, the next pass shrinks everything again and the other column loses a
-row per pass. Most height sets do that on some window size; the current ones do
-not, for windows of 18 to 45 rows.
+The Dashboard tab fits the window itself (`board-layout.js`): the USD tables
+take the rows they draw, Equities the rest, and Trades and Rebalances half the
+right column each, both columns ending level at the window's bottom. A window
+too short to give Equities a few rows (a small laptop) gets them anyway, and the
+page scrolls. Grafana's `autofitpanels` would squeeze every panel into one
+screen however short, so the header takes it off a link that has it. On a phone
+the panels stack, inventory first, and a table too narrow for every column shows
+its compact set (`board-scale.js`). It reaches the layout through
+`window.__grafanaSceneContext`, which Grafana exposes for debugging; without it
+the board keeps the generator's heights. Keep those (`TRADES_H`, `TRANSFERS_H`
+and the `native_inventory` heights) unless you check a new set on a preview
+board at a few window sizes.
 
 `alerting/liquidity.rules.yml` is the alert rules, in the `Alerts` folder. Each
 rule's `uid` is permanent and must be unique across every repo's file. Removing
