@@ -1,6 +1,6 @@
 // The detail dialog's status history: a Trades or Rebalances row's status-log
 // entries in order, and the status the row is at. The generator prepends this
-// file to detail.js; dashboard/src/lib/transfer-board.test.ts imports it as a
+// file to detail.js; observability/tests/recovery.test.ts imports it as a
 // module through the export line, which the generator drops.
 
 // A USDC bridge's in-flight statuses in lifecycle order per direction. Their

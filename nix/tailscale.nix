@@ -1,8 +1,8 @@
 # Tailscale stack for the deployed hosts: enrolls the node onto our
 # tailnet via a per-environment agenix-encrypted auth key, opens the
 # WireGuard port + marks `tailscale0` as a trusted firewall interface,
-# and provisions a Tailscale-issued HTTPS certificate that nginx
-# serves the dashboard from.
+# and provisions a Tailscale-issued HTTPS certificate for the nginx
+# vhost.
 #
 # The `tailscale-cert` oneshot provisions the initial certificate and
 # remains active so later NixOS switches do not call the certificate API.
@@ -73,8 +73,8 @@ in
       # new unit starts, causing a crash-loop.
       tailscaled.serviceConfig.ExecStartPre = [ "-${pkgs.iproute2}/bin/ip link delete tailscale0" ];
 
-      # Provision a Tailscale-issued TLS certificate so the dashboard is
-      # served over HTTPS. Runs before nginx to guarantee cert files exist.
+      # Provision a Tailscale-issued TLS certificate so nginx serves over
+      # HTTPS. Runs before nginx to guarantee cert files exist.
       tailscale-cert = {
         description = "Provision Tailscale HTTPS certificate for ${tailscaleMagicDnsName}";
         after = [ "tailscaled.service" ];

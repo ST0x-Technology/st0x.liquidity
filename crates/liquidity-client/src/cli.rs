@@ -1398,8 +1398,8 @@ mod tests {
         }
     }
 
-    /// Every client command the SPA and the board show, written by
-    /// `dashboard/src/lib/transfer-board.test.ts`.
+    /// Every client command the board shows as text, written by
+    /// `observability/tests/recovery.test.ts`.
     const SHOWN_COMMANDS: &str = include_str!("../testdata/shown-commands.txt");
 
     /// A value for each `<name>` placeholder in a shown command. A new
@@ -1552,7 +1552,7 @@ mod tests {
         );
     }
 
-    /// The SPA and the board show recovery commands as text. A command whose
+    /// The board shows recovery commands as text. A command whose
     /// verb, flag, or value this client no longer accepts fails here, in both
     /// environments.
     #[test]

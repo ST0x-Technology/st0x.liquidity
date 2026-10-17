@@ -140,8 +140,9 @@ When equities are configured, `[pricing].ws_url` and the encrypted
 `[pricing].api_key` are also required. Remote endpoints must use `wss://`;
 plaintext `ws://` is limited to `st0x-pricing` and loopback. The server
 subscribes to the pricing service's Raindex `wt<symbol>` stream for
-dashboard-only USD values; an outage leaves those values unavailable without
-stopping hedging or falling back to a trade fill.
+reference-only USD values (the board and the `liq_*` prices); an outage leaves
+those values unavailable without stopping hedging or falling back to a trade
+fill.
 
 The `[chains.<name>.trading]` table requires an explicit `inventory_mode`
 (`"legacy"` or `"managed"`) and a `vault_owner` address (the on-chain owner the
@@ -367,10 +368,10 @@ metric. Scan-time transient and rate-limited preflight failures instead wait for
 
 ## Deployment
 
-The liquidity bot, dashboard, and datasette run as OCI containers on a Google
-Compute Engine VM. Nix builds the container images reproducibly; the VM pulls
-its own deploy state and runs them. Staging and production are separate GCP
-projects.
+The liquidity bot, the dashboard proxy, and datasette run as OCI containers on a
+Google Compute Engine VM. Nix builds the container images reproducibly; the VM
+pulls its own deploy state and runs them. Staging and production are separate
+GCP projects.
 
 ### Architecture
 
@@ -386,7 +387,9 @@ Artifact Registry (europe-west3-docker.pkg.dev/t0-artifacts/t0-liquidity)
 GCE VM (roll timer polls images.env, verifies the liquidity-image
 attestation, then restarts the container stack)
   - bot         (server binary; also ships /bin/st0x-cli for operators)
-  - dashboard   (nginx serving the SvelteKit build, proxies the API to bot:8001)
+  - dashboard   (nginx: proxies the ops API prefixes /liquidity-read/,
+                 /liquidity-debug/, and /liquidity-capital/ to bot:8001 and
+                 redirects / to the Grafana board)
   - datasette   (SQLite database explorer)
   - exporter    (metrics; image managed by t0.devops terraform)
 ```
@@ -477,7 +480,8 @@ nix run .#deployAll   # first deployment
 ### CI/CD
 
 - **CI** (`.github/workflows/ci.yaml`): builds the packages, runs tests and
-  clippy inside Nix derivations, and builds the dashboard. It never reaches a
+  clippy inside Nix derivations, and runs the `dashboard tests` job (the Grafana
+  board script tests and the Turnkey message utility). It never reaches a
   deployed machine. Runs on pull request activity and pushes to `master`.
 - **CD** (`.github/workflows/build-oci.yml`): on every push to `master`, builds
   the OCI images with Nix, pushes them to Artifact Registry, signs the Binary
@@ -517,12 +521,15 @@ nix develop .#ci-backend -c cargo clippy --workspace --all-targets --all-feature
 
 `nix run .#simulate` launches the full-system chaos eventual-consistency e2e
 test (`full_system_concurrent`) with [mprocs](https://github.com/pvolok/mprocs)
-running the dashboard and bot side-by-side. Trades fire in randomized order with
-delayed broker fills; between rounds the test injects chaos (bot restarts, NAV
-bumps, asset add/remove, broker latency) and then asserts hedging, mint, and
-USDC rebalancing still converge. Open `http://localhost:5173` to watch the
-dashboard while it runs. Set `SIMULATE_EXIT_AFTER_CHAOS=1` to exit once
-assertions pass instead of idling for dashboard inspection.
+running the bot, the mock REST API, and datasette side-by-side. Trades fire in
+randomized order with delayed broker fills; between rounds the test injects
+chaos (bot restarts, NAV bumps, asset add/remove, broker latency) and then
+asserts hedging, mint, and USDC rebalancing still converge. The simulation does
+not start a web UI or Grafana. The first line it prints lists the ports it
+picked: the bot's REST API (`8001` by default), the mock REST API, and datasette
+(`8200` by default). Browse the database in datasette or query the bot's REST
+API while it runs. Set `SIMULATE_EXIT_AFTER_CHAOS=1` to exit once assertions
+pass instead of idling for inspection.
 
 `nix run .#simulate-market` runs the infinite market simulation instead —
 continuous user trades at ~10-second intervals. Use this when you want to
@@ -531,15 +538,14 @@ scenario.
 
 `nix run .#simulate-14d` starts the same stack as `simulate-market`, but
 preloads 14 days of seeded hedge-latency, mint, redemption, and USDC-rebalance
-history so Performance tab trends and the Transfers panel are populated
-immediately.
+history so the performance and transfer history reads (and the matching
+datasette tables) show trends immediately.
 
 `nix run .#simulate-trade-outcomes` starts the same stack as `simulate-market`,
 but rotates every counter-trade through the three outcomes the trade history
-renders: filled, rejected by the broker, and cancelled by the broker after a
-partial fill. Use it to inspect the Status column, the venue/asset/time-range
-filters, and the accepted/filled/unfilled breakdown in the detail panel without
-waiting for a real failure.
+reports: filled, rejected by the broker, and cancelled by the broker after a
+partial fill. Use it to inspect the `/trades` outcomes and the
+accepted/filled/unfilled breakdown without waiting for a real failure.
 
 `nix run .#simulate-failures` starts the same stack as `simulate-market`, then
 creates failed mint and redemption rebalances whose mock Alpaca provider later
@@ -552,20 +558,17 @@ What `simulate-market` does:
 3. Creates Raindex liquidity orders — one buy and one sell per symbol (AAPL,
    TSLA) — all sharing a single USDC vault, with per-symbol equity vaults
 4. Starts the bot (hedging, equity rebalancing, USDC bridging all enabled)
-5. Starts the dashboard dev server
+5. Starts the mock REST API and datasette
 6. Continuously takes orders at 10-second intervals, simulating users buying and
    selling tokenized equities
 
 The `simulate-14d` variant also preloads 14 days of history -- hedge-latency
 cycles, equity mints, equity redemptions, and USDC rebalances (alternating
-Alpaca<->Base direction) -- before live trades begin, so the Performance tab's
-percentile charts and rebalance-stage breakdown, and the dashboard's Transfers
-panel, all show a trend immediately instead of waiting for historical data to
-accumulate. The dashboard's default `1W` view renders the most recent week of
-that seed at daily granularity; switch to `2W` to see the full 14-day history,
-still at daily granularity (within ~12h of the bot starting -- the seed is a
-fixed point in time, so a much longer-running session ages its oldest day out of
-the `2W` window).
+Alpaca<->Base direction) -- before live trades begin, so the performance
+percentiles, the rebalance-stage breakdown, and the transfer history all show a
+trend immediately instead of waiting for historical data to accumulate. The seed
+is a fixed point in time, so a much longer-running session ages its oldest days
+out of a fixed lookback window.
 
 The bot counter-trades each fill on the mock broker, mints/redeems to rebalance
 equity supply between venues, and bridges USDC via mock CCTP to keep cash
@@ -581,12 +584,12 @@ Press `Ctrl-C` to stop.
 Workspace crates:
 
 - **`st0x-hedge`** (root) - Main arbitrage bot: event loop, CQRS/ES aggregates,
-  conductor, and dashboard backend
+  conductor, and the REST and websocket read endpoints
 - **`st0x-cli`** (`crates/cli/`) - Operator command-line application
 - **`st0x-config`** (`crates/config/`) - TOML/secrets loading and runtime
   context assembly; restricted to the `st0x-hedge` and `st0x-cli` application
   crates
-- **`st0x-dto`** (`crates/dto/`) - Dashboard DTOs and TypeScript binding
+- **`st0x-dto`** (`crates/dto/`) - Shared API DTOs and TypeScript binding
   generation
 - **`st0x-execution`** (`crates/execution/`) - `Executor` trait and
   Liquidity-specific hedge policy over the released `st0x-alpaca` broker and
@@ -630,10 +633,9 @@ infra/
 secret/
 ├── st0x-hedge.toml.age           # encrypted core service secrets
 └── st0x-hedge-pricing.toml.age   # encrypted pricing credential overlay
-dashboard/                 # SvelteKit operations dashboard
-observability/             # Grafana boards and alert rules, shipped on merge
+observability/             # Grafana boards, panel tests, alert rules, shipped on merge
 .github/workflows/
-├── ci.yaml                # Build, test, clippy, dashboard
+├── ci.yaml                # Build, test, clippy, board script tests
 ├── observability.yml      # Check and ship observability/
 └── cd.yaml                # Deploy to NixOS host
 ```
@@ -670,19 +672,12 @@ All commands are run via `nix run .#<name>`. Commands that access infrastructure
 or secrets decrypt state using your SSH key (`~/.ssh/id_ed25519` by default).
 Pass `-i <path>` to use a different key.
 
-**Development:**
-
-| Command     | Usage                 | Notes                                           |
-| ----------- | --------------------- | ----------------------------------------------- |
-| `genBunNix` | `nix run .#genBunNix` | Regenerates `dashboard/bun.nix` from `bun.lock` |
-
 **Building (Nix):**
 
-| Command          | Usage                        | Notes               |
-| ---------------- | ---------------------------- | ------------------- |
-| `st0x-liquidity` | `nix build .#st0x-liquidity` | Build + tests       |
-| `st0x-clippy`    | `nix build .#st0x-clippy`    | Clippy linting      |
-| `st0x-dashboard` | `nix build .#st0x-dashboard` | SvelteKit dashboard |
+| Command          | Usage                        | Notes          |
+| ---------------- | ---------------------------- | -------------- |
+| `st0x-liquidity` | `nix build .#st0x-liquidity` | Build + tests  |
+| `st0x-clippy`    | `nix build .#st0x-clippy`    | Clippy linting |
 
 **Deployment** (requires SSH key for host access and terraform state
 decryption):
@@ -706,17 +701,6 @@ decryption):
 | `tfEditVars` | `nix run .#tfEditVars` | Edit terraform vars in `$EDITOR`  |
 | `tfRekey`    | `nix run .#tfRekey`    | Re-encrypt terraform state + vars |
 | `resolveIp`  | `nix run .#resolveIp`  | Print the production host IP      |
-
-### Dashboard Dependencies
-
-After changing `dashboard/bun.lock`, regenerate and format the Nix lockfile:
-
-```bash
-nix run .#genBunNix
-nix fmt -- dashboard/bun.nix
-```
-
-CI will fail if `bun.nix` is out of sync with `bun.lock`.
 
 ## Documentation
 

@@ -15,7 +15,8 @@
 # [wallet] kms_api_key is keyless Turnkey auth (no [wallet] secrets); there
 # is no [telemetry] section (stdout -> Cloud Logging).
 #
-# HTTP API port for the dashboard and health checks.
+# HTTP API port (REST reads for st0x-liquidity-client and the exporter, and
+# health checks).
 server_port = 8001
 # HTTP port for the apalis-board job queue UI.
 board_port = 8002

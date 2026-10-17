@@ -20,26 +20,23 @@
 #              the upstream Docker image -- that one's bundled SQLite is too
 #              old to parse the schema's STRICT table (dashboard_trade_delivery)
 #              and dies with "malformed database schema".
-#   dashboard: nginx serving the SvelteKit build, proxying the API paths to
-#              the compose service name `bot` on :8001 (same location list
-#              the droplet's os.nix nginx serves, minus TLS — the VM has no
-#              tailnet; humans reach it over an IAP tunnel).
+#   dashboard: nginx in front of the IAP load balancer. It proxies the ops
+#              API prefixes (/liquidity-read, /liquidity-debug,
+#              /liquidity-capital) to the compose service name `bot` on
+#              :8001, and answers / with a page that sends people to the
+#              Grafana liquidity board, which replaced the SvelteKit
+#              dashboard. The load balancer's health check reads /, so it
+#              must stay a 200.
 {
   pkgs,
   st0x-liquidity,
   st0x-cli,
-  st0x-dashboard,
 }:
 
 let
-  dashboardRoot = pkgs.runCommand "st0x-dashboard-root" { } ''
-    mkdir -p $out/usr/share
-    cp -r ${st0x-dashboard} $out/usr/share/t0-liquidity-dashboard
-  '';
-
-  # Same proxy surface as os.nix's virtualHost locations, addressed to the
-  # compose service `bot` instead of 127.0.0.1 (the two containers share the
-  # compose default network). Logs to stdout/stderr for the gcplogs driver.
+  # The ops API prefixes, addressed to the compose service `bot` (the two
+  # containers share the compose default network). Logs to stdout/stderr
+  # for the gcplogs driver.
   nginxConf = pkgs.writeText "nginx.conf" ''
     user nobody;
     worker_processes 1;
@@ -68,97 +65,31 @@ let
 
       server {
         listen 80;
-        root /usr/share/t0-liquidity-dashboard;
         set $bot_upstream "bot:8001";
 
-        # Cache policy exists because of how this image is BUILT. Every
-        # layer is stamped `created = "1970-01-01T00:00:01Z"` for
-        # reproducibility, so nginx reports `Last-Modified: Thu, 01 Jan
-        # 1970` on every file. With no Cache-Control to override it,
-        # browsers fall back to heuristic freshness (RFC 9111: 10% of the
-        # age), which on a 1970 mtime is roughly five and a half YEARS.
-        #
-        # Behind IAP that is not a staleness annoyance, it is a lockout.
-        # Re-running the sign-in flow requires a top-level navigation that
-        # actually reaches the load balancer; a browser holding an
-        # indefinitely-fresh index.html never makes one. So when the IAP
-        # session expires the tab cannot recover on its own: it serves the
-        # cached shell forever while every XHR is 302'd into sign-in, and
-        # only a hard reload or a private window breaks out. That was the
-        # staging reload loop on 2026-08-17.
-        #
-        # The split below is the standard one. The entry document and the
-        # version poller must never be served from cache; everything under
-        # /_app/immutable/ is content-hashed by the SvelteKit build, so a
-        # changed file is a changed URL and a long TTL is safe.
-        location = /index.html {
+        # The SvelteKit dashboard this image served is gone; the Grafana
+        # board replaced it. A bookmark lands here, and so does the load
+        # balancer's health check, which needs a 200. no-store, so an IAP
+        # session that expired re-runs its sign-in on the next visit.
+        location = / {
+          default_type text/html;
           add_header Cache-Control "no-store" always;
-          try_files $uri =404;
+          return 200 '<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=https://grafana.t0trade.com/d/t0-liquidity/liquidity-bot"><title>Liquidity bot</title><p>The liquidity dashboard moved to Grafana: <a href="https://grafana.t0trade.com/d/t0-liquidity/liquidity-bot">Liquidity bot</a>.</p>';
         }
 
-        location = /_app/version.json {
-          add_header Cache-Control "no-store" always;
-          try_files $uri =404;
-        }
-
-        location /_app/immutable/ {
-          add_header Cache-Control "public, max-age=31536000, immutable" always;
-        }
-
-        # The fallback lands on /index.html as an INTERNAL redirect, which
-        # re-enters location matching, so the exact-match block above still
-        # applies its no-store to every SPA route.
-        location / {
-          try_files $uri $uri/ /index.html;
-        }
-
-        # NO URI after $bot_upstream, in any of these. nginx normally
+        # NO URI after $bot_upstream in the locations below. nginx normally
         # replaces the matched location prefix with the proxy_pass URI, but
         # when proxy_pass contains a VARIABLE that rewriting is skipped and
-        # the literal URI is sent instead of the request path. So
-        # `proxy_pass http://$bot_upstream/orders/` sent every /orders/*
-        # request to the bot as plain `/orders/` -- 404 for /orders/pending
-        # and /orders/raindex (the whole Orders tab), and 404 for all four
-        # /performance/* endpoints. Worse than the 404s: /transfers/interrupted
-        # and /trades/{venue}/{id}/events silently returned the plain
-        # /transfers and /trades lists, a wrong answer with a 200.
-        # With no URI part, nginx forwards the original request URI unchanged.
-        # Every location is GET-only (limit_except GET also admits HEAD).
-        # The dashboard is a read surface; the bot's /transfers/resume and
-        # /transfers/recheck/{kind}/{id} are POST mutation endpoints and now
-        # carry their own guards (src/api.rs): the bare mounts admit only
-        # loopback peers (the in-container st0x-cli via docker exec), and
-        # network operators use the IAP-verified /liquidity-debug mount
-        # (and /liquidity-capital for the capital verbs).
-        # This proxy still refuses the method as defense in depth. An IAP
-        # tunnel to the bot port can no longer invoke them: the peer is the
-        # bridge interface, not loopback, and the bot answers 403.
-        location /api/ws {
-          limit_except GET { deny all; }
-          proxy_pass http://$bot_upstream;
-          proxy_http_version 1.1;
-          proxy_set_header Upgrade $http_upgrade;
-          proxy_set_header Connection "upgrade";
-          proxy_connect_timeout 60;
-          proxy_send_timeout 60;
-          proxy_read_timeout 86400;
-        }
-
-        location /health      { limit_except GET { deny all; } proxy_pass http://$bot_upstream; }
-        location /logs        { limit_except GET { deny all; } proxy_pass http://$bot_upstream; }
-        location /orders/     { limit_except GET { deny all; } proxy_pass http://$bot_upstream; }
-        location /pnl         { limit_except GET { deny all; } proxy_pass http://$bot_upstream; }
-        location /trades      { limit_except GET { deny all; } proxy_pass http://$bot_upstream; }
-        location /transfers   { limit_except GET { deny all; } proxy_pass http://$bot_upstream; }
-        location /performance { limit_except GET { deny all; } proxy_pass http://$bot_upstream; }
-
-        # Role-gated ops API. Unlike the dashboard locations above, the load
-        # balancer sends each of these prefixes to its own IAP backend, and
-        # the bot verifies the assertion and pins the audience per prefix
-        # before running the handler. So the method restriction here is not
-        # the thing keeping mutations safe -- it is a second, cheaper fence
-        # that keeps a prefix from carrying verbs its role never intended,
-        # the same way the dashboard locations do.
+        # the literal URI is sent instead of the request path, so a URI part
+        # would send every request to the same path. With no URI part, nginx
+        # forwards the original request URI unchanged.
+        #
+        # Role-gated ops API. The load balancer sends each of these prefixes
+        # to its own IAP backend, and the bot verifies the assertion and pins
+        # the audience per prefix before running the handler. So the method
+        # restriction here is not the thing keeping mutations safe -- it is a
+        # second, cheaper fence that keeps a prefix from carrying verbs its
+        # role never intended. Every other path is a 404.
         #
         # /liquidity-debug and /liquidity-capital are the only locations in
         # this file that admit POST, one per mutation tier: debug repairs
@@ -172,6 +103,8 @@ let
         location /liquidity-read/    { limit_except GET  { deny all; } proxy_pass http://$bot_upstream; }
         location /liquidity-debug/   { limit_except POST { deny all; } proxy_pass http://$bot_upstream; }
         location /liquidity-capital/ { limit_except POST { deny all; } proxy_pass http://$bot_upstream; }
+
+        location / { return 404; }
       }
     }
   '';
@@ -231,6 +164,44 @@ in
     };
   };
 
+  # Runs the dashboard image's nginx config and probes it, so a slip in the
+  # inline page or a location fails CI, not the staging roll: the load
+  # balancer's health check needs `/` to answer 200, and the ops API needs
+  # its method fences. The bot upstream is not running here, so no request
+  # reaches it.
+  dashboard-nginx-check =
+    pkgs.runCommand "dashboard-nginx-check"
+      {
+        nativeBuildInputs = [
+          pkgs.nginx
+          pkgs.curl
+        ];
+      }
+      ''
+        sed -e "s#/tmp/#$TMPDIR/#g" -e 's#listen 80;#listen 127.0.0.1:18080;#' \
+          -e 's#^user nobody;##' ${nginxConf} > nginx.conf
+        nginx -t -c "$PWD/nginx.conf" -p "$TMPDIR" -e /dev/stderr
+        nginx -c "$PWD/nginx.conf" -p "$TMPDIR" -e /dev/stderr
+        trap 'nginx -c "$PWD/nginx.conf" -p "$TMPDIR" -e /dev/stderr -s stop' EXIT
+        for _ in $(seq 50); do
+          curl -s -o /dev/null http://127.0.0.1:18080/ && break
+          sleep 0.1
+        done
+        check() {
+          got=$(curl -s -o /dev/null -w '%{http_code}' -X "$1" "http://127.0.0.1:18080$2")
+          [ "$got" = "$3" ] || { echo "$1 $2: expected $3, got $got" >&2; exit 1; }
+        }
+        check GET / 200
+        curl -s -D - -o /dev/null http://127.0.0.1:18080/ | grep -qi '^cache-control: no-store'
+        curl -s http://127.0.0.1:18080/ | grep -q 'grafana.t0trade.com/d/t0-liquidity'
+        check GET /pnl 404
+        check GET /api/ws 404
+        check POST /liquidity-read/x 403
+        check GET /liquidity-debug/x 403
+        check GET /liquidity-capital/x 403
+        touch "$out"
+      '';
+
   dashboard-oci = pkgs.dockerTools.streamLayeredImage {
     name = "t0-liquidity-dashboard";
     tag = "latest";
@@ -238,7 +209,6 @@ in
     contents = [
       pkgs.nginx
       pkgs.dockerTools.fakeNss
-      dashboardRoot
     ];
     extraCommands = ''
       mkdir -p tmp var/log/nginx var/cache/nginx

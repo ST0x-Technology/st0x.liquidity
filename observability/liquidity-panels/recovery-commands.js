@@ -1,10 +1,9 @@
-// The board's per-row recovery commands: the client form of the SPA's
-// tradeRecoveryCommands and transferRecoveryCommands
-// (dashboard/src/lib/transfer.ts). The generator prepends this file to
-// detail.js; dashboard/src/lib/transfer-board.test.ts runs it against the SPA's
-// builders so the two cannot drift, importing it as a module through the
-// export line, which the generator drops. `client` is the client invocation
-// with its --env.
+// The board's per-row recovery commands, the source of truth for what the
+// row dialog offers. The generator prepends this file to detail.js;
+// observability/tests/recovery.test.ts imports it as a module through the
+// export line, which the generator drops, and writes every command it shows
+// to the files the Rust parser tests read. `client` is the client
+// invocation with its --env.
 
 const tradeCommands = (client, symbol) => [
   {
@@ -25,9 +24,9 @@ const tradeCommands = (client, symbol) => [
   },
 ];
 
-// USDC_RECONCILE_BASE_TO_ALPACA in transfer.ts. The board offers no USDC
-// reconcile row (the exporter does not log postBurn), so the dialog shows it
-// in usdcFailedNote.
+// The stop-first rule for a failed Base to Alpaca bridge. The board offers no
+// USDC reconcile row (the status lines do not carry postBurn), so the dialog
+// shows it in usdcFailedNote.
 const USDC_RECONCILE_BASE_TO_ALPACA =
   ' Base to Alpaca after its burn (not a deposit or conversion failure): unless the mint ' +
   'was reported unresolvable or funds were already moved by hand, keep the bot running ' +
@@ -37,11 +36,11 @@ const USDC_RECONCILE_BASE_TO_ALPACA =
   'earlier send. Follow docs/cli-ops.md, "Settling a post-burn Base to Alpaca failure by hand".';
 
 // The detail dialog's note for a failed USDC bridge. The Base to Alpaca
-// stop-first rule is left out of an Alpaca to Base bridge, as in the SPA; a
-// bridge with no direction gets it.
+// stop-first rule is left out of an Alpaca to Base bridge; a bridge with no
+// direction gets it.
 const usdcFailedNote = (direction) =>
   'Reconcile applies only when the funds left their source venue, which the logs do not ' +
-  'show. Check the transfer in the SPA before you reconcile it.' +
+  'show. Check its events with the client\'s read transfer-events before you reconcile it.' +
   (direction === 'alpaca_to_base' ? '' : USDC_RECONCILE_BASE_TO_ALPACA);
 
 const EQUITY_RECONCILE_INFLIGHT =
@@ -152,8 +151,8 @@ const transferCommands = (client, transfer) => {
   const id = transfer.id;
 
   if (transfer.kind === 'usdc_bridge') {
-    // Reconcile needs the bridge's postBurn flag, which the exporter does not
-    // log; the SPA offers nothing without it either.
+    // Reconcile needs the bridge's postBurn flag, which the status lines do
+    // not carry, so a failed bridge offers no command.
     if (failed) return [];
     const direction =
       { alpaca_to_base: 'alpaca-to-base', base_to_alpaca: 'base-to-alpaca' }[transfer.direction] ||

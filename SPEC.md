@@ -201,11 +201,10 @@ Operators pause rebalancing with narrow, explicit controls:
   derivative; redeeming without unwrap sends the wrong token. Publish
   `rebalancing = "paused"` only after this order: deploy the bot that reads
   `paused`, merge the `t0/check.jq` validator change, then publish `paused`. On
-  rollback, restore the token value before downgrading the binary. The dashboard
-  currently shows paused and disabled listings with the same red rebalancing
-  indicator; verify the registry mode before you set `disabled`. It displays
-  settings for the primary chain only. A listing with rebalancing `enabled` or
-  `paused` also needs `wrapped_equity_recovery = "enabled"` on every chain.
+  rollback, restore the token value before downgrading the binary. The Liquidity
+  bot Grafana board shows a paused rebalancing listing in amber and a disabled
+  one in red, per chain. A listing with rebalancing `enabled` or `paused` also
+  needs `wrapped_equity_recovery = "enabled"` on every chain.
 - **Per-asset `rebalancing = "disabled"`**: removes the asset from the trigger
   whitelist. New equity rebalancing flows do not start for that asset. On a
   secondary chain where no equity is `enabled` or `paused`, the chain's equity
@@ -873,8 +872,8 @@ Robinhood -- so adding a chain requires pinning its stable before the code
 compiles. It is the cash leg everywhere: vault polling reads that token's vault,
 the fill parse scales the cash amount by its decimals (a fill whose moved amount
 the six-decimal internal amount cannot hold is skipped and recorded, never
-rounded), and the inventory view names it in the `symbol` field the dashboard
-labels the cash row with. Fill validation matches it two ways: an
+rounded), and the inventory view names it in the `symbol` field the Grafana
+board labels the cash row with. Fill validation matches it two ways: an
 `InventoryTrade` fill must quote in the stable's address, while a
 `ClearV3`/`TakeOrderV3` fill is classified by the stable's symbol and its
 address is gated only by vault discovery, which skips a cash vault whose token
@@ -1236,7 +1235,7 @@ queued job from using the wrong order type or feed.
 ##### Schedule-driven close flattening
 
 Pricing owns the execution cutoff for each explicit asset eligibility scope. The
-trading-owned consumer polls `/trading-state`, independently of dashboard
+trading-owned consumer polls `/trading-state`, independently of reference
 pricing. It validates environment, scope membership, eligibility profile,
 calendar evidence, and timestamp ordering before accepting a schedule.
 
@@ -1696,9 +1695,9 @@ migration files in `migrations/`.
 
 ### Performance Observability
 
-The dashboard exposes a Performance tab measuring the _technological_ health of
-the system (latency and reliability), complementing the P&L tab's economic view.
-The hedge-latency metrics are maintained by a forward-only reactor that
+The Grafana board exposes a Performance tab measuring the _technological_ health
+of the system (latency and reliability), complementing the PnL tab's economic
+view. The hedge-latency metrics are maintained by a forward-only reactor that
 subscribes to live CQRS events and writes into bespoke read-model tables
 (`hedge_fill`, `hedge_cycle`, `hedge_submission`, and
 `hedge_attribution_reset`). That read model reflects activity since deployment
@@ -1754,14 +1753,14 @@ hedging decisions.
 - **USDC rebalance stage timing**: per-stage durations of USDC rebalances
   (withdrawal, CCTP burn -> attestation -> mint, deposit, conversion) derived
   from `UsdcRebalanceEvent` timestamps, including attestation-time trends. The
-  Relay swap events open no stage. Shown on its own dashboard chart, clearly
+  Relay swap events open no stage. Shown on its own Grafana chart, clearly
   labeled as USDC-specific.
 - **Equity rebalance stage timing**: per-stage durations of equity mints
   (acceptance, token receipt, wrap, vault deposit) and redemptions (vault
   withdraw, unwrap, send, detection, completion), derived from
   `TokenizedEquityMintEvent`/`EquityRedemptionEvent` timestamps and combined
-  into one dashboard chart (mint and redemption rows share the chart, each
-  labeled by kind), separate from the USDC chart above.
+  into one Grafana chart (mint and redemption rows share the chart, each labeled
+  by kind), separate from the USDC chart above.
 - **Reliability**: error/warning counts by severity, module, and time bucket
   from the structured log store; lifecycle failure events (failed hedges, failed
   rebalance stages, rejections) as an impact-weighted category; job queue health
@@ -1771,14 +1770,14 @@ Phase 2 adds instrumentation for signals not yet captured: chain tip vs backfill
 checkpoint (block lag), poll-cycle duration and skipped ticks, and RPC/broker
 API latency, persisted in a lightweight telemetry store outside the event store.
 An unavailable ingestion cutoff is recorded as unknown rather than synthesized
-as block zero. Its block lag is therefore absent, and the dashboard surfaces the
-latest unknown-cutoff sample as degraded instead of reporting a healthy zero
-lag. Every block-lag and poll-cycle sample is keyed by the chain whose fill
-watcher took it (legacy samples belong to Base), and the infra report exposes
-one block-lag series and one poll-health report per hedged chain, primary first,
-each with its own current lag and its own cycle, error and skipped-tick counts:
-two chains never merge into one series, even when their orderbooks share an
-address.
+as block zero. Its block lag is therefore absent, and the Performance tab
+surfaces the latest unknown-cutoff sample as degraded instead of reporting a
+healthy zero lag. Every block-lag and poll-cycle sample is keyed by the chain
+whose fill watcher took it (legacy samples belong to Base), and the infra report
+exposes one block-lag series and one poll-health report per hedged chain,
+primary first, each with its own current lag and its own cycle, error and
+skipped-tick counts: two chains never merge into one series, even when their
+orderbooks share an address.
 
 ### Prometheus metrics (`liq_*` contract)
 
@@ -2666,11 +2665,12 @@ _System configuration_ (deploy-rs `activate.nixos`):
 - ragenix integration for secret decryption
 - Nix configuration (flakes, garbage collection)
 
-The dashboard's Tailscale-issued TLS certificate uses separate provisioning and
-renewal services. The provisioning oneshot remains active after first boot so a
-NixOS switch does not call the certificate API. A persistent daily timer starts
-the bounded renewal oneshot independently of nginx activation. A successful
-renewal reloads nginx so it serves the new certificate.
+The legacy host's Tailscale-issued TLS certificate (nginx serves it only for the
+redirect page to the Grafana board) uses separate provisioning and renewal
+services. The provisioning oneshot remains active after first boot so a NixOS
+switch does not call the certificate API. A persistent daily timer starts the
+bounded renewal oneshot independently of nginx activation. A successful renewal
+reloads nginx so it serves the new certificate.
 
 _Per-service profiles_ (deploy-rs `activate.custom`, deployed independently):
 
@@ -2721,8 +2721,6 @@ systemd unit:
   the running bot and otherwise fails immediately with the required rollout
   order. Outside systemd, the server uses a no-op readiness notifier so local
   runs remain available.
-- `dashboard` (kind = `static`) - frontend assets served by nginx; the deploy
-  step is `systemctl reload nginx` and there is no managed systemd unit.
 - `datasette` (kind = `plain`) - read-only SQLite explorer over the hedge DB.
   Has a systemd unit but no secrets/config; activation just touches the
   readiness marker and restarts. Bound to `127.0.0.1`; access via SSH tunnel.
@@ -2990,13 +2988,13 @@ The system provides two top-level capabilities:
 │  ├─ Ctx, BrokerCtx, Env (TOML loading and assembly)                     │
 │  └─ setup_tracing                                                       │
 │                                                                         │
-│  st0x-server          st0x-dashboard         st0x-cli                   │
-│  ├─ Bot binary        ├─ Admin UI backend    ├─ Operator binary         │
-│  ├─ Conductor         ├─ Websocket events    ├─ Manual operations       │
-│  ├─ Startup, Monitor  └─ Manual operations   └─ View rebuilds           │
+│  st0x-server                                st0x-cli                    │
+│  ├─ Bot binary                              ├─ Operator binary          │
+│  ├─ Conductor                               ├─ Manual operations        │
+│  ├─ Startup, Monitor                        └─ View rebuilds            │
 │  └─ API endpoints                                                       │
 │                                                                         │
-│  All three are thin wrappers; domain logic lives in the layers above.   │
+│  Both are thin wrappers; domain logic lives in the layers above.        │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -3044,18 +3042,17 @@ be config-agnostic**: they accept narrow constructor arguments (`&dyn Wallet`,
 
 **Application Layer** (binaries and wiring):
 
-| Crate            | Purpose                                                                                                                                                                                                               |
-| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `st0x-config`    | TOML/secrets loading, `Ctx`/`BrokerCtx`/`Env` assembly, `setup_tracing`. **Restricted visibility: only `st0x-server` and `st0x-cli` may depend on it. No integration, shared, or domain crate may import it.**        |
-| `st0x-server`    | Main bot binary, conductor, wires hedging + rebalancing, API endpoints                                                                                                                                                |
-| `st0x-dashboard` | Admin dashboard backend, websocket events, manual operations                                                                                                                                                          |
-| `st0x-cli`       | Operator binary; thin wrapper exposing manual operations (orders, equity/USDC transfers, vault deposit/withdraw, CCTP bridging, wrap/unwrap, Alpaca wallet ops, view rebuilds) over the integration and domain crates |
+| Crate         | Purpose                                                                                                                                                                                                               |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `st0x-config` | TOML/secrets loading, `Ctx`/`BrokerCtx`/`Env` assembly, `setup_tracing`. **Restricted visibility: only `st0x-server` and `st0x-cli` may depend on it. No integration, shared, or domain crate may import it.**        |
+| `st0x-server` | Main bot binary, conductor, wires hedging + rebalancing, API endpoints                                                                                                                                                |
+| `st0x-cli`    | Operator binary; thin wrapper exposing manual operations (orders, equity/USDC transfers, vault deposit/withdraw, CCTP bridging, wrap/unwrap, Alpaca wallet ops, view rebuilds) over the integration and domain crates |
 
 The binary crates wire the layers above into a runnable artifact: `st0x-server`
-runs the bot, `st0x-dashboard` exposes the admin UI, `st0x-cli` exposes the same
-domain capabilities to a human operator. A command added to the CLI corresponds
-to a feature already implemented in an integration or domain crate -- the CLI
-does not contain business rules.
+runs the bot and `st0x-cli` exposes the same domain capabilities to a human
+operator. A command added to the CLI corresponds to a feature already
+implemented in an integration or domain crate -- the CLI does not contain
+business rules.
 
 ### Feature Flag Strategy
 
@@ -3320,10 +3317,11 @@ outstanding `TradingDisabled` rows for wrapped symbols whose ratio is not 1 at
 the wrapped quantity times the ratio at its fill block, not at the recorded
 figure.
 
-The dashboard trade feed shows onchain fills in wrapped shares, because the
-`OnChainTrade` record keeps the raw chain facts, and labels them as wrapped.
-Broker hedges are in underlying shares, so at a ratio other than 1 an onchain
-fill and its hedge show different quantities for the same exposure.
+The trade feeds (the board's trade tables and the REST `/trades` reads) show
+onchain fills in wrapped shares and label them as wrapped, because the
+`OnChainTrade` record keeps the raw chain facts. Broker hedges are in underlying
+shares, so at a ratio other than 1 an onchain fill and its hedge show different
+quantities for the same exposure.
 
 ### Aggregate Design
 
@@ -3937,19 +3935,19 @@ is fundamentally about transferring inventory between these venues. The transfer
 steps differ by asset type and direction, but the core abstraction is the same:
 move assets from one venue to the other.
 
-The operator dashboard reads cross-venue transfer history from the three
-aggregates' materialized projections. Type and time filters, newest-first
-ordering, and pagination are applied in SQLite before payloads are decoded. Page
-retrieval and payload decoding are bounded by the requested page, but the
-total-count queries scan all matching projection rows. Page sizes must be
-positive and are capped at 500. History offsets above 10,000 are rejected so one
-request cannot force an unbounded SQLite result window; clients must narrow the
-type or time filters to retrieve older entries. Unreadable rows in the selected
-page are skipped and surfaced as category-specific warnings without hiding
-readable transfers. The dashboard WebSocket's initial snapshot reads the same
-projections, selecting all active transfers and only terminal transfers updated
-within the last 24 hours before decoding payloads. It never rebuilds transfer
-state from event history when a client connects.
+The REST transfer history reads cross-venue transfers from the three aggregates'
+materialized projections. Type and time filters, newest-first ordering, and
+pagination are applied in SQLite before payloads are decoded. Page retrieval and
+payload decoding are bounded by the requested page, but the total-count queries
+scan all matching projection rows. Page sizes must be positive and are capped
+at 500. History offsets above 10,000 are rejected so one request cannot force an
+unbounded SQLite result window; clients must narrow the type or time filters to
+retrieve older entries. Unreadable rows in the selected page are skipped and
+surfaced as category-specific warnings without hiding readable transfers. The
+`/api/ws` initial snapshot (the exporter's seed) reads the same projections,
+selecting all active transfers and only terminal transfers updated within the
+last 24 hours before decoding payloads. It never rebuilds transfer state from
+event history when a client connects.
 
 ##### Architecture: Three Layers
 
@@ -8286,7 +8284,7 @@ rollback floor from the first adoption on, whether or not the adopted redemption
 has finished.
 
 The `Reconciled` state retains the identifying fields (symbol, quantity,
-original failure reason, request/redemption identifiers) so the dashboard
+original failure reason, request/redemption identifiers) so the transfer
 projection still reports the real transfer, and maps to a distinct terminal
 `Reconciled` DTO status carrying `reconciled_at`, `failure_reason`, and
 `reconcile_reason` -- distinguishable from genuine success (`Completed`) at the
@@ -8736,12 +8734,12 @@ effect rather than a generic intent:
 - **Every main port route comes from a route declaration.** `src/api.rs`
   declares each route's method and path: the role-gated ops routes and the debug
   and capital prefixes' catch alls, the loopback recovery routes, the
-  unauthenticated dashboard reads, and the `/metrics` and `/api/ws` service
-  routes. Each group gets its own guard: IAP on the role prefixes when the ops
-  API is configured, `require_loopback` on the loopback routes, and none on the
-  dashboard reads and service routes. A route guard admits only declared methods
-  and paths, before any handler runs. Both operations audits and the loopback
-  gate wrap it, so every request under the mounted `/liquidity-debug` and
+  unauthenticated REST reads, and the `/metrics` and `/api/ws` service routes.
+  Each group gets its own guard: IAP on the role prefixes when the ops API is
+  configured, `require_loopback` on the loopback routes, and none on the REST
+  reads and service routes. A route guard admits only declared methods and
+  paths, before any handler runs. Both operations audits and the loopback gate
+  wrap it, so every request under the mounted `/liquidity-debug` and
   `/liquidity-capital` prefixes and every `POST` under `/transfers` is audited
   even when the guard refuses it, and a `POST` under `/transfers` passes the
   loopback gate first. A `POST` under `/transfers` that no declaration admits
@@ -9092,12 +9090,12 @@ All work managed by the Conductor falls into one of these categories:
 
 **Scheduled jobs** (periodic, future — currently long-running with sleep loops):
 
-| Job                  | Interval | Description                                          |
-| -------------------- | -------- | ---------------------------------------------------- |
-| Inventory poll       | ~30s     | Poll vault + broker balances, broadcast to dashboard |
-| Order status poll    | ~10s     | Poll broker for pending order fills                  |
-| Position check       | ~60s     | Reconcile accumulated positions (safety net)         |
-| Executor maintenance | ~15m     | Refresh broker metadata, check asset availability    |
+| Job                  | Interval | Description                                        |
+| -------------------- | -------- | -------------------------------------------------- |
+| Inventory poll       | ~30s     | Poll vault + broker balances, broadcast to /api/ws |
+| Order status poll    | ~10s     | Poll broker for pending order fills                |
+| Position check       | ~60s     | Reconcile accumulated positions (safety net)       |
+| Executor maintenance | ~15m     | Refresh broker metadata, check asset availability  |
 
 `Position check`'s per-tick recovery re-enqueue is a no-op for any order that
 already has a live `Order status poll` chain; it only arms polling for an order
@@ -9308,123 +9306,46 @@ src/                              - Main st0x-hedge library crate
   rebalancing/                    - Cross-venue transfer orchestration and triggers
   symbol/                         - Token symbol caching and locking
   alpaca_wallet/                  - Alpaca cryptocurrency wallet and CCTP bridge
-  dashboard/                      - Admin dashboard event streaming
+  dashboard/                      - Read models, PnL report, event lines, and /api/ws stream
 crates/
   cli/                            - st0x-cli operator binary and subcommands
   bridge/                         - Circle CCTP bridge abstraction
-  dto/                            - TypeScript binding generation for dashboard
+  dto/                            - Shared API DTOs and TypeScript bindings
   event-sorcery/                  - CQRS/ES framework (EventSourced, Store, Reactor, Projection)
   execution/                      - Trade execution library (Executor trait, Alpaca, mock)
 ```
 
 ---
 
-## Admin Dashboard
+## Operator dashboard
 
-### Overview
+The operator UI is the Grafana "Liquidity bot" board and its tabs (Orders, PnL,
+Performance, Logs). `observability/gen-t0-liquidity.py` generates the board, and
+the panel scripts live in `observability/liquidity-panels/`. The bot has no web
+UI of its own. The board covers inventory against its rebalancing bands, trades,
+transfers, hedge orders, profit and loss, technological health, and the bot's
+logs.
 
-A web-based admin dashboard for monitoring and controlling the liquidity bot
-from a single interface. The dashboard consolidates system health, trading
-activity, P&L metrics, and operational controls without duplicating
-functionality already available in Grafana.
+The board reads only what the bot already emits: the `liq_*` Prometheus metrics
+and the structured log lines (see "Prometheus metrics (`liq_*` contract)" and
+[docs/observability.md](docs/observability.md)). Hedging never depends on the
+board, so a dashboard failure cannot affect it.
 
-### Technology Stack
+Operators run recovery commands through `st0x-liquidity-client`, not through the
+board. The board's recovery guide lists the command for each stuck transfer or
+order state (the source is `observability/liquidity-panels/recovery-guide.json`
+and `recovery-commands.js`). The client calls the bot's REST routes under
+`/liquidity-read/`, `/liquidity-debug/`, and `/liquidity-capital/`.
 
-- **Framework**: SvelteKit with Svelte 5 (runes, snippets)
-- **UI Components**: shadcn-svelte
-- **Charts**: TradingView Lightweight Charts for financial visualizations
-- **Data Fetching**: TanStack Query v6 (svelte-query with runes support)
-- **Grafana**: Embedded iframes for detailed metrics dashboards
-- **Build Tool**: Vite
-- **Language**: TypeScript
+The bot's REST read endpoints (`/health`, `/pnl`, `/trades`, `/transfers`,
+`/orders/*`, `/logs`, `/performance/*`) and the `/api/ws` websocket stay for
+`st0x-liquidity-client` and for the liquidity exporter sidecar. The exporter
+reads the `/api/ws` initial `current_state` snapshot as a seed. No UI consumes
+the websocket stream today. Removing the websocket and the terminal-trade
+delivery behind it is tracked in RAI-3002, after the exporter is deleted
+(RAI-3001). The REST read endpoints stay for the client.
 
-### TypeScript Patterns
-
-#### Tagged Unions for Domain Modeling
-
-Following the same ADT philosophy used in the Rust backend, the dashboard uses
-discriminated unions (tagged unions) for type-safe domain modeling:
-
-```typescript
-// Domain types
-type Position =
-  | { status: "empty"; symbol: string }
-  | {
-    status: "active";
-    symbol: string;
-    net: number;
-    pendingExecutionId?: string;
-  };
-
-// API errors
-type ApiError =
-  | { tag: "network"; message: string }
-  | { tag: "unauthorized" }
-  | { tag: "not_found"; resource: string }
-  | { tag: "server"; status: number; message: string };
-
-// Result type
-type Result<T, E> =
-  | { ok: true; value: T }
-  | { ok: false; error: E };
-```
-
-#### Custom FP Helpers Module
-
-A small `lib/fp.ts` module provides utility functions for working with Result
-types and tagged unions:
-
-- `ok<T>(value: T)` / `err<E>(error: E)` - Result constructors
-- `match(union, handlers)` - Exhaustive pattern matching
-- `pipe(value, ...fns)` - Left-to-right function composition
-- `map`, `flatMap`, `mapErr` - Result transformations
-
-No external dependencies - keeps bundle small and avoids library lock-in.
-
-#### Alternatives Considered
-
-- **Effect**: Full-featured FP library with structured concurrency, dependency
-  injection, and comprehensive error handling. Rejected as overkill for a
-  dashboard - adds ~50kb+ and significant conceptual overhead. Would shine for
-  complex async orchestration but this is mostly "fetch and display".
-
-- **neverthrow**: Lightweight Result/ResultAsync library (~2kb). Considered for
-  typed error handling but adds friction with TanStack Query (expects throwing
-  promises). Hand-rolled Result type provides 80% of the benefit with zero
-  dependencies.
-
-- **Plain fetch + Svelte stores**: Simplest approach but requires manual
-  caching, retry logic, and background refetch. TanStack Query handles this
-  better.
-
-#### State Management
-
-- **Server state**: TanStack Query v6 as reactive cache, populated via WebSocket
-- **Local UI state**: Svelte 5 `$state` and `$derived` runes
-
-#### WebSocket-First Data Flow
-
-All read data flows through a single WebSocket connection:
-
-1. Client connects to `WS /api/ws`
-2. Server sends full initial state as first message (positions, trades, P&L,
-   circuit breaker state)
-3. Server streams incremental updates as events occur
-
-##### Benefits
-
-- Single connection to manage
-- No race condition between HTTP fetch and WebSocket updates
-- Server controls exactly what state the client starts with
-- HTTP endpoints only needed for mutations (circuit breaker)
-
-##### Message Types
-
-Message types (`ServerMessage`, `InitialState`, etc.) are defined in the
-`st0x-dto` crate (`crates/dto/src/lib.rs`) and auto-generated as TypeScript
-types via `ts-rs`. The DTO crate is the source of truth for all wire formats.
-
-##### Inventory per chain
+### Inventory payload
 
 The inventory payload (the `current_state` seed and every `inventory_snapshot`)
 keeps its flat `onchain*` figures for the primary chain's vault, as the
@@ -9443,341 +9364,49 @@ of itself plus the broker's gross cash, and its deviation. A chain whose cash
 asset rebalances has it, whatever the USDC mode; any other chain has none. The
 `settings` band fields keep their meaning.
 
-##### TanStack Query Integration
+Until RAI-3002 removes the stream, a DTO change must keep the flat
+`onchainAvailable` and `onchainInflight` fields, or the exporter's inventory
+gauges read zero.
 
-WebSocket messages populate the TanStack Query cache. Each `ServerMessage`
-variant maps to one or more query keys (e.g., `["trades"]`, `["inventory"]`,
-`["transfers", "active"]`). The `initial` message seeds all caches on
-connection; subsequent messages update individual caches incrementally.
+### Reference prices
 
-### Core Features
+The equity USD values the board shows are live reference values from the st0x
+pricing service, independent of whether a `Position` aggregate exists or when
+the asset last filled onchain. The server uses the pricing service's existing
+`oracle` consumer identity, which selects Raindex quotes, and subscribes to the
+wrapped symbol for every configured equity (`AAPL` -> `wtAAPL`) so the quote is
+denominated per wrapped vault share, including any wrapper NAV scaling applied
+by the pricing service. It validates the returned Base token pair against the
+configured wrapped token and Base USDC, rejects future or non-increasing
+source/expiry timestamps, and only then publishes a price.
 
-#### Grafana Dashboard Embedding
+A pricing-service quote contains directional rates rather than a neutral mark.
+For display only, the reference price is the midpoint of the two executable
+directions expressed as quote per base: `bid = rate_base_to_quote`,
+`ask = 1 / rate_quote_to_base`, and `price = (bid + ask) / 2`. This calculation
+uses Rain `Float` throughout. Missing, rejected, crossed, disconnected, or
+expired quotes are unavailable, and the price never falls back to
+`Position.last_price`. A valid live price with a genuinely zero net position
+still renders `$0`.
 
-Embed existing Grafana dashboards directly in the admin UI:
+The pricing WebSocket uses TLS for remote endpoints. Plaintext WebSocket is
+accepted only for the private `st0x-pricing` service name and loopback test
+endpoints, where the connection does not leave the deployment host or test
+environment.
 
-- Configure Grafana for anonymous viewer access (already supported)
-- Embed dashboards via iframe with time range synchronization
-- Dashboard selector for switching between different views (overview, trades,
-  P&L)
-- Fallback UI when Grafana is unavailable
-
-No need to rebuild Grafana's visualization capabilities - leverage existing
-dashboards.
-
-#### HyperDX Health Status
-
-Display service health from HyperDX:
-
-- Fetch health metrics via HyperDX API
-- Display health status badge in dashboard header
-- Show recent alerts and error counts
-- Link to full HyperDX dashboard for detailed investigation
-
-```typescript
-// HyperDX API integration
-const response = await fetch("https://api.hyperdx.io/api/v1/alerts", {
-  headers: { Authorization: `Bearer ${HYPERDX_API_KEY}` },
-});
-```
-
-#### Circuit Breaker
-
-Emergency control to halt all trading activity:
-
-- Prominent toggle in dashboard header (always visible)
-- Confirmation dialog before triggering
-- Displays current status: active/tripped with timestamp and reason
-- When tripped: bot stops placing new hedge orders
-- Existing positions preserved (no forced liquidation)
-- Manual reset required to resume trading
-
-##### Implementation
-
-- New database table or flag to track circuit breaker state
-- Bot checks flag before placing any broker orders
-- API endpoints for trigger/reset/status
-
-```text
-GET  /api/circuit-breaker/status
-POST /api/circuit-breaker/trigger  { reason: string }
-POST /api/circuit-breaker/reset
-```
-
-### Dashboard Layout
-
-Single-page dashboard with live-updating panels, each expandable to full-screen.
-It presents the current Alpaca-backed runtime rather than switching between
-multiple broker-specific contexts.
-
-#### Header Bar
-
-- Circuit breaker status toggle
-- WebSocket connection status
-
-#### Panels
-
-1. **Performance Metrics**: Key metrics (AUM, P&L, volume, trade count, Sharpe,
-   Sortino, max drawdown, hedge lag, uptime) with timeframe selector (1h, 1d,
-   1w, 1m, all-time).
-
-2. **Inventory**: Per-symbol equity holdings and cash balances across venues,
-   with available/inflight breakdowns. It also shows wallet-observed inventory
-   outside the venues: Ethereum/Base wallet USDC and Base wallet unwrapped
-   (`tSTOCK`) vs wrapped (`wtSTOCK`) equity tokens. Includes an "Inventory
-   Transfers" section showing active and recent transfer operations with status.
-
-   Dashboard equity USD values are live reference values from the st0x pricing
-   service, independent of whether a `Position` aggregate exists or when the
-   asset last filled onchain. The server uses the pricing service's existing
-   `oracle` consumer identity, which selects Raindex quotes, and subscribes to
-   the wrapped symbol for every configured equity (`AAPL` -> `wtAAPL`) so the
-   quote is denominated per wrapped vault share, including any wrapper NAV
-   scaling applied by the pricing service. It validates the returned Base token
-   pair against the configured wrapped token and Base USDC, rejects future or
-   non-increasing source/expiry timestamps, and only then publishes a dashboard
-   price.
-
-   A pricing-service quote contains directional rates rather than a neutral
-   mark. For display only, the dashboard reference price is the midpoint of the
-   two executable directions expressed as quote per base:
-   `bid = rate_base_to_quote`, `ask = 1 / rate_quote_to_base`, and
-   `price = (bid + ask) / 2`. This calculation uses Rain `Float` throughout.
-   Missing, rejected, crossed, disconnected, or expired quotes are unavailable;
-   the dashboard never falls back to `Position.last_price`. Inventory tooltips
-   then say the value is unavailable and Exposure renders unknown rather than
-   `$0`. A valid live price with a genuinely zero net position still renders
-   `$0`.
-
-   The pricing WebSocket uses TLS for remote endpoints. Plaintext WebSocket is
-   accepted only for the private `st0x-pricing` service name and loopback test
-   endpoints, where the connection does not leave the deployment host or test
-   environment.
-
-   `Position.last_price` remains the last fill-derived observation used by the
-   trading domain. Dashboard pricing is a separate, process-local read model
-   streamed in the initial WebSocket state and in live price updates; it does
-   not mutate a Position or the event store. The same store also supplies the
-   rebalancer's minimum-operation-size price for a never-filled symbol, the
-   daily portfolio snapshot's newer-than-fill mark (see "USD marks"), and the
-   `liq_*` prices family (`liq_position_last_price_usd`,
-   `liq_equity_exposure_usd`, and the last observed prices, see "Prometheus
-   metrics (`liq_*` contract)"). Pricing transport failures are retried. They
-   never affect hedging; they can delay a never-filled symbol's rebalancing, a
-   snapshot taken before any mark arrives falls back to the last fill, and a
-   symbol with no live price is omitted from the replacement prices family at
-   the next refresh that loads positions (a refresh whose position load fails
-   keeps the last family), so its previous sample is dropped until a later
-   refresh has a live price.
-
-3. **Spreads**: Last realized spreads per asset (buy/sell prices and spread bps)
-   and per-symbol price charts over time.
-
-4. **Trade History**: Recent trades filterable by venue (onchain/offchain/both).
-   Onchain entries are completed fills and carry their execution source:
-   `ClearV3`/`TakeOrderV3` fills are Raindex, while an `InventoryTrade` persists
-   the raw inventory `operator` and resolves it through the deployment's
-   configured adapter table. Recognized operators are reported as their venue
-   (currently Bebop or Uniswap v4). An operator absent from the table is
-   persisted and logged as unrecognized, and its trade is reported as the
-   distinct Unknown Onchain venue rather than being asserted to be Raindex.
-   Initial history and live WebSocket updates derive the venue from the same
-   persisted source, and venue filtering includes every exposed adapter venue.
-   Legacy `OnChainTradeEvent::Filled` events that predate source persistence
-   retain a legacy source marker and display as Raindex for compatibility. The
-   event store alone cannot reconstruct their discarded operator. Reprocessing
-   the transaction through the existing `process-tx` recovery path reads the
-   operator from chain and appends a source-attribution event through CQRS,
-   repairing history without repeating an already-acknowledged hedge. The same
-   repair upgrades an Unknown Onchain fill when its persisted operator is later
-   configured, but cannot replace it with an adapter carrying a different
-   operator.
-
-   History is served from the materialized `onchain_trade_view` and
-   `offchain_order_view` projections, which the event-sourcing framework
-   maintains from the event log and backfills on startup. Both the HTTP endpoint
-   and the WebSocket seed filter, sort, and page in SQL, so a request costs a
-   bounded index range per venue side for the page it returns, plus a count of
-   the matches that walks the terminal row index and reads only stored key
-   columns, never the serialized payload, rather than a replay of every
-   aggregate. Response shapes, protocol semantics, and the `limit`/`offset`
-   contract are unchanged. The views hold the serialized aggregates, and the
-   conversion to a dashboard trade still runs at read time over the returned
-   page only, so the projections stay pure read keys with no second source of
-   truth for the wire shape.
-
-   Offchain counter-trade entries include successful fills, terminal failures,
-   and terminal cancellations; each entry carries its terminal outcome
-   timestamp. Failed entries expose the broker or placement error. Failed and
-   cancelled entries keep the requested quantity distinct from the
-   broker-accepted quantity. The accepted and actually-filled quantities are
-   nullable provenance: `null` means the persisted history does not prove that
-   fact, including legacy outcomes that predate explicit fill evidence. An
-   explicit broker-reported zero therefore distinguishes a wholly unfilled
-   cancellation from an outcome whose fill remains unknown. Remaining and excess
-   quantities are derived only when both accepted and filled quantities are
-   known. An overfill reports the complete actual fill plus its excess rather
-   than clamping the fill to the accepted quantity. Non-terminal submitted,
-   partially-filled, and cancelling orders remain excluded. Terminal outcomes
-   use the same provenance in initial history and live dashboard updates. A
-   broker-terminal failure or cancellation with a positive fill but no execution
-   price is still persisted and surfaced; the owning position remains pending
-   for manual reconciliation so the unpriced fill cannot be silently applied or
-   discarded.
-
-   Dashboard trade messages remain compatible during rolling deploys. The
-   canonical protocol sends every terminal outcome as `trade_update`. Filled
-   outcomes also carry the legacy `filledAt` timestamp field and are broadcast
-   as a legacy `trade_fill`, so an older dashboard connected to a newer backend
-   continues to receive fills. Snapshot, HTTP, and live protocols default to
-   legacy filled-only behavior; dashboards opt into versioned terminal outcomes
-   with a `trade_protocol` query parameter. Old backends ignore that query
-   parameter. A newer dashboard accepts legacy `trade_fill` messages and legacy
-   snapshot/HTTP trade rows, normalizing them to a filled outcome before merging
-   by trade ID. The original `terminal_outcomes_v1` contract remains stable for
-   older dashboards: its failed quantities are always non-null and retain the
-   legacy split representation. When accepted-quantity provenance is unknown, v1
-   reports the requested quantity as the accepted quantity and derives the split
-   from it, because v1 has no way to express an unknown acceptance.
-   Provenance-aware nullable failure quantities use
-   `trade_protocol=terminal_outcomes_v2`. Cancelled outcomes are also v2-only,
-   because adding a new tagged outcome to v1 would break older exhaustive
-   consumers; a v1 fallback therefore omits cancelled entries from history
-   rather than losing them. Adapter-specific venue values use
-   `trade_protocol=terminal_outcomes_v3`; legacy, v1, and v2 responses downgrade
-   every adapter or unknown-onchain venue to Raindex so an older exhaustive
-   dashboard cannot enter a parse/reconnect loop. The v3 trade also carries
-   `price`, the fill price in USD per share of the trade's `shares`: the onchain
-   fill price per wrapped share, or the broker fill price per underlying share
-   of a filled counter-trade, and `null` for a failed or cancelled
-   counter-trade. A broker fill price that is not positive is logged as an error
-   and sent as `null`, since the dashboard rejects a non-positive price. Older
-   protocols omit the field. A newer dashboard requests v3 and retries v2, then
-   v1, when an older backend rejects an unknown protocol. Legacy-protocol filter
-   requests likewise collapse selected adapter venues to Raindex so an old
-   backend does not reject the venue query. The dashboard continues to accept v1
-   responses and reconstructs the complete fill as the legacy filled plus excess
-   quantity. A legacy zero fill remains unknown because v1 synthesized zero when
-   no fill evidence existed. A successful lower-version WebSocket fallback
-   probes v3 again after its next disconnect so a transient restart cannot pin
-   the client to an older protocol. Failed outcomes are sent only through a
-   terminal-outcome protocol. Trade ordering compares the complete RFC 3339
-   timestamp, including sub-millisecond precision, then uses the same stable
-   trade-ID tie-breaker for initial history and live updates.
-
-   Every dashboard transport validates trade payloads at runtime before they
-   enter client state. Snapshot, live WebSocket, and paginated HTTP paths use
-   the same validation rules for the canonical and legacy wire shapes:
-   timestamps must be valid UTC RFC 3339 values, venues/directions/outcomes must
-   be known variants, the total share quantity must be positive, and outcome
-   quantities must be non-negative decimal strings. A trade carrying a future,
-   unknown venue is skipped with a warning so a rolling dashboard deployment can
-   continue showing compatible trades without reconnecting. Any other invalid
-   payload is reported visibly and leaves the last known-good trade state
-   unchanged. The remaining domains from an otherwise valid snapshot still
-   refresh. Any other invalid WebSocket payload closes the connection, shows the
-   reconnect banner, and retries with bounded exponential backoff. The Rust
-   trade DTO encodes the positive total-quantity invariant so an invalid trade
-   cannot be constructed or deserialized at the server boundary.
-
-   Terminal trade live updates are delivered through a persistent delivery
-   ledger and job queue, not directly from the CQRS reactor. The ledger is keyed
-   by trade ID. The reactor attempts to register the outcome and idempotently
-   enqueue its delivery job. A supervised handoff monitor retains and retries an
-   outcome when that durable insertion fails while the process remains alive;
-   startup also reconciles the complete authoritative trade history into the
-   ledger and queue, closing the remaining process-crash window between event
-   persistence and job insertion. Before workers start, unfinished and
-   retry-exhausted delivery jobs become pending again. A job records
-   `delivered_at` only after publishing; failure to read or update that durable
-   state uses the standard supervised-worker retry policy, and exhaustion is a
-   fail-stop condition reported through the conductor monitor. Re-delivery is
-   permitted: the dashboard merges trade updates by trade ID, making a retry or
-   crash replay idempotent from the operator's point of view. Publishing with no
-   connected WebSocket receivers is successful because the next connection
-   obtains the same terminal outcome from its initial-state snapshot. A later
-   source-attribution correction reloads the authoritative onchain-trade history
-   and broadcasts a replacement update. Transient reload failures receive
-   bounded retries; exhaustion restarts the handoff monitor, whose startup
-   reconciliation reloads every pending source correction retained by that
-   monitor. After a process restart, clients reconnect from the
-   already-corrected snapshot.
-
-5. **Live Events**: Real-time domain event stream (aggregate type, ID, sequence,
-   event type, timestamp). Starts empty, populates via WebSocket.
-
-### Architecture
-
-#### Separate Frontend Package
-
-Dashboard lives in `dashboard/` directory at repository root:
-
-```text
-dashboard/
-├── src/
-│   ├── lib/
-│   │   ├── components/     # Panel components, UI primitives
-│   │   ├── api/            # API client and types
-│   │   ├── fp.ts           # Result type, match, pipe utilities
-│   │   └── websocket.svelte.ts
-│   ├── routes/
-│   │   ├── +layout.svelte  # App shell with header bar
-│   │   └── +page.svelte    # Main dashboard (all panels)
-│   └── app.html
-├── static/
-├── package.json
-├── svelte.config.js
-├── tsconfig.json
-└── vite.config.ts
-```
-
-#### Backend API Extensions
-
-Extend existing Rocket server (`src/api.rs`):
-
-##### WebSocket (all read data)
-
-```text
-WS /api/ws
-```
-
-Sends initial state on connect, then streams updates. See WebSocket-First Data
-Flow section above.
-
-##### Mutations (HTTP, require API key)
-
-```text
-POST /api/circuit-breaker/trigger  { reason: string }
-POST /api/circuit-breaker/reset
-```
-
-#### Authentication
-
-Public read access with authenticated actions:
-
-- **Read endpoints** (positions, trades, P&L, status): No authentication
-  required
-- **Action endpoints** (circuit breaker trigger/reset): Require API key
-- API key sent in `Authorization` header, validated against `DASHBOARD_API_KEY`
-  environment variable
-- Future: Proper user authentication system with role-based access
-
-#### Deployment
-
-Dashboard is built as a Nix derivation (`st0x-dashboard`) that produces static
-assets. Nginx on the NixOS host serves these files and reverse-proxies API
-requests to the backend.
-
-### Non-Goals (MVP)
-
-- User authentication system (API key is sufficient for actions)
-- Position entry from dashboard (read-only + circuit breaker only)
-- Multi-tenant support
-
-### Nice to Have
-
-- Mobile-responsive design (not mobile-first, but usable on mobile - modern
-  stack makes this low effort)
+`Position.last_price` remains the last fill-derived observation used by the
+trading domain. Reference pricing is a separate, process-local read model; it
+does not mutate a Position or the event store. The same store also supplies the
+rebalancer's minimum-operation-size price for a never-filled symbol, the daily
+portfolio snapshot's newer-than-fill mark (see "USD marks"), and the `liq_*`
+prices family (`liq_position_last_price_usd`, `liq_equity_exposure_usd`, and the
+last observed prices, see "Prometheus metrics (`liq_*` contract)"). Pricing
+transport failures are retried. They never affect hedging; they can delay a
+never-filled symbol's rebalancing, a snapshot taken before any mark arrives
+falls back to the last fill, and a symbol with no live price is omitted from the
+replacement prices family at the next refresh that loads positions (a refresh
+whose position load fails keeps the last family), so its previous sample is
+dropped until a later refresh has a live price.
 
 ## Operational Alerting
 

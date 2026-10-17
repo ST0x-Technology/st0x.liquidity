@@ -21,8 +21,9 @@ apalis_finished_job_cleanup_interval_secs = 3600
 # reconciliation. Required; must be a positive integer.
 inventory_divergence_threshold = 10
 hedge_order_gate_reconciliation_timeout_secs = 10
-# Live dashboard reference prices. The pricing service runs on the private
-# network and authenticates the WebSocket with `[pricing].api_key` from secrets.
+# Live reference prices (the board and the `liq_*` prices). The pricing service
+# runs on the private network and authenticates the WebSocket with
+# `[pricing].api_key` from secrets.
 [pricing]
 ws_url = "ws://st0x-pricing:8080/ws"
 
@@ -439,8 +440,9 @@ rebalancing = "enabled"
 vault_ids = "0xcd34"
 # operational_limit = 10000.0
 
-# Optional — enables the Orders dashboard tab by querying the st0x REST API.
-# When absent, the Orders tab shows "unavailable in simulate mode".
+# Optional: enables the Raindex orders reads (the board's Orders tab) by
+# querying the st0x REST API. When absent, the orders endpoint reports
+# "unavailable in simulate mode".
 # Credentials go in the secrets file under [rest_api].
 # [rest_api]
 # url = "https://api.example.com"

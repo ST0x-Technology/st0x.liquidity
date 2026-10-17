@@ -123,14 +123,14 @@ impl OrderPlacer for FixtureOrderPlacer {
     }
 }
 
-/// Seeds deterministic hedge history for local dashboard simulation.
+/// Seeds deterministic hedge history for local simulation.
 ///
 /// Drives real `Position`/`OffchainOrder`/`OnChainTrade` commands through
 /// temporary CQRS stores -- the same reactor (`HedgeLatencyProjection`) that
-/// builds the Performance tab's read model in production builds it here, and
-/// the raw `events` table it persists to also feeds Trade History
-/// (`dashboard/trade_loader.rs`) and PnL (`dashboard/src/lib/pnl/sql-source.ts`)
-/// directly, so all three tabs populate from one seeding pass.
+/// builds the performance read model in production builds it here, and the raw
+/// `events` table it persists to also feeds trade history
+/// (`dashboard/trade_loader.rs`) and PnL (`dashboard/pnl/source.rs`) directly,
+/// so all three reads populate from one seeding pass.
 ///
 /// Uses dedicated fixture symbols (`AAPL.SIM`/`TSLA.SIM`), never the live
 /// simulation's real `AAPL`/`TSLA`: replaying fabricated fills into the same
@@ -144,16 +144,16 @@ impl OrderPlacer for FixtureOrderPlacer {
 /// `RebalancingService`) starts, so the two never coexist against the same
 /// symbols.
 ///
-/// The dashboard's default "1W" view shows the most recent week of this
-/// seed at daily granularity immediately; the "2W" preset shows the full 14
-/// days (also at daily granularity -- `ReportRange::bucket_width` only steps
-/// to weekly past 31 days, and "2W" stays under that). Presets past "2W"
-/// (1M+) switch to coarser buckets whose newest bucket can be wide enough to
-/// catch both the freshest synthetic day and live samples, re-mixing them
-/// the same way the buffer below prevents for "1W"/"2W" -- an accepted
-/// trade-off, not an oversight: sizing the buffer for the widest preset
-/// would push all synthetic data outside the "1W" window instead, defeating
-/// this fixture's purpose (trends visible immediately in the default view).
+/// A one-week report range shows the most recent week of this seed at daily
+/// granularity immediately; a two-week range shows the full 14 days (also at
+/// daily granularity -- `ReportRange::bucket_width` only steps to weekly past
+/// 31 days, and two weeks stays under that). Ranges past two weeks (a month or
+/// more) switch to coarser buckets whose newest bucket can be wide enough to
+/// catch both the freshest synthetic day and live samples, re-mixing them the
+/// same way the buffer below prevents for one- and two-week ranges -- an
+/// accepted trade-off, not an oversight: sizing the buffer for the widest range
+/// would push all synthetic data outside the one-week window instead, defeating
+/// this fixture's purpose (trends visible immediately in a short range).
 ///
 /// Single-run-only: unlike the old raw-`INSERT OR IGNORE` version, real
 /// aggregate commands are not transparently re-run-safe -- a second call
@@ -191,7 +191,7 @@ pub async fn seed_simulated_hedge_latency_history(
         .build(())
         .await?;
 
-    // The dashboard's rolling window queries with `to = now()`, which keeps
+    // A rolling report window queries with `to = now()`, which keeps
     // advancing while the simulation runs. Without this buffer the newest
     // synthetic day would land inside the live tail bucket (`[to-24h, to]`)
     // alongside real simulated trades, whose near-instant hedge-cycle
@@ -733,10 +733,10 @@ mod simulated_history_tests {
         assert!(last.p50_ms > first.p50_ms);
     }
 
-    /// Regression test for a bug where the dashboard's percentile chart
-    /// showed p50 crashing to near-zero on its most recent data point: the
-    /// fixture's newest synthetic day landed in the same rolling 24h bucket
-    /// the live dashboard queries with `to = now()`, mixing deliberately
+    /// Regression test for a bug where the percentile chart showed p50
+    /// crashing to near-zero on its most recent data point: the fixture's
+    /// newest synthetic day landed in the same rolling 24h bucket a live
+    /// report queries with `to = now()`, mixing deliberately
     /// slow synthetic samples with real (near-instant, in a local
     /// simulation) trade latency in one bucket.
     #[tokio::test]

@@ -1,7 +1,7 @@
 // Loads the Trades and Rebalances tables in two steps. The generator
 // prepends this file to header.js, which calls it on every render;
-// dashboard/src/lib/board-progressive.test.ts imports it as a module through
-// the export line, which the generator drops.
+// observability/tests/board-progressive.test.ts imports it as a module
+// through the export line, which the generator drops.
 //
 // A log table's panel asks for only the newest entries that fill a screen
 // (its maxDataPoints, the row limit of the Cloud Logging plugin), so the

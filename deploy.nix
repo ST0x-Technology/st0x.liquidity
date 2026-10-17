@@ -258,8 +258,6 @@ let
         "touch ${cfg.markerFile}"
         "systemctl restart ${name} || { rm -f ${cfg.markerFile}; exit 1; }"
       ]
-    else if cfg.kind == "static" then
-      cfg.activation
     else
       throw "services.${name}: unknown kind ${cfg.kind}";
 

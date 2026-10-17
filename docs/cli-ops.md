@@ -593,9 +593,9 @@ on any chain until the read is fresh again or that listing is `disabled`.
 
 Before you publish `paused`, the running bot must read it, and the registry
 validator (`t0/check.jq`) must accept it. On rollback, restore the token value
-before you downgrade the binary. The dashboard shows paused and disabled
-listings with the same red rebalancing indicator, so check the mode in the
-registry, not on the dashboard, before step 3.
+before you downgrade the binary. The Grafana board shows paused and disabled
+listings with different colors (amber and red), but check the mode in the
+registry before step 3.
 
 ### Recovery Holds a Symbol
 
@@ -1046,10 +1046,10 @@ so the guard stays held. Let it mine, or escalate.
 
 `transfer reconcile` accepts an Alpaca->Robinhood `SwapQuoted` or `SwapRefunded`
 even while its job still quotes or signs (the CLI preflight and the API take it
-as reconcilable; the dashboard shows it as bridging, with no reconcile action).
-Reconcile one only after its hold page ("Relay refused the re-quote from the
-hub", "Relay deposits from the hub kept reverting", "past the corridor's
-re-quote budget", "Relay refused the quote for a refund at the hub").
+as reconcilable; the Grafana board shows it as bridging). Reconcile one only
+after its hold page ("Relay refused the re-quote from the hub", "Relay deposits
+from the hub kept reverting", "past the corridor's re-quote budget", "Relay
+refused the quote for a refund at the hub").
 
 ### Clearing a pre-burn guard latch
 
@@ -1840,7 +1840,7 @@ latch and the burn-absent on-chain state first.
     stox clear-pending-burn --id <uuid> --reason "dropped burn verified absent on-chain"
     stox fail-usdc-transfer --id <uuid> --reason "pre-burn crash, burn never landed"
 
-For local dashboard testing, run:
+For local testing of the recovery commands, run:
 
 ```
 nix run .#simulate-failures

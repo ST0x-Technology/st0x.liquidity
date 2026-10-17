@@ -1,7 +1,7 @@
 // The Copy button beside each recovery command in the header's guide and the
 // row dialog. The generator prepends this file to header.js and detail.js;
-// dashboard/src/lib/board-copy-command.test.ts imports it as a module through
-// the export line, which the generator drops.
+// observability/tests/board-copy-command.test.ts imports it as a module
+// through the export line, which the generator drops.
 
 // The markup of one command: its text in a <pre> and the button that copies
 // it. `commandHtml` is already escaped.

@@ -88,7 +88,7 @@ let negated = (-a)?;
 | Oracle prices       | `Decimal`                   | `Float`                   |
 | Inventory balances  | `Decimal`                   | `Float`                   |
 | Position events     | `Decimal`                   | `Float`                   |
-| Dashboard DTOs      | `Decimal`                   | `Float`                   |
+| API DTOs            | `Decimal`                   | `Float`                   |
 
 ## Formatting for output
 
@@ -159,9 +159,9 @@ enum cannot carry `FloatError` (it is not `Clone`/`Eq`/`Serialize`), map the
 failure to an explicit serializable domain error variant; do not stringify the
 source or collapse an arithmetic failure into a legitimate `false` result.
 
-Presentation boundaries (Prometheus gauges, dashboard DTOs consumed by
-JavaScript) convert out of `Float` for display. That is fine; what is not fine
-is substituting a fallback value when the conversion fails, which fabricates a
+Presentation boundaries (Prometheus gauges, API DTOs consumed by JavaScript)
+convert out of `Float` for display. That is fine; what is not fine is
+substituting a fallback value when the conversion fails, which fabricates a
 financial number.
 
 ### Why not arbitrary-precision rationals

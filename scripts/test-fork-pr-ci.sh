@@ -100,10 +100,9 @@ expected_wiring = {
     "needs" => %w[backend-build backend-build-e2e backend-lint backend-docs backend-test],
     "if" => "${{ always() }}"
   },
-  "dashboard-build" => { "needs" => nil, "if" => nil },
-  "dashboard-lint" => { "needs" => nil, "if" => nil },
+  "dashboard-tests" => { "needs" => nil, "if" => nil },
   "dashboard" => {
-    "needs" => %w[dashboard-build dashboard-lint],
+    "needs" => "dashboard-tests",
     "if" => "${{ always() }}"
   },
   "hooks-run" => { "needs" => nil, "if" => nil },
@@ -255,18 +254,13 @@ check_gate.call(
   "dashboard",
   "Check dashboard validation",
   %w[
-    needs.dashboard-build.result
-    needs.dashboard-lint.result
+    needs.dashboard-tests.result
   ],
   [
-    [%w[success success], true],
-    [%w[failure success], false],
-    [%w[skipped success], false],
-    [%w[cancelled success], false],
-    [%w[success failure], false],
-    [%w[success skipped], false],
-    [%w[success cancelled], false],
-    [%w[skipped skipped], false]
+    [%w[success], true],
+    [%w[failure], false],
+    [%w[skipped], false],
+    [%w[cancelled], false]
   ]
 )
 
@@ -375,11 +369,11 @@ if [ "$parsed_action_count" -ne "$action_line_count" ]; then
   exit 1
 fi
 
-assert_count 8 '      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6'
+assert_count 7 '      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6'
 assert_absent 'dorny/paths-filter@'
-assert_count 8 '      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035  # v34'
-assert_count 8 '      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71  # v17'
-assert_count 8 '      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569  # v7'
+assert_count 7 '      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035  # v34'
+assert_count 7 '      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71  # v17'
+assert_count 7 '      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569  # v7'
 # Swatinem/rust-cache prunes workspace-crate and incremental artifacts from the
 # target directory in its save step, which would empty the sticky disks.
 assert_absent 'Swatinem/rust-cache@'
@@ -410,9 +404,9 @@ RUBY
 # from a branch naming convention. Dependabot uses an in-repository branch but
 # receives the same restricted token and secret treatment as a fork.
 assert_line "  UNTRUSTED_PR: \${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.fork || github.event.pull_request.user.login == 'dependabot[bot]') }}"
-assert_count 8 "          authToken: \${{ env.UNTRUSTED_PR != 'true' && secrets.CACHIX_AUTH_TOKEN || '' }}"
-assert_count 8 "          skipPush: \${{ env.UNTRUSTED_PR == 'true' }}"
-assert_count 8 "          save: \${{ env.UNTRUSTED_PR != 'true' }}"
+assert_count 7 "          authToken: \${{ env.UNTRUSTED_PR != 'true' && secrets.CACHIX_AUTH_TOKEN || '' }}"
+assert_count 7 "          skipPush: \${{ env.UNTRUSTED_PR == 'true' }}"
+assert_count 7 "          save: \${{ env.UNTRUSTED_PR != 'true' }}"
 # A sticky disk snapshot is shared by every later run, so only reviewed code
 # may commit the shared disk: master pushes. Pull requests (fork or not) never
 # commit. A manual dispatch (any branch) commits only its own -dispatch disk,

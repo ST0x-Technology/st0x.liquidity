@@ -53,9 +53,6 @@
     deploy-rs.url = "github:serokell/deploy-rs";
     deploy-rs.inputs.nixpkgs.follows = "nixpkgs";
 
-    bun2nix.url = "github:nix-community/bun2nix/2.0.8";
-    bun2nix.inputs.nixpkgs.follows = "nixpkgs";
-
     crane.url = "github:ipetkov/crane";
 
     disko.url = "github:nix-community/disko";
@@ -77,7 +74,7 @@
   };
 
   outputs =
-    inputs@{
+    {
       self,
       flake-utils,
       rainix,
@@ -195,7 +192,6 @@
         foundryBin = rainix.pkgs.${system}.foundry-bin;
         rainixPkgs = rainix.packages.${system};
 
-        bun2nix = inputs.bun2nix.packages.${system}.default;
         ragenixPkg = ragenix.packages.${system}.default;
         nixosAnywherePkg = nixos-anywhere.packages.${system}.default;
 
@@ -278,10 +274,10 @@
               rustToolchain
             ];
 
-            # Mock infra + bot + dashboard + e2e driver. Picks the lowest port
-            # offset whose bot/board/vite/mock-api ports are all free so
-            # multiple instances can run side-by-side without collisions. The
-            # dashboard auto-opens in the browser on start. Press `q` to exit.
+            # Mock infra + bot + e2e driver. Picks the lowest port offset whose
+            # bot/board/mock-api/datasette ports are all free so multiple
+            # instances can run side-by-side without collisions. Press `q` to
+            # exit.
             mkSimulation =
               {
                 name,
@@ -310,12 +306,10 @@
                   while (( offset <= max_offset )); do
                     bot_port=$((8001 + offset))
                     board_port=$((8002 + offset))
-                    vite_port=$((5173 + offset))
                     mock_api_port=$((8099 + offset))
                     datasette_port=$((8200 + offset))
                     if port_free "$bot_port" \
                       && port_free "$board_port" \
-                      && port_free "$vite_port" \
                       && port_free "$mock_api_port" \
                       && port_free "$datasette_port"; then
                       break
@@ -329,18 +323,12 @@
                   fi
 
                   echo "${name}: offset=$offset (bot=$bot_port \
-                    board=$board_port vite=$vite_port mock_api=$mock_api_port \
+                    board=$board_port mock_api=$mock_api_port \
                     datasette=$datasette_port)"
 
                   # Mirrors the DB path `simulate()` hardcodes in
-                  # tests/e2e/full_system.rs. Datasette serves it under a
-                  # route named after the file's basename (extension
-                  # stripped); the trailing .json forces a JSON response --
-                  # without it, Datasette content-negotiates to an HTML page
-                  # for a plain fetch() and sql-source.ts's response.json()
-                  # parse fails.
+                  # tests/e2e/full_system.rs.
                   db_path="/tmp/st0x-liquidity-simulate-$bot_port.sqlite"
-                  pnl_sql_api_url="http://127.0.0.1:$datasette_port/st0x-liquidity-simulate-$bot_port.json"
 
                   # A stale $db_path from a previous run at this same port
                   # offset would let datasette's `-f` check below pass
@@ -356,14 +344,6 @@
                     -E 'test(=full_system::${testFilter})' \
                     --run-ignored ignored-only --no-capture"
 
-                  dashboard="cd dashboard && \
-                    BACKEND_PORT=$bot_port \
-                    PUBLIC_BACKEND_PORT=$bot_port \
-                    PUBLIC_PNL_SQL_API_URL=$pnl_sql_api_url \
-                    PUBLIC_SIMULATE_REV=${self.shortRev or self.dirtyShortRev or "unknown"} \
-                    PUBLIC_SIMULATE_SOURCE_ID=${builtins.substring 0 8 (baseNameOf self.outPath)} \
-                    bun run dev --port=$vite_port --strictPort --open"
-
                   mockApi="MOCK_REST_API_PORT=$mock_api_port \
                     bun run e2e/mock-rest-api.ts"
 
@@ -374,14 +354,7 @@
                   datasette="while [ ! -f $db_path ]; do sleep 1; done; \
                     exec datasette serve $db_path -p $datasette_port -h 127.0.0.1"
 
-                  # Generated TS bindings are gitignored and nothing in this
-                  # flow refreshes them, so a worktree that predates a DTO
-                  # change serves stale bindings -- e.g. a Statement guard
-                  # missing newer variants makes the dashboard reject every
-                  # live WebSocket message in an endless reconnect loop.
-                  ${rust.st0x-dto}/bin/st0x-dto dashboard/src/lib/api
-
-                  exec mprocs "$backend" "$dashboard" "$mockApi" "$datasette"
+                  exec mprocs "$backend" "$mockApi" "$datasette"
                 '';
               };
 
@@ -393,21 +366,17 @@
                 ;
               inherit (pkgs) datasette;
 
-              st0x-dashboard = pkgs.callPackage ./dashboard {
-                inherit bun2nix;
-                inherit (rust) st0x-dto;
-              };
-
               # OCI images for the GCP staging VM (pushed + attested to
               # t0-artifacts by build-oci.yml; consumed by t0.devops
               # terraform/staging-liquidity). See nix/oci-images.nix for the
               # image contract.
               inherit
                 (import ./nix/oci-images.nix {
-                  inherit pkgs st0x-dashboard;
+                  inherit pkgs;
                   inherit (rust) st0x-liquidity st0x-cli;
                 })
                 bot-oci
+                dashboard-nginx-check
                 dashboard-oci
                 datasette-oci
                 ;
@@ -431,16 +400,17 @@
 
                   nix develop .#ci-audit -c bash -c './scripts/test-rust-audit.sh && ./scripts/audit-rust.sh'
 
-                  # Dashboard: bun.nix freshness, DTO generation, lint, svelte-check
-                  nix run .#genBunNix
-                  nix fmt -- dashboard/bun.nix
-                  nix run .#st0x-dto -- dashboard/src/lib/api
+                  # Dashboard image: its nginx config answers and fences as expected
+                  nix build .#dashboard-nginx-check
+
+                  # Board scripts: frozen deps, tests, types, format
                   nix develop .#ci-dashboard -c bash -c '
                     set -euxo pipefail
-                    cd dashboard
+                    cd observability/tests
                     bun install --frozen-lockfile
-                    bun run lint
-                    bun run check
+                    bun run test
+                    bun run typecheck
+                    bun run format:check
                   '
 
                   # Turnkey public-message utility: frozen deps, tests, types, format
@@ -455,8 +425,8 @@
                 '';
               };
 
-              # Eventual-consistency chaos test with live dashboard — the default
-              # local simulation entry point.
+              # Eventual-consistency chaos test — the default local simulation
+              # entry point.
               simulate = mkSimulation {
                 name = "simulate";
                 testFilter = "full_system_concurrent";
@@ -468,40 +438,29 @@
                 testFilter = "simulate";
               };
 
-              # Same live dashboard stack as `simulate-market`, but preloads the
-              # hedge-latency read model with 14 days of completed cycles so
-              # Performance tab trends can be inspected immediately.
+              # Same stack as `simulate-market`, but preloads the hedge-latency
+              # read model with 14 days of completed cycles.
               "simulate-14d" = mkSimulation {
                 name = "simulate-14d";
                 testFilter = "simulate";
                 backendEnv = "SIMULATE_LATENCY_FIXTURE_DAYS=14";
               };
 
-              # Same live dashboard stack as `simulate-market`, but rotates each
-              # counter-trade through filled, rejected, and
-              # partially-filled-then-cancelled so the trade history shows every
-              # outcome the dashboard renders.
+              # Same stack as `simulate-market`, but rotates each counter-trade
+              # through filled, rejected, and partially-filled-then-cancelled.
               "simulate-trade-outcomes" = mkSimulation {
                 name = "simulate-trade-outcomes";
                 testFilter = "simulate";
                 backendEnv = "SIMULATE_BROKER_OUTCOME_ROTATION=1";
               };
 
-              # Same live dashboard stack as `simulate-market`, but first creates
+              # Same stack as `simulate-market`, but first creates
               # stuck mint and redemption rebalances whose Alpaca mock
               # provider later completes. The backend logs the
               # `transfer recheck` commands needed to recover them.
               "simulate-failures" = mkSimulation {
                 name = "simulate-failures";
                 testFilter = "simulate_failures";
-              };
-
-              genBunNix = pkgs.writeShellApplication {
-                name = "gen-bun-nix";
-                runtimeInputs = [ bun2nix ];
-                text = ''
-                  exec bun2nix -o dashboard/bun.nix --lock-file dashboard/bun.lock
-                '';
               };
 
               "pr-template" = pkgs.writeShellApplication {
@@ -884,9 +843,8 @@
               RAIN_MATH_FLOAT_SOURCE = rain-math-float;
             };
 
-            # CI dashboard: bun install + lint only. `nix build .#st0x-dashboard`
-            # and `nix run .#st0x-dto` realize their own closures and don't need
-            # this shell on PATH.
+            # CI bun shell: the Grafana board script tests (observability/tests)
+            # and the Turnkey message utility (scripts/turnkey-message).
             ci-dashboard = pkgs.mkShell { buildInputs = [ pkgs.bun ]; };
 
             # CI hooks: pre-commit invokes hook tools by absolute /nix/store

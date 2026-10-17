@@ -1,5 +1,5 @@
 {
-  "source": "ST0x-Technology/st0x.liquidity dashboard/src/lib/transfer.ts RECOVERY_GUIDE, same commit as this file; regenerate from there, do not edit by hand",
+  "source": "The source of truth for the board's CLI recovery guide. observability/tests/recovery.test.ts pins its mode labels and writes every command to the Rust parser test files.",
   "modeLabels": {
     "requires-bot": "REST — requires the running bot",
     "direct-db": "direct DB — stop the bot / ensure it is not driving this id"
