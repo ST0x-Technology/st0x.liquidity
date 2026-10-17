@@ -119,6 +119,14 @@ code, a regular shell is fine.
 
 ### Configuration
 
+Job queue fetch and heartbeat streams recover transient storage failures with
+three shared restarts and 1s/2s/4s backoff while active jobs retain ownership.
+Exhaustion or worker panic fails the service promptly. After startup, `/health`
+returns 503 with `stalledQueues` when essential runnable work is overdue; future
+scheduled jobs are excluded. The cleanup loop also logs overdue queues at ERROR.
+See [Conductor queue health](docs/conductor.md#monitor-configuration) for bounds
+and recovery semantics.
+
 The application uses TOML configuration files split into plaintext config and
 encrypted secrets. See `example.config.toml` and `example.secrets.toml` for all
 available options. Operational intervals such as

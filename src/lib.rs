@@ -225,6 +225,7 @@ pub(crate) struct AppState {
     pub(crate) pnl_ledger: Arc<dashboard::pnl::PnlLedger>,
     pub(crate) metrics_handle: PrometheusHandle,
     pub(crate) health: startup::HealthGate,
+    pub(crate) apalis_pool: apalis_sqlite::SqlitePool,
     /// Request work that must outlive its request, such as a process-tx whose
     /// broker placement has begun. Shutdown waits for it, up to the drain
     /// timeout, before exiting.
@@ -398,6 +399,7 @@ async fn run_bot_session_inner(
         pnl_ledger: pnl_ledger.clone(),
         metrics_handle: metrics_handle.clone(),
         health: health.clone(),
+        apalis_pool: pools.apalis.clone(),
         detached_tasks: detached_tasks.clone(),
     };
     let startup_barrier = startup::StartupBarrier::new();

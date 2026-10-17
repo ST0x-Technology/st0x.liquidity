@@ -67,9 +67,9 @@ pub(crate) fn report_ready(notifier: &dyn StartupNotifier) -> anyhow::Result<()>
 }
 
 /// Readiness flag behind `/health`: the endpoint reports 503 until every
-/// startup token has acknowledged, 200 after. Set exactly where deployment
-/// readiness is reported. A post-startup fatal failure tears the whole
-/// process down, so process liveness covers the rest of the lifecycle.
+/// startup token has acknowledged. Set exactly where deployment readiness is
+/// reported. After startup, the endpoint also checks essential runnable queues;
+/// a fatal runtime failure tears the process down.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct HealthGate(Arc<AtomicBool>);
 

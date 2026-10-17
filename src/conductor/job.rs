@@ -752,7 +752,7 @@ macro_rules! build_worker_inner {
             <$job as $crate::conductor::job::Job<$ctx_type>>::WORKER_NAME,
             $index,
         ))
-        .backend($queue.into_storage())
+        .backend($crate::conductor::worker_recovery::RecoveringBackend::new($queue.into_storage()))
         .data($ctx);
 
         $(
@@ -876,7 +876,7 @@ macro_rules! build_best_effort_worker {
             <$job as $crate::conductor::job::Job<$ctx_type>>::WORKER_NAME,
             $index,
         ))
-        .backend($queue.into_storage())
+        .backend($crate::conductor::worker_recovery::RecoveringBackend::new($queue.into_storage()))
         .data($ctx);
 
         $(
